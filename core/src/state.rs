@@ -4,12 +4,13 @@
 //! native 侧不反调 Java。Kotlin 把 UI 树拍平成扁平 JSON 送进来，
 //! Rust 只回传指令。所以这里所有跨边界类型都是 JSON 可序列化的。
 
-use std::sync::atomic::{AtomicBool, AtomicU16};use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::agent::SessionStore;
+use crate::db::Db;
 use crate::linux::LinuxSandbox;
 use crate::llm::Provider;
 
@@ -219,6 +220,19 @@ pub struct AppState {
     pub llm: RwLock<Option<Provider>>,
     /// 持久化目录（安卓上是 `<filesDir>`；桌面上为空则只存内存）
     pub data_dir: RwLock<Option<std::path::PathBuf>>,
+    /// 会话库。`set_data_dir` 时打开。
+    pub db: RwLock<Option<Arc<Db>>>,
+    /// 有回合正在跑。前端切回来时用它判断「还在进行中」还是「卡住了」。
+    ///
+    /// 注意：agent 循环**不依赖** SSE 客户端。客户端断开时 `tx.send`
+    /// 失败但被忽略，循环照跑、工具照执行、LLM 照调 —— 所以 App 切到
+    /// 后台 agent 是在继续干活的（前台服务保着进程）。
+    pub turn_active: AtomicBool,
+    /// 会话有改动，等着落盘。定时器每 2s 检查一次。
+    ///
+    /// 不用「改一次写一次」：一轮对话会产生几十次变更，每次都写盘太浪费。
+    /// 也不能不写：进程被 kill 会话就没了（实测 force-stop 之后抽屉空了）。
+    pub sessions_dirty: AtomicBool,
 }
 
 impl AppState {
@@ -236,6 +250,9 @@ impl AppState {
             auto_approve: AtomicBool::new(true),
             llm: RwLock::new(None),
             data_dir: RwLock::new(None),
+            turn_active: AtomicBool::new(false),
+            db: RwLock::new(None),
+            sessions_dirty: AtomicBool::new(false),
         })
     }
 
@@ -292,6 +309,56 @@ impl AppState {
 
     pub fn linux(&self) -> Option<Arc<LinuxSandbox>> {
         self.linux.read().ok().and_then(|g| g.clone())
+    }
+
+    pub fn db(&self) -> Option<Arc<Db>> {
+        self.db.read().ok().and_then(|g| g.clone())
+    }
+
+    /// 打开会话库并恢复会话。启动时调一次。
+    pub fn open_db(&self, dir: &std::path::Path) {
+        let path = dir.join("sessions.db");
+        match Db::open(&path) {
+            Ok(db) => {
+                let db = Arc::new(db);
+                match db.load() {
+                    Ok(store) => {
+                        let n = store.sessions.len();
+                        // blocking_write 在异步上下文里会 panic。启动时是从
+                        // Kotlin 主线程调进来的，没有 runtime —— 但还是挡一下。
+                        if tokio::runtime::Handle::try_current().is_ok() {
+                            tracing::warn!("在异步上下文里恢复会话，跳过");
+                        } else {
+                            *self.chat.blocking_write() = store;
+                            if n > 0 {
+                                self.log("info", format!("从 sessions.db 恢复 {n} 个会话"));
+                            }
+                        }
+                    }
+                    Err(e) => self.log("warn", format!("读取会话失败: {e:#}")),
+                }
+                if let Ok(mut g) = self.db.write() {
+                    *g = Some(db);
+                }
+            }
+            Err(e) => self.log("error", format!("打开 {} 失败: {e:#}", path.display())),
+        }
+    }
+
+    pub fn mark_sessions_dirty(&self) {
+        self.sessions_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// 会话落盘。定时器每 2s 调一次，只追加新增的消息。
+    pub fn save_sessions(&self) -> anyhow::Result<()> {
+        let Some(db) = self.db() else {
+            return Ok(());
+        };
+        let store = self
+            .chat
+            .try_read()
+            .map_err(|_| anyhow::anyhow!("会话被占用，跳过本次落盘"))?;
+        db.sync(&store)
     }
 
     pub fn llm(&self) -> Option<Provider> {

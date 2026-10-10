@@ -47,6 +47,12 @@ http = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 webpki-roots = "1"
+
+# 会话持久化。bundled = 把 SQLite 源码一起编进来，不依赖系统库
+# （Android 上根本没有 libsqlite3.so 可链）。
+# 为什么不是 JSON 文件：追加一条消息要全量重写，流式输出时就是每秒
+# 上兆的闪存写入。SQLite 追加是 O(新增)。
+rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 # 决策 D2：正向绑定 + 反向 callback，不手写 JNI
 uniffi = { version = "0.32", features = ["tokio"] }

@@ -17,6 +17,8 @@
 
   let input = $state('');
   let busy = $state(false);
+  /** 服务端还在跑。App 切到后台时 agent 不停，切回来靠它判断"还在进行中"。 */
+  let serverBusy = $state(false);
   let messages = $state<Message[]>([]);
   let sessions = $state<Session[]>([]);
   let controller: AbortController | null = null;
@@ -35,7 +37,11 @@
   async function loadMessages() {
     try {
       const r = await fetch('/api/session');
-      if (r.ok) messages = ((await r.json()) as { messages: Message[] }).messages ?? [];
+      if (!r.ok) return;
+      const d = (await r.json()) as { messages: Message[]; busy: boolean };
+      // 本地流还在跑就别覆盖，否则会把正在流式的消息对象换掉
+      if (!busy) messages = d.messages ?? [];
+      serverBusy = !!d.busy;
     } catch {
       /* 拉不到就算了 */
     }
@@ -87,6 +93,39 @@
   $effect(() => {
     void loadMessages();
     void loadSessions();
+  });
+
+  // 切回前台 / 重新聚焦 → 同步一次。
+  //
+  // 为什么需要：App 切到后台时 WebView 会挂起 JS，SSE 流可能就断了。
+  // 但**服务端的 agent 不会停**（前台服务保着进程，Rust 线程照跑，
+  // SSE 客户端断开只是让 tx.send 失败然后被忽略）。
+  // 所以切回来时从服务端拉最新状态，而不是相信本地的旧视图。
+  $effect(() => {
+    const sync = () => {
+      if (document.visibilityState !== 'visible') return;
+      void loadMessages();
+      void loadSessions();
+    };
+    document.addEventListener('visibilitychange', sync);
+    window.addEventListener('focus', sync);
+    window.addEventListener('pageshow', sync);
+    return () => {
+      document.removeEventListener('visibilitychange', sync);
+      window.removeEventListener('focus', sync);
+      window.removeEventListener('pageshow', sync);
+    };
+  });
+
+  // 服务端还在跑 → 轮询到结束。
+  //
+  // 比"重连 SSE"简单得多，而且跨 WebView 挂起也可靠。
+  // 服务端每个步骤完成都会把 assistant 消息写进会话，所以轮询能
+  // 看到逐步骤推进。
+  $effect(() => {
+    if (!serverBusy) return;
+    const t = setInterval(() => void loadMessages(), 1500);
+    return () => clearInterval(t);
   });
 
   // 打开抽屉时**显式**刷新列表。
@@ -192,6 +231,14 @@
       <MessageList {messages} ondecide={decide} />
     {/if}
   </main>
+
+  {#if serverBusy && !busy}
+    <!-- 服务端在跑但本地没连着流（刚从后台回来）-->
+    <div class="flex shrink-0 items-center gap-2 px-5 pb-1 text-xs text-muted">
+      <span class="size-1.5 animate-pulse rounded-full bg-warn"></span>
+      agent 正在运行…
+    </div>
+  {/if}
 
   <Composer
     bind:value={input}

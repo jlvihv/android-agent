@@ -21,6 +21,8 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | Prompt cache | ✅ 实测命中 73–87% |
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
 | 多会话 | ✅ 侧边栏「最近对话」，标题自动生成 |
+| 会话持久化 | ✅ SQLite（增量落盘），force-stop 后能恢复 |
+| 后台运行 | ✅ 前台服务保活，切回来自动同步 |
 
 ## 快速开始（桌面）
 
@@ -106,6 +108,7 @@ python3 scripts/ask.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"
 | [docs/03-prompt-cache.md](docs/03-prompt-cache.md) | 提示词前缀不变式 + 实测命中率 |
 | [docs/04-android-shell.md](docs/04-android-shell.md) | Android 壳：三个架构决策的落点、真机踩到的 11 个坑 |
 | [docs/05-ui.md](docs/05-ui.md) | 界面：设计令牌、edge-to-edge、对话渲染 |
+| [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）与后台运行 |
 
 ## 脚本
 

@@ -299,7 +299,7 @@ fn find_tool(name: &str) -> Option<ToolSpec> {
 // 会话状态
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatMessage {
     System(String),
     User(String),
@@ -313,7 +313,7 @@ pub enum ChatMessage {
         content: String,
     },
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedToolCall {
     pub id: String,
     pub name: String,
@@ -373,14 +373,14 @@ impl ChatMessage {
 }
 
 /// 待审批的工具调用
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApproval {
     pub tool_call_id: String,
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ChatSession {
     pub id: String,
     /// 标题：取第一条用户输入的前若干字（Claude 的侧边栏就是这样）
@@ -436,7 +436,7 @@ impl ChatSession {
 }
 
 /// 多个会话。侧边栏的「最近对话」就是它。
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct SessionStore {
     pub sessions: Vec<ChatSession>,
     pub active: String,
@@ -682,6 +682,10 @@ pub async fn run_turn(
     user_text: &str,
     tx: mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
+    core.state
+        .turn_active
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let _guard = TurnGuard(core.clone());
     {
         let mut store = core.state.chat.write().await;
         let sess = store.active_mut();
@@ -692,7 +696,22 @@ pub async fn run_turn(
         sess.maybe_title(user_text);
         sess.updated_at = now_ms();
     }
+    core.state.mark_sessions_dirty();
     drive(core, provider, &tx).await
+}
+
+/// 回合结束时清掉 busy 标志。用 Drop 保证任何路径（包括 panic 和
+/// 提前 return）都会清 —— 否则前端会一直显示「运行中」。
+struct TurnGuard(Core);
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .turn_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.0.state.mark_sessions_dirty();
+    }
 }
 
 /// 审批结果回来之后，从这里继续。
@@ -703,6 +722,10 @@ pub async fn resolve_approval(
     approved: bool,
     tx: mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
+    core.state
+        .turn_active
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let _guard = TurnGuard(core.clone());
     let pending = {
         let mut store = core.state.chat.write().await;
         store.active_mut().pending.remove(approval_id)

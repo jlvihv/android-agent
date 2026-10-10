@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod assets;
+pub mod db;
 pub mod demo;
 pub mod editor;
 pub mod ffi;
@@ -135,6 +136,7 @@ impl Core {
             *g = Some(dir.clone());
         }
         self.state.load_llm(&dir);
+        self.state.open_db(&dir);
     }
 
     pub fn set_linux_sandbox(&self, cfg: linux::SandboxConfig) {
@@ -234,6 +236,24 @@ impl Core {
             st.log("info", format!("http://127.0.0.1:{actual}"));
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("http server exited: {e}");
+            }
+        });
+
+        // 会话落盘的定时器。
+        //
+        // 会话改动频繁（一轮对话几十次），不能改一次写一次；但也不能不写
+        // —— 进程被 kill 就全没了。所以攒 2 秒写一次，写之前看 dirty 标志。
+        let st = self.state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if st.sessions_dirty.swap(false, Ordering::Relaxed) {
+                    if let Err(e) = st.save_sessions() {
+                        tracing::warn!("会话落盘失败: {e:#}");
+                    }
+                }
             }
         });
 

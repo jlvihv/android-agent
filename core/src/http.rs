@@ -338,7 +338,13 @@ async fn get_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         .active_ref()
         .map(crate::agent::session_view)
         .unwrap_or_default();
-    Json(json!({ "messages": msgs }))
+    drop(store);
+    // busy 让前端知道「服务端还在跑」—— App 切到后台时 agent 不会停，
+    // 切回来要能看出还在进行中，而不是以为卡住了。
+    Json(json!({
+        "messages": msgs,
+        "busy": st.turn_active.load(std::sync::atomic::Ordering::Relaxed),
+    }))
 }
 
 /// `GET /api/sessions` → 侧边栏的「最近对话」列表
@@ -351,6 +357,8 @@ async fn list_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 async fn new_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let mut store = st.chat.write().await;
     let id = store.create();
+    drop(store);
+    st.mark_sessions_dirty();
     Json(json!({ "id": id }))
 }
 
@@ -365,7 +373,10 @@ async fn activate_session(
     Json(body): Json<ActivateBody>,
 ) -> Response {
     let mut store = st.chat.write().await;
-    if store.activate(&body.id) {
+    let ok = store.activate(&body.id);
+    drop(store);
+    st.mark_sessions_dirty();
+    if ok {
         Json(json!({ "ok": true })).into_response()
     } else {
         (StatusCode::NOT_FOUND, "没有这个会话").into_response()
@@ -388,6 +399,8 @@ async fn rename_session(
         Some(s) => {
             let t = body.title.trim();
             s.title = t.chars().take(60).collect();
+            drop(store);
+            st.mark_sessions_dirty();
             Json(json!({ "ok": true })).into_response()
         }
         None => (StatusCode::NOT_FOUND, "没有这个会话").into_response(),
@@ -401,6 +414,8 @@ async fn delete_session(
 ) -> Response {
     let mut store = st.chat.write().await;
     store.delete(&body.id);
+    drop(store);
+    st.mark_sessions_dirty();
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -408,6 +423,8 @@ async fn delete_session(
 async fn reset(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let mut store = st.chat.write().await;
     store.active_mut().clear();
+    drop(store);
+    st.mark_sessions_dirty();
     st.log("info", "会话已清空");
     StatusCode::NO_CONTENT
 }
