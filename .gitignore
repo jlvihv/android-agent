@@ -1,0 +1,33 @@
+# secrets
+.env
+.env.local
+*.key
+
+# rust
+core/target/
+
+# android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+*.keystore
+
+# 生成物：uniffi 的 Kotlin 绑定（用 `just android-bindings` 重新生成）
+android/app/src/main/java/uniffi/
+
+# 大文件 / 第三方产物：用 `just android-assets` 取
+android/app/src/main/jniLibs/
+android/app/src/main/assets/
+
+# 桌面沙箱
+.dev/
+
+# web
+web/node_modules/
+web/dist/
+
+# misc
+.DS_Store

@@ -1,0 +1,33 @@
+//! 桌面开发用二进制。
+//!
+//! ```sh
+//! just web-build   # 先构建前端（rust-embed 在编译期嵌入）
+//! just dev         # cargo run --bin agent-dev
+//! ```
+//!
+//! 打开 <http://127.0.0.1:8787> 就是完整 App —— 和手机上 WebView 看到的
+//! 是同一份东西。这是 D3（同源 localhost）最大的好处。
+
+use anyhow::Context;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    agent_core::init_tracing();
+
+    let port: u16 = std::env::var("AGENT_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8787);
+
+    let core = agent_core::Core::with_mock();
+    let actual = core.serve(port).await.context("启动 HTTP 服务失败")?;
+
+    println!();
+    println!("  android-agent core v{}", agent_core::VERSION);
+    println!("  → http://127.0.0.1:{actual}");
+    println!("  （mock 设备已启用；Ctrl-C 退出）");
+    println!();
+
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}

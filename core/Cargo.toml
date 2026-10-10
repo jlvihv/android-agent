@@ -1,0 +1,78 @@
+[package]
+name = "agent-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "android-agent 核心：HTTP/SSE/WS 服务 + agent loop + LLM 接入"
+
+[lib]
+name = "agent_core"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "agent-dev"
+path = "src/main.rs"
+
+# 生成 Kotlin 绑定用。放在 feature 后面，这样默认构建不会把
+# uniffi_bindgen（含 askama 模板）编进来。
+#   cargo run --features uniffi-bindgen --bin uniffi-bindgen -- \
+#     generate --library target/debug/libagent_core.so \
+#     --language kotlin --out-dir ../android/app/src/main/java
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+# 不加这行的话，默认构建会尝试编译这个 bin 并因为缺 `cli` feature 而失败
+required-features = ["uniffi-bindgen"]
+
+[features]
+uniffi-bindgen = ["uniffi/cli"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "process", "io-util"] }
+tokio-stream = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust-embed = "8"
+mime_guess = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+http = "1"
+
+# 自己造 reqwest client，绕开 rustls-platform-verifier（R9）。
+# Android 上后者要求先 init_with_env(env, context)，否则第一次请求就 panic。
+# 见 src/llm.rs 的 tls_config() 说明。
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+webpki-roots = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+# 决策 D2：正向绑定 + 反向 callback，不手写 JNI
+uniffi = { version = "0.32", features = ["tokio"] }
+
+# 决策 D4：不手写 OpenAI 协议。只开 4 个 feature（该 crate 共 57 个）。
+# rustls 而非 native-tls —— 避免 openssl 交叉编译，这是 Android/Rust 最容易卡死的地方。
+# byot（bring your own types）：官方逃生口，用来接住 DeepSeek 的
+# `reasoning_content`（自带类型里没这个字段，也没有 flatten extra）。
+async-openai = { version = "0.42", default-features = false, features = [
+    "rustls",
+    "chat-completion",
+    "responses",
+    "byot",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+# android_logger 的 Config::with_max_level 收的是 log::LevelFilter，
+# 而这个 crate 只在 android 目标上需要
+log = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"
+# 注意：不要设 panic = "abort"。D1 选了进程内 .so，
+# 需要在 FFI 边界 catch_unwind 兜住 panic，否则一个 Rust panic 会带走整个 App。
+panic = "unwind"

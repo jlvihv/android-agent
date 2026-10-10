@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 和 web 侧的设计令牌 ink 一致：暖调近黑，不是纯黑 -->
+    <color name="ink">#FF151515</color>
+</resources>

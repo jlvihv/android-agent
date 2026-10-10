@@ -1,0 +1,252 @@
+package dev.vihv.agent
+
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.net.ConnectivityManager
+import android.os.Build
+import android.util.Log
+import uniffi.agent_core.AgentCore
+import uniffi.agent_core.AndroidEnv
+import java.util.TimeZone
+
+/**
+ * 应用入口。核心生命周期就在这里 —— 跟 Application 一致，
+ * 这样无障碍服务和 WebView 都拿得到同一个 `AgentCore`。
+ */
+class AgentApp : Application() {
+
+    companion object {
+        private const val TAG = "AgentApp"
+
+        @Volatile
+        private var instance: AgentApp? = null
+
+        /** Rust 核心。`onCreate` 之后一定非空。 */
+        @Volatile
+        lateinit var core: AgentCore
+            private set
+
+        /** 实际监听的端口（0 表示还没起来） */
+        @Volatile
+        var port: Int = 0
+            private set
+
+        /**
+         * 无障碍服务连上时调用。
+         *
+         * 注意时序：服务可能在 Application.onCreate 之前/之后连上，
+         * 两种顺序都要能工作，所以这里是幂等的。
+         */
+        fun onDeviceReady(service: AgentAccessibilityService) {
+            if (!::core.isInitialized) {
+                Log.w(TAG, "核心还没起来，设备注入延后")
+                return
+            }
+            runCatching {
+                core.setDevice(DeviceHostImpl(service))
+                core.log("info", "设备已接入（无障碍服务）")
+                service.pushSnapshot()
+            }.onFailure { Log.e(TAG, "注入设备失败", it) }
+        }
+
+        fun onDeviceGone() {
+            if (!::core.isInitialized) return
+            runCatching {
+                core.clearDevice()
+                core.log("warn", "设备已断开（无障碍服务关闭）")
+            }
+        }
+
+        fun context(): Context? = instance
+    }
+
+    /**
+     * ⚠️ **这个函数绝不能抛异常。**
+     *
+     * 实测教训：在里面调 `startForegroundService()` 抛了
+     * `ForegroundServiceStartNotAllowedException`（Android 12+ 禁止从
+     * Application.onCreate 起前台服务，那时 uid 状态还是 CEM），
+     * 结果整个 App 直接 FATAL。
+     *
+     * 所以每一步都包起来：任何一步失败都只降级，不致命。
+     */
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+
+        // 1. 建核心（触发 System.loadLibrary("agent_core")）
+        //    这一步失败就没得玩了，但也只记日志，让 Activity 显示错误页
+        runCatching {
+            core = AgentCore()
+            Log.i(TAG, "agent-core ${core.version()}")
+        }.onFailure {
+            Log.e(TAG, "核心加载失败", it)
+            return
+        }
+
+        // 2. 配 Linux 沙箱。
+        //    安卓上 proot 必须住在 nativeLibraryDir（那里才允许 exec），
+        //    rootfs 在 filesDir（靠 proot 的 loader mmap，不靠 exec）。
+        //    见 docs/02-linux-sandbox.md。
+        runCatching { core.setupLinux(androidEnv()) }
+            .onFailure { core.log("warn", "Linux 沙箱配置失败: ${it.message}") }
+
+        // 2b. 首次启动解压 rootfs。
+        //     ~500 个条目，几秒钟。放后台线程 —— 卡在 Application.onCreate
+        //     里会直接 ANR。解压完成前调用 bash 会报"沙箱未就绪"，
+        //     日志里能看到进度。
+        if (!RootfsInstaller.isInstalled(this)) {
+            core.log("info", "首次启动，正在解压 Alpine rootfs…")
+            Thread({
+                val ok = RootfsInstaller.installIfNeeded(this)
+                if (ok) {
+                    // ⚠️ 必须**再调一次** setupLinux。
+                    //
+                    // 第一次调的时候 rootfs 还不存在（解压在后台），
+                    // 而解压会 deleteRecursively 整个目录重建 ——
+                    // 把 prepare_rootfs 写进去的 /etc/resolv.conf、/root、/tmp
+                    // 全冲掉了。
+                    //
+                    // 少了 resolv.conf 的后果：apk 解析不了域名，报
+                    // "no such package"，看起来像软件源挂了。
+                    // （实测踩过）
+                    runCatching { core.setupLinux(androidEnv()) }
+                        .onFailure { core.log("warn", "解压后重配沙箱失败: ${it.message}") }
+                    core.log("info", "Linux 沙箱就绪")
+                } else {
+                    core.log("error", "rootfs 解压失败，bash/edit 不可用")
+                }
+            }, "rootfs-install").apply { isDaemon = true }.start()
+        } else {
+            core.log("info", "Linux 沙箱就绪")
+        }
+
+        // 3. 起 HTTP 服务。传 0 让系统分配端口 —— 硬编码端口在真机上
+        //    可能被别的 App 占了。
+        runCatching { port = core.start(0u.toUShort()).toInt() }
+            .onSuccess { Log.i(TAG, "WebView 应指向 http://127.0.0.1:$port") }
+            .onFailure {
+                Log.e(TAG, "核心启动失败", it)
+                port = 0
+            }
+
+        // 4. 如果无障碍服务已经连上了（进程重启的情况），补一次注入
+        runCatching { AgentAccessibilityService.instance?.let { onDeviceReady(it) } }
+
+        // 注意：前台服务**不在这里起**。
+        // Android 12+ 会抛 ForegroundServiceStartNotAllowedException ——
+        // Application.onCreate 时 App 还没进入前台。改到 MainActivity.onResume。
+    }
+
+    private fun androidEnv(): AndroidEnv {
+        val info = applicationInfo
+        return AndroidEnv(
+            nativeLibDir = info.nativeLibraryDir,
+            filesDir = filesDir.absolutePath,
+            cacheDir = cacheDir.absolutePath,
+            dnsServers = systemDnsServers(),
+            tzOffsetMinutes = tzOffsetMinutes(),
+        )
+    }
+
+    /**
+     * 系统 DNS。
+     *
+     * **必须传**：Alpine minirootfs 里没有 `/etc/resolv.conf`，不写的话
+     * `apk add` 会因为解析不了域名而报 "no such package" —— 看起来像
+     * 软件源挂了，其实是 DNS 根本没配。实测踩过这个坑。
+     */
+    private fun systemDnsServers(): List<String> = runCatching {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+
+        // 实测踩过：直接用 activeNetwork 的 DNS 会拿到 VPN（Tailscale）的
+        // 172.19.0.2 / fdfe:...，而**这个 App 的流量不走 VPN**，
+        // 于是沙箱里每条 DNS 查询都超时 → apk 报 "no such package"。
+        //
+        // 所以按可达性排序：非 VPN 网络优先，VPN 次之，公网兜底。
+        val nonVpn = mutableListOf<String>()
+        val vpn = mutableListOf<String>()
+        for (net in cm.allNetworks) {
+            val lp = cm.getLinkProperties(net) ?: continue
+            val caps = cm.getNetworkCapabilities(net)
+            val isVpn = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
+            val addrs = lp.dnsServers.mapNotNull { it.hostAddress }
+            if (isVpn) vpn += addrs else nonVpn += addrs
+        }
+
+        (nonVpn + vpn).distinct().take(3) + listOf("1.1.1.1", "8.8.8.8")
+    }.getOrDefault(listOf("1.1.1.1", "8.8.8.8"))
+
+    /**
+     * 当前时区偏移（分钟）。
+     *
+     * 沙箱里读不到宿主时区，只能外部注入。注意 Rust 侧会把它转成
+     * POSIX 格式（符号与 UTC 相反）—— musl 的 TZ 解析器认不出 "GMT+8"。
+     */
+    private fun tzOffsetMinutes(): Int =
+        TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000
+}
+
+/** 前台服务：让进程别被系统回收 */
+class AgentForegroundService : android.app.Service() {
+
+    companion object {
+        private const val CHANNEL_ID = "agent-runtime"
+        private const val NOTIF_ID = 1001
+
+        /**
+         * 起前台服务。**必须从 Activity 可见时调用** ——
+         * Android 12+ 从后台（含 Application.onCreate）起会抛
+         * `ForegroundServiceStartNotAllowedException`。
+         *
+         * 这里再包一层 try/catch：起不来只意味着可能被系统回收，
+         * 不该让调用方崩掉。
+         */
+        fun start(ctx: Context) {
+            runCatching {
+                val i = Intent(ctx, AgentForegroundService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    ctx.startForegroundService(i)
+                } else {
+                    ctx.startService(i)
+                }
+            }.onFailure { Log.w("AgentFgs", "前台服务起不来（不影响主流程）: ${it.message}") }
+        }
+    }
+
+    override fun onBind(intent: Intent?) = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val nm = getSystemService(android.app.NotificationManager::class.java)
+        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+            nm.createNotificationChannel(
+                android.app.NotificationChannel(
+                    CHANNEL_ID,
+                    getString(R.string.notif_channel),
+                    android.app.NotificationManager.IMPORTANCE_LOW,
+                ).apply { setShowBadge(false) },
+            )
+        }
+
+        val notif = android.app.Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText("正在运行 · 127.0.0.1:${AgentApp.port}")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIF_ID,
+                notif,
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
+        } else {
+            startForeground(NOTIF_ID, notif)
+        }
+
+        // START_STICKY：被系统杀掉后自动重启（agent 需要常驻）
+        return START_STICKY
+    }
+}

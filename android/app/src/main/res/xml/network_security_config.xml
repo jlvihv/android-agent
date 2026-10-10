@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  前端由 Rust 的 axum 从 http://127.0.0.1:<port> 提供（决策 D3）。
+
+  Android 9 (API 28) 起默认禁止明文 HTTP，包括 loopback。不给例外的话
+  WebView 加载会直接失败，报 ERR_CLEARTEXT_NOT_PERMITTED。
+  实测确认过：这个例外是必需的，不是保险起见。
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+/*
+ * 设计令牌 → Tailwind 主题。
+ *
+ * 参考 Claude 移动端的手感：暖调近黑、低对比、大量留白、只有输入区
+ * 一块"浮起"的卡片。**不追像素对齐** —— 换机型、换字体渲染、换状态栏
+ * 高度都会漂。要的是同一套语言。
+ *
+ * 尺寸一律用 Tailwind 自带的刻度（p-1=4 p-2=8 p-4=16 p-6=24, size-9=36），
+ * 这里只补语义色和两个非标准值。
+ */
+@theme {
+  /* 表面 */
+  --color-ink: #151515; /* 背景：暖调近黑，不是纯黑 */
+  --color-surface: #20201f; /* 输入卡片 */
+  --color-bubble: #2c2c2a; /* 用户气泡（实测 Claude 的值）*/
+  --color-control: #313131; /* 圆形按钮 / 药丸 */
+  --color-hairline: #262624; /* 分隔线，比表面只高一点 */
+  --color-hairline-soft: #1c1c1b;
+
+  /* 文字 */
+  --color-fg: #f9f9f7; /* 暖白，不用纯白 */
+  --color-muted: #97958d;
+  --color-faint: #6f6d66;
+
+  /* 语义色：刻意去饱和，不抢主色 */
+  --color-ok: #7fb37f;
+  --color-warn: #d9b87f;
+  --color-bad: #d98a8a;
+  --color-accent: #5fa564;
+
+  /* 只有三档圆角 */
+  --radius-card: 22px;
+
+  /* 补一个 Tailwind 没有的字号档（日志/元信息用） */
+  --text-meta: 11px;
+  --text-meta--line-height: 1.45;
+
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  background: var(--color-ink);
+  color: var(--color-fg);
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 消息、日志、代码、输入框要能选中复制 */
+.selectable,
+pre,
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* 触屏上没有 hover，按压反馈统一走 active */
+button:active:not(:disabled) {
+  filter: brightness(1.3);
+}
