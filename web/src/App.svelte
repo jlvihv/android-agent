@@ -209,45 +209,73 @@
   }
 </script>
 
-<div class="flex h-full flex-col bg-ink">
-  <header
-    class="flex shrink-0 items-center justify-between px-4 pb-2 pt-[calc(1.5rem+env(safe-area-inset-top))]"
-  >
-    <button onclick={openDrawer} aria-label="菜单" class="p-1 text-fg">
-      <Icon name="menu" size={17} />
-    </button>
-    <button
-      onclick={() => (sheet = true)}
-      aria-label="模型设置"
-      class="size-2 rounded-full {dot}"
-      title={store.device?.name ?? '未连接'}
-    ></button>
-  </header>
-
-  <main class="flex min-h-0 flex-1 flex-col">
+<div class="relative h-full overflow-hidden bg-ink">
+  <!-- 消息列表铺满整个高度：内容从头部和输入卡片下面穿过去。
+       渐隐（mask）在 MessageList 里，所以正文是淡出的，不是盖一层
+       背景色 —— 换背景也不会穿帮。 -->
+  <main class="absolute inset-0 z-0">
     {#if messages.length === 0}
-      <h1 class="grid flex-1 place-items-center text-2xl font-normal">来思考些什么?</h1>
+      <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
     {:else}
       <MessageList {messages} ondecide={decide} />
     {/if}
   </main>
 
-  {#if serverBusy && !busy}
-    <!-- 服务端在跑但本地没连着流（刚从后台回来）-->
-    <div class="flex shrink-0 items-center gap-2 px-5 pb-1 text-xs text-muted">
-      <span class="size-1.5 animate-pulse rounded-full bg-warn"></span>
-      agent 正在运行…
-    </div>
-  {/if}
+  <!--
+    渐隐用浮层而不是滚动容器上的 mask。
+    mask 会让滚动容器每帧重新合成 —— 实测手机上划动明显卡顿。
+    浮层要显式写 z-index：定位元素会盖住非定位元素，光靠 DOM 顺序不够。
+  -->
 
-  <Composer
-    bind:value={input}
-    {busy}
-    onsend={send}
-    onstop={stop}
-    onmenu={openDrawer}
-    onmodel={() => (sheet = true)}
-  />
+  <!-- 顶部：内容在头部下面淡出 -->
+  <div
+    class="pointer-events-none absolute inset-x-0 top-0 z-10 h-[calc(var(--hdr)+3.5rem)]"
+    style="background: linear-gradient(to bottom, var(--color-ink), var(--color-ink) var(--hdr), transparent)"
+  ></div>
+
+  <!-- 底部：内容在输入卡片下面淡出。
+       形状按 Claude 实测 —— 上缘还是全透明（内容可见），往下 40px
+       淡到全遮。所以是「卡片浮在内容上」，不是「底部盖了一层」。 -->
+  <div
+    class="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-14"
+    style="background: linear-gradient(to bottom, transparent 0, var(--color-ink) 75%, var(--color-ink) 100%)"
+  ></div>
+
+  <!-- 头部浮在内容上 -->
+  <header
+    class="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-center justify-between
+           px-4 pb-2 pt-[calc(1.5rem+env(safe-area-inset-top))]"
+  >
+    <button onclick={openDrawer} aria-label="菜单" class="pointer-events-auto p-1 text-fg">
+      <Icon name="menu" size={17} />
+    </button>
+    <button
+      onclick={() => (sheet = true)}
+      aria-label="模型设置"
+      class="pointer-events-auto size-2 rounded-full {dot}"
+      title={store.device?.name ?? '未连接'}
+    ></button>
+  </header>
+
+  <!-- 输入卡片也浮在内容上 -->
+  <div class="absolute inset-x-0 bottom-0 z-20">
+    {#if serverBusy && !busy}
+      <!-- 服务端在跑但本地没连着流（刚从后台回来）-->
+      <div class="flex items-center gap-2 px-5 pb-1 text-xs text-muted">
+        <span class="size-1.5 animate-pulse rounded-full bg-warn"></span>
+        agent 正在运行…
+      </div>
+    {/if}
+
+    <Composer
+      bind:value={input}
+      {busy}
+      onsend={send}
+      onstop={stop}
+      onmenu={openDrawer}
+      onmodel={() => (sheet = true)}
+    />
+  </div>
 </div>
 
 {#if drawer}

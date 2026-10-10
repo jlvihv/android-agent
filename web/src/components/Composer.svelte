@@ -35,8 +35,8 @@
 
 <!-- 输入卡片：文字在上、控件在下，整体是一块浮起的圆角面 -->
 <div
-  class="mx-4 mb-[calc(1rem+env(safe-area-inset-bottom))] flex flex-col gap-3
-         rounded-card border border-hairline bg-surface p-3"
+  class="mx-5 mb-[var(--composer-gap)] flex flex-col gap-3
+         rounded-card border border-control bg-surface p-3"
 >
   <textarea
     bind:this={ta}

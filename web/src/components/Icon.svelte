@@ -15,6 +15,7 @@
     | 'back'
     | 'close'
     | 'chevron'
+    | 'sparkle'
     | 'clock'
     | 'chat'
     | 'screen'
@@ -123,6 +124,13 @@
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <circle cx="10" cy="10" r="7.4" stroke="currentColor" stroke-width="1.7" />
     <path d="M10 5.8V10l2.9 1.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{:else if name === 'sparkle'}
+  <!-- 四角星。用于「思考」那一行，跟工具调用的时钟图标区分开。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="currentColor" class={cls}>
+    <path
+      d="M10 3.6C10.7 7.4 12.6 9.3 16.4 10 12.6 10.7 10.7 12.6 10 16.4 9.3 12.6 7.4 10.7 3.6 10 7.4 9.3 9.3 7.4 10 3.6Z"
+    />
   </svg>
 {:else if name === 'chevron'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>

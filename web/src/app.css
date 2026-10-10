@@ -49,6 +49,17 @@ body,
   height: 100%;
 }
 
+/*
+ * 头部高度 / 输入卡片下边距。
+ *
+ * 头部和输入卡片都是**浮动**的（内容从它们下面穿过去），所以消息列表
+ * 的上下留白和渐隐都得引用这两个值 —— 定义在这里避免同一个数写三遍。
+ */
+:root {
+  --hdr: calc(3.5rem + env(safe-area-inset-top));
+  --composer-gap: calc(1rem + env(safe-area-inset-bottom));
+}
+
 body {
   background: var(--color-ink);
   color: var(--color-fg);
@@ -67,7 +78,20 @@ textarea {
   user-select: text;
 }
 
-/* 触屏上没有 hover，按压反馈统一走 active */
-button:active:not(:disabled) {
-  filter: brightness(1.3);
+/*
+ * 触屏上不要任何 hover / 按压高亮 —— 界面保持安静。
+ *
+ * 代码里本来就没写 `hover:` 类，但 WebView 里 tap 完 :hover 会**粘在**
+ * 元素上（经典的 sticky hover），而且 `button:active` 的提亮在手指按住
+ * 期间一直亮着，看着就像 hover。所以这里显式清掉，而不是靠“反正没写”。
+ */
+button:active,
+button:hover,
+button:focus,
+input:focus,
+textarea:focus,
+a:hover,
+a:focus {
+  filter: none;
+  outline: none;
 }

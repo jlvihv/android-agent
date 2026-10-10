@@ -1,7 +1,7 @@
 <script lang="ts">
   /** 模型设置。从输入卡片上的模型药丸打开。 */
   import { store } from '../lib/store.svelte.ts';
-  import Icon from './Icon.svelte';
+  import Sheet from './Sheet.svelte';
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -45,20 +45,9 @@
   }
 </script>
 
-<button class="fixed inset-0 z-40 bg-black/60" aria-label="关闭" onclick={onclose}></button>
-
-<div
-  class="fixed inset-x-0 bottom-0 z-50 flex flex-col gap-3 rounded-t-card border-t border-hairline
-         bg-[#1b1b1a] px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))]"
->
-  <div class="flex items-center text-[15px] font-semibold">
-    模型设置
-    <button class="ml-auto p-1 text-muted" aria-label="关闭" onclick={onclose}>
-      <Icon name="close" size={18} />
-    </button>
-  </div>
-
-  <div class="flex gap-1.5 overflow-x-auto">
+<Sheet title="模型设置" onclose={onclose}>
+  <div class="flex flex-col gap-3">
+    <div class="flex gap-1.5 overflow-x-auto">
     {#each presets as p (p.label)}
       <button
         onclick={() => {
@@ -88,7 +77,7 @@
           else apiKey = v;
         }}
         class="rounded-xl border border-control bg-surface px-3.5 py-3 text-sm outline-none
-               placeholder:text-faint focus:border-[#4a4a46]"
+               placeholder:text-faint"
       />
     </label>
   {/each}
@@ -106,4 +95,5 @@
   <p class="text-meta leading-snug text-faint">
     配置存在 App 私有目录 <code class="font-mono">llm.json</code>，目前是明文（受 Android 沙箱保护）。
   </p>
-</div>
+  </div>
+</Sheet>

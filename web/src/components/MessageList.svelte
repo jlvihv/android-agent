@@ -2,11 +2,19 @@
   /**
    * 消息列表。对齐 Claude 的层级：
    *   用户 —— 右侧浅色气泡
-   *   助手 —— 左侧无气泡，纯文本全宽
-   *   工具调用 —— 细边卡片，缩进，不抢视觉
+   *   助手 —— 左侧无气泡，markdown 全宽
+   *   思考 / 工具调用 —— 一行摘要，点开是底部面板
+   *
+   * 为什么用面板而不是就地展开：中间步骤（尤其 bash 输出）很长，就地展开
+   * 会把正文挤没；而且正文是流式的，展开会让内容往下跳。面板是覆盖层，
+   * 不参与正文布局。
+   *
+   * 每个思考、每次工具调用**各开各的面板**，面板里只有它自己。
    */
   import type { Message, ToolPart } from '../lib/sse';
   import Icon from './Icon.svelte';
+  import Markdown from './Markdown.svelte';
+  import Sheet from './Sheet.svelte';
 
   let {
     messages,
@@ -17,8 +25,11 @@
   } = $props();
 
   let scroller: HTMLDivElement | null = $state(null);
-  let showReasoning = $state(false);
-  let open = $state<string | null>(null);
+
+  /** 当前打开的面板。一次只有一个。 */
+  let sheet = $state<
+    { kind: 'reasoning'; text: string } | { kind: 'tool'; msg: Message; tool: ToolPart } | null
+  >(null);
 
   /**
    * 把工具调用压成一句人话。Claude 的中间步骤就是这样 ——
@@ -49,21 +60,162 @@
     }
   }
 
+  /** 面板标题。要短，细节放正文。 */
+  function toolTitle(t: ToolPart): string {
+    switch (t.toolName) {
+      case 'bash':
+        return '执行命令';
+      case 'edit':
+        return '编辑文件';
+      case 'device_snapshot':
+        return '读取界面';
+      case 'device_tap':
+        return '点击';
+      case 'device_type':
+        return '输入文字';
+      case 'device_key':
+        return '按键';
+      case 'device_launch':
+        return '启动应用';
+      default:
+        return t.toolName || '工具调用';
+    }
+  }
+
+  /** 面板正文的主体：能一眼看懂的那部分，而不是把 JSON 摊开 */
+  function primary(t: ToolPart): string {
+    const a = (t.input ?? {}) as Record<string, unknown>;
+    const s = (v: unknown) => (typeof v === 'string' ? v : '');
+    if (t.toolName === 'bash') return s(a.command);
+    if (t.toolName === 'edit') return s(a.path);
+    if (t.input !== undefined) return JSON.stringify(t.input, null, 2);
+    return t.inputText ?? '';
+  }
+
+  const asText = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
+
+  /** 兜底：对象排成 key: value，去掉 JSON 的括号和引号噪音 */
+  function kv(v: unknown): string {
+    if (typeof v !== 'object' || v === null) return asText(v);
+    return Object.entries(v as Record<string, unknown>)
+      .map(([k, val]) => `${k}: ${typeof val === 'string' ? val : JSON.stringify(val)}`)
+      .join('\n');
+  }
+
+  type Chip = { text: string; tone: 'ok' | 'bad' | 'warn' | 'plain' };
+
+  type Result = {
+    chips: Chip[];
+    label: string;
+    failed: boolean;
+    body: string;
+    diff: boolean;
+    path: string | null;
+  };
+
+  /**
+   * 把工具结果拆成能分样式显示的部分。
+   *
+   * 之前是把整个结果 JSON 摊开 —— output 里的换行会转义成字面量 `\n`，
+   * 一屏全是反斜杠。现在每个字段有自己的样式：
+   *   exit_code / wall_time / truncated / message → 顶部小药丸
+   *   output  → 正文（非 0 退出时整块红）
+   *   diff    → 按行染色（+ 绿 / - 红）
+   *   error   → 整块红
+   *   full_output_path → 底部的路径说明
+   */
+  function result(t: ToolPart): Result | null {
+    const o = t.output;
+    if (o === undefined) return null;
+
+    const plain = (label: string, body: string, failed = false): Result => ({
+      chips: [],
+      label,
+      failed,
+      body,
+      diff: false,
+      path: null,
+    });
+
+    if (typeof o === 'string') return plain('输出', o);
+    if (typeof o !== 'object' || o === null) return plain('输出', asText(o));
+
+    const r = o as Record<string, unknown>;
+
+    // 工具直接报错
+    if (typeof r.error === 'string') return plain('错误', r.error, true);
+
+    const chips: Chip[] = [];
+
+    // bash
+    if (typeof r.exit_code === 'number') {
+      const ok = r.exit_code === 0;
+      chips.push({ text: ok ? 'exit 0' : `exit ${r.exit_code}`, tone: ok ? 'plain' : 'bad' });
+    }
+    if (typeof r.wall_time_seconds === 'number') {
+      chips.push({ text: `${r.wall_time_seconds}s`, tone: 'plain' });
+    }
+    if (r.truncated === true) chips.push({ text: '已截断', tone: 'warn' });
+
+    // edit
+    if (typeof r.message === 'string') chips.push({ text: r.message, tone: 'plain' });
+    if (typeof r.firstChangedLine === 'number') {
+      chips.push({ text: `第 ${r.firstChangedLine} 行起`, tone: 'plain' });
+    }
+
+    const failed = typeof r.exit_code === 'number' && r.exit_code !== 0;
+
+    if (typeof r.diff === 'string') {
+      return { chips, label: '改动', failed: false, body: r.diff, diff: true, path: null };
+    }
+
+    if (typeof r.output === 'string') {
+      return {
+        chips,
+        label: '输出',
+        failed,
+        body: r.output,
+        diff: false,
+        path: typeof r.full_output_path === 'string' ? r.full_output_path : null,
+      };
+    }
+
+    return { chips, label: '结果', failed: false, body: kv(o), diff: false, path: null };
+  }
+
+  /** diff 按行染色 */
+  const diffLine = (l: string) => {
+    if (l.startsWith('+') && !l.startsWith('+++')) return 'text-ok';
+    if (l.startsWith('-') && !l.startsWith('---')) return 'text-bad';
+    if (l.startsWith('@@') || l.startsWith('+++') || l.startsWith('---')) return 'text-faint';
+    return 'text-muted';
+  };
+
+  const CHIP: Record<Chip['tone'], string> = {
+    ok: 'bg-ok/15 text-ok',
+    bad: 'bg-bad/15 text-bad',
+    warn: 'bg-warn/15 text-warn',
+    plain: 'bg-control text-muted',
+  };
+
   // 新内容贴底
   $effect(() => {
     void messages.length;
     void messages.at(-1)?.parts.length;
     if (scroller) scroller.scrollTop = scroller.scrollHeight;
   });
-
-  const json = (v: unknown) => (v === undefined ? '' : JSON.stringify(v, null, 2));
 </script>
 
-<div bind:this={scroller} class="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto px-4 pt-2 pb-4">
+<div
+  bind:this={scroller}
+  class="flex h-full flex-col gap-6 overflow-y-auto px-4 pb-6 pt-[var(--hdr)]"
+>
   {#each messages as msg (msg.id)}
     {#if msg.role === 'user'}
       <div class="flex justify-end">
-        <p class="max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words">
+        <p
+          class="max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
+        >
           {msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
         </p>
       </div>
@@ -71,25 +223,21 @@
       <div class="flex flex-col gap-2.5 text-base leading-relaxed">
         {#each msg.parts as part, i (i)}
           {#if part.type === 'text'}
-            <p class="whitespace-pre-wrap break-words">{part.text}</p>
+            <Markdown text={part.text} />
           {:else if part.type === 'reasoning'}
-            <div class="border-l-2 border-hairline pl-2.5">
-              <button
-                onclick={() => (showReasoning = !showReasoning)}
-                class="text-xs text-muted"
-              >
-                思考 {showReasoning ? '▾' : '▸'}
-              </button>
-              {#if showReasoning}
-                <p class="mt-1 text-[13px] leading-5 whitespace-pre-wrap text-muted">{part.text}</p>
-              {/if}
-            </div>
+            <!-- 一行摘要，点开面板看全文 -->
+            <button
+              onclick={() => (sheet = { kind: 'reasoning', text: part.text })}
+              class="flex w-full items-center gap-2 py-0.5 text-left"
+            >
+              <Icon name="sparkle" size={16} class="shrink-0 text-faint" />
+              <span class="truncate text-sm text-muted">思考</span>
+              <Icon name="chevron" size={15} class="ml-auto shrink-0 text-faint" />
+            </button>
           {:else if part.type === 'tool'}
             {@const tool = part}
-            <!-- 折叠条：一行摘要 + 展开。对齐 Claude 的中间步骤渲染，
-                 不是一直摊开的卡片（那样会把正文挤没）。 -->
             <button
-              onclick={() => (open = open === tool.toolCallId ? null : tool.toolCallId)}
+              onclick={() => (sheet = { kind: 'tool', msg, tool })}
               class="flex w-full items-center gap-2 py-0.5 text-left"
             >
               <Icon name="clock" size={16} class="shrink-0 text-faint" />
@@ -99,49 +247,8 @@
               {:else if tool.state === 'denied'}
                 <span class="shrink-0 text-meta text-bad">已拒绝</span>
               {/if}
-              <Icon
-                name="chevron"
-                size={15}
-                class="ml-auto shrink-0 text-faint transition-transform
-                       {open === tool.toolCallId ? 'rotate-90' : ''}"
-              />
+              <Icon name="chevron" size={15} class="ml-auto shrink-0 text-faint" />
             </button>
-
-            {#if open === tool.toolCallId}
-              <div class="ml-6 flex flex-col gap-2 rounded-xl border border-hairline bg-[#1b1b1a] px-2.5 py-2">
-                {#if tool.input !== undefined}
-                  <pre class="max-h-56 overflow-auto font-mono text-meta whitespace-pre-wrap break-all text-muted">{json(
-                      tool.input,
-                    )}</pre>
-                {:else if tool.inputText}
-                  <pre class="max-h-56 overflow-auto font-mono text-meta whitespace-pre-wrap break-all text-faint">{tool.inputText}</pre>
-                {/if}
-                {#if tool.approvalReason}
-                  <p class="text-xs text-warn">{tool.approvalReason}</p>
-                {/if}
-                {#if tool.state === 'awaiting-approval'}
-                  <div class="flex gap-2">
-                    <button
-                      onclick={() => ondecide(msg, tool, true)}
-                      class="rounded-full bg-fg px-3.5 py-1 text-xs text-ink"
-                    >
-                      批准
-                    </button>
-                    <button
-                      onclick={() => ondecide(msg, tool, false)}
-                      class="rounded-full bg-control px-3.5 py-1 text-xs text-fg"
-                    >
-                      拒绝
-                    </button>
-                  </div>
-                {/if}
-                {#if tool.output !== undefined}
-                  <pre class="max-h-56 overflow-auto border-t border-hairline pt-2 font-mono text-meta whitespace-pre-wrap break-all text-muted">{json(
-                      tool.output,
-                    )}</pre>
-                {/if}
-              </div>
-            {/if}
           {:else if part.type === 'data'}
             <!-- 用量不显示：Claude 没有，看着啰嗦 -->
           {:else if part.type === 'error'}
@@ -156,3 +263,88 @@
     {/if}
   {/each}
 </div>
+
+{#if sheet}
+  {#if sheet.kind === 'reasoning'}
+    <Sheet title="思考" onclose={() => (sheet = null)}>
+      <p class="text-[15px] leading-6 whitespace-pre-wrap">{sheet.text}</p>
+    </Sheet>
+  {:else}
+    <!-- 存成 const：sheet 是 $state，在 onclick 闭包里 TS 收窄不了 -->
+    {@const s = sheet}
+    {@const t = s.tool}
+    {@const res = result(t)}
+    <Sheet title={toolTitle(t)} onclose={() => (sheet = null)}>
+      <div class="flex flex-col gap-4">
+        {#if primary(t)}
+          <pre
+            class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5 whitespace-pre-wrap break-all">{primary(
+              t,
+            )}</pre>
+        {/if}
+
+        {#if t.approvalReason}
+          <p class="text-sm text-warn">{t.approvalReason}</p>
+        {/if}
+
+        {#if t.state === 'awaiting-approval'}
+          <div class="flex gap-2">
+            <button
+              onclick={() => {
+                ondecide(s.msg, t, true);
+                sheet = null;
+              }}
+              class="rounded-full bg-fg px-4 py-2 text-sm font-medium text-ink"
+            >
+              批准
+            </button>
+            <button
+              onclick={() => {
+                ondecide(s.msg, t, false);
+                sheet = null;
+              }}
+              class="rounded-full bg-control px-4 py-2 text-sm"
+            >
+              拒绝
+            </button>
+          </div>
+        {/if}
+
+        {#if res}
+          <div class="flex flex-col gap-2">
+            <!-- 元信息药丸：退出码 / 耗时 / 是否截断 / 替换处数 -->
+            <div class="flex flex-wrap items-center gap-1.5">
+              <span class="text-meta {res.failed ? 'text-bad' : 'text-faint'}">{res.label}</span>
+              {#each res.chips as c}
+                <span class="rounded-full px-2 py-0.5 text-meta {CHIP[c.tone]}">{c.text}</span>
+              {/each}
+            </div>
+
+            {#if res.diff}
+              <div
+                class="overflow-x-auto rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5"
+              >
+                {#each res.body.split('\n') as line}
+                  <p class="whitespace-pre {diffLine(line)}">{line || ' '}</p>
+                {/each}
+              </div>
+            {:else}
+              <pre
+                class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-all {res.failed
+                  ? 'text-bad'
+                  : ''}">{res.body}</pre>
+            {/if}
+
+            {#if res.path}
+              <p class="text-meta text-faint">
+                完整输出：<code class="font-mono">{res.path}</code>
+              </p>
+            {/if}
+          </div>
+        {:else if t.state === 'streaming'}
+          <p class="text-sm text-muted">执行中…</p>
+        {/if}
+      </div>
+    </Sheet>
+  {/if}
+{/if}
