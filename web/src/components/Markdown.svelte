@@ -3,11 +3,26 @@
    * 渲染 markdown 块。走 Svelte 组件而不是 {@html}：
    * 没有 XSS 面，样式也全在 Tailwind 里。
    */
+  import { untrack } from 'svelte';
   import { parse, type Span } from '../lib/markdown';
 
   let { text }: { text: string } = $props();
 
-  const blocks = $derived(parse(text));
+  // 流式时每个 delta 都会改 text，一帧里可能来好几个。整段重新解析 +
+  // 重新渲染一帧做一次就够了：变化先攒着，下一帧取最新值。
+  // 历史消息首帧就是完整的，不经过这里。
+  let shown = $state(untrack(() => text));
+  let raf = 0;
+  $effect(() => {
+    void text;
+    raf ||= requestAnimationFrame(() => {
+      raf = 0;
+      shown = text;
+    });
+  });
+  $effect(() => () => cancelAnimationFrame(raf));
+
+  const blocks = $derived(parse(shown));
 </script>
 
 {#snippet spans(list: Span[])}

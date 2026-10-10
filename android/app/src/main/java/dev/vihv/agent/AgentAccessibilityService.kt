@@ -8,6 +8,7 @@ import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
@@ -36,8 +37,23 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     private val main = Handler(Looper.getMainLooper())
+
+    /**
+     * 快照专用线程。
+     *
+     * 原来快照在主线程做 —— 无障碍服务和 WebView 在**同一个进程**，主线程
+     * 就是我们自己 UI 的线程。遍历 500 个节点、每个 getChild 都是一次跨进程
+     * 调用，再拼 JSON，一次几十到上百毫秒，用户在 App 里划动时就是掉帧。
+     * 节点查询本身是线程安全的，不需要主线程。
+     */
+    private val worker = Handler(HandlerThread("a11y-snapshot").apply { start() }.looper)
     private var pendingPush: Runnable? = null
+
+    @Volatile
     private var lastActivity: String = ""
+
+    /** 上次推给 Rust 的界面内容（不含时间戳）。没变就不推。 */
+    private var lastKey: String? = null
 
     /** 最近一次快照的节点定位信息，指令执行时按索引查 */
     @Volatile
@@ -56,6 +72,7 @@ class AgentAccessibilityService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         instance = null
+        worker.looper.quitSafely()
         AgentApp.onDeviceGone()
         Log.i(TAG, "无障碍服务已断开")
         return super.onUnbind(intent)
@@ -67,6 +84,10 @@ class AgentAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val e = event ?: return
+        // 自己的界面不用盯。用户在 App 里划动、流式输出时 WebView 每秒几十个
+        // 事件，每个都引来一次快照 + 一次广播给前端，前端又因此重绘 —— 白费，
+        // 还拖慢正在看的那个界面。agent 要看自己时会显式调 snapshot。
+        if (e.packageName?.toString() == packageName) return
         if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             e.className?.toString()?.let { lastActivity = it }
         }
@@ -75,29 +96,36 @@ class AgentAccessibilityService : AccessibilityService() {
 
     /** 合并密集事件：取消上一个待执行的，250ms 后再快照 */
     private fun schedulePush() {
-        pendingPush?.let { main.removeCallbacks(it) }
+        pendingPush?.let { worker.removeCallbacks(it) }
         val r = Runnable {
             pendingPush = null
-            pushSnapshot()
+            pushSnapshot(force = false)
         }
         pendingPush = r
-        main.postDelayed(r, DEBOUNCE_MS)
+        worker.postDelayed(r, DEBOUNCE_MS)
     }
 
     // -----------------------------------------------------------------------
     // 快照
     // -----------------------------------------------------------------------
 
-    /** 读一次界面并推给 Rust。返回节点数；失败返回 -1。 */
-    fun pushSnapshot(): Int = onMain {
+    /**
+     * 读一次界面并推给 Rust。返回节点数；失败返回 -1。
+     *
+     * `force = false`（事件触发的）时界面没变就不推 —— 每次推送都会广播
+     * 给前端，几百个节点的 JSON。agent 显式要快照时总是推。
+     */
+    fun pushSnapshot(force: Boolean = true): Int = onThread(worker) {
         val snap = UiTree.snapshot(this, lastActivity)
         if (snap == null) {
             Log.w(TAG, "拿不到根节点，跳过本次快照")
-            return@onMain -1
+            return@onThread -1
         }
         refs = snap.refs
+        if (!force && snap.key == lastKey) return@onThread snap.refs.size
         try {
             AgentApp.core.pushSnapshot(snap.json)
+            lastKey = snap.key
             snap.refs.size
         } catch (t: Throwable) {
             Log.e(TAG, "推送快照失败", t)
@@ -241,14 +269,17 @@ class AgentAccessibilityService : AccessibilityService() {
      * post 到主线程并**阻塞等结果** —— 调用方（Rust）本来就在阻塞线程上，
      * 而且单次调用只有几毫秒。
      */
-    private fun <T> onMain(block: () -> T): T {
-        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+    private fun <T> onMain(block: () -> T): T = onThread(main, block)
+
+    /** 在 `h` 的线程上跑 `block` 并阻塞等结果 */
+    private fun <T> onThread(h: Handler, block: () -> T): T {
+        if (Looper.myLooper() == h.looper) return block()
 
         val latch = CountDownLatch(1)
         var result: T? = null
         var error: Throwable? = null
 
-        main.post {
+        h.post {
             try {
                 result = block()
             } catch (t: Throwable) {
@@ -259,7 +290,7 @@ class AgentAccessibilityService : AccessibilityService() {
         }
 
         if (!latch.await(8, TimeUnit.SECONDS)) {
-            error("主线程执行超时（8s）")
+            error("${h.looper.thread.name} 线程执行超时（8s）")
         }
         error?.let { throw it }
         @Suppress("UNCHECKED_CAST")

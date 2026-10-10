@@ -21,7 +21,15 @@
   let ta: HTMLTextAreaElement | null = $state(null);
 
   const canSend = $derived(value.trim().length > 0 && !busy);
-  const rows = $derived(Math.min(5, value.split('\n').length));
+
+  // 按内容长高，最多 5 行，再多就在框里滚。
+  // 原来按换行符数算 rows，一行长文字自动折行时框不长，只能在一行里滚。
+  $effect(() => {
+    void value;
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = `${ta.scrollHeight}px`;
+  });
 
   export const focus = () => ta?.focus();
 
@@ -41,13 +49,13 @@
   <textarea
     bind:this={ta}
     bind:value
-    {rows}
+    rows="1"
     placeholder="与 agent 对话…"
     onkeydown={onkeydown}
     spellcheck="false"
     class="resize-none bg-transparent px-1 pt-1 text-base leading-6 text-fg
            placeholder:text-muted outline-none"
-    style="max-height: 8.5rem"
+    style="max-height: 8.5rem; overflow-y: auto"
   ></textarea>
 
   <div class="flex items-center gap-2">

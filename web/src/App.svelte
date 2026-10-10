@@ -26,6 +26,9 @@
   let drawer = $state(false);
   let sheet = $state(false);
 
+  /** 输入区实际高度。消息列表的底部留白和底部渐隐都跟着它走。 */
+  let composerH = $state(0);
+
   const dot = $derived(
     !store.connected ? 'bg-control' : store.device?.connected ? 'bg-accent' : 'bg-warn',
   );
@@ -38,13 +41,34 @@
     try {
       const r = await fetch('/api/session');
       if (!r.ok) return;
-      const d = (await r.json()) as { messages: Message[]; busy: boolean };
-      // 本地流还在跑就别覆盖，否则会把正在流式的消息对象换掉
-      if (!busy) messages = d.messages ?? [];
+      const raw = await r.text();
+      const d = JSON.parse(raw) as { messages: Message[]; busy: boolean };
       serverBusy = !!d.busy;
+      // 本地流还在跑就别覆盖，否则会把正在流式的消息对象换掉
+      if (busy || raw === lastRaw) return;
+      lastRaw = raw;
+      messages = reconcile(messages, d.messages ?? []);
     } catch {
       /* 拉不到就算了 */
     }
+  }
+
+  /** 上次拉到的原样响应。轮询时没变化就什么都不做。 */
+  let lastRaw = '';
+
+  /**
+   * 能复用的旧消息对象原样留着。
+   *
+   * 轮询每 1.5 秒拉一次整份会话，直接整体替换的话每条消息都是新对象，
+   * 所有 markdown 全部重新解析、重新渲染 —— 跑长任务时划动明显掉帧。
+   * 内容没变的消息留旧对象，Svelte 就不会碰它们的 DOM。
+   */
+  function reconcile(prev: Message[], next: Message[]): Message[] {
+    const old = new Map(prev.map((m) => [m.id, m]));
+    return next.map((m) => {
+      const o = old.get(m.id);
+      return o && JSON.stringify(o) === JSON.stringify(m) ? o : m;
+    });
   }
 
   async function loadSessions() {
@@ -139,29 +163,10 @@
     void loadMessages();
   }
 
-  // 让 Android 的返回键能关掉覆盖层。
-  //
-  // 抽屉/面板是 JS 覆盖层，系统的返回键不知道它们存在 —— 不处理的话
-  // 按返回会直接退出 App（实测踩过）。做法：打开时往 history 里 push
-  // 一个状态，返回键触发 popstate 时关闭。**所有关闭都走 history**，
-  // 否则会留下脏记录，下次返回要按两下。
-  let depth = 0;
-  $effect(() => {
-    if (drawer || sheet) window.history.pushState({ overlay: ++depth }, '');
-  });
-  $effect(() => {
-    const onPop = () => {
-      if (drawer || sheet) {
-        drawer = false;
-        sheet = false;
-      }
-    };
-    addEventListener('popstate', onPop);
-    return () => removeEventListener('popstate', onPop);
-  });
-
+  // 返回键关覆盖层：每个覆盖层自己登记（lib/overlay.ts），这里不管。
   const close = () => {
-    if (drawer || sheet) window.history.back();
+    drawer = false;
+    sheet = false;
   };
 
   // —— 对话 ——
@@ -209,7 +214,7 @@
   }
 </script>
 
-<div class="relative h-full overflow-hidden bg-ink">
+<div class="relative h-full overflow-hidden bg-ink" style:--composer-h="{composerH}px">
   <!-- 消息列表铺满整个高度：内容从头部和输入卡片下面穿过去。
        渐隐（mask）在 MessageList 里，所以正文是淡出的，不是盖一层
        背景色 —— 换背景也不会穿帮。 -->
@@ -228,18 +233,12 @@
   -->
 
   <!-- 顶部：内容在头部下面淡出 -->
-  <div
-    class="pointer-events-none absolute inset-x-0 top-0 z-10 h-[calc(var(--hdr)+3.5rem)]"
-    style="background: linear-gradient(to bottom, var(--color-ink), var(--color-ink) var(--hdr), transparent)"
-  ></div>
+  <div class="fade-top pointer-events-none absolute inset-x-0 top-0 z-10"></div>
 
-  <!-- 底部：内容在输入卡片下面淡出。
-       形状按 Claude 实测 —— 上缘还是全透明（内容可见），往下 40px
-       淡到全遮。所以是「卡片浮在内容上」，不是「底部盖了一层」。 -->
-  <div
-    class="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-14"
-    style="background: linear-gradient(to bottom, transparent 0, var(--color-ink) 75%, var(--color-ink) 100%)"
-  ></div>
+  <!-- 底部：内容在输入卡片上方开始淡出，到卡片半腰全遮。
+       高度跟着输入区实测高度走 —— 原来写死 h-14，输入框一长高，
+       渐隐就整个缩在卡片后面，卡片两侧的正文是硬切的。 -->
+  <div class="fade-bottom pointer-events-none absolute inset-x-0 bottom-0 z-10"></div>
 
   <!-- 头部浮在内容上 -->
   <header
@@ -258,7 +257,7 @@
   </header>
 
   <!-- 输入卡片也浮在内容上 -->
-  <div class="absolute inset-x-0 bottom-0 z-20">
+  <div class="absolute inset-x-0 bottom-0 z-20" bind:offsetHeight={composerH}>
     {#if serverBusy && !busy}
       <!-- 服务端在跑但本地没连着流（刚从后台回来）-->
       <div class="flex items-center gap-2 px-5 pb-1 text-xs text-muted">
@@ -279,7 +278,6 @@
 </div>
 
 {#if drawer}
-  <button class="fixed inset-0 z-40 bg-black/50" aria-label="关闭" onclick={close}></button>
   <Drawer
     {sessions}
     onclose={close}

@@ -17,7 +17,9 @@ import type {
 import { applyChunk, type Message } from './sse';
 import { uid } from './uid';
 
-export type LogItem = { ts: number; level: string; msg: string };
+export type LogItem = { id: number; ts: number; level: string; msg: string };
+
+let logSeq = 0;
 
 class AgentStore {
   connected = $state(false);
@@ -134,7 +136,7 @@ class AgentStore {
   }
 
   pushLog(level: string, msg: string): void {
-    this.logs = [{ ts: Date.now(), level, msg }, ...this.logs].slice(0, 300);
+    this.logs = [{ id: ++logSeq, ts: Date.now(), level, msg }, ...this.logs].slice(0, 300);
   }
 
   send(msg: ClientMsg): void {

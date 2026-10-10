@@ -37,7 +37,7 @@
     {#if store.logs.length === 0}
       <p class="py-5 text-center text-meta text-faint">暂无</p>
     {:else}
-      {#each store.logs as l, i (i)}
+      {#each store.logs as l (l.id)}
         <div class="selectable flex gap-2 border-b border-hairline-soft px-4 py-1 font-mono text-meta">
           <span class="shrink-0 text-faint">{hhmmss(l.ts)}</span>
           <span class="shrink-0 {lv[l.level] ?? 'text-muted'}">{l.level}</span>

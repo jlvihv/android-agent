@@ -198,21 +198,53 @@
     plain: 'bg-control text-muted',
   };
 
-  // 新内容贴底
+  // —— 贴底 ——
+  //
+  // 原来是监听 messages.length / parts.length 再滚到底，两个问题：
+  //   1. 流式输出时文字在同一个 part 里变长，长度不变 → 不跟
+  //   2. 用户往上翻着看，来一个新 part 就被硬拽回底部
+  // 现在：在底部附近才算"贴着"；内容或容器尺寸一变（流式长高、键盘弹起、
+  // 输入框长高），贴着就跟到底。用 ResizeObserver，不用每个 delta 都跑。
+  let content: HTMLDivElement | null = $state(null);
+  let pinned = true;
+
+  const toBottom = () => {
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  };
+
+  function onscroll() {
+    const el = scroller!;
+    pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  }
+
+  $effect(() => {
+    if (!scroller || !content) return;
+    const ro = new ResizeObserver(() => pinned && toBottom());
+    ro.observe(scroller);
+    ro.observe(content);
+    return () => ro.disconnect();
+  });
+
+  // 自己发了消息 / 切了会话 → 无论在哪都回到底部
   $effect(() => {
     void messages.length;
-    void messages.at(-1)?.parts.length;
-    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    void messages[0]?.id;
+    pinned = true;
+    toBottom();
   });
 </script>
 
+<!-- 底部留白 = 输入区高度 + 一点余量：输入区是浮在上面的，
+     不留够的话最后一条消息永远有半截压在卡片下面。 -->
 <div
   bind:this={scroller}
-  class="flex h-full flex-col gap-6 overflow-y-auto px-4 pb-6 pt-[var(--hdr)]"
+  {onscroll}
+  class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[var(--hdr)] pb-[calc(var(--composer-h,0px)+1rem)]"
 >
+<div bind:this={content} class="flex flex-col gap-6">
   {#each messages as msg (msg.id)}
     {#if msg.role === 'user'}
-      <div class="flex justify-end">
+      <div class="msg flex justify-end">
         <p
           class="max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
         >
@@ -220,7 +252,7 @@
         </p>
       </div>
     {:else}
-      <div class="flex flex-col gap-2.5 text-base leading-relaxed">
+      <div class="flex flex-col gap-2.5 text-base leading-relaxed {msg.done ? 'msg' : ''}">
         {#each msg.parts as part, i (i)}
           {#if part.type === 'text'}
             <Markdown text={part.text} />
@@ -263,6 +295,17 @@
     {/if}
   {/each}
 </div>
+</div>
+
+<style>
+  /* 屏幕外的消息跳过布局和绘制。长对话里这是划动掉帧的大头。
+     auto 让浏览器记住渲染过的真实高度，翻回来不会跳。
+     正在流式的那条不加 —— 它一直在变。 */
+  .msg {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 6rem;
+  }
+</style>
 
 {#if sheet}
   {#if sheet.kind === 'reasoning'}

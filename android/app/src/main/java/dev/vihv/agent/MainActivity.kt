@@ -111,7 +111,9 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT,
         )
-        w.setBackgroundColor(Color.BLACK)
+        // 和窗口背景、页面背景同色（@color/ink）。原来是纯黑：启动时先闪一下
+        // 黑，页面画出来再变成 #151515。
+        w.setBackgroundColor(getColor(R.color.ink))
 
         w.settings.apply {
             javaScriptEnabled = true

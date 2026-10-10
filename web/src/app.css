@@ -95,3 +95,62 @@ a:focus {
   filter: none;
   outline: none;
 }
+
+/*
+ * 头尾渐隐。
+ *
+ * 用浮层而不是滚动容器上的 mask —— mask 会让滚动容器每帧重新合成，
+ * 手机上划动明显卡顿。浮层是静态的一层，滚动时不用重画。
+ *
+ * 两段线性渐变在交界处有一道看得见的"边"（马赫带），所以按缓动曲线
+ * 多放几个色标。颜色用 color-mix 从 --color-ink 派生，换背景不穿帮。
+ */
+.fade-top,
+.fade-bottom {
+  --a0: transparent;
+  --a1: color-mix(in srgb, var(--color-ink) 4%, transparent);
+  --a2: color-mix(in srgb, var(--color-ink) 13%, transparent);
+  --a3: color-mix(in srgb, var(--color-ink) 28%, transparent);
+  --a4: color-mix(in srgb, var(--color-ink) 38%, transparent);
+  --a5: color-mix(in srgb, var(--color-ink) 54%, transparent);
+  --a6: color-mix(in srgb, var(--color-ink) 74%, transparent);
+  --a7: var(--color-ink);
+}
+
+/* 头部下方：头部区域全遮，往下 3rem 淡到全透明 */
+.fade-top {
+  --l: 3rem;
+  height: calc(var(--hdr) + var(--l));
+  background: linear-gradient(
+    to top,
+    var(--a0) 0,
+    var(--a1) calc(var(--l) * 0.14),
+    var(--a2) calc(var(--l) * 0.27),
+    var(--a3) calc(var(--l) * 0.435),
+    var(--a4) calc(var(--l) * 0.53),
+    var(--a5) calc(var(--l) * 0.66),
+    var(--a6) calc(var(--l) * 0.81),
+    var(--a7) var(--l)
+  );
+}
+
+/*
+ * 屏幕底边：卡片本身不淡（正文贴着卡片上缘直接从它后面穿过去），
+ * 只在卡片下沿到屏幕底这一段淡掉 —— 卡片两侧和下面露出的正文
+ * 越靠近屏幕底越暗，到底边全遮。
+ */
+.fade-bottom {
+  --l: calc(var(--composer-gap) + 2.5rem);
+  height: var(--l);
+  background: linear-gradient(
+    to bottom,
+    var(--a0) 0,
+    var(--a1) calc(var(--l) * 0.14),
+    var(--a2) calc(var(--l) * 0.27),
+    var(--a3) calc(var(--l) * 0.435),
+    var(--a4) calc(var(--l) * 0.53),
+    var(--a5) calc(var(--l) * 0.66),
+    var(--a6) calc(var(--l) * 0.81),
+    var(--a7) var(--l)
+  );
+}

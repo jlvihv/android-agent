@@ -250,8 +250,13 @@ impl Core {
             loop {
                 tick.tick().await;
                 if st.sessions_dirty.swap(false, Ordering::Relaxed) {
-                    if let Err(e) = st.save_sessions() {
-                        tracing::warn!("会话落盘失败: {e:#}");
+                    // SQLite 写盘是阻塞 I/O。runtime 只有 2 个 worker，直接在
+                    // 异步任务里写会占住一个，期间 SSE/HTTP 都变慢。
+                    let res = tokio::task::block_in_place(|| st.save_sessions());
+                    if let Err(e) = res {
+                        // 没写成（比如会话正被占用）就留到下一轮再写
+                        st.mark_sessions_dirty();
+                        tracing::debug!("会话落盘推迟: {e:#}");
                     }
                 }
             }

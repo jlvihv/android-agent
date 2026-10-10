@@ -367,26 +367,39 @@ impl LinuxSandbox {
         }
 
         let started = Instant::now();
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
 
-        let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(r) => r?,
+        // 边跑边读，内存里只留尾巴（见 `Capture`）。
+        //
+        // 原来是 wait_with_output() —— 整段输出全攒在内存里。`yes`、
+        // `cat /dev/urandom | base64` 这类命令 60 秒能吐出几个 GB，
+        // 手机上直接 OOM 带走整个 App。
+        let out_task = tokio::spawn(Capture::read(child.stdout.take()));
+        let err_task = tokio::spawn(Capture::read(child.stderr.take()));
+
+        let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(r) => (Some(r?), false),
             Err(_) => {
-                return Ok(ExecResult {
-                    code: -1,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    truncated: false,
-                    timed_out: true,
-                    full_output_path: None,
-                });
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                (None, true)
             }
+        };
+
+        // 管道可能被沙箱里的孙进程继承着不关 —— 别为它无限等
+        let grace = Duration::from_secs(2);
+        let stdout = tokio::time::timeout(grace, out_task).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+        let stderr = tokio::time::timeout(grace, err_task).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+        let dropped = stdout.dropped + stderr.dropped;
+        let out = std::process::Output {
+            status: status.unwrap_or_default(),
+            stdout: stdout.buf,
+            stderr: stderr.buf,
         };
 
         let (stdout, t1) = tail_clamp(&out.stdout);
         let (stderr, t2) = tail_clamp(&out.stderr);
-        let truncated = t1 || t2;
+        let truncated = t1 || t2 || dropped > 0;
 
         // 截断了就把完整输出落进沙箱的 /tmp，并告诉模型路径 ——
         // 它可以再用 grep/sed 去翻，不用把几十 MB 塞回上下文
@@ -397,12 +410,14 @@ impl LinuxSandbox {
         };
 
         Ok(ExecResult {
-            code: out.status.code().unwrap_or(-1),
+            code: if timed_out { -1 } else { out.status.code().unwrap_or(-1) },
             stdout,
             stderr,
             duration_ms: started.elapsed().as_millis() as u64,
             truncated,
-            timed_out: false,
+            // 超时也把已经产出的输出带回去 —— 原来直接丢空，模型只知道
+            // "超时了"，看不到卡在哪一步
+            timed_out,
             full_output_path,
         })
     }
@@ -517,6 +532,43 @@ fn is_alpine_rootfs(rootfs: &Path) -> bool {
     rootfs.join("bin/busybox").is_file() || rootfs.join("etc/alpine-release").is_file()
 }
 
+/// 一路输出的尾巴。超过 `CAPTURE_LIMIT` 就把前一半扔掉，只记扔了多少。
+///
+/// 回给模型的最多 50 KB，落盘的完整输出也只需要"足够翻查"，所以 4 MB
+/// 的尾巴足够；关键是内存有上界。
+#[derive(Default)]
+struct Capture {
+    buf: Vec<u8>,
+    dropped: u64,
+}
+
+const CAPTURE_LIMIT: usize = 4 << 20;
+
+impl Capture {
+    async fn read<R: tokio::io::AsyncRead + Unpin>(src: Option<R>) -> Capture {
+        use tokio::io::AsyncReadExt;
+        let mut cap = Capture::default();
+        let Some(mut src) = src else { return cap };
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match src.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => cap.push(&chunk[..n]),
+            }
+        }
+        cap
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() > CAPTURE_LIMIT {
+            let cut = self.buf.len() - CAPTURE_LIMIT / 2;
+            self.buf.drain(..cut);
+            self.dropped += cut as u64;
+        }
+    }
+}
+
 /// 只留**尾部**：先砍行数，再砍字节。
 ///
 /// 与头截断相比，尾巴里有报错信息和最终结论 —— 那些才是模型需要的。
@@ -611,6 +663,18 @@ fn parse_posix_tz(s: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn capture_keeps_memory_bounded_and_keeps_the_tail() {
+        // 模拟一个狂吐输出的命令：远超上限
+        let total = CAPTURE_LIMIT * 3 + 123;
+        let mut data = vec![b'x'; total - 4];
+        data.extend_from_slice(b"END\n");
+        let cap = Capture::read(Some(&data[..])).await;
+        assert!(cap.buf.len() <= CAPTURE_LIMIT, "内存要有上界");
+        assert!(cap.buf.ends_with(b"END\n"), "尾巴不能丢");
+        assert_eq!(cap.buf.len() as u64 + cap.dropped, total as u64);
+    }
     use super::*;
 
     fn sandbox() -> LinuxSandbox {

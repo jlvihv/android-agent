@@ -12,8 +12,14 @@
    *
    * **长按**对话行 → 弹出菜单（重命名 / 删除）。
    * Claude 就是这样 —— 列表里没有常驻的删除按钮，那太吵。
+   *
+   * 动画：进出场是 Svelte 过渡（CSS 动画，跑在合成线程上）；
+   * 往左拖可以跟手关掉。遮罩也在这里，跟面板一起淡入淡出。
    */
+  import { fade } from 'svelte/transition';
+  import { cubicIn, quintOut } from 'svelte/easing';
   import { store } from '../lib/store.svelte.ts';
+  import { onBack } from '../lib/overlay';
   import Icon from './Icon.svelte';
   import DevicePanel from './DevicePanel.svelte';
   import EventLog from './EventLog.svelte';
@@ -39,6 +45,75 @@
   // null = 显示列表；否则显示对应面板
   let panel = $state<'device' | 'events' | null>(null);
 
+  // 返回键：先退子面板，再关抽屉
+  $effect(() => onBack(() => onclose()));
+  $effect(() => {
+    if (panel) return onBack(() => (panel = null));
+  });
+
+  // —— 拖拽关闭 ——
+  //
+  // aside 上是 touch-action: pan-y：竖直方向交给浏览器滚列表（会收到
+  // pointercancel），水平方向的 pointermove 才归我们。
+  let aside: HTMLElement | null = $state(null);
+  /** 被往左拖出去的比例，0 = 完全展开，1 = 完全收起 */
+  let off = $state(0);
+  /** 跟手中：关掉回弹过渡，否则拖起来发黏 */
+  let dragging = $state(false);
+  let drag: { id: number; x0: number; y0: number; t0: number; w: number; on: boolean } | null =
+    null;
+
+  function dragStart(e: PointerEvent) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    drag = { id: e.pointerId, x0: e.clientX, y0: e.clientY, t0: e.timeStamp, w: aside?.offsetWidth ?? 1, on: false };
+  }
+
+  function dragMove(e: PointerEvent) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dx = e.clientX - drag.x0;
+    if (!drag.on) {
+      // 先认方向：水平位移明显大于竖直才算拖抽屉
+      if (Math.abs(dx) < 8 || Math.abs(dx) < Math.abs(e.clientY - drag.y0)) return;
+      drag.on = true;
+      dragging = true;
+      clearTimeout(pressTimer);
+      aside?.setPointerCapture(e.pointerId);
+    }
+    off = Math.min(1, Math.max(0, -dx / drag.w));
+  }
+
+  function dragEnd(e: PointerEvent) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const d = drag;
+    drag = null;
+    if (!d.on) return;
+    dragging = false;
+    // 拖完别把这次抬手当成点击
+    longPressed = true;
+    const v = off / Math.max(1, e.timeStamp - d.t0); // 每毫秒收起的比例
+    if (off > 0.35 || (v > 0.0015 && off > 0.08)) onclose();
+    else off = 0;
+  }
+
+  /** 进场：从左边整个滑进来 */
+  function slideIn(_: Element) {
+    return {
+      duration: 320,
+      easing: quintOut,
+      css: (_t: number, u: number) => `transform: translateX(${-u * 100}%)`,
+    };
+  }
+
+  /** 出场：从当前位置（可能被拖到一半）继续往左收 */
+  function slideOut(_: Element) {
+    const from = off;
+    return {
+      duration: 220 * (1 - from) + 60,
+      easing: cubicIn,
+      css: (_t: number, u: number) => `transform: translateX(${-(from + (1 - from) * u) * 100}%)`,
+    };
+  }
+
   // 长按弹出的菜单
   let menu = $state<{ id: string; x: number; y: number } | null>(null);
   // 正在重命名的行
@@ -50,6 +125,7 @@
 
   function pressStart(e: PointerEvent, id: string) {
     longPressed = false;
+    clearTimeout(pressTimer);
     const { clientX: x, clientY: y } = e;
     pressTimer = setTimeout(() => {
       longPressed = true;
@@ -80,8 +156,25 @@
   }
 </script>
 
+<button
+  class="fixed inset-0 z-40 bg-black/50 {dragging ? '' : 'transition-opacity duration-200'}"
+  style:opacity={1 - off}
+  aria-label="关闭"
+  onclick={onclose}
+  transition:fade|global={{ duration: 220 }}
+></button>
+
 <aside
-  class="fixed inset-y-0 left-0 z-50 flex w-[92%] flex-col bg-[#111] pt-[env(safe-area-inset-top)]"
+  bind:this={aside}
+  onpointerdown={dragStart}
+  onpointermove={dragMove}
+  onpointerup={dragEnd}
+  onpointercancel={dragEnd}
+  style:transform={off ? `translateX(${-off * 100}%)` : null}
+  class="fixed inset-y-0 left-0 z-50 flex w-[92%] touch-pan-y flex-col bg-[#111]
+         pt-[env(safe-area-inset-top)] {dragging ? '' : 'transition-transform duration-200 ease-out'}"
+  in:slideIn|global
+  out:slideOut|global
 >
   {#if panel === null}
     <div class="flex shrink-0 items-center px-5 pt-6 pb-4">
@@ -184,7 +277,7 @@
   <button class="fixed inset-0 z-[60]" aria-label="关闭菜单" onclick={() => (menu = null)}></button>
   <div
     class="fixed z-[61] w-40 overflow-hidden rounded-2xl bg-[#2a2a28] shadow-2xl shadow-black/60"
-    style="left: min({m.x}px, calc(92vw - 10.5rem)); top: {m.y}px"
+    style="left: min({m.x}px, calc(92vw - 10.5rem)); top: min({m.y}px, calc(100dvh - 8.5rem))"
   >
     <button
       onclick={() => pick(m.id)}

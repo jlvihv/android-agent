@@ -25,7 +25,8 @@ object UiTree {
     /** 一个节点的定位信息，指令执行时要用 */
     data class NodeRef(val bounds: Rect, val viewId: String?)
 
-    data class Snapshot(val json: String, val refs: Map<Int, NodeRef>)
+    /** `key` = 去掉时间戳的内容，用来判断界面到底变没变 */
+    data class Snapshot(val json: String, val key: String, val refs: Map<Int, NodeRef>)
 
     /**
      * 读一次当前界面。
@@ -41,15 +42,18 @@ object UiTree {
             walk(root, -1, 0, nodes, refs, counter)
 
             val m = service.resources.displayMetrics
-            val json = JSONObject()
-                .put("ts", System.currentTimeMillis())
-                .put("package", root.packageName?.toString().orEmpty())
-                .put("activity", activity)
-                .put("screen", JSONObject().put("w", m.widthPixels).put("h", m.heightPixels))
-                .put("nodes", nodes)
-                .toString()
+            val pkg = root.packageName?.toString().orEmpty()
+            // 手拼外层，节点只序列化一次：key 和 json 共用同一份 nodes 字符串
+            val body = nodes.toString()
+            val key = "${JSONObject.quote(pkg)},${JSONObject.quote(activity)}," +
+                "${m.widthPixels}x${m.heightPixels},$body"
+            val json = "{\"ts\":${System.currentTimeMillis()}," +
+                "\"package\":${JSONObject.quote(pkg)}," +
+                "\"activity\":${JSONObject.quote(activity)}," +
+                "\"screen\":{\"w\":${m.widthPixels},\"h\":${m.heightPixels}}," +
+                "\"nodes\":$body}"
 
-            return Snapshot(json, refs)
+            return Snapshot(json, key, refs)
         } finally {
             recycle(root)
         }

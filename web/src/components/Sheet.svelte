@@ -14,6 +14,7 @@
    */
   import type { Snippet } from 'svelte';
   import Icon from './Icon.svelte';
+  import { onBack } from '../lib/overlay';
 
   let {
     title,
@@ -35,17 +36,29 @@
   let startAt = 0;
   let panelH = 1;
 
-  // 进场：初始在屏幕外，下一帧滑进来
+  // 进场：初始在屏幕外，等首帧画出来再滑进来。
+  // 两层 rAF：第一层回调时初始位置还没提交，直接改会被合并成一帧、没有动画。
   $effect(() => {
-    const t = setTimeout(() => {
-      animate = true;
-      dy = 0;
-    }, 16);
-    return () => clearTimeout(t);
+    let r = requestAnimationFrame(() => {
+      r = requestAnimationFrame(() => {
+        panelH = panel?.offsetHeight ?? 400;
+        animate = true;
+        dy = 0;
+      });
+    });
+    return () => cancelAnimationFrame(r);
   });
+
+  // 返回键关面板（带动画）
+  $effect(() => onBack(close));
 
   // 拖到哪，遮罩淡到哪
   const dim = $derived(Math.max(0, 1 - dy / panelH));
+
+  /** 外部想关（比如保存成功）也走动画 */
+  export function dismiss() {
+    close();
+  }
 
   function close() {
     if (closing) return;
@@ -86,7 +99,7 @@
 
 <!-- 遮罩。点它即关。 -->
 <button
-  class="fixed inset-0 z-40 bg-black/35"
+  class="fixed inset-0 z-40 bg-black/35 {animate ? 'transition-opacity duration-200' : ''}"
   style:opacity={dim}
   aria-label="关闭"
   onclick={close}

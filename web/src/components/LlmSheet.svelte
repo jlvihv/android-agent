@@ -17,6 +17,7 @@
   let apiKey = $state('');
   let saving = $state(false);
   let err = $state('');
+  let sh: Sheet | null = $state(null);
 
   async function save() {
     err = '';
@@ -36,7 +37,7 @@
       });
       if (!r.ok) throw new Error(await r.text());
       await store.reloadHealth();
-      onclose();
+      sh?.dismiss();
     } catch (e) {
       err = String(e);
     } finally {
@@ -45,7 +46,7 @@
   }
 </script>
 
-<Sheet title="模型设置" onclose={onclose}>
+<Sheet bind:this={sh} title="模型设置" {onclose}>
   <div class="flex flex-col gap-3">
     <div class="flex gap-1.5 overflow-x-auto">
     {#each presets as p (p.label)}

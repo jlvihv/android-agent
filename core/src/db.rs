@@ -202,7 +202,15 @@ impl Db {
                 ],
             )?;
 
-            let done = saved.get(&s.id).copied().unwrap_or(0);
+            let mut done = saved.get(&s.id).copied().unwrap_or(0);
+            // 会话被清空过（/api/reset）：消息变少了。不处理的话 done 还停在
+            // 旧长度，新消息的 seq 从 0 开始会被 skip(done) 全部跳过不落盘，
+            // 而库里的旧消息还在 —— 重启后清掉的对话又回来了。
+            // 变少只可能是整个清空过，前缀也不可信，整段重写。
+            if s.messages.len() < done {
+                tx.execute("DELETE FROM messages WHERE session_id = ?1", [&s.id])?;
+                done = 0;
+            }
             if s.messages.len() > done {
                 let mut ins = tx.prepare(
                     "INSERT OR REPLACE INTO messages(session_id, seq, payload) VALUES(?1, ?2, ?3)",
@@ -320,6 +328,25 @@ mod tests {
                 ChatMessage::User(t) => assert_eq!(t, &format!("m{i}")),
                 _ => panic!("类型不对"),
             }
+        }
+    }
+
+    #[test]
+    fn clearing_a_session_does_not_resurrect_or_drop_messages() {
+        let db = Db::in_memory().unwrap();
+        let mut st = store_with(1, 3);
+        db.sync(&st).unwrap();
+
+        st.sessions[0].messages.clear();
+        st.sessions[0].messages.push(msg_user("清空后第一条"));
+        db.sync(&st).unwrap();
+
+        let back = db.load().unwrap();
+        let msgs = &back.sessions[0].messages;
+        assert_eq!(msgs.len(), 1, "旧消息不该回来");
+        match &msgs[0] {
+            ChatMessage::User(t) => assert_eq!(t, "清空后第一条"),
+            _ => panic!("类型不对"),
         }
     }
 

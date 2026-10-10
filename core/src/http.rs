@@ -215,7 +215,7 @@ struct ApproveBody {
 /// 配了 provider 就跑真实 agent loop（`agent.rs`），否则回退到脚本演示流。
 /// 两种情况下**输出格式完全一致**，所以前端不需要知道区别。
 async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let core = Core {
         state: st.clone(),
     };
@@ -236,7 +236,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
             tokio::spawn(async move {
                 let txc = tx.clone();
                 if let Err(e) = crate::agent::run_turn(&core, &p, &body.text, txc).await {
-                    let _ = tx.send(sse::error(&format!("{e:#}"))).await;
+                    let _ = tx.send(sse::error(&format!("{e:#}")));
                 }
                 // tx 在这里 drop → 转发任务会补上 [DONE]
             });
@@ -245,7 +245,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
             st.log("debug", format!("chat (demo): {}", body.text));
             tokio::spawn(async move {
                 for chunk in crate::demo::scripted(&body.text) {
-                    if tx.send(chunk).await.is_err() {
+                    if tx.send(chunk).is_err() {
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(35)).await;
@@ -259,7 +259,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
 
 /// `POST /api/approve` → 继续被挂起的回合。
 async fn approve(State(st): State<Arc<AppState>>, Json(body): Json<ApproveBody>) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let core = Core {
         state: st.clone(),
     };
@@ -284,7 +284,7 @@ async fn approve(State(st): State<Arc<AppState>>, Json(body): Json<ApproveBody>)
         if let Err(e) =
             crate::agent::resolve_approval(&core, &p, &approval_id, approved, txc).await
         {
-            let _ = tx.send(sse::error(&format!("{e:#}"))).await;
+            let _ = tx.send(sse::error(&format!("{e:#}")));
         }
     });
 
@@ -430,7 +430,10 @@ async fn reset(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 /// 把 chunk 通道包成带正确 header 的 SSE 响应，并在结束时补 `[DONE]`。
-fn sse_response(mut rx: tokio::sync::mpsc::Receiver<serde_json::Value>) -> Response {
+///
+/// 上游是无界通道（见 agent.rs 的 `send`）：前端读得慢只会让 chunk 在这里
+/// 排队，不会反压到 agent 循环。
+fn sse_response(mut rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) -> Response {
     let (out_tx, out_rx) =
         tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
 

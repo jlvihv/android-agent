@@ -461,6 +461,14 @@ impl SessionStore {
         self.sessions.iter().find(|s| s.id == self.active)
     }
 
+    pub fn get(&self, id: &str) -> Option<&ChatSession> {
+        self.sessions.iter().find(|s| s.id == id)
+    }
+
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut ChatSession> {
+        self.sessions.iter_mut().find(|s| s.id == id)
+    }
+
     pub fn create(&mut self) -> String {
         let s = ChatSession::new();
         let id = s.id.clone();
@@ -680,13 +688,13 @@ pub async fn run_turn(
     core: &Core,
     provider: &Provider,
     user_text: &str,
-    tx: mpsc::Sender<Value>,
+    tx: mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
     core.state
         .turn_active
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let _guard = TurnGuard(core.clone());
-    {
+    let sid = {
         let mut store = core.state.chat.write().await;
         let sess = store.active_mut();
         // 上下文作为独立消息，**放在用户输入之前**，且只生成这一次。
@@ -695,9 +703,26 @@ pub async fn run_turn(
         sess.messages.push(ChatMessage::User(user_text.into()));
         sess.maybe_title(user_text);
         sess.updated_at = now_ms();
-    }
+        sess.id.clone()
+    };
     core.state.mark_sessions_dirty();
-    drive(core, provider, &tx).await
+    drive(core, provider, &sid, &tx).await
+}
+
+/// 往本回合所属的会话追加一条消息。
+///
+/// **按 id 找，不用 `active_mut()`**：回合跑在后台，用户随时可能在侧边栏
+/// 切到别的会话或新建会话 —— 之前全用 active_mut()，切走之后模型的回复
+/// 和工具结果就写进了**另一个**会话，两边都坏掉。
+/// 会话中途被删了就丢掉（下一步 stream_one 会报错停下）。
+async fn append(core: &Core, sid: &str, m: ChatMessage) {
+    let mut store = core.state.chat.write().await;
+    if let Some(s) = store.get_mut(sid) {
+        s.messages.push(m);
+        s.updated_at = now_ms();
+    }
+    drop(store);
+    core.state.mark_sessions_dirty();
 }
 
 /// 回合结束时清掉 busy 标志。用 Drop 保证任何路径（包括 panic 和
@@ -720,49 +745,56 @@ pub async fn resolve_approval(
     provider: &Provider,
     approval_id: &str,
     approved: bool,
-    tx: mpsc::Sender<Value>,
+    tx: mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
     core.state
         .turn_active
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let _guard = TurnGuard(core.clone());
+    // 审批挂在哪个会话上就回到哪个会话，不管当前激活的是谁
     let pending = {
         let mut store = core.state.chat.write().await;
-        store.active_mut().pending.remove(approval_id)
+        store
+            .sessions
+            .iter_mut()
+            .find_map(|s| s.pending.remove(approval_id).map(|p| (s.id.clone(), p)))
     };
-    let Some(p) = pending else {
+    let Some((sid, p)) = pending else {
         let _ = tx
-            .send(sse::error(&format!("未知的审批 ID: {approval_id}")))
-            .await;
+            .send(sse::error(&format!("未知的审批 ID: {approval_id}")));
         return Ok(());
     };
 
     let _ = tx
-        .send(sse::tool_approval_response(approval_id, approved, ""))
-        .await;
+        .send(sse::tool_approval_response(approval_id, approved, ""));
 
     if approved {
         let output = execute_tool(core, &p.name, &p.arguments).await;
         let _ = tx
-            .send(sse::tool_output_available(&p.tool_call_id, output.clone()))
-            .await;
-        let mut store = core.state.chat.write().await;
-        let sess = store.active_mut();
-        sess.messages.push(ChatMessage::Tool {
-            tool_call_id: p.tool_call_id.clone(),
-            content: output.to_string(),
-        });
-        sess.updated_at = now_ms();
+            .send(sse::tool_output_available(&p.tool_call_id, output.clone()));
+        append(
+            core,
+            &sid,
+            ChatMessage::Tool {
+                tool_call_id: p.tool_call_id.clone(),
+                content: output.to_string(),
+            },
+        )
+        .await;
     } else {
-        let _ = tx.send(sse::tool_output_denied(&p.tool_call_id)).await;
-        let mut store = core.state.chat.write().await;
-        store.active_mut().messages.push(ChatMessage::Tool {
-            tool_call_id: p.tool_call_id.clone(),
-            content: "用户拒绝了这个操作。请不要重试，改为向用户说明情况。".into(),
-        });
+        let _ = tx.send(sse::tool_output_denied(&p.tool_call_id));
+        append(
+            core,
+            &sid,
+            ChatMessage::Tool {
+                tool_call_id: p.tool_call_id.clone(),
+                content: "用户拒绝了这个操作。请不要重试，改为向用户说明情况。".into(),
+            },
+        )
+        .await;
     }
 
-    drive(core, provider, &tx).await
+    drive(core, provider, &sid, &tx).await
 }
 
 /// 一轮 LLM 调用的产出
@@ -773,14 +805,19 @@ struct StepOutput {
 }
 
 /// 真正的 loop：模型 → 工具 → 模型 …
-async fn drive(core: &Core, provider: &Provider, tx: &mpsc::Sender<Value>) -> anyhow::Result<()> {
+async fn drive(
+    core: &Core,
+    provider: &Provider,
+    sid: &str,
+    tx: &mpsc::UnboundedSender<Value>,
+) -> anyhow::Result<()> {
     let message_id = uuid::Uuid::now_v7().to_string();
     send(tx, sse::start(&message_id)).await;
 
     for _step in 0..MAX_STEPS {
         send(tx, sse::start_step()).await;
 
-        let step = match stream_one(core, provider, tx).await {
+        let step = match stream_one(core, provider, sid, tx).await {
             Ok(c) => c,
             Err(e) => {
                 send(tx, sse::error(&format!("{e:#}"))).await;
@@ -792,12 +829,16 @@ async fn drive(core: &Core, provider: &Provider, tx: &mpsc::Sender<Value>) -> an
 
         // 不管有没有工具调用，这一轮的 assistant 输出都要进历史
         if !step.content.is_empty() || !step.reasoning.is_empty() || !step.calls.is_empty() {
-            let mut store = core.state.chat.write().await;
-            store.active_mut().messages.push(ChatMessage::Assistant {
-                content: step.content.clone(),
-                reasoning: step.reasoning.clone(),
-                tool_calls: step.calls.clone(),
-            });
+            append(
+                core,
+                sid,
+                ChatMessage::Assistant {
+                    content: step.content.clone(),
+                    reasoning: step.reasoning.clone(),
+                    tool_calls: step.calls.clone(),
+                },
+            )
+            .await;
         }
 
         let calls = step.calls;
@@ -817,22 +858,30 @@ async fn drive(core: &Core, provider: &Provider, tx: &mpsc::Sender<Value>) -> an
                 Some(ToolKind::ReadOnly) => {
                     let output = execute_tool(core, &call.name, &call.arguments).await;
                     send(tx, sse::tool_output_available(&call.id, output.clone())).await;
-                    let mut store = core.state.chat.write().await;
-                    store.active_mut().messages.push(ChatMessage::Tool {
-                        tool_call_id: call.id.clone(),
-                        content: output.to_string(),
-                    });
+                    append(
+                        core,
+                        sid,
+                        ChatMessage::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: output.to_string(),
+                        },
+                    )
+                    .await;
                 }
                 Some(ToolKind::SideEffecting) => {
                     if core.state.auto_approve() {
                         // 默认路径：直接执行，不打断 agent
                         let output = execute_tool(core, &call.name, &call.arguments).await;
                         send(tx, sse::tool_output_available(&call.id, output.clone())).await;
-                        let mut store = core.state.chat.write().await;
-                        store.active_mut().messages.push(ChatMessage::Tool {
-                            tool_call_id: call.id.clone(),
-                            content: output.to_string(),
-                        });
+                        append(
+                            core,
+                            sid,
+                            ChatMessage::Tool {
+                                tool_call_id: call.id.clone(),
+                                content: output.to_string(),
+                            },
+                        )
+                        .await;
                     } else {
                         // 审批模式（auto_approve = false）
                         all_auto = false;
@@ -841,7 +890,8 @@ async fn drive(core: &Core, provider: &Provider, tx: &mpsc::Sender<Value>) -> an
                         let reason = approval_reason(&call.name, &call.arguments);
                         {
                             let mut store = core.state.chat.write().await;
-                            store.active_mut().pending.insert(
+                            let Some(sess) = store.get_mut(sid) else { break };
+                            sess.pending.insert(
                                 approval_id.clone(),
                                 PendingApproval {
                                     tool_call_id: call.id.clone(),
@@ -861,11 +911,15 @@ async fn drive(core: &Core, provider: &Provider, tx: &mpsc::Sender<Value>) -> an
                     // 模型编了一个不存在的工具，如实告诉它
                     let msg = format!("错误：没有名为 {} 的工具", call.name);
                     send(tx, sse::tool_output_available(&call.id, json!({ "error": msg }))).await;
-                    let mut store = core.state.chat.write().await;
-                    store.active_mut().messages.push(ChatMessage::Tool {
-                        tool_call_id: call.id.clone(),
-                        content: msg,
-                    });
+                    append(
+                        core,
+                        sid,
+                        ChatMessage::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: msg,
+                        },
+                    )
+                    .await;
                 }
             }
             let _ = idx;
@@ -896,15 +950,16 @@ async fn drive(core: &Core, provider: &Provider, tx: &mpsc::Sender<Value>) -> an
 async fn stream_one(
     core: &Core,
     provider: &Provider,
-    tx: &mpsc::Sender<Value>,
+    sid: &str,
+    tx: &mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<StepOutput> {
     // SYSTEM_PROMPT 是静态常量，**这里不做任何插值** —— 见它上面的说明。
     // 动态的界面/环境信息在 run_turn 里作为独立消息进历史，保证前缀可缓存。
     let (messages, session_id) = {
         let store = core.state.chat.read().await;
         let sess = store
-            .active_ref()
-            .ok_or_else(|| anyhow::anyhow!("没有活跃会话"))?;
+            .get(sid)
+            .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
         (build_messages(sess)?, sess.provider_session.clone())
     };
 
@@ -1062,8 +1117,8 @@ async fn stream_one(
     })
 }
 
-async fn send(tx: &mpsc::Sender<Value>, v: Value) {
-    let _ = tx.send(v).await;
+async fn send(tx: &mpsc::UnboundedSender<Value>, v: Value) {
+    let _ = tx.send(v);
 }
 
 /// 把工具参数里的 `edits` 数组解成 `editor::Edit`。
