@@ -218,7 +218,10 @@
   <!-- 消息列表铺满整个高度：内容从头部和输入卡片下面穿过去。
        渐隐（mask）在 MessageList 里，所以正文是淡出的，不是盖一层
        背景色 —— 换背景也不会穿帮。 -->
-  <main class="absolute inset-0 z-0">
+  <!-- 不要给 main 加 z-index：`z-0` 会形成层叠上下文，把里面
+       弹出面板的 z-50 困住，压不过同级 z-20 的输入框（踩过）。
+       z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
+  <main class="absolute inset-0">
     {#if messages.length === 0}
       <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
     {:else}
