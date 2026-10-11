@@ -261,11 +261,15 @@
   // —— 窗口化 ——
   //
   // 长对话不能把几百条消息全挂进 DOM（节点数和内存都线性涨）。只渲染最后
-  // WINDOW_STEP 条；往上翻到顶再往前补一窗，并补偿 scrollTop，视口不跳。
+  // `limit` 条；往上翻到顶再往前补一窗，并补偿 scrollTop，视口不跳。
   // 注意 `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** ——
   // 这个才是真的封顶。
-  const WINDOW_STEP = 40;
-  let limit = $state(WINDOW_STEP);
+  //
+  // 这里的「条」是**消息**（用户/助手），不是工具调用：一个回合的思考、
+  // 工具、正文都是同一条助手消息里的 parts。所以 100 条 ≈ 50 个回合，
+  // 每个回合里几十个工具调用都算在这一条里。
+  const WINDOW_STEP = 50;
+  let limit = $state(100);
   let loadingEarlier = false;
 
   let start = $derived(Math.max(0, messages.length - limit));
