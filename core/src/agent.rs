@@ -315,7 +315,7 @@ impl ChatMessage {
 }
 
 /// 当前会话。
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatSession {
     pub id: String,
     /// 标题：取第一条用户输入的前若干字（Claude 的侧边栏就是这样）
@@ -530,7 +530,9 @@ fn build_messages(
 /// - 同一条提示词不会重复追加。
 ///
 /// 推论：`provider_session`**不能**因为提示词变了就轮换 —— 那正是要保住的缓存路由。
-fn ensure_system_prompt(sess: &mut ChatSession, prompt: &str) {
+///
+/// `pub` 是给 `/api/debug/request` 用的：它要预测下一次真正会发什么。
+pub fn ensure_system_prompt(sess: &mut ChatSession, prompt: &str) {
     let present = sess
         .messages
         .iter()
@@ -644,12 +646,15 @@ pub async fn run_turn(
         .turn_active
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let _guard = TurnGuard(core.clone());
+    // 系统提示词可能被 /api/debug/system-prompt 覆盖过，所以不能直接用常量。
+    // 在拿会话写锁之前先取出来，避免锁套锁。
+    let system_prompt = core.state.system_prompt();
     let sid = {
         let mut store = core.state.chat.write().await;
         let sess = store.active_mut();
         // 历史里只追加两类东西：待补的系统提示词（见 `ensure_system_prompt`）
         // 和这条用户消息。不插任何“每轮重发”的上下文块。
-        ensure_system_prompt(sess, SYSTEM_PROMPT);
+        ensure_system_prompt(sess, &system_prompt);
         sess.messages.push(ChatMessage::User(user_text.into()));
         sess.maybe_title(user_text);
         sess.updated_at = now_ms();
@@ -774,7 +779,9 @@ async fn drive(
 /// 1. 让「工具表也是可缓存前缀的一部分」这条不变式**可测** —— 只比
 ///    `messages` 不够，前一轮的完整请求体必须原样出现在后一轮里。
 /// 2. 它直接产出**强类型**请求，交给 `create_stream_byot` 一次序列化。
-fn build_request(sess: &ChatSession, model: &str) -> anyhow::Result<CreateChatCompletionRequest> {
+///
+/// `pub` 是给 `/api/debug/request` 用的（把模型将看到的东西原样吐出来）。
+pub fn build_request(sess: &ChatSession, model: &str) -> anyhow::Result<CreateChatCompletionRequest> {
     let messages = build_messages(sess)?;
     let tools: Vec<ChatCompletionTools> = tools()
         .iter()

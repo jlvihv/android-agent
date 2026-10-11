@@ -47,10 +47,19 @@ just web-build
 just dev
 
 # 4. 另开一个终端，让 agent 干活
-python3 scripts/ask.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"
+python3 scripts/agentctl.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"
 ```
 
 打开 <http://127.0.0.1:8787> 就是完整 App —— 和手机上 WebView 看到的是同一份东西。
+
+对**手机上**跑着的那个（不用重装 APK、也不用手点手机屏幕）：
+
+```sh
+just phone "在沙箱里建个 fizzbuzz 跑一下"    # 自动 adb forward 后连上去
+just phone                                   # 交互模式，/help 看命令
+```
+
+细节见 [docs/07-debugging.md](docs/07-debugging.md)。
 
 ## 架构
 
@@ -115,6 +124,7 @@ App 随时被杀都没关系。
 | [docs/04-android-shell.md](docs/04-android-shell.md) | Android 壳：三个架构决策的落点、真机踩到的 11 个坑 |
 | [docs/05-ui.md](docs/05-ui.md) | 界面：设计令牌、edge-to-edge、对话渲染 |
 | [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）与后台运行 |
+| [docs/07-debugging.md](docs/07-debugging.md) | 从电脑上驱动真机调试：adb forward + agentctl + `/api/debug/*` |
 
 ## 脚本
 
@@ -126,7 +136,9 @@ App 随时被杀都没关系。
 | `just smoke` | 端到端：读界面 → 执行 → 复述 |
 | `just android-assets` | 一次性：取 Alpine rootfs + proot 二进制 |
 | `just android-debug` | 完整 Android 构建 → APK |
-| `python3 scripts/ask.py "…"` | 给 agent 一句话并打印转录 |
+| `python3 scripts/agentctl.py "…"` | 给 agent 一句话并打印转录；不带参数进交互模式（`--json` 机器可读） |
+| `just forward` | 把手机上核心的端口转发到本机（端口从 logcat 里捞） |
+| `just phone "…"` | 对手机上跑着的核心说话（自动 forward），不用重装 APK |
 
 ## 构建 APK
 

@@ -61,6 +61,34 @@ web-build:
 web-check:
     cd {{web}} && bun run check
 
+# --- 对着真机调试 ----------------------------------------------------------
+#
+# 核心是个只听 127.0.0.1 的 HTTP 服务，所以 adb forward 一下就能从电脑驱动它。
+# 改 Rust 代码仍要重装（核心是 .so），但**调提示词、试沙箱、发设备指令、
+# 看请求体**都不用。
+
+# 把手机上核心的端口转发到本机（端口是启动时随机分的，从 logcat 里捞）
+#
+#   just forward          # 自动找
+#   just forward 41234    # 手动指定
+forward port="":
+    #!/usr/bin/env bash
+    set -eu
+    p=$(scripts/phone-port.sh "{{port}}")
+    adb forward "tcp:$p" "tcp:$p" >/dev/null
+    echo "core → http://127.0.0.1:$p"
+
+# 对着**手机上**跑着的核心说话
+#
+#   just phone "在沙箱里建个 fizzbuzz 跑一下"
+#   just phone                     # 交互模式（/help 看命令）
+phone *ARGS:
+    #!/usr/bin/env bash
+    set -eu
+    p=$(scripts/phone-port.sh)
+    adb forward "tcp:$p" "tcp:$p" >/dev/null
+    python3 scripts/agentctl.py --base "http://127.0.0.1:$p" "$@"
+
 # --- 桌面沙箱 --------------------------------------------------------------
 
 linux-setup:

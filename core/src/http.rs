@@ -32,6 +32,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/llm", post(set_llm))
         .route("/api/chat", post(chat))
         .route("/api/session", get(get_session))
+        .route("/api/debug/state", get(debug_state))
+        .route("/api/debug/request", get(debug_request))
+        .route("/api/debug/system-prompt", post(debug_set_system_prompt))
         .route("/api/sessions", get(list_sessions).post(new_session))
         .route("/api/sessions/activate", post(activate_session))
         .route("/api/sessions/rename", post(rename_session))
@@ -337,6 +340,143 @@ struct SessionQuery {
 /// 上一个会话的消息不动。
 fn session_rev(sess: &crate::agent::ChatSession) -> String {
     format!("{}:{}:{}", sess.id, sess.messages.len(), sess.updated_at)
+}
+
+// ---------------------------------------------------------------------------
+// 调试接口（`/api/debug/*`）
+// ---------------------------------------------------------------------------
+//
+// 存在的理由只有一个：**从电脑上对着真机调，不用重装 APK、也不用手点手机屏幕**。
+// 服务本身只听 127.0.0.1（连手机要 `adb forward`，见 scripts/agentctl.py），
+// 所以这些接口不会暴露到网上。
+
+/// `GET /api/debug/state` → 一眼看全运行时状态。
+///
+/// 原本要敲六个接口（health / sessions / snapshot / linux / llm …）才能拼出来，
+/// 而调试时最想要的就是「现在到底什么情况」。前端不用它。
+async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let provider = st.llm().or_else(Provider::from_env);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let snapshot = st.latest_snapshot().map(|s| {
+        json!({
+            "nodes": s.nodes.len(),
+            "package": s.package,
+            "activity": s.activity,
+            "screen": [s.screen.w, s.screen.h],
+            // 快照是设备推上来的。这个数大得离谱 = 无障碍服务没在推了
+            "ageMs": now.saturating_sub(s.ts),
+        })
+    });
+
+    let sessions = {
+        let store = st.chat.read().await;
+        json!({
+            "count": store.sessions.len(),
+            "active": store.active_ref().map(|s| json!({
+                "id": s.id,
+                "title": if s.title.is_empty() { "新对话" } else { &s.title },
+                "messages": s.messages.len(),
+                "rev": session_rev(s),
+            })),
+        })
+    };
+
+    Json(json!({
+        "version": VERSION,
+        "platform": std::env::consts::OS,
+        "port": st.port.load(std::sync::atomic::Ordering::Relaxed),
+        "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),
+        "device": st.device().map(|d| d.name()),
+        "turnActive": st.turn_active.load(std::sync::atomic::Ordering::Relaxed),
+        "sessions": sessions,
+        "snapshot": snapshot,
+        "linux": st.linux().map(|s| json!({
+            "rootfs": s.rootfs().display().to_string(),
+            "sharedStorage": s.has_shared_storage(),
+        })),
+        "llm": provider.map(|p| json!({
+            "name": p.name,
+            "model": p.model,
+            "baseUrl": p.base_url,
+        })),
+        "systemPrompt": {
+            "chars": st.system_prompt().chars().count(),
+            "overridden": st.system_prompt_overridden(),
+        },
+    }))
+}
+
+/// `GET /api/debug/request` → **下一次**会发给 provider 的完整请求体。
+///
+/// 调提示词、查 prompt cache 的时候不用猜：它就是模型将看到的东西
+/// （`messages[0]` 是历史里的系统提示词，`tools` 是当前工具表）。
+///
+/// 说是「预测」是因为真的发的时候，历史里可能先补上一条新的系统提示词
+/// （`ensure_system_prompt`）—— 这里也照做，所以和实际发送一致。
+async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
+    let Some(p) = st.llm().or_else(Provider::from_env) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "未配置 LLM provider").into_response();
+    };
+
+    let mut sess = {
+        let store = st.chat.read().await;
+        match store.active_ref() {
+            // 拷一份：不想持着锁做拼装，而这是手动的调试接口，不在乎这点开销
+            Some(s) => s.clone(),
+            None => return (StatusCode::NOT_FOUND, "没有活跃会话").into_response(),
+        }
+    };
+    crate::agent::ensure_system_prompt(&mut sess, &st.system_prompt());
+
+    match crate::agent::build_request(&sess, &p.model).and_then(|r| Ok(serde_json::to_value(&r)?)) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SystemPromptBody {
+    /// **原样**使用（不做 trim）：调提示词时字节必须可控。
+    /// 空串 = 恢复成编译进二进制的那一版。
+    #[serde(default)]
+    text: String,
+}
+
+/// `POST /api/debug/system-prompt` → 运行时换一份系统提示词。
+///
+/// 不重装 APK 就能调提示词，只改内存（重启回到 `SYSTEM_PROMPT`）。
+///
+/// 换提示词**不会动老会话的前缀**：`ensure_system_prompt` 会把新的作为一条
+/// system 消息追加在历史末尾，老前缀原样保留、缓存照命中
+/// （见 docs/03-prompt-cache.md §3.1）。
+///
+/// ```sh
+/// curl -s localhost:8787/api/debug/system-prompt \
+///   -H 'content-type: application/json' \
+///   -d "$(python3 -c 'import json,sys;print(json.dumps({"text":open("p.txt").read()}))')"
+/// ```
+async fn debug_set_system_prompt(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<SystemPromptBody>,
+) -> impl IntoResponse {
+    let on = !body.text.is_empty();
+    st.set_system_prompt(if on { Some(body.text) } else { None });
+    let chars = st.system_prompt().chars().count();
+    // 覆盖是内存态、重启就没了，但当时必须是看得见的 —— 否则
+    // “为什么它的表现和代码里写的不一样”能查半天。
+    st.log(
+        "warn",
+        if on {
+            format!("系统提示词已被运行时覆盖（{chars} 字符），重启后回到编译进去的那版")
+        } else {
+            "系统提示词已恢复成编译进去的那版".to_string()
+        },
+    );
+    Json(json!({ "ok": true, "overridden": on, "chars": chars }))
 }
 
 /// `GET /api/sessions` → 侧边栏的「最近对话」列表

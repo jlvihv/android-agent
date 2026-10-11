@@ -4,7 +4,9 @@
 //! native 侧不反调 Java。Kotlin 把 UI 树拍平成扁平 JSON 送进来，
 //! Rust 只回传指令。所以这里所有跨边界类型都是 JSON 可序列化的。
 
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};use std::sync::{Arc, RwLock};
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -228,6 +230,12 @@ pub struct AppState {
     /// 不用「改一次写一次」：一轮对话会产生几十次变更，每次都写盘太浪费。
     /// 也不能不写：进程被 kill 会话就没了（实测 force-stop 之后抽屉空了）。
     pub sessions_dirty: AtomicBool,
+    /// 运行时覆盖的系统提示词（`POST /api/debug/system-prompt`）。
+    ///
+    /// `None` = 用编译进二进制的 `SYSTEM_PROMPT`。存在的理由就一个：
+    /// **不重装 APK 就能对着真机调提示词** —— 改 Rust 常量要重编 .so、
+    /// 重新打包安装，而提示词是迭代最频繁的东西。只改内存，重启即失效。
+    pub system_prompt: RwLock<Option<String>>,
 }
 
 impl AppState {
@@ -246,6 +254,7 @@ impl AppState {
             turn_active: AtomicBool::new(false),
             db: RwLock::new(None),
             sessions_dirty: AtomicBool::new(false),
+            system_prompt: RwLock::new(None),
         })
     }
 
@@ -348,6 +357,34 @@ impl AppState {
 
     pub fn mark_sessions_dirty(&self) {
         self.sessions_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// 当前生效的系统提示词。
+    ///
+    /// 默认是编译进去的 `SYSTEM_PROMPT`；被 `/api/debug/system-prompt` 覆盖过
+    /// 就返回那一份。`Cow` 是为了没覆盖时**不拷贝**那个常量。
+    pub fn system_prompt(&self) -> Cow<'static, str> {
+        match self.system_prompt.read() {
+            Ok(g) => match &*g {
+                Some(s) => Cow::Owned(s.clone()),
+                None => Cow::Borrowed(crate::agent::SYSTEM_PROMPT),
+            },
+            Err(_) => Cow::Borrowed(crate::agent::SYSTEM_PROMPT),
+        }
+    }
+
+    pub fn system_prompt_overridden(&self) -> bool {
+        self.system_prompt
+            .read()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    /// `None` = 恢复成编译进去的那版。
+    pub fn set_system_prompt(&self, p: Option<String>) {
+        if let Ok(mut g) = self.system_prompt.write() {
+            *g = p;
+        }
     }
 
     /// 会话落盘。定时器每 2s 调一次，只追加新增的消息。
