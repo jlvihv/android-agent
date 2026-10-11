@@ -31,10 +31,6 @@
   /** 输入区实际高度。消息列表的底部留白和底部渐隐都跟着它走。 */
   let composerH = $state(0);
 
-  const dot = $derived(
-    !store.connected ? 'bg-control' : store.device?.connected ? 'bg-accent' : 'bg-warn',
-  );
-
   // —— 会话 ——
   //
   // 消息本来只活在 JS 内存里，Activity 重建 / 刷新 / 从后台回来就空了。
@@ -257,14 +253,18 @@
            px-4 pb-2 pt-[calc(0.5rem+env(safe-area-inset-top))]"
   >
     <button onclick={openDrawer} aria-label="菜单" class="pointer-events-auto p-1 text-fg">
-      <Icon name="menu" size={17} />
+      <Icon name="menu" size={20} />
     </button>
+    <!-- 右上角 = 新对话（对齐 Claude 移动端：左边菜单，右边开新会话）。
+         设备状态点挪进抽屉左下角的设置按钮（作为角标）。 -->
     <button
-      onclick={() => (sheet = true)}
-      aria-label="模型设置"
-      class="pointer-events-auto size-2 rounded-full {dot}"
-      title={store.device?.name ?? '未连接'}
-    ></button>
+      onclick={() => void newSession()}
+      aria-label="新对话"
+      title="新对话"
+      class="pointer-events-auto p-1 text-fg"
+    >
+      <Icon name="newchat" size={20} />
+    </button>
   </header>
 
   <!-- 输入卡片也浮在内容上 -->

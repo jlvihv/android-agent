@@ -1,17 +1,20 @@
 <script lang="ts">
   /**
-   * 抽屉。结构对齐 Claude 的侧边栏：
+   * 抽屉（侧边栏）。
    *
-   *   agent  v0.1.0
-   *   📱 界面            ← 导航项（Claude 那边是 项目/Code/Artifacts/定时任务）
-   *   📋 事件
-   *   ────────────────────
-   *   最近对话
-   *     💬 <标题>        ← 选中项底 #414141
-   *   (●)              [+ 新建会话]
+   *   [ 搜索对话… ]                  ← 顶上就一个搜索框，输入即搜（跨会话搜正文）
+   *   💬 新对话                     ← 没搜 = 最近对话；搜了 = 命中（标题 + 摘要）
+   *   💬 帮我看看屏幕上是什么界面
+   *   (⚙)              [+ 新建会话]
    *
-   * **长按**对话行 → 弹出菜单（重命名 / 删除）。
-   * Claude 就是这样 —— 列表里没有常驻的删除按钮，那太吵。
+   * 去掉了：agent 标题栏 + 版本号、事件入口、分割线、「最近对话」标题。
+   * 搜索框替掉标题栏：边栏本来就是用来找对话的，搜索比版本号有用。
+   * 事件日志（EventLog）以后挂进「设置」里。
+   *
+   * **长按**对话行 → 重命名 / 删除。跟 Claude 一样，列表里不放常驻按钮。
+   *
+   * DOM 刻意浅：aside 只有三个孩子（搜索框 / 列表 / 底栏），
+   * 中间那层仅仅是滚动容器 —— 滚动区必须是单个元素，省不掉。
    *
    * 动画：进出场是 Svelte 过渡（CSS 动画，跑在合成线程上）；
    * 往左拖可以跟手关掉。遮罩也在这里，跟面板一起淡入淡出。
@@ -23,9 +26,10 @@
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
   import Icon from './Icon.svelte';
-  import EventLog from './EventLog.svelte';
 
   export type Session = { id: string; title: string; active: boolean; count: number };
+  /** 搜索命中（GET /api/search） */
+  export type Hit = { id: string; title: string; active: boolean; role: string; snippet: string };
 
   let {
     sessions,
@@ -43,14 +47,39 @@
     onrename: (id: string, title: string) => void;
   } = $props();
 
-  // null = 显示列表；否则显示对应面板
-  let panel = $state<'device' | 'events' | null>(null);
+  // —— 搜索 ——
+  //
+  // 输入停顿 180ms 再打后端：一边打字一边发请求纯属浪费。
+  // effect 的清理函数会把上一个计时器干掉，所以快速输入不会堆积请求。
+  let q = $state('');
+  let hits = $state<Hit[]>([]);
+  let searching = $state(false);
 
-  // 返回键：先退子面板，再关抽屉
-  $effect(() => onBack(() => onclose()));
   $effect(() => {
-    if (panel) return onBack(() => (panel = null));
+    const needle = q.trim();
+    if (!needle) {
+      hits = [];
+      searching = false;
+      return;
+    }
+    searching = true;
+    const t = setTimeout(() => void search(needle), 180);
+    return () => clearTimeout(t);
   });
+
+  async function search(needle: string) {
+    try {
+      const r = await fetch(`/api/search?q=${encodeURIComponent(needle)}`);
+      if (r.ok) hits = ((await r.json()) as { hits: Hit[] }).hits ?? [];
+    } catch {
+      /* 后端不在就当没搜到 */
+    } finally {
+      searching = false;
+    }
+  }
+
+  // 返回键关抽屉
+  $effect(() => onBack(() => onclose()));
 
   // —— 拖拽关闭 ——
   //
@@ -159,34 +188,37 @@
   in:slideIn|global
   out:slideOut|global
 >
-  {#if panel === null}
-    <div class="flex shrink-0 items-center px-5 pt-3 pb-4">
-      <span class="text-2xl font-semibold tracking-tight">agent</span>
-      <span class="ml-2 self-end pb-1 font-mono text-meta text-faint"
-        >v{store.hello?.version ?? '…'}</span
-      >
-    </div>
+  <input
+    bind:value={q}
+    type="search"
+    placeholder="搜索对话…"
+    spellcheck="false"
+    autocomplete="off"
+    aria-label="搜索对话"
+    class="mx-4 mt-4 mb-3 shrink-0 rounded-2xl bg-[#1f1f1f] px-4 py-3 text-base
+           text-fg placeholder:text-faint outline-none"
+  />
 
-    <nav class="flex shrink-0 flex-col">
-      {#each [['events', '事件', 'list']] as const as [k, label, icon] (k)}
-        <button
-          onclick={() => (panel = k)}
-          class="flex items-center gap-3.5 px-5 py-3.5 text-base text-fg"
-        >
-          <Icon name={icon} size={20} class="shrink-0 text-muted" />
-          {label}
-        </button>
-      {/each}
-    </nav>
-
-    <div class="mx-5 my-2 shrink-0 border-t border-hairline"></div>
-
-    <div class="shrink-0 px-5 pb-2 text-xs text-faint">最近对话</div>
-
-    <div class="min-h-0 flex-1 overflow-y-auto px-3">
-      {#if sessions.length === 0}
-        <p class="px-2 py-3 text-sm text-faint">还没有对话</p>
+  <div class="min-h-0 flex-1 overflow-y-auto px-3 pb-1">
+    {#if q.trim()}
+      {#if hits.length === 0}
+        <p class="px-3 py-3 text-sm text-faint">
+          {searching ? '搜索中…' : '没有匹配的对话'}
+        </p>
+      {:else}
+        {#each hits as h, i (`${h.id}:${i}`)}
+          <button
+            onclick={() => onswitch(h.id)}
+            class="block w-full rounded-2xl px-3 py-2.5 text-left {h.active ? 'bg-[#414141]' : ''}"
+          >
+            <span class="block truncate text-xs text-faint">{h.title}</span>
+            <span class="mt-0.5 block line-clamp-2 text-sm text-fg">{h.snippet}</span>
+          </button>
+        {/each}
       {/if}
+    {:else if sessions.length === 0}
+      <p class="px-3 py-3 text-sm text-faint">还没有对话</p>
+    {:else}
       {#each sessions as s (s.id)}
         {#if renaming === s.id}
           <input
@@ -214,38 +246,37 @@
           </button>
         {/if}
       {/each}
-    </div>
+    {/if}
+  </div>
 
-    <div
-      class="flex shrink-0 items-center gap-3 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+  <div
+    class="flex shrink-0 items-center gap-3 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+  >
+    <!-- 左下角 = 设置。图标本身说明用途；功能待接（点开还没东西）。
+         连接状态当角标挂在这个按钮上，顺手保留了原来那个点的信息。 -->
+    <button
+      type="button"
+      aria-label="设置"
+      title="设置"
+      class="relative grid size-11 shrink-0 place-items-center rounded-full bg-hairline text-muted"
     >
+      <Icon name="gear" size={20} />
       <span
-        class="grid size-11 shrink-0 place-items-center rounded-full bg-hairline"
+        aria-hidden="true"
         title={store.device?.name ?? '未连接设备'}
-      >
-        <span class="size-2.5 rounded-full {store.device?.connected ? 'bg-accent' : 'bg-faint'}"
-        ></span>
-      </span>
+        class="absolute right-0.5 bottom-0.5 size-2.5 rounded-full ring-2 ring-[#111]
+               {store.device?.connected ? 'bg-accent' : 'bg-faint'}"
+      ></span>
+    </button>
 
-      <button
-        onclick={onnew}
-        class="ml-auto flex h-11 items-center gap-1.5 rounded-full bg-fg px-5 text-sm font-medium text-ink"
-      >
-        <Icon name="plus" size={16} />
-        新建会话
-      </button>
-    </div>
-  {:else}
-    <div class="flex shrink-0 items-center gap-2 px-4 pt-5 pb-3">
-      <button class="p-1 text-fg" aria-label="返回" onclick={() => (panel = null)}>
-        <Icon name="back" size={20} />
-      </button>
-      <span class="text-base font-medium">事件</span>
-    </div>
-    <div class="min-h-0 flex-1 border-t border-hairline">
-      <EventLog />
-    </div>
-  {/if}
+    <button
+      onclick={onnew}
+      class="ml-auto flex h-11 items-center gap-1.5 rounded-full bg-fg px-5 text-sm font-medium text-ink"
+    >
+      <Icon name="plus" size={16} />
+      新建会话
+    </button>
+  </div>
 </aside>
 
 {#if menu}

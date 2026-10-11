@@ -383,7 +383,37 @@ impl ChatSession {
     }
 }
 
-/// 多个会话。侧边栏的「最近对话」就是它。
+/// 一段文本里找 `needle`（忽略大小写），命中就返回带省略号的上下文。
+///
+/// 按**字符**切而不是字节：中文（和多字节 UTF-8）里按字节切会把字切碎。
+fn hit_snippet(text: &str, needle: &str) -> Option<String> {
+    const BEFORE: usize = 20;
+    const AFTER: usize = 60;
+
+    let hay: Vec<char> = text.to_lowercase().chars().collect();
+    let pat: Vec<char> = needle.to_lowercase().chars().collect();
+    if pat.is_empty() || hay.len() < pat.len() {
+        return None;
+    }
+    let at = hay.windows(pat.len()).position(|w| w == pat.as_slice())?;
+
+    let raw: Vec<char> = text.chars().collect();
+    let start = at.saturating_sub(BEFORE);
+    let end = (at + pat.len() + AFTER).min(raw.len());
+
+    let mut s = String::new();
+    if start > 0 {
+        s.push('…');
+    }
+    // 换行拍平成空格，否则摘要里会带出多行
+    s.extend(raw[start..end].iter().map(|c| if *c == '\n' { ' ' } else { *c }));
+    if end < raw.len() {
+        s.push('…');
+    }
+    Some(s)
+}
+
+/// 多个会话。侧边栏的「最近对话」/ 搜索结果都从它来。
 #[derive(Default, Serialize, Deserialize)]
 pub struct SessionStore {
     pub sessions: Vec<ChatSession>,
@@ -456,6 +486,52 @@ impl SessionStore {
                 })
             })
             .collect()
+    }
+
+    /// 全文搜：跨会话找用户／助手消息里的子串（忽略大小写），
+    /// 每个会话最多回 `per_session` 条，总量封顶 `limit`。
+    ///
+    /// 直接在内存里线性扫 —— 整个 store 本来就在内存里，会话量级是几十，
+    /// 用不上 SQL 的 FTS（少一张表、少一处 schema 迁移）。
+    pub fn search(&self, q: &str, per_session: usize, limit: usize) -> Vec<Value> {
+        let needle = q.trim();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut sorted: Vec<&ChatSession> = self.sessions.iter().collect();
+        sorted.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+
+        let mut out = Vec::new();
+        for s in sorted {
+            let mut in_this = 0;
+            for m in &s.messages {
+                let (role, text) = match m {
+                    ChatMessage::User(t) => ("user", t.as_str()),
+                    ChatMessage::Assistant { content, .. } => ("assistant", content.as_str()),
+                    // 系统提示词和工具结果不参与搜索：前者不是对话，后者是噪音
+                    _ => continue,
+                };
+                let Some(snippet) = hit_snippet(text, needle) else {
+                    continue;
+                };
+                out.push(json!({
+                    "id": s.id,
+                    "title": if s.title.is_empty() { "新对话" } else { &s.title },
+                    "active": s.id == self.active,
+                    "role": role,
+                    "snippet": snippet,
+                    "updatedAt": s.updated_at,
+                }));
+                in_this += 1;
+                if in_this >= per_session || out.len() >= limit {
+                    break;
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
     }
 }
 
@@ -1619,5 +1695,82 @@ mod tests {
         // provider 什么都不报时不能瞎猜
         let unknown: Usage = serde_json::from_value(json!({ "prompt_tokens": 50 })).unwrap();
         assert_eq!(unknown.cache_hit_ratio(), None);
+    }
+
+    // —— 侧边栏搜索 ——
+
+    fn store_with_two_sessions() -> SessionStore {
+        let mut a = ChatSession::new();
+        a.title = "Alpine 版本".into();
+        a.updated_at = 200;
+        a.messages = vec![
+            ChatMessage::System("系统提示词里有 apk 这个词，不该被搜到".into()),
+            ChatMessage::User("看一下 apk 版本".into()),
+            ChatMessage::Assistant {
+                content: "Alpine 3.21\n第二行".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
+            ChatMessage::Tool { tool_call_id: "c1".into(), content: "apk 的输出".into() },
+        ];
+
+        let mut b = ChatSession::new();
+        b.title = "FizzBuzz".into();
+        b.updated_at = 100;
+        b.messages = vec![ChatMessage::User("写个 fizzbuzz".into())];
+
+        SessionStore { sessions: vec![a, b], active: String::new() }
+    }
+
+    #[test]
+    fn search_hits_message_text_case_insensitively() {
+        let store = store_with_two_sessions();
+
+        let hits = store.search("APK", 3, 60);
+        assert_eq!(hits.len(), 1, "只搜用户/助手正文，系统提示词和工具结果不算");
+        assert_eq!(hits[0]["title"], "Alpine 版本");
+        assert_eq!(hits[0]["role"], "user");
+        assert_eq!(hits[0]["snippet"], "看一下 apk 版本");
+
+        let hits = store.search("alpine", 3, 60);
+        assert_eq!(hits[0]["snippet"], "Alpine 3.21 第二行", "换行要拍成空格");
+    }
+
+    #[test]
+    fn search_is_ordered_by_recency_and_capped() {
+        let store = store_with_two_sessions();
+        // "a" 两个会话都命中；更新的那个（a，updated_at=200）排前面
+        let hits = store.search("a", 3, 60);
+        assert!(hits.len() >= 2);
+        assert_eq!(hits[0]["title"], "Alpine 版本");
+
+        // 每个会话最多 3 条
+        let mut many = ChatSession::new();
+        many.messages = (0..10).map(|i| ChatMessage::User(format!("命中 {i}"))).collect();
+        let store = SessionStore { sessions: vec![many], active: String::new() };
+        assert_eq!(store.search("命中", 3, 60).len(), 3);
+        assert_eq!(store.search("命中", 3, 1).len(), 1, "总量封顶");
+    }
+
+    #[test]
+    fn search_handles_empty_and_multibyte() {
+        let store = store_with_two_sessions();
+        assert!(store.search("", 3, 60).is_empty());
+        assert!(store.search("   ", 3, 60).is_empty());
+        assert!(store.search("不存在的词", 3, 60).is_empty());
+
+        // 中文按字符切，不能切出半截 UTF-8
+        let mut s = ChatSession::new();
+        s.messages = vec![ChatMessage::User(format!(
+            "{}测试{}",
+            "开头".repeat(100),
+            "尾巴".repeat(100)
+        ))];
+        let store = SessionStore { sessions: vec![s], active: String::new() };
+        let hits = store.search("测试", 3, 60);
+        assert_eq!(hits.len(), 1);
+        let snip = hits[0]["snippet"].as_str().unwrap();
+        assert!(snip.starts_with('…') && snip.ends_with('…'));
+        assert!(snip.chars().count() < 90);
     }
 }

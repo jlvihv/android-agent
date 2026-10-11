@@ -36,6 +36,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/debug/tools", get(debug_tools))
         .route("/api/debug/system-prompt", post(debug_set_system_prompt))
         .route("/api/sessions", get(list_sessions).post(new_session))
+        .route("/api/search", get(search_sessions))
         .route("/api/sessions/activate", post(activate_session))
         .route("/api/sessions/rename", post(rename_session))
         .route("/api/sessions/delete", post(delete_session))
@@ -477,6 +478,26 @@ async fn debug_set_system_prompt(
 async fn list_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let store = st.chat.read().await;
     Json(json!({ "sessions": store.list() }))
+}
+
+/// `GET /api/search?q=…` → 跨会话搜消息正文。
+///
+/// 侧边栏顶上那个搜索框就靠它。命中回 `{ id, title, active, role, snippet }`，
+/// 点一下就是普通的切会话（activate）。
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+}
+
+async fn search_sessions(
+    State(st): State<Arc<AppState>>,
+    Query(SearchQuery { q }): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let store = st.chat.read().await;
+    // 每个会话最多 3 条、总共 60 条：侧边栏不是搜索页，再多也看不过来
+    let hits = store.search(&q, 3, 60);
+    Json(json!({ "q": q, "hits": hits }))
 }
 
 /// `POST /api/sessions` → 新建会话

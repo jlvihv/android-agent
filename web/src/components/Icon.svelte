@@ -2,11 +2,25 @@
   /**
    * 图标。全部内联 SVG，不引图标库。
    *
-   * 尺寸按 Claude 界面实测：汉堡 17×15、状态点 19×19、圆形按钮内的图标 ~18。
-   * 描边宽度 1.8（实测 2px @ DPR 2.625 ≈ 0.76css… 视觉上取 1.8 更像）。
+   * **统一规格**（同一行放不同图标，光学尺寸才对得上）：
+   *   - `viewBox="0 0 20 20"`，正方形画布 —— 一律 20，没有例外
+   *     （`gear` 原来是 24，描边实际只有 1.58 px，跟谁都不齐）
+   *   - `stroke-width="1.8"` —— 一律 1.8，没有例外
+   *     （原来 1.6/1.7/1.8/1.9/2.1 混着用）
+   *   - 线端/拐角 `round`
+   *   - **描边型**图标的墨迹（几何 + 半个描边）都在 13.6–16.8 之间；
+   *     填充型（`stop` `sparkle`）没有描边，靠外框对齐
+   *   - 故意画小的只有两个“小尖角”`back` / `chevron` —— 它们贴着文字用，
+   *     撑满画布反而把行高顶开
+   *
+   * 各图标墨迹（上面这条规矩的实测值，20px 渲染时就是像素）：
+   *   gear 16.8 · newchat 16.8 · clock 16.6 · menu 16.2×10.2 · sparkle 15.8
+   *   chat 15.0 · pencil 14.9 · trash 14.6 · plus 14.2 · mic 13.0×17.4
+   *   list 13.6 · send 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
    */
   type Name =
     | 'menu'
+    | 'newchat'
     | 'plus'
     | 'send'
     | 'stop'
@@ -19,32 +33,51 @@
     | 'chat'
     | 'list'
     | 'pencil'
-    | 'trash';
+    | 'trash'
+    | 'gear';
 
   let { name, size = 20, class: cls = '' }: { name: Name; size?: number; class?: string } =
     $props();
 </script>
 
 {#if name === 'menu'}
-  <!-- 三条横线。实测 17.1 × 14.9 css，线间距 ~5.5 -->
-  <svg width={size} height={size * 0.88} viewBox="0 0 17 15" fill="none" class={cls}>
+  <!-- 两条横线：上一条满宽，下一条 3/5（14.4 × 0.6 = 8.64）。
+       比三条视觉噪点少，也比三条更明确地“只是个菜单”。
+       行距 8.4（5.8 / 14.2）：最初写的 6.4 贴得太近，两条像一条粗线。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <path
-      d="M1 1.2h15M1 7.5h15M1 13.8h15"
+      d="M2.8 5.8h14.4M2.8 14.2h8.64"
       stroke="currentColor"
-      stroke-width="1.9"
+      stroke-width="1.8"
       stroke-linecap="round"
     />
   </svg>
+{:else if name === 'newchat'}
+  <!-- 新对话：圆气泡 + 左下小尾巴 + 里面一个加号。
+       经典 message-circle 造型（半径 7.5 的圆），等比缩到 20 画布：
+       一条路径画完（长弧 + 尾巴三角形闭合），不用两个图形叠，
+       交接处不会出现双重描边。
+       尾巴尖端停在 y=17.2 —— **不越过圆的底部**（圆心 y=10 + 半径 7.5 = 17.5），
+       否则加上描边会有一小截垂到圆下面去（最初的 18.33 就是这样）。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <path
+      d="M6.58 16.67A7.5 7.5 0 1 0 3.33 13.42L2.75 17.2Z"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linejoin="round"
+    />
+    <path d="M10 7.2v5.6M7.2 10h5.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+  </svg>
 {:else if name === 'plus'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
+    <path d="M10 3.8v12.4M3.8 10h12.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
   </svg>
 {:else if name === 'send'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <path
       d="M10 16V4.6M5 9.6 10 4.6l5 5"
       stroke="currentColor"
-      stroke-width="2.1"
+      stroke-width="1.8"
       stroke-linecap="round"
       stroke-linejoin="round"
     />
@@ -70,23 +103,27 @@
   </svg>
 {:else if name === 'back'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <path d="M12.5 4.5 7 10l5.5 5.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M12.5 4.5 7 10l5.5 5.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{:else if name === 'chevron'}
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <path d="M7.5 5 12.5 10l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
   </svg>
 {:else if name === 'pencil'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <path
       d="M13.4 3.6l3 3L7.2 15.8l-3.9.9.9-3.9 9.2-9.2Z"
       stroke="currentColor"
-      stroke-width="1.6"
+      stroke-width="1.8"
       stroke-linejoin="round"
     />
   </svg>
 {:else if name === 'trash'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <path
-      d="M3.8 5.6h12.4M8 5.6V3.8h4v1.8M5.4 5.6l.8 10.6h7.6l.8-10.6M8.4 8.6v4.8M11.6 8.6v4.8"
+      d="M3.6 5.8h12.8M8 5.8V4h4v1.8M5.3 5.8l.8 10.4h7.8l.8-10.4M8.4 8.8v4.6M11.6 8.8v4.6"
       stroke="currentColor"
-      stroke-width="1.6"
+      stroke-width="1.8"
       stroke-linecap="round"
       stroke-linejoin="round"
     />
@@ -96,7 +133,7 @@
     <path
       d="M3.4 9.6c0-3.2 2.9-5.8 6.6-5.8s6.6 2.6 6.6 5.8-2.9 5.8-6.6 5.8c-.8 0-1.6-.1-2.3-.4l-3.4 1.6.9-2.9a5.6 5.6 0 0 1-1.8-4.1Z"
       stroke="currentColor"
-      stroke-width="1.6"
+      stroke-width="1.8"
       stroke-linejoin="round"
     />
   </svg>
@@ -105,24 +142,36 @@
     <path
       d="M6.6 5.6h9.2M6.6 10h9.2M6.6 14.4h9.2M4 5.6h.01M4 10h.01M4 14.4h.01"
       stroke="currentColor"
-      stroke-width="1.7"
+      stroke-width="1.8"
       stroke-linecap="round"
     />
   </svg>
 {:else if name === 'clock'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <circle cx="10" cy="10" r="7.4" stroke="currentColor" stroke-width="1.7" />
-    <path d="M10 5.8V10l2.9 1.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="10" cy="10" r="7.4" stroke="currentColor" stroke-width="1.8" />
+    <path d="M10 5.8V10l2.9 1.9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
   </svg>
 {:else if name === 'sparkle'}
-  <!-- 四角星。用于「思考」那一行，跟工具调用的时钟图标区分开。 -->
+  <!-- 四角星。用于「思考」那一行，跟工具调用那行的时钟图标并排，
+       所以外框要对齐：老版本只有 12.8，比时钟（16.6）小一圈，
+       同一列里看着一个瘦一个胖。现在按 1.234 倍从中心放大到 15.8。 -->
   <svg width={size} height={size} viewBox="0 0 20 20" fill="currentColor" class={cls}>
-    <path
-      d="M10 3.6C10.7 7.4 12.6 9.3 16.4 10 12.6 10.7 10.7 12.6 10 16.4 9.3 12.6 7.4 10.7 3.6 10 7.4 9.3 9.3 7.4 10 3.6Z"
-    />
+    <path d="M10 2.1C10.86 6.79 13.21 9.14 17.9 10 13.21 10.86 10.86 13.21 10 17.9 9.14 13.21 6.79 10.86 2.1 10 6.79 9.14 9.14 6.79 10 2.1Z" />
   </svg>
-{:else if name === 'chevron'}
+{:else if name === 'gear'}
+  <!-- 齿轮。抽屉左下角那个「设置」入口用。
+       经典 cog 造型（8 齿圆角）缩到 20 画布：以 24 画布上的原图中心 (12,12) 为基准
+       整体 ×0.68 并平移到 (10,10)，孔半径 2.108，墨迹 16.8 —— 和 newchat 完全同尺寸。
+       为什么不自己画 8 齿梯形：20 画布里齿深只剩 2 上下，配上 1.8 的描边，
+       齿和齿根会糊成一个圆疙瘩（试过三版都一样），圆角齿廓才立得住。 -->
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <path d="M7.5 5 12.5 10l-5 5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="10" cy="10" r="2.108" stroke="currentColor" stroke-width="1.8" />
+    <path
+      d="M15.032 12.04a1.122 1.122 0 0 0 0.224 1.238l0.041 0.041a1.36 1.36 0 0 1 0 1.924a1.36 1.36 0 0 1-1.924 0l-0.041-0.041a1.122 1.122 0 0 0-1.238-0.224a1.122 1.122 0 0 0-0.68 1.027V16.12a1.36 1.36 0 0 1-1.36 1.36a1.36 1.36 0 0 1-1.36-1.36v-0.061A1.122 1.122 0 0 0 7.96 15.032a1.122 1.122 0 0 0-1.238 0.224l-0.041 0.041a1.36 1.36 0 0 1-1.924 0a1.36 1.36 0 0 1 0-1.924l0.041-0.041a1.122 1.122 0 0 0 0.224-1.238a1.122 1.122 0 0 0-1.027-0.68H3.88a1.36 1.36 0 0 1-1.36-1.36a1.36 1.36 0 0 1 1.36-1.36h0.061A1.122 1.122 0 0 0 4.968 7.96a1.122 1.122 0 0 0-0.224-1.238l-0.041-0.041a1.36 1.36 0 0 1 0-1.924a1.36 1.36 0 0 1 1.924 0l0.041 0.041a1.122 1.122 0 0 0 1.238 0.224H7.96a1.122 1.122 0 0 0 0.68-1.027V3.88a1.36 1.36 0 0 1 1.36-1.36a1.36 1.36 0 0 1 1.36 1.36v0.061a1.122 1.122 0 0 0 0.68 1.027a1.122 1.122 0 0 0 1.238-0.224l0.041-0.041a1.36 1.36 0 0 1 1.924 0a1.36 1.36 0 0 1 0 1.924l-0.041 0.041a1.122 1.122 0 0 0-0.224 1.238V7.96a1.122 1.122 0 0 0 1.027 0.68H16.12a1.36 1.36 0 0 1 1.36 1.36a1.36 1.36 0 0 1-1.36 1.36h-0.061a1.122 1.122 0 0 0-1.027 0.68Z"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
   </svg>
 {/if}
