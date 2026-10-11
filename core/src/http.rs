@@ -392,12 +392,65 @@ async fn get_session(
     if !q.rev.is_empty() && q.rev == rev {
         return Json(json!({ "unchanged": true, "rev": rev, "busy": busy }));
     }
+
+    // 增量：客户端上次的 rev 里有 (会话 id, 已存消息数)。同一个会话、且它手上的
+    // 消息数没超过当前（没被重置）→ 只重发「当前回合」那一段。会话是只追加的，
+    // 前面都是最终的。不这样做的话，跑长任务时每步都要重传整段历史（含每个
+    // 50KB 的 bash 输出），客户端还要再 JSON.parse 一遍。
+    let len = sess.messages.len();
+    if let Some((cid, client_len)) = parse_rev(&q.rev) {
+        if cid == sess.id && client_len <= len {
+            let mut from = client_len;
+            if client_len == len {
+                // 没有新消息（只是 updated_at 变了）：尾部不用重发
+                from = len;
+            } else if !matches!(
+                &sess.messages[client_len],
+                crate::agent::ChatMessage::User(_)
+            ) {
+                // 新消息是同一回合的延续（assistant/tool）—— 回到这个回合的起点
+                // （上一条是 User，或到 0），这样开头那个 assistant 一定是新的
+                // 一条，与完整视图的合并规则一致。
+                // 若新消息本身就是一条 User（新回合），from 就留在 client_len。
+                while from > 0
+                    && !matches!(
+                        &sess.messages[from - 1],
+                        crate::agent::ChatMessage::User(_)
+                    )
+                {
+                    from -= 1;
+                }
+            }
+            let replace_from = crate::agent::session_view_count_before(sess, from);
+            let msgs = crate::agent::session_view_from(sess, from);
+            drop(store);
+            return Json(json!({
+                "messages": msgs,
+                "rev": rev,
+                "busy": busy,
+                "append": true,
+                "replaceFrom": replace_from,
+            }));
+        }
+    }
+
     let msgs = crate::agent::session_view(sess);
     drop(store);
 
     // busy 让前端知道「服务端还在跑」—— App 切到后台时 agent 不会停，
     // 切回来要能看出还在进行中，而不是以为卡住了。
     Json(json!({ "messages": msgs, "rev": rev, "busy": busy }))
+}
+
+/// 从 rev 里解出 (会话 id, 已存消息数)。格式见 `session_rev`。
+fn parse_rev(rev: &str) -> Option<(&str, usize)> {
+    let mut it = rev.split(':');
+    let id = it.next()?;
+    let len = it.next()?.parse().ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((id, len))
 }
 
 #[derive(Deserialize)]
@@ -1134,7 +1187,7 @@ fn cmd_name(c: &Command) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_origin, parse_range, session_rev};
+    use super::{is_loopback_origin, parse_range, parse_rev, session_rev};
     use crate::agent::{ChatMessage, ChatSession};
 
     #[test]
@@ -1170,6 +1223,16 @@ mod tests {
         b.messages.push(ChatMessage::User("问".into()));
         b.updated_at = a.updated_at;
         assert_ne!(session_rev(&b), session_rev(&a));
+    }
+
+    #[test]
+    fn parse_rev_reads_the_session_id_and_message_count() {
+        assert_eq!(parse_rev("abc:7:123"), Some(("abc", 7)));
+        // 空 / 残缺 / 非法 → None（当作全量拉）
+        assert_eq!(parse_rev(""), None);
+        assert_eq!(parse_rev("abc"), None);
+        assert_eq!(parse_rev(":7:123"), None);
+        assert_eq!(parse_rev("abc:x:123"), None);
     }
 
     #[test]

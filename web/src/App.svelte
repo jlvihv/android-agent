@@ -59,6 +59,10 @@
         busy: boolean;
         unchanged?: boolean;
         rev?: string;
+        /** 增量：只给了「当前回合」那一段 */
+        append?: boolean;
+        /** 增量时从哪里开始替换 */
+        replaceFrom?: number;
       };
       serverBusy = !!d.busy;
       // 服务端说没变：连 JSON 里都不带 messages，什么都不用做
@@ -67,7 +71,14 @@
       // rev 的格式是 `会话id:消息数:更新时间`。会话 id 变了（切会话 / 重置）
       // 就不能按 id 复用旧消息 —— `u1` 这种 id 每条会话都会有。
       const sid = rev.split(':')[0];
-      messages = sid === sessionId ? reconcile(messages, d.messages ?? []) : (d.messages ?? []);
+      const same = sid === sessionId;
+      if (d.append && same) {
+        // 服务端只重发了「当前回合」那段：前面的原样留着，从 replaceFrom 换掉尾部
+        const from = Math.min(d.replaceFrom ?? 0, messages.length);
+        messages = [...messages.slice(0, from), ...(d.messages ?? [])];
+      } else {
+        messages = same ? reconcile(messages, d.messages ?? []) : (d.messages ?? []);
+      }
       sessionId = sid;
     } catch {
       /* 拉不到就算了 */

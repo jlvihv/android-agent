@@ -99,6 +99,11 @@ WebView 切到后台会挂起 JS，SSE 流可能就断了。切回来时本地�
 chunk 并支持断点续传（offset），复杂得多。而服务端每个步骤完成都会把
 assistant 消息写进会话，所以轮询已经能看到逐步骤推进。
 
+轮询是**增量**的：`rev` 不变直接 `unchanged`；变了也只重发「当前回合」
+那一段（`append: true` + `replaceFrom`），不重传整段历史。不这样做的话，
+跑长任务时每 1.5 秒要把整段会话（含每个 50KB 的 bash 输出）传一遍，
+客户端还要再 `JSON.parse` 一遍。
+
 `turn_active` 用 `Drop` guard 清：
 
 ```rust

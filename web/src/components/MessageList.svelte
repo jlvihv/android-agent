@@ -11,6 +11,7 @@
    *
    * 每个思考、每次工具调用**各开各的面板**，面板里只有它自己。
    */
+  import { tick } from 'svelte';
   import type { Message, ToolPart } from '../lib/sse';
   import Icon from './Icon.svelte';
   import Markdown from './Markdown.svelte';
@@ -257,6 +258,41 @@
 
   let lastTop = 0;
 
+  // —— 窗口化 ——
+  //
+  // 长对话不能把几百条消息全挂进 DOM（节点数和内存都线性涨）。只渲染最后
+  // WINDOW_STEP 条；往上翻到顶再往前补一窗，并补偿 scrollTop，视口不跳。
+  // 注意 `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** ——
+  // 这个才是真的封顶。
+  const WINDOW_STEP = 40;
+  let limit = $state(WINDOW_STEP);
+  let loadingEarlier = false;
+
+  let start = $derived(Math.max(0, messages.length - limit));
+
+  /** 切会话 → 窗口收回来（否则新会话只显示尾巴那几条） */
+  let windowKey = $state('');
+  $effect(() => {
+    const k = messages[0]?.id ?? '';
+    if (k !== windowKey) {
+      windowKey = k;
+      limit = WINDOW_STEP;
+    }
+  });
+
+  async function loadEarlier() {
+    if (loadingEarlier || start === 0 || !scroller) return;
+    loadingEarlier = true;
+    const before = scroller.scrollHeight;
+    const top = scroller.scrollTop;
+    limit += WINDOW_STEP;
+    await tick();
+    // 前面补进来多少高度，scrollTop 就补多少 —— 视口里那条不动
+    scroller.scrollTop = top + (scroller.scrollHeight - before);
+    lastTop = scroller.scrollTop;
+    loadingEarlier = false;
+  }
+
   /**
    * 只有用户**往上**翻才取消贴底。
    *
@@ -270,6 +306,8 @@
     if (gap < 48) pinned = true;
     else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
+    // 快到顶了 → 再补一窗更早的（窗口化）
+    if (el.scrollTop < 200) void loadEarlier();
   }
 
   $effect(() => {
@@ -297,7 +335,15 @@
   class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[calc(var(--hdr)+var(--fade-top))] pb-[calc(var(--composer-h,0px)+1rem)]"
 >
 <div bind:this={content} class="flex flex-col gap-6">
-  {#each messages as msg (msg.id)}
+  {#if start > 0}
+    <button
+      onclick={loadEarlier}
+      class="self-center rounded-full bg-hairline px-3 py-1 text-xs text-muted"
+    >
+      显示更早的 {Math.min(WINDOW_STEP, start)} 条
+    </button>
+  {/if}
+  {#each messages.slice(start) as msg (msg.id)}
     {#if msg.role === 'user'}
       <!-- 右对齐靠 `self-end`（父级是 flex-col）：不用再套一层
            `<div class="flex justify-end">`。对齐 + 收缩到内容宽 + 上限 84% -->

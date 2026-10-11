@@ -799,9 +799,56 @@ pub fn ensure_system_prompt(sess: &mut ChatSession, prompt: &str) {
 ///
 /// 形状必须和 `web/src/lib/sse.ts` 的 `Message` 一致。
 pub fn session_view(sess: &ChatSession) -> Vec<Value> {
-    // 工具结果先按 id 索引：assistant 消息里的 tool_calls 要配上它
+    session_view_from(sess, 0)
+}
+
+/// `messages[..upto]` 会产生几条前端消息（合并规则与 `session_view_from` 一致）。
+///
+/// 增量同步时客户端靠它知道「从哪里开始替换」。只数不建 Value，很便宜。
+/// 有测试盯着它和 `session_view_from` 不跑偏。
+pub fn session_view_count_before(sess: &ChatSession, upto: usize) -> usize {
+    let upto = upto.min(sess.messages.len());
+    let mut n = 0usize;
+    let mut last_assistant = false;
+    for m in &sess.messages[..upto] {
+        match m {
+            ChatMessage::System(_) => {}
+            ChatMessage::User(_) => {
+                n += 1;
+                last_assistant = false;
+            }
+            ChatMessage::Assistant {
+                content,
+                reasoning,
+                tool_calls,
+            } => {
+                if content.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
+                    continue;
+                }
+                if !last_assistant {
+                    n += 1;
+                    last_assistant = true;
+                }
+            }
+            ChatMessage::Tool { .. } => {}
+        }
+    }
+    n
+}
+
+/// 同 `session_view`，但只产出 `messages[from..]` 对应的那部分。
+///
+/// **`from` 必须是一个「回合边界」**（上一条是 User，或 0）—— 否则开头那个
+/// assistant 会被当成新的一条，而完整视图会把它合并进前一个 assistant。
+/// 调用方（`/api/session`）就是这么取 from 的。
+///
+/// 存在的理由：会话是只追加的，除当前正在长的那个回合，前面的输出都是最终的，
+/// 客户端不用每轮重收整段历史（含每个 50KB 的 bash 输出）。
+pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
+    let from = from.min(sess.messages.len());
+    // 工具结果按 id 索引：只需要切片内的（一个回合的 tool 结果都在它自己后面）
     let mut results: HashMap<&str, &str> = HashMap::new();
-    for m in &sess.messages {
+    for m in &sess.messages[from..] {
         if let ChatMessage::Tool {
             tool_call_id,
             content,
@@ -817,7 +864,7 @@ pub fn session_view(sess: &ChatSession) -> Vec<Value> {
     };
 
     let mut out: Vec<Value> = Vec::new();
-    for (i, m) in sess.messages.iter().enumerate() {
+    for (i, m) in sess.messages.iter().enumerate().skip(from) {
         match m {
             // 系统提示词（第一条，以及后续的“提示词升级”）是给模型看的，不给用户看
             ChatMessage::System(_) => {}
@@ -2024,6 +2071,55 @@ mod tests {
         let ids: std::collections::HashSet<&str> =
             v[1]["parts"].as_array().unwrap().iter().filter_map(|p| p["id"].as_str()).collect();
         assert_eq!(ids.len(), 4, "合并后的思考/正文 id 不能撞");
+    }
+
+    /// 增量同步的核心不变式：从任意「回合边界」切开，
+    /// `count_before(from) + view_from(from)` 必须逐字节等于完整视图。
+    #[test]
+    fn incremental_session_slice_matches_the_full_view() {
+        let call = |id: &str| RecordedToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("U1".into()),
+            ChatMessage::Assistant {
+                content: "先看看".into(),
+                reasoning: "想".into(),
+                tool_calls: vec![call("c1")],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "c1".into(),
+                content: "{}".into(),
+                images: vec![],
+            },
+            ChatMessage::Assistant {
+                content: "答1".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
+            ChatMessage::User("U2".into()),
+            ChatMessage::Assistant {
+                content: "答2".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
+        ];
+        let full = session_view(&sess);
+
+        // 只在回合边界切（上一条是 User，或 from == 0）
+        for from in 0..=sess.messages.len() {
+            if from > 0 && !matches!(&sess.messages[from - 1], ChatMessage::User(_)) {
+                continue;
+            }
+            let head = session_view_count_before(&sess, from);
+            let tail = session_view_from(&sess, from);
+            let joined: Vec<Value> = full[..head].iter().cloned().chain(tail).collect();
+            assert_eq!(joined, full, "from={from} 时增量结果与完整视图不一致");
+        }
     }
 
     #[test]
