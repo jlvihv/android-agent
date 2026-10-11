@@ -197,6 +197,7 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #   agent sessions           会话列表
 #   agent session            当前这条会话的消息（不会切走你正在看的那条）
 #   agent doctor             各部件体检
+#   agent setup [--force|--list|包…]   装/看常用工具（rg fd jq git python3…）
 #   agent command <json>     操作这台手机，例如 '{"type":"key","name":"back"}'
 #   agent get <path>         直接 GET 自己的接口（逃生口）
 #   agent post <path> <json> 直接 POST
@@ -247,6 +248,10 @@ case "$cmd" in
     echo '--- 在沙箱里跑一句 ---'
     post /api/linux '{"command":"echo ok"}'
     ;;
+  setup)
+    shift || true
+    exec /usr/local/bin/agent-setup "$@"
+    ;;
   command)
     if [ $# -lt 2 ]; then
       cat >&2 <<'EOT'
@@ -264,7 +269,7 @@ EOT
   get)  [ $# -ge 2 ] || { echo "用法：agent get /api/…" >&2; exit 2; }; get "$2" ;;
   post) [ $# -ge 3 ] || { echo "用法：agent post /api/… '{…}'" >&2; exit 2; }; post "$2" "$3" ;;
   help|-h|--help)
-    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,20p'
+    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,21p'
     ;;
   *)
     echo "不认识的子命令：$cmd（agent help）" >&2
@@ -272,6 +277,110 @@ EOT
     ;;
 esac
 "##;
+
+/// 预装的工具。**改这里就够了** —— `agent-setup` 脚本是从它生成的。
+///
+/// 为什么预装：Alpine minirootfs 里只有 busybox（没有 python、没有 curl、
+/// 没有 jq、`grep` 不认 `-P`），而模型干活几乎每次都碰它们。装一次，
+/// 后面每个回合就不用自己 `apk add`，也不会因为工具的小脾气卡住。
+///
+/// 增删请顺手想一下体积：手机上这是要下载的（约 75MB），别把 ffmpeg 塞进来。
+pub const TOOLSET: &[&str] = &[
+    "bash",            // 提示词里让模型用 bash，沙箱里原来只有 ash
+    "curl",            // 比 busybox wget 好用得多
+    "ca-certificates", // 没有它 curl/git 走 https 会验证失败
+    "grep",            // GNU grep：busybox 的不认 -P
+    "findutils",       // GNU find
+    "jq",              // JSON（模型处理 JSON 太频繁了）
+    "git",
+    "ripgrep",         // rg
+    "fd",
+    "tree",
+    "unzip",           // busybox 没有
+    "python3",
+    "openssl",         // 证书/小工具用得上
+];
+
+/// `agent-setup`：装上面那套（幂等）。
+/// `agent-setup`：装上面那套（幂等）。
+///
+/// 注意：**不能拿 `apk add` 的退出码当准**。proot 下 busybox / ca-certificates
+/// 的 trigger 常常返回非零（实测：装一个全新的小包也会报 “1 error; N packages”，
+/// 但包确实装上了）。所以脚本以**那些命令找不找得到**为准。
+const AGENT_SETUP_TEMPLATE: &str = r##"#!/bin/sh
+# agent-setup —— 把干活要用的工具装上。
+#
+# Alpine minirootfs 里只有 busybox（没有 python、没有 curl、没有 jq，
+# grep 也不认 -P），而模型几乎每个任务都要碰到它们。App 启动后会自动跑一次
+# 这个脚本；也可以随时手动跑（幂等）。
+#
+#   agent-setup            装标准那一套（装过就秒退）
+#   agent-setup --force    不管标记，重跑一遍
+#   agent-setup --list     只看看装了哪些
+#   agent-setup <包…>      在标准那套之外再加几个
+set -eu
+
+MARK=/etc/agent-tools
+VERSION=__VERSION__
+BASE="__PACKAGES__"
+# 装完必须能找到这些命令（ca-certificates 没有命令，单独查证书包）
+CHECK="bash curl grep find jq git rg fd tree unzip python3 openssl"
+CA=/etc/ssl/certs/ca-certificates.crt
+
+missing() {
+  out=""
+  for b in $CHECK; do
+    command -v "$b" >/dev/null 2>&1 || out="$out $b"
+  done
+  [ -s "$CA" ] || out="$out ca-certificates"
+  echo "$out"
+}
+
+if [ "${1:-}" = "--list" ]; then
+  for b in $CHECK; do
+    printf '%-12s %s\n' "$b" "$(command -v "$b" 2>/dev/null || echo '❌ 没有')"
+  done
+  printf '%-12s %s\n' "ca-bundle" "$([ -s "$CA" ] && echo "$CA" || echo '❌ 没有')"
+  exit 0
+fi
+
+force=""
+if [ "${1:-}" = "--force" ]; then force=1; shift; fi
+
+if [ -z "$force" ] && [ -f "$MARK" ] && [ "$(cat "$MARK")" = "$VERSION" ] \
+   && [ -z "$(missing)" ]; then
+  echo "工具就绪（$MARK=$VERSION）。重装：agent-setup --force"
+  exit 0
+fi
+
+echo "装工具：$BASE $*"
+echo "（首次要下几十 MB，之后不再装）"
+# apk 的退出码在这个沙箱里不可信：proot 下 busybox/ca-certificates 的 trigger
+# 常报 “1 error”，但包确实装上了。所以这里不看它，后面用「命令找不找得到」判断。
+apk add --no-cache $BASE "$@" || true
+
+left=$(missing)
+if [ -n "$left" ]; then
+  echo "还缺：$left" >&2
+  echo "多半是网络/DNS。查一下：curl -sI https://dl-cdn.alpinelinux.org" >&2
+  echo "然后重跑：agent-setup --force" >&2
+  exit 1
+fi
+
+mkdir -p /etc
+echo "$VERSION" > "$MARK"
+echo "好了（apk 那句 1 error 是 proot 下 trigger 的事，以这份清单为准）："
+for b in $CHECK; do
+  printf '  %-10s %s\n' "$b" "$(command -v "$b" 2>/dev/null || echo '?')"
+done
+"##;
+
+/// 预装脚本的内容。清单变了这里就变，`write_if_changed` 会重写文件。
+fn setup_script() -> String {
+    AGENT_SETUP_TEMPLATE
+        .replace("__VERSION__", &TOOLSET.len().to_string())
+        .replace("__PACKAGES__", &TOOLSET.join(" "))
+}
 
 /// 只在内容变了才写，避免每次启动都碰文件（和 resolv.conf 一样的做法）。
 ///
@@ -308,6 +417,29 @@ impl LinuxSandbox {
     /// 核心 bind 成功后告诉沙箱自己的端口 —— 沙箱里的 `agent` 命令要靠它。
     pub fn set_agent_port(&self, port: u16) {
         self.agent_port.store(port, Ordering::Relaxed);
+    }
+
+    /// rootfs 齐了吗（安卓上解压是后台做的，之前只是个空壳）。
+    pub fn is_ready(&self) -> bool {
+        is_alpine_rootfs(&self.cfg.rootfs)
+    }
+
+    /// 常用工具装过了吗。
+    ///
+    /// 标记文件里存的是**清单版本**（工具数）。只判文件在不在的话，以后往
+    /// `TOOLSET` 里加工具，老设备永远装不上 —— 它会一直以为自己装过了。
+    pub fn is_provisioned(&self) -> bool {
+        std::fs::read_to_string(self.cfg.rootfs.join("etc/agent-tools"))
+            .map(|s| s.trim() == TOOLSET.len().to_string())
+            .unwrap_or(false)
+    }
+
+    /// 把常用工具装上（`agent-setup`）。幂等，装过就秒退。
+    ///
+    /// 超时给得很大：手机上首次要下 ~75MB。
+    pub async fn provision(&self) -> anyhow::Result<ExecResult> {
+        self.run("/usr/local/bin/agent-setup", Duration::from_secs(900))
+            .await
     }
 
     /// 从环境变量构造（桌面开发用）。
@@ -375,6 +507,12 @@ impl LinuxSandbox {
 
         // 沙箱里的 `agent` 命令：让模型能查看 / 操作自己
         write_if_changed(&rootfs.join("usr/local/bin/agent"), AGENT_CLI, true)?;
+        // 预装工具的那个脚本（App 启动后会自动跑一次，也可以手动跑）
+        write_if_changed(
+            &rootfs.join("usr/local/bin/agent-setup"),
+            &setup_script(),
+            true,
+        )?;
 
         let resolv = rootfs.join("etc/resolv.conf");
         let servers = self.resolved_dns();
@@ -476,7 +614,15 @@ impl LinuxSandbox {
 
         arg!("-w", WORKSPACE);
 
-        arg!("/bin/sh", "-c", script);
+        // 装过 bash 就用 bash：模型写的命令常带 bash 语法（`[[ ]]`、数组、
+        // 进程替换、`<<<`），拿 ash 跑会报 "syntax error"。首次预装之前
+        // （或者手动清了 rootfs）没有 bash，退回 /bin/sh。
+        let shell = if self.cfg.rootfs.join("bin/bash").is_file() {
+            "/bin/bash"
+        } else {
+            "/bin/sh"
+        };
+        arg!(shell, "-c", script);
 
         cmd
     }
@@ -496,6 +642,9 @@ impl LinuxSandbox {
         env.insert("CHARSET".into(), "UTF-8".into());
         env.insert("LANG".into(), "C.UTF-8".into());
         env.insert("TERM".into(), "dumb".into()); // 非交互，别输出 ANSI
+        // 分页器会**挂住**（非交互环境没人按键），一次工具调用就废了
+        env.insert("PAGER".into(), "cat".into());
+        env.insert("GIT_PAGER".into(), "cat".into());
         env.insert("NO_COLOR".into(), "1".into());
         env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
         env.insert("GOMAXPROCS".into(), "2".into()); // 手机上限
@@ -1263,6 +1412,52 @@ mod tests {
 
         // 幂等：再跑一次不炸
         sb.prepare_rootfs().unwrap();
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    /// 预装脚本也得写进去、可执行，而且**工具清单不能是空的**。
+    ///
+    /// 这个清单掉了不会有任何报错 —— 只是模型又开始每个回合自己 `apk add`。
+    #[test]
+    fn prepare_rootfs_installs_the_toolset_script() {
+        let t = TempRoot::new("agentsetup");
+        let sb = t.sandbox();
+        sb.prepare_rootfs().unwrap();
+
+        let sh = t.dir.join("usr/local/bin/agent-setup");
+        let body = std::fs::read_to_string(&sh).expect("agent-setup 没写进去");
+        assert!(body.starts_with("#!/bin/sh"));
+        for tool in TOOLSET {
+            assert!(body.contains(tool), "清单里的 {tool} 没出现在脚本里");
+        }
+        assert!(!body.contains("__PACKAGES__"), "模板占位没替换");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sh).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "必须可执行");
+        }
+        if let Ok(out) = std::process::Command::new("sh").arg("-n").arg(&sh).output() {
+            assert!(
+                out.status.success(),
+                "shell 语法不过：{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // 清单得真管用：模型最常碰的几样必须在
+        for want in ["ripgrep", "fd", "jq", "python3", "curl", "bash"] {
+            assert!(TOOLSET.contains(&want), "预装清单里少了 {want}");
+        }
+
+        // 没装过 → false；标记文件版本对上 → true；**版本对不上要重新装**
+        assert!(!sb.is_provisioned());
+        std::fs::write(t.dir.join("etc/agent-tools"), "1").unwrap();
+        assert!(!sb.is_provisioned(), "老版本的标记不该算装过");
+        std::fs::write(t.dir.join("etc/agent-tools"), TOOLSET.len().to_string()).unwrap();
+        assert!(sb.is_provisioned());
+
         let _ = std::fs::remove_dir_all(&t.dir);
     }
 

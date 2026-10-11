@@ -284,6 +284,7 @@ agent request            # 我下一次会收到的完整上下文（提示词 +
 agent tools              # 我有哪些工具
 agent sessions / session # 会话列表 / 当前这条会话的消息
 agent doctor             # 各部件体检
+agent setup [--force|--list|包…]   # 装/看常用工具
 agent command '{"type":"key","name":"back"}'   # 操作这台手机
 agent get /api/…         # 直接 GET 自己的任意接口（逃生口）
 agent post /api/… '{…}'
@@ -303,6 +304,23 @@ agent post /api/… '{…}'
    `sh -n` 语法 + `AGENT_PORT` 注入与否。
 
 系统提示词里有一行告诉模型这个命令存在（`dump_prompt` 能看到）—— 否则等于没有。
+
+### 顺带：沙箱里的工具是预装好的
+
+Alpine minirootfs 里只有 busybox，所以 App 启动后会在后台跑一次 `agent-setup`
+（同样 `prepare_rootfs` 写进去的脚本，清单在 `linux.rs` 的 `TOOLSET`）：
+
+```sh
+agent setup              # 幂等，装过就秒退
+agent setup --list       # 看每个工具在不在
+agent setup --force      # 重跑
+agent setup <包…>        # 标准那套之外再加
+```
+
+预装的是 `bash curl ca-certificates grep findutils jq git ripgrep fd tree unzip
+python3 openssl`（约 75MB，只在首次下载）。细节和三个坑（apk 退出码不可信、
+标记要带版本、安卓上 serve 比 rootfs 解压早）见
+[docs/02-linux-sandbox.md](02-linux-sandbox.md) 的「预装的工具」。
 
 ---
 

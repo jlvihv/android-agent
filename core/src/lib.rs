@@ -77,6 +77,12 @@ pub fn init_tracing() {
                 .with_max_level(level)
                 .with_tag("agent-core"),
         );
+        // 这里**故意不装 tracing subscriber**：安卓上走 `tracing` 的 `log`
+        // feature，事件直接交给上面那个 android_logger（见 Cargo.toml）。
+        // 以前 `let _ = filter;` 就这么把它丢了 —— 结果所有 tracing::info!
+        // （缓存命中率、装工具的进度、沙箱告警）在 logcat 里一条都看不到，
+        // 只剩 Kotlin 自己的日志。过滤粒度因此由 android_logger 的 level 决定
+        // （AGENT_LOG=debug 或 setprop log.tag.agent-core DEBUG 都能调）。
         let _ = filter;
     }
 
@@ -139,6 +145,10 @@ impl Core {
 
     pub fn set_linux_sandbox(&self, cfg: linux::SandboxConfig) {
         let sb = linux::LinuxSandbox::new(cfg);
+        // 端口可能早就 bind 好了（安卓上 rootfs 解压完之后会**再调一次**这里，
+        // 那是个新的 sandbox 实例）—— 不补这一下，沙箱里的 `agent` 命令
+        // 就找不到核心。
+        sb.set_agent_port(self.state.port.load(Ordering::Relaxed));
         if let Err(e) = sb.prepare_rootfs() {
             self.push_log("warn", &format!("准备 rootfs 失败: {e:#}"));
         }
@@ -242,6 +252,9 @@ impl Core {
             sb.set_agent_port(actual);
         }
 
+        // 后台把常用工具装上（rg/fd/jq/python3…）。幂等：装过就秒退。
+        tokio::spawn(provision_tools(self.state.clone()));
+
         let app = http::router(self.state.clone());
         let st = self.state.clone();
         tokio::spawn(async move {
@@ -319,6 +332,63 @@ impl Core {
             .map_err(|e| anyhow::anyhow!("runtime thread died: {e}"))?
             .map_err(|e| anyhow::anyhow!(e))
     }
+}
+
+/// 把常用工具装进沙箱（后台、幂等、出错只记日志，不挡启动）。
+///
+/// Alpine minirootfs 里只有 busybox：没有 python、没有 curl、没有 jq，
+/// `grep` 也不认 `-P`。装这一次，模型后面就不用每个回合自己 `apk add`。
+///
+/// 安卓上这件事有坑：`serve()` 比 rootfs 解压**早**（解压在 Kotlin 的后台线程里），
+/// 所以这里先等沙箱就绪再动手 —— 空壳上跑 `apk` 只会失败。
+async fn provision_tools(st: Arc<AppState>) {
+    for attempt in 0..90 {
+        let Some(sb) = st.linux() else {
+            if attempt == 0 {
+                tracing::debug!("没有 Linux 沙箱，跳过工具预装");
+            }
+            return;
+        };
+        if !sb.is_ready() {
+            // 安卓首次启动：rootfs 还在解压。等 2 秒再看（最多 3 分钟）
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+        if sb.is_provisioned() {
+            tracing::debug!("常用工具已就绪，跳过");
+            return;
+        }
+
+        st.log("info", "正在给沙箱装常用工具（rg/fd/jq/git/python3…，首次几十秒）");
+        match sb.provision().await {
+            Ok(r) if r.code == 0 => {
+                let last = r
+                    .stdout
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .to_string();
+                st.log(
+                    "info",
+                    format!(
+                        "常用工具装好了（{:.0}s）{last}",
+                        r.duration_ms as f64 / 1000.0
+                    ),
+                );
+            }
+            Ok(r) => {
+                let tail: String = r.stdout.chars().rev().take(300).collect::<String>().chars().rev().collect();
+                st.log(
+                    "warn",
+                    format!("装常用工具失败（exit {}）：{tail}", r.code),
+                );
+            }
+            Err(e) => st.log("warn", format!("装常用工具失败：{e:#}")),
+        }
+        return;
+    }
+    tracing::warn!("等沙箱就绪超时，常用工具没装（可手动跑 agent-setup）");
 }
 
 #[cfg(test)]

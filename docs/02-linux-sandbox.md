@@ -307,6 +307,31 @@ Rust core                     ▼
 `agent request` / `agent tools`）和操作这台手机（`agent command`）。
 见 [docs/07-debugging.md](07-debugging.md) §8。
 
+### 预装的工具（`agent-setup`）
+
+minirootfs 里**只有 busybox**：没有 python、没有 curl、没有 jq，`grep` 也不认 `-P`。
+这些几乎每个任务都要碰到，所以 App 启动后会后台跑一次 `agent-setup`
+（`prepare_rootfs` 写进 `/usr/local/bin/agent-setup`，清单在 `linux.rs` 的 `TOOLSET`）：
+
+```
+bash curl ca-certificates grep findutils jq git ripgrep fd tree unzip python3 openssl
+```
+
+三个实现上的坑：
+
+- **不能拿 `apk add` 的退出码当准**。proot 下 busybox / ca-certificates 的 trigger
+  常常返回非零 —— 实测装一个全新的小包也会报 `1 error; N packages`，但包确实装上了。
+  所以脚本以「那些命令找不找得到」为准（`missing()`），装完再写标记文件。
+- **标记文件里存清单版本**（工具数）。只判文件在不在的话，以后往 `TOOLSET` 里加工具，
+  老设备会永远以为自己装过了。
+- **安卓上 `serve()` 比 rootfs 解压早**，所以 `provision_tools()` 先等 `is_ready()`
+  （用 `is_alpine_rootfs` 判断），最多等 3 分钟。装过程走 `st.log`，在 App 的事件页
+  能看到「正在给沙箱装常用工具…」。
+
+装好之后，`bash` 工具**默认用 bash 执行**（`command_line()` 里判 `bin/bash` 在不在，
+不在就退回 `/bin/sh`）—— 模型写的 `[[ ]]`、数组、进程替换、`<<<` 才能跑。
+`PAGER` / `GIT_PAGER` 固定成 `cat`：分页器在非交互环境会**挂住**，一次工具调用就废了。
+
 这样 agent 就有了真正的计算机：**跑代码**（`bash`）+ 沙箱里的文件系统，
 这才是 OpenMinis 那个形态。
 

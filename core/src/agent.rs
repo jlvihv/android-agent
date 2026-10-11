@@ -197,7 +197,7 @@ fn build_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "在设备上的 Alpine Linux 沙箱里执行 shell 命令。返回 stdout 和 stderr。输出截断到**最后** 2000 行或 50KB（先到者为准）；截断时完整输出会存到临时文件并返回路径。可选 timeout（秒，默认 60）。每次调用都是全新的进程：文件系统持久，shell 状态（变量、cwd、后台任务）不持久；cwd 是 /workspace，相对路径都相对它。要点：ICMP/ping 被封，用 curl/wget；装 Python 包优先 `apk add py3-*` 而不是 pip（musllinux_aarch64 的 wheel 很少）；matplotlib 画图前先 `matplotlib.use('Agg')`；后台服务必须重定向 stdout/stderr，否则调用不会返回；搜索用 rg（`apk add ripgrep`），`rg -uuu` 才包含隐藏和忽略的文件。",
+            description: "在 Alpine Linux 沙箱里执行 shell 命令。cwd 是 /workspace；每次调用都是新进程：文件系统持久，shell 状态（变量、cwd、后台任务）不持久。输出取**尾部**（最后 2000 行或 50KB，先到者为准），被截断时完整输出会存到临时文件并返回路径。可选 timeout（秒，默认 60）。**已预装**：bash、curl、git、jq、ripgrep（rg）、fd、tree、unzip、python3（另有 GNU grep/find）。要点：ICMP/ping 被封，用 curl；装 Python 包优先 `apk add py3-*`（musllinux_aarch64 的 wheel 很少）；matplotlib 画图前先 `matplotlib.use('Agg')`；后台服务必须重定向 stdout/stderr，否则调用不会返回；搜索用 `rg -uuu` 才包含隐藏和忽略的文件。",
             schema: || {
                 json!({
                     "type": "object",

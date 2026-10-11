@@ -37,7 +37,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rust-embed = "8"
 mime_guess = "2"
-tracing = "0.1"
+# features = ["log"]：把 tracing 的事件也发给 `log` crate。
+# **安卓上必须有它** —— 那边只装 android_logger（log 的 sink），没装 tracing
+# subscriber，所以没有这座桥的话，我们所有的 tracing::info!（缓存命中率、
+# 装工具的进度、沙箱告警）在 logcat 里**全部看不到**。桌面装了 fmt subscriber，
+# 而系统里没有别的 log logger，所以不会重复打。
+tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
@@ -70,11 +75,12 @@ async-openai = { version = "0.42", default-features = false, features = [
     "byot",
 ] }
 
+# log 由 tracing 的 log feature 和 android_logger 一起用；panic hook 在安卓上
+# 也走它（Rust 默认把 panic 打到 stderr，而安卓上 stderr 是丢掉的）
+log = "0.4"
+
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"
-# android_logger 的 Config::with_max_level 收的是 log::LevelFilter，
-# 而这个 crate 只在 android 目标上需要
-log = "0.4"
 
 [profile.release]
 lto = true
