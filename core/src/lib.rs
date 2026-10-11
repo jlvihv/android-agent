@@ -20,9 +20,12 @@ pub mod demo;
 pub mod editor;
 pub mod ffi;
 pub mod http;
+pub mod imaging;
 pub mod linux;
 pub mod llm;
 pub mod mock;
+pub mod models;
+pub mod reader;
 pub mod sse;
 pub mod state;
 
@@ -202,6 +205,57 @@ impl Core {
             .linux()
             .ok_or_else(|| anyhow::anyhow!("Linux 沙箱未初始化"))?;
         sb.run_live(script, timeout, Some(live)).await
+    }
+
+    /// 读沙箱里的文件（`read` 工具）。
+    ///
+    /// 图片（`ReadResult::Image`）已经解码/缩放好、可以直接内联；
+    /// 其余是带 offset/limit/截断提示的文本。和 `edit_file` 一样是同步
+    /// 本地 I/O，包一层 `spawn_blocking` 免得占住 tokio 的 worker（只有 2 个）。
+    pub async fn read_any(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> anyhow::Result<linux::ReadResult> {
+        let sb = self
+            .state
+            .linux()
+            .ok_or_else(|| anyhow::anyhow!("Linux 沙箱未初始化"))?;
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || sb.read_any(&path, offset, limit)).await?
+    }
+
+    /// 把要内联给模型的图片字节落盘，返回绝对路径。
+    ///
+    /// **为什么落盘**：带图的消息进了历史之后，后面每一轮都要重发同一张图
+    /// （prompt cache 靠字节一致）。消息本身只存路径，组装请求时再从盘上读 ——
+    /// 否则 SQLite 里会不断累积 base64 大字符串，而且每轮还要重编码一遍。
+    pub async fn save_image(&self, bytes: Vec<u8>, mime: String) -> anyhow::Result<std::path::PathBuf> {
+        let dir = self
+            .state
+            .data_dir
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|d| d.join("images"))
+            .unwrap_or_else(|| std::env::temp_dir().join("android-agent-images"));
+        // 写盘是阻塞 I/O，几 MB 也会占住一个 worker（runtime 只有 2 个）
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("建图片目录失败: {e}"))?;
+            let ext = match mime.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                "image/bmp" => "bmp",
+                _ => "bin",
+            };
+            let path = dir.join(format!("{}.{ext}", uuid::Uuid::now_v7()));
+            std::fs::write(&path, &bytes).map_err(|e| anyhow::anyhow!("写图片失败: {e}"))?;
+            Ok(path)
+        })
+        .await?
     }
 
     /// 编辑沙箱里的文件（`edit` 工具）。

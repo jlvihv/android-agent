@@ -386,6 +386,7 @@ mod tests {
             ChatMessage::Tool {
                 tool_call_id: "c1".into(),
                 content: "ok".into(),
+                images: vec![],
             },
         ];
         db.sync(&st).unwrap();

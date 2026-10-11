@@ -37,6 +37,16 @@ pub struct Provider {
     /// 额外的请求头。OpenCode Go 需要 `x-opencode-session`（见 `client()`）。
     #[serde(default)]
     pub extra_headers: BTreeMap<String, String>,
+    /// 这个模型能不能吃 `image_url`（`read` 读图片时要发）。
+    ///
+    /// 默认 **true** —— 关错了只会多一条文字说明，开错了是请求直接 400。
+    /// 不能用时可以 `AGENT_LLM_VISION=0`（或 `/api/llm` 的 `vision:false`）关掉。
+    #[serde(default = "default_supports_images")]
+    pub supports_images: bool,
+}
+
+pub(crate) fn default_supports_images() -> bool {
+    true
 }
 
 impl Provider {
@@ -47,6 +57,7 @@ impl Provider {
             model: "gpt-5".into(),
             api_key: api_key.into(),
             extra_headers: BTreeMap::new(),
+            supports_images: true,
         }
     }
 
@@ -62,6 +73,7 @@ impl Provider {
             model: model.into(),
             api_key: api_key.into(),
             extra_headers: BTreeMap::new(),
+            supports_images: true,
         }
     }
 
@@ -101,6 +113,8 @@ impl Provider {
             model,
             api_key: key,
             extra_headers: BTreeMap::new(),
+            // 占位；真正的值由 `AppState::supports_images_for` 从 models.dev 自动判定
+            supports_images: true,
         })
     }
 
@@ -171,7 +185,7 @@ impl Provider {
 ///
 /// TLS 配置与 provider 无关（只用内嵌的 Mozilla 根证书，见 `tls_config`），
 /// 所以全进程共享一个就够。`reqwest::Client` 的内部是 Arc，克隆很便宜。
-fn shared_http() -> anyhow::Result<reqwest::Client> {
+pub(crate) fn shared_http() -> anyhow::Result<reqwest::Client> {
     static HTTP: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     HTTP.get_or_init(|| {
         let tls = Provider::tls_config().map_err(|e| format!("{e:#}"))?;

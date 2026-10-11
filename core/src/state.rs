@@ -116,6 +116,9 @@ struct PersistedProvider {
     base_url: String,
     model: String,
     api_key: String,
+    /// 老 llm.json 里没有这个字段 → 默认 true（模型能看图）
+    #[serde(default = "crate::llm::default_supports_images")]
+    supports_images: bool,
 }
 
 pub struct AppState {
@@ -156,6 +159,15 @@ pub struct AppState {
     /// **不重装 APK 就能对着真机调提示词** —— 改 Rust 常量要重编 .so、
     /// 重新打包安装，而提示词是迭代最频繁的东西。只改内存，重启即失效。
     pub system_prompt: RwLock<Option<String>>,
+    /// 视觉能力的自动判定结果：`(base_url|model, 能不能看图)`。
+    ///
+    /// provider 换了（key 变了）就重算。判定来源见 `models` 模块。
+    pub vision: RwLock<Option<(String, bool)>>,
+    /// 用户按了停止。回合循环每轮开始前 / 每个工具执行前都会看它。
+    ///
+    /// agent loop **没有轮数上限**，所以必须有一个真的能停下来、而不只是
+    /// 断开前端连接的开关 —— 否则模型空转时只能在后台烧 token。
+    pub abort_turn: AtomicBool,
 }
 
 impl AppState {
@@ -174,6 +186,8 @@ impl AppState {
             db: RwLock::new(None),
             sessions_dirty: AtomicBool::new(false),
             system_prompt: RwLock::new(None),
+            vision: RwLock::new(None),
+            abort_turn: AtomicBool::new(false),
         })
     }
 
@@ -329,32 +343,115 @@ impl AppState {
     /// ⚠️ 目前是**明文**存在 App 私有目录里（受 Android 沙箱 + SELinux 保护）。
     /// 下一步应该用 Android Keystore 加密 —— 见 docs/04-android-shell.md 的债。
     pub fn set_llm(&self, p: Provider, persist_dir: Option<&std::path::Path>) {
-        if let Some(dir) = persist_dir {
-            let f = dir.join("llm.json");
-            // 用独立的持久化结构，**不能**直接序列化 Provider ——
-            // 它的 api_key 是 skip_serializing（防止泄给前端），
-            // 直接存的话 key 就丢了。
-            let rec = PersistedProvider {
-                name: p.name.clone(),
-                base_url: p.base_url.clone(),
-                model: p.model.clone(),
-                api_key: p.api_key.clone(),
-            };
-            match serde_json::to_vec_pretty(&rec) {
-                Ok(body) => {
-                    if let Err(e) = std::fs::write(&f, body) {
-                        tracing::warn!("写 {} 失败: {e}", f.display());
-                    }
-                }
-                Err(e) => tracing::warn!("序列化 provider 失败: {e}"),
-            }
-        }
+        self.persist_provider(&p, persist_dir);
         let name = p.name.clone();
         let model = p.model.clone();
         if let Ok(mut g) = self.llm.write() {
             *g = Some(p);
         }
         self.log("info", format!("LLM 已配置: {name} / {model}"));
+    }
+
+    /// 只更新「能不能看图」并落盘（自动判定后调用），不重发配置日志。
+    pub fn set_supports_images(&self, vision: bool, persist_dir: Option<&std::path::Path>) {
+        let Some(mut p) = self.llm() else { return };
+        if p.supports_images == vision {
+            return;
+        }
+        p.supports_images = vision;
+        self.persist_provider(&p, persist_dir);
+        if let Ok(mut g) = self.llm.write() {
+            *g = Some(p);
+        }
+        tracing::debug!("视觉能力已记录: {vision}");
+    }
+
+    fn persist_provider(&self, p: &Provider, persist_dir: Option<&std::path::Path>) {
+        let Some(dir) = persist_dir else { return };
+        let f = dir.join("llm.json");
+        // 用独立的持久化结构，**不能**直接序列化 Provider ——
+        // 它的 api_key 是 skip_serializing（防止泄给前端），
+        // 直接存的话 key 就丢了。
+        let rec = PersistedProvider {
+            name: p.name.clone(),
+            base_url: p.base_url.clone(),
+            model: p.model.clone(),
+            api_key: p.api_key.clone(),
+            supports_images: p.supports_images,
+        };
+        match serde_json::to_vec_pretty(&rec) {
+            Ok(body) => {
+                if let Err(e) = std::fs::write(&f, body) {
+                    tracing::warn!("写 {} 失败: {e}", f.display());
+                }
+            }
+            Err(e) => tracing::warn!("序列化 provider 失败: {e}"),
+        }
+    }
+
+    /// 当前 provider 能不能看图：
+    /// 缓存 → models.dev 自动判定 → 拿不准就保留原值。
+    ///
+    /// 判定结果会落盘，下次启动直接读，不用再联网。
+    pub async fn supports_images_for(&self, provider: &Provider) -> bool {
+        let key = vision_key(provider);
+        if let Some((k, v)) = self.vision.read().ok().and_then(|g| g.clone()) {
+            if k == key {
+                return v;
+            }
+        }
+        let dir = self.data_dir.read().ok().and_then(|g| g.clone());
+        let resolved = crate::models::vision_for(provider, &provider.model, false, dir.as_deref()).await;
+        let vision = resolved.unwrap_or(provider.supports_images);
+        match resolved {
+            Some(v) => tracing::info!("视觉能力自动判定: {} → {v}", provider.model),
+            None => tracing::info!(
+                "视觉能力查不到 {}（models.dev 没这个模型），沿用 {vision}",
+                provider.model
+            ),
+        }
+        if let Ok(mut g) = self.vision.write() {
+            *g = Some((key, vision));
+        }
+        if resolved.is_some() {
+            self.set_supports_images(vision, dir.as_deref());
+        }
+        vision
+    }
+
+    /// 用户请求停止当前回合（`POST /api/stop`）。
+    pub fn request_abort(&self) {
+        self.abort_turn
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn abort_requested(&self) -> bool {
+        self.abort_turn
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 只看缓存/已存的值（同步，给组装请求和工具用，不做网络）。
+    pub fn cached_supports_images(&self, provider: &Provider) -> bool {
+        let key = vision_key(provider);
+        if let Some((k, v)) = self.vision.read().ok().and_then(|g| g.clone()) {
+            if k == key {
+                return v;
+            }
+        }
+        provider.supports_images
+    }
+
+    /// provider 的模型清单（带 vision 判定），给设置界面 / CLI 用。
+    pub async fn list_models(
+        &self,
+        refresh: bool,
+    ) -> anyhow::Result<Vec<crate::models::ModelInfo>> {
+        let provider = self
+            .llm()
+            .or_else(Provider::from_env)
+            .ok_or_else(|| anyhow::anyhow!("还没有配置 LLM"))?;
+        let dir = self.data_dir.read().ok().and_then(|g| g.clone());
+        crate::models::list(&provider, refresh, dir.as_deref()).await
     }
 
     /// 启动时从磁盘恢复
@@ -365,7 +462,12 @@ impl AppState {
             Ok(rec) => {
                 let name = rec.name.clone();
                 let model = rec.model.clone();
-                let p = Provider::compatible(rec.name, rec.base_url, rec.model, rec.api_key);
+                let mut p = Provider::compatible(rec.name, rec.base_url, rec.model, rec.api_key);
+                p.supports_images = rec.supports_images;
+                // 恢复出来的值先当已知（不用等下一次请求再联网）
+                if let Ok(mut g) = self.vision.write() {
+                    *g = Some((vision_key(&p), rec.supports_images));
+                }
                 if let Ok(mut g) = self.llm.write() {
                     *g = Some(p);
                 }
@@ -382,4 +484,9 @@ impl AppState {
         }
         self.log("info", format!("Linux 沙箱就绪: {rootfs}"));
     }
+}
+
+/// 视觉判定的缓存键：base_url + 模型名。任一变了就重算。
+fn vision_key(p: &Provider) -> String {
+    format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
 }

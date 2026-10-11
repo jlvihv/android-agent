@@ -57,9 +57,15 @@ async fn stream_one(...) {
 [system]  SYSTEM_PROMPT              ← 建会话时写入历史，之后不动
 [user]    U1
 [assistant] ...
-[tool]    ...（bash 输出 / edit 的 diff）
+[tool]    ...（read 的正文 / bash 输出 / edit 的 diff）
+[user]    ...（read 读到图时的图片 carrier，见下）
 [user]    U2
 ```
+
+> **图片 carrier**：`read` 读到图片时，tool 消息后面会紧跟一条 `user`
+> 消息，里面是 `image_url`。OpenAI 的 tool 消息内容只能是字符串，图片没
+> 别的地方可挂。它由历史推导、字节确定（图片从盘上重读），所以照样是前缀
+> 的一部分 —— 后面的轮次会原样重发同一份字节，缓存命中不受影响。
 
 三条规则：
 
@@ -79,11 +85,12 @@ pub const SYSTEM_PROMPT: &str = "你是运行在安卓手机上的操作助手�
 ensure_system_prompt(sess, SYSTEM_PROMPT);
 sess.messages.push(ChatMessage::User(user_text.into()));
 
-// build_messages：历史原样，一条不多一条不少
-sess.messages.iter().map(|m| m.to_openai()).collect()
+// build_messages：历史原样；唯一的例外是图片 carrier，排在连续 tool 消息之后
+build_messages(sess, supports_images)
 ```
 
-因此请求体长度 == 历史长度。`the_request_is_the_history_verbatim` 守着这一点。
+因此请求体长度 == 历史长度（加上图片 carrier）。`the_request_is_the_history_verbatim`
+和 `message_prefix_is_stable_across_turns` 守着这一点。
 
 ### 3.1 改了系统提示词怎么办：**追加，不替换**
 

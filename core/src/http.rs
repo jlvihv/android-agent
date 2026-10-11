@@ -29,6 +29,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/linux", post(bash_run))
         .route("/api/edit", post(edit_file))
         .route("/api/llm", post(set_llm))
+        .route("/api/models", get(get_models))
+        .route("/api/model", post(set_model))
+        .route("/api/stop", post(stop_turn))
         .route("/api/chat", post(chat))
         .route("/api/session", get(get_session))
         .route("/api/debug/state", get(debug_state))
@@ -121,7 +124,8 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
     let timeout = body
         .timeout_ms
         .map(Duration::from_millis)
-        .unwrap_or(crate::linux::DEFAULT_TIMEOUT);
+        .unwrap_or(crate::linux::DEFAULT_TIMEOUT)
+        .min(crate::linux::MAX_TIMEOUT);
 
     match core.run_linux(&body.command, timeout).await {
         Ok(r) => Json(json!({
@@ -270,6 +274,18 @@ struct LlmBody {
     api_key: String,
 }
 
+#[derive(serde::Deserialize)]
+struct ModelsQuery {
+    /// `?refresh=1` 强制重拉 models.dev 目录
+    #[serde(default)]
+    refresh: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelBody {
+    model: String,
+}
+
 fn default_name() -> String {
     "custom".into()
 }
@@ -293,12 +309,63 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
         body.api_key,
     );
     let dir = st.data_dir.read().ok().and_then(|g| g.clone());
-    st.set_llm(p, dir.as_deref());
+    st.set_llm(p.clone(), dir.as_deref());
+    // 自动判定这个模型能不能吃图片（查 models.dev），结果落盘。
+    // 不劳烦用户配 —— 这是模型自己的属性。
+    let vision = st.supports_images_for(&p).await;
     // 换了 provider / model，缓存前缀的语义就变了：给所有会话换一个
     // provider session id，否则 provider 侧会把新前缀路由到旧模型的缓存上。
     st.rotate_provider_sessions().await;
 
+    Json(json!({ "ok": true, "vision": vision })).into_response()
+}
+
+/// `POST /api/stop` → 停当前回合。
+///
+/// agent loop 没有轮数上限，前端那个「停止」按钮必须真的把服务端循环停下来，
+/// 而不只是断开 SSE（循环看不到断连，会继续跑、继续烧 token）。
+async fn stop_turn(State(st): State<Arc<AppState>>) -> Response {
+    st.request_abort();
+    st.log("info", "用户请求停止当前回合");
     Json(json!({ "ok": true })).into_response()
+}
+
+/// `GET /api/models` → 当前 provider 的模型清单（带 vision 判定）。
+///
+/// 设置界面/CLI 拿它列模型、看哪些能看图。`/api/llm` 配的模型也在里面。
+async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery>) -> Response {
+    let Some(p) = st.llm().or_else(Provider::from_env) else {
+        return (StatusCode::BAD_REQUEST, "还没有配置 LLM").into_response();
+    };
+    match st.list_models(q.refresh).await {
+        Ok(models) => Json(json!({
+            "current": p.model,
+            "name": p.name,
+            "baseUrl": p.base_url,
+            "vision": st.cached_supports_images(&p),
+            "models": models,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `POST /api/model` → 在当前 provider 内换模型（不用再传 key）。
+///
+/// 换完自动重判视觉能力（并落盘）—— 模型能不能看图是它自己的属性。
+async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>) -> Response {
+    if body.model.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "model 不能为空").into_response();
+    }
+    let Some(mut p) = st.llm().or_else(Provider::from_env) else {
+        return (StatusCode::BAD_REQUEST, "还没有配置 LLM").into_response();
+    };
+    p.model = body.model.trim().to_string();
+    let dir = st.data_dir.read().ok().and_then(|g| g.clone());
+    st.set_llm(p.clone(), dir.as_deref());
+    let vision = st.supports_images_for(&p).await;
+    st.rotate_provider_sessions().await;
+    Json(json!({ "ok": true, "model": p.model, "vision": vision })).into_response()
 }
 
 /// `GET /api/session?rev=…` → 服务端的会话历史，转成前端 `Message[]` 的形状。
@@ -429,7 +496,9 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
     };
     crate::agent::ensure_system_prompt(&mut sess, &st.system_prompt());
 
-    match crate::agent::build_request(&sess, &p.model).and_then(|r| Ok(serde_json::to_value(&r)?)) {
+    match crate::agent::build_request(&sess, &p.model, st.cached_supports_images(&p))
+        .and_then(|r| Ok(serde_json::to_value(&r)?))
+    {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }

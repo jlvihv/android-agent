@@ -29,9 +29,29 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::editor::{self, Edit, EditOutcome};
+use crate::reader::{self, ReadView};
 
-/// 单次命令的默认超时
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// 单次命令的默认超时。
+///
+/// 只给 `bash` 工具之外的入口用（`/api/linux` 的终端/CLI）—— 那边没人替我们
+/// 估时间，得给个默认值。**`bash` 工具不走这个默认值**：模型必须自己传 `timeout`
+///（见 `agent.rs`），免得它不假思索地依赖一个偏短的默认值，把长时间下载/编译
+/// 在半路杀掉。
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 单次命令的超时上限：24 小时。
+///
+/// 基本等于「不设限」，但总得有个兜底 —— 一条真正挂死的命令不能把沙箱占住到
+/// 天荒地老。下载、编译、`apk add` 这类活儿几十分钟到几小时都正常，6000 秒
+/// 那种量级完全该允许。
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
+/// `read` 工具允许整份读进内存的文本文件上限。
+///
+/// 读取要按行定位 `offset`，所以是整份读进来再切 —— 一个 200MB 的日志会把
+/// 手机内存吃爆（OOM kill 不是 panic，但一样是崩溃）。超过就回一条错误，
+/// 让模型改用 `sed -n` / `head` / `rg` 局部读。
+const MAX_TEXT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// 回给模型的输出上限。超过就只留**尾部**。
 /// 命令的错误和结论通常在末尾，砍尾部等于砍掉最有用的信息。
@@ -54,6 +74,12 @@ pub const WORKSPACE: &str = "/workspace";
 
 /// 手机内部存储整个挂在这里（`/storage/emulated/0`）
 pub const SHARED: &str = "/sdcard";
+
+/// `read` 工具看到的东西：图片（缩放后内联）或文本（含截断提示）。
+pub enum ReadResult {
+    Text(ReadView),
+    Image(crate::imaging::Encoded),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
@@ -850,6 +876,47 @@ impl LinuxSandbox {
         Ok(outcome)
     }
 
+    /// `read` 工具：先嗅魔数，是图片就走图片那条路（缩放 + 内联），
+    /// 否则当 UTF-8 文本读（offset/limit/头截断，见 `reader` 模块）。
+    pub fn read_any(
+        &self,
+        guest_path: &str,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> anyhow::Result<ReadResult> {
+        let host = self.resolve_readable(guest_path)?;
+        // 先嗅头（只读 12 字节）再决定走哪条路：不能为了判断“是不是图片”
+        // 就把一个可能上百 MB 的文本文件整份读进来。
+        if crate::imaging::is_image_file(&host)? {
+            if let Some(img) = crate::imaging::load_if_image(&host)? {
+                return Ok(ReadResult::Image(img));
+            }
+        }
+        let text = read_utf8(&host, guest_path)?;
+        Ok(ReadResult::Text(reader::read(&text, guest_path, offset, limit)?))
+    }
+
+    /// 纯文本那条路（测试与内部用）。
+    pub fn read_text(
+        &self,
+        guest_path: &str,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> anyhow::Result<ReadView> {
+        let host = self.resolve_readable(guest_path)?;
+        let text = read_utf8(&host, guest_path)?;
+        reader::read(&text, guest_path, offset, limit)
+    }
+
+    fn resolve_readable(&self, guest_path: &str) -> anyhow::Result<PathBuf> {
+        let host = self.resolve_path(guest_path)?;
+        anyhow::ensure!(
+            host.is_file(),
+            "不是文件或不存在: {guest_path}（目录内容用 bash 的 ls）"
+        );
+        Ok(host)
+    }
+
     /// 写文件（`bash` 之外的小工具，也供测试用）
     pub fn read_file(&self, guest_path: &str) -> anyhow::Result<String> {
         let host = self.resolve_path(guest_path)?;
@@ -867,6 +934,30 @@ fn confine(root: &Path, path: &Path, guest: &str) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(real.starts_with(&real_root), "符号链接指向沙箱外: {guest}");
     }
     Ok(norm)
+}
+
+/// 读成 UTF-8 文本。二进制给一条能操作的错误，而不是一句 "invalid utf-8"。
+fn read_utf8(host: &Path, guest_path: &str) -> anyhow::Result<String> {
+    let size = std::fs::metadata(host).map(|m| m.len()).unwrap_or(0);
+    check_text_size(size, guest_path)?;
+    let raw = std::fs::read(host).map_err(|e| anyhow::anyhow!("读取失败 {guest_path}: {e}"))?;
+    String::from_utf8(raw).map_err(|_| {
+        anyhow::anyhow!(
+            "不是 UTF-8 文本（二进制文件？）: {guest_path}；要查看内容用 bash 的 file / xxd"
+        )
+    })
+}
+
+/// 文本大小闸门。单独抽出来是为了能测（不用真写一个 32MB 的文件）。
+fn check_text_size(size: u64, guest_path: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        size <= MAX_TEXT_BYTES,
+        "文件 {}MB，超过 {}MB：不能整份读进内存（会 OOM）。\
+         用 bash 局部读，例如 `sed -n '1,2000p' {guest_path}` 或 `head -c 50000 {guest_path}`",
+        size / 1024 / 1024,
+        MAX_TEXT_BYTES / 1024 / 1024
+    );
+    Ok(())
 }
 
 /// 词法归一化：处理 `.` / `..` / 重复分隔符，**不碰文件系统**。
@@ -1340,6 +1431,47 @@ mod tests {
         assert!(sb.edit_file("/root/f.txt", &[Edit::new("x", "y")]).is_err());
         // 失败时不能留下半成品
         assert_eq!(sb.read_file("/root/f.txt").unwrap(), original);
+    }
+
+    // --- 文件读取 ---------------------------------------------------------
+
+    #[test]
+    fn read_text_resolves_the_path_and_applies_offset_and_limit() {
+        let t = TempRoot::new("read");
+        let sb = t.sandbox();
+        std::fs::create_dir_all(t.dir.join("workspace")).unwrap();
+        std::fs::write(t.dir.join("workspace/a.txt"), "l0\nl1\nl2\nl3\n").unwrap();
+
+        // 相对路径按 cwd `/workspace` 算
+        let v = sb.read_text("a.txt", 2, Some(2)).unwrap();
+        assert!(v.content.starts_with("l1\nl2"), "{}", v.content);
+        assert!(v.content.contains("offset=4"), "{}", v.content);
+    }
+
+    #[test]
+    fn oversized_text_files_are_refused_before_reading() {
+        assert!(check_text_size(1024, "/root/a.txt").is_ok());
+        assert!(check_text_size(MAX_TEXT_BYTES, "/root/a.txt").is_ok());
+        let err = check_text_size(MAX_TEXT_BYTES + 1, "/root/big.log")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OOM"), "{err}");
+        assert!(err.contains("sed -n"), "要给出替代做法: {err}");
+        assert!(err.contains("/root/big.log"), "{err}");
+    }
+
+    #[test]
+    fn read_text_rejects_missing_files_and_binaries_with_a_useful_message() {
+        let t = TempRoot::new("readbad");
+        let sb = t.sandbox();
+
+        let err = sb.read_text("/root/nope.txt", 1, None).unwrap_err().to_string();
+        assert!(err.contains("不存在"), "{err}");
+        assert!(err.contains("bash"), "应该告诉模型替代做法: {err}");
+
+        std::fs::write(t.dir.join("root/blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let err = sb.read_text("/root/blob.bin", 1, None).unwrap_err().to_string();
+        assert!(err.contains("UTF-8"), "{err}");
     }
 
     #[test]

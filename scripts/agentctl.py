@@ -144,6 +144,19 @@ def fmt_tool_output(name: str, out) -> str:
         head = "   " + c(OK if out.get("exit_code") == 0 else BAD, " ".join(bits))
         tail = indent(str(out.get("output", "")), 25)
         return f"{head}\n{tail}" if tail.strip(" │") else head
+    if name == "read":
+        if out.get("imagePath"):
+            bits = [
+                str(out.get("imageMime", "图片")),
+                f"{out.get('imageWidth', '?')}×{out.get('imageHeight', '?')}",
+            ]
+        else:
+            bits = [f"{out.get('totalLines', '?')} 行"]
+            if out.get("truncated"):
+                bits.append("已截断")
+        head = "   " + c(OK, " ".join(bits))
+        body = str(out.get("output", ""))
+        return f"{head}\n{indent(body, 25)}" if body.strip() else head
     if name == "edit":
         if out.get("replaced") is not None:
             head = "   " + c(OK, f"已替换 {out['replaced']} 处")
@@ -448,6 +461,8 @@ HELP = f"""
   /request [raw]         下一次会发给模型的完整请求体
   /prompt                看当前系统提示词
   /sessions              列会话
+  /models [refresh]      列 provider 的模型（👁 = 能看图；refresh 强制重拉目录）
+  /model <id>            切到某个模型（自动重判能不能看图）
 
 {c('1', '改')}
   /prompt <文字>         运行时换系统提示词 —— 不用重装 APK
@@ -458,7 +473,7 @@ HELP = f"""
                            /use active 改成写进当前活动会话）
 
 {c('1', '直连（绕过模型）')}
-  /bash <命令>           在沙箱里跑命令（/api/linux）
+  /bash [--timeout 秒] <命令>   在沙箱里跑命令（/api/linux）
   /cat <沙箱路径>        读沙箱里的文件（/sandbox/…）
   /dev <json>            发一条设备指令，如 /dev {{"type":"key","name":"back"}}
 
@@ -528,7 +543,18 @@ def set_prompt(text: str | None) -> None:
 
 
 def cmd_bash(script: str) -> None:
-    code, d = call("POST", "/api/linux", {"command": script}, timeout=900)
+    # 可选：/bash --timeout 3600 <命令>（长下载/编译用）。不传用服务端默认。
+    body = {"command": script}
+    client_timeout = 900.0
+    if script.startswith("--timeout"):
+        parts = script.split(None, 2)
+        if len(parts) < 3 or not parts[1].isdigit():
+            print(c(WARN, "用法：/bash --timeout <秒> <命令>"))
+            return
+        secs = int(parts[1])
+        body = {"command": parts[2], "timeout_ms": secs * 1000}
+        client_timeout = secs + 60
+    code, d = call("POST", "/api/linux", body, timeout=client_timeout)
     if code != 200 or not isinstance(d, dict):
         print(c(BAD, f"失败 {code}: {d}"))
         return
@@ -566,6 +592,28 @@ def cmd_sessions() -> None:
     for s in d.get("sessions", []):
         mark = "*" if s.get("active") else " "
         print(f" {mark} {s['id']}  {s.get('count', 0):3} 条  {s.get('title')}")
+
+
+def cmd_models(refresh: bool = False) -> None:
+    code, d = call("GET", "/api/models" + ("?refresh=1" if refresh else ""))
+    if code != 200:
+        print(c(BAD, f"失败 {code}: {d}"))
+        return
+    print(f"{d.get('name')} · {d.get('baseUrl')} · 当前 {d.get('current')}（能看图：{d.get('vision')}）")
+    for m in d.get("models", []):
+        mark = "*" if m.get("id") == d.get("current") else " "
+        eye = "👁" if m.get("vision") else "  "
+        ctx = m.get("context_window")
+        window = f"{(ctx // 1000)}K" if ctx else ""
+        print(f" {mark} {eye} {m.get('id'):<34} {window}")
+
+
+def cmd_model(model: str) -> None:
+    code, d = call("POST", "/api/model", {"model": model})
+    if code != 200:
+        print(c(BAD, f"失败 {code}: {d}"))
+        return
+    print(c(OK, f"已切到 {d.get('model')}（能看图：{d.get('vision')}）"))
 
 
 def cmd_doctor(deep: bool = False) -> int:
@@ -679,6 +727,13 @@ def handle_command(line: str) -> bool:
         cmd_dev(rest)
     elif cmd == "/sessions":
         cmd_sessions()
+    elif cmd == "/models":
+        cmd_models(refresh=(rest == "refresh"))
+    elif cmd == "/model":
+        if rest:
+            cmd_model(rest)
+        else:
+            print(c(WARN, "用法：/model <id>（/models 看列表）"))
     elif cmd == "/new":
         code, d = call("POST", "/api/sessions")
         print(c(OK, f"新会话 {d.get('id')}") if code == 200 else c(BAD, f"失败 {code}: {d}"))

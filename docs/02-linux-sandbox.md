@@ -295,7 +295,9 @@ Rust core                     ▼
 {
   "name": "bash",
   "description": "在设备上的 Alpine Linux 沙箱里执行 shell 命令。可以装包(apk add)、跑 python/node、读写文件。",
-  "schema": { "command": "string", "timeout": "number?" }
+  // timeout 是**必填**的秒数：逼模型先想「这条命令要跑多久」。默认值会诱惑
+  // 它不假思索地用一个偏短的超时，把长时间下载/编译在半路杀掉。上限 24h。
+  "schema": { "command": "string", "timeout": "number (seconds, required)" }
 }
 ```
 

@@ -183,7 +183,7 @@ just phone -- --session <会话 id> "…"    # 写进指定的那条
 ```sh
 just phone
 > /request
-model = deepseek-v4.1-flash   messages = 7   tools = ['bash', 'edit']
+model = deepseek-v4.1-flash   messages = 7   tools = ['read', 'bash', 'edit']
 stream_options = {"include_usage": true}
   [  0] system        630 B  你是运行在安卓手机上的操作助手：…
   [  1] user           12 B  在沙箱里建个 fizzbuzz
@@ -229,7 +229,7 @@ stream_options = {"include_usage": true}
 
 ## 6. 工具描述怎么改（也要重装，但可以少重启几次）
 
-工具表（`bash` / `edit` 的描述和 schema）是编译进 `.so` 的，改它要重装。
+工具表（`read` / `bash` / `edit` 的描述和 schema）是编译进 `.so` 的，改它要重装。
 但它和系统提示词一样是**可缓存前缀的一部分**，所以改完先看 `/request`
 确认工具表序列化没变过样子（`/request` 的 `tools` 字段就是当前表）。
 

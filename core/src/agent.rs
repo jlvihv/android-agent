@@ -13,10 +13,12 @@ use std::sync::OnceLock;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions, ChatCompletionTool,
+    ChatCompletionRequestMessageContentPartImageArgs,
+    ChatCompletionRequestMessageContentPartTextArgs, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionStreamOptions, ChatCompletionTool,
     ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    FunctionCall, FunctionObjectArgs,
+    FunctionCall, FunctionObjectArgs, ImageUrlArgs,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -196,16 +198,31 @@ pub fn tools() -> &'static [ToolSpec] {
 fn build_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
+            name: "read",
+            description: "读取文件。文本：offset 是起始行号（从 1 开始），limit 是最多读多少行；不传就从头读到底（或到截断上限）。输出截断到 2000 行或 50KB（先到者为准），被截断时正文末尾会写明用哪个 offset 继续读，按它接着读完整份文件。**图片（png/jpg/gif/webp/bmp）会被缩放后直接发给你，你能看到图本身**（offset/limit 对图片无效）；看截图、照片、图表都用它。改文件之前先用它确认原文。",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "文件路径（相对或绝对；相对路径基于 /workspace）" },
+                        "offset": { "type": "integer", "description": "起始行号，从 1 开始（可选，默认 1）" },
+                        "limit": { "type": "integer", "description": "最多读取的行数（可选，默认读到截断上限）" }
+                    },
+                    "required": ["path"]
+                })
+            },
+        },
+        ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里执行 shell 命令。cwd 是 /workspace；每次调用都是新进程：文件系统持久，shell 状态（变量、cwd、后台任务）不持久。输出取**尾部**（最后 2000 行或 50KB，先到者为准），被截断时完整输出会存到临时文件并返回路径。可选 timeout（秒，默认 60）。**已预装**：bash、curl、git、jq、ripgrep（rg）、fd、tree、unzip、python3（另有 GNU grep/find）。要点：ICMP/ping 被封，用 curl；装 Python 包优先 `apk add py3-*`（musllinux_aarch64 的 wheel 很少）；matplotlib 画图前先 `matplotlib.use('Agg')`；后台服务必须重定向 stdout/stderr，否则调用不会返回；搜索用 `rg -uuu` 才包含隐藏和忽略的文件。",
+            description: "在 Alpine Linux 沙箱里执行 shell 命令。cwd 是 /workspace；每次调用都是新进程：文件系统持久，shell 状态（变量、cwd、后台任务）不持久。**timeout（秒）是必填参数，没有默认值**：调用前先想清楚这条命令大概要多久 —— 下载、`apk add`、编译、`git clone`、`pip install` 要几十分钟到几小时都正常，估小了命令会被中途 SIGKILL、之前的下载/编译全部白费。**宁可估大**：命令一结束就立即返回，多估的时间不会真的等；上限 24 小时。输出取**尾部**（最后 2000 行或 50KB，先到者为准），被截断时完整输出会存到临时文件并返回路径。**已预装**：bash、curl、git、jq、ripgrep（rg）、fd、tree、unzip、python3（另有 GNU grep/find）。要点：ICMP/ping 被封，用 curl；装 Python 包优先 `apk add py3-*`（musllinux_aarch64 的 wheel 很少）；matplotlib 画图前先 `matplotlib.use('Agg')`；后台服务必须重定向 stdout/stderr，否则调用不会返回；搜索用 `rg -uuu` 才包含隐藏和忽略的文件。",
             schema: || {
                 json!({
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "要执行的 shell 命令" },
-                        "timeout": { "type": "number", "description": "超时秒数（可选，默认 60）" }
+                        "timeout": { "type": "number", "description": "超时秒数（**必填**）。先估算这条命令要跑多久；下载/编译/装包可能几千秒。宁可估大：估小了会被中途杀掉，多估不会真等。上限 86400（24h）。" }
                     },
-                    "required": ["command"]
+                    "required": ["command", "timeout"]
                 })
             },
         },
@@ -253,7 +270,27 @@ pub enum ChatMessage {
     Tool {
         tool_call_id: String,
         content: String,
+        /// 这次工具调用返回的图片（`read` 读图片时才有）。
+        ///
+        /// 不放进 `content` 里：OpenAI 的 tool 消息只能是字符串，图片必须
+        /// 作为紧随其后的一条 `user` 消息发（多个 tool 调用要等全部发完）。
+        /// 见 `build_messages`。`#[serde(default)]` 让老会话不受影响。
+        #[serde(default)]
+        images: Vec<ImagePart>,
     },
+}
+
+/// 一张已经缩好、等着内联进请求的图片。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePart {
+    /// 处理后字节的落盘路径（绝对）。组装请求时从盘上读 —— 字节一致才能
+    /// 命中 prompt cache，也不让 SQLite 里堆 base64。
+    pub path: String,
+    pub mime: String,
+    /// 沙箱里原图的路径，给模型看（裁剪/看元数据用）和界面展示用。
+    pub source: String,
+    /// 哪个工具返回的（目前只有 read）
+    pub tool: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedToolCall {
@@ -305,6 +342,7 @@ impl ChatMessage {
             ChatMessage::Tool {
                 tool_call_id,
                 content,
+                ..
             } => ChatCompletionRequestToolMessageArgs::default()
                 .tool_call_id(tool_call_id.as_str())
                 .content(content.as_str())
@@ -580,7 +618,7 @@ impl SessionStore {
 pub const SYSTEM_PROMPT: &str = "\
 你是运行在安卓手机上的操作助手：可以在 Alpine Linux 沙箱里跑命令、改文件、做出成品。\n\
 \n\
-- 跑命令用 bash，改文件用 edit。\n\
+- 读文件 / 看图用 read（图片会缩放后直接发给你看），跑命令用 bash，改文件用 edit。\n\
 - 工作目录固定在 /workspace，它就是手机内部存储的 Agent 文件夹：用户在手机\n\
   文件管理器里能直接看到，App 卸载也不会丢。给每个任务建一个有意义的子目录\n\
   （如 /workspace/天气网页），做完的成品留在里面。整个手机内部存储挂在 /sdcard，\n\
@@ -604,13 +642,111 @@ pub const SYSTEM_PROMPT: &str = "\
 
 /// 构造发给 provider 的消息数组 = **会话历史原样**。
 ///
-/// 这里**不拼任何东西** —— 系统提示词是历史里的第一条（见
-/// `ensure_system_prompt`）。于是“后一轮以前一轮为前缀”是天然的：
-/// 请求体就是历史的单调扩展。
+/// 唯一的“拼”是图片 carrier：`read` 读到图时，tool 消息后面会多一条 `user`
+/// 消息（图片只能挂在那里）。它由历史推导出来、字节确定，所以不影响
+/// “后一轮以前一轮为前缀”这条不变式 —— 系统提示词仍然是历史的第一条
+/// （见 `ensure_system_prompt`），请求体仍然是历史的单调扩展。
 fn build_messages(
     sess: &ChatSession,
+    supports_images: bool,
 ) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
-    sess.messages.iter().map(|m| m.to_openai()).collect()
+    let msgs = &sess.messages;
+    let mut out: Vec<ChatCompletionRequestMessage> = Vec::with_capacity(msgs.len());
+    let mut i = 0;
+    while i < msgs.len() {
+        if !matches!(msgs[i], ChatMessage::Tool { .. }) {
+            out.push(msgs[i].to_openai()?);
+            i += 1;
+            continue;
+        }
+
+        // 先把这一串连续的 tool 消息一次发完，再发图片。
+        //
+        // OpenAI 要求 assistant 的每个 tool_call 后面**紧跟着**对应的 tool
+        // 消息，中间不能插 user —— 一个回合调了 3 个工具、只有第 1 个带图时，
+        // 图绝不能插在第 1、2 个 tool 之间。
+        let mut carriers: Vec<(String, ImagePart)> = Vec::new();
+        while i < msgs.len() {
+            match &msgs[i] {
+                ChatMessage::Tool {
+                    tool_call_id,
+                    content,
+                    images,
+                } => {
+                    out.push(
+                        ChatCompletionRequestToolMessageArgs::default()
+                            .tool_call_id(tool_call_id.as_str())
+                            .content(content.as_str())
+                            .build()?
+                            .into(),
+                    );
+                    for img in images {
+                        carriers.push((tool_call_id.clone(), img.clone()));
+                    }
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        for (id, img) in carriers {
+            out.push(image_carrier(&id, &img, supports_images)?);
+        }
+    }
+    Ok(out)
+}
+
+/// 把一张工具返回的图片包成一条 `user` 消息。
+///
+/// 为什么是 user 消息：OpenAI Chat Completions 的 tool 消息内容只能是字符串，
+/// 工具结果里的图片没有别的合法位置可挂。OpenMinis 的 OpenAI 编码器也是这么
+/// 绕的（`ChatMessagesEncoder` 里那批 "image carriers"）。
+fn image_carrier(
+    tool_call_id: &str,
+    img: &ImagePart,
+    supports_images: bool,
+) -> anyhow::Result<ChatCompletionRequestMessage> {
+    let label = format!(
+        "[{} 返回的图片（tool_call_id: {tool_call_id}）；原文件：{}]",
+        img.tool, img.source
+    );
+
+    let mut parts: Vec<ChatCompletionRequestUserMessageContentPart> = vec![text_part(label)?];
+    if supports_images {
+        // 走缓存：每一步都要重新组装请求，不能每步都把同一张图重新 base64。
+        // 字节仍然逐字一致（文件不变），prompt cache 照命中。
+        match crate::imaging::cached_data_url(&img.path, &img.mime) {
+            Ok(url) => parts.push(image_part(&url)?),
+            Err(e) => {
+                tracing::warn!("图片读不到了 {}: {e}", img.path);
+                parts.push(text_part("[图片文件已丢失，本轮没能附带]".to_string())?);
+            }
+        }
+    } else {
+        parts.push(text_part(
+            "[当前模型不支持图片输入，这张图没有附带；它在沙箱里，可以用 bash 处理或让用户在界面上看]"
+                .to_string(),
+        )?);
+    }
+
+    Ok(ChatCompletionRequestUserMessageArgs::default()
+        .content(parts)
+        .build()?
+        .into())
+}
+
+fn text_part(text: String) -> anyhow::Result<ChatCompletionRequestUserMessageContentPart> {
+    Ok(ChatCompletionRequestMessageContentPartTextArgs::default()
+        .text(text)
+        .build()?
+        .into())
+}
+
+fn image_part(url: &str) -> anyhow::Result<ChatCompletionRequestUserMessageContentPart> {
+    let image_url = ImageUrlArgs::default().url(url.to_string()).build()?;
+    Ok(ChatCompletionRequestMessageContentPartImageArgs::default()
+        .image_url(image_url)
+        .build()?
+        .into())
 }
 
 /// 工具表的线上形态（`{"type":"function","function":{…}}` 的数组）。
@@ -669,6 +805,7 @@ pub fn session_view(sess: &ChatSession) -> Vec<Value> {
         if let ChatMessage::Tool {
             tool_call_id,
             content,
+            ..
         } = m
         {
             results.insert(tool_call_id.as_str(), content.as_str());
@@ -745,9 +882,6 @@ pub fn session_view(sess: &ChatSession) -> Vec<Value> {
     out
 }
 
-/// 一个回合最多几轮「模型 → 工具 → 模型」，防止死循环烧钱
-const MAX_STEPS: usize = 8;
-
 /// 跑一个用户回合，把 chunk 推到 `tx`。
 ///
 /// `session`：指定写进哪个会话（调试端用 —— 见 `scripts/agentctl.py` 的
@@ -762,6 +896,10 @@ pub async fn run_turn(
     core.state
         .turn_active
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    // 上一回合的「停止」不能把这一回合也停了
+    core.state
+        .abort_turn
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let _guard = TurnGuard(core.clone());
     // 系统提示词可能被 /api/debug/system-prompt 覆盖过，所以不能直接用常量。
     // 在拿会话写锁之前先取出来，避免锁套锁。
@@ -835,10 +973,18 @@ async fn drive(
     let message_id = uuid::Uuid::now_v7().to_string();
     send(tx, sse::start(&message_id)).await;
 
-    for _step in 0..MAX_STEPS {
+    // 不设轮数上限：任务要多少轮就跑多少轮，"干到一半停下" 不是可接受的
+    // 行为。唯一的出口是模型自己不再调工具，或者用户按停止
+    //（`POST /api/stop` → `abort_requested`）。
+    loop {
+        if core.state.abort_requested() {
+            send(tx, sse::abort("已停止")).await;
+            send(tx, sse::finish()).await;
+            return Ok(());
+        }
         send(tx, sse::start_step()).await;
 
-        let step = match stream_one(core, provider, sid, tx).await {
+        let step_out = match stream_one(core, provider, sid, tx).await {
             Ok(c) => c,
             Err(e) => {
                 send(tx, sse::error(&format!("{e:#}"))).await;
@@ -847,6 +993,7 @@ async fn drive(
             }
         };
         send(tx, sse::finish_step()).await;
+        let step = step_out;
 
         // 不管有没有工具调用，这一轮的 assistant 输出都要进历史
         if !step.content.is_empty() || !step.reasoning.is_empty() || !step.calls.is_empty() {
@@ -870,31 +1017,34 @@ async fn drive(
         }
 
         for call in &calls {
+            // 用户按了停止：这一批剩下的工具不再执行
+            if core.state.abort_requested() {
+                send(tx, sse::abort("已停止")).await;
+                send(tx, sse::finish()).await;
+                return Ok(());
+            }
             // 工具一律直接执行，没有审批环节。不存在的工具由 execute_tool
             // 返回错误，模型看到「未知工具 X」自己会改。
-            let output =
+            let outcome =
                 execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))).await;
-            send(tx, sse::tool_output_available(&call.id, output.clone())).await;
+            send(
+                tx,
+                sse::tool_output_available(&call.id, outcome.result.clone()),
+            )
+            .await;
             append(
                 core,
                 sid,
                 ChatMessage::Tool {
                     tool_call_id: call.id.clone(),
-                    content: output.to_string(),
+                    content: outcome.result.to_string(),
+                    images: outcome.images,
                 },
             )
             .await;
         }
         // 工具结果回灌，继续下一轮
     }
-
-    send(
-        tx,
-        sse::error(&format!("超过 {MAX_STEPS} 轮工具调用，已停止")),
-    )
-    .await;
-    send(tx, sse::finish()).await;
-    Ok(())
 }
 
 /// 构造一次完整的请求体（含工具表）。
@@ -905,8 +1055,12 @@ async fn drive(
 /// 2. 它直接产出**强类型**请求，交给 `create_stream_byot` 一次序列化。
 ///
 /// `pub` 是给 `/api/debug/request` 用的（把模型将看到的东西原样吐出来）。
-pub fn build_request(sess: &ChatSession, model: &str) -> anyhow::Result<CreateChatCompletionRequest> {
-    let messages = build_messages(sess)?;
+pub fn build_request(
+    sess: &ChatSession,
+    model: &str,
+    supports_images: bool,
+) -> anyhow::Result<CreateChatCompletionRequest> {
+    let messages = build_messages(sess, supports_images)?;
     let tools = tool_definitions()?;
 
     let req = CreateChatCompletionRequestArgs::default()
@@ -934,6 +1088,10 @@ async fn stream_one(
     sid: &str,
     tx: &mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<StepOutput> {
+    // 这个模型能不能看图：自动判定（models.dev，带缓存 + 落盘）。
+    // 在拿会话锁之前算 —— 首次判定要联网，不能拖着锁。
+    let supports_images = core.state.supports_images_for(provider).await;
+
     // SYSTEM_PROMPT 是静态常量，**这里不做任何插值** —— 见它上面的说明。
     // 动态的界面/环境信息在 run_turn 里作为独立消息进历史，保证前缀可缓存。
     let (req, session_id) = {
@@ -941,7 +1099,10 @@ async fn stream_one(
         let sess = store
             .get(sid)
             .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-        (build_request(sess, &provider.model)?, sess.provider_session.clone())
+        (
+            build_request(sess, &provider.model, supports_images)?,
+            sess.provider_session.clone(),
+        )
     };
 
     let client = provider.client(&session_id)?;
@@ -1260,9 +1421,58 @@ fn parse_edits(args: &Value) -> anyhow::Result<Vec<crate::editor::Edit>> {
         .collect()
 }
 
+/// `read` 的 offset：从 1 开始；缺失/非法/<=0 都退回第 1 行。
+fn parse_offset(args: &Value) -> usize {
+    args.get("offset")
+        .and_then(|v| v.as_i64())
+        .map(|n| n.max(1) as usize)
+        .unwrap_or(1)
+}
+
+/// `bash` 的 timeout（秒）：**必填**。缺失、非数、非正数都返回 `None`，由调用方
+/// 回一条「先估算一下」的错误给模型。超过 `MAX_TIMEOUT` 就夹到上限。
+fn parse_timeout(args: &Value) -> Option<std::time::Duration> {
+    let secs = args.get("timeout")?.as_f64()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    let capped = secs.min(linux::MAX_TIMEOUT.as_secs_f64());
+    Some(std::time::Duration::from_secs_f64(capped))
+}
+
+/// `read` 的 limit：缺失或 null = None，负数/非整数报错。
+fn parse_limit(args: &Value) -> anyhow::Result<Option<usize>> {
+    match args.get("limit") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("limit 必须是整数"))?;
+            anyhow::ensure!(n >= 0, "limit 不能是负数");
+            Ok(Some(n as usize))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 工具执行
 // ---------------------------------------------------------------------------
+
+/// 一次工具执行的结果：回给模型/前端的 JSON，外加要内联给模型的图片。
+struct ToolOutcome {
+    result: Value,
+    images: Vec<ImagePart>,
+}
+
+impl ToolOutcome {
+    /// 没有图片的普通结果（绝大多数工具）。
+    fn json(result: Value) -> Self {
+        Self {
+            result,
+            images: Vec::new(),
+        }
+    }
+}
 
 /// `live`：(推给前端的通道, 工具调用 id)。给了就把 bash 的输出边跑边推过去。
 async fn execute_tool(
@@ -1270,21 +1480,49 @@ async fn execute_tool(
     name: &str,
     arguments: &str,
     live: Option<(&mpsc::UnboundedSender<Value>, &str)>,
-) -> Value {
+) -> ToolOutcome {
     let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
 
-    // bash / edit 都不走设备（`DeviceApi`）：bash 起 proot 子进程，
-    // edit 直接改 rootfs 里的文件。
+    // read / bash / edit 都不走设备（`DeviceApi`）：read 和 edit 直接
+    // 读写 rootfs 里的文件，bash 起 proot 子进程。
+    if name == "read" {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        if path.is_empty() {
+            return ToolOutcome::json(json!({ "error": "缺少参数 path" }));
+        }
+        let offset = parse_offset(&args);
+        let limit = match parse_limit(&args) {
+            Ok(l) => l,
+            Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+        };
+
+        return match core.read_any(path, offset, limit).await {
+            Ok(linux::ReadResult::Text(view)) => ToolOutcome::json(json!({
+                "output": view.content,
+                "truncated": view.truncated,
+                "totalLines": view.total_lines,
+            })),
+            Ok(linux::ReadResult::Image(img)) => read_image_outcome(core, path, img).await,
+            Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+        };
+    }
+
     if name == "bash" {
         let script = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if script.trim().is_empty() {
-            return json!({ "error": "缺少参数 command" });
+            return ToolOutcome::json(json!({ "error": "缺少参数 command" }));
         }
-        let timeout = args
-            .get("timeout")
-            .and_then(|v| v.as_f64())
-            .map(|s| std::time::Duration::from_secs_f64(s.clamp(1.0, 600.0)))
-            .unwrap_or(linux::DEFAULT_TIMEOUT);
+        // timeout **必填**：不让模型靠一个偏短的默认值蒙混，逼它先想「这条
+        // 命令要跑多久」。估小了的代价是命令被 SIGKILL、前面的活儿白干，
+        // 所以宁可估大。
+        let Some(timeout) = parse_timeout(&args) else {
+            return ToolOutcome::json(json!({
+                "error": "缺少参数 timeout（或不是正数）。调用 bash 之前必须先估算这条命令\
+                          要跑多久，把秒数显式传进来：下载 / `apk add` / 编译 / `git clone`\
+                          可能要几十分钟到几小时。**宁可估大** —— 估小了命令会被中途杀掉，\
+                          之前的进度全白费；多估不会真的等（命令一结束就返回）。上限 24 小时。"
+            }));
+        };
 
         let res = match live {
             Some((tx, id)) => {
@@ -1298,41 +1536,106 @@ async fn execute_tool(
             None => core.run_linux(script, timeout).await,
         };
         return match res {
-            Ok(r) => json!({
+            Ok(r) => ToolOutcome::json(json!({
                 "output": r.to_text(),
                 "exit_code": r.code,
                 "truncated": r.truncated,
                 "full_output_path": r.full_output_path,
                 "wall_time_seconds": (r.duration_ms as f64) / 1000.0,
-            }),
-            Err(e) => json!({ "error": format!("{e:#}") }),
+            })),
+            Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
         };
     }
 
     if name == "edit" {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
         if path.is_empty() {
-            return json!({ "error": "缺少参数 path" });
+            return ToolOutcome::json(json!({ "error": "缺少参数 path" }));
         }
         let edits = match parse_edits(&args) {
             Ok(e) => e,
-            Err(e) => return json!({ "error": format!("{e:#}") }),
+            Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
         };
 
         return match core.edit_file(path, &edits).await {
-            Ok(out) => json!({
+            Ok(out) => ToolOutcome::json(json!({
                 "ok": true,
                 "message": format!("已替换 {} 处", edits.len()),
                 "firstChangedLine": out.first_changed_line,
                 "diff": out.patch,
-            }),
-            Err(e) => json!({ "error": format!("{e:#}") }),
+            })),
+            Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
         };
     }
 
     // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）现在**不作为工具**
     // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
-    json!({ "error": format!("未知工具 {name}") })
+    ToolOutcome::json(json!({ "error": format!("未知工具 {name}") }))
+}
+
+/// 图片结果：缩好的字节落盘（历史回放时还要重发），回给模型一段能读的说明
+/// 外加原图路径；图片本体作为 `images` 走 `build_messages` 里那条 carrier。
+async fn read_image_outcome(
+    core: &Core,
+    guest_path: &str,
+    img: crate::imaging::Encoded,
+) -> ToolOutcome {
+    // 模型不支持图片时不落盘、不附带：只给一段说明。
+    // 用缓存里的自动判定值（本回合开始时 stream_one 已经算过）。
+    let supports_images = core
+        .state
+        .llm()
+        .map(|p| core.state.cached_supports_images(&p))
+        .unwrap_or(true);
+
+    let mime = img.mime.clone();
+    let original = format!("{}×{}", img.original_width, img.original_height);
+    let mut output = format!("读取图片 {mime}（{original}");
+    if (img.width, img.height) != (img.original_width, img.original_height) {
+        output.push_str(&format!("，已缩到 {}×{}", img.width, img.height));
+    }
+    output.push_str(&format!(
+        "）。原文件：{guest_path} —— 要裁剪或看元数据就用这个路径。"
+    ));
+
+    if !supports_images {
+        output.push_str("\n[当前模型不支持图片输入，这张图没有发给模型]");
+        return ToolOutcome::json(json!({
+            "output": output,
+            "imagePath": guest_path,
+            "imageMime": mime,
+            "truncated": false,
+        }));
+    }
+
+    match core.save_image(img.bytes, mime.clone()).await {
+        Ok(stored) => ToolOutcome {
+            result: json!({
+                "output": output,
+                "imagePath": guest_path,
+                "imageMime": mime.clone(),
+                "imageWidth": img.width,
+                "imageHeight": img.height,
+                "truncated": false,
+            }),
+            images: vec![ImagePart {
+                path: stored.display().to_string(),
+                mime,
+                source: guest_path.to_string(),
+                tool: "read".to_string(),
+            }],
+        },
+        Err(e) => {
+            tracing::warn!("图片落盘失败: {e:#}");
+            output.push_str(&format!("\n[图片没能保存，本轮没发给模型：{e:#}]"));
+            ToolOutcome::json(json!({
+                "output": output,
+                "imagePath": guest_path,
+                "imageMime": mime,
+                "truncated": false,
+            }))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,7 +1645,7 @@ mod tests {
     use super::*;
 
     fn wire(sess: &ChatSession) -> Vec<serde_json::Value> {
-        build_messages(sess)
+        build_messages(sess, true)
             .unwrap()
             .iter()
             .map(|m| serde_json::to_value(m).unwrap())
@@ -1376,6 +1679,7 @@ mod tests {
         sess.messages.push(ChatMessage::Tool {
             tool_call_id: "c1".into(),
             content: "ok".into(),
+            images: vec![],
         });
         ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
         sess.messages.push(ChatMessage::User("第二问".into()));
@@ -1472,7 +1776,9 @@ mod tests {
         ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
         sess.messages.push(ChatMessage::User("第一问".into()));
         // 转成 Value 是为了断言请求体本身；线上路径不经过这一步
-        let req1 = serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash").unwrap()).unwrap();
+        let req1 =
+            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true).unwrap())
+                .unwrap();
 
         sess.messages.push(ChatMessage::Assistant {
             content: "答".into(),
@@ -1486,9 +1792,12 @@ mod tests {
         sess.messages.push(ChatMessage::Tool {
             tool_call_id: "c1".into(),
             content: "ok".into(),
+            images: vec![],
         });
         sess.messages.push(ChatMessage::User("第二问".into()));
-        let req2 = serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash").unwrap()).unwrap();
+        let req2 =
+            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true).unwrap())
+                .unwrap();
 
         assert_eq!(req1["tools"], req2["tools"], "工具表变了 → 整段前缀缓存失效");
         assert_eq!(req1["model"], req2["model"]);
@@ -1500,6 +1809,82 @@ mod tests {
         assert_eq!(&b[..a.len()], &a[..], "完整请求体不是前缀关系");
     }
 
+    /// 工具返回的图片：必须作为一条 `user` 消息发在**所有** tool 消息之后。
+    ///
+    /// 顺序错了 OpenAI 直接 400（tool 消息之间不能插 user），而且这种错
+    /// 只有真机、只有「一个回合调了好几个工具、其中一个带图」时才会出现。
+    #[test]
+    fn tool_images_are_carried_after_all_tool_replies() {
+        let img = std::env::temp_dir().join(format!("agent-carrier-{}.png", std::process::id()));
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let call = |id: &str| RecordedToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::User("看图".into()),
+            ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![call("c1"), call("c2")],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "c1".into(),
+                content: "{}".into(),
+                images: vec![ImagePart {
+                    path: img.display().to_string(),
+                    mime: "image/png".into(),
+                    source: "/workspace/a.png".into(),
+                    tool: "read".into(),
+                }],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "c2".into(),
+                content: "{}".into(),
+                images: vec![],
+            },
+        ];
+
+        let v: Vec<Value> = build_messages(&sess, true)
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        let roles: Vec<&str> = v.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "tool", "user"]);
+        let parts = v[4]["content"].as_array().expect("carrier 是内容数组");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(parts[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        // 同一份历史必须序列化出**完全一样**的请求：图片从盘上重读，
+        // 字节必须一致，否则 prompt cache 每轮都失效。
+        let again: Vec<Value> = build_messages(&sess, true)
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(v, again, "带图的历史不是逐字节可复现的");
+
+        // 模型不支持图片时：仍然有这条 carrier，但只有文字说明
+        let v: Vec<Value> = build_messages(&sess, false)
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(v[4]["role"], "user");
+        let parts = v[4]["content"].as_array().unwrap();
+        assert!(parts.iter().all(|p| p["type"] == "text"));
+
+        let _ = std::fs::remove_file(&img);
+    }
+
     #[test]
     fn tool_schema_order_and_names_are_fixed() {
         // 工具表也是可缓存前缀的一部分。顺序必须稳定，
@@ -1508,7 +1893,7 @@ mod tests {
         // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）暂时**不作为工具**
         // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
         let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["bash", "edit"]);
+        assert_eq!(names, vec!["read", "bash", "edit"]);
         // 重复调用必须完全一致
         assert_eq!(names, tools().iter().map(|t| t.name).collect::<Vec<_>>());
     }
@@ -1557,6 +1942,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_offset_and_limit_match_the_schema() {
+        // 缺省 → 第 1 行、读到上限
+        assert_eq!(parse_offset(&json!({})), 1);
+        assert_eq!(parse_limit(&json!({})).unwrap(), None);
+        assert_eq!(parse_limit(&json!({ "limit": null })).unwrap(), None);
+
+        assert_eq!(parse_offset(&json!({ "offset": 42 })), 42);
+        // 非法/越界的 offset 退回第 1 行，不报错（模型偶发写 0）
+        assert_eq!(parse_offset(&json!({ "offset": 0 })), 1);
+        assert_eq!(parse_offset(&json!({ "offset": -3 })), 1);
+        assert_eq!(parse_offset(&json!({ "offset": "x" })), 1);
+
+        assert_eq!(parse_limit(&json!({ "limit": 5 })).unwrap(), Some(5));
+        assert_eq!(parse_limit(&json!({ "limit": 0 })).unwrap(), Some(0));
+        assert!(parse_limit(&json!({ "limit": -1 })).is_err());
+        assert!(parse_limit(&json!({ "limit": "5" })).is_err());
+    }
+
+    #[test]
+    fn bash_timeout_is_required_and_capped() {
+        // 缺失 / 非法都不能偷偷用一个短默认值
+        assert!(parse_timeout(&json!({})).is_none());
+        assert!(parse_timeout(&json!({ "timeout": null })).is_none());
+        assert!(parse_timeout(&json!({ "timeout": 0 })).is_none());
+        assert!(parse_timeout(&json!({ "timeout": -5 })).is_none());
+        assert!(parse_timeout(&json!({ "timeout": "600" })).is_none());
+
+        // 普通值原样，长时间任务（比如 3 小时下载）完全允许
+        assert_eq!(parse_timeout(&json!({ "timeout": 600 })).unwrap().as_secs(), 600);
+        assert_eq!(
+            parse_timeout(&json!({ "timeout": 10800 })).unwrap().as_secs(),
+            10800
+        );
+        // 超过上限就夹到 24h，而不是报错或无限大
+        assert_eq!(parse_timeout(&json!({ "timeout": 999_999_999 })).unwrap(), linux::MAX_TIMEOUT);
+        assert!(linux::MAX_TIMEOUT >= std::time::Duration::from_secs(6 * 3600));
+    }
+
+    #[test]
     fn parse_edits_rejects_malformed_input_with_a_locatable_message() {
         let e = parse_edits(&json!({ "edits": "nope" })).unwrap_err();
         assert!(e.to_string().contains("数组"), "{e}");
@@ -1580,7 +2004,7 @@ mod tests {
             ChatMessage::System("ctx".into()),
             ChatMessage::User("问".into()),
             ChatMessage::Assistant { content: "先看看".into(), reasoning: "想1".into(), tool_calls: vec![call("c1")] },
-            ChatMessage::Tool { tool_call_id: "c1".into(), content: "{}".into() },
+            ChatMessage::Tool { tool_call_id: "c1".into(), content: "{}".into(), images: vec![] },
             ChatMessage::Assistant { content: "答".into(), reasoning: "想2".into(), tool_calls: vec![] },
             ChatMessage::User("再问".into()),
             ChatMessage::Assistant { content: "再答".into(), reasoning: String::new(), tool_calls: vec![] },
@@ -1723,7 +2147,11 @@ mod tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
             },
-            ChatMessage::Tool { tool_call_id: "c1".into(), content: "apk 的输出".into() },
+            ChatMessage::Tool {
+                tool_call_id: "c1".into(),
+                content: "apk 的输出".into(),
+                images: vec![],
+            },
         ];
 
         let mut b = ChatSession::new();

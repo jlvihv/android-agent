@@ -38,6 +38,8 @@
     const firstLine = (v: string) => v.split('\n')[0].trim();
 
     switch (t.toolName) {
+      case 'read':
+        return `读取 ${s(a.path) || '文件'}`;
       case 'bash':
         return firstLine(s(a.command)) || '执行命令';
       case 'edit':
@@ -78,6 +80,8 @@
   /** 面板标题。要短，细节放正文。 */
   function toolTitle(t: ToolPart): string {
     switch (t.toolName) {
+      case 'read':
+        return '读取文件';
       case 'bash':
         return '执行命令';
       case 'edit':
@@ -91,6 +95,7 @@
   function primary(t: ToolPart): string {
     const a = (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
     const s = (v: unknown) => (typeof v === 'string' ? v : '');
+    if (t.toolName === 'read') return s(a.path);
     if (t.toolName === 'bash') return s(a.command);
     if (t.toolName === 'edit') return s(a.path);
     if (t.input !== undefined) return JSON.stringify(t.input, null, 2);
@@ -116,6 +121,8 @@
     body: string;
     diff: boolean;
     path: string | null;
+    /** 工具返回的图片在沙箱里的路径（read 读图才有） */
+    image: string | null;
   };
 
   /**
@@ -140,6 +147,7 @@
       body,
       diff: false,
       path: null,
+      image: null,
     });
 
     if (typeof o === 'string') return plain('输出', o);
@@ -173,8 +181,10 @@
 
     const failed = typeof r.exit_code === 'number' && r.exit_code !== 0;
 
+    const image = typeof r.imagePath === 'string' ? r.imagePath : null;
+
     if (typeof r.diff === 'string') {
-      return { chips, label: '改动', failed: false, body: r.diff, diff: true, path: null };
+      return { chips, label: '改动', failed: false, body: r.diff, diff: true, path: null, image };
     }
 
     if (typeof r.output === 'string') {
@@ -185,10 +195,11 @@
         body: r.output,
         diff: false,
         path: typeof r.full_output_path === 'string' ? r.full_output_path : null,
+        image,
       };
     }
 
-    return { chips, label: '结果', failed: false, body: kv(o), diff: false, path: null };
+    return { chips, label: '结果', failed: false, body: kv(o), diff: false, path: null, image };
   }
 
   /**
@@ -325,7 +336,14 @@
               <Icon name="chevron" size={15} class="ml-auto shrink-0 text-faint" />
             </button>
           {:else if part.type === 'data'}
-            <!-- 用量不显示：Claude 没有，看着啰嗦 -->
+            <!-- 用量不显示（Claude 没有，看着啰嗦）；警告要显示，
+                 否则「输出被长度上限截断」这种中途停下的提示是隐形的 -->
+            {#if part.name === 'warning'}
+              {@const w = part.data as { message?: string }}
+              {#if w?.message}
+                <p class="text-[13px] text-warn">⚠️ {w.message}</p>
+              {/if}
+            {/if}
           {:else if part.type === 'error'}
             <p class="text-[13px] text-bad">错误：{part.text}</p>
           {/if}
@@ -376,6 +394,15 @@
                 <span class="rounded-full px-2 py-0.5 text-meta {CHIP[c.tone]}">{c.text}</span>
               {/each}
             </div>
+
+            {#if res.image}
+              <!-- read 读到的图：直接展示原图（沙箱路由），模型看的是缩放后的那份 -->
+              <img
+                src={`/sandbox${encodeURI(res.image)}`}
+                alt="工具返回的图片"
+                class="max-h-80 w-auto self-start rounded-xl bg-hairline-soft object-contain"
+              />
+            {/if}
 
             {#if res.diff}
               <div

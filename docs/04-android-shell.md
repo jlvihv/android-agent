@@ -440,6 +440,10 @@ dev_shell 'uname -m'
 安卓上 App **不继承 shell 环境变量**，所以 LLM 配置走运行时接口
 `POST /api/llm`，并持久化到 `<filesDir>/llm.json`。
 
+模型能不能看图不靠人配：`GET /api/models` 拉 provider 的 `/models` 清单，
+再查 models.dev 目录（缓存 48h）里该模型的 `modalities.input`，自动得出。
+`POST /api/model` 可在同一 provider 内换模型（自动重判）。
+
 ---
 
 ## 8. 还欠的债
@@ -452,4 +456,5 @@ dev_shell 'uname -m'
 4. **API key 明文存在 `<filesDir>/llm.json`。** 受 Android 沙箱保护，
    但下一步应该用 Android Keystore 加密。
 5. **没有 Web 端的设置界面。** 目前只能用 `curl POST /api/llm` 配置。
-   应该加个设置页。
+   现在有 `GET /api/models`（带能否看图）+ `POST /api/model`，接一个
+   模型选择页只差前端。

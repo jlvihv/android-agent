@@ -64,7 +64,11 @@
       // 服务端说没变：连 JSON 里都不带 messages，什么都不用做
       if (d.unchanged) return;
       rev = d.rev ?? '';
-      messages = reconcile(messages, d.messages ?? []);
+      // rev 的格式是 `会话id:消息数:更新时间`。会话 id 变了（切会话 / 重置）
+      // 就不能按 id 复用旧消息 —— `u1` 这种 id 每条会话都会有。
+      const sid = rev.split(':')[0];
+      messages = sid === sessionId ? reconcile(messages, d.messages ?? []) : (d.messages ?? []);
+      sessionId = sid;
     } catch {
       /* 拉不到就算了 */
     }
@@ -78,19 +82,34 @@
    */
   let rev = '';
 
+  /** 当前会话 id（从 rev 里解出来）。切会话时清掉，避免跨会话复用消息对象。 */
+  let sessionId = '';
+
   /**
-   * 能复用的旧消息对象原样留着。
+   * 能复用的旧消息对象原样留着，Svelte 就不会重新渲染它们的 DOM。
    *
-   * 轮询每 1.5 秒拉一次整份会话，直接整体替换的话每条消息都是新对象，
-   * 所有 markdown 全部重新解析、重新渲染 —— 跑长任务时划动明显掉帧。
-   * 内容没变的消息留旧对象，Svelte 就不会碰它们的 DOM。
+   * 服务端的会话是**只追加**的：一条消息 append 之后内容不再变。唯一的例外
+   * 是最后一条 assistant —— 一个回合里它会把多步的 parts 合进来、越变越长。
+   * 所以除了最后一条，能按 id 对上的消息直接复用；最后一条永远用新的。
+   *
+   * 以前这里比的是 `JSON.stringify(o) === JSON.stringify(m)`：轮询每 1.5 秒
+   * 就要把**整段历史**（包括每个 50KB 的 bash 输出）序列化两遍 —— 长任务
+   * 轮询时这是最大的一笔 CPU 和 GC。id 是位置标识，只追加的情况下对 id
+   * 就够了。
    */
   function reconcile(prev: Message[], next: Message[]): Message[] {
-    const old = new Map(prev.map((m) => [m.id, m]));
-    return next.map((m) => {
-      const o = old.get(m.id);
-      return o && JSON.stringify(o) === JSON.stringify(m) ? o : m;
-    });
+    // 切会话 / 清空 / 换了一条会话：不能复用
+    if (next.length < prev.length) return next;
+    if (prev.length > 0 && next.length > 0 && prev[0].id !== next[0].id) return next;
+
+    // 只复用「上次就已经不是最后一条」的消息：上次的最后一条当时可能还在长
+    // （一个回合里 assistant 消息会把多步 parts 合进来），它保存的可能是半成品。
+    const out = next.slice();
+    const prevLast = prev.length - 1;
+    for (let i = 0; i < Math.min(prev.length, next.length); i++) {
+      if (i < prevLast && prev[i].id === next[i].id) out[i] = prev[i];
+    }
+    return out;
   }
 
   async function loadSessions() {
@@ -107,6 +126,7 @@
     // 这里只把本地视图清空 —— 点了不发就不会攒出一堆空会话。
     fresh = true;
     rev = '';
+    sessionId = '';
     messages = [];
     drawer = false;
   }
@@ -119,6 +139,7 @@
     });
     fresh = false;
     rev = '';
+    sessionId = '';
     await Promise.all([loadSessions(), loadMessages()]);
     drawer = false;
   }
@@ -140,6 +161,7 @@
     });
     fresh = false;
     rev = '';
+    sessionId = '';
     await Promise.all([loadSessions(), loadMessages()]);
   }
 
@@ -234,7 +256,12 @@
     void run(msg, '/api/chat', { text, fresh: startFresh });
   }
 
-  const stop = () => controller?.abort();
+  const stop = () => {
+    // 服务端循环看不到 SSE 断连（tx.send 失败会被忽略），得显式告诉它停。
+    // 否则前端显示停了，agent 还在后台一轮轮跑工具、烧 token。
+    void fetch('/api/stop', { method: 'POST' });
+    controller?.abort();
+  };
 </script>
 
 <div class="shell relative h-full overflow-hidden bg-ink" style:--composer-h="{composerH}px">

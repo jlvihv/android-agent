@@ -55,6 +55,13 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 webpki-roots = "1"
 
+# `read` 工具读图片：解码 → 按 EXIF 转正 → 缩到 2000×2000 → 重编码。
+# 移植 OpenMinis 的 ImageReader.kt（那边用 Android BitmapFactory，这边纯 Rust）。
+# default-features = false：不要 rayon，也别把 avif/exr/tiff 那些拖进 Android 包。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# 图片以 data URL 发出，直接 base64
+base64 = "0.22"
+
 # 会话持久化。bundled = 把 SQLite 源码一起编进来，不依赖系统库
 # （Android 上根本没有 libsqlite3.so 可链）。
 # 为什么不是 JSON 文件：追加一条消息要全量重写，流式输出时就是每秒
