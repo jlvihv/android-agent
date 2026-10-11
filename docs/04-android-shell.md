@@ -451,8 +451,16 @@ dev_shell 'uname -m'
 1. **proot 是从本地 OpenMinis checkout 复制的二进制。**
    正式发布前必须自己编 —— provenance + 许可证（proot GPL-2.0，OpenMinis fork 也 GPL）。
    `just android-assets` 里标了警告。
-2. **只有 arm64 有 proot。** x86_64 模拟器上 `bash`/`edit` 会失败。
-3. **`.so` 5.7 MB。** `aws-lc-rs` 是大头，换 `ring` 能省不少。
+2. **只出 arm64-v8a。** 要跑模拟器得把 `x86_64` 加回 `abiFilters` 和
+   `android-libs` 的 `cargo ndk -t`（加回来真机就白带 4MB）。
+3. ~~**`.so` 5.7 MB，`aws-lc-rs` 是大头。**~~ 已处理：
+   - `aws-lc-rs` → `ring`（reqwest/async-openai 走 `rustls-no-provider`）
+   - `tracing-subscriber` 改成非安卓依赖（它把 `regex` 也带进来了）
+   - `android_logger` 关掉默认的 `regex` feature
+   - `async-openai` 去掉没用的 `responses` feature
+   现在 `.so` **7.06 MB**（比之前大是因为加了 `image` 解码器），release APK **7.1 MB**。
+   再省就得砍 `image` 的 webp/gif/bmp（~0.3MB）或绕过 reqwest 的
+   `rustls-platform-verifier`（~0.1MB）。
 4. **API key 明文存在 `<filesDir>/llm.json`。** 受 Android 沙箱保护，
    但下一步应该用 Android Keystore 加密。
 5. **没有 Web 端的设置界面。** 目前只能用 `curl POST /api/llm` 配置。

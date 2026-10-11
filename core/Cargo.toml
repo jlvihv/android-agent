@@ -50,8 +50,12 @@ http = "1"
 # 自己造 reqwest client，绕开 rustls-platform-verifier（R9）。
 # Android 上后者要求先 init_with_env(env, context)，否则第一次请求就 panic。
 # 见 src/llm.rs 的 tls_config() 说明。
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+#
+# rustls-no-provider 而不是 rustls：后者硬编码 aws-lc-rs（AWS-LC 是个大 C 库）。
+# crypto provider 由我们自己的 rustls 依赖选（ring，更小）。
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# ring 而不是 aws-lc-rs：体积小不少（aws-lc 是个完整的 C 库）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 webpki-roots = "1"
 
 # `read` 工具读图片：解码 → 按 EXIF 转正 → 缩到 2000×2000 → 重编码。
@@ -76,7 +80,7 @@ uniffi = { version = "0.32", features = ["tokio"] }
 # `reasoning_content`（自带类型里没这个字段，也没有 flatten extra）。
 # 只要 chat-completion（代码里没用 responses，开着它白白把一堆类型编进 .so）。
 async-openai = { version = "0.42", default-features = false, features = [
-    "rustls",
+    "rustls-no-provider",
     "chat-completion",
     "byot",
 ] }
