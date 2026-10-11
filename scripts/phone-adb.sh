@@ -15,6 +15,13 @@
 # 它们只依赖 adb，不关心底下是 USB 还是无线。
 set -euo pipefail
 
+# ⚠️ 自己的 stdin 关掉：`adb shell` 会把 stdin 转发给远端命令，
+# 于是调用方（`printf '/bash ls\n' | just phone` 这种管道）喂进来的东西
+# 会被这里的第一条 adb 吃掉，后面的 python 客户端收到空 stdin 直接退出。
+# 我们不需要 stdin，直接用 /dev/null。
+exec 0</dev/null
+
+
 . "$(dirname "$0")/adb.sh"
 
 # mdns 发现：$1 = 服务类型

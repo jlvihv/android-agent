@@ -23,6 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -169,11 +170,144 @@ impl ExecResult {
 
 pub struct LinuxSandbox {
     cfg: SandboxConfig,
+    /// 核心 HTTP 服务的端口。`agent` 命令靠它找到「自己」（见 `AGENT_CLI`）。
+    /// 0 = 还不知道（核心还没 bind），这时不注入环境变量。
+    agent_port: AtomicU16,
+}
+
+/// 沙箱里的 `agent` 命令。
+///
+/// 为什么要有它：模型平时只看得见自己的上下文和历史，看不见「自己现在什么状态」。
+/// 这个命令让它能查自己（状态 / 下一次会收到的完整上下文 / 会话），
+/// 也能操作自己所在的这台手机（坐标点击、按键、启动应用）。
+///
+/// 只用 busybox 的 wget，没有别的依赖 —— Alpine minirootfs 里就有。
+/// 端口由 App 通过 `AGENT_PORT` 注入（`guest_env`）。
+const AGENT_CLI: &str = r##"#!/bin/sh
+# agent —— 在沙箱里和**自己**说话。
+#
+# 这个 App 的核心是个只听 127.0.0.1 的 HTTP 服务，这个脚本只是它的薄包装：
+# 让你能看见自己（状态、下一次会收到的上下文、会话），也能操作自己所在的
+# 这台手机。输出基本都是原始 JSON。
+#
+#   agent help               看全部
+#   agent state              我现在的状态
+#   agent request            下一次会发给我自己的完整请求体（提示词 + 工具表 + 历史）
+#   agent tools              我有哪些工具
+#   agent sessions           会话列表
+#   agent session            当前这条会话的消息（不会切走你正在看的那条）
+#   agent doctor             各部件体检
+#   agent command <json>     操作这台手机，例如 '{"type":"key","name":"back"}'
+#   agent get <path>         直接 GET 自己的接口（逃生口）
+#   agent post <path> <json> 直接 POST
+#
+# 端口从 $AGENT_PORT 来。看不到它就说明不是在 agent 的 bash 里。
+set -eu
+
+BASE="${AGENT_BASE:-http://127.0.0.1:${AGENT_PORT:-}}"
+if [ -z "$BASE" ] || [ "$BASE" = "http://127.0.0.1:" ]; then
+  echo "AGENT_PORT 没设 —— 不是在 agent 的 bash 里跑？" >&2
+  exit 1
+fi
+
+# 「改自己身份」的接口不从这儿走：别让网页里的一段话把 agent 自己改了。
+guard() {
+  case "$1" in
+    /api/llm*|/api/debug/system-prompt*)
+      echo "拒绝：$1 会改掉我自己的身份（模型 / key / 提示词）。" >&2
+      echo "那两件事留给人做：在宿主机上跑 scripts/agentctl.py" >&2
+      exit 3
+      ;;
+  esac
+}
+
+get() {
+  guard "$1"
+  wget -q -T 120 -O - "$BASE$1" || { echo "GET $1 失败" >&2; exit 1; }
+}
+
+post() {
+  guard "$1"
+  wget -q -T 120 -O - --header 'content-type: application/json' --post-data "$2" "$BASE$1" \
+    || { echo "POST $1 失败" >&2; exit 1; }
+}
+
+# 把一行 JSON 摊开，方便人看（没有 jq，纯 shell）
+fmt() { tr ',' '\n' | tr -d '{}"' | sed 's/^[[:space:]]*//; /^[[:space:]]*$/d'; }
+
+cmd="${1:-help}"
+case "$cmd" in
+  state)    get /api/debug/state | fmt ;;
+  request)  get /api/debug/request | fmt ;;
+  tools)    get /api/debug/tools | tr ',' '\n' | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p' ;;
+  sessions) get /api/sessions | fmt ;;
+  session)  get /api/session | fmt ;;
+  doctor)
+    get /api/health | fmt
+    echo '--- 在沙箱里跑一句 ---'
+    post /api/linux '{"command":"echo ok"}'
+    ;;
+  command)
+    if [ $# -lt 2 ]; then
+      cat >&2 <<'EOT'
+用法：agent command '{"type":"key","name":"back"}'
+可用的 type：
+  {"type":"key","name":"back|home|recents|notifications"}
+  {"type":"tap_xy","x":540,"y":1200}
+  {"type":"swipe","x1":540,"y1":1800,"x2":540,"y2":600,"ms":300}
+  {"type":"launch","package":"com.android.settings"}
+EOT
+      exit 2
+    fi
+    post /api/command "{\"cmd\":$2}"
+    ;;
+  get)  [ $# -ge 2 ] || { echo "用法：agent get /api/…" >&2; exit 2; }; get "$2" ;;
+  post) [ $# -ge 3 ] || { echo "用法：agent post /api/… '{…}'" >&2; exit 2; }; post "$2" "$3" ;;
+  help|-h|--help)
+    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,20p'
+    ;;
+  *)
+    echo "不认识的子命令：$cmd（agent help）" >&2
+    exit 2
+    ;;
+esac
+"##;
+
+/// 只在内容变了才写，避免每次启动都碰文件（和 resolv.conf 一样的做法）。
+///
+/// `exec` = 写成 0755（可执行）。
+fn write_if_changed(path: &Path, body: &str, exec: bool) -> anyhow::Result<()> {
+    let same = std::fs::read_to_string(path)
+        .map(|old| old == body)
+        .unwrap_or(false);
+    if same {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, body)?;
+    #[cfg(unix)]
+    if exec {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = exec;
+    Ok(())
 }
 
 impl LinuxSandbox {
     pub fn new(cfg: SandboxConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            agent_port: AtomicU16::new(0),
+        }
+    }
+
+    /// 核心 bind 成功后告诉沙箱自己的端口 —— 沙箱里的 `agent` 命令要靠它。
+    pub fn set_agent_port(&self, port: u16) {
+        self.agent_port.store(port, Ordering::Relaxed);
     }
 
     /// 从环境变量构造（桌面开发用）。
@@ -238,6 +372,9 @@ impl LinuxSandbox {
         for d in ["root", "tmp", "var/tmp", "workspace", "sdcard"] {
             std::fs::create_dir_all(rootfs.join(d))?;
         }
+
+        // 沙箱里的 `agent` 命令：让模型能查看 / 操作自己
+        write_if_changed(&rootfs.join("usr/local/bin/agent"), AGENT_CLI, true)?;
 
         let resolv = rootfs.join("etc/resolv.conf");
         let servers = self.resolved_dns();
@@ -368,6 +505,13 @@ impl LinuxSandbox {
         // TZ 必须是 POSIX 格式（符号与 UTC 偏移相反）：musl 的 TZ 解析器
         // 认不出 "GMT+8" 这种带 +/- 的缩写
         env.insert("TZ".into(), posix_tz(self.cfg.tz_offset_minutes));
+
+        // 沙箱里的 `agent` 命令靠它找到核心（App 在 bind 成功后注入）
+        let port = self.agent_port.load(Ordering::Relaxed);
+        if port != 0 {
+            env.insert("AGENT_PORT".into(), port.to_string());
+            env.insert("AGENT_BASE".into(), format!("http://127.0.0.1:{port}"));
+        }
 
         // 给 guest 程序用的临时目录
         if let Some(tmp) = &self.cfg.tmp {
@@ -1081,6 +1225,65 @@ mod tests {
         sb.prepare_rootfs().unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 沙箱里那个 `agent` 命令是 `prepare_rootfs` 写进去的。
+    ///
+    /// 它是模型「查看 / 操作自己」的唯一入口（`agent state` / `agent request` /
+    /// `agent command`），掉了就等于这个能力没了 —— 而且不会有任何报错，
+    /// 只是模型发现 `agent: not found`。
+    #[test]
+    fn prepare_rootfs_installs_the_agent_cli() {
+        let t = TempRoot::new("agentcli");
+        let sb = t.sandbox();
+        sb.prepare_rootfs().unwrap();
+
+        let cli = t.dir.join("usr/local/bin/agent");
+        let body = std::fs::read_to_string(&cli).expect("agent 命令没写进去");
+        assert!(body.starts_with("#!/bin/sh"), "要有 shebang");
+        assert!(body.contains("/api/debug/request"), "得能看自己的上下文");
+        assert!(body.contains("/api/command"), "得能操作手机");
+        assert!(body.contains("AGENT_PORT"), "端口从环境变量来");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cli).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "必须可执行（现在是 {:o}）", mode);
+        }
+
+        // 语法交给 sh -n 过一遍（busybox ash 的语法是 POSIX 子集，够了）
+        if let Ok(out) = std::process::Command::new("sh").arg("-n").arg(&cli).output() {
+            assert!(
+                out.status.success(),
+                "shell 语法不过：{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // 幂等：再跑一次不炸
+        sb.prepare_rootfs().unwrap();
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    /// `agent` 命令靠 `AGENT_PORT` 找到核心；核心还没 bind 时不该注入。
+    #[test]
+    fn guest_env_carries_the_agent_port_once_known() {
+        let t = TempRoot::new("agentport");
+        let sb = t.sandbox();
+
+        let has = |k: &str| sb.guest_env().iter().any(|(n, _)| n == k);
+        assert!(!has("AGENT_PORT"), "还没 bind 就不该有端口");
+
+        sb.set_agent_port(41234);
+        let env: BTreeMap<String, String> = sb.guest_env().into_iter().collect();
+        assert_eq!(env.get("AGENT_PORT").map(String::as_str), Some("41234"));
+        assert_eq!(
+            env.get("AGENT_BASE").map(String::as_str),
+            Some("http://127.0.0.1:41234")
+        );
+
+        let _ = std::fs::remove_dir_all(&t.dir);
     }
 
     #[test]

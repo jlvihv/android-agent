@@ -237,6 +237,11 @@ impl Core {
         let actual = listener.local_addr()?.port();
         self.state.port.store(actual, Ordering::Relaxed);
 
+        // 沙箱里的 `agent` 命令要靠端口找到核心（见 linux.rs 的 AGENT_CLI）
+        if let Some(sb) = self.state.linux() {
+            sb.set_agent_port(actual);
+        }
+
         let app = http::router(self.state.clone());
         let st = self.state.clone();
         tokio::spawn(async move {

@@ -101,6 +101,7 @@ adb shell cat /proc/net/tcp | awk -v u="$uid" '$4=="0A" && $8==u && $2 ~ /^01000
 | 看模型将看到什么 | ✅ | `/request` |
 | 会话 / 持久化 | ✅ | `/sessions`，或 `run-as … cat files/sessions.db` 拉下来看 |
 | 前端界面 | ✅ | `just open` → 桌面浏览器 + 真 DevTools |
+| 模型查看/操作自己 | ✅ | 沙箱里的 `agent` 命令（见 §8） |
 | 改 Rust / 装包 | ⚠️ 要重装 | `just android-install` |
 | 无障碍服务开关、存储权限 | ❌ | 只能在手机屏幕上点 |
 | 切后台保活 / force-stop 后恢复 | ❌ | 手机上手动（核心的会话库可以直接看） |
@@ -269,7 +270,43 @@ exit=0 0.31s
 
 ---
 
-## 8. SSE 断了怎么办
+## 8. 沙箱里的 `agent` 命令：让模型查看 / 操作自己
+
+模型平时只看得到自己的上下文和历史，看不到「自己现在什么状态」。所以沙箱里放了
+一个 `agent` 命令（`core/src/linux.rs` 的 `AGENT_CLI`，`prepare_rootfs` 写进
+`/usr/local/bin/agent`），它就是核心那个 HTTP 服务的薄包装 —— 只用 busybox 的
+`wget`，没有别的依赖：
+
+```sh
+agent help               # 看全部
+agent state              # 我现在的状态
+agent request            # 我下一次会收到的完整上下文（提示词 + 工具表 + 历史）
+agent tools              # 我有哪些工具
+agent sessions / session # 会话列表 / 当前这条会话的消息
+agent doctor             # 各部件体检
+agent command '{"type":"key","name":"back"}'   # 操作这台手机
+agent get /api/…         # 直接 GET 自己的任意接口（逃生口）
+agent post /api/… '{…}'
+```
+
+三件设计上的事：
+
+1. **端口靠环境变量注入**，不靠猜。`guest_env()` 里加 `AGENT_PORT` / `AGENT_BASE`，
+   值来自 `LinuxSandbox::set_agent_port()` —— 由 `Core::serve` 在 bind 成功后调用。
+   核心还没 bind 时不注入（`agent` 会明确报「AGENT_PORT 没设」而不是瞎连）。
+2. **`/api/llm` 和 `/api/debug/system-prompt` 被挡住**（exit 3）。那两个是
+   「改自己身份」（换模型/key/提示词），留给人在宿主机上用 `scripts/agentctl.py`。
+   理由：模型会把网页、文件、命令输出读进上下文，一条提示注入就能让它顺手把
+   自己换成别人的模型。读自己随便读，改自己得人来。
+3. **`prepare_rootfs` 里写这个文件是幂等的**（内容没变就不碰），所以每次启动都会
+   存在、也不会磨文件系统。`just test` 里有两条测试守着：文件在不在 + 可执行 +
+   `sh -n` 语法 + `AGENT_PORT` 注入与否。
+
+系统提示词里有一行告诉模型这个命令存在（`dump_prompt` 能看到）—— 否则等于没有。
+
+---
+
+## 9. SSE 断了怎么办
 
 手机是手机会干的事：WebView 被切后台、Wi-Fi 抖一下、进程被系统压一下，
 **客户端这边的 SSE 都会断** —— 但服务端的回合不会停（前台服务保着进程，
@@ -286,7 +323,7 @@ exit=0 0.31s
 
 ---
 
-## 9. 安全边界
+## 10. 安全边界
 
 服务和调试接口都只听 `127.0.0.1`，没开 `0.0.0.0`；从电脑访问必须显式
 `adb forward`。

@@ -2,7 +2,12 @@
   /**
    * 沙箱文件查看器：全屏覆盖层，从右边滑进来。
    *
-   * HTML（和其他文本类文件）放进 iframe；图片居中显示；音视频用播放器。
+   * 分四种：音视频用播放器；图片居中显示；**网页**（.html / 目录列表）放 iframe；
+   * 其余文本（.sh / .py / .json / …）自己拉出来渲染成等宽文本。
+   *
+   * 为什么文本不丢给 iframe：`.sh` 以前是 `application/x-sh`，WebView 不认，
+   * iframe 里一片空白（用户实测）。服务端现在把这些发成 `text/plain` 了，
+   * 能显示；但白底无样式、整段复制也难，所以还是自己渲染（见 TextView.svelte）。
    * 关闭：左上角返回箭头、返回键、按住标题栏往右拖。
    *
    * iframe 加了 sandbox 属性（不含 allow-same-origin），服务端也给
@@ -15,9 +20,20 @@
   import { dismissable, RELEASE } from '../lib/drag';
   import { viewer, closeViewer } from '../lib/viewer.svelte.ts';
   import { mediaKind } from '../lib/markdown';
+  import TextView from './TextView.svelte';
 
   const IMAGE = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i;
-  const isImage = $derived(IMAGE.test((viewer.url ?? '').split(/[?#]/)[0]));
+  /** 明确是网页的扩展名 */
+  const HTMLISH = /\.(x?html?|xhtml|php)$/i;
+  /** 有没有「像扩展名」的后缀。没有的（`报告`、`LICENSE`）当网页/目录处理 */
+  const HAS_EXT = /\.[a-z0-9]+$/i;
+
+  const path = $derived((viewer.url ?? '').split(/[?#]/)[0]);
+  const isImage = $derived(IMAGE.test(path));
+  // 目录列表是服务端生成的 HTML：带结尾斜杠的、或者**没有扩展名**的都可能是它
+  // （服务端对不带斜杠的目录会 302 到带斜杠的，fetch 会跟着走，拿回来是 HTML）。
+  // 反过来，有扩展名的（.sh/.py/.json/…）才走文本视图。
+  const isWebPage = $derived(HTMLISH.test(path) || path.endsWith('/') || !HAS_EXT.test(path));
   const media = $derived(mediaKind(viewer.url ?? ''));
 
   $effect(() => onBack(closeViewer));
@@ -90,7 +106,7 @@
       <div class="grid h-full place-items-center overflow-auto p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
         <img src={viewer.url} alt={viewer.title} class="max-h-full max-w-full object-contain" />
       </div>
-    {:else}
+    {:else if isWebPage}
       <!-- 白底：大多数网页默认是白底黑字，透出 App 的深色底反而看不清 -->
       <iframe
         src={viewer.url}
@@ -98,6 +114,8 @@
         sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
         class="absolute inset-0 size-full bg-white"
       ></iframe>
+    {:else}
+      <TextView url={viewer.url ?? ''} />
     {/if}
   </div>
 </section>

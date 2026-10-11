@@ -505,6 +505,9 @@ pub const SYSTEM_PROMPT: &str = "\
   （HTML 正常渲染，页面里用相对路径引用的 css/js/图片也能加载）。图片、音频、\n\
   视频都用图片语法 `![说明](sandbox:…)`，不需要转换格式。做了成品要主动给出\n\
   这样的链接，不要只把路径写成代码。\n\
+- 沙箱里有 `agent` 命令，可以在 bash 里查看和操作**你自己**：`agent state`（自己的\n\
+  状态）、`agent request`（自己下一次会收到的完整上下文）、`agent tools`（自己的工具）、\n\
+  `agent command`（操作这台手机：按键 / 点击 / 滑动 / 启动应用）。`agent help` 看全部。\n\
 \n\
 回答要求：用中文，简洁直接，不要寒暄。";
 
@@ -517,6 +520,25 @@ fn build_messages(
     sess: &ChatSession,
 ) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
     sess.messages.iter().map(|m| m.to_openai()).collect()
+}
+
+/// 工具表的线上形态（`{"type":"function","function":{…}}` 的数组）。
+///
+/// 抽出来是给 `/api/debug/tools` 用的：模型（或人）想知道「我有哪些工具」，
+/// 不用去翻整份请求体。
+pub fn tool_definitions() -> anyhow::Result<Vec<ChatCompletionTools>> {
+    tools()
+        .iter()
+        .map(|t| {
+            Ok(ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObjectArgs::default()
+                    .name(t.name)
+                    .description(t.description)
+                    .parameters((t.schema)())
+                    .build()?,
+            }))
+        })
+        .collect()
 }
 
 /// 保证历史里有当前版本的系统提示词。
@@ -794,18 +816,7 @@ async fn drive(
 /// `pub` 是给 `/api/debug/request` 用的（把模型将看到的东西原样吐出来）。
 pub fn build_request(sess: &ChatSession, model: &str) -> anyhow::Result<CreateChatCompletionRequest> {
     let messages = build_messages(sess)?;
-    let tools: Vec<ChatCompletionTools> = tools()
-        .iter()
-        .map(|t| {
-            Ok(ChatCompletionTools::Function(ChatCompletionTool {
-                function: FunctionObjectArgs::default()
-                    .name(t.name)
-                    .description(t.description)
-                    .parameters((t.schema)())
-                    .build()?,
-            }))
-        })
-        .collect::<anyhow::Result<_>>()?;
+    let tools = tool_definitions()?;
 
     let req = CreateChatCompletionRequestArgs::default()
         .model(model)

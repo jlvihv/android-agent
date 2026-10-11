@@ -33,6 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/session", get(get_session))
         .route("/api/debug/state", get(debug_state))
         .route("/api/debug/request", get(debug_request))
+        .route("/api/debug/tools", get(debug_tools))
         .route("/api/debug/system-prompt", post(debug_set_system_prompt))
         .route("/api/sessions", get(list_sessions).post(new_session))
         .route("/api/sessions/activate", post(activate_session))
@@ -420,6 +421,17 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// `GET /api/debug/tools` → 当前工具表（就是发给模型的 `tools` 字段）。
+///
+/// 存在的意义：沙箱里的 `agent tools` 靠它回答「我自己有哪些工具」，
+/// 不用去翻整份请求体。
+async fn debug_tools() -> Response {
+    match crate::agent::tool_definitions().and_then(|t| Ok(serde_json::to_value(t)?)) {
+        Ok(v) => Json(json!({ "tools": v })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct SystemPromptBody {
     /// **原样**使用（不做 trim）：调提示词时字节必须可控。
@@ -644,6 +656,67 @@ async fn sandbox_file(
     serve_sandbox(&st, &format!("/{path}"), trailing, range).await
 }
 
+/// 沙箱文件的 Content-Type。
+///
+/// ⚠️ **不能直接信 `mime_guess`**：`.sh` → `application/x-sh`、`.py` →
+/// `text/x-python`、`.json` → `application/json` —— 这些类型 WebView 不保证
+/// 当文本渲染，iframe 里就是一片空白（实测：点开一个 `.sh` 链接是空的）。
+///
+/// 规则：
+/// - 网页**和它要的子资源**（html/css/js/json/xml）按原样 —— 生成的网页靠这个能跑
+/// - 图片 / 音视频 / 字体 / pdf 按原样 —— 浏览器认识
+/// - 其余一律 `text/plain`（先嗅一下像不像文本；不像就 octet-stream 让它下载）
+async fn sandbox_mime(host: &std::path::Path, name: &str) -> String {
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    let e = mime.essence_str();
+    let keep = e == "text/html"
+        || e == "application/xhtml+xml"
+        || e == "text/css"
+        || e == "application/javascript"
+        || e == "text/javascript"
+        || e == "application/json"
+        || e.ends_with("+json")
+        || e == "application/xml"
+        || e == "text/xml"
+        || e.starts_with("image/")
+        || e.starts_with("audio/")
+        || e.starts_with("video/")
+        || e.starts_with("font/")
+        || e == "application/pdf"
+        || e == "application/wasm";
+    if keep {
+        return if e.starts_with("text/") || e.ends_with("json") || e.ends_with("xml") {
+            format!("{e}; charset=utf-8")
+        } else {
+            e.to_string()
+        };
+    }
+    if looks_like_text(host).await {
+        "text/plain; charset=utf-8".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+/// 开头这 4KB 像不像文本：没有 NUL、也没有 \n \r \t 之外的控制字符。
+///
+/// 用「像不像文本」而不是扩展名白名单：代码文件的后缀太多太杂
+/// （`.sh` `.py` `.rs` `.toml` `.env` `.gitignore` …），而二进制倒是很好认。
+async fn looks_like_text(host: &std::path::Path) -> bool {
+    use tokio::io::AsyncReadExt;
+    let Ok(mut f) = tokio::fs::File::open(host).await else {
+        return false;
+    };
+    let mut buf = vec![0u8; 4096];
+    let n = match f.read(&mut buf).await {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    buf[..n]
+        .iter()
+        .all(|&b| b == b'\n' || b == b'\r' || b == b'\t' || b >= 0x20)
+}
+
 /// 沙箱页面统一的响应头
 fn sandbox_headers(res: &mut Response, mime: &str) {
     let h = res.headers_mut();
@@ -708,12 +781,7 @@ async fn serve_bytes(host: &std::path::Path, name: &str, range: Option<String>) 
     };
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-    let mime = mime_guess::from_path(name).first_or_octet_stream();
-    let mime = if mime.type_() == "text" || mime.essence_str() == "application/javascript" {
-        format!("{mime}; charset=utf-8")
-    } else {
-        mime.to_string()
-    };
+    let mime = sandbox_mime(host, name).await;
 
     let span = match range.as_deref().map(|r| parse_range(r, len)) {
         Some(Some(s)) => Some(s),

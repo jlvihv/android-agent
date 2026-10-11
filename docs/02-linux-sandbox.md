@@ -302,6 +302,11 @@ Rust core                     ▼
 （早期设计里工具分 `ReadOnly` / `NeedsApproval` 两类，后者要等用户点批准。
 审批环节后来整个删了：工具一律直接执行，`ToolKind` 也随之消失。）
 
+沙箱里还预置了一个 `agent` 命令（`prepare_rootfs` 写进 `/usr/local/bin/agent`）：
+它是核心自己那个 HTTP 服务的薄包装，让模型能查看自己（`agent state` /
+`agent request` / `agent tools`）和操作这台手机（`agent command`）。
+见 [docs/07-debugging.md](07-debugging.md) §8。
+
 这样 agent 就有了真正的计算机：**跑代码**（`bash`）+ 沙箱里的文件系统，
 这才是 OpenMinis 那个形态。
 
