@@ -57,7 +57,10 @@ body,
  */
 :root {
   /* 头部紧贴状态栏：上面只留 0.5rem。原来是 1.5rem，离通知栏太远，白占地方 */
-  --hdr: calc(2.75rem + env(safe-area-inset-top));
+  /* 顶栏高度 = App.svelte 里 header 的实际高度（上下各 0.25rem 内边距
+     + 28px 的图标按钮）。它决定两件事：顶部渐隐要多高，消息列表顶部要留多少。
+     改 header 的 padding 就要同步改这里（实测 2.25rem → 36px）。 */
+  --hdr: calc(2.25rem + env(safe-area-inset-top));
   /* 头部下沿往下的渐隐长度。消息列表顶部留白要把它算进去，
      否则第一条消息停在渐隐里，一进来就是半透明的 */
   --fade-top: 1.25rem;
