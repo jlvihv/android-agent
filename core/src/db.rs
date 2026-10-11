@@ -129,6 +129,12 @@ impl Db {
                     .filter_map(|p| serde_json::from_str(&p).ok())
                     .collect();
 
+                // 空会话不给回来（跟 sync 的过滤对称）：库里可能还留着
+                // 老版本攒下的空会话，读到内存里就只在侧边栏里占位。
+                if messages.is_empty() {
+                    continue;
+                }
+
                 store.sessions.push(ChatSession {
                     id,
                     title,
@@ -167,7 +173,10 @@ impl Db {
         let saved = g.saved.clone();
 
         let tx = g.conn.transaction()?;
-        for s in &store.sessions {
+        // 空会话不落盘（也把它上次可能写进去的旧行清掉，见下面的 alive）：
+        // 「新对话」点了没说话、或 `/api/reset` 清空过，重启后不该又冒出来。
+        let keep: Vec<&ChatSession> = store.sessions.iter().filter(|s| s.has_content()).collect();
+        for s in &keep {
             tx.execute(
                 "INSERT INTO sessions(id, title, created_at, updated_at, provider_session)
                  VALUES(?1, ?2, ?3, ?4, ?5)
@@ -203,8 +212,8 @@ impl Db {
             }
         }
 
-        // 已经删掉的会话，连带消息一起清
-        let alive: Vec<&str> = store.sessions.iter().map(|s| s.id.as_str()).collect();
+        // 已经删掉的会话（以及空会话），连带消息一起清
+        let alive: Vec<&str> = keep.iter().map(|s| s.id.as_str()).collect();
         if alive.is_empty() {
             tx.execute("DELETE FROM sessions", [])?;
             tx.execute("DELETE FROM messages", [])?;
@@ -225,11 +234,11 @@ impl Db {
         )?;
         tx.commit()?;
 
-        for s in &store.sessions {
+        for s in &keep {
             g.saved.insert(s.id.clone(), s.messages.len());
         }
-        // 清掉已经不存在的会话的水位线
-        g.saved.retain(|id, _| store.sessions.iter().any(|s| &s.id == id));
+        // 清掉已经不存在的会话（含空会话）的水位线
+        g.saved.retain(|id, _| keep.iter().any(|s| &s.id == id));
 
         Ok(())
     }
@@ -431,5 +440,57 @@ mod tests {
         db.sync(&store_with(2, 2)).unwrap();
         db.sync(&SessionStore::default()).unwrap();
         assert_eq!(db.load().unwrap().sessions.len(), 0);
+    }
+
+    /// 空会话（建了、没说过话）不落盘。
+    ///
+    /// 「新对话」连点几次就会攼出一堆这种会话，重启后还在抽屉里占位 —— 踩过。
+    #[test]
+    fn empty_sessions_are_not_persisted() {
+        let db = Db::in_memory().unwrap();
+        let mut st = store_with(1, 1);
+        db.sync(&st).unwrap();
+        assert_eq!(db.load().unwrap().sessions.len(), 1);
+
+        // 再建两条空的：不该进库
+        st.create();
+        st.create();
+        db.sync(&st).unwrap();
+        assert_eq!(db.load().unwrap().sessions.len(), 1);
+
+        // 给其中一条写上话，它就正常落盘了
+        let id = st.active.clone();
+        st.get_mut(&id).unwrap().messages.push(msg_user("说话了"));
+        db.sync(&st).unwrap();
+        assert_eq!(db.load().unwrap().sessions.len(), 2);
+    }
+
+    /// 库里已经有的空会话（旧版本或别的客户端写的）不再恢复，也会被下次 sync 清掉。
+    #[test]
+    fn old_empty_sessions_are_dropped() {
+        let db = Db::in_memory().unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "INSERT INTO sessions(id, title, created_at, updated_at, provider_session)
+                 VALUES('legacy', '新对话', 1, 1, 'ps')",
+                [],
+            )
+            .unwrap();
+
+        let back = db.load().unwrap();
+        assert!(back.sessions.is_empty(), "空会话不回到内存里");
+
+        db.sync(&back).unwrap();
+        let left: i64 = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "下次 sync 把它从盘上清掉");
     }
 }

@@ -381,6 +381,13 @@ impl ChatSession {
         // 只会让 provider 白跑一次冷启动。
         self.rotate_provider_session();
     }
+
+    /// 有内容吗？空会话（建了、没说过话）不入列表、不落盘。
+    ///
+    /// 「新对话」点了不发消息就不该留痕 —— 否则连点几次攒一堆空会话。
+    pub fn has_content(&self) -> bool {
+        !self.messages.is_empty()
+    }
 }
 
 /// 一段文本里找 `needle`（忽略大小写），命中就返回带省略号的上下文。
@@ -471,9 +478,14 @@ impl SessionStore {
         }
     }
 
-    /// 给侧边栏用的列表，最近更新的在前
+    /// 给侧边栏用的列表，最近更新的在前。
+    ///
+    /// **空会话不进列表**：前端点「新对话」不同，那是本地清空视图、服务端
+    /// 到第一句话才建会话（见 `POST /api/chat` 的 `fresh`）。这里是兜底 ——
+    /// 调试端/CLI 直接 `POST /api/sessions` 建的、`/api/reset` 清空后的、
+    /// 以及启动时 `active_mut()` 顺手建的，都是没内容的，不该在抽屉里占位。
     pub fn list(&self) -> Vec<Value> {
-        let mut v: Vec<&ChatSession> = self.sessions.iter().collect();
+        let mut v: Vec<&ChatSession> = self.sessions.iter().filter(|s| s.has_content()).collect();
         v.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         v.into_iter()
             .map(|s| {
@@ -1772,5 +1784,32 @@ mod tests {
         let snip = hits[0]["snippet"].as_str().unwrap();
         assert!(snip.starts_with('…') && snip.ends_with('…'));
         assert!(snip.chars().count() < 90);
+    }
+
+    // —— 空会话 ——
+
+    /// 建了会话但一句话没说 → 不进侧边栏列表。
+    ///
+    /// 前端点「新对话」已经不再让服务端建会话了，这里是兜底：
+    /// 调试端/CLI 直接 create、`/api/reset` 清空后的会话都走这条。
+    #[test]
+    fn empty_sessions_stay_out_of_the_list() {
+        let mut store = SessionStore::default();
+        let id = store.create();
+        assert!(store.list().is_empty(), "新建但没说话：不该出现在列表里");
+
+        store
+            .get_mut(&id)
+            .unwrap()
+            .messages
+            .push(ChatMessage::User("问了".into()));
+        let listed = store.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], id.as_str());
+        assert!(listed[0]["active"].as_bool().unwrap());
+
+        // 清空过（/api/reset）又回到「不算数」
+        store.get_mut(&id).unwrap().clear();
+        assert!(store.list().is_empty());
     }
 }

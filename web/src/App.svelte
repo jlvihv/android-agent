@@ -25,6 +25,15 @@
   let sessions = $state<Session[]>([]);
   let controller: AbortController | null = null;
 
+  /**
+   * 点了「新对话」、但第一句还没发出去。
+   *
+   * 这时服务端**还没有**这个会话 —— 不这样就会变成：连点五次「新对话」，
+   * 抽屉里多出五条「新对话」空记录。所以它只是一个本地意图，
+   * 跟着第一句话一起发给服务端（`/api/chat` 的 `fresh`）。
+   */
+  let fresh = $state(false);
+
   let drawer = $state(false);
   let sheet = $state(false);
 
@@ -39,6 +48,9 @@
     // 本地流正在跑：本地才是最新的，服务端那份是旧的。拉回来只会白传
     // 一整段历史再丢掉 —— 干脆不发这个请求。
     if (busy) return;
+    // 刚点了「新对话」还没发第一句：服务端那边还是旧会话（新的根本还没建），
+    // 拉回来会把刚清空的界面又填满旧内容。
+    if (fresh) return;
     try {
       const r = await fetch(`/api/session?rev=${encodeURIComponent(rev)}`);
       if (!r.ok) return;
@@ -90,10 +102,12 @@
     }
   }
 
-  async function newSession() {
-    await fetch('/api/sessions', { method: 'POST' });
+  function newSession() {
+    // **不请求服务端**：新会话到第一句话才建（`POST /api/chat` 的 fresh），
+    // 这里只把本地视图清空 —— 点了不发就不会攒出一堆空会话。
+    fresh = true;
     rev = '';
-    await Promise.all([loadSessions(), loadMessages()]);
+    messages = [];
     drawer = false;
   }
 
@@ -103,6 +117,7 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id }),
     });
+    fresh = false;
     rev = '';
     await Promise.all([loadSessions(), loadMessages()]);
     drawer = false;
@@ -123,6 +138,7 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id }),
     });
+    fresh = false;
     rev = '';
     await Promise.all([loadSessions(), loadMessages()]);
   }
@@ -202,6 +218,9 @@
   function send() {
     const text = input.trim();
     if (!text || busy) return;
+    // 第一句发出去的时候才告诉服务端「开新会话」（fresh 是个一次性意图）
+    const startFresh = fresh;
+    fresh = false;
     input = '';
     messages.push({
       id: uid(),
@@ -212,7 +231,7 @@
     });
     const msg = store.beginStreaming();
     messages.push(msg);
-    void run(msg, '/api/chat', { text });
+    void run(msg, '/api/chat', { text, fresh: startFresh });
   }
 
   const stop = () => controller?.abort();
@@ -248,7 +267,7 @@
     <!-- 右上角 = 新对话（对齐 Claude 移动端：左边菜单，右边开新会话）。
          设备状态点挪进抽屉左下角的设置按钮（作为角标）。 -->
     <button
-      onclick={() => void newSession()}
+      onclick={newSession}
       aria-label="新对话"
       title="新对话"
       class="pointer-events-auto p-1 text-fg"

@@ -190,6 +190,12 @@ struct ChatBody {
     /// 调试端会指定一条专用会话，免得把测试消息混进用户正在聊的那条。
     #[serde(default)]
     session: Option<String>,
+    /// 这一轮开一个新会话。
+    ///
+    /// 前端点「新对话」**不建会话**（只是本地把视图清空）—— 所以
+    /// 「新建」这件事拖到第一句话才发生：点了不发就不会攒出空会话。
+    #[serde(default)]
+    fresh: bool,
 }
 
 /// `POST /api/chat` → AI SDK UI Message Stream。
@@ -197,6 +203,13 @@ struct ChatBody {
 /// 配了 provider 就跑真实 agent loop（`agent.rs`），否则回退到脚本演示流。
 /// 两种情况下**输出格式完全一致**，所以前端不需要知道区别。
 async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Response {
+    // 「新对话」的第一句：会话到这一刻才建（前端点按钮时只清空了视图）。
+    // 指定了 session（调试端）就不动这个。
+    if body.fresh && body.session.is_none() {
+        let mut store = st.chat.write().await;
+        store.create();
+    }
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let core = Core {
         state: st.clone(),
