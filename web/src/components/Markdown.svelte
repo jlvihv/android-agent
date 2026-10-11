@@ -6,7 +6,8 @@
    * 列表、引用可以嵌套，所以块和行内都是递归 snippet。
    */
   import { untrack } from 'svelte';
-  import { parse, type Block, type Span, type Align } from '../lib/markdown';
+  import { parse, sandboxUrl, type Block, type Span, type Align } from '../lib/markdown';
+  import { openViewer } from '../lib/viewer.svelte.ts';
 
   let { text }: { text: string } = $props();
 
@@ -59,12 +60,35 @@
     {:else if s.t === 'strong'}<strong class="font-semibold">{@render spans(s.c)}</strong>
     {:else if s.t === 'em'}<em class="italic">{@render spans(s.c)}</em>
     {:else if s.t === 'del'}<del class="text-muted">{@render spans(s.c)}</del>
-    {:else}<a
-        href={s.href}
-        target="_blank"
-        rel="noopener noreferrer"
-        class="break-all underline decoration-faint underline-offset-2">{@render spans(s.c)}</a
+    {:else if s.t === 'img'}
+      {@const local = sandboxUrl(s.src)}
+      <!-- 沙箱里的图片点开看大图；外链图片只内嵌 -->
+      <button
+        class="my-1 block max-w-full overflow-hidden rounded-xl bg-hairline-soft align-top"
+        disabled={!local}
+        onclick={() => local && openViewer(local, s.alt)}
       >
+        <img src={local ?? s.src} alt={s.alt} loading="lazy" class="max-h-80 max-w-full object-contain" />
+      </button>
+    {:else}
+      {@const local = sandboxUrl(s.href)}
+      {#if local}
+        <!-- 沙箱文件：在 App 里的查看器打开，不跳走 -->
+        <a
+          href={local}
+          onclick={(e) => {
+            e.preventDefault();
+            openViewer(local);
+          }}
+          class="break-all text-fg underline decoration-muted underline-offset-2">{@render spans(s.c)}</a
+        >
+      {:else}<a
+          href={s.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          class="break-all underline decoration-faint underline-offset-2">{@render spans(s.c)}</a
+        >
+      {/if}
     {/if}
   {/each}
 {/snippet}

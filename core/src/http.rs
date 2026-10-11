@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Path as UrlPath, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -41,6 +41,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/device/snapshot", post(device_snapshot))
         .route("/api/device/log", post(device_log))
         .route("/api/ws", get(ws_upgrade))
+        .route("/sandbox", get(sandbox_root))
+        .route("/sandbox/", get(sandbox_root))
+        .route("/sandbox/{*path}", get(sandbox_file))
         .fallback(crate::assets::serve)
         .with_state(state)
 }
@@ -465,8 +468,171 @@ fn sse_response(mut rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>)
 // WebSocket
 // ---------------------------------------------------------------------------
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> impl IntoResponse {
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Response {
+    // WebSocket 不受 CORS 管：手机浏览器里随便一个网页都能连
+    // ws://127.0.0.1:<端口>，然后给设备下指令。只放行本机来源（App 自己、
+    // Vite 开发服务器）和不带 Origin 的非浏览器客户端。沙箱里的 HTML 是
+    // opaque origin（Origin: null），也挡在外面。
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+        if !is_loopback_origin(origin.to_str().unwrap_or("")) {
+            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+    }
     ws.on_upgrade(move |socket| ws_loop(socket, st))
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    let host = match host.rfind(':') {
+        Some(i) if !host.ends_with(']') => &host[..i],
+        _ => host,
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+// ---------------------------------------------------------------------------
+// 沙箱文件：`sandbox:` 协议的落点
+// ---------------------------------------------------------------------------
+//
+// AI 在回复里写 `[报告](sandbox:/root/report.html)` 或
+// `![图](sandbox:/root/chart.png)`，前端把它改写成 `/sandbox/root/…`
+// 打到这里。按 URL 路径直接映射，所以 HTML 里的相对路径（css/js/图片）
+// 天然能用。
+//
+// 安全：这些文件是 AI 写的（内容可能来自网上），却和 App 同源。所以
+// 一律加 `Content-Security-Policy: sandbox` —— 页面变成 opaque origin，
+// 读不到 /api/*、连不上 WebSocket（见 ws_upgrade 的 Origin 检查），
+// 只能看。路径越界和符号链接逃逸由 LinuxSandbox::resolve_path 挡。
+
+async fn sandbox_root(State(st): State<Arc<AppState>>) -> Response {
+    serve_sandbox(&st, "/root/", true).await
+}
+
+async fn sandbox_file(
+    State(st): State<Arc<AppState>>,
+    UrlPath(path): UrlPath<String>,
+    uri: axum::http::Uri,
+) -> Response {
+    // 目录要带结尾斜杠，否则页面里的相对链接会解析到上一级
+    let trailing = uri.path().ends_with('/');
+    serve_sandbox(&st, &format!("/{path}"), trailing).await
+}
+
+/// 沙箱页面统一的响应头
+fn sandbox_headers(res: &mut Response, mime: &str) {
+    let h = res.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(mime) {
+        h.insert(axum::http::header::CONTENT_TYPE, v);
+    }
+    h.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads",
+        ),
+    );
+    // 文件随时会被 AI 改写，别缓存
+    h.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+}
+
+async fn serve_sandbox(st: &Arc<AppState>, guest: &str, trailing: bool) -> Response {
+    let Some(sb) = st.linux() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Linux 沙箱未初始化").into_response();
+    };
+    let host = match sb.resolve_path(guest) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response(),
+    };
+
+    let meta = match tokio::fs::metadata(&host).await {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::NOT_FOUND, format!("沙箱里没有 {guest}")).into_response(),
+    };
+
+    if meta.is_dir() {
+        if !trailing {
+            let to = format!("/sandbox{}/", guest.trim_end_matches('/'));
+            return axum::response::Redirect::to(&to).into_response();
+        }
+        let index = host.join("index.html");
+        if index.is_file() {
+            return serve_bytes(&index, "index.html").await;
+        }
+        return dir_listing(guest, &host).await;
+    }
+
+    if meta.len() > 64 << 20 {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "文件超过 64 MB").into_response();
+    }
+    serve_bytes(&host, guest).await
+}
+
+async fn serve_bytes(host: &std::path::Path, name: &str) -> Response {
+    match tokio::fs::read(host).await {
+        Ok(body) => {
+            let mime = mime_guess::from_path(name).first_or_octet_stream();
+            let mime = if mime.type_() == "text" || mime.essence_str() == "application/javascript" {
+                format!("{mime}; charset=utf-8")
+            } else {
+                mime.to_string()
+            };
+            let mut res = body.into_response();
+            sandbox_headers(&mut res, &mime);
+            res
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// 没有 index.html 的目录：给一个简单的文件列表
+async fn dir_listing(guest: &str, host: &std::path::Path) -> Response {
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(host).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            entries.push((e.file_name().to_string_lossy().into_owned(), dir));
+        }
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let mut html = format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>\
+         <title>{t}</title><style>body{{font:15px system-ui;background:#151515;color:#f9f9f7;\
+         margin:0;padding:12px 16px}}a{{color:inherit;text-decoration:none;display:block;\
+         padding:10px 0;border-bottom:1px solid #262624}}.d{{color:#97958d}}</style>\
+         <p class=d>{t}</p>",
+        t = esc(guest)
+    );
+    if !guest.trim_end_matches('/').is_empty() {
+        html.push_str("<a href='../' class=d>..</a>");
+    }
+    for (name, dir) in entries {
+        let slash = if dir { "/" } else { "" };
+        html.push_str(&format!(
+            "<a href=\"{h}{slash}\">{n}{slash}</a>",
+            h = esc(&name),
+            n = esc(&name)
+        ));
+    }
+    let mut res = html.into_response();
+    sandbox_headers(&mut res, "text/html; charset=utf-8");
+    res
 }
 
 async fn ws_loop(mut socket: WebSocket, st: Arc<AppState>) {
@@ -605,5 +771,20 @@ fn cmd_name(c: &Command) -> &'static str {
         Command::SetText { .. } => "set_text",
         Command::Key { .. } => "key",
         Command::Launch { .. } => "launch",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_origin;
+
+    #[test]
+    fn only_loopback_origins_may_open_the_websocket() {
+        for ok in ["http://127.0.0.1:41209", "http://localhost:5173", "http://[::1]:8787", "http://127.0.0.1"] {
+            assert!(is_loopback_origin(ok), "{ok}");
+        }
+        for bad in ["null", "https://evil.example", "http://127.0.0.1.evil.example", "http://192.168.0.2:41209", ""] {
+            assert!(!is_loopback_origin(bad), "{bad}");
+        }
     }
 }

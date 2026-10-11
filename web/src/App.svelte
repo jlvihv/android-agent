@@ -14,6 +14,8 @@
   import MessageList from './components/MessageList.svelte';
   import Drawer, { type Session } from './components/Drawer.svelte';
   import LlmSheet from './components/LlmSheet.svelte';
+  import Viewer from './components/Viewer.svelte';
+  import { viewer } from './lib/viewer.svelte.ts';
 
   let input = $state('');
   let busy = $state(false);
@@ -292,3 +294,5 @@
 {/if}
 
 {#if sheet}<LlmSheet onclose={close} />{/if}
+
+{#if viewer.url}<Viewer />{/if}

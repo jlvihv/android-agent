@@ -37,7 +37,8 @@
    * 一行截断描述，而不是把 JSON 摊在正文里。
    */
   function summarize(t: ToolPart): string {
-    const a = (t.input ?? {}) as Record<string, unknown>;
+    // 参数还在流式（JSON 没写完）时从半截文本里抠字段，边写边显示
+    const a = (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
     const s = (v: unknown) => (typeof v === 'string' ? v : '');
     // 只取第一行，长度交给 CSS 截断 —— 屏幕多宽就显示多少
     const firstLine = (v: string) => v.split('\n')[0].trim();
@@ -60,6 +61,34 @@
       default:
         return t.toolName || '工具调用';
     }
+  }
+
+  /**
+   * 从还没写完的参数 JSON 里抠出已经出现的字段。
+   *
+   * 工具参数是一片一片流过来的（`{"command":"apk add py`…），等完整
+   * JSON 才显示的话，模型写长命令那几秒工具行是空的。字符串字段取到
+   * 目前为止的内容，数字字段写完了才取。
+   */
+  function partialArgs(text: string): Record<string, unknown> {
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      /* 没写完，下面逐个抠 */
+    }
+    const out: Record<string, unknown> = {};
+    for (const m of text.matchAll(/"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)/g)) {
+      // 末尾可能是半个转义（`\`），去掉再解
+      const raw = m[2].replace(/\\(u[0-9a-fA-F]{0,3})?$/, '');
+      try {
+        out[m[1]] = JSON.parse(`"${raw}"`);
+      } catch {
+        out[m[1]] = raw;
+      }
+    }
+    for (const m of text.matchAll(/"(\w+)"\s*:\s*(-?\d+)\s*[,}]/g)) out[m[1]] = Number(m[2]);
+    return out;
   }
 
   /** 面板标题。要短，细节放正文。 */
@@ -86,7 +115,7 @@
 
   /** 面板正文的主体：能一眼看懂的那部分，而不是把 JSON 摊开 */
   function primary(t: ToolPart): string {
-    const a = (t.input ?? {}) as Record<string, unknown>;
+    const a = (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
     const s = (v: unknown) => (typeof v === 'string' ? v : '');
     if (t.toolName === 'bash') return s(a.command);
     if (t.toolName === 'edit') return s(a.path);
@@ -214,9 +243,21 @@
     if (scroller) scroller.scrollTop = scroller.scrollHeight;
   };
 
+  let lastTop = 0;
+
+  /**
+   * 只有用户**往上**翻才取消贴底。
+   *
+   * 原来是每次滚动都按"离底部多远"重算：程序刚把列表滚到底，滚动事件
+   * 还没派发，内容又长了一截（流式时很常见），事件里一算离底部超过
+   * 48px，就误判成用户往上翻了 —— 之后再也不跟，回复结束时停在半截。
+   */
   function onscroll() {
     const el = scroller!;
-    pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (gap < 48) pinned = true;
+    else if (el.scrollTop < lastTop - 1) pinned = false;
+    lastTop = el.scrollTop;
   }
 
   $effect(() => {
@@ -291,9 +332,6 @@
           {/if}
         {/each}
 
-        {#if !msg.done}
-          <span class="inline-block h-4 w-1.5 animate-pulse bg-muted"></span>
-        {/if}
       </div>
     {/if}
   {/each}

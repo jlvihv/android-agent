@@ -553,6 +553,14 @@ pub const SYSTEM_PROMPT: &str = "\
 4. 跑命令用 bash，改文件用 edit。沙箱内文件路径基于 /root。\n\
 5. 装 Python 包优先 `apk add py3-*`，不要用 pip。\n\
 \n\
+给用户看沙箱里的文件：\n\
+- 用 `sandbox:` 协议写 Markdown 链接或图片，路径就是沙箱内的绝对路径，例如\n\
+  `[打开报告](sandbox:/root/report/index.html)`、`![图表](sandbox:/root/chart.png)`。\n\
+- 用户点链接会在 App 里直接打开：HTML 正常渲染、脚本能运行，页面里用相对路径\n\
+  引用的 css/js/图片也能加载；指向目录会列出文件。图片直接内嵌在回复里显示，\n\
+  png/jpg/gif/webp/svg 都可以，不需要转换格式。\n\
+- 做了网页、图表、图片等成品时，主动给出这样的链接，不要只把路径写成代码。\n\
+\n\
 回答要求：用中文，简洁直接，不要寒暄。";
 
 /// 每轮用户输入前插入的上下文块。
@@ -645,10 +653,10 @@ pub fn session_view(sess: &ChatSession) -> Vec<Value> {
             } => {
                 let mut parts: Vec<Value> = Vec::new();
                 if !reasoning.is_empty() {
-                    parts.push(json!({ "type": "reasoning", "id": "r", "text": reasoning }));
+                    parts.push(json!({ "type": "reasoning", "id": format!("r{i}"), "text": reasoning }));
                 }
                 if !content.is_empty() {
-                    parts.push(json!({ "type": "text", "id": "t", "text": content }));
+                    parts.push(json!({ "type": "text", "id": format!("t{i}"), "text": content }));
                 }
                 for tc in tool_calls {
                     let output = results.get(tc.id.as_str()).map(|c| parse(c));
@@ -662,7 +670,16 @@ pub fn session_view(sess: &ChatSession) -> Vec<Value> {
                         "output": output,
                     }));
                 }
-                if !parts.is_empty() {
+                if parts.is_empty() {
+                    continue;
+                }
+                // 同一回合的多步（思考 → 工具 → 思考 → 正文 …）合成一条消息，
+                // 和流式时前端看到的一样。不合的话刷新前后排版不一致：
+                // 流式是一条消息里的几段，恢复出来是好几条消息、间距也不同。
+                if let Some(last) = out.last_mut().filter(|m| m["role"] == "assistant") {
+                    last["parts"].as_array_mut().expect("parts 是数组").extend(parts);
+                    last["steps"] = json!(last["steps"].as_u64().unwrap_or(1) + 1);
+                } else {
                     out.push(json!({
                         "id": format!("a{i}"),
                         "role": "assistant",
@@ -1000,8 +1017,13 @@ async fn stream_one(
 
     // 工具调用是分片到达的：按 index 累积
     let mut acc: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
-    let mut text_started = false;
-    let mut reason_started = false;
+    // 每个工具调用是否已经告诉前端"开始了"。
+    //
+    // 之前要等这一步整个流完、才一次性发 tool-input-available —— 模型写
+    // 一条长命令（或一大段 edit）的那几秒里，界面上什么都没有。现在 id 和
+    // 名字一到就发 start，参数边到边发 delta，前端能边写边显示。
+    let mut started: Vec<bool> = Vec::new();
+    let mut blocks = BlockStream::default();
     let mut text_acc = String::new();
     let mut reason_acc = String::new();
     let mut finish: Option<String> = None;
@@ -1014,21 +1036,17 @@ async fn stream_one(
         }
         for choice in chunk.choices {
             if let Some(r) = choice.delta.reasoning_text() {
-                if !reason_started {
-                    reason_started = true;
-                    send(tx, sse::reasoning_start("r1")).await;
-                }
                 reason_acc.push_str(r);
-                send(tx, sse::reasoning_delta("r1", r)).await;
+                for c in blocks.push(BlockKind::Reasoning, r) {
+                    send(tx, c).await;
+                }
             }
             if let Some(c) = choice.delta.content.as_deref() {
                 if !c.is_empty() {
-                    if !text_started {
-                        text_started = true;
-                        send(tx, sse::text_start("t1")).await;
-                    }
                     text_acc.push_str(c);
-                    send(tx, sse::text_delta("t1", c)).await;
+                    for c in blocks.push(BlockKind::Text, c) {
+                        send(tx, c).await;
+                    }
                 }
             }
             if let Some(fr) = choice.finish_reason.as_deref() {
@@ -1041,21 +1059,45 @@ async fn stream_one(
                     let i = tc.index as usize;
                     while acc.len() <= i {
                         acc.push((String::new(), String::new(), String::new()));
+                        started.push(false);
                     }
                     if let Some(id) = tc.id {
                         acc[i].0 = id;
                     }
+                    let mut piece = String::new();
                     if let Some(f) = tc.function {
                         if let Some(n) = f.name {
                             acc[i].1.push_str(&n);
                         }
                         if let Some(a) = f.arguments {
                             acc[i].2.push_str(&a);
+                            piece = a;
                         }
+                    }
+
+                    let (id, name, args) = &acc[i];
+                    if !started[i] && !id.is_empty() && !name.is_empty() {
+                        started[i] = true;
+                        // 先收尾正在流的思考/正文，工具行才排在它们后面
+                        if let Some(c) = blocks.close() {
+                            send(tx, c).await;
+                        }
+                        send(tx, sse::tool_input_start(id, name)).await;
+                        // id/名字到之前就来了的参数一并补上
+                        if !args.is_empty() {
+                            send(tx, sse::tool_input_delta(id, args)).await;
+                        }
+                    } else if started[i] && !piece.is_empty() {
+                        send(tx, sse::tool_input_delta(id, &piece)).await;
                     }
                 }
             }
         }
+    }
+
+    // 收尾最后一个块，之后才是工具调用 —— 前端按收到的顺序排 part
+    if let Some(c) = blocks.close() {
+        send(tx, c).await;
     }
 
     // 被 max_tokens 截断时要告诉用户，否则看起来就像模型话说到一半
@@ -1087,13 +1129,6 @@ async fn stream_one(
         send(tx, sse::data_part("usage", serde_json::to_value(u)?)).await;
     }
 
-    // 正文块收尾
-    if text_started {
-        send(tx, sse::text_end("t1")).await;
-    }
-    if reason_started {
-        send(tx, sse::reasoning_end("r1")).await;
-    }
 
     let calls: Vec<RecordedToolCall> = acc
         .into_iter()
@@ -1115,6 +1150,55 @@ async fn stream_one(
         reasoning: reason_acc,
         calls,
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BlockKind {
+    Text,
+    Reasoning,
+}
+
+/// 流式文本/思考块的开合。
+///
+/// **每个块一个独立 id**。之前写死 "t1" / "r1"：一个回合里有好几步
+/// （思考 → 正文 → 工具 → 思考 → 正文 …），前端按 id 找块追加，第二步
+/// 的思考就接到了第一步的思考后面，正文也全堆进第一段 —— 顺序全乱了。
+/// 同一步里思考和正文交替出现时也各开新块，保持模型输出的原始顺序。
+#[derive(Default)]
+struct BlockStream {
+    open: Option<(BlockKind, String)>,
+}
+
+impl BlockStream {
+    /// 追加一段内容。返回要发出的 chunk：可能先收尾上一块、再开新块。
+    fn push(&mut self, kind: BlockKind, delta: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        if self.open.as_ref().map(|(k, _)| *k) != Some(kind) {
+            out.extend(self.close());
+            let id = match kind {
+                BlockKind::Text => format!("t-{}", uuid::Uuid::now_v7()),
+                BlockKind::Reasoning => format!("r-{}", uuid::Uuid::now_v7()),
+            };
+            out.push(match kind {
+                BlockKind::Text => sse::text_start(&id),
+                BlockKind::Reasoning => sse::reasoning_start(&id),
+            });
+            self.open = Some((kind, id));
+        }
+        let (_, id) = self.open.as_ref().expect("刚开过块");
+        out.push(match kind {
+            BlockKind::Text => sse::text_delta(id, delta),
+            BlockKind::Reasoning => sse::reasoning_delta(id, delta),
+        });
+        out
+    }
+
+    fn close(&mut self) -> Option<Value> {
+        self.open.take().map(|(k, id)| match k {
+            BlockKind::Text => sse::text_end(&id),
+            BlockKind::Reasoning => sse::reasoning_end(&id),
+        })
+    }
 }
 
 async fn send(tx: &mpsc::UnboundedSender<Value>, v: Value) {
@@ -1488,6 +1572,89 @@ mod tests {
 
         let e = parse_edits(&json!({ "edits": [] })).unwrap_err();
         assert!(e.to_string().contains("至少"), "{e}");
+    }
+
+    #[test]
+    fn session_view_keeps_a_turns_steps_in_one_message_in_order() {
+        let call = |id: &str| RecordedToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        };
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::System("ctx".into()),
+            ChatMessage::User("问".into()),
+            ChatMessage::Assistant { content: "先看看".into(), reasoning: "想1".into(), tool_calls: vec![call("c1")] },
+            ChatMessage::Tool { tool_call_id: "c1".into(), content: "{}".into() },
+            ChatMessage::Assistant { content: "答".into(), reasoning: "想2".into(), tool_calls: vec![] },
+            ChatMessage::User("再问".into()),
+            ChatMessage::Assistant { content: "再答".into(), reasoning: String::new(), tool_calls: vec![] },
+        ];
+        let v = session_view(&sess);
+        let roles: Vec<&str> = v.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant"], "一个回合一条助手消息");
+
+        let parts: Vec<String> = v[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| format!("{}:{}", p["type"].as_str().unwrap(), p["text"].as_str().unwrap_or("")))
+            .collect();
+        assert_eq!(parts, ["reasoning:想1", "text:先看看", "tool:", "reasoning:想2", "text:答"]);
+
+        let ids: std::collections::HashSet<&str> =
+            v[1]["parts"].as_array().unwrap().iter().filter_map(|p| p["id"].as_str()).collect();
+        assert_eq!(ids.len(), 4, "合并后的思考/正文 id 不能撞");
+    }
+
+    #[test]
+    fn each_block_gets_its_own_id_in_output_order() {
+        let ids = |chunks: &[Value]| -> Vec<(String, String)> {
+            chunks
+                .iter()
+                .map(|c| {
+                    (
+                        c["type"].as_str().unwrap().to_string(),
+                        c["id"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        // 第一步：思考 → 正文
+        let mut a = BlockStream::default();
+        let mut step1 = a.push(BlockKind::Reasoning, "想");
+        step1.extend(a.push(BlockKind::Reasoning, "一想"));
+        step1.extend(a.push(BlockKind::Text, "答"));
+        step1.extend(a.close());
+        // 第二步（新的一次模型调用）：又是思考 → 正文
+        let mut b = BlockStream::default();
+        let mut step2 = b.push(BlockKind::Reasoning, "再想");
+        step2.extend(b.push(BlockKind::Text, "再答"));
+        step2.extend(b.close());
+
+        let s1 = ids(&step1);
+        let kinds: Vec<&str> = s1.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "reasoning-start",
+                "reasoning-delta",
+                "reasoning-delta",
+                "reasoning-end",
+                "text-start",
+                "text-delta",
+                "text-end"
+            ],
+            "切换类型时先收尾上一块"
+        );
+        assert_eq!(s1[0].1, s1[3].1, "同一块 id 一致");
+        assert_ne!(s1[0].1, s1[4].1, "思考和正文不同块");
+
+        let s2 = ids(&step2);
+        assert_ne!(s1[0].1, s2[0].1, "第二步的思考不能和第一步同 id，否则前端会接到一起");
+        assert_ne!(s1[4].1, s2[3].1, "第二步的正文同理");
     }
 
     #[test]

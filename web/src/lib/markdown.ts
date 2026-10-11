@@ -7,7 +7,7 @@
  *
  * 块级：段落、标题、分隔线、围栏代码块、表格、引用（可嵌套）、
  *       有序/无序/任务列表（可嵌套、可续行、项之间可空行）
- * 行内：粗体、斜体、粗斜体、删除线、行内代码、链接、裸链接、转义
+ * 行内：粗体、斜体、粗斜体、删除线、行内代码、链接、图片、裸链接、转义
  *
  * 几个刻意的行为：
  *   - **没闭合的围栏也当代码块收**。流式输出时经常只有前半截，这时候
@@ -15,7 +15,9 @@
  *   - 有序列表项之间空一行仍是同一个列表，编号接着数。LLM 很爱这样写，
  *     按严格 CommonMark 拆开的话每一项都是"1."。
  *   - `snake_case` 里的下划线不算斜体。
- *   - 链接只放行 http/https/mailto，其余（javascript: 之类）当普通文字。
+ *   - 链接只放行 http/https/mailto/sandbox，其余（javascript: 之类）当普通文字。
+ *   - `sandbox:/root/x.html` 指向沙箱里的文件，渲染时改写成 `/sandbox/root/x.html`
+ *     （服务端按路径直接映射），图片同理。
  */
 
 export type Span =
@@ -24,7 +26,8 @@ export type Span =
   | { t: 'strong'; c: Span[] }
   | { t: 'em'; c: Span[] }
   | { t: 'del'; c: Span[] }
-  | { t: 'link'; href: string; c: Span[] };
+  | { t: 'link'; href: string; c: Span[] }
+  | { t: 'img'; src: string; alt: string };
 
 export type Align = 'left' | 'center' | 'right' | null;
 
@@ -278,7 +281,30 @@ const URL_RE = /^https?:\/\/[^\s<>()（）「」，。；：！？、]+/;
 
 /** 只放行这些协议。javascript: 等一律当文字 */
 export function safeHref(href: string): string | null {
-  return /^(https?:|mailto:)/i.test(href.trim()) ? href.trim() : null;
+  return /^(https?:|mailto:|sandbox:)/i.test(href.trim()) ? href.trim() : null;
+}
+
+/**
+ * `sandbox:` → 服务端的 `/sandbox/…` 路径。不是 sandbox 链接返回 null。
+ *
+ * 宽松接受几种写法：`sandbox:/root/a.html`、`sandbox:///root/a.html`、
+ * `sandbox:a.html`（相对路径按 /root 算，和沙箱里的 cwd 一致）。
+ */
+export function sandboxUrl(href: string): string | null {
+  const m = /^sandbox:(.*)$/i.exec(href.trim());
+  if (!m) return null;
+  let rest = m[1].replace(/^\/\/+/, '/');
+  if (!rest.startsWith('/')) rest = '/root/' + rest;
+  const cut = rest.search(/[?#]/);
+  const path = cut === -1 ? rest : rest.slice(0, cut);
+  const tail = cut === -1 ? '' : rest.slice(cut);
+  let decoded = path;
+  try {
+    decoded = decodeURI(path);
+  } catch {
+    /* 已经是编码好的或者有坏的 %，原样用 */
+  }
+  return '/sandbox' + encodeURI(decoded) + tail;
 }
 
 export function inline(src: string): Span[] {
@@ -326,6 +352,19 @@ export function inline(src: string): Span[] {
         flush();
         out.push(span.node);
         i = span.end;
+        continue;
+      }
+    }
+
+    // 图片 ![alt](src)：只认沙箱文件和 http(s)
+    if (c === '!' && src[i + 1] === '[') {
+      const l = link(src, i + 1);
+      if (l) {
+        const href = safeHref(l.href);
+        flush();
+        if (href && !/^mailto:/i.test(href)) out.push({ t: 'img', src: href, alt: l.text });
+        else text += l.text;
+        i = l.end;
         continue;
       }
     }
