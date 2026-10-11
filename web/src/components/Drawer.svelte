@@ -55,6 +55,52 @@
   let hits = $state<Hit[]>([]);
   let searching = $state(false);
 
+  /**
+   * 命中按会话分组。
+   *
+   * 以前是平铺的，同一个会话的三条命中会把标题重复三遍，而且
+   * `h.active`（当前打开的那个会话）会给其中几条涂上 #414141 ——
+   * 看着像“这几条被选中了”，其实跟搜索无关。
+   */
+  const groups = $derived.by(() => {
+    const m = new Map<string, { id: string; title: string; hits: Hit[] }>();
+    for (const h of hits) {
+      let g = m.get(h.id);
+      if (!g) m.set(h.id, (g = { id: h.id, title: h.title, hits: [] }));
+      g.hits.push(h);
+    }
+    return [...m.values()];
+  });
+
+  /** 摘要里全是 markdown 记号，直接显示很脏（`**1. \`bash\`**`）。去记号留字。
+      只去强调和反引号，以及最前面那个列表项标记 —— 正文里的 `1)` `-` 是内容。 */
+  function plain(s: string): string {
+    return s
+      .replace(/\*\*|__|`{1,3}/g, '')
+      .replace(/^\s*(#+|\d+[.)]|[-*+])\s+/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /** 把摘要按命中词切成段，命中那段提亮 —— 不然看不出为什么它被搜出来 */
+  function mark(text: string, needle: string): { t: string; hit: boolean }[] {
+    const n = needle.trim();
+    if (!n) return [{ t: text, hit: false }];
+    const out: { t: string; hit: boolean }[] = [];
+    const lower = text.toLowerCase();
+    const nl = n.toLowerCase();
+    let i = 0;
+    for (;;) {
+      const at = lower.indexOf(nl, i);
+      if (at < 0) break;
+      if (at > i) out.push({ t: text.slice(i, at), hit: false });
+      out.push({ t: text.slice(at, at + n.length), hit: true });
+      i = at + n.length;
+    }
+    if (i < text.length) out.push({ t: text.slice(i), hit: false });
+    return out;
+  }
+
   $effect(() => {
     const needle = q.trim();
     if (!needle) {
@@ -189,9 +235,9 @@
   in:slideIn|global
   out:slideOut|global
 >
-  <!-- 顶部对齐就好，不高一样高：搜索框是输入控件，按它该有的高度来
-       （上下 12px 内边距 + 16px 字 = 48px）。三处顶栏对齐的是**顶部**：
-       `mt-1` = 安全区下 4px，和对话页图标、查看器返回键同一个起始线。 -->
+  <!-- 全圆角 + 里面一个放大镜。放大镜是 CSS 背景图（不套 div/span）：
+       纯装饰，为它多一层 DOM 不值当。图形跟 Icon.svelte 一个规格
+       （20 画布 / 描边 1.8），颜色取 muted。 -->
   <input
     bind:value={q}
     type="search"
@@ -199,7 +245,7 @@
     spellcheck="false"
     autocomplete="off"
     aria-label="搜索对话"
-    class="mx-4 mt-1 mb-3 shrink-0 rounded-2xl bg-[#1f1f1f] px-4 py-3 text-base
+    class="search-input mx-4 mt-1 mb-3 shrink-0 rounded-full bg-[#1f1f1f] py-3 pr-4 pl-10 text-base
            text-fg placeholder:text-faint outline-none"
   />
 
@@ -210,14 +256,26 @@
           {searching ? '搜索中…' : '没有匹配的对话'}
         </p>
       {:else}
-        {#each hits as h, i (`${h.id}:${i}`)}
-          <button
-            onclick={() => onswitch(h.id)}
-            class="block w-full rounded-2xl px-3 py-2.5 text-left {h.active ? 'bg-[#414141]' : ''}"
-          >
-            <span class="block truncate text-xs text-faint">{h.title}</span>
-            <span class="mt-0.5 block line-clamp-2 text-sm text-fg">{h.snippet}</span>
-          </button>
+        {#each groups as g (g.id)}
+          <!-- 会话名只在组头出现一次（图标跟会话列表一致） -->
+          <p class="flex items-center gap-2 px-3 pt-3 pb-1 text-xs text-faint">
+            <Icon name="chat" size={13} class="shrink-0 text-muted" />
+            <span class="truncate">{g.title}</span>
+          </p>
+          {#each g.hits as h, i (`${g.id}:${i}`)}
+            <button
+              onclick={() => onswitch(g.id)}
+              class="block w-full rounded-2xl px-3 py-2 text-left active:bg-[#2a2a28]"
+            >
+              <span class="line-clamp-2 text-sm"
+                ><span class="mr-1.5 text-meta text-faint"
+                  >{h.role === 'user' ? '你' : 'agent'}</span
+                >{#each mark(plain(h.snippet), q) as p}{#if p.hit}<mark
+                      class="bg-transparent font-medium text-fg">{p.t}</mark
+                    >{:else}<span class="text-muted">{p.t}</span>{/if}{/each}</span
+              >
+            </button>
+          {/each}
         {/each}
       {/if}
     {:else if sessions.length === 0}

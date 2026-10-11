@@ -180,3 +180,18 @@ a:focus {
     var(--a7) var(--l)
   );
 }
+
+/*
+ * 抽屉顶上那个搜索框里的放大镜。
+ *
+ * 用背景图而不是多套一个 <div>/<span>：它是纯装饰，为它加一层 DOM 不值当
+ * （而且这个 App 对层级敏感到抠过 DOM）。图形跟 Icon.svelte 一个规格
+ * （20 画布、描边 1.8、圆头），颜色写死 muted —— CSS 里拿不到 currentColor。
+ * 文本的左边距由 Tailwind 的 pl-10 给（12 图位 + 18 图标 + 10 间隙）。
+ */
+.search-input {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Ccircle cx='8.7' cy='8.7' r='5.6' stroke='%2397958d' stroke-width='1.8'/%3E%3Cpath d='M13 13l4 4' stroke='%2397958d' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 0.75rem center;
+  background-size: 1.125rem 1.125rem;
+}
