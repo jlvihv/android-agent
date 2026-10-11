@@ -19,6 +19,7 @@
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
   import { viewer, closeViewer } from '../lib/viewer.svelte.ts';
+  import { probeBackground } from '../lib/pagebg';
   import { mediaKind } from '../lib/markdown';
   import TextView from './TextView.svelte';
 
@@ -37,6 +38,31 @@
   const media = $derived(mediaKind(viewer.url ?? ''));
 
   $effect(() => onBack(closeViewer));
+
+  /**
+   * 网页的底色。iframe 里那份文档是透明的（见 lib/pagebg.ts），
+   * 所以这里既是 iframe 自己的背景色，也是页面没写背景时的可见底色。
+   *
+   *   `undefined` = 还没探到 → **不写背景（透明）**，露出 App 自己的底色；
+   *                        以前这里写死白，于是深色页先白后黑闪一下
+   *   null      = 确定页面没写背景 → 白底（浏览器对无样式文档的默认）
+   */
+  let frameBg = $state<string | null | undefined>(undefined);
+
+  $effect(() => {
+    const url = viewer.url;
+    if (!url || !isWebPage) return;
+    frameBg = undefined;
+    let alive = true;
+    // iframe 立刻挂上，不阻塞加载（探测和页面加载并行跑）。
+    // 探到之前是透明，所以最多是「深色底 → 页面的底色」，不会白闪。
+    void probeBackground(url).then((bg) => {
+      if (alive) frameBg = bg ?? '#fff';
+    });
+    return () => {
+      alive = false;
+    };
+  });
 
   let box: HTMLElement | null = $state(null);
   let off = $state(0);
@@ -109,12 +135,15 @@
         <img src={viewer.url} alt={viewer.title} class="max-h-full max-w-full object-contain" />
       </div>
     {:else if isWebPage}
-      <!-- 白底：大多数网页默认是白底黑字，透出 App 的深色底反而看不清 -->
+      <!-- 底色跟页面走（探不到就白底 —— 浏览器对无样式文档的默认）：
+           内层文档 canvas 透明，所以这个背景就是它在页面画出来之前
+           先上屏的颜色。探测结果没回来之前不写背景（透明）→ 露 App 底色 -->
       <iframe
         src={viewer.url}
         title={viewer.title}
         sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
-        class="absolute inset-0 size-full bg-white"
+        style:background={frameBg}
+        class="absolute inset-0 size-full"
       ></iframe>
     {:else}
       <TextView url={viewer.url ?? ''} />

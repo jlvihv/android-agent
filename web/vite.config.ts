@@ -19,6 +19,10 @@ export default defineConfig({
     host: true,
     proxy: {
       '/api': { target: CORE, ws: true, changeOrigin: false },
+      // 沙箱文件（查看器里的网页/图片、markdown 里的 sandbox: 链接）也在核心那边。
+      // 只代理 /api 的话这些请求会落回 Vite 自己 —— 它给不存在的路径吐 index.html，
+      // 于是查看器里显示的是 App 自己的界面（踩过：探测底色全部探成了深色）。
+      '/sandbox': { target: CORE, changeOrigin: false },
     },
   },
   build: {
