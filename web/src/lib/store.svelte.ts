@@ -24,7 +24,13 @@ class AgentStore {
   hello = $state<Hello | null>(null);
   device = $state<DeviceInfo | null>(null);
   /** 从 /api/health 读到的 provider 信息；null = 未配置，会走演示流 */
-  llm = $state<{ name: string; model: string; baseUrl: string } | null>(null);
+  llm = $state<{
+    name: string;
+    model: string;
+    baseUrl: string;
+    /** 思考强度（`minimal`/`low`/`medium`/`high`）；null = 默认档（不发这个参数） */
+    reasoningEffort?: string | null;
+  } | null>(null);
   /**
    * 当前模型能吃什么输入。决定输入卡片里显示哪些附件入口：
    * `pdf` 为 false 时不显示「文件」（发了也必然 400）。
@@ -94,7 +100,12 @@ class AgentStore {
       const r = await fetch('/api/health');
       if (!r.ok) return;
       const h = (await r.json()) as {
-        llm?: { name: string; model: string; baseUrl: string } | null;
+        llm?: {
+          name: string;
+          model: string;
+          baseUrl: string;
+          reasoningEffort?: string | null;
+        } | null;
         capabilities?: { vision: boolean; pdf: boolean } | null;
       };
       this.llm = h.llm ?? null;

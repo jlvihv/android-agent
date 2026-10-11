@@ -40,6 +40,12 @@ pub struct ChatRequest {
     pub tools: Vec<Tool>,
     pub stream: bool,
     pub stream_options: StreamOptions,
+    /// 思考强度（`minimal` / `low` / `medium` / `high`）。
+    ///
+    /// `None` 时**整个字段都不发**：有些网关见到不认识的参数会直接 400，
+    /// 而默认档（什么都不发）才是所有端点的最大公约数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

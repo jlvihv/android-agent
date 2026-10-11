@@ -14,15 +14,32 @@
    * 最多 75%，再长就在面板内滚。
    */
   import type { Snippet } from 'svelte';
+  import { fly } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
 
   let {
     title,
     onclose,
+    onback,
+    slide = 1,
     minClass = 'min-h-[45dvh]',
     children,
-  }: { title: string; onclose: () => void; minClass?: string; children: Snippet } = $props();
+  }: {
+    title: string;
+    onclose: () => void;
+    /** 返回上一层的动作（面板内部换页时给，比如 模型 → 思考强度）。
+     *  给了它就接管**系统返回键**：在第二页按返回是退回第一页，而不是把
+     *  整个面板关掉。第二页不画返回箭头 —— 安卓本来就有返回键/返回手势，
+     *  再画一个纯属重复。 */
+    onback?: () => void;
+    /** 标题从哪边飞进来：1 = 从右（内容往左推，进第二页），-1 = 从左（退回）。
+     *  只在面板内部换页时有意义。 */
+    slide?: number;
+    minClass?: string;
+    children: Snippet;
+  } = $props();
 
   let panel: HTMLDivElement | null = $state(null);
   let body: HTMLDivElement | null = $state(null);
@@ -70,8 +87,26 @@
     setTimeout(onclose, 280);
   }
 
-  // 返回键关面板（带动画）；拖拽三件套同时是「预测性返回」的跟手位移
-  $effect(() => onBack(close, drag));
+  /**
+   * 返回上一层的动作：第二页 → 退回第一页（面板留在原地），第一页 → 关面板。
+   *
+   * **返回键和跟手返回必须都走这里。** 之前 `drag.onEnd` 里直接调 `close()`，
+   * 而安卓手势返回（预测性返回）commit 的那一下走的正是 `peek.onEnd(true)` ——
+   * 于是「在思考强度页返回」直接把整个面板关了，根本轮不到上面这一层。
+   *
+   * `onback` 是在**调用时**读的，不会被当成依赖；返回值表示面板是否真的要关
+   * （`close()` 会把 `p` 推到 1 滑出去，调用方就不要再动 `p` 了）。
+   */
+  const goBack = (): boolean => {
+    if (onback) {
+      onback();
+      return false;
+    }
+    close();
+    return true;
+  };
+
+  $effect(() => onBack(goBack, drag));
 
   const drag = {
     axis: 'y' as const,
@@ -84,8 +119,8 @@
     onMove: (v: number) => (p = v),
     onEnd: (shouldClose: boolean) => {
       dragging = false;
-      if (shouldClose) close();
-      else p = 0;
+      // 真关时 close() 自己会把 p 推到 1；只是回上一层则留在原地
+      if (!shouldClose || !goBack()) p = 0;
     },
   };
 </script>
@@ -115,9 +150,22 @@
 >
   <div class="shrink-0">
     <div class="mx-auto h-1.5 w-9 rounded-full bg-control"></div>
-    <h2 class="mt-3 flex h-11 items-center justify-center truncate px-12 text-[17px] font-semibold">
-      {title}
-    </h2>
+    <!-- 头部高度写死（mt-3 + h-11）：标题绝对定位，
+         换页那一瞬新旧标题同时在 DOM 里，不能让它把面板顶开。 -->
+    <div class="relative mt-3 h-11">
+      <div class="relative h-full overflow-hidden">
+        {#key title}
+          <h2
+            in:fly={{ x: 28 * slide, duration: 300, easing: cubicOut }}
+            out:fly={{ x: -28 * slide, duration: 300, easing: cubicOut }}
+            class="absolute inset-0 flex items-center justify-center truncate px-12 text-[17px]
+                   font-semibold"
+          >
+            {title}
+          </h2>
+        {/key}
+      </div>
+    </div>
   </div>
 
   <div

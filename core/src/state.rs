@@ -126,6 +126,9 @@ struct PersistedProvider {
     /// 协议偏好。老 llm.json 里没有 → Auto（优先 Responses）
     #[serde(default)]
     api_style: crate::llm::ApiStyle,
+    /// 思考强度。老 llm.json 里没有 → 默认档（不发）
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 pub struct AppState {
@@ -412,6 +415,7 @@ impl AppState {
             supports_images: p.supports_images,
             supports_files: p.supports_files,
             api_style: p.api_style,
+            reasoning_effort: p.reasoning_effort.clone(),
         };
         match serde_json::to_vec_pretty(&rec) {
             Ok(body) => {
@@ -542,6 +546,7 @@ impl AppState {
                 p.supports_images = rec.supports_images;
                 p.supports_files = rec.supports_files;
                 p.api_style = rec.api_style;
+                p.reasoning_effort = rec.reasoning_effort;
                 // 恢复出来的值先当已知（不用等下一次请求再联网）
                 if let Ok(mut g) = self.vision.write() {
                     *g = Some((vision_key(&p), rec.supports_images));

@@ -92,6 +92,7 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "name": p.name,
             "model": p.model,
             "baseUrl": p.base_url,
+            "reasoningEffort": p.reasoning_effort,
         })),
         // 界面靠它决定要不要显示「文件」那个附件入口
         "capabilities": capabilities,
@@ -320,6 +321,9 @@ struct LlmBody {
     /// `responses` / `chat` / `auto`（不传 = auto：优先 Responses）
     #[serde(default)]
     api_style: Option<crate::llm::ApiStyle>,
+    /// 思考强度。不传 = 不动；空串 = 清掉（回到默认档）。
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -330,8 +334,12 @@ struct ModelsQuery {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ModelBody {
     model: String,
+    /// 思考强度。不传 = 不动；空串 = 清掉（回到默认档）。
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 fn default_name() -> String {
@@ -390,6 +398,9 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
     if let Some(style) = body.api_style {
         p.api_style = style;
     }
+    if let Some(e) = body.reasoning_effort {
+        p.reasoning_effort = crate::llm::normalize_effort(&e);
+    }
     let dir = st.data_dir.read().ok().and_then(|g| g.clone());
     st.set_llm(p.clone(), dir.as_deref());
     // 自动判定这个模型能不能吃图片 / PDF（查 models.dev），结果落盘。
@@ -427,6 +438,7 @@ async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery
             "baseUrl": p.base_url,
             "vision": st.cached_supports_images(&p),
             "pdf": st.cached_supports_files(&p),
+            "reasoningEffort": p.reasoning_effort,
             "models": models,
         }))
         .into_response(),
@@ -513,12 +525,22 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
         return (StatusCode::BAD_REQUEST, "还没有配置 LLM").into_response();
     };
     p.model = body.model.trim().to_string();
+    if let Some(e) = body.reasoning_effort {
+        p.reasoning_effort = crate::llm::normalize_effort(&e);
+    }
     let dir = st.data_dir.read().ok().and_then(|g| g.clone());
     st.set_llm(p.clone(), dir.as_deref());
     let vision = st.supports_images_for(&p).await;
     let pdf = st.supports_files_for(&p).await;
     st.rotate_provider_sessions().await;
-    Json(json!({ "ok": true, "model": p.model, "vision": vision, "pdf": pdf })).into_response()
+    Json(json!({
+        "ok": true,
+        "model": p.model,
+        "vision": vision,
+        "pdf": pdf,
+        "reasoningEffort": p.reasoning_effort,
+    }))
+    .into_response()
 }
 
 /// `GET /api/session?rev=…` → 服务端的会话历史，转成前端 `Message[]` 的形状。
@@ -664,6 +686,7 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "name": p.name,
             "model": p.model,
             "baseUrl": p.base_url,
+            "reasoningEffort": p.reasoning_effort,
         })),
         "systemPrompt": {
             "chars": st.system_prompt().chars().count(),
@@ -699,12 +722,24 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
     let files = st.cached_supports_files(&p);
     let body = match p.transport() {
         crate::llm::Transport::Responses => {
-            crate::agent::build_responses_request(&sess, &p.model, images, files)
-                .and_then(|r| Ok(serde_json::to_value(&r)?))
+            crate::agent::build_responses_request(
+                &sess,
+                &p.model,
+                images,
+                files,
+                p.reasoning_effort.as_deref(),
+            )
+            .and_then(|r| Ok(serde_json::to_value(&r)?))
         }
         crate::llm::Transport::Chat => {
-            crate::agent::build_request(&sess, &p.model, images, files)
-                .and_then(|r| Ok(serde_json::to_value(&r)?))
+            crate::agent::build_request(
+                &sess,
+                &p.model,
+                images,
+                files,
+                p.reasoning_effort.as_deref(),
+            )
+            .and_then(|r| Ok(serde_json::to_value(&r)?))
         }
     };
     match body {

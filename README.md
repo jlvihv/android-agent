@@ -197,6 +197,11 @@ PDF / 文档输入同理，看的是 `modalities.input` 里的 `pdf`（`/api/hea
 `capabilities.pdf`）。**只有它为真时，输入卡片的「+」里才会出现「文件」入口** ——
 不支持 `file` 内容块的端点接了 PDF 会直接 400。
 
+界面里点输入卡片的模型药丸 = **选择模型**面板：上面是 `GET /api/models` 拉回来的
+清单（不写描述），下面两行是「思考强度」和「模型服务」。思考强度选完存进 llm.json，
+发请求时映射成 `reasoning_effort`（Chat Completions）或 `reasoning.effort`
+（Responses）；**默认档一个字段都不发**（严格网关会 400）。
+
 ## 环境
 
 | 项 | 版本 |

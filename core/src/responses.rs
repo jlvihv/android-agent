@@ -45,6 +45,15 @@ pub struct ResponsesRequest {
     pub stream: bool,
     /// 不落服务端状态：我们靠完整回放历史（也才可控 prompt 前缀）。
     pub store: bool,
+    /// 思考强度。Responses 里它是嵌套对象（Chat Completions 是顶层字符串）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
+}
+
+/// `reasoning: { effort: "…" }`。目前只用 `effort`；`summary` 之类等真需要再说。
+#[derive(Debug, Clone, Serialize)]
+pub struct Reasoning {
+    pub effort: String,
 }
 
 /// `input` 里的一条。用 `#[serde(untagged)]`：几种形状靠各自字段区分，
@@ -451,6 +460,7 @@ mod tests {
             tools: vec![],
             stream: true,
             store: false,
+            reasoning: None,
         };
         let v = req_json(&r);
         assert_eq!(v["store"], false);
@@ -499,6 +509,7 @@ mod tests {
             }],
             stream: true,
             store: false,
+            reasoning: None,
         };
         let v = req_json(&r);
         assert_eq!(v["input"][0]["role"], "assistant");

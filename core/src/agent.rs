@@ -21,7 +21,7 @@ use crate::openai::{
 };
 use crate::responses::{
     AssistantItem, FunctionCallItem, FunctionCallOutputItem, InputItem, InputPart, MessageContent,
-    MessageItem, OutputPart, ResponsesRequest, ToolOutput,
+    MessageItem, OutputPart, Reasoning, ResponsesRequest, ToolOutput,
 };
 use crate::{linux, sse, Core};
 
@@ -1110,6 +1110,7 @@ pub fn build_request(
     model: &str,
     supports_images: bool,
     supports_files: bool,
+    effort: Option<&str>,
 ) -> anyhow::Result<ChatRequest> {
     let messages = build_messages(sess, supports_images, supports_files)?;
     Ok(ChatRequest {
@@ -1122,6 +1123,8 @@ pub fn build_request(
         stream_options: StreamOptions {
             include_usage: true,
         },
+        // 思考强度只是请求参数，不进 messages —— 前缀不变式不受影响
+        reasoning_effort: effort.map(str::to_string),
     })
 }
 
@@ -1131,6 +1134,7 @@ pub fn build_responses_request(
     model: &str,
     supports_images: bool,
     supports_files: bool,
+    effort: Option<&str>,
 ) -> anyhow::Result<ResponsesRequest> {
     Ok(ResponsesRequest {
         model: model.to_string(),
@@ -1138,6 +1142,7 @@ pub fn build_responses_request(
         tools: tool_definitions_responses(),
         stream: true,
         store: false,
+        reasoning: effort.map(|e| Reasoning { effort: e.to_string() }),
     })
 }
 
@@ -1319,6 +1324,7 @@ async fn stream_one(
                         &provider.model,
                         supports_images,
                         supports_files,
+                        provider.reasoning_effort.as_deref(),
                     )?,
                     sess.provider_session.clone(),
                 )
@@ -1342,6 +1348,7 @@ async fn stream_one(
                                 &provider.model,
                                 supports_images,
                                 supports_files,
+                                provider.reasoning_effort.as_deref(),
                             )?,
                             sess.provider_session.clone(),
                         )
@@ -1358,7 +1365,13 @@ async fn stream_one(
                     .get(sid)
                     .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
                 (
-                    build_request(sess, &provider.model, supports_images, supports_files)?,
+                    build_request(
+                        sess,
+                        &provider.model,
+                        supports_images,
+                        supports_files,
+                        provider.reasoning_effort.as_deref(),
+                    )?,
                     sess.provider_session.clone(),
                 )
             };
@@ -2029,7 +2042,7 @@ mod tests {
         sess.messages.push(ChatMessage::User("第一问".into()));
         // 转成 Value 是为了断言请求体本身；线上路径不经过这一步
         let req1 =
-            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true, true).unwrap())
+            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true, true, None).unwrap())
                 .unwrap();
 
         sess.messages.push(ChatMessage::Assistant {
@@ -2048,7 +2061,7 @@ mod tests {
         });
         sess.messages.push(ChatMessage::User("第二问".into()));
         let req2 =
-            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true, true).unwrap())
+            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true, true, None).unwrap())
                 .unwrap();
 
         assert_eq!(req1["tools"], req2["tools"], "工具表变了 → 整段前缀缓存失效");
@@ -2059,6 +2072,35 @@ mod tests {
         let a = req1["messages"].as_array().unwrap();
         let b = req2["messages"].as_array().unwrap();
         assert_eq!(&b[..a.len()], &a[..], "完整请求体不是前缀关系");
+    }
+
+    /// 思考强度：两套协议字段形状不同（Chat 顶层字符串 / Responses 嵌套对象），
+    /// 而**默认档必须一个字都不发** —— 严格网关见到不认识的参数会 400。
+    #[test]
+    fn reasoning_effort_is_tagged_per_protocol_and_omitted_when_unset() {
+        let mut sess = ChatSession::default();
+        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        sess.messages.push(ChatMessage::User("嗨".into()));
+
+        let chat = serde_json::to_value(build_request(&sess, "m", true, true, None).unwrap())
+            .unwrap();
+        assert!(chat.get("reasoning_effort").is_none(), "{chat}");
+        let resp =
+            serde_json::to_value(build_responses_request(&sess, "m", true, true, None).unwrap())
+                .unwrap();
+        assert!(resp.get("reasoning").is_none(), "{resp}");
+
+        let chat = serde_json::to_value(build_request(&sess, "m", true, true, Some("high")).unwrap())
+            .unwrap();
+        assert_eq!(chat["reasoning_effort"], "high");
+        let resp = serde_json::to_value(
+            build_responses_request(&sess, "m", true, true, Some("low")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resp["reasoning"]["effort"], "low");
+
+        // 强度只是顶层请求参数，不进 messages —— 前缀不变式不受影响
+        assert_eq!(chat["messages"][0]["role"], "system");
     }
 
     /// 工具返回的图片：必须作为一条 `user` 消息发在**所有** tool 消息之后。

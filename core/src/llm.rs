@@ -47,6 +47,19 @@ pub enum Transport {
     Chat,
 }
 
+/// 规整思考强度：trim + 小写；空串 = 不设置（`None`）。
+///
+/// 不做白名单校验 —— 各家的档位集合不一样（OpenAI 有 `minimal`，别家可能只有
+/// `low/high`），这里只负责「空 = 不发」，具体取值直接透传。
+pub fn normalize_effort(s: &str) -> Option<String> {
+    let t = s.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 /// 一个 provider 配置。`base_url` 是接入任何兼容服务的唯一开关。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -75,6 +88,13 @@ pub struct Provider {
     /// 协议偏好。见 `ApiStyle`。
     #[serde(default)]
     pub api_style: ApiStyle,
+    /// 思考强度：`minimal` / `low` / `medium` / `high`，`None` = 默认档（不发）。
+    ///
+    /// 各家的档位叫法并不完全一致，这里只是**原样透传**给端点（Chat 放顶层、
+    /// Responses 放 `reasoning.effort`）；不认识它的端点会忽略，严格的会 400 ——
+    /// 所以默认是 `None`，即一个字都不发。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 pub(crate) fn default_supports_images() -> bool {
@@ -92,6 +112,7 @@ impl Provider {
             supports_images: true,
             supports_files: false,
             api_style: ApiStyle::Auto,
+            reasoning_effort: None,
         }
     }
 
@@ -110,6 +131,7 @@ impl Provider {
             supports_images: true,
             supports_files: false,
             api_style: ApiStyle::Auto,
+            reasoning_effort: None,
         }
     }
 
@@ -153,6 +175,9 @@ impl Provider {
             "chat" | "chat_completions" => ApiStyle::Chat,
             _ => ApiStyle::Auto,
         };
+        let effort = normalize_effort(
+            &get("AGENT_LLM_REASONING_EFFORT", "OPENCODE_REASONING_EFFORT").unwrap_or_default(),
+        );
 
         Some(Self {
             name,
@@ -164,6 +189,7 @@ impl Provider {
             supports_images: true,
             supports_files: false,
             api_style,
+            reasoning_effort: effort,
         })
     }
 
@@ -435,11 +461,21 @@ pub fn build_chat_request(model: &str, system: Option<&str>, user: &str) -> Chat
         stream_options: openai::StreamOptions {
             include_usage: true,
         },
+        reasoning_effort: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn effort_normalizes_and_empty_means_unset() {
+        assert_eq!(normalize_effort("  HIGH "), Some("high".into()));
+        assert_eq!(normalize_effort("Minimal"), Some("minimal".into()));
+        // 空串 = 不设置（前端用它表达「清掉」）
+        assert_eq!(normalize_effort(""), None);
+        assert_eq!(normalize_effort("   "), None);
+    }
     use super::*;
 
     #[test]

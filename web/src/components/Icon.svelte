@@ -38,6 +38,7 @@
     | 'camera'
     | 'image'
     | 'file'
+    | 'check'
     | 'close';
 
   let { name, size = 20, class: cls = '' }: { name: Name; size?: number; class?: string } =
@@ -112,6 +113,18 @@
 {:else if name === 'chevron'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <path d="M7.5 5 12.5 10l-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{:else if name === 'check'}
+  <!-- 对勾。描边型，墨迹 11.6 × 8.2，跟同行的文字居中。
+       竖笔比横笔稍短一点点（4.7 vs 4.9），视觉上两段才等长。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <path
+      d="M4.2 10.6 8 14.3l7.8-8.6"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
   </svg>
 {:else if name === 'pencil'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
