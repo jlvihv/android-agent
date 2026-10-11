@@ -9,10 +9,8 @@ import type {
   Ack,
   AgentEvent,
   ClientMsg,
-  Command,
   DeviceInfo,
   Hello,
-  UiSnapshot,
 } from './types';
 import { applyChunk, type Message } from './sse';
 import { uid } from './uid';
@@ -27,7 +25,6 @@ class AgentStore {
   device = $state<DeviceInfo | null>(null);
   /** 从 /api/health 读到的 provider 信息；null = 未配置，会走演示流 */
   llm = $state<{ name: string; model: string; baseUrl: string } | null>(null);
-  snapshot = $state<UiSnapshot | null>(null);
   logs = $state<LogItem[]>([]);
   acks = $state<(Ack & { ts: number })[]>([]);
   /** 当前正在流式接收的助手消息 */
@@ -110,9 +107,6 @@ class AgentStore {
         };
         break;
 
-      case 'snapshot':
-        this.snapshot = ev.data;
-        break;
 
       case 'device':
         this.device = { connected: ev.connected, name: ev.name, mock: ev.mock };
@@ -149,15 +143,7 @@ class AgentStore {
   }
 
   /** 让设备重新读一次 UI 树 */
-  refresh(): void {
-    this.send({ type: 'refresh' });
-  }
-
   /** 直接下发一条指令给设备 */
-  command(cmd: Command): void {
-    this.send({ type: 'command', cmd });
-  }
-
   /**
    * 开始一条新的助手消息（聊天流用）。
    *

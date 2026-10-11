@@ -19,13 +19,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::llm::Provider;
 use crate::sse;
-use crate::state::{AppState, Command, Event, UiSnapshot, VERSION};
+use crate::state::{AppState, Command, Event, VERSION};
 use crate::Core;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/snapshot", get(get_snapshot))
         .route("/api/command", post(post_command))
         .route("/api/linux", post(bash_run))
         .route("/api/edit", post(edit_file))
@@ -40,7 +39,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/rename", post(rename_session))
         .route("/api/sessions/delete", post(delete_session))
         .route("/api/reset", post(reset))
-        .route("/api/device/snapshot", post(device_snapshot))
         .route("/api/device/log", post(device_log))
         .route("/api/ws", get(ws_upgrade))
         .route("/sandbox", get(sandbox_root))
@@ -65,7 +63,6 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "platform": std::env::consts::OS,
         "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),
         "device": dev.map(|d| d.name()),
-        "hasSnapshot": st.has_snapshot(),
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
         })),
@@ -76,13 +73,6 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "baseUrl": p.base_url,
         })),
     }))
-}
-
-async fn get_snapshot(State(st): State<Arc<AppState>>) -> Response {
-    match st.latest_snapshot() {
-        Some(s) => Json(s).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
-    }
 }
 
 #[derive(Deserialize)]
@@ -164,17 +154,6 @@ async fn edit_file(State(st): State<Arc<AppState>>, Json(body): Json<EditBody>) 
         }))
         .into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
-    }
-}
-
-/// 设备（Kotlin）→ Rust：推送新快照。
-async fn device_snapshot(
-    State(st): State<Arc<AppState>>,
-    body: String,
-) -> Response {
-    match store_snapshot(&st, &body) {
-        Ok(s) => Json(json!({ "ok": true, "nodes": s.nodes.len() })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
@@ -352,26 +331,10 @@ fn session_rev(sess: &crate::agent::ChatSession) -> String {
 
 /// `GET /api/debug/state` → 一眼看全运行时状态。
 ///
-/// 原本要敲六个接口（health / sessions / snapshot / linux / llm …）才能拼出来，
+/// 原本要敲六个接口（health / sessions / linux / llm …）才能拼出来，
 /// 而调试时最想要的就是「现在到底什么情况」。前端不用它。
 async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let provider = st.llm().or_else(Provider::from_env);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let snapshot = st.latest_snapshot().map(|s| {
-        json!({
-            "nodes": s.nodes.len(),
-            "package": s.package,
-            "activity": s.activity,
-            "screen": [s.screen.w, s.screen.h],
-            // 快照是设备推上来的。这个数大得离谱 = 无障碍服务没在推了
-            "ageMs": now.saturating_sub(s.ts),
-        })
-    });
-
     let sessions = {
         let store = st.chat.read().await;
         json!({
@@ -393,7 +356,6 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "device": st.device().map(|d| d.name()),
         "turnActive": st.turn_active.load(std::sync::atomic::Ordering::Relaxed),
         "sessions": sessions,
-        "snapshot": snapshot,
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
             "sharedStorage": s.has_shared_storage(),
@@ -842,11 +804,6 @@ async fn ws_loop(mut socket: WebSocket, st: Arc<AppState>) {
         return;
     }
 
-    // 补发当前快照，避免前端刚连上时空白
-    if let Some(snap) = st.latest_snapshot() {
-        let _ = send_event(&mut socket, &Event::Snapshot { data: snap }).await;
-    }
-
     loop {
         tokio::select! {
             // Rust → 前端
@@ -885,8 +842,6 @@ async fn send_event(socket: &mut WebSocket, ev: &Event) -> Result<(), axum::Erro
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
-    /// 让设备重新读一次 UI 树
-    Refresh,
     /// 转发一条指令给设备
     Command { cmd: Command },
     /// 前端发起的日志（调试用）
@@ -896,9 +851,6 @@ enum ClientMsg {
 async fn handle_client_msg(st: &Arc<AppState>, raw: &str) -> anyhow::Result<()> {
     let msg: ClientMsg = serde_json::from_str(raw)?;
     match msg {
-        ClientMsg::Refresh => {
-            dispatch(st, Command::Snapshot).await;
-        }
         ClientMsg::Command { cmd } => {
             dispatch(st, cmd).await;
         }
@@ -910,16 +862,6 @@ async fn handle_client_msg(st: &Arc<AppState>, raw: &str) -> anyhow::Result<()> 
 // ---------------------------------------------------------------------------
 // 共享逻辑（HTTP 和 WS 都走这里；将来 uniffi 导出也复用）
 // ---------------------------------------------------------------------------
-
-/// 存快照并广播。`body` 是 `UiSnapshot` 的 JSON。
-pub fn store_snapshot(st: &Arc<AppState>, body: &str) -> anyhow::Result<UiSnapshot> {
-    let snap: UiSnapshot = serde_json::from_str(body)?;
-    if let Ok(mut g) = st.snapshot.write() {
-        *g = Some(snap.clone());
-    }
-    st.emit(Event::Snapshot { data: snap.clone() });
-    Ok(snap)
-}
 
 /// 把指令发给设备执行。设备实现可能阻塞，所以走 `spawn_blocking`。
 pub async fn dispatch(st: &Arc<AppState>, cmd: Command) -> serde_json::Value {
@@ -957,11 +899,8 @@ pub async fn dispatch(st: &Arc<AppState>, cmd: Command) -> serde_json::Value {
 
 fn cmd_name(c: &Command) -> &'static str {
     match c {
-        Command::Snapshot => "snapshot",
-        Command::TapNode { .. } => "tap_node",
         Command::TapXy { .. } => "tap_xy",
         Command::Swipe { .. } => "swipe",
-        Command::SetText { .. } => "set_text",
         Command::Key { .. } => "key",
         Command::Launch { .. } => "launch",
     }

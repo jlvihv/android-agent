@@ -51,7 +51,7 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ---
 
-### D2 — Rust 怎么反向调用 Kotlin（执行 tap / 读 UI 树）？
+### D2 — Rust 怎么反向调用 Kotlin（执行设备指令）？
 
 | | A. UniFFI callback interface | B. Kotlin 侧跑 localhost HTTP server | C. 手写反向 JNI |
 |---|---|---|---|
@@ -181,6 +181,10 @@ genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B �
 
 ### D10 — UI 树快照格式（Kotlin → Rust）
 
+> **已废弃：**这条是实现过的（`UiSnapshot` + `UiTree.kt`），后来随
+> `device_snapshot` / `device_tap` 两个工具一起删掉了。留着作为「以后要做沙箱里
+> 那个设备命令时怎么选格式」的记录。
+
 | | A. JSON（serde_json） | B. CBOR（ciborium） | C. Protobuf |
 |---|---|---|---|
 | 调试 | 最好（logcat 直接看） | 要工具 | 要工具 |
@@ -242,7 +246,7 @@ genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B �
 ┌──────────────────────────────────────────────────────────────┐
 │ Kotlin 薄壳（目标 < 800 行，不随功能增长）                      │
 │   MainActivity        WebView + 权限                          │
-│   AgentAccessibilityService   读 UI 树 / 执行 tap·swipe·type  │
+│   AgentAccessibilityService   执行 tap·swipe·key·launch      │
 │   DeviceApiImpl       实现 UniFFI callback trait              │
 │   AgentForegroundService      后台常驻 + 通知渠道               │
 │   Application         启动时把 JavaVM/Context 交给 native      │
@@ -254,21 +258,22 @@ genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B �
 | 必须存在 | 原因 | 估算行数 |
 |---|---|---|
 | `MainActivity` | 入口；`requestPermissions` 只能在 Activity 发起 | ~80 |
-| `AgentAccessibilityService` | 操控其他 App 的**唯一**途径，必须继承该基类 | ~300 |
+| `AgentAccessibilityService` | 操控其他 App 的**唯一**途径，必须继承该基类 | ~150 |
 | `DeviceApiImpl` | 实现 Rust 定义的 callback trait | ~150 |
 | `AgentForegroundService` + 通知渠道 | 后台常驻；Android 14+ 要 `foregroundServiceType` | ~120 |
 | `Application` | 把 `JavaVM`/`Context` 存进 native 全局 | ~30 |
 | `AndroidManifest.xml` + `accessibility_service_config.xml` | 组件与权限声明 | ~80 |
 | **合计** | | **~760 行** |
 
-**设计铁律**：native 侧**不写任何反调 Java 的代码**。
-Kotlin 把 UI 树拍平成扁平 JSON 送进来，native 只回传指令（`tap(id)` / `swipe` / `type` / `back`）。
+**设计铁律**：native 侧**不写任何反调 Java 的代码**。跨语言边界只有 JSON 字符串：
+Rust 回传指令（`tap_xy` / `swipe` / `key` / `launch`），Kotlin 执行。
 
 ```
-Kotlin Service ──[扁平 JSON UI 快照]──▶ Rust（决策/规划/推理）
-      ▲                                      │
-      └────────[指令: tap/swipe/type]────────┘
+Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无障碍）
 ```
+
+> 原来还有反方向的一条：Kotlin 把 UI 树拍平成扁平 JSON 推给 Rust（D10）。
+> 那部分随 `device_snapshot` / `device_tap` 一起删了。
 
 另外：`onAccessibilityEvent` 跑在**主线程**，绝对不能阻塞——native 侧收到立刻入队返回。
 
@@ -328,7 +333,7 @@ Kotlin Service ──[扁平 JSON UI 快照]──▶ Rust（决策/规划/推�
 | D7 | 流式协议 | **A AI SDK UI Message Stream**（保留规范；客户端见 §10） |
 | D8 | Gradle 集成 | 脚本驱动 |
 | D9 | ABI | arm64-v8a + x86_64 |
-| D10 | UI 快照 | JSON + 剪枝 |
+| D10 | UI 快照 | ~~JSON + 剪枝~~ **已删**（代码实现过，随设备工具一起移除） |
 | D11 | 本地推理 | 先不做 |
 | D12 | 其余 | bun / Tailwind v4 / **不用 shadcn** / markdown 后补 |
 | — | `genai` | **砍掉** |

@@ -17,7 +17,6 @@
     /request      下一次会发给模型的完整请求体 —— 调提示词 / 查缓存靠它
     /prompt <文字> 运行时换系统提示词（不用重装 APK）
     /bash <命令>   直接进沙箱跑，绕过模型
-    /snap         让手机重推一次界面，然后打出来
     /dev {"type":"key","name":"back"}    直接发设备指令
 """
 
@@ -391,7 +390,6 @@ HELP = f"""
 {c('1', '直连（绕过模型）')}
   /bash <命令>           在沙箱里跑命令（/api/linux）
   /cat <沙箱路径>        读沙箱里的文件（/sandbox/…）
-  /snap                  让手机重推一次界面并打出来
   /dev <json>            发一条设备指令，如 /dev {{"type":"key","name":"back"}}
 
   /help  /quit
@@ -457,30 +455,6 @@ def set_prompt(text: str | None) -> None:
                     f"新提示词会作为一条 system 消息追加在历史末尾。"))
     else:
         print(c(OK, "已恢复成编译进去的那版。"))
-
-
-def print_snapshot() -> None:
-    # 让手机重读一次界面：走「人按按钮」那条路（/api/command），
-    # 设备执行完会把新快照推回 /api/device/snapshot。
-    call("POST", "/api/command", {"cmd": {"type": "snapshot"}})
-    time.sleep(0.6)
-    code, d = call("GET", "/api/snapshot")
-    if code != 200 or not isinstance(d, dict):
-        print(c(BAD, f"没有快照（{code}）：{d}"))
-        return
-    screen = d.get("screen") or {}
-    print(f"包名 {d.get('package')}   Activity {d.get('activity')}   "
-          f"屏幕 {screen.get('w')}x{screen.get('h')}   {len(d.get('nodes', []))} 个节点")
-    for n in d.get("nodes", []):
-        flags = n.get("a") or {}
-        txt = (n.get("t") or "").replace("\n", " ")
-        caps = [k for k in ("clickable", "long_clickable", "editable", "scrollable", "checkable")
-                if flags.get(k)]
-        if txt == "" and not caps:
-            continue
-        if not flags.get("enabled", True):
-            caps.append("disabled")
-        print(f"  [{n.get('i'):3}] {n.get('c'):18} {txt[:40]:42} {tuple(n.get('b') or [])} {caps}")
 
 
 def cmd_bash(script: str) -> None:
@@ -554,8 +528,6 @@ def handle_command(line: str) -> bool:
             print(c(WARN, "用法：/bash <命令>"))
     elif cmd == "/cat":
         cmd_cat(rest)
-    elif cmd == "/snap":
-        print_snapshot()
     elif cmd == "/dev":
         cmd_dev(rest)
     elif cmd == "/sessions":

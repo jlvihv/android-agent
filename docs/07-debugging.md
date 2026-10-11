@@ -41,11 +41,10 @@ python3 scripts/agentctl.py --json "…" # 一整份机器可读转录，给脚�
 ### `GET /api/debug/state`
 
 一次拿全：版本 / 平台 / 端口 / 设备名 / 有没有在跑回合 / 活跃会话（id、标题、
-消息数、rev）/ 快照（节点数、包名、Activity、**快照有多旧**）/ 沙箱（rootfs、
-手机存储挂没挂）/ 模型 / 系统提示词（多少字符、是不是被覆盖过）。
+消息数、rev）/ 沙箱（rootfs、手机存储挂没挂）/ 模型 / 系统提示词（多少字符、
+是不是被覆盖过）。
 
-以前要拼这些得敲六个接口。`snapshot.ageMs` 特别有用 —— 它一直涨就说明无障碍服务
-不再推快照了。
+以前要拼这些得敲六个接口。
 
 ### `GET /api/debug/request`
 
@@ -126,7 +125,6 @@ cd core && cargo run -q --example dump_prompt
 |---|---|
 | `/bash <命令>` | 在沙箱里直接跑（走 `/api/linux`，和 `bash` 工具同一条路） |
 | `/cat <沙箱路径>` | 看沙箱里的文件（走 `/sandbox/…`，和给用户看的链接同一条路） |
-| `/snap` | 让手机重读一次 UI 树并打出来（走 `/api/command`） |
 | `/dev {"type":"key","name":"back"}` | 直接发设备指令 |
 | `/state` | 服务端状态 |
 | `/new` `/use <id>` `/sessions` `/clear` | 会话管理 |

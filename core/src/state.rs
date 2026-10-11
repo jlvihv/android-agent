@@ -19,92 +19,12 @@ use crate::llm::Provider;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
-// 设备侧 → Rust：UI 快照
-// ---------------------------------------------------------------------------
-
-/// 剪枝 + 扁平化后的 UI 快照（决策 D10）。
-///
-/// 树结构用 `parent` 索引表达，避免嵌套 JSON —— 无障碍树可以有几层深、
-/// 几百个节点，嵌套结构在 Kotlin 侧序列化和 Rust 侧反序列化都更贵。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct UiSnapshot {
-    /// Unix 毫秒
-    pub ts: u64,
-    #[serde(default)]
-    pub package: String,
-    #[serde(default)]
-    pub activity: String,
-    #[serde(default)]
-    pub screen: Screen,
-    pub nodes: Vec<Node>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct Screen {
-    pub w: u32,
-    pub h: u32,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Node {
-    /// 节点索引，也是指令里引用的句柄
-    pub i: u32,
-    /// 父节点索引；-1 表示根
-    pub p: i32,
-    /// 类名简写，如 `Button` / `TextView` / `RecyclerView`
-    pub c: String,
-    /// 可见文本
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub t: String,
-    /// `viewIdResourceName`
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub id: String,
-    /// bounds `[left, top, right, bottom]`
-    #[serde(default)]
-    pub b: [i32; 4],
-    /// 能力标志
-    #[serde(default)]
-    pub a: Flags,
-    /// 状态描述，如 `checked=true`、`scrollable`、`password`
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub s: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct Flags {
-    pub clickable: bool,
-    pub long_clickable: bool,
-    pub editable: bool,
-    pub scrollable: bool,
-    pub checkable: bool,
-    pub focusable: bool,
-    pub enabled: bool,
-    pub selected: bool,
-}
-
-impl Flags {
-    /// 是否值得保留在快照里（剪枝依据）。
-    pub fn interesting(&self) -> bool {
-        self.clickable
-            || self.long_clickable
-            || self.editable
-            || self.scrollable
-            || self.checkable
-            || self.focusable
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Rust → 设备侧：指令
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
-    /// 请求重新读取 UI 树
-    Snapshot,
-    /// 点击某个节点（由 Kotlin 侧解析成坐标 + performAction）
-    TapNode { i: u32 },
     TapXy { x: i32, y: i32 },
     Swipe {
         x1: i32,
@@ -114,7 +34,6 @@ pub enum Command {
         #[serde(default = "default_swipe_ms")]
         ms: u32,
     },
-    SetText { i: u32, text: String },
     /// `back` / `home` / `recents` / `enter`
     Key { name: String },
     Launch { package: String },
@@ -136,6 +55,10 @@ fn default_swipe_ms() -> u32 {
 ///
 /// 实现方必须是非阻塞的（或自行转后台线程）—— Rust 侧会用
 /// `spawn_blocking` 调用，但一次调用不应超过几百毫秒。
+///
+/// 现在模型**拿不到**设备工具，所以这条通路只有人在用（前端 / `/api/command`、
+/// agentctl 的 `/dev`）。读界面那套（`Command::Snapshot` + `UiSnapshot`）跟着
+/// 快照一起删了，以后作为沙箱里的一个命令回来。
 pub trait DeviceApi: Send + Sync + 'static {
     /// 执行一条指令（`Command` 的 JSON），返回结果 JSON 字符串。
     fn execute(&self, cmd_json: &str) -> Result<String, String>;
@@ -160,8 +83,6 @@ pub enum Event {
         platform: String,
         mock: bool,
     },
-    /// 新的 UI 快照
-    Snapshot { data: UiSnapshot },
     /// 设备连接状态变化
     Device {
         connected: bool,
@@ -199,7 +120,6 @@ struct PersistedProvider {
 
 pub struct AppState {
     pub tx: broadcast::Sender<Event>,
-    pub snapshot: RwLock<Option<UiSnapshot>>,
     pub device: RwLock<Option<Arc<dyn DeviceApi>>>,
     pub port: AtomicU16,
     pub mock: AtomicBool,
@@ -243,7 +163,6 @@ impl AppState {
         let (tx, _) = broadcast::channel(512);
         Arc::new(Self {
             tx,
-            snapshot: RwLock::new(None),
             device: RwLock::new(None),
             port: AtomicU16::new(0),
             mock: AtomicBool::new(false),
@@ -303,18 +222,6 @@ impl AppState {
             name,
             mock,
         });
-    }
-
-    pub fn latest_snapshot(&self) -> Option<UiSnapshot> {
-        self.snapshot.read().ok().and_then(|g| g.clone())
-    }
-
-    /// 有没有界面快照。
-    ///
-    /// `/api/health` 只是想知道「有没有」，用这个 —— `latest_snapshot()`
-    /// 会把整棵树（几百个节点加字符串）克隆一份。
-    pub fn has_snapshot(&self) -> bool {
-        self.snapshot.read().map(|g| g.is_some()).unwrap_or(false)
     }
 
     pub fn linux(&self) -> Option<Arc<LinuxSandbox>> {

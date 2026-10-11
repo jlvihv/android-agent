@@ -189,12 +189,6 @@ impl AgentCore {
         self.core.set_linux_sandbox(cfg);
     }
 
-    /// 设备推送 UI 快照（`UiSnapshot` 的 JSON）
-    pub fn push_snapshot(&self, json: String) -> Result<(), CoreError> {
-        self.core.push_snapshot(&json)?;
-        Ok(())
-    }
-
     /// 推送一条日志（会出现在前端的「事件」页）
     pub fn log(&self, level: String, msg: String) {
         self.core.push_log(&level, &msg);
@@ -226,7 +220,7 @@ mod tests {
         let adapter = HostAdapter(Box::new(FakeHost));
         // 内部 trait 是同步的，callback 也是同步的
         assert_eq!(adapter.name(), "fake");
-        assert!(adapter.execute(r#"{"type":"snapshot"}"#).unwrap().contains("snapshot"));
+        assert!(adapter.execute(r#"{"type":"key","name":"back"}"#).unwrap().contains("back"));
     }
 
     #[test]

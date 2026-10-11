@@ -17,7 +17,6 @@
     | 'sparkle'
     | 'clock'
     | 'chat'
-    | 'screen'
     | 'list'
     | 'pencil'
     | 'trash';
@@ -100,11 +99,6 @@
       stroke-width="1.6"
       stroke-linejoin="round"
     />
-  </svg>
-{:else if name === 'screen'}
-  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <rect x="5.2" y="2.4" width="9.6" height="15.2" rx="2.2" stroke="currentColor" stroke-width="1.6" />
-    <path d="M8.6 15.4h2.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
   </svg>
 {:else if name === 'list'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>

@@ -14,8 +14,8 @@
 | UniFFI 正向调用（Kotlin → Rust） | ✅ |
 | UniFFI 反向 callback（Rust → Kotlin，D2） | ✅ |
 | WebView 加载 `http://127.0.0.1:<port>`（D3） | ✅ 明文例外够用（R2 解决） |
-| 无障碍读 UI 树（真实 500 节点） | ✅ |
-| 无障碍点击（按 viewId / 坐标） | ✅ |
+| 无障碍读 UI 树（真实 500 节点） | ✅ **后来删了**（见 §6 的注） |
+| 无障碍坐标点击 / 滑动 / 系统按键 / 启动应用 | ✅ |
 | **Alpine 沙箱跑起来**（proot + W^X 绕过） | ✅ 87ms 启动 |
 | `apk add` 联网装包（jq + python3） | ✅ 32s / 50 MiB |
 | `edit` 工具（unified diff） | ✅ |
@@ -355,11 +355,16 @@ align: 0x8
 `execute` 是从 Rust 的 `spawn_blocking` 线程进来的，而无障碍 API 必须在主线程调。
 `onMain {}` 会 post 到主线程并**阻塞等结果**（8s 超时）。
 
-### 事件节流
+### 事件节流（已随快照一起删掉）
 
-`onAccessibilityEvent` 每秒可达几十次。`schedulePush()` 用 250ms 的 debounce 合并。
+`onAccessibilityEvent` 每秒可达几十次，原来用 250ms 的 debounce 合并。
 
-### 实测效果
+> 读 UI 树那整套（`UiTree.kt`、推快照、按节点索引点击/输入）是给
+> `device_snapshot` / `device_tap` 两个工具做地基的；工具删掉之后它跟着删了。
+> 现在无障碍服务只剩不需要读界面的那几条：坐标点击、滑动、系统按键、启动应用。
+> 以后做沙箱里的设备命令时会连同它一起重做。
+
+### 实测效果（当时的记录）
 
 模型读到节点 #14 是「📱 界面」标签页 → 点击 `(540,2259)` → 界面切换 →
 再次快照确认（500 节点）。

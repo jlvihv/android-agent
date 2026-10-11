@@ -137,7 +137,7 @@ pub fn tool_output_preliminary(tool_call_id: &str, output: Value) -> Value {
 
 // --- 自定义数据 -----------------------------------------------------------
 
-/// `data-*` 通道：推设备快照、日志等非 LLM 内容，前端 reducer 同样处理。
+/// `data-*` 通道：推用量、告警等非 LLM 内容，前端 reducer 同样处理。
 pub fn data_part(name: &str, data: Value) -> Value {
     json!({ "type": format!("data-{name}"), "data": data })
 }
@@ -169,8 +169,8 @@ mod tests {
 
     #[test]
     fn data_parts_use_the_data_prefix() {
-        let v = data_part("snapshot", json!({ "nodes": 3 }));
-        assert_eq!(v["type"], "data-snapshot");
-        assert_eq!(v["data"]["nodes"], 3);
+        let v = data_part("warning", json!({ "message": "x" }));
+        assert_eq!(v["type"], "data-warning");
+        assert_eq!(v["data"]["message"], "x");
     }
 }

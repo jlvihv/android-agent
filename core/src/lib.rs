@@ -29,9 +29,7 @@ pub mod state;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-pub use state::{
-    AppState, Command, DeviceApi, Event, Flags, Node, Screen, UiSnapshot, VERSION,
-};
+pub use state::{AppState, Command, DeviceApi, Event, VERSION};
 // proc-macro 模式的脚手架。必须在 crate 根调用一次，
 // 之后 `uniffi-bindgen generate --library` 才能从 .so 里读出元数据。
 uniffi::setup_scaffolding!();
@@ -114,7 +112,7 @@ impl Core {
     pub fn with_mock() -> Self {
         let core = Self::new();
         core.state.mock.store(true, Ordering::Relaxed);
-        let dev = mock::MockDevice::new(Arc::downgrade(&core.state));
+        let dev = mock::MockDevice::new();
         core.state.set_device(dev);
 
         // 桌面：如果环境里能找到 proot + rootfs，就把 Linux 沙箱也接上
@@ -221,11 +219,6 @@ impl Core {
     /// 注入设备实现（安卓上由 Kotlin 通过 UniFFI 传入）。
     pub fn set_device(&self, dev: Arc<dyn DeviceApi>) {
         self.state.set_device(dev);
-    }
-
-    /// 设备推送 UI 快照。`body` 是 `UiSnapshot` 的 JSON。
-    pub fn push_snapshot(&self, body: &str) -> anyhow::Result<UiSnapshot> {
-        http::store_snapshot(&self.state, body)
     }
 
     /// 设备推送日志。
@@ -335,19 +328,10 @@ mod tests {
     }
 
     #[test]
-    fn mock_device_produces_a_snapshot() {
+    fn mock_device_takes_commands_and_reports_garbage() {
         let core = Core::with_mock();
         let dev = core.state.device().unwrap();
-        dev.execute(r#"{"type":"snapshot"}"#).unwrap();
-        let snap = core.state.latest_snapshot().expect("snapshot 应该已存入");
-        assert!(snap.nodes.len() >= 4, "Home 屏应有 5 个节点");
-        assert_eq!(snap.nodes[0].p, -1, "根节点 parent = -1");
-    }
-
-    #[test]
-    fn push_snapshot_rejects_garbage() {
-        let core = Core::new();
-        assert!(core.push_snapshot("not json").is_err());
-        assert!(core.push_snapshot(r#"{"ts":1,"nodes":[]}"#).is_ok());
+        assert!(dev.execute(r#"{"type":"key","name":"back"}"#).unwrap().contains("back"));
+        assert!(dev.execute("not json").is_err(), "非法指令必须报错");
     }
 }

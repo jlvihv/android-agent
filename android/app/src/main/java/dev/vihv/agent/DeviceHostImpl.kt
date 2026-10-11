@@ -35,19 +35,12 @@ class DeviceHostImpl(
 
         return try {
             when (val type = cmd.getString("type")) {
-                "snapshot" -> {
-                    val n = service.pushSnapshot()
-                    if (n < 0) "拿不到界面（可能被系统弹窗挡住）" else "snapshot ok, $n 个节点"
-                }
-
-                "tap_node" -> service.tapNode(cmd.getInt("i"))
                 "tap_xy" -> service.tapXY(cmd.getInt("x"), cmd.getInt("y"))
                 "swipe" -> service.swipe(
                     cmd.getInt("x1"), cmd.getInt("y1"),
                     cmd.getInt("x2"), cmd.getInt("y2"),
                     cmd.optInt("ms", 300),
                 )
-                "set_text" -> service.setText(cmd.getInt("i"), cmd.getString("text"))
                 "key" -> service.pressKey(cmd.getString("name"))
                 "launch" -> service.launch(cmd.getString("package"))
                 else -> throw CoreException.Failed("未知指令: $type")

@@ -23,7 +23,6 @@
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
   import Icon from './Icon.svelte';
-  import DevicePanel from './DevicePanel.svelte';
   import EventLog from './EventLog.svelte';
 
   export type Session = { id: string; title: string; active: boolean; count: number };
@@ -169,7 +168,7 @@
     </div>
 
     <nav class="flex shrink-0 flex-col">
-      {#each [['device', '界面', 'screen'], ['events', '事件', 'list']] as const as [k, label, icon] (k)}
+      {#each [['events', '事件', 'list']] as const as [k, label, icon] (k)}
         <button
           onclick={() => (panel = k)}
           class="flex items-center gap-3.5 px-5 py-3.5 text-base text-fg"
@@ -241,10 +240,10 @@
       <button class="p-1 text-fg" aria-label="返回" onclick={() => (panel = null)}>
         <Icon name="back" size={20} />
       </button>
-      <span class="text-base font-medium">{panel === 'device' ? '界面' : '事件'}</span>
+      <span class="text-base font-medium">事件</span>
     </div>
     <div class="min-h-0 flex-1 border-t border-hairline">
-      {#if panel === 'device'}<DevicePanel />{:else}<EventLog />{/if}
+      <EventLog />
     </div>
   {/if}
 </aside>

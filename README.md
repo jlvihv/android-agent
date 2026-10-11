@@ -17,7 +17,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | `android/` 壳 | ✅ **真机验证通过** |
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
 | Linux 沙箱 | ✅ **Alpine 3.21 aarch64 在真机上跑起来**，`apk add` 可用 |
-| 设备操控 | ✅ 真机读 UI 树 + 点击（内核已有；暂不暴露给模型，见下） |
+| 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用（读 UI 树那套已删，见下） |
 | Prompt cache | ✅ 实测命中 73–87% |
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
 | 多会话 | ✅ 侧边栏「最近对话」，标题自动生成 |
@@ -92,7 +92,7 @@ just phone                                   # 交互模式，/help 看命令
 1. **不手写 LLM 协议** —— `async-openai`，`default-features = false` 只开 3 个 feature
 2. **不手写流式协议** —— 用 AI SDK 的 UI Message Stream 规范
 3. **不手写反向 JNI** —— UniFFI callback interface
-4. **native 侧不反调 Java** —— Kotlin 把 UI 树拍平成 JSON 送进来
+4. **native 侧不反调 Java** —— 跨语言边界只有 JSON 字符串，Rust 里没有一行 JNI
 5. **Kotlin 壳不写业务逻辑** —— 目标 < 800 行，不随功能增长
 6. **提示词前缀一个字都不能变** —— 见 [docs/03-prompt-cache.md](docs/03-prompt-cache.md)
 7. **没有审批环节** —— 工具调用一律直接执行，服务端不保存「挂起等回复」的状态
@@ -106,10 +106,14 @@ just phone                                   # 交互模式，/help 看命令
 | `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`），cwd 是 `/workspace` |
 | `edit` | 按原文精确替换编辑文件，返回 unified diff |
 
-设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**暂时不作为工具**暴露给模型。
-内核那条路还在（Kotlin 拍 UI 树 → `/api/command` → 回推快照），
+设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不作为工具**暴露给模型。
 以后收进沙箱里的一个命令、由 `bash` 调用 —— 这样模型只需要理解 shell，
 工具表也能一直保持只有两个。
+
+内核那条路（`/api/command` → 无障碍服务）现在只剩**不需要读界面**的几条：
+坐标点击、滑动、系统按键、启动应用。读 UI 树那套（无障碍树拍平成 JSON 推上来）
+跟 `device_snapshot` 一起删掉了 —— 它当时只为那两个工具服务。要做沙箱里的设备
+命令时会连同它一起重做（`git log --diff-filter=D --name-only` 找得到）。
 
 工具调用一律直接执行，没有审批环节 —— 服务端因此不持有「挂起等回复」的状态，
 App 随时被杀都没关系。

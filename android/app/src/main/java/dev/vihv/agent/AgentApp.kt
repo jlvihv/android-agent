@@ -46,7 +46,6 @@ class AgentApp : Application() {
             runCatching {
                 core.setDevice(DeviceHostImpl(service))
                 core.log("info", "设备已接入（无障碍服务）")
-                service.pushSnapshot()
             }.onFailure { Log.e(TAG, "注入设备失败", it) }
         }
 
