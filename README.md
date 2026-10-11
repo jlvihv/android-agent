@@ -74,7 +74,7 @@ just phone                                   # 交互模式，/help 看命令
 ┌──────────────────────────────────────────────────────────┐
 │ Rust core (.so, 进程内, tokio + axum)                     │
 │   axum + rust-embed        静态资源 + /api + /ws          │
-│   async-openai (3 features) LLM，不手写协议                │
+│   openai.rs / responses.rs 自研 LLM 协议，不引 SDK           │
 │   自研 agent loop           事件流 / 工具循环               │
 │   linux.rs                  proot + Alpine 沙箱           │
 │   editor.rs                 edit 工具（精确替换 + diff）    │
@@ -89,7 +89,10 @@ just phone                                   # 交互模式，/help 看命令
 
 ## 设计铁律
 
-1. **不手写 LLM 协议** —— `async-openai`，`default-features = false` 只开 3 个 feature
+1. **自研 LLM 协议，不引 SDK** —— `openai.rs`（Chat Completions）+ `responses.rs`
+   （Responses API）。默认**优先 Responses**，端点不支持（404/405）自动退回
+   Chat Completions 并记住。为什么要自研：`async-openai` 会在我们拿不到的地方
+   建自己的 reqwest client，`rustls-no-provider` 下直接 panic（见下）
 2. **不手写流式协议** —— 用 AI SDK 的 UI Message Stream 规范
 3. **不手写反向 JNI** —— UniFFI callback interface
 4. **native 侧不反调 Java** —— 跨语言边界只有 JSON 字符串，Rust 里没有一行 JNI
@@ -189,6 +192,10 @@ dev_shell 'uname -m'
 再查 [models.dev](https://models.dev) 目录里该模型的 `modalities.input` 有没有
 `image`。判定结果跟着 llm.json 落盘，下次启动直接用。`read` 读到的图片会作为
 `image_url` 发给能看图的模型；查不到（目录里没这个模型）就沿用上次的值。
+
+PDF / 文档输入同理，看的是 `modalities.input` 里的 `pdf`（`/api/health` 的
+`capabilities.pdf`）。**只有它为真时，输入卡片的「+」里才会出现「文件」入口** ——
+不支持 `file` 内容块的端点接了 PDF 会直接 400。
 
 ## 环境
 

@@ -1,7 +1,12 @@
 //! LLM 接入层。
 //!
-//! 决策 D4：**不手写 OpenAI 协议**。用 `async-openai`，只开 3 个 feature
-//! （该 crate 共 57 个）：`rustls` + `chat-completion` + `responses`。
+//! **不引 SDK，自己实现协议**（原决策 D4 是「用 `async-openai`」，已修订）：
+//! 我们只用得到一个请求体 + 一条 SSE 流，而 SDK 会在我们拿不到的地方建
+//! 自己的 reqwest client（`rustls-no-provider` 下直接 panic）。协议类型在
+//! `openai.rs`（Chat Completions）和 `responses.rs`（Responses API）。
+//!
+//! **优先用 Responses API**（`ApiStyle::Auto`）：它对图片/工具结果的表达更
+//! 干净；端点不支持（404/405）就自动退回 Chat Completions 并记住。
 //!
 //! 覆盖范围：任何提供 **OpenAI 兼容端点**的服务 —— OpenAI、DeepSeek、Kimi、
 //! 通义 DashScope、智谱、SiliconFlow、OpenRouter、Groq、xAI、Together、
@@ -9,21 +14,38 @@
 //!
 //! 已知不支持：Anthropic / Gemini 的**原生**协议（需走中转或另加 adapter）。
 
-use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
-use async_openai::config::OpenAIConfig;
-use async_openai::types::chat::{
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
-    CreateChatCompletionRequestArgs,
-};
-use async_openai::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+use crate::openai::{self, ChatRequest, StreamChunk, UserContent};
+use crate::responses::ResponsesRequest;
 
 /// OpenCode Go 明确要求：客户端要"用自己的 user agent 标识自己，
 /// 而不是通用 SDK / HTTP 库名"。
 pub const USER_AGENT: &str = concat!("android-agent/", env!("CARGO_PKG_VERSION"));
+
+/// 用哪套协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiStyle {
+    /// 先试 Responses，端点不支持就退回 Chat Completions（默认）
+    #[default]
+    Auto,
+    /// 只用 Responses API
+    Responses,
+    /// 只用 Chat Completions
+    Chat,
+}
+
+/// `ApiStyle` 落地后的具体协议（不会再有 `Auto`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Responses,
+    Chat,
+}
 
 /// 一个 provider 配置。`base_url` 是接入任何兼容服务的唯一开关。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +65,16 @@ pub struct Provider {
     /// 不能用时可以 `AGENT_LLM_VISION=0`（或 `/api/llm` 的 `vision:false`）关掉。
     #[serde(default = "default_supports_images")]
     pub supports_images: bool,
+    /// 这个模型能不能吃 PDF / 文档输入（OpenAI 的 `file` 内容块）。
+    ///
+    /// 由 models.dev 的 `pdf` 模态自动判定，也持久化到 llm.json。
+    /// 默认 **false** —— 绝大多数兼容端点不认 `file` 内容块，瞎发就是 400；
+    /// 默认关掉只意味着界面上不显示「文件」入口。
+    #[serde(default)]
+    pub supports_files: bool,
+    /// 协议偏好。见 `ApiStyle`。
+    #[serde(default)]
+    pub api_style: ApiStyle,
 }
 
 pub(crate) fn default_supports_images() -> bool {
@@ -58,6 +90,8 @@ impl Provider {
             api_key: api_key.into(),
             extra_headers: BTreeMap::new(),
             supports_images: true,
+            supports_files: false,
+            api_style: ApiStyle::Auto,
         }
     }
 
@@ -74,6 +108,8 @@ impl Provider {
             api_key: api_key.into(),
             extra_headers: BTreeMap::new(),
             supports_images: true,
+            supports_files: false,
+            api_style: ApiStyle::Auto,
         }
     }
 
@@ -106,6 +142,17 @@ impl Provider {
             .unwrap_or_else(|| "https://api.openai.com/v1".into());
         let model = get("AGENT_LLM_MODEL", "OPENCODE_MODEL").unwrap_or_else(|| "gpt-5".into());
         let name = get("AGENT_LLM_NAME", "OPENCODE_NAME").unwrap_or_else(|| "custom".into());
+        // 强制协议：`responses` / `chat` / `auto`（不设 = auto）
+        let api_style = match get("AGENT_LLM_API_STYLE", "OPENCODE_API_STYLE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "responses" => ApiStyle::Responses,
+            "chat" | "chat_completions" => ApiStyle::Chat,
+            _ => ApiStyle::Auto,
+        };
 
         Some(Self {
             name,
@@ -115,6 +162,8 @@ impl Provider {
             extra_headers: BTreeMap::new(),
             // 占位；真正的值由 `AppState::supports_images_for` 从 models.dev 自动判定
             supports_images: true,
+            supports_files: false,
+            api_style,
         })
     }
 
@@ -152,29 +201,124 @@ impl Provider {
             .with_no_client_auth())
     }
 
-    /// 建客户端。`session_id` 非空时会作为 `x-opencode-session` 发出去 ——
-    /// OpenCode Go 用它做路由和 prompt cache 优化，缺了会直接 400。
-    pub fn client(&self, session_id: &str) -> anyhow::Result<Client<OpenAIConfig>> {
-        let mut cfg = OpenAIConfig::new()
-            .with_api_base(self.base_url.clone())
-            .with_api_key(self.api_key.clone())
-            // OpenCode Go 要求客户端用自己的 UA 标识自己，
-            // 而不是通用 SDK / HTTP 库名。
-            .with_header("user-agent", USER_AGENT)?;
+    fn base(&self) -> &str {
+        self.base_url.trim_end_matches('/')
+    }
 
+    pub fn chat_url(&self) -> String {
+        format!("{}/chat/completions", self.base())
+    }
+
+    pub fn responses_url(&self) -> String {
+        format!("{}/responses", self.base())
+    }
+
+    /// 实际用哪套协议（`Auto` 会在这里落地成具体的一种）。
+    pub fn transport(&self) -> Transport {
+        match self.api_style {
+            ApiStyle::Chat => Transport::Chat,
+            ApiStyle::Responses => Transport::Responses,
+            ApiStyle::Auto => {
+                if responses_known_unsupported(self) {
+                    Transport::Chat
+                } else {
+                    Transport::Responses
+                }
+            }
+        }
+    }
+
+    /// 发一个 JSON 请求并拿到流式响应。非 2xx 包成 `StreamError::Http`。
+    async fn post_stream(
+        &self,
+        url: &str,
+        body: &impl Serialize,
+        session_id: &str,
+    ) -> Result<reqwest::Response, StreamError> {
+        let http = shared_http().map_err(StreamError::Other)?;
+        let mut rb = http.post(url).header("user-agent", USER_AGENT).json(body);
+        if !self.api_key.is_empty() {
+            rb = rb.bearer_auth(&self.api_key);
+        }
         if !session_id.is_empty() {
-            cfg = cfg.with_header("x-opencode-session", session_id)?;
+            rb = rb.header("x-opencode-session", session_id);
         }
         for (k, v) in &self.extra_headers {
-            // IntoHeaderName 要求 'static，所以得用 owned 的 HeaderName
-            let name = http::header::HeaderName::from_bytes(k.as_bytes())?;
-            cfg = cfg.with_header(name, v.clone())?;
+            rb = rb.header(k, v);
         }
-
-        // 把自建的 reqwest client 注入进去。
-        // `Client::with_http_client` 是 async-openai 给的官方口子。
-        Ok(Client::with_config(cfg).with_http_client(shared_http()?))
+        let resp = rb.send().await.map_err(|e| StreamError::Other(e.into()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(StreamError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp)
     }
+
+    /// Chat Completions 的流。
+    pub async fn stream_chat(
+        &self,
+        req: &ChatRequest,
+        session_id: &str,
+    ) -> Result<mpsc::UnboundedReceiver<anyhow::Result<StreamChunk>>, StreamError> {
+        let resp = self
+            .post_stream(&self.chat_url(), req, session_id)
+            .await?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let r = openai::pump_frames(resp, tx.clone(), |data| {
+                Ok(Some(serde_json::from_str::<StreamChunk>(data)?))
+            })
+            .await;
+            if let Err(e) = r {
+                let _ = tx.send(Err(e));
+            }
+        });
+        Ok(rx)
+    }
+
+    /// Responses API 的流。事件在 `responses::Mapper` 里映射回 `StreamChunk`。
+    pub async fn stream_responses(
+        &self,
+        req: &ResponsesRequest,
+        session_id: &str,
+    ) -> Result<mpsc::UnboundedReceiver<anyhow::Result<StreamChunk>>, StreamError> {
+        let resp = self
+            .post_stream(&self.responses_url(), req, session_id)
+            .await?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut mapper = crate::responses::Mapper::default();
+            let r = openai::pump_frames(resp, tx.clone(), |data| mapper.map(data)).await;
+            if let Err(e) = r {
+                let _ = tx.send(Err(e));
+            }
+        });
+        Ok(rx)
+    }
+}
+
+/// 装 rustls 的进程级 CryptoProvider（ring）。
+///
+/// rustls 0.23 **不会**自动装；reqwest 开了 `rustls-no-provider` 后更是要求
+/// 调用方自己装，否则建 reqwest Client 时直接 panic：
+///
+/// ```text
+/// No rustls crypto provider is configured...
+/// ```
+///
+/// **必须在建任何 HTTP client 之前调** —— 不只是我们自己的 `shared_http`，
+/// async-openai 的 `Client::with_config()` 内部也会先建一个默认 reqwest
+/// client。所以放在 `init_tracing()` 里（桌面 / 安卓两条启动路径都经过它）。
+/// 幂等：重复调只生效一次。
+pub fn install_crypto_provider() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// 进程级共享的 HTTP client。
@@ -188,6 +332,22 @@ impl Provider {
 pub(crate) fn shared_http() -> anyhow::Result<reqwest::Client> {
     static HTTP: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     HTTP.get_or_init(|| {
+        // rustls 0.23 **不会**自动装进程级 CryptoProvider；而 reqwest 开了
+        // `rustls-no-provider` 后不但不装，构建 Client 时还硬要求它已经存在：
+        //
+        //   No rustls crypto provider is configured. When using the
+        //   `rustls-no-provider` feature you must install a crypto provider
+        //   before building a Client.
+        //
+        // 这是个 panic，而且发生在 `stream_one` 里 —— agent 任务直接 unwind，
+        // 前端只看到 start / start-step / [DONE]，模型永远不回复。
+        // 装 ring：跟 Cargo.toml 里 `rustls` 的 `ring` feature 一致（没有 ring
+        // 就只有 aws-lc 那个大 C 库）。已经装过时返回 Err，忽略即可。
+        // rustls 0.23 **不会**自动装进程级 CryptoProvider；而 reqwest 开了
+        // `rustls-no-provider` 后不但不装，构建 Client 时还硬要求它已经存在。
+        // 正常启动路径已在 `init_tracing()` 里装过，这里再保险一下（幂等）。
+        install_crypto_provider();
+
         let tls = Provider::tls_config().map_err(|e| format!("{e:#}"))?;
         // 注意：`tls_backend_preconfigured` **自己会包一层 Some** ——
         // 它的实现是 `let mut tls = Some(tls)` 然后 downcast 到
@@ -203,36 +363,79 @@ pub(crate) fn shared_http() -> anyhow::Result<reqwest::Client> {
     .map_err(|e| anyhow::anyhow!("建 HTTP client 失败: {e}"))
 }
 
-/// 构造一条最小的 chat 请求。存在的意义之一是让 `chat-completion`
-/// feature 的类型真的被编译到，避免"选了 feature 其实没生效"。
-pub fn build_chat_request(
-    model: &str,
-    system: Option<&str>,
-    user: &str,
-) -> anyhow::Result<CreateChatCompletionRequest> {
-    let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
+/// 流式请求的错误。
+///
+/// `Http` 单独拿出来，是为了让调用方认出「这个端点根本没有 Responses API」
+/// 而自动退回 Chat Completions。
+#[derive(Debug, thiserror::Error)]
+pub enum StreamError {
+    #[error("HTTP {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
-    if let Some(sys) = system {
-        messages.push(
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content(sys)
-                .build()?
-                .into(),
-        );
+impl StreamError {
+    /// 是不是「端点不支持这个 API」。
+    pub fn is_unsupported_endpoint(&self) -> bool {
+        match self {
+            StreamError::Http { status, body } => {
+                matches!(*status, 404 | 405 | 501)
+                    || (*status == 400
+                        && ["not found", "unsupported", "unknown", "does not exist"]
+                            .iter()
+                            .any(|k| body.to_ascii_lowercase().contains(k)))
+            }
+            StreamError::Other(_) => false,
+        }
     }
-    messages.push(
-        ChatCompletionRequestUserMessageArgs::default()
-            .content(user)
-            .build()?
-            .into(),
-    );
+}
 
-    let req = CreateChatCompletionRequestArgs::default()
-        .model(model)
-        .messages(messages)
-        .build()?;
+/// 已知不支持 Responses 的端点：`base_url|model`。
+///
+/// 探测到一次就记住，后面直接走 Chat Completions，不再每个 step 白试一次。
+fn responses_unsupported() -> &'static Mutex<HashSet<String>> {
+    static M: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
-    Ok(req)
+fn responses_key(p: &Provider) -> String {
+    format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
+}
+
+pub fn responses_known_unsupported(p: &Provider) -> bool {
+    responses_unsupported()
+        .lock()
+        .map(|s| s.contains(&responses_key(p)))
+        .unwrap_or(false)
+}
+
+pub fn mark_responses_unsupported(p: &Provider) {
+    if let Ok(mut s) = responses_unsupported().lock() {
+        s.insert(responses_key(p));
+    }
+}
+
+/// 构造一条最小的 chat 请求（Chat Completions）。
+pub fn build_chat_request(model: &str, system: Option<&str>, user: &str) -> ChatRequest {
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(openai::Message::System {
+            content: sys.to_string(),
+        });
+    }
+    messages.push(openai::Message::User {
+        content: UserContent::Text(user.to_string()),
+    });
+    ChatRequest {
+        model: model.to_string(),
+        messages,
+        tools: Vec::new(),
+        stream: true,
+        stream_options: openai::StreamOptions {
+            include_usage: true,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -248,8 +451,9 @@ mod tests {
 
     #[test]
     fn chat_request_builds_without_network() {
-        let req = build_chat_request("gpt-5", Some("你是助手"), "你好").unwrap();
+        let req = build_chat_request("gpt-5", Some("你是助手"), "你好");
         assert_eq!(req.messages.len(), 2);
+        assert!(req.stream);
     }
 
     #[test]
@@ -257,5 +461,31 @@ mod tests {
         let p = Provider::openai("sk-secret");
         let j = serde_json::to_string(&p).unwrap();
         assert!(!j.contains("sk-secret"), "key 不能泄漏给前端: {j}");
+    }
+
+    #[test]
+    fn auto_prefers_responses_and_falls_back_once_marked_unsupported() {
+        let p = Provider::compatible("x", "https://example.test/v1", "m", "k");
+        assert_eq!(p.transport(), Transport::Responses, "默认优先 Responses");
+        mark_responses_unsupported(&p);
+        assert_eq!(p.transport(), Transport::Chat, "标记后直接走 Chat");
+        // 显式指定的不受探测影响
+        let mut q = p.clone();
+        q.api_style = ApiStyle::Responses;
+        assert_eq!(q.transport(), Transport::Responses);
+    }
+
+    #[test]
+    fn unsupported_endpoint_is_recognized() {
+        let e = StreamError::Http {
+            status: 404,
+            body: "not found".into(),
+        };
+        assert!(e.is_unsupported_endpoint());
+        let e = StreamError::Http {
+            status: 401,
+            body: "bad key".into(),
+        };
+        assert!(!e.is_unsupported_endpoint());
     }
 }

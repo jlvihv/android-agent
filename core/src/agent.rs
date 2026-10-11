@@ -10,170 +10,20 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestMessageContentPartImageArgs,
-    ChatCompletionRequestMessageContentPartTextArgs, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestUserMessageContentPart, ChatCompletionStreamOptions, ChatCompletionTool,
-    ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    FunctionCall, FunctionObjectArgs, ImageUrlArgs,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::llm::Provider;
+use crate::llm::{Provider, Transport};
+use crate::openai::{
+    ChatRequest, FileData, FunctionCall, FunctionDef, ImageUrl, Message, Part, StreamOptions, Tool,
+    ToolCall, Usage, UserContent,
+};
+use crate::responses::{
+    AssistantItem, FunctionCallItem, FunctionCallOutputItem, InputItem, InputPart, MessageContent,
+    MessageItem, OutputPart, ResponsesRequest, ToolOutput,
+};
 use crate::{linux, sse, Core};
-
-// ---------------------------------------------------------------------------
-// BYOT：自己的流式 chunk 类型
-// ---------------------------------------------------------------------------
-//
-// 为什么不用 async-openai 自带的 `CreateChatCompletionStreamResponse`：
-// 它的 `delta` 只有 content / tool_calls / role / refusal，**没有
-// `reasoning_content`，也没有 `#[serde(flatten)] extra`** —— DeepSeek 系
-// 模型的思考过程会被静默丢掉。
-//
-// `create_stream_byot` 是官方给的逃生口（T0: Serialize, R: DeserializeOwned），
-// 需要开 `byot` feature。
-
-#[derive(Debug, Deserialize)]
-struct StreamChunk {
-    #[serde(default)]
-    choices: Vec<StreamChoice>,
-    /// 开了 `stream_options.include_usage` 后，倒数第二个 chunk 带完整用量
-    #[serde(default)]
-    usage: Option<Usage>,
-}
-
-/// token 用量。
-///
-/// 缓存命中字段有**两套写法**，都要接：
-/// - OpenAI 系：`prompt_tokens_details.cached_tokens`
-/// - DeepSeek 系：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
-///
-/// （实测 OpenCode Go 的 `deepseek-v4.1-flash` 走的是**前者**。）
-///
-/// 这两个数字是验证 prompt cache 真的命中的唯一手段 —— 缓存命中价差 50 倍，
-/// 不能只靠"我写对了"来相信。
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct Usage {
-    #[serde(default)]
-    pub prompt_tokens: u32,
-    #[serde(default)]
-    pub completion_tokens: u32,
-    #[serde(default)]
-    pub total_tokens: u32,
-    #[serde(default)]
-    pub prompt_tokens_details: Option<PromptTokensDetails>,
-    #[serde(default)]
-    pub completion_tokens_details: Option<CompletionTokensDetails>,
-    #[serde(default)]
-    pub prompt_cache_hit_tokens: Option<u32>,
-    #[serde(default)]
-    pub prompt_cache_miss_tokens: Option<u32>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct PromptTokensDetails {
-    #[serde(default)]
-    pub cached_tokens: Option<u32>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct CompletionTokensDetails {
-    /// 推理 token。DeepSeek 系按 output 计费，所以它直接影响成本。
-    #[serde(default)]
-    pub reasoning_tokens: Option<u32>,
-}
-
-impl Usage {
-    /// 命中的缓存 token 数。
-    ///
-    /// 两套字段都接。同时出现时取**大**的那个 —— 之前用 `.or()`，
-    /// 只要 OpenAI 系先报了 `cached_tokens: 0`（有些网关冷启动会填 0
-    /// 而不是省略），DeepSeek 系报的真值就被吞掉，日志变成「命中 0%」，
-    /// 而命中率正是判断缓存有没有生效的唯一硬证据。
-    pub fn cached_tokens(&self) -> Option<u32> {
-        let openai = self
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|d| d.cached_tokens);
-        match (openai, self.prompt_cache_hit_tokens) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        }
-    }
-
-    pub fn reasoning_tokens(&self) -> Option<u32> {
-        self.completion_tokens_details
-            .as_ref()
-            .and_then(|d| d.reasoning_tokens)
-    }
-
-    /// 缓存命中率。provider 不报缓存字段时返回 None。
-    ///
-    /// 夹到 `[0,1]`：`prompt_tokens` 含不含缓存部分各厂商定义不同，
-    /// 有的实现里它是 miss-only，直接相除会得到 >100%。
-    pub fn cache_hit_ratio(&self) -> Option<f64> {
-        let hit = self.cached_tokens()? as f64;
-        if self.prompt_tokens == 0 {
-            return None;
-        }
-        Some((hit / self.prompt_tokens as f64).clamp(0.0, 1.0))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamChoice {
-    #[serde(default)]
-    delta: Delta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct Delta {
-    #[serde(default)]
-    content: Option<String>,
-    /// DeepSeek 系非标准字段
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    /// 另一些模型（如 GLM）用这个
-    #[serde(default)]
-    reasoning: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<ToolCallChunk>>,
-}
-
-impl Delta {
-    fn reasoning_text(&self) -> Option<&str> {
-        self.reasoning_content
-            .as_deref()
-            .or(self.reasoning.as_deref())
-            .filter(|s| !s.is_empty())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolCallChunk {
-    #[serde(default)]
-    index: u32,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    function: Option<FunctionChunk>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FunctionChunk {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
-}
 
 // ---------------------------------------------------------------------------
 // 工具注册表
@@ -262,6 +112,16 @@ fn build_tools() -> Vec<ToolSpec> {
 pub enum ChatMessage {
     System(String),
     User(String),
+    /// 用户在输入卡片里附了文件的用户消息（图片 / PDF）。
+    ///
+    /// 单独一个变体是为了**向后兼容**：老会话里存的是 `User(String)`，
+    /// 照样能读；带附件的才有这个形状。不能把 `User` 改成带字段的结构体
+    /// 变体 —— 那样老 SQLite 里的 `{"User":"..."}` 就解析不了了。
+    UserFiles {
+        text: String,
+        #[serde(default)]
+        attachments: Vec<Attachment>,
+    },
     Assistant {
         content: String,
         reasoning: String,
@@ -292,6 +152,30 @@ pub struct ImagePart {
     /// 哪个工具返回的（目前只有 read）
     pub tool: String,
 }
+
+/// 用户从界面上附的一个文件。
+///
+/// 字节**落盘**（`<filesDir>/attachments/<id>`）而不是进历史：和图片
+/// carrier 同一个理由 —— 后面每轮都要重发，SQLite 里不能堆 base64。
+/// `id` 同时是磁盘文件名，也是前端取回的 URL 段（`/api/attachment/<id>`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: String,
+    /// 绝对路径（data_dir 底下），组装请求时从盘上读
+    pub path: String,
+    pub mime: String,
+    /// 用户选文件时的原始文件名，给模型看
+    pub name: String,
+    pub kind: AttachmentKind,
+}
+
+/// 附件类型：图片走 `image_url`，PDF 走 `file`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentKind {
+    Image,
+    Pdf,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedToolCall {
     pub id: String,
@@ -300,55 +184,67 @@ pub struct RecordedToolCall {
 }
 
 impl ChatMessage {
-    fn to_openai(&self) -> anyhow::Result<ChatCompletionRequestMessage> {
-        Ok(match self {
-            ChatMessage::System(s) => ChatCompletionRequestSystemMessageArgs::default()
-                .content(s.as_str())
-                .build()?
-                .into(),
-            ChatMessage::User(s) => ChatCompletionRequestUserMessageArgs::default()
-                .content(s.as_str())
-                .build()?
-                .into(),
+    /// 是不是一条用户消息（带不带附件都算）。回合边界、标题、计数都靠它 ——
+    /// 别在各处直接 `matches!(ChatMessage::User(_))`，会把 `UserFiles` 漏掉。
+    pub fn is_user(&self) -> bool {
+        matches!(self, ChatMessage::User(_) | ChatMessage::UserFiles { .. })
+    }
+
+    /// 用户消息的正文（非用户消息返回 None）。
+    pub fn user_text(&self) -> Option<&str> {
+        match self {
+            ChatMessage::User(t) => Some(t),
+            ChatMessage::UserFiles { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// 转成 Chat Completions 的一条消息。
+    ///
+    /// 带附件的 `UserFiles` 正常路径由 `build_messages` 处理（它知道模型
+    /// 支不支持图片/PDF）；这里只保证单独调用时也不炸，正文里点名有哪些附件。
+    fn to_openai(&self) -> Message {
+        match self {
+            ChatMessage::System(s) => Message::System { content: s.clone() },
+            ChatMessage::User(s) => Message::User {
+                content: UserContent::Text(s.clone()),
+            },
+            ChatMessage::UserFiles { text, attachments } => {
+                let mut body = text.clone();
+                for a in attachments {
+                    body.push_str(&format!("\n[附件：{}（{}）]", a.name, a.mime));
+                }
+                Message::User {
+                    content: UserContent::Text(body),
+                }
+            }
             ChatMessage::Assistant {
                 content,
                 tool_calls,
                 ..
-            } => {
-                let mut b = ChatCompletionRequestAssistantMessageArgs::default();
-                if !content.is_empty() {
-                    b.content(content.as_str());
-                }
-                if !tool_calls.is_empty() {
-                    b.tool_calls(
-                        tool_calls
-                            .iter()
-                            .map(|tc| {
-                                ChatCompletionMessageToolCalls::Function(
-                                    ChatCompletionMessageToolCall {
-                                        id: tc.id.clone(),
-                                        function: FunctionCall {
-                                            name: tc.name.clone(),
-                                            arguments: tc.arguments.clone(),
-                                        },
-                                    },
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                }
-                b.build()?.into()
-            }
+            } => Message::Assistant {
+                content: (!content.is_empty()).then(|| content.clone()),
+                tool_calls: tool_calls
+                    .iter()
+                    .map(|tc| ToolCall {
+                        id: tc.id.clone(),
+                        kind: "function".into(),
+                        function: FunctionCall {
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                        },
+                    })
+                    .collect(),
+            },
             ChatMessage::Tool {
                 tool_call_id,
                 content,
                 ..
-            } => ChatCompletionRequestToolMessageArgs::default()
-                .tool_call_id(tool_call_id.as_str())
-                .content(content.as_str())
-                .build()?
-                .into(),
-        })
+            } => Message::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: content.clone(),
+            },
+        }
     }
 }
 
@@ -532,7 +428,7 @@ impl SessionStore {
                     "title": if s.title.is_empty() { "新对话" } else { &s.title },
                     "active": s.id == self.active,
                     "updatedAt": s.updated_at,
-                    "count": s.messages.iter().filter(|m| matches!(m, ChatMessage::User(_))).count(),
+                    "count": s.messages.iter().filter(|m| m.is_user()).count(),
                 })
             })
             .collect()
@@ -557,6 +453,7 @@ impl SessionStore {
             for m in &s.messages {
                 let (role, text) = match m {
                     ChatMessage::User(t) => ("user", t.as_str()),
+                    ChatMessage::UserFiles { text, .. } => ("user", text.as_str()),
                     ChatMessage::Assistant { content, .. } => ("assistant", content.as_str()),
                     // 系统提示词和工具结果不参与搜索：前者不是对话，后者是噪音
                     _ => continue,
@@ -638,13 +535,20 @@ pub const SYSTEM_PROMPT: &str = "\
 fn build_messages(
     sess: &ChatSession,
     supports_images: bool,
-) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
+    supports_files: bool,
+) -> anyhow::Result<Vec<Message>> {
     let msgs = &sess.messages;
-    let mut out: Vec<ChatCompletionRequestMessage> = Vec::with_capacity(msgs.len());
+    let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
     let mut i = 0;
     while i < msgs.len() {
+        // 带附件的用户消息：正文 + 图片 / PDF 内容块拼在一条消息里。
+        if let ChatMessage::UserFiles { text, attachments } = &msgs[i] {
+            out.push(user_message(text, attachments, supports_images, supports_files));
+            i += 1;
+            continue;
+        }
         if !matches!(msgs[i], ChatMessage::Tool { .. }) {
-            out.push(msgs[i].to_openai()?);
+            out.push(msgs[i].to_openai());
             i += 1;
             continue;
         }
@@ -662,13 +566,10 @@ fn build_messages(
                     content,
                     images,
                 } => {
-                    out.push(
-                        ChatCompletionRequestToolMessageArgs::default()
-                            .tool_call_id(tool_call_id.as_str())
-                            .content(content.as_str())
-                            .build()?
-                            .into(),
-                    );
+                    out.push(Message::Tool {
+                        tool_call_id: tool_call_id.clone(),
+                        content: content.clone(),
+                    });
                     for img in images {
                         carriers.push((tool_call_id.clone(), img.clone()));
                     }
@@ -678,7 +579,7 @@ fn build_messages(
             }
         }
         for (id, img) in carriers {
-            out.push(image_carrier(&id, &img, supports_images)?);
+            out.push(image_carrier(&id, &img, supports_images));
         }
     }
     Ok(out)
@@ -686,73 +587,150 @@ fn build_messages(
 
 /// 把一张工具返回的图片包成一条 `user` 消息。
 ///
-/// 为什么是 user 消息：OpenAI Chat Completions 的 tool 消息内容只能是字符串，
-/// 工具结果里的图片没有别的合法位置可挂。OpenMinis 的 OpenAI 编码器也是这么
-/// 绕的（`ChatMessagesEncoder` 里那批 "image carriers"）。
-fn image_carrier(
-    tool_call_id: &str,
-    img: &ImagePart,
-    supports_images: bool,
-) -> anyhow::Result<ChatCompletionRequestMessage> {
+/// 为什么是 user 消息：Chat Completions 的 tool 消息内容只能是字符串，
+/// 工具结果里的图片没有别的合法位置可挂。Responses API 没这个问题（图片
+/// 直接放在 `function_call_output` 里，见 `build_responses_input`）。
+fn image_carrier(tool_call_id: &str, img: &ImagePart, supports_images: bool) -> Message {
     let label = format!(
         "[{} 返回的图片（tool_call_id: {tool_call_id}）；原文件：{}]",
         img.tool, img.source
     );
 
-    let mut parts: Vec<ChatCompletionRequestUserMessageContentPart> = vec![text_part(label)?];
+    let mut parts: Vec<Part> = vec![text_part(label)];
     if supports_images {
         // 走缓存：每一步都要重新组装请求，不能每步都把同一张图重新 base64。
         // 字节仍然逐字一致（文件不变），prompt cache 照命中。
         match crate::imaging::cached_data_url(&img.path, &img.mime) {
-            Ok(url) => parts.push(image_part(&url)?),
+            Ok(url) => parts.push(image_part(&url)),
             Err(e) => {
                 tracing::warn!("图片读不到了 {}: {e}", img.path);
-                parts.push(text_part("[图片文件已丢失，本轮没能附带]".to_string())?);
+                parts.push(text_part("[图片文件已丢失，本轮没能附带]".to_string()));
             }
         }
     } else {
         parts.push(text_part(
             "[当前模型不支持图片输入，这张图没有附带；它在沙箱里，可以用 bash 处理或让用户在界面上看]"
                 .to_string(),
-        )?);
+        ));
     }
 
-    Ok(ChatCompletionRequestUserMessageArgs::default()
-        .content(parts)
-        .build()?
-        .into())
+    Message::User {
+        content: UserContent::Parts(parts),
+    }
 }
 
-fn text_part(text: String) -> anyhow::Result<ChatCompletionRequestUserMessageContentPart> {
-    Ok(ChatCompletionRequestMessageContentPartTextArgs::default()
-        .text(text)
-        .build()?
-        .into())
+fn text_part(text: String) -> Part {
+    Part::Text { text }
 }
 
-fn image_part(url: &str) -> anyhow::Result<ChatCompletionRequestUserMessageContentPart> {
-    let image_url = ImageUrlArgs::default().url(url.to_string()).build()?;
-    Ok(ChatCompletionRequestMessageContentPartImageArgs::default()
-        .image_url(image_url)
-        .build()?
-        .into())
+fn image_part(url: &str) -> Part {
+    Part::ImageUrl {
+        image_url: ImageUrl { url: url.to_string() },
+    }
 }
 
-/// 工具表的线上形态（`{"type":"function","function":{…}}` 的数组）。
+fn file_part(name: &str, data_url: &str) -> Part {
+    Part::File {
+        file: FileData {
+            file_data: data_url.to_string(),
+            filename: name.to_string(),
+        },
+    }
+}
+
+/// 一条带附件的用户消息：正文 + 每个附件一个内容块。
+///
+/// 图片发 `image_url`，PDF 发 `file`（`file_data` 是 data URL）。
+/// 模型不支持对应模态时降级成文字说明 —— 宁可能力判定出错时模型少看一眼，
+/// 也不能发一个必然 400 的请求。
+fn user_message(
+    text: &str,
+    attachments: &[Attachment],
+    supports_images: bool,
+    supports_files: bool,
+) -> Message {
+    if attachments.is_empty() {
+        return Message::User {
+            content: UserContent::Text(text.to_string()),
+        };
+    }
+
+    let mut parts: Vec<Part> = Vec::new();
+    // 只有附件、没有文字时不要塞一个空 text 块：有些 provider 会把空内容块
+    // 当成非法请求。
+    if !text.is_empty() {
+        parts.push(text_part(text.to_string()));
+    }
+    for a in attachments {
+        parts.push(text_part(format!("[附件：{}（{}）]", a.name, a.mime)));
+        match a.kind {
+            AttachmentKind::Image => {
+                if !supports_images {
+                    parts.push(text_part(format!(
+                        "[当前模型不支持图片输入，{}没有附带；可以让用户在界面上看，或存到沙箱用 bash 处理]",
+                        a.name
+                    )));
+                    continue;
+                }
+                match crate::imaging::cached_data_url(&a.path, &a.mime) {
+                    Ok(url) => parts.push(image_part(&url)),
+                    Err(e) => {
+                        tracing::warn!("附件读不到了 {}: {e}", a.path);
+                        parts.push(text_part(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
+                    }
+                }
+            }
+            AttachmentKind::Pdf => {
+                if !supports_files {
+                    parts.push(text_part(format!(
+                        "[当前模型不支持 PDF 输入，{}没有附带]",
+                        a.name
+                    )));
+                    continue;
+                }
+                match crate::imaging::cached_data_url(&a.path, &a.mime) {
+                    Ok(url) => parts.push(file_part(&a.name, &url)),
+                    Err(e) => {
+                        tracing::warn!("附件读不到了 {}: {e}", a.path);
+                        parts.push(text_part(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
+                    }
+                }
+            }
+        }
+    }
+
+    Message::User {
+        content: UserContent::Parts(parts),
+    }
+}
+
+/// 工具表的线上形态（Chat Completions：`{"type":"function","function":{…}}`）。
 ///
 /// 抽出来是给 `/api/debug/tools` 用的：模型（或人）想知道「我有哪些工具」，
 /// 不用去翻整份请求体。
-pub fn tool_definitions() -> anyhow::Result<Vec<ChatCompletionTools>> {
+pub fn tool_definitions() -> Vec<Tool> {
     tools()
         .iter()
-        .map(|t| {
-            Ok(ChatCompletionTools::Function(ChatCompletionTool {
-                function: FunctionObjectArgs::default()
-                    .name(t.name)
-                    .description(t.description)
-                    .parameters((t.schema)())
-                    .build()?,
-            }))
+        .map(|t| Tool {
+            kind: "function".into(),
+            function: FunctionDef {
+                name: t.name.to_string(),
+                description: t.description.to_string(),
+                parameters: (t.schema)(),
+            },
+        })
+        .collect()
+}
+
+/// Responses API 的工具表：**扁平**的 `{"type":"function","name":…}`。
+fn tool_definitions_responses() -> Vec<crate::responses::Tool> {
+    tools()
+        .iter()
+        .map(|t| crate::responses::Tool {
+            kind: "function",
+            name: t.name.to_string(),
+            description: t.description.to_string(),
+            parameters: (t.schema)(),
         })
         .collect()
 }
@@ -780,6 +758,24 @@ pub fn ensure_system_prompt(sess: &mut ChatSession, prompt: &str) {
     }
 }
 
+/// 前端用户消息的 parts：正文 + 附件。
+///
+/// 附件本体不在 JSON 里，只给 id（拼成 `/api/attachment/<id>`）和名字；
+/// 图片的缩略图、PDF 的下载都靠那个路由。
+fn user_view_parts(text: &str, attachments: &[Attachment]) -> Vec<Value> {
+    let mut parts = vec![json!({ "type": "text", "id": "u", "text": text })];
+    for (n, a) in attachments.iter().enumerate() {
+        parts.push(json!({
+            "type": if a.kind == AttachmentKind::Image { "image" } else { "file" },
+            "id": format!("a{n}"),
+            "url": format!("/api/attachment/{}", a.id),
+            "name": a.name,
+            "mime": a.mime,
+        }));
+    }
+    parts
+}
+
 /// 把服务端会话转成前端 `Message[]` 的形状。
 ///
 /// **为什么需要**：前端的消息是纯客户端状态，Activity 重建 / 页面刷新 /
@@ -802,7 +798,7 @@ pub fn session_view_count_before(sess: &ChatSession, upto: usize) -> usize {
     for m in &sess.messages[..upto] {
         match m {
             ChatMessage::System(_) => {}
-            ChatMessage::User(_) => {
+            ChatMessage::User(_) | ChatMessage::UserFiles { .. } => {
                 n += 1;
                 last_assistant = false;
             }
@@ -866,6 +862,14 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
                 "parts": [{ "type": "text", "id": "u", "text": text }],
             })),
 
+            ChatMessage::UserFiles { text, attachments } => out.push(json!({
+                "id": format!("u{i}"),
+                "role": "user",
+                "steps": 0,
+                "done": true,
+                "parts": user_view_parts(text, attachments),
+            })),
+
             ChatMessage::Assistant {
                 content,
                 reasoning,
@@ -926,6 +930,7 @@ pub async fn run_turn(
     core: &Core,
     provider: &Provider,
     user_text: &str,
+    attachments: Vec<Attachment>,
     session: Option<&str>,
     tx: mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
@@ -953,7 +958,16 @@ pub async fn run_turn(
         // 历史里只追加两类东西：待补的系统提示词（见 `ensure_system_prompt`）
         // 和这条用户消息。不插任何“每轮重发”的上下文块。
         ensure_system_prompt(sess, &system_prompt);
-        sess.messages.push(ChatMessage::User(user_text.into()));
+        // 一条消息装下正文和附件（有附件时才用 `UserFiles`，空附件保持老形状，
+        // 前缀不变）。
+        if attachments.is_empty() {
+            sess.messages.push(ChatMessage::User(user_text.into()));
+        } else {
+            sess.messages.push(ChatMessage::UserFiles {
+                text: user_text.into(),
+                attachments,
+            });
+        }
         sess.maybe_title(user_text);
         sess.updated_at = now_ms();
         sess.id.clone()
@@ -1083,38 +1097,196 @@ async fn drive(
     }
 }
 
-/// 构造一次完整的请求体（含工具表）。
+/// 构造一次完整的 **Chat Completions** 请求体（含工具表）。
 ///
 /// 抽成纯函数有两个理由：
 /// 1. 让「工具表也是可缓存前缀的一部分」这条不变式**可测** —— 只比
 ///    `messages` 不够，前一轮的完整请求体必须原样出现在后一轮里。
-/// 2. 它直接产出**强类型**请求，交给 `create_stream_byot` 一次序列化。
+/// 2. 它直接产出强类型请求，交给 `stream_chat` 一次序列化。
 ///
 /// `pub` 是给 `/api/debug/request` 用的（把模型将看到的东西原样吐出来）。
 pub fn build_request(
     sess: &ChatSession,
     model: &str,
     supports_images: bool,
-) -> anyhow::Result<CreateChatCompletionRequest> {
-    let messages = build_messages(sess, supports_images)?;
-    let tools = tool_definitions()?;
+    supports_files: bool,
+) -> anyhow::Result<ChatRequest> {
+    let messages = build_messages(sess, supports_images, supports_files)?;
+    Ok(ChatRequest {
+        model: model.to_string(),
+        messages,
+        tools: tool_definitions(),
+        stream: true,
+        // 要 provider 在流末尾回报 token 用量 —— 这是验证 prompt cache
+        // 命中的唯一硬证据。
+        stream_options: StreamOptions {
+            include_usage: true,
+        },
+    })
+}
 
-    let req = CreateChatCompletionRequestArgs::default()
-        .model(model)
-        .messages(messages)
-        .tools(tools)
-        .stream(true)
-        // 要 provider 在流末尾回报 token 用量。
-        //
-        // 用类型里的字段，**不要**先 `to_value` 再补键：那会把整份请求
-        // （含整段历史，可能几 MB）先物化成 Value 树、再序列化一次 ——
-        // 每个 step 白拷一遍最贵的东西（一个回合最多 8 个 step）。
-        .stream_options(ChatCompletionStreamOptions {
-            include_usage: Some(true),
-            include_obfuscation: None,
-        })
-        .build()?;
-    Ok(req)
+/// 构造一次完整的 **Responses API** 请求体。
+pub fn build_responses_request(
+    sess: &ChatSession,
+    model: &str,
+    supports_images: bool,
+    supports_files: bool,
+) -> anyhow::Result<ResponsesRequest> {
+    Ok(ResponsesRequest {
+        model: model.to_string(),
+        input: build_responses_input(sess, supports_images, supports_files),
+        tools: tool_definitions_responses(),
+        stream: true,
+        store: false,
+    })
+}
+
+/// 历史 → `input` 条目。和 `build_messages` 是同一份历史的两种编码。
+fn build_responses_input(
+    sess: &ChatSession,
+    supports_images: bool,
+    supports_files: bool,
+) -> Vec<InputItem> {
+    let mut out: Vec<InputItem> = Vec::new();
+    for m in &sess.messages {
+        match m {
+            ChatMessage::System(s) => out.push(message_item("system", MessageContent::Text(s.clone()))),
+            ChatMessage::User(s) => out.push(message_item("user", MessageContent::Text(s.clone()))),
+            ChatMessage::UserFiles { text, attachments } => out.push(message_item(
+                "user",
+                user_message_content(text, attachments, supports_images, supports_files),
+            )),
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                // Responses 的 output 顺序：先正文，再每个 function_call。
+                if !content.is_empty() {
+                    out.push(InputItem::AssistantMessage(AssistantItem {
+                        kind: "message",
+                        role: "assistant",
+                        content: vec![OutputPart::Text {
+                            text: content.clone(),
+                        }],
+                    }));
+                }
+                for tc in tool_calls {
+                    out.push(InputItem::FunctionCall(FunctionCallItem {
+                        kind: "function_call",
+                        call_id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    }));
+                }
+            }
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+                images,
+            } => out.push(InputItem::FunctionCallOutput(FunctionCallOutputItem {
+                kind: "function_call_output",
+                call_id: tool_call_id.clone(),
+                output: tool_output(content, images, supports_images),
+            })),
+        }
+    }
+    out
+}
+
+fn message_item(role: &str, content: MessageContent) -> InputItem {
+    InputItem::Message(MessageItem {
+        kind: "message",
+        role: role.to_string(),
+        content,
+    })
+}
+
+fn input_text(text: String) -> InputPart {
+    InputPart::Text { text }
+}
+
+fn input_image(url: &str) -> InputPart {
+    InputPart::Image {
+        image_url: url.to_string(),
+        detail: "auto".to_string(),
+    }
+}
+
+fn input_file(name: &str, data_url: &str) -> InputPart {
+    InputPart::File {
+        file_data: data_url.to_string(),
+        filename: name.to_string(),
+    }
+}
+
+/// Responses 的用户消息内容（文本 + 图片 / PDF）。
+fn user_message_content(
+    text: &str,
+    attachments: &[Attachment],
+    supports_images: bool,
+    supports_files: bool,
+) -> MessageContent {
+    if attachments.is_empty() {
+        return MessageContent::Text(text.to_string());
+    }
+    let mut parts: Vec<InputPart> = Vec::new();
+    if !text.is_empty() {
+        parts.push(input_text(text.to_string()));
+    }
+    for a in attachments {
+        parts.push(input_text(format!("[附件：{}（{}）]", a.name, a.mime)));
+        match a.kind {
+            AttachmentKind::Image => {
+                if !supports_images {
+                    parts.push(input_text(format!(
+                        "[当前模型不支持图片输入，{}没有附带]",
+                        a.name
+                    )));
+                    continue;
+                }
+                match crate::imaging::cached_data_url(&a.path, &a.mime) {
+                    Ok(url) => parts.push(input_image(&url)),
+                    Err(e) => {
+                        tracing::warn!("附件读不到了 {}: {e}", a.path);
+                        parts.push(input_text(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
+                    }
+                }
+            }
+            AttachmentKind::Pdf => {
+                if !supports_files {
+                    parts.push(input_text(format!(
+                        "[当前模型不支持 PDF 输入，{}没有附带]",
+                        a.name
+                    )));
+                    continue;
+                }
+                match crate::imaging::cached_data_url(&a.path, &a.mime) {
+                    Ok(url) => parts.push(input_file(&a.name, &url)),
+                    Err(e) => {
+                        tracing::warn!("附件读不到了 {}: {e}", a.path);
+                        parts.push(input_text(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
+                    }
+                }
+            }
+        }
+    }
+    MessageContent::Parts(parts)
+}
+
+/// 工具结果的 Responses 形态：图片直放在 `function_call_output` 里。
+fn tool_output(content: &str, images: &[ImagePart], supports_images: bool) -> ToolOutput {
+    if images.is_empty() || !supports_images {
+        return ToolOutput::Text(content.to_string());
+    }
+    let mut parts: Vec<InputPart> = vec![input_text(content.to_string())];
+    for img in images {
+        match crate::imaging::cached_data_url(&img.path, &img.mime) {
+            Ok(url) => parts.push(input_image(&url)),
+            Err(e) => tracing::warn!("图片读不到了 {}: {e}", img.path),
+        }
+    }
+    ToolOutput::Parts(parts)
 }
 
 /// 调一次 LLM，把 delta 转成 chunk 推出去，返回本轮产出。
@@ -1124,31 +1296,75 @@ async fn stream_one(
     sid: &str,
     tx: &mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<StepOutput> {
-    // 这个模型能不能看图：自动判定（models.dev，带缓存 + 落盘）。
+    // 这个模型能不能看图 / 吃 PDF：自动判定（models.dev，带缓存 + 落盘）。
     // 在拿会话锁之前算 —— 首次判定要联网，不能拖着锁。
     let supports_images = core.state.supports_images_for(provider).await;
+    let supports_files = core.state.supports_files_for(provider).await;
 
     // SYSTEM_PROMPT 是静态常量，**这里不做任何插值** —— 见它上面的说明。
     // 动态的界面/环境信息在 run_turn 里作为独立消息进历史，保证前缀可缓存。
-    let (req, session_id) = {
-        let store = core.state.chat.read().await;
-        let sess = store
-            .get(sid)
-            .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-        (
-            build_request(sess, &provider.model, supports_images)?,
-            sess.provider_session.clone(),
-        )
+    //
+    // 优先 Responses API（见 `ApiStyle`）：端点不支持（404/405）就退回
+    // Chat Completions，并记住这个 base_url|model，后面不再白试。
+    let mut rx = match provider.transport() {
+        Transport::Responses => {
+            let (req, session_id) = {
+                let store = core.state.chat.read().await;
+                let sess = store
+                    .get(sid)
+                    .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+                (
+                    build_responses_request(
+                        sess,
+                        &provider.model,
+                        supports_images,
+                        supports_files,
+                    )?,
+                    sess.provider_session.clone(),
+                )
+            };
+            match provider.stream_responses(&req, &session_id).await {
+                Ok(rx) => rx,
+                Err(e) if e.is_unsupported_endpoint() => {
+                    crate::llm::mark_responses_unsupported(provider);
+                    tracing::info!(
+                        "{} 不支持 Responses API，退回 Chat Completions",
+                        provider.base_url
+                    );
+                    let (req, session_id) = {
+                        let store = core.state.chat.read().await;
+                        let sess = store
+                            .get(sid)
+                            .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+                        (
+                            build_request(
+                                sess,
+                                &provider.model,
+                                supports_images,
+                                supports_files,
+                            )?,
+                            sess.provider_session.clone(),
+                        )
+                    };
+                    provider.stream_chat(&req, &session_id).await?
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Transport::Chat => {
+            let (req, session_id) = {
+                let store = core.state.chat.read().await;
+                let sess = store
+                    .get(sid)
+                    .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+                (
+                    build_request(sess, &provider.model, supports_images, supports_files)?,
+                    sess.provider_session.clone(),
+                )
+            };
+            provider.stream_chat(&req, &session_id).await?
+        }
     };
-
-    let client = provider.client(&session_id)?;
-    // 强类型请求 → `create_stream_byot` 直接序列化，不做多余的 Value 中转。
-    let mut stream = client
-        .chat()
-        .create_stream_byot::<_, StreamChunk>(req)
-        .await?;
-
-    use tokio_stream::StreamExt;
 
     // 工具调用是分片到达的：按 index 累积
     let mut acc: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
@@ -1164,7 +1380,7 @@ async fn stream_one(
     let mut finish: Option<String> = None;
     let mut usage: Option<Usage> = None;
 
-    while let Some(item) = stream.next().await {
+    while let Some(item) = rx.recv().await {
         let chunk = item?;
         if chunk.usage.is_some() {
             usage = chunk.usage.clone();
@@ -1681,7 +1897,7 @@ mod tests {
     use super::*;
 
     fn wire(sess: &ChatSession) -> Vec<serde_json::Value> {
-        build_messages(sess, true)
+        build_messages(sess, true, true)
             .unwrap()
             .iter()
             .map(|m| serde_json::to_value(m).unwrap())
@@ -1813,7 +2029,7 @@ mod tests {
         sess.messages.push(ChatMessage::User("第一问".into()));
         // 转成 Value 是为了断言请求体本身；线上路径不经过这一步
         let req1 =
-            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true).unwrap())
+            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true, true).unwrap())
                 .unwrap();
 
         sess.messages.push(ChatMessage::Assistant {
@@ -1832,7 +2048,7 @@ mod tests {
         });
         sess.messages.push(ChatMessage::User("第二问".into()));
         let req2 =
-            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true).unwrap())
+            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true, true).unwrap())
                 .unwrap();
 
         assert_eq!(req1["tools"], req2["tools"], "工具表变了 → 整段前缀缓存失效");
@@ -1884,7 +2100,7 @@ mod tests {
             },
         ];
 
-        let v: Vec<Value> = build_messages(&sess, true)
+        let v: Vec<Value> = build_messages(&sess, true, true)
             .unwrap()
             .iter()
             .map(|m| serde_json::to_value(m).unwrap())
@@ -1901,7 +2117,7 @@ mod tests {
 
         // 同一份历史必须序列化出**完全一样**的请求：图片从盘上重读，
         // 字节必须一致，否则 prompt cache 每轮都失效。
-        let again: Vec<Value> = build_messages(&sess, true)
+        let again: Vec<Value> = build_messages(&sess, true, true)
             .unwrap()
             .iter()
             .map(|m| serde_json::to_value(m).unwrap())
@@ -1909,7 +2125,7 @@ mod tests {
         assert_eq!(v, again, "带图的历史不是逐字节可复现的");
 
         // 模型不支持图片时：仍然有这条 carrier，但只有文字说明
-        let v: Vec<Value> = build_messages(&sess, false)
+        let v: Vec<Value> = build_messages(&sess, false, false)
             .unwrap()
             .iter()
             .map(|m| serde_json::to_value(m).unwrap())
@@ -1919,6 +2135,120 @@ mod tests {
         assert!(parts.iter().all(|p| p["type"] == "text"));
 
         let _ = std::fs::remove_file(&img);
+    }
+
+    /// 用户附件：正文、图片、PDF 要拼在**同一条** user 消息里。
+    ///
+    /// 为什么要单测：一条消息 = 一个回合边界，附件如果另占一条消息，
+    /// 增量同步的切点就可能把正文和附件切开。
+    #[test]
+    fn user_attachments_ride_on_the_same_user_message() {
+        let dir = std::env::temp_dir();
+        let png = dir.join(format!("agent-att-img-{}.png", std::process::id()));
+        let pdf = dir.join(format!("agent-att-pdf-{}.pdf", std::process::id()));
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\nfake").unwrap();
+
+        let att = |id: &str, path: &std::path::Path, mime: &str, kind| Attachment {
+            id: id.into(),
+            path: path.display().to_string(),
+            mime: mime.into(),
+            name: format!("文件.{id}"),
+            kind,
+        };
+        let mut sess = ChatSession::new();
+        sess.messages = vec![ChatMessage::UserFiles {
+            text: "看看这两个".into(),
+            attachments: vec![
+                att("a.png", &png, "image/png", AttachmentKind::Image),
+                att("b.pdf", &pdf, "application/pdf", AttachmentKind::Pdf),
+            ],
+        }];
+
+        let v: Vec<Value> = build_messages(&sess, true, true)
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(v.len(), 1, "正文和附件必须在同一条消息里");
+        assert_eq!(v[0]["role"], "user");
+        let parts = v[0]["content"].as_array().expect("带附件时 content 是数组");
+        assert_eq!(parts[0]["type"], "text");
+        let kinds: Vec<&str> = parts.iter().map(|p| p["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["text", "text", "image_url", "text", "file"]);
+        assert!(parts[2]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert_eq!(parts[4]["file"]["filename"], "文件.b.pdf");
+        assert!(parts[4]["file"]["file_data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:application/pdf;base64,"));
+
+        // 同一份历史要逐字节可复现（prompt cache 靠这个）
+        let again: Vec<Value> = build_messages(&sess, true, true)
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(v, again);
+
+        // 模型不支持对应模态时降级成文字，绝不发必然 400 的请求
+        let v: Vec<Value> = build_messages(&sess, false, false)
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        let parts = v[0]["content"].as_array().unwrap();
+        assert!(parts.iter().all(|p| p["type"] == "text"), "{parts:?}");
+        assert_eq!(v.len(), 1, "降级也不能多出消息");
+
+        let _ = std::fs::remove_file(&png);
+        let _ = std::fs::remove_file(&pdf);
+    }
+
+    /// 带附件的会话：完整视图与「回合边界切分」的增量视图必须一致 ——
+    /// 否则滚动到一半刷新会看到重复的附件。
+    #[test]
+    fn incremental_slice_keeps_attachments_with_their_turn() {
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("U1".into()),
+            ChatMessage::Assistant {
+                content: "答1".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
+            ChatMessage::UserFiles {
+                text: "U2".into(),
+                attachments: vec![Attachment {
+                    id: "x.pdf".into(),
+                    path: "/nonexistent".into(),
+                    mime: "application/pdf".into(),
+                    name: "x.pdf".into(),
+                    kind: AttachmentKind::Pdf,
+                }],
+            },
+            ChatMessage::Assistant {
+                content: "答2".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
+        ];
+        let full = session_view(&sess);
+        for from in 0..=sess.messages.len() {
+            if from > 0 && !sess.messages[from - 1].is_user() {
+                continue;
+            }
+            let head = session_view_count_before(&sess, from);
+            let tail = session_view_from(&sess, from);
+            let joined: Vec<Value> = full[..head].iter().cloned().chain(tail).collect();
+            assert_eq!(joined, full, "from={from} 时增量与完整视图不一致");
+        }
+        assert_eq!(full[2]["parts"][1]["type"], "file");
+        assert_eq!(full[2]["parts"][1]["url"], "/api/attachment/x.pdf");
     }
 
     #[test]
@@ -2101,7 +2431,7 @@ mod tests {
 
         // 只在回合边界切（上一条是 User，或 from == 0）
         for from in 0..=sess.messages.len() {
-            if from > 0 && !matches!(&sess.messages[from - 1], ChatMessage::User(_)) {
+            if from > 0 && !sess.messages[from - 1].is_user() {
                 continue;
             }
             let head = session_view_count_before(&sess, from);
@@ -2158,64 +2488,6 @@ mod tests {
         let s2 = ids(&step2);
         assert_ne!(s1[0].1, s2[0].1, "第二步的思考不能和第一步同 id，否则前端会接到一起");
         assert_ne!(s1[4].1, s2[3].1, "第二步的正文同理");
-    }
-
-    #[test]
-    fn usage_understands_both_cache_field_styles() {
-        // OpenAI 系（实测 OpenCode Go 的 deepseek-v4.1-flash 用这个）
-        let openai: Usage = serde_json::from_value(json!({
-            "prompt_tokens": 2138,
-            "completion_tokens": 139,
-            "prompt_tokens_details": { "cached_tokens": 2048 },
-            "completion_tokens_details": { "reasoning_tokens": 136 }
-        }))
-        .unwrap();
-        assert_eq!(openai.cached_tokens(), Some(2048));
-        assert_eq!(openai.reasoning_tokens(), Some(136));
-        let r = openai.cache_hit_ratio().unwrap();
-        assert!((r - 0.958).abs() < 0.001, "{r}");
-
-        // DeepSeek 系
-        let ds: Usage = serde_json::from_value(json!({
-            "prompt_tokens": 100,
-            "prompt_cache_hit_tokens": 80,
-            "prompt_cache_miss_tokens": 20
-        }))
-        .unwrap();
-        assert_eq!(ds.cached_tokens(), Some(80));
-        assert_eq!(ds.cache_hit_ratio(), Some(0.8));
-
-        // 两套字段同时出现、值不一致时取**大**的那个。之前用 `.or()`，
-        // OpenAI 系填了 `cached_tokens: 0`（而不是省略）就会把真值吞掉，
-        // 日志误报成 0% 命中 —— 而这是判断缓存有没有生效的唯一硬证据。
-        let both: Usage = serde_json::from_value(json!({
-            "prompt_tokens": 1000,
-            "prompt_tokens_details": { "cached_tokens": 0 },
-            "prompt_cache_hit_tokens": 768
-        }))
-        .unwrap();
-        assert_eq!(both.cached_tokens(), Some(768));
-        assert_eq!(both.cache_hit_ratio(), Some(0.768));
-
-        // 命中率夹在 0..1（有的实现里 prompt_tokens 是 miss-only）
-        let weird: Usage = serde_json::from_value(json!({
-            "prompt_tokens": 100,
-            "prompt_cache_hit_tokens": 250
-        }))
-        .unwrap();
-        assert_eq!(weird.cache_hit_ratio(), Some(1.0));
-
-        // 冷启动
-        let cold: Usage = serde_json::from_value(json!({
-            "prompt_tokens": 2138,
-            "prompt_tokens_details": { "cached_tokens": 0 }
-        }))
-        .unwrap();
-        assert_eq!(cold.cache_hit_ratio(), Some(0.0));
-
-        // provider 什么都不报时不能瞎猜
-        let unknown: Usage = serde_json::from_value(json!({ "prompt_tokens": 50 })).unwrap();
-        assert_eq!(unknown.cache_hit_ratio(), None);
     }
 
     // —— 侧边栏搜索 ——

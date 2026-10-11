@@ -25,7 +25,9 @@ pub mod linux;
 pub mod llm;
 pub mod mock;
 pub mod models;
+pub mod openai;
 pub mod reader;
+pub mod responses;
 pub mod sse;
 pub mod state;
 
@@ -39,6 +41,12 @@ uniffi::setup_scaffolding!();
 
 /// 初始化日志。安卓上同时输出到 logcat，桌面上输出到 stdout。
 pub fn init_tracing() {
+    // rustls 的 crypto provider 必须在**建任何 reqwest client 之前**装好，
+    // 否则 async-openai 的 `Client::with_config()` 里那句
+    // `reqwest::Client::new()` 直接 panic，整个回合静默死掉。
+    // 放在这里是因为桌面 / 安卓两条启动路径都会先调它。
+    crate::llm::install_crypto_provider();
+
     // panic hook。
     //
     // 必须装：Rust 的 panic 默认打到 stderr，而 **Android 上 stderr 是丢掉的**。
@@ -106,6 +114,21 @@ impl Default for Core {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 将附件字节写到 `<dir>/<id>`（阻塞 I/O 包一层 `spawn_blocking`）。
+async fn write_attachment(
+    dir: std::path::PathBuf,
+    id: String,
+    bytes: Vec<u8>,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("建附件目录失败: {e}"))?;
+        std::fs::write(dir.join(&id), &bytes).map_err(|e| anyhow::anyhow!("写附件失败: {e}"))?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
 }
 
 impl Core {
@@ -256,6 +279,86 @@ impl Core {
         .await?
     }
 
+    /// 附件（界面上传的图片 / PDF）的落盘目录。
+    fn attachments_dir(&self) -> std::path::PathBuf {
+        self.state
+            .data_dir
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|d| d.join("attachments"))
+            .unwrap_or_else(|| std::env::temp_dir().join("android-agent-attachments"))
+    }
+
+    /// 按 id 取已落盘的附件绝对路径。
+    ///
+    /// `id` 是磁盘文件名，所以**必须**先确认它是个裸文件名 —— 否则一个
+    /// `../../llm.json` 就能把 App 私有目录里的 key 读出去。
+    pub fn attachment_path(&self, id: &str) -> Option<std::path::PathBuf> {
+        if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
+            return None;
+        }
+        let path = self.attachments_dir().join(id);
+        path.is_file().then_some(path)
+    }
+
+    /// 处理一个上传的附件并落盘，返回可直接进会话历史的 `Attachment`。
+    ///
+    /// 图片走 `read` 读图同一条缩放流水线；PDF 原样存（只限大小）。
+    /// 两个“不是文件”的底线：图片必须能被解码，PDF 必须真的以 `%PDF` 开头。
+    pub async fn store_attachment(
+        &self,
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<crate::agent::Attachment> {
+        use crate::agent::{Attachment, AttachmentKind};
+
+        const MAX_PDF_BYTES: usize = 32 * 1024 * 1024;
+        let dir = self.attachments_dir();
+        let id = uuid::Uuid::now_v7().to_string();
+
+        // 图片：按魔数认，不看客户端报的 mime（那是可以伪造的）
+        if let Some(img) = crate::imaging::load_if_image_bytes(&bytes)? {
+            let ext = match img.mime.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                "image/bmp" => "bmp",
+                _ => "bin",
+            };
+            let id = format!("{id}.{ext}");
+            write_attachment(dir.clone(), id.clone(), img.bytes).await?;
+            return Ok(Attachment {
+                path: dir.join(&id).display().to_string(),
+                id,
+                mime: img.mime,
+                name,
+                kind: AttachmentKind::Image,
+            });
+        }
+
+        // PDF：认魔数，别只看 mime
+        anyhow::ensure!(bytes.starts_with(b"%PDF-"), "只支持图片和 PDF");
+        anyhow::ensure!(
+            bytes.len() <= MAX_PDF_BYTES,
+            "PDF 有 {}MB，超过 {}MB 上限",
+            bytes.len() / 1024 / 1024,
+            MAX_PDF_BYTES / 1024 / 1024
+        );
+        let _ = mime; // mime 统一由服务端判定，不信客户端
+        let id = format!("{id}.pdf");
+        write_attachment(dir.clone(), id.clone(), bytes).await?;
+        Ok(Attachment {
+            path: dir.join(&id).display().to_string(),
+            id,
+            mime: "application/pdf".into(),
+            name,
+            kind: AttachmentKind::Pdf,
+        })
+    }
+
     /// 编辑沙箱里的文件（`edit` 工具）。
     ///
     /// 读、改、写都同步且很快（都是本地文件），但包成 async 是为了
@@ -306,6 +409,9 @@ impl Core {
 
         // 后台把常用工具装上（rg/fd/jq/python3…）。幂等：装过就秒退。
         tokio::spawn(provision_tools(self.state.clone()));
+        // 后台补一次模型能力判定（models.dev）。老 llm.json 里没有 PDF 能力，
+        // 界面靠它决定要不要显示「文件」入口；目录有磁盘缓存，大多不联网。
+        tokio::spawn(refresh_capabilities(self.state.clone()));
 
         let app = http::router(self.state.clone());
         let st = self.state.clone();
@@ -384,6 +490,19 @@ impl Core {
             .map_err(|e| anyhow::anyhow!("runtime thread died: {e}"))?
             .map_err(|e| anyhow::anyhow!(e))
     }
+}
+
+/// 启动后补一次视觉 / PDF 能力判定。
+///
+/// 不在 `health` 里同步做（那会阻塞页面加载最多 15 秒），也不在
+/// `load_llm` 里做（那时可能还没有 tokio runtime）。失败只记日志，
+/// 调用方（`supports_*_for`）会退回落盘值。
+async fn refresh_capabilities(st: Arc<AppState>) {
+    let Some(p) = st.llm().or_else(crate::llm::Provider::from_env) else {
+        return;
+    };
+    st.supports_images_for(&p).await;
+    st.supports_files_for(&p).await;
 }
 
 /// 把常用工具装进沙箱（后台、幂等、出错只记日志，不挡启动）。

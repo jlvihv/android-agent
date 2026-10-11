@@ -20,8 +20,9 @@
   let {
     title,
     onclose,
+    minClass = 'min-h-[45dvh]',
     children,
-  }: { title: string; onclose: () => void; children: Snippet } = $props();
+  }: { title: string; onclose: () => void; minClass?: string; children: Snippet } = $props();
 
   let panel: HTMLDivElement | null = $state(null);
   let body: HTMLDivElement | null = $state(null);
@@ -109,7 +110,7 @@
   tabindex="-1"
   style:transform="translateY({p * 100}%)"
   style:transition={dragging ? 'none' : RELEASE}
-  class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[75dvh] min-h-[45dvh] flex-col
+  class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[75dvh] {minClass} flex-col
          rounded-t-card bg-surface pt-1 will-change-transform"
 >
   <div class="shrink-0">

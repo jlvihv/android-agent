@@ -7,7 +7,7 @@
    * 没有魔法数字：尺寸走 Tailwind 刻度，顶部/底部由安全区给。
    */
   import { store } from './lib/store.svelte.ts';
-  import { consume, streamFrom, type Message } from './lib/sse';
+  import { consume, streamFrom, type Message, type Part, type Upload } from './lib/sse';
   import { uid } from './lib/uid';
   import Icon from './components/Icon.svelte';
   import Composer from './components/Composer.svelte';
@@ -248,23 +248,40 @@
     }
   }
 
-  function send() {
+  function send(attachments: Upload[]) {
     const text = input.trim();
-    if (!text || busy) return;
+    if ((!text && attachments.length === 0) || busy) return;
     // 第一句发出去的时候才告诉服务端「开新会话」（fresh 是个一次性意图）
     const startFresh = fresh;
     fresh = false;
     input = '';
+
+    // 附件先作为 part 拼进本地气泡（和 session_view 恢复出来的形状一致）——
+    // 否则发出去的下一秒，自己的图片就看不见了。
+    const parts: Part[] = [
+      { type: 'text', id: 'u', text },
+      ...attachments.map(
+        (a, i): Part =>
+          a.kind === 'image'
+            ? { type: 'image', id: `a${i}`, url: a.url, name: a.name, mime: a.mime }
+            : { type: 'file', id: `a${i}`, url: a.url, name: a.name, mime: a.mime },
+      ),
+    ];
+
     messages.push({
       id: uid(),
       role: 'user',
-      parts: [{ type: 'text', id: 'u', text }],
+      parts,
       steps: 0,
       done: true,
     });
     const msg = store.beginStreaming();
     messages.push(msg);
-    void run(msg, '/api/chat', { text, fresh: startFresh });
+    void run(msg, '/api/chat', {
+      text,
+      fresh: startFresh,
+      attachments: attachments.map((a) => a.id),
+    });
   }
 
   const stop = () => {
@@ -329,7 +346,6 @@
       {busy}
       onsend={send}
       onstop={stop}
-      onmenu={openDrawer}
       onmodel={() => (sheet = true)}
     />
   </div>

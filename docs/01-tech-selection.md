@@ -85,6 +85,19 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ### D4 + D5 — LLM 协议层 & Agent Loop（**这两个绑在一起选**）
 
+> **修订（后来）：协议层改为自研，不再用 `async-openai`。**
+>
+> 实际用下来，SDK 的 `Client::with_config()` 会**先** `reqwest::Client::new()`
+> 建一个默认连接（然后才轮到我们 `with_http_client` 覆盖）；在
+> `rustls-no-provider` 下这个连接没有 crypto provider，**直接 panic** ——
+> 而它建的那个连接我们根本拿不到。加上我们真正用到的只有「一个请求体 +
+> 一条 SSE 流」，于是自己写了：`openai.rs`（Chat Completions）+
+> `responses.rs`（Responses API），**优先 Responses**，端点不支持就自动退回
+> Chat Completions（`llm.rs` 的 `ApiStyle`/`Transport`）。少一个大依赖，
+> 而且每个字节都在我们手里（对 prompt cache 的前缀不变式有好处）。
+>
+> 下面的选择过程保留作为当时的记录。
+
 不想手写 OpenAI Chat/Responses 协议，所以有两个自洽的组合：
 
 #### 组合 A「薄内核」
@@ -116,6 +129,7 @@ Streaming events、Webhooks、Evals、Fine-tuning、Graders、Audio/Images 全�
 用 feature gate 隔离，默认不引。
 
 > ❌ 已否决：手写 OpenAI Chat / Responses 协议。
+> ⚠️ **后已推翻**：见本节开头的修订 —— 自研比引 SDK 更可控。
 
 **倾向：组合 A**。理由：审批流 + 事件流推送是这个工具的 UI 核心，loop 必须自己拿；
 genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B 也合理。

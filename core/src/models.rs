@@ -39,6 +39,8 @@ pub struct ModelInfo {
     pub name: String,
     /// 能不能吃 `image_url`（`read` 读图时要不要发给模型）
     pub vision: bool,
+    /// 能不能吃 PDF / 文档输入（界面上「文件」那个入口要不要显示）
+    pub pdf: bool,
     pub context_window: Option<u64>,
     pub max_output: Option<u64>,
 }
@@ -199,6 +201,7 @@ pub async fn list(
                     id: id.clone(),
                     name: m.name.clone().unwrap_or_else(|| id.clone()),
                     vision: model_vision(m).unwrap_or(false),
+                    pdf: model_pdf(m).unwrap_or(false),
                     context_window: m.limit.as_ref().and_then(|l| l.context),
                     max_output: m.limit.as_ref().and_then(|l| l.output),
                 })
@@ -228,14 +231,17 @@ async fn fetch_models(provider: &Provider) -> anyhow::Result<Vec<RawModel>> {
 fn info_for(cat: &Catalog, provider_key: Option<&str>, raw: RawModel) -> ModelInfo {
     let dev = find_model(cat, provider_key, &raw.id);
     // 网关自己在 `architecture.input_modalities` 里报了模态就用它，否则查目录
-    let vision = vision_from_modalities(
-        &raw.architecture
-            .as_ref()
-            .map(|a| a.input_modalities.clone())
-            .unwrap_or_default(),
-    )
-    .or_else(|| dev.and_then(model_vision))
-    .unwrap_or(false);
+    let modalities = raw
+        .architecture
+        .as_ref()
+        .map(|a| a.input_modalities.clone())
+        .unwrap_or_default();
+    let vision = vision_from_modalities(&modalities)
+        .or_else(|| dev.and_then(model_vision))
+        .unwrap_or(false);
+    let pdf = pdf_from_modalities(&modalities)
+        .or_else(|| dev.and_then(model_pdf))
+        .unwrap_or(false);
 
     ModelInfo {
         name: raw
@@ -247,6 +253,7 @@ fn info_for(cat: &Catalog, provider_key: Option<&str>, raw: RawModel) -> ModelIn
         max_output: dev.and_then(|m| m.limit.as_ref()?.output),
         id: raw.id,
         vision,
+        pdf,
     }
 }
 
@@ -261,6 +268,19 @@ pub async fn vision_for(
     let key = provider_entry(&cat, &provider.base_url).map(|(k, _)| k);
     let m = find_model(&cat, key, model_id)?;
     model_vision(m)
+}
+
+/// 给单个模型自动判定能不能吃 PDF。查不到返回 `None`（调用方保留旧值）。
+pub async fn pdf_for(
+    provider: &Provider,
+    model_id: &str,
+    refresh: bool,
+    data_dir: Option<&Path>,
+) -> Option<bool> {
+    let cat = catalog(refresh, data_dir).await?;
+    let key = provider_entry(&cat, &provider.base_url).map(|(k, _)| k);
+    let m = find_model(&cat, key, model_id)?;
+    model_pdf(m)
 }
 
 // ---------------------------------------------------------------------------
@@ -368,11 +388,31 @@ fn model_vision(m: &CatalogModel) -> Option<bool> {
     vision_from_modalities(&m.modalities.as_ref()?.input)
 }
 
+fn model_pdf(m: &CatalogModel) -> Option<bool> {
+    pdf_from_modalities(&m.modalities.as_ref()?.input)
+}
+
 fn vision_from_modalities(list: &[String]) -> Option<bool> {
+    modality_present(list, "image")
+}
+
+/// PDF 是 models.dev 目录里的一个输入模态（`pdf`）。网关自己的
+/// `architecture.input_modalities` 偶尔会写成 `file_input` —— 一起认。
+fn pdf_from_modalities(list: &[String]) -> Option<bool> {
     if list.is_empty() {
         return None;
     }
-    Some(list.iter().any(|s| normalize_modality(s) == "image"))
+    Some(list.iter().any(|s| {
+        let n = normalize_modality(s);
+        n == "pdf" || n == "file"
+    }))
+}
+
+fn modality_present(list: &[String], want: &str) -> Option<bool> {
+    if list.is_empty() {
+        return None;
+    }
+    Some(list.iter().any(|s| normalize_modality(s) == want))
 }
 
 /// OpenAI / OpenRouter 写 `image_input`，models.dev 写 `image` —— 统一成裸名
@@ -396,6 +436,7 @@ mod tests {
                 "api": "https://opencode.ai/zen/go/v1",
                 "models": {
                   "ds-vision": { "name": "DS Vision", "modalities": { "input": ["text","image"] }, "limit": {"context": 1000000, "output": 384000} },
+                  "ds-pdf":    { "name": "DS PDF",    "modalities": { "input": ["text","pdf"] } },
                   "ds-text":   { "name": "DS Text",   "modalities": { "input": ["text"] } }
                 }
               },
@@ -469,5 +510,21 @@ mod tests {
         assert_eq!(vision_from_modalities(&["image_input".into()]), Some(true));
         assert_eq!(vision_from_modalities(&["text".into()]), Some(false));
         assert_eq!(vision_from_modalities(&[]), None);
+        // PDF 也是一样的写法
+        assert_eq!(pdf_from_modalities(&["pdf".into()]), Some(true));
+        assert_eq!(pdf_from_modalities(&["file_input".into()]), Some(true));
+        assert_eq!(pdf_from_modalities(&["text".into()]), Some(false));
+        assert_eq!(pdf_from_modalities(&[]), None);
+    }
+
+    #[test]
+    fn pdf_comes_from_the_catalog_modalities() {
+        let cat = catalog_fixture();
+        let key = Some("opencode-go");
+        assert_eq!(model_pdf(find_model(&cat, key, "ds-pdf").unwrap()), Some(true));
+        assert_eq!(model_pdf(find_model(&cat, key, "ds-vision").unwrap()), Some(false));
+        // 图片和 PDF 是两件独立的事，不能互相推导
+        assert_eq!(model_vision(find_model(&cat, key, "ds-pdf").unwrap()), Some(false));
+        assert_eq!(model_pdf(find_model(&cat, key, "ds-text").unwrap()), Some(false));
     }
 }

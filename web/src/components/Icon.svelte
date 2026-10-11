@@ -34,7 +34,11 @@
     | 'list'
     | 'pencil'
     | 'trash'
-    | 'gear';
+    | 'gear'
+    | 'camera'
+    | 'image'
+    | 'file'
+    | 'close';
 
   let { name, size = 20, class: cls = '' }: { name: Name; size?: number; class?: string } =
     $props();
@@ -173,5 +177,40 @@
       stroke-linecap="round"
       stroke-linejoin="round"
     />
+  </svg>
+{:else if name === 'camera'}
+  <!-- 相机：机身 + 顶部取景器凸起 + 镜头。
+       机身 14.4×10.6（x 2.8–17.2，y 5.4–16），墨迹 16.4×13。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <path
+      d="M7.2 5.4 8.1 3.9h3.8l.9 1.5h3.6a1 1 0 0 1 1 1v9.1a1 1 0 0 1-1 1H3.6a1 1 0 0 1-1-1V6.4a1 1 0 0 1 1-1h3.6Z"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linejoin="round"
+    />
+    <circle cx="10" cy="10.9" r="2.7" stroke="currentColor" stroke-width="1.8" />
+  </svg>
+{:else if name === 'image'}
+  <!-- 图片：外框 + 左下小太阳 + 右下斜山。和 camera 同为 16.4 墨迹。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <rect x="2.8" y="3.8" width="14.4" height="12.4" rx="2" stroke="currentColor" stroke-width="1.8" />
+    <circle cx="7.3" cy="8.2" r="1.4" stroke="currentColor" stroke-width="1.8" />
+    <path d="m4.6 15.4 4-4 3.2 3.2 2.2-2.2 2 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{:else if name === 'file'}
+  <!-- 文件：右上折角 + 左下折角线。墨迹 12.8×14.6。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <path
+      d="M11.6 2.7H5.9a1.6 1.6 0 0 0-1.6 1.6v11.4a1.6 1.6 0 0 0 1.6 1.6h8.2a1.6 1.6 0 0 0 1.6-1.6V6.8l-4.1-4.1Z"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linejoin="round"
+    />
+    <path d="M11.6 2.7v4.1h4.1" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+  </svg>
+{:else if name === 'close'}
+  <!-- 叉：两条对角线，墨迹 11.6×11.6（跟 send 同档）。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <path d="M4.6 4.6 15.4 15.4M15.4 4.6 4.6 15.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
   </svg>
 {/if}

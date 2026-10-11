@@ -92,7 +92,18 @@ pub fn load_if_image(path: &Path) -> anyhow::Result<Option<Encoded>> {
     );
     let source =
         std::fs::read(path).map_err(|e| anyhow::anyhow!("读取失败 {}: {e}", path.display()))?;
-    let Some(source_mime) = mime_of(&source) else {
+    load_if_image_bytes(&source)
+}
+
+/// 同 `load_if_image`，但直接吃字节（界面上的上传没有落盘的原图可读）。
+pub fn load_if_image_bytes(source: &[u8]) -> anyhow::Result<Option<Encoded>> {
+    anyhow::ensure!(
+        source.len() as u64 <= MAX_SOURCE_BYTES,
+        "图片有 {}MB，超过 {}MB 上限",
+        source.len() / 1024 / 1024,
+        MAX_SOURCE_BYTES / 1024 / 1024
+    );
+    let Some(source_mime) = mime_of(source) else {
         return Ok(None);
     };
 
@@ -100,14 +111,11 @@ pub fn load_if_image(path: &Path) -> anyhow::Result<Option<Encoded>> {
     // 兜住它：一个坏图片最坏只该让 `read` 报错，不该把一个回合（甚至进程）
     // 带走。和 FFI 边界上 `catch_unwind` 同一个理由。
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        encode(&source, source_mime)
+        encode(source, source_mime)
     })) {
         Ok(Ok(img)) => Ok(Some(img)),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow::anyhow!(
-            "图片解码时内部出错（文件可能损坏）: {}",
-            path.display()
-        )),
+        Err(_) => Err(anyhow::anyhow!("图片解码时内部出错（文件可能损坏）")),
     }
 }
 

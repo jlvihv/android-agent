@@ -349,13 +349,46 @@
   {/if}
   {#each messages.slice(start) as msg (msg.id)}
     {#if msg.role === 'user'}
-      <!-- 右对齐靠 `self-end`（父级是 flex-col）：不用再套一层
-           `<div class="flex justify-end">`。对齐 + 收缩到内容宽 + 上限 84% -->
-      <p
-        class="msg self-end max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
-      >
-        {msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
-      </p>
+      {@const atts = msg.parts.filter((p) => p.type === 'image' || p.type === 'file')}
+      {@const text = msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
+      {#if atts.length === 0}
+        <!-- 常见情况：只有正文，一层 <p> 就够。不为了「可能会有的附件」
+             恒常多套一层 div（对齐 + 收缩 + 上限 84%）。 -->
+        <p
+          class="msg self-end max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
+        >
+          {text}
+        </p>
+      {:else}
+        <!-- 有附件：缩略图/药丸在上，正文气泡在下 -->
+        <div class="msg flex max-w-[84%] flex-col items-end gap-2 self-end">
+          <div class="flex flex-wrap justify-end gap-2">
+            {#each atts as a (a.id)}
+              {#if a.type === 'image'}
+                <img
+                  src={a.url}
+                  alt={a.name}
+                  class="max-h-48 max-w-full rounded-card border border-hairline object-cover"
+                />
+              {:else}
+                <span
+                  class="flex items-center gap-1.5 rounded-card bg-bubble px-3 py-2 text-meta text-fg"
+                >
+                  <Icon name="file" size={16} class="shrink-0 text-muted" />
+                  <span class="max-w-52 truncate">{a.name}</span>
+                </span>
+              {/if}
+            {/each}
+          </div>
+          {#if text}
+            <p
+              class="max-w-full rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
+            >
+              {text}
+            </p>
+          {/if}
+        </div>
+      {/if}
     {:else}
       <div class="flex flex-col gap-2.5 text-base leading-relaxed {msg.done ? 'msg' : ''}">
         {#each msg.parts as part, i (i)}

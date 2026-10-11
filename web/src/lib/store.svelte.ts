@@ -25,6 +25,12 @@ class AgentStore {
   device = $state<DeviceInfo | null>(null);
   /** 从 /api/health 读到的 provider 信息；null = 未配置，会走演示流 */
   llm = $state<{ name: string; model: string; baseUrl: string } | null>(null);
+  /**
+   * 当前模型能吃什么输入。决定输入卡片里显示哪些附件入口：
+   * `pdf` 为 false 时不显示「文件」（发了也必然 400）。
+   * 未配置 provider 时给个保守默认值。
+   */
+  capabilities = $state<{ vision: boolean; pdf: boolean }>({ vision: true, pdf: false });
   logs = $state<LogItem[]>([]);
   acks = $state<(Ack & { ts: number })[]>([]);
   /** 当前正在流式接收的助手消息 */
@@ -89,8 +95,10 @@ class AgentStore {
       if (!r.ok) return;
       const h = (await r.json()) as {
         llm?: { name: string; model: string; baseUrl: string } | null;
+        capabilities?: { vision: boolean; pdf: boolean } | null;
       };
       this.llm = h.llm ?? null;
+      this.capabilities = h.capabilities ?? { vision: true, pdf: false };
     } catch {
       // health 失败不影响主流程
     }

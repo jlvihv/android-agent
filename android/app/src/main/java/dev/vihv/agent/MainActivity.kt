@@ -2,16 +2,20 @@ package dev.vihv.agent
 
 import android.Manifest
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -39,12 +43,20 @@ class MainActivity : Activity() {
         private const val KEY_ASKED_FILES = "asked_all_files"
         private const val REQ_NOTIF = 1
         private const val REQ_STORAGE = 2
+        /** 页面 `<input type=file>` 选文件 */
+        private const val REQ_FILE = 3
+        /** 页面 `<input capture>` 拉起相机 */
+        private const val REQ_CAMERA = 4
     }
 
     private var web: WebView? = null
     private var fgsStarted = false
     /** 已注册的系统返回回调（API 33+；类型用 Any 存，低版本设备不会碰到这个类） */
     private var backCallback: Any? = null
+    /** 页面等着回调的文件选择请求（WebView 的 onShowFileChooser） */
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+    /** 相机拍下的那张图落在 MediaStore 里的 URI（取消时要删掉） */
+    private var cameraUri: Uri? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -182,6 +194,52 @@ class MainActivity : Activity() {
         }
 
         w.webChromeClient = object : WebChromeClient() {
+            /**
+             * 页面上 `<input type=file>` 的点击要靠这里接住。
+             *
+             * WebView **默认什么都不做** —— 不实现这个方法，附件的「相机 /
+             * 照片 / 文件」哪一颗都是点了没反应（而且不报错）。
+             *
+             * 三颗入口在页面里对应三个 input：
+             *   - 相机：`capture="environment"` → `isCaptureEnabled` 为真，
+             *     直接拉 `ACTION_IMAGE_CAPTURE`（不经过文件选择器）
+             *   - 照片 / 文件：`ACTION_OPEN_DOCUMENT`（见 `chooserIntent()`）
+             */
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?,
+            ): Boolean {
+                if (fileChooserParams == null) return false
+                // 上一个请求还没回落就再点一次：先把它取消，否则页面永远拿不到回调
+                fileCallback?.onReceiveValue(null)
+                fileCallback = filePathCallback
+
+                if (fileChooserParams.isCaptureEnabled) {
+                    val intent = cameraIntent()
+                    if (intent != null) {
+                        val ok = runCatching { startActivityForResult(intent, REQ_CAMERA) }
+                            .onFailure { Log.w(TAG, "相机不可用，回退到文件选择", it) }
+                            .isSuccess
+                        if (ok) return true
+                    }
+                }
+
+                Log.i(
+                    TAG,
+                    "文件选择：accept=${fileChooserParams.acceptTypes.joinToString()} " +
+                        "multiple=${fileChooserParams.mode == FileChooserParams.MODE_OPEN_MULTIPLE}",
+                )
+                return try {
+                    startActivityForResult(chooserIntent(fileChooserParams), REQ_FILE)
+                    true
+                } catch (e: Exception) {
+                    Log.w(TAG, "打开文件选择失败", e)
+                    fileCallback = null
+                    false
+                }
+            }
+
             override fun onConsoleMessage(m: android.webkit.ConsoleMessage?): Boolean {
                 Log.d(TAG, "[web] ${m?.message()} @${m?.lineNumber()}")
                 return true
@@ -191,6 +249,171 @@ class MainActivity : Activity() {
         w.loadUrl("http://127.0.0.1:$port")
         web = w
         return w
+    }
+
+    /**
+     * 相机：把输出直接写进 MediaStore，换一张我们自己的 `content://` URI。
+     *
+     * 为什么不用 `data` 里的小缩略图：那只有几十 KB，看不清、也不能给模型看。
+     * 为什么不用文件路径 + `file://`：targetSdk 24+ 对一个外部的 `file://` 直接
+     * 抛 `FileUriExposedException`。MediaStore 的 content URI 两条都避开了，
+     * 也不像 FileProvider 那样要再引一层 AndroidX。
+     *
+     * 返回 null 表示插不进 MediaStore（极罕见），让调用方回退到文件选择器。
+     */
+    private fun cameraIntent(): Intent? {
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "agent-${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+        }
+        val uri = runCatching {
+            contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        }.getOrNull() ?: return null
+        cameraUri = uri
+        return Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+            putExtra(MediaStore.EXTRA_OUTPUT, uri)
+            addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        }
+    }
+
+    /**
+     * 文件选择器的回流。两个 requestCode：
+     * - `REQ_CAMERA`：`EXTRA_OUTPUT` 的 URI 不会出现在 `data` 里，所以直接
+     *   把我们自己插的那张交回去；取消则把空图删掉（否则相册里会多一张
+     *   永远没人用的照片）。
+     * - `REQ_FILE`：交给 `FileChooserParams.parseResult`，它会把单选/多选、
+     *   `content://` 的可持久化授权都处理好。
+     */
+    @Deprecated("平台接口；我们不用 AndroidX，所以走老的 onActivityResult")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val cb = fileCallback ?: return
+        when (requestCode) {
+            REQ_CAMERA -> {
+                val uri = cameraUri
+                cameraUri = null
+                if (resultCode == RESULT_OK && uri != null) {
+                    cb.onReceiveValue(arrayOf(uri))
+                } else {
+                    uri?.let { runCatching { contentResolver.delete(it, null, null) } }
+                    cb.onReceiveValue(null)
+                }
+                fileCallback = null
+            }
+            REQ_FILE -> {
+                fileCallback = null
+                val uris = urisFromChooserResult(resultCode, data)
+                // content:// 的读权限只对这次返回有效，但有些选择器（相册/
+                // 文件）会要求显式拿一次可持久权限；拿不到就算了，不报错。
+                uris?.forEach { uri ->
+                    if (uri.scheme == "content") {
+                        runCatching {
+                            contentResolver.takePersistableUriPermission(
+                                uri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                            )
+                        }
+                    }
+                }
+                Log.i(TAG, "文件选择返回 resultCode=$resultCode uris=${uris?.joinToString()}")
+                cb.onReceiveValue(uris)
+            }
+        }
+    }
+
+    /**
+     * 从系统选择器的结果里抠出选中的 URI。
+     *
+     * **不能直接用 `WebChromeClient.FileChooserParams.parseResult`**：实测
+     * Pixel 10 / Android 16 的 Google 相册选择器（它接住了
+     * `ACTION_GET_CONTENT`）返回时 `getData()` 和 `getClipData()` **都是 null**，
+     * `parseResult` 于是返回 null → WebView 拿不到文件，`<input>` 的 change
+     * 事件根本不触发，界面上就像“选了但没加进去”。
+     *
+     * 所以这里把常见几种携带形式都扫一遍：clipData → data → 几个已知的
+     * extra。都拿不到再把整个 Intent 打进日志，下次碰到别的选择器能直接看。
+     */
+    private fun urisFromChooserResult(resultCode: Int, data: Intent?): Array<Uri>? {
+        if (resultCode != RESULT_OK) {
+            Log.i(TAG, "选择器取消（resultCode=$resultCode）")
+            return null
+        }
+        if (data == null) {
+            Log.w(TAG, "选择器返回 RESULT_OK 但 data 是 null")
+            return null
+        }
+
+        val out = LinkedHashSet<Uri>()
+        data.clipData?.let { cd ->
+            for (i in 0 until cd.itemCount) cd.getItemAt(i).uri?.let { out.add(it) }
+        }
+        data.data?.let { out.add(it) }
+        // 有些实现把 URI 塞在 extra 里（EXTRA_STREAM 可能是单个 Uri，也可能是
+        // ArrayList<Uri>）。类型对不上会抛，包起来。
+        runCatching { data.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) }
+            .getOrNull()?.let { out.add(it) }
+        @Suppress("DEPRECATION")
+        runCatching { data.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM) }
+            .getOrNull()?.forEach { out.add(it) }
+
+        if (out.isEmpty()) {
+            val keys = data.extras?.keySet()?.joinToString() ?: "—"
+            Log.w(
+                TAG,
+                "选择器返回里没有 URI：action=${data.action} data=${data.data} " +
+                    "clip=${data.clipData?.itemCount ?: 0} extras=[$keys]",
+            )
+            return null
+        }
+        return out.toTypedArray()
+    }
+
+    /**
+     * 照片 / 文件选择器。
+     *
+     * **刻意不用 `FileChooserParams.createIntent()`**：它发的是
+     * `ACTION_GET_CONTENT`，在 Android 13+ 上会命中系统 Photo Picker
+     * （`PhotopickerGetContentActivity`）。实测 Pixel 10 / Android 16 上
+     * 选完照片点「完成」回来，`WebChromeClient.FileChooserParams.parseResult`
+     * 拿不到任何 URI（`uris=0`）→ WebView 的 `<input>` 不触发 change，
+     * 界面上就像「选了但没加进去」。（Photo Picker 还有另一个已知坑：
+     * 它返回的 proxy URI 会让 Chromium 报 `ERR_UPLOAD_FILE_CHANGED`。
+     * WordPress/GutenbergKit 也因为这个从 GET_CONTENT 换到 OPEN_DOCUMENT。）
+     *
+     * `ACTION_OPEN_DOCUMENT`（SAF / 文件应用）的结果契约稳定：单选走
+     * `intent.data`、多选走 `intent.clipData`，而且支持可持久化读权限。
+     * 代价是 UI 是「文件」而不是那个照片网格 —— 换可靠性值得。
+     */
+    private fun chooserIntent(params: WebChromeClient.FileChooserParams): Intent {
+        // acceptTypes 里可能有 `.pdf` 这种非 MIME 写法，DocumentsUI 会不认
+        val mimes = params.acceptTypes.filter { it.contains('/') }
+        val multiple = params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+
+        // 只要选的是图片，优先走系统 Photo Picker（相册那个网格，就是 Claude 的
+        // 「照片」打开的东西）。它是 `ACTION_PICK_IMAGES`，结果契约清楚：
+        // 单选 `intent.data`、多选 `intent.clipData`，正是 `urisFromChooserResult`
+        // 扫的那两处。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            mimes.isNotEmpty() && mimes.all { it.startsWith("image/") }
+        ) {
+            val pick = Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+                type = mimes.first()
+                if (multiple) {
+                    putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, MediaStore.getPickImagesMaxLimit())
+                }
+            }
+            if (pick.resolveActivity(packageManager) != null) return pick
+        }
+
+        // 其余（PDF、多类型、老系统、没相册选择器）：SAF 的 OPEN_DOCUMENT。
+        // 它比 `createIntent()` 的 `ACTION_GET_CONTENT` 稳定，也不会撞上
+        // Photo Picker 的 `ERR_UPLOAD_FILE_CHANGED`。
+        return Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = mimes.firstOrNull() ?: "*/*"
+            if (mimes.size > 1) putExtra(Intent.EXTRA_MIME_TYPES, mimes.toTypedArray())
+            if (multiple) putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
     }
 
     private fun errorView(text: String): TextView = TextView(this).apply {
@@ -280,6 +503,9 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        // 页面已经没了，别把一个永远等不到结果的文件选择请求留着
+        fileCallback?.onReceiveValue(null)
+        fileCallback = null
         unregisterBackCallback()
         web?.destroy()
         web = null

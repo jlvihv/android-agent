@@ -159,7 +159,21 @@ export type Part =
   | { type: 'reasoning'; id: string; text: string }
   | ToolPart
   | { type: 'data'; name: string; data: unknown }
-  | { type: 'error'; text: string };
+  | { type: 'error'; text: string }
+  /** 用户在输入框里附的图片 / PDF。服务端 `session_view` 恢复历史时才有；
+   *  刚发出去的那条是本地直接拼的（同一个形状）。 */
+  | { type: 'image'; id: string; url: string; name: string; mime: string }
+  | { type: 'file'; id: string; url: string; name: string; mime: string };
+
+/** 已上传、还没发出去的附件（输入卡片里的一个小胶囊）。 */
+export type Upload = {
+  id: string;
+  name: string;
+  mime: string;
+  kind: 'image' | 'pdf';
+  /** 取回本体给缩略图/下载用的 URL */
+  url: string;
+};
 
 export type Message = {
   id: string;

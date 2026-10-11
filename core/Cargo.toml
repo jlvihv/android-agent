@@ -53,7 +53,7 @@ http = "1"
 #
 # rustls-no-provider 而不是 rustls：后者硬编码 aws-lc-rs（AWS-LC 是个大 C 库）。
 # crypto provider 由我们自己的 rustls 依赖选（ring，更小）。
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 # ring 而不是 aws-lc-rs：体积小不少（aws-lc 是个完整的 C 库）。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 webpki-roots = "1"
@@ -73,17 +73,6 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 # 决策 D2：正向绑定 + 反向 callback，不手写 JNI
 uniffi = { version = "0.32", features = ["tokio"] }
-
-# 决策 D4：不手写 OpenAI 协议。只开 4 个 feature（该 crate 共 57 个）。
-# rustls 而非 native-tls —— 避免 openssl 交叉编译，这是 Android/Rust 最容易卡死的地方。
-# byot（bring your own types）：官方逃生口，用来接住 DeepSeek 的
-# `reasoning_content`（自带类型里没这个字段，也没有 flatten extra）。
-# 只要 chat-completion（代码里没用 responses，开着它白白把一堆类型编进 .so）。
-async-openai = { version = "0.42", default-features = false, features = [
-    "rustls-no-provider",
-    "chat-completion",
-    "byot",
-] }
 
 # log 由 tracing 的 log feature 和 android_logger 一起用；panic hook 在安卓上
 # 也走它（Rust 默认把 panic 打到 stderr，而安卓上 stderr 是丢掉的）

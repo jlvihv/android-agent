@@ -5,8 +5,9 @@
 //! Rust 只回传指令。所以这里所有跨边界类型都是 JSON 可序列化的。
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -119,6 +120,12 @@ struct PersistedProvider {
     /// 老 llm.json 里没有这个字段 → 默认 true（模型能看图）
     #[serde(default = "crate::llm::default_supports_images")]
     supports_images: bool,
+    /// 老 llm.json 里没有这个字段 → 默认 false（不知道就不显示文件入口）
+    #[serde(default)]
+    supports_files: bool,
+    /// 协议偏好。老 llm.json 里没有 → Auto（优先 Responses）
+    #[serde(default)]
+    api_style: crate::llm::ApiStyle,
 }
 
 pub struct AppState {
@@ -163,11 +170,20 @@ pub struct AppState {
     ///
     /// provider 换了（key 变了）就重算。判定来源见 `models` 模块。
     pub vision: RwLock<Option<(String, bool)>>,
+    /// PDF / 文档输入能力的自动判定结果，和 `vision` 分开存。
+    pub files: RwLock<Option<(String, bool)>>,
     /// 用户按了停止。回合循环每轮开始前 / 每个工具执行前都会看它。
     ///
     /// agent loop **没有轮数上限**，所以必须有一个真的能停下来、而不只是
     /// 断开前端连接的开关 —— 否则模型空转时只能在后台烧 token。
     pub abort_turn: AtomicBool,
+    /// 已上传但还没随消息发出去的附件：`id → Attachment`。
+    ///
+    /// 上传和发送是两个请求，中间隔着一个用户可能改主意的间隔，所以需
+    /// 要把“已经把字节存到磁盘上”这件事先记下来。发出去时按 id 取走。
+    /// 附件一旦进了会话历史，`ChatMessage` 里就带着完整的 `Attachment`，
+    /// 不靠这个 map 了。
+    pub pending_attachments: Mutex<HashMap<String, crate::agent::Attachment>>,
 }
 
 impl AppState {
@@ -187,6 +203,8 @@ impl AppState {
             sessions_dirty: AtomicBool::new(false),
             system_prompt: RwLock::new(None),
             vision: RwLock::new(None),
+            files: RwLock::new(None),
+            pending_attachments: Mutex::new(HashMap::new()),
             abort_turn: AtomicBool::new(false),
         })
     }
@@ -366,6 +384,20 @@ impl AppState {
         tracing::debug!("视觉能力已记录: {vision}");
     }
 
+    /// 只更新「能不能吃 PDF」并落盘（自动判定后调用），不重发配置日志。
+    pub fn set_supports_files(&self, files: bool, persist_dir: Option<&std::path::Path>) {
+        let Some(mut p) = self.llm() else { return };
+        if p.supports_files == files {
+            return;
+        }
+        p.supports_files = files;
+        self.persist_provider(&p, persist_dir);
+        if let Ok(mut g) = self.llm.write() {
+            *g = Some(p);
+        }
+        tracing::debug!("文档输入能力已记录: {files}");
+    }
+
     fn persist_provider(&self, p: &Provider, persist_dir: Option<&std::path::Path>) {
         let Some(dir) = persist_dir else { return };
         let f = dir.join("llm.json");
@@ -378,6 +410,8 @@ impl AppState {
             model: p.model.clone(),
             api_key: p.api_key.clone(),
             supports_images: p.supports_images,
+            supports_files: p.supports_files,
+            api_style: p.api_style,
         };
         match serde_json::to_vec_pretty(&rec) {
             Ok(body) => {
@@ -419,6 +453,37 @@ impl AppState {
         vision
     }
 
+    /// 当前 provider 能不能吃 PDF / 文档输入：
+    /// 缓存 → models.dev 自动判定 → 拿不准就保留原值（默认 false）。
+    ///
+    /// 和视觉能力同一个套路，但 PDF 默认关：没法确定时**不显示**文件入口，
+    /// 总好过发一个保证 400 的请求。
+    pub async fn supports_files_for(&self, provider: &Provider) -> bool {
+        let key = files_key(provider);
+        if let Some((k, v)) = self.files.read().ok().and_then(|g| g.clone()) {
+            if k == key {
+                return v;
+            }
+        }
+        let dir = self.data_dir.read().ok().and_then(|g| g.clone());
+        let resolved = crate::models::pdf_for(provider, &provider.model, false, dir.as_deref()).await;
+        let files = resolved.unwrap_or(provider.supports_files);
+        match resolved {
+            Some(v) => tracing::info!("文档输入能力自动判定: {} → {v}", provider.model),
+            None => tracing::info!(
+                "文档输入能力查不到 {}（models.dev 没这个模型），沿用 {files}",
+                provider.model
+            ),
+        }
+        if let Ok(mut g) = self.files.write() {
+            *g = Some((key, files));
+        }
+        if resolved.is_some() {
+            self.set_supports_files(files, dir.as_deref());
+        }
+        files
+    }
+
     /// 用户请求停止当前回合（`POST /api/stop`）。
     pub fn request_abort(&self) {
         self.abort_turn
@@ -439,6 +504,17 @@ impl AppState {
             }
         }
         provider.supports_images
+    }
+
+    /// 同 `cached_supports_images`，但看的是 PDF / 文档输入。
+    pub fn cached_supports_files(&self, provider: &Provider) -> bool {
+        let key = files_key(provider);
+        if let Some((k, v)) = self.files.read().ok().and_then(|g| g.clone()) {
+            if k == key {
+                return v;
+            }
+        }
+        provider.supports_files
     }
 
     /// provider 的模型清单（带 vision 判定），给设置界面 / CLI 用。
@@ -464,10 +540,16 @@ impl AppState {
                 let model = rec.model.clone();
                 let mut p = Provider::compatible(rec.name, rec.base_url, rec.model, rec.api_key);
                 p.supports_images = rec.supports_images;
+                p.supports_files = rec.supports_files;
+                p.api_style = rec.api_style;
                 // 恢复出来的值先当已知（不用等下一次请求再联网）
                 if let Ok(mut g) = self.vision.write() {
                     *g = Some((vision_key(&p), rec.supports_images));
                 }
+                // 刻意**不**给 `files` 填缓存：老 llm.json 里没有这个字段，
+                // 填了就会把「从未判定过」当成「已判定为 false」，界面就一直
+                // 不显示文件入口。留给启动后的 `refresh_capabilities` 去查
+                // models.dev（磁盘有目录缓存，大多不联网）。
                 if let Ok(mut g) = self.llm.write() {
                     *g = Some(p);
                 }
@@ -488,5 +570,10 @@ impl AppState {
 
 /// 视觉判定的缓存键：base_url + 模型名。任一变了就重算。
 fn vision_key(p: &Provider) -> String {
+    format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
+}
+
+/// 文档输入判定的缓存键，和视觉那套分开存。
+fn files_key(p: &Provider) -> String {
     format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
 }

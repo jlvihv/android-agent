@@ -66,6 +66,10 @@ async fn stream_one(...) {
 > 消息，里面是 `image_url`。OpenAI 的 tool 消息内容只能是字符串，图片没
 > 别的地方可挂。它由历史推导、字节确定（图片从盘上重读），所以照样是前缀
 > 的一部分 —— 后面的轮次会原样重发同一份字节，缓存命中不受影响。
+>
+> 这是 **Chat Completions** 的绕法。**Responses API** 不需要：图片直接放在
+> `function_call_output.output` 的内容块数组里（`build_responses_input`），
+> 更干净、也不多一条消息。两条协议编码同一份历史，前缀不变式一致。
 
 三条规则：
 
@@ -86,7 +90,9 @@ ensure_system_prompt(sess, SYSTEM_PROMPT);
 sess.messages.push(ChatMessage::User(user_text.into()));
 
 // build_messages：历史原样；唯一的例外是图片 carrier，排在连续 tool 消息之后
-build_messages(sess, supports_images)
+build_messages(sess, supports_images, supports_files)
+// Responses API 走同一个历史的另一种编码（build_responses_input），
+// 工具结果里的图片直接内联，不需要 carrier
 ```
 
 因此请求体长度 == 历史长度（加上图片 carrier）。`the_request_is_the_history_verbatim`

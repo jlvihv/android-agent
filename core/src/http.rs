@@ -6,9 +6,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, Query, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,6 +32,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/llm", post(set_llm))
         .route("/api/models", get(get_models))
         .route("/api/model", post(set_model))
+        .route(
+            "/api/attachment",
+            // 附件是真文件（PDF 可能几十 MB），默认 2MB 的 body 限制
+            // 在它进 handler 之前就 413 了
+            post(upload_attachment).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route("/api/attachment/{id}", get(get_attachment))
         .route("/api/stop", post(stop_turn))
         .route("/api/chat", post(chat))
         .route("/api/session", get(get_session))
@@ -61,6 +69,14 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let dev = st.device();
     // 优先运行时配置，回退环境变量（桌面）
     let provider = st.llm().or_else(Provider::from_env);
+    // 能力判定只看缓存（health 不能联网等 models.dev）
+    let capabilities = provider.as_ref().map(|p| {
+        json!({
+            "vision": st.cached_supports_images(p),
+            "pdf": st.cached_supports_files(p),
+            "apiStyle": p.api_style,
+        })
+    });
     Json(json!({
         "ok": true,
         "version": VERSION,
@@ -77,6 +93,8 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "model": p.model,
             "baseUrl": p.base_url,
         })),
+        // 界面靠它决定要不要显示「文件」那个附件入口
+        "capabilities": capabilities,
     }))
 }
 
@@ -200,6 +218,10 @@ struct ChatBody {
     /// 「新建」这件事拖到第一句话才发生：点了不发就不会攒出空会话。
     #[serde(default)]
     fresh: bool,
+    /// 已经在 `/api/attachment` 上传好、随这条消息发出去的附件 id。
+    /// 服务端从 `pending_attachments` 取出完整描述后跟着用户消息进历史。
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// `POST /api/chat` → AI SDK UI Message Stream。
@@ -212,6 +234,28 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     if body.fresh && body.session.is_none() {
         let mut store = st.chat.write().await;
         store.create();
+    }
+
+    // 取出这条消息带的附件。刚从上传接口存进来的，按 id 取走（取走就从
+    // pending 里消失，同一份附件不会被两条消息重复引用）。
+    let mut attachments: Vec<crate::agent::Attachment> = Vec::new();
+    if !body.attachments.is_empty() {
+        let mut pending = st
+            .pending_attachments
+            .lock()
+            .expect("pending_attachments poisoned");
+        for id in &body.attachments {
+            match pending.remove(id) {
+                Some(a) => attachments.push(a),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("附件已失效（{id}），请重新添加"),
+                    )
+                        .into_response()
+                }
+            }
+        }
     }
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
@@ -238,6 +282,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
                     &core,
                     &p,
                     &body.text,
+                    attachments,
                     body.session.as_deref(),
                     txc,
                 )
@@ -272,6 +317,9 @@ struct LlmBody {
     base_url: String,
     model: String,
     api_key: String,
+    /// `responses` / `chat` / `auto`（不传 = auto：优先 Responses）
+    #[serde(default)]
+    api_style: Option<crate::llm::ApiStyle>,
 }
 
 #[derive(serde::Deserialize)]
@@ -290,6 +338,37 @@ fn default_name() -> String {
     "custom".into()
 }
 
+/// 解 `%XX`（前端用 `encodeURIComponent` 编的文件名）。
+///
+/// 不引 `percent-encoding` 只为这一个地方：HTTP 头值只能是 ISO-8859-1，
+/// 中文文件名必须编码，而 `+`/空格在这里不是查询串、不特殊处理。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// `POST /api/llm` → 运行时配置 provider。
 ///
 /// 安卓上没法用环境变量，用户也没别的地方填 key，所以需要这个接口。
@@ -302,22 +381,26 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
         return (StatusCode::BAD_REQUEST, "baseUrl 和 model 都不能为空").into_response();
     }
 
-    let p = Provider::compatible(
+    let mut p = Provider::compatible(
         body.name,
         body.base_url.trim_end_matches('/'),
         body.model,
         body.api_key,
     );
+    if let Some(style) = body.api_style {
+        p.api_style = style;
+    }
     let dir = st.data_dir.read().ok().and_then(|g| g.clone());
     st.set_llm(p.clone(), dir.as_deref());
-    // 自动判定这个模型能不能吃图片（查 models.dev），结果落盘。
+    // 自动判定这个模型能不能吃图片 / PDF（查 models.dev），结果落盘。
     // 不劳烦用户配 —— 这是模型自己的属性。
     let vision = st.supports_images_for(&p).await;
+    let pdf = st.supports_files_for(&p).await;
     // 换了 provider / model，缓存前缀的语义就变了：给所有会话换一个
     // provider session id，否则 provider 侧会把新前缀路由到旧模型的缓存上。
     st.rotate_provider_sessions().await;
 
-    Json(json!({ "ok": true, "vision": vision })).into_response()
+    Json(json!({ "ok": true, "vision": vision, "pdf": pdf })).into_response()
 }
 
 /// `POST /api/stop` → 停当前回合。
@@ -343,10 +426,79 @@ async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery
             "name": p.name,
             "baseUrl": p.base_url,
             "vision": st.cached_supports_images(&p),
+            "pdf": st.cached_supports_files(&p),
             "models": models,
         }))
         .into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `POST /api/attachment` → 上传一个附件（图片 / PDF）。
+///
+/// body 就是文件原始字节（不是 multipart）：文件名走 `x-filename`
+/// （percent-encoded，避免非ASCII 头非法），类型服务端按魔数自己认，
+/// 不信 `content-type`。处理完落盘并记进 `pending_attachments`，
+/// 随后的 `/api/chat` 带着返回的 `id` 把它挂到那条用户消息上。
+async fn upload_attachment(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "空文件").into_response();
+    }
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let name = headers
+        .get("x-filename")
+        .and_then(|v| v.to_str().ok())
+        .map(percent_decode)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "file".into());
+
+    let core = Core { state: st.clone() };
+    match core.store_attachment(name, mime, body.to_vec()).await {
+        Ok(a) => {
+            if let Ok(mut pending) = st.pending_attachments.lock() {
+                pending.insert(a.id.clone(), a.clone());
+            }
+            Json(json!({
+                "id": a.id,
+                "name": a.name,
+                "mime": a.mime,
+                "kind": a.kind,
+                "url": format!("/api/attachment/{}", a.id),
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `GET /api/attachment/{id}` → 取回附件本体给用户消息气泡展示。
+///
+/// `id` 必须是裸文件名（`attachment_path` 把这一点钉死在路径拼接之前）。
+async fn get_attachment(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<String>) -> Response {
+    let core = Core { state: st };
+    let Some(path) = core.attachment_path(&id) else {
+        return (StatusCode::NOT_FOUND, "没有这个附件").into_response();
+    };
+    let mime = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("读附件失败: {e}")).into_response(),
     }
 }
 
@@ -364,8 +516,9 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
     let dir = st.data_dir.read().ok().and_then(|g| g.clone());
     st.set_llm(p.clone(), dir.as_deref());
     let vision = st.supports_images_for(&p).await;
+    let pdf = st.supports_files_for(&p).await;
     st.rotate_provider_sessions().await;
-    Json(json!({ "ok": true, "model": p.model, "vision": vision })).into_response()
+    Json(json!({ "ok": true, "model": p.model, "vision": vision, "pdf": pdf })).into_response()
 }
 
 /// `GET /api/session?rev=…` → 服务端的会话历史，转成前端 `Message[]` 的形状。
@@ -404,20 +557,12 @@ async fn get_session(
             if client_len == len {
                 // 没有新消息（只是 updated_at 变了）：尾部不用重发
                 from = len;
-            } else if !matches!(
-                &sess.messages[client_len],
-                crate::agent::ChatMessage::User(_)
-            ) {
+            } else if !sess.messages[client_len].is_user() {
                 // 新消息是同一回合的延续（assistant/tool）—— 回到这个回合的起点
                 // （上一条是 User，或到 0），这样开头那个 assistant 一定是新的
                 // 一条，与完整视图的合并规则一致。
                 // 若新消息本身就是一条 User（新回合），from 就留在 client_len。
-                while from > 0
-                    && !matches!(
-                        &sess.messages[from - 1],
-                        crate::agent::ChatMessage::User(_)
-                    )
-                {
+                while from > 0 && !sess.messages[from - 1].is_user() {
                     from -= 1;
                 }
             }
@@ -549,9 +694,20 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
     };
     crate::agent::ensure_system_prompt(&mut sess, &st.system_prompt());
 
-    match crate::agent::build_request(&sess, &p.model, st.cached_supports_images(&p))
-        .and_then(|r| Ok(serde_json::to_value(&r)?))
-    {
+    // 和真正发出去的一致：按解析出来的协议偏好给请求体
+    let images = st.cached_supports_images(&p);
+    let files = st.cached_supports_files(&p);
+    let body = match p.transport() {
+        crate::llm::Transport::Responses => {
+            crate::agent::build_responses_request(&sess, &p.model, images, files)
+                .and_then(|r| Ok(serde_json::to_value(&r)?))
+        }
+        crate::llm::Transport::Chat => {
+            crate::agent::build_request(&sess, &p.model, images, files)
+                .and_then(|r| Ok(serde_json::to_value(&r)?))
+        }
+    };
+    match body {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -560,9 +716,9 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
 /// `GET /api/debug/tools` → 当前工具表（就是发给模型的 `tools` 字段）。
 ///
 /// 存在的意义：沙箱里的 `agent tools` 靠它回答「我自己有哪些工具」，
-/// 不用去翻整份请求体。
+/// 不用去翻整份请求体。给的是 Chat Completions 的形态（嵌套 `function`）。
 async fn debug_tools() -> Response {
-    match crate::agent::tool_definitions().and_then(|t| Ok(serde_json::to_value(t)?)) {
+    match serde_json::to_value(crate::agent::tool_definitions()) {
         Ok(v) => Json(json!({ "tools": v })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
