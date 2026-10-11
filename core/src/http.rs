@@ -717,6 +717,35 @@ async fn looks_like_text(host: &std::path::Path) -> bool {
         .all(|&b| b == b'\n' || b == b'\r' || b == b'\t' || b >= 0x20)
 }
 
+/// 沙箱里的错误页（找不到 / 越界 / 沙箱没起来）。
+///
+/// 为什么要 HTML 而不是一行 `text/plain`：这东西多数时候是给**查看器里的用户**
+/// 看的（iframe 里）。一行小字很容易被当成「网页打开是空白」，也说不清为什么没了。
+/// 所以页面上直接写明：哪个路径、可能的原因，以及**东西该放哪**。
+fn sandbox_error(status: StatusCode, guest: &str, reason: &str) -> Response {
+    let title = match status {
+        StatusCode::NOT_FOUND => "沙箱里没有这个文件",
+        StatusCode::FORBIDDEN => "不能访问这个路径",
+        StatusCode::SERVICE_UNAVAILABLE => "沙箱没起来",
+        _ => "读不了这个文件",
+    };
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let html = format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>         <title>{title}</title><style>body{{font:15px/1.7 system-ui;background:#151515;color:#f9f9f7;         margin:0;padding:26px 20px}}code{{background:#262624;padding:2px 6px;border-radius:6px;         word-break:break-all}}h3{{margin:0 0 12px}}p{{color:#97958d;margin:12px 0}}         b{{color:#f9f9f7}}</style>         <h3>{title}</h3>         <p><code>{path}</code></p>         <p>{reason}</p>         <p><b>App 重装或清数据会清空沙箱内部</b>（<code>/root</code>、<code>/usr</code> 这些）；         放在 <code>/workspace</code>（手机内部存储的 Agent 文件夹）里的东西不会丢。         让 agent 重新生成一次就行。</p>",
+        title = title,
+        path = esc(guest),
+        reason = esc(reason),
+    );
+    let mut res = (status, axum::response::Html(html)).into_response();
+    sandbox_headers(&mut res, "text/html; charset=utf-8");
+    res
+}
+
 /// 沙箱页面统一的响应头
 fn sandbox_headers(res: &mut Response, mime: &str) {
     let h = res.headers_mut();
@@ -741,16 +770,22 @@ async fn serve_sandbox(
     range: Option<String>,
 ) -> Response {
     let Some(sb) = st.linux() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Linux 沙箱未初始化").into_response();
+        return sandbox_error(StatusCode::SERVICE_UNAVAILABLE, guest, "Linux 沙箱没有初始化。");
     };
     let host = match sb.resolve_path(guest) {
         Ok(p) => p,
-        Err(e) => return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response(),
+        Err(e) => return sandbox_error(StatusCode::FORBIDDEN, guest, &format!("{e:#}")),
     };
 
     let meta = match tokio::fs::metadata(&host).await {
         Ok(m) => m,
-        Err(_) => return (StatusCode::NOT_FOUND, format!("沙箱里没有 {guest}")).into_response(),
+        Err(_) => {
+            return sandbox_error(
+                StatusCode::NOT_FOUND,
+                guest,
+                "它可能被删过，或者路径写错了。",
+            )
+        }
     };
 
     if meta.is_dir() {

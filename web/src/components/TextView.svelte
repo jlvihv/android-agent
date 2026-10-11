@@ -26,7 +26,16 @@
     void (async () => {
       try {
         const r = await fetch(url);
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        if (!r.ok) {
+          // 服务端对这些错误页给的是 HTML（给查看器里的用户看的），
+          // 这里抠出文字来，比只显示 “HTTP 404” 有用得多
+          const body = await r.text();
+          const plain = body
+            .replace(/<[^>]*>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          throw new Error(plain || `HTTP ${r.status}`);
+        }
         const body = await r.text();
         if (dead) return;
         if (body.length > LIMIT) {
