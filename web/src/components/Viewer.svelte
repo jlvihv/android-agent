@@ -109,10 +109,15 @@
   aria-label={viewer.title}
 >
   <!-- 顶栏高度用 `--hdr`（= 对话页顶栏，36px + 安全区）：
-       同一个 App 里三处顶栏（对话页 / 抽屉 / 查看器）应该一样高。 -->
+       同一个 App 里三处顶栏（对话页 / 抽屉 / 查看器）应该一样高。
+
+       **安全区要当内边距扣掉**：`--hdr` 里包含 `env(safe-area-inset-top)`，
+       只写 `h-[var(--hdr)]` + items-center 的话，内容会被居中在整个高度里 ——
+       真机（安全区 66px）上返回键落到 top=37，钻进状态栏里了（踩过）。
+       对话页 header 就是这么写的（pt-4 + pb-4 + 28px 按钮）。 -->
   <header
     use:dismissable={drag}
-    class="flex h-[var(--hdr)] shrink-0 items-center gap-2 px-3"
+    class="flex h-[var(--hdr)] shrink-0 items-center gap-2 px-3 pt-[env(safe-area-inset-top)]"
   >
     <button class="p-1 text-fg" aria-label="返回" onclick={closeViewer}>
       <Icon name="back" size={20} />
