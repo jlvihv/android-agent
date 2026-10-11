@@ -189,6 +189,9 @@
   in:slideIn|global
   out:slideOut|global
 >
+  <!-- 顶部对齐就好，不高一样高：搜索框是输入控件，按它该有的高度来
+       （上下 12px 内边距 + 16px 字 = 48px）。三处顶栏对齐的是**顶部**：
+       `mt-1` = 安全区下 4px，和对话页图标、查看器返回键同一个起始线。 -->
   <input
     bind:value={q}
     type="search"
@@ -196,13 +199,11 @@
     spellcheck="false"
     autocomplete="off"
     aria-label="搜索对话"
-    class="mx-4 my-1 h-7 shrink-0 rounded-full bg-[#1f1f1f] px-3 text-sm
+    class="mx-4 mt-1 mb-3 shrink-0 rounded-2xl bg-[#1f1f1f] px-4 py-3 text-base
            text-fg placeholder:text-faint outline-none"
   />
-  <!-- 搜索框占的顶部高度 = 4 + 28 + 4 = 36px = `--hdr`：
-       和对话页顶栏、查看器顶栏一样高，三处的文字基线就对齐了。 -->
 
-  <div class="min-h-0 flex-1 overflow-y-auto px-3 pt-2 pb-1">
+  <div class="min-h-0 flex-1 overflow-y-auto px-3 pt-1 pb-1">
     {#if q.trim()}
       {#if hits.length === 0}
         <p class="px-3 py-3 text-sm text-faint">
