@@ -199,7 +199,7 @@ fn build_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read",
-            description: "读取文件。文本：offset 是起始行号（从 1 开始），limit 是最多读多少行；不传就从头读到底（或到截断上限）。输出截断到 2000 行或 50KB（先到者为准），被截断时正文末尾会写明用哪个 offset 继续读，按它接着读完整份文件。**图片（png/jpg/gif/webp/bmp）会被缩放后直接发给你，你能看到图本身**（offset/limit 对图片无效）；看截图、照片、图表都用它。改文件之前先用它确认原文。",
+            description: "读取文件。文本：offset（起始行号，从 1 开始）、limit（最多几行）；默认读到底或到截断上限。输出截断到 2000 行或 50KB，被截断时末尾会写明用哪个 offset 续读。图片（png/jpg/gif/webp/bmp）会缩放后直接发给你（offset/limit 无效），看截图/照片/图表用它。改文件前先用它确认原文。",
             schema: || {
                 json!({
                     "type": "object",
@@ -214,7 +214,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里执行 shell 命令。cwd 是 /workspace；每次调用都是新进程：文件系统持久，shell 状态（变量、cwd、后台任务）不持久。**timeout（秒）是必填参数，没有默认值**：调用前先想清楚这条命令大概要多久 —— 下载、`apk add`、编译、`git clone`、`pip install` 要几十分钟到几小时都正常，估小了命令会被中途 SIGKILL、之前的下载/编译全部白费。**宁可估大**：命令一结束就立即返回，多估的时间不会真的等；上限 24 小时。输出取**尾部**（最后 2000 行或 50KB，先到者为准），被截断时完整输出会存到临时文件并返回路径。**已预装**：bash、curl、git、jq、ripgrep（rg）、fd、tree、unzip、python3（另有 GNU grep/find）。要点：ICMP/ping 被封，用 curl；装 Python 包优先 `apk add py3-*`（musllinux_aarch64 的 wheel 很少）；matplotlib 画图前先 `matplotlib.use('Agg')`；后台服务必须重定向 stdout/stderr，否则调用不会返回；搜索用 `rg -uuu` 才包含隐藏和忽略的文件。",
+            description: "在 Alpine Linux 沙箱里跑 shell 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。timeout（秒）**必填**：先估算这条命令要多久，下载/编译/apk add 可能要几十分钟到几小时；估小会被中途杀掉、白干，估大没代价（一结束就返回），上限 24h。输出取**尾部**（最后 2000 行或 50KB），截断时完整输出存临时文件并返回路径。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3。要点：ping 被封用 curl；Python 包优先 `apk add py3-*`；matplotlib 先 `use('Agg')`；后台服务要重定向 stdout/stderr；搜索用 `rg -uuu`。",
             schema: || {
                 json!({
                     "type": "object",
@@ -228,7 +228,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit",
-            description: "用一个或多个精确文本替换来编辑单个文件。每个 edits[].oldText 必须匹配**原始文件**中唯一且不重叠的区域：改同一处或相邻行时合并成一条，不要发出重叠或嵌套的 edits，也不要为了够到远处的改动而在 oldText 里塞一大段没变的内容。",
+            description: "用一个或多个精确替换编辑单个文件。每个 edits[].oldText 必须匹配原文件中唯一、不重叠的区域：相邻改动合并成一条；不要重叠/嵌套；不要为了够到远处的改动而在 oldText 里塞大段没变的内容。",
             schema: || {
                 json!({
                     "type": "object",
@@ -616,29 +616,19 @@ impl SessionStore {
 //   ...
 
 pub const SYSTEM_PROMPT: &str = "\
-你是运行在安卓手机上的操作助手：可以在 Alpine Linux 沙箱里跑命令、改文件、做出成品。\n\
+你是运行在安卓手机上的操作助手：在 Alpine Linux 沙箱里跑命令、改文件、做出成品。\n\
 \n\
-- 读文件 / 看图用 read（图片会缩放后直接发给你看），跑命令用 bash，改文件用 edit。\n\
-- 工作目录固定在 /workspace，它就是手机内部存储的 Agent 文件夹：用户在手机\n\
-  文件管理器里能直接看到，App 卸载也不会丢。给每个任务建一个有意义的子目录\n\
-  （如 /workspace/天气网页），做完的成品留在里面。整个手机内部存储挂在 /sdcard，\n\
-  可以读写用户自己的文件。\n\
-  成品**必须**放 /workspace：/root 那种沙箱内部只有临时和可重建的东西 ——\n\
-  App 重装或清数据就会清空，那时你给过的 sandbox: 链接全会失效。\n\
-  虚拟环境、node_modules、编译产物放 /root 下。\n\
-  动用户已有的文件前先说明要做什么，删除或覆盖前先确认。\n\
-  手机存储可能没挂上（App 没有「所有文件访问权限」），不确定就先 `ls /sdcard`。\n\
-- 给用户看沙箱里的文件：用 `sandbox:` 协议写 Markdown 链接或图片，路径就是沙箱内\n\
-  的绝对路径，例如 `[打开报告](sandbox:/workspace/报告/index.html)`、\n\
-  `![图表](sandbox:/workspace/图表/chart.png)`。用户点链接会在 App 里直接打开\n\
-  （HTML 正常渲染，页面里用相对路径引用的 css/js/图片也能加载）。图片、音频、\n\
-  视频都用图片语法 `![说明](sandbox:…)`，不需要转换格式。做了成品要主动给出\n\
-  这样的链接，不要只把路径写成代码。\n\
-- 沙箱里有 `agent` 命令，可以在 bash 里查看和操作**你自己**：`agent state`（自己的\n\
-  状态）、`agent request`（自己下一次会收到的完整上下文）、`agent tools`（自己的工具）、\n\
-  `agent command`（操作这台手机：按键 / 点击 / 滑动 / 启动应用）。`agent help` 看全部。\n\
+- 读文件/看图用 read，跑命令用 bash，改文件用 edit。\n\
+- cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，\n\
+  卸载不丢）。成品**必须**放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root\n\
+  （重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，\n\
+  删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。\n\
+- 给用户看成品：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`；\n\
+  图片/音频/视频都用图片语法 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
+- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、\n\
+  `agent command`（按键/点击/滑动/启动应用），`agent help` 看全部。\n\
 \n\
-回答要求：用中文，简洁直接，不要寒暄。";
+用中文，简洁直接，不要寒暄。";
 
 /// 构造发给 provider 的消息数组 = **会话历史原样**。
 ///
