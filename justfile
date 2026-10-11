@@ -231,6 +231,22 @@ android-install: android-debug
     . scripts/jdk.sh
     cd {{and}} && ./gradlew :app:installDebug
 
+# release APK：R8 混淆/压缩 + 用 debug key 签（本地能直接装）。
+# 原生核心两者都是 release（android-libs 里的 `--release`），区别只在
+# Kotlin/dex 那层和签名。
+android-release: android-bindings web-build android-libs
+    #!/usr/bin/env bash
+    set -eu
+    . scripts/jdk.sh
+    cd {{and}} && ./gradlew :app:assembleRelease
+    echo "APK: {{and}}/app/build/outputs/apk/release/app-release.apk"
+
+android-install-release: android-release
+    #!/usr/bin/env bash
+    set -eu
+    . scripts/jdk.sh
+    cd {{and}} && ./gradlew :app:installRelease
+
 android-log:
     adb logcat -s AgentApp AgentA11y AgentDeviceHost Rootfs AgentMain
 

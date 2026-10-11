@@ -23,6 +23,10 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            // 本地装 release 用 debug key 签（AGP 默认就有一把
+            // ~/.android/debug.keystore）。和 debug 包同一把钥匙，能互相覆盖安装。
+            // 正式发布前要换成自己的 keystore。
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
