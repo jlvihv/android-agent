@@ -312,15 +312,23 @@ SCRATCH = "调试（agentctl）"
 TARGET: str | None = None
 
 
-def pick_session(which: str) -> str | None:
-    """决定这一轮写进哪个会话，返回会话 id（None = 当前活动会话）。"""
+def pick_session(which: str) -> None:
+    """决定这一程写进哪个会话（直接设到模块级 `TARGET`）。
+
+    **自己设全局、不返回** —— 免得调用方忘了写 `global TARGET`。
+    这个坑真踩过：`main()` 里少了 `global`，`TARGET` 变成局部变量，
+    模块级那份一直是 None，于是消息全都写进了**用户当前打开的**那条会话。
+    """
+    global TARGET
     if which == "active":
         print(c(WARN, "⚠ --session active：会写进你当前打开的那条会话"), file=sys.stderr)
-        return None
+        TARGET = None
+        return
     if which not in ("", "scratch"):
         # 显式给了 id 就**不动**活动会话 —— run_turn 是按 id 找会话的，
         # 没必要顺手把用户正开着的那条切走。（要切用 /use）
-        return which
+        TARGET = which
+        return
 
     # find-or-create：同一条调试会话反复用，历史能连着，也不会在侧边栏堆一堆
     code, d = call("GET", "/api/sessions")
@@ -328,7 +336,8 @@ def pick_session(which: str) -> str | None:
     if code == 200 and isinstance(d, dict):
         for sess in d.get("sessions") or []:
             if sess.get("title") == SCRATCH:
-                return str(sess["id"])
+                TARGET = str(sess["id"])
+                return
             if sess.get("active"):
                 was_active = str(sess["id"])
 
@@ -337,14 +346,15 @@ def pick_session(which: str) -> str | None:
     code, d = call("POST", "/api/sessions")
     if code != 200 or not isinstance(d, dict):
         print(c(WARN, f"建不了调试会话（{code}），改写到当前活动会话"), file=sys.stderr)
-        return None
+        TARGET = None
+        return
     sid = str(d.get("id"))
     call("POST", "/api/sessions/rename", {"id": sid, "title": SCRATCH})
     if was_active:
         call("POST", "/api/sessions/activate", {"id": was_active})
     print(c(DIM, f"建了一条调试会话「{SCRATCH}」—— 你的对话和当前打开的那条都不动"),
           file=sys.stderr)
-    return sid
+    TARGET = sid
 
 
 def session_note() -> str:
@@ -758,7 +768,7 @@ def main() -> int:
 
     # 定好这一程写进哪个会话。默认是一条**专用调试会话** —— 直接在 CLI 里
     # 发消息而不小心写进用户正在聊的那条，是真踩过的坑。
-    TARGET = pick_session(args.session)
+    pick_session(args.session)
 
     if args.doctor:
         return cmd_doctor(args.deep)
