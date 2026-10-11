@@ -186,6 +186,8 @@
   {/each}
 {/snippet}
 
+<!-- 块级内容分组。在 MessageList 里父级已经是 flex-col gap-2.5，看着像多余的一层，
+     但思考面板（Sheet）里父级不是 flex 容器 —— 那里的段间距就靠这一层。 -->
 <div class="flex flex-col gap-2.5">
   {@render blocks(doc)}
 </div>

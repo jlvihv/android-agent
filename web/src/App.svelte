@@ -218,10 +218,9 @@
   const stop = () => controller?.abort();
 </script>
 
-<div class="relative h-full overflow-hidden bg-ink" style:--composer-h="{composerH}px">
+<div class="shell relative h-full overflow-hidden bg-ink" style:--composer-h="{composerH}px">
   <!-- 消息列表铺满整个高度：内容从头部和输入卡片下面穿过去。
-       渐隐（mask）在 MessageList 里，所以正文是淡出的，不是盖一层
-       背景色 —— 换背景也不会穿帮。 -->
+       顶部/底部的渐隐是 `.shell` 的伪元素（只为了装饰，不值得占两个 div）。 -->
   <!-- 不要给 main 加 z-index：`z-0` 会形成层叠上下文，把里面
        弹出面板的 z-50 困住，压不过同级 z-20 的输入框（踩过）。
        z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
@@ -236,16 +235,7 @@
   <!--
     渐隐用浮层而不是滚动容器上的 mask。
     mask 会让滚动容器每帧重新合成 —— 实测手机上划动明显卡顿。
-    浮层要显式写 z-index：定位元素会盖住非定位元素，光靠 DOM 顺序不够。
   -->
-
-  <!-- 顶部：内容在头部下面淡出 -->
-  <div class="fade-top pointer-events-none absolute inset-x-0 top-0 z-10"></div>
-
-  <!-- 底部：内容在输入卡片上方开始淡出，到卡片半腰全遮。
-       高度跟着输入区实测高度走 —— 原来写死 h-14，输入框一长高，
-       渐隐就整个缩在卡片后面，卡片两侧的正文是硬切的。 -->
-  <div class="fade-bottom pointer-events-none absolute inset-x-0 bottom-0 z-10"></div>
 
   <!-- 头部浮在内容上 -->
   <header

@@ -288,13 +288,13 @@
 <div bind:this={content} class="flex flex-col gap-6">
   {#each messages as msg (msg.id)}
     {#if msg.role === 'user'}
-      <div class="msg flex justify-end">
-        <p
-          class="max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
-        >
-          {msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
-        </p>
-      </div>
+      <!-- 右对齐靠 `self-end`（父级是 flex-col）：不用再套一层
+           `<div class="flex justify-end">`。对齐 + 收缩到内容宽 + 上限 84% -->
+      <p
+        class="msg self-end max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
+      >
+        {msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
+      </p>
     {:else}
       <div class="flex flex-col gap-2.5 text-base leading-relaxed {msg.done ? 'msg' : ''}">
         {#each msg.parts as part, i (i)}

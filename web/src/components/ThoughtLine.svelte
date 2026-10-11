@@ -152,6 +152,10 @@
   }
 </script>
 
+<!-- 这里两层 span 不能合：外层是**稳定**的 flex 项（量宽度 clientWidth、
+     取字体），内层被 {#key} 重建 —— 每换一行重建一次元素，
+     `.reveal` 那条亮起动画才会重播。合成一个元素就只剩“量得到”或
+     “能重播”两者之一。 -->
 <span bind:this={box} bind:clientWidth={width} class="flex min-w-0 flex-1 text-sm">
   {#key shown}
     <span class="min-w-0 truncate text-muted" class:live class:reveal={changed}

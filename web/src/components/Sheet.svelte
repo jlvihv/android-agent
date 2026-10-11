@@ -50,6 +50,9 @@
    * 思考/工具面板是在消息列表里渲染的，而消息列表在 `<main class="z-0">`
    * 里 —— 那是个独立的层叠上下文，里面的 z-50 再高也压不过外面 z-20 的
    * 输入卡片，结果输入框叠在面板上面。搬到 body 下就和输入卡片平级比了。
+   *
+   * 遮罩和面板各挂各的（不再用一个 `display:contents` 的包装元素）：
+   * 那个包装只为当 portal 的落点，真正干活的就这两个节点。
    */
   function portal(node: HTMLElement) {
     document.body.appendChild(node);
@@ -86,40 +89,40 @@
   };
 </script>
 
-<div use:portal class="contents">
-  <!-- 遮罩。点它即关；拖到哪淡到哪。 -->
-  <button
-    class="fixed inset-0 z-40 bg-black/35"
-    style:opacity={1 - p}
-    style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
-    aria-label="关闭"
-    onclick={close}
-  ></button>
+<!-- 遮罩。点它即关；拖到哪淡到哪。 -->
+<button
+  use:portal
+  class="fixed inset-0 z-40 bg-black/35"
+  style:opacity={1 - p}
+  style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
+  aria-label="关闭"
+  onclick={close}
+></button>
+
+<div
+  use:portal
+  bind:this={panel}
+  use:dismissable={drag}
+  role="dialog"
+  aria-modal="true"
+  aria-label={title}
+  tabindex="-1"
+  style:transform="translateY({p * 100}%)"
+  style:transition={dragging ? 'none' : RELEASE}
+  class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[75dvh] min-h-[45dvh] flex-col
+         rounded-t-card bg-surface pt-1 will-change-transform"
+>
+  <div class="shrink-0">
+    <div class="mx-auto h-1.5 w-9 rounded-full bg-control"></div>
+    <h2 class="mt-3 flex h-11 items-center justify-center truncate px-12 text-[17px] font-semibold">
+      {title}
+    </h2>
+  </div>
 
   <div
-    bind:this={panel}
-    use:dismissable={drag}
-    role="dialog"
-    aria-modal="true"
-    aria-label={title}
-    tabindex="-1"
-    style:transform="translateY({p * 100}%)"
-    style:transition={dragging ? 'none' : RELEASE}
-    class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[75dvh] min-h-[45dvh] flex-col
-           rounded-t-card bg-surface pt-1 will-change-transform"
+    bind:this={body}
+    class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
   >
-    <div class="shrink-0">
-      <div class="mx-auto h-1.5 w-9 rounded-full bg-control"></div>
-      <h2 class="mt-3 flex h-11 items-center justify-center truncate px-12 text-[17px] font-semibold">
-        {title}
-      </h2>
-    </div>
-
-    <div
-      bind:this={body}
-      class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
-    >
-      {@render children()}
-    </div>
+    {@render children()}
   </div>
 </div>

@@ -74,13 +74,11 @@
       {store.llm?.model ?? '未配置模型'}
     </button>
 
-    <div class="flex-1"></div>
-
     {#if busy}
       <button
         onclick={onstop}
         aria-label="停止"
-        class="grid size-9 shrink-0 place-items-center rounded-full bg-control text-fg"
+        class="ml-auto grid size-9 shrink-0 place-items-center rounded-full bg-control text-fg"
       >
         <Icon name="stop" size={18} />
       </button>
@@ -90,7 +88,7 @@
         onclick={onsend}
         disabled={!canSend}
         aria-label="发送"
-        class="grid size-9 shrink-0 place-items-center rounded-full transition-colors
+        class="ml-auto grid size-9 shrink-0 place-items-center rounded-full transition-colors
                {canSend ? 'bg-fg text-ink' : 'bg-control text-faint'}"
       >
         <Icon name="send" size={18} />
