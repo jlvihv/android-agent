@@ -199,7 +199,7 @@ fn build_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read",
-            description: "读取文件。文本：offset（起始行号，从 1 开始）、limit（最多几行）；默认读到底或到截断上限。输出截断到 2000 行或 50KB，被截断时末尾会写明用哪个 offset 续读。图片（png/jpg/gif/webp/bmp）会缩放后直接发给你（offset/limit 无效），看截图/照片/图表用它。改文件前先用它确认原文。",
+            description: "读取文件。输出截断到 2000 行或 50KB，被截断时末尾会写明用哪个 offset 续读。图片（png/jpg/gif/webp/bmp）会缩放后直接发给你（offset/limit 对图片无效），看截图/照片/图表用它。改文件前先用它确认原文。",
             schema: || {
                 json!({
                     "type": "object",
@@ -214,7 +214,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里跑 shell 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。timeout（秒）**必填**：先估算这条命令要多久，下载/编译/apk add 可能要几十分钟到几小时；估小会被中途杀掉、白干，估大没代价（一结束就返回），上限 24h。输出取**尾部**（最后 2000 行或 50KB），截断时完整输出存临时文件并返回路径。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3。要点：ping 被封用 curl；Python 包优先 `apk add py3-*`；matplotlib 先 `use('Agg')`；后台服务要重定向 stdout/stderr；搜索用 `rg -uuu`。",
+            description: "在 Alpine Linux 沙箱里跑 shell 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出取**尾部**（最后 2000 行或 50KB），截断时完整输出存临时文件并返回路径。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3。要点：ping 被封用 curl；Python 包优先 `apk add py3-*`；matplotlib 先 `use('Agg')`；后台服务要重定向 stdout/stderr；搜索用 `rg -uuu`。",
             schema: || {
                 json!({
                     "type": "object",
@@ -228,7 +228,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit",
-            description: "用一个或多个精确替换编辑单个文件。每个 edits[].oldText 必须匹配原文件中唯一、不重叠的区域：相邻改动合并成一条；不要重叠/嵌套；不要为了够到远处的改动而在 oldText 里塞大段没变的内容。",
+            description: "用一个或多个精确替换编辑单个文件。相邻改动合并成一条；不要为了够到远处的改动而在 oldText 里塞大段没变的内容。",
             schema: || {
                 json!({
                     "type": "object",
@@ -618,7 +618,6 @@ impl SessionStore {
 pub const SYSTEM_PROMPT: &str = "\
 你是运行在安卓手机上的操作助手：在 Alpine Linux 沙箱里跑命令、改文件、做出成品。\n\
 \n\
-- 读文件/看图用 read，跑命令用 bash，改文件用 edit。\n\
 - cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，\n\
   卸载不丢）。成品**必须**放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root\n\
   （重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，\n\
@@ -628,7 +627,7 @@ pub const SYSTEM_PROMPT: &str = "\
 - 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、\n\
   `agent command`（按键/点击/滑动/启动应用），`agent help` 看全部。\n\
 \n\
-用中文，简洁直接，不要寒暄。";
+回答要言简意赅。";
 
 /// 构造发给 provider 的消息数组 = **会话历史原样**。
 ///
