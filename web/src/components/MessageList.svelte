@@ -178,6 +178,9 @@
 
     const chips: Chip[] = [];
 
+    // bash 还在跑：服务端推的阶段性输出
+    if (r.running === true) chips.push({ text: '运行中', tone: 'warn' });
+
     // bash
     if (typeof r.exit_code === 'number') {
       const ok = r.exit_code === 0;
@@ -212,6 +215,30 @@
     }
 
     return { chips, label: '结果', failed: false, body: kv(o), diff: false, path: null };
+  }
+
+  /**
+   * 输出在长的时候跟到最底下，像终端一样。
+   *
+   * 只在"本来就在底部"时跟：用户往上翻着看前面的输出，就别把他拽回去。
+   */
+  function followTail(node: HTMLElement) {
+    const sc = node.closest('.overflow-y-auto') as HTMLElement | null;
+    if (!sc) return;
+    const gap = () => sc.scrollHeight - sc.scrollTop - sc.clientHeight;
+    let atBottom = gap() < 40;
+    const onScroll = () => (atBottom = gap() < 40);
+    const mo = new MutationObserver(() => {
+      if (atBottom) sc.scrollTop = sc.scrollHeight;
+    });
+    sc.addEventListener('scroll', onScroll, { passive: true });
+    mo.observe(node, { childList: true, characterData: true, subtree: true });
+    return {
+      destroy() {
+        mo.disconnect();
+        sc.removeEventListener('scroll', onScroll);
+      },
+    };
   }
 
   /** diff 按行染色 */
@@ -322,6 +349,8 @@
                 <span class="shrink-0 text-meta text-warn">待批准</span>
               {:else if tool.state === 'denied'}
                 <span class="shrink-0 text-meta text-bad">已拒绝</span>
+              {:else if tool.state !== 'output' && !msg.done}
+                <span class="shrink-0 text-meta text-faint">运行中</span>
               {/if}
               <Icon name="chevron" size={15} class="ml-auto shrink-0 text-faint" />
             </button>
@@ -415,6 +444,7 @@
               </div>
             {:else}
               <pre
+                use:followTail
                 class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-all {res.failed
                   ? 'text-bad'
                   : ''}">{res.body}</pre>

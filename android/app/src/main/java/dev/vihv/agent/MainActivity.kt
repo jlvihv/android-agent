@@ -35,7 +35,9 @@ class MainActivity : Activity() {
         private const val TAG = "AgentMain"
         private const val PREFS = "agent"
         private const val KEY_ASKED_A11Y = "asked_accessibility"
+        private const val KEY_ASKED_FILES = "asked_all_files"
         private const val REQ_NOTIF = 1
+        private const val REQ_STORAGE = 2
     }
 
     private var web: WebView? = null
@@ -55,7 +57,8 @@ class MainActivity : Activity() {
         }
 
         askNotificationPermission()
-        maybeOpenAccessibilitySettings()
+        // 两个设置页只能一个一个来：先存储（沙箱干活的地方），下次启动再无障碍
+        if (!maybeAskAllFilesAccess()) maybeOpenAccessibilitySettings()
     }
 
     /**
@@ -72,6 +75,8 @@ class MainActivity : Activity() {
             fgsStarted = true
             AgentForegroundService.start(this)
         }
+        // 从设置页回来时权限可能刚打开：重挂沙箱的 /sdcard 和 /workspace
+        AgentApp.syncSharedStorage(this)
     }
 
     /**
@@ -214,6 +219,48 @@ class MainActivity : Activity() {
             return
         }
         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
+    }
+
+    /**
+     * 首次启动时要「所有文件访问权限」。
+     *
+     * 沙箱的 /workspace 挂在手机内部存储的 Agent 文件夹上 —— 用户在文件
+     * 管理器里能直接看到 AI 的产出，卸载 App 也不会丢；/sdcard 是整个存储。
+     * 没有这个权限就退回 App 私有目录。只问一次，返回 true 表示这次问了。
+     */
+    private fun maybeAskAllFilesAccess(): Boolean {
+        if (AgentApp.hasAllFilesAccess(this)) return false
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        if (prefs.getBoolean(KEY_ASKED_FILES, false)) return false
+        prefs.edit().putBoolean(KEY_ASKED_FILES, true).apply()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val i = Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                android.net.Uri.parse("package:$packageName"),
+            )
+            runCatching { startActivity(i) }
+                .recoverCatching { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
+                .onFailure { Log.w(TAG, "打不开所有文件访问设置页", it) }
+        } else {
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                ),
+                REQ_STORAGE,
+            )
+        }
+        return true
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_STORAGE) AgentApp.syncSharedStorage(this)
     }
 
     /**

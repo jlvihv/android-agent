@@ -2,7 +2,7 @@
   /**
    * 沙箱文件查看器：全屏覆盖层，从右边滑进来。
    *
-   * HTML（和其他文本类文件）放进 iframe；图片直接居中显示。
+   * HTML（和其他文本类文件）放进 iframe；图片居中显示；音视频用播放器。
    * 关闭：左上角返回箭头、返回键、按住标题栏往右拖。
    *
    * iframe 加了 sandbox 属性（不含 allow-same-origin），服务端也给
@@ -14,9 +14,11 @@
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
   import { viewer, closeViewer } from '../lib/viewer.svelte.ts';
+  import { mediaKind } from '../lib/markdown';
 
   const IMAGE = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i;
   const isImage = $derived(IMAGE.test((viewer.url ?? '').split(/[?#]/)[0]));
+  const media = $derived(mediaKind(viewer.url ?? ''));
 
   $effect(() => onBack(closeViewer));
 
@@ -75,7 +77,16 @@
   </header>
 
   <div class="relative min-h-0 flex-1 border-t border-hairline">
-    {#if isImage}
+    {#if media === 'video'}
+      <div class="grid h-full place-items-center bg-black pb-[env(safe-area-inset-bottom)]">
+        <!-- svelte-ignore a11y_media_has_caption -->
+        <video src={viewer.url} controls autoplay playsinline class="max-h-full max-w-full"></video>
+      </div>
+    {:else if media === 'audio'}
+      <div class="grid h-full place-items-center px-6">
+        <audio src={viewer.url} controls autoplay class="w-full"></audio>
+      </div>
+    {:else if isImage}
       <div class="grid h-full place-items-center overflow-auto p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
         <img src={viewer.url} alt={viewer.title} class="max-h-full max-w-full object-contain" />
       </div>

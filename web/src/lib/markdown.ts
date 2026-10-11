@@ -284,17 +284,25 @@ export function safeHref(href: string): string | null {
   return /^(https?:|mailto:|sandbox:)/i.test(href.trim()) ? href.trim() : null;
 }
 
+/** 按扩展名判断媒体类型（图片语法 `![]()` 也用来嵌音视频） */
+export function mediaKind(url: string): 'image' | 'audio' | 'video' {
+  const ext = url.split(/[?#]/)[0].split('.').pop()?.toLowerCase() ?? '';
+  if (['mp4', 'webm', 'mov', 'm4v', 'ogv', 'mkv'].includes(ext)) return 'video';
+  if (['mp3', 'm4a', 'aac', 'wav', 'ogg', 'oga', 'opus', 'flac'].includes(ext)) return 'audio';
+  return 'image';
+}
+
 /**
  * `sandbox:` → 服务端的 `/sandbox/…` 路径。不是 sandbox 链接返回 null。
  *
  * 宽松接受几种写法：`sandbox:/root/a.html`、`sandbox:///root/a.html`、
- * `sandbox:a.html`（相对路径按 /root 算，和沙箱里的 cwd 一致）。
+ * `sandbox:a.html`（相对路径按 /workspace 算，和沙箱里的 cwd 一致）。
  */
 export function sandboxUrl(href: string): string | null {
   const m = /^sandbox:(.*)$/i.exec(href.trim());
   if (!m) return null;
   let rest = m[1].replace(/^\/\/+/, '/');
-  if (!rest.startsWith('/')) rest = '/root/' + rest;
+  if (!rest.startsWith('/')) rest = '/workspace/' + rest;
   const cut = rest.search(/[?#]/);
   const path = cut === -1 ? rest : rest.slice(0, cut);
   const tail = cut === -1 ? '' : rest.slice(cut);

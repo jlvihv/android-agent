@@ -182,6 +182,20 @@ impl Core {
         sb.run(script, timeout).await
     }
 
+    /// 同 `run_linux`，输出边跑边送进 `live`
+    pub async fn run_linux_live(
+        &self,
+        script: &str,
+        timeout: std::time::Duration,
+        live: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) -> anyhow::Result<linux::ExecResult> {
+        let sb = self
+            .state
+            .linux()
+            .ok_or_else(|| anyhow::anyhow!("Linux 沙箱未初始化"))?;
+        sb.run_live(script, timeout, Some(live)).await
+    }
+
     /// 编辑沙箱里的文件（`edit` 工具）。
     ///
     /// 读、改、写都同步且很快（都是本地文件），但包成 async 是为了

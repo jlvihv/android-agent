@@ -28,8 +28,10 @@ required-features = ["uniffi-bindgen"]
 uniffi-bindgen = ["uniffi/cli"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "process", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "process", "io-util", "fs"] }
 tokio-stream = "0.1"
+# 沙箱文件按块流式返回（音视频、大文件），不整个读进内存
+tokio-util = { version = "0.7", features = ["io"] }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

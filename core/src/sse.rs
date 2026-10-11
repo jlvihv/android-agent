@@ -124,6 +124,17 @@ pub fn tool_output_available(tool_call_id: &str, output: Value) -> Value {
     })
 }
 
+/// 工具还在跑时的阶段性结果（AI SDK 的 preliminary tool result）。
+/// 前端拿它实时刷新输出；最终结果仍是不带 preliminary 的那条。
+pub fn tool_output_preliminary(tool_call_id: &str, output: Value) -> Value {
+    json!({
+        "type": "tool-output-available",
+        "toolCallId": tool_call_id,
+        "output": output,
+        "preliminary": true,
+    })
+}
+
 pub fn tool_output_denied(tool_call_id: &str) -> Value {
     json!({ "type": "tool-output-denied", "toolCallId": tool_call_id })
 }

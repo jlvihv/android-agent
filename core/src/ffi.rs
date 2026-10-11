@@ -57,6 +57,9 @@ pub struct AndroidEnv {
     pub dns_servers: Vec<String>,
     /// 时区偏移（分钟）。写进沙箱的 TZ（POSIX 格式，符号与 UTC 相反）
     pub tz_offset_minutes: i32,
+    /// 手机内部存储根目录（`/storage/emulated/0`）。有「所有文件访问权限」
+    /// 才传，否则 None —— 沙箱的 /workspace 就退回 App 私有目录。
+    pub shared_storage: Option<String>,
 }
 
 /// 设备能力接口，**由 Kotlin 实现**。
@@ -161,9 +164,29 @@ impl AgentCore {
             dns: env.dns_servers,
             tz_offset_minutes: Some(env.tz_offset_minutes),
             env: Default::default(),
-        };
+            workspace: None,
+            shared: None,
+        }
+        .with_shared_storage(env.shared_storage.as_deref().map(std::path::Path::new));
         self.core.set_linux_sandbox(cfg);
         Ok(())
+    }
+
+    /// 存储权限变了（用户刚在设置里打开「所有文件访问」）：只重配沙箱的
+    /// 挂载，不碰别的。不能为此重新调 setup_linux —— 它会重开会话库、
+    /// 用磁盘上的旧数据覆盖内存里的会话。
+    pub fn set_shared_storage(&self, path: Option<String>) {
+        let Some(sb) = self.core.state.linux() else {
+            return;
+        };
+        let cfg = sb
+            .config()
+            .clone()
+            .with_shared_storage(path.as_deref().map(std::path::Path::new));
+        if cfg.shared.is_some() == sb.has_shared_storage() {
+            return;
+        }
+        self.core.set_linux_sandbox(cfg);
     }
 
     /// 设备推送 UI 快照（`UiSnapshot` 的 JSON）

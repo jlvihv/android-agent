@@ -515,17 +515,22 @@ fn is_loopback_origin(origin: &str) -> bool {
 // 只能看。路径越界和符号链接逃逸由 LinuxSandbox::resolve_path 挡。
 
 async fn sandbox_root(State(st): State<Arc<AppState>>) -> Response {
-    serve_sandbox(&st, "/root/", true).await
+    serve_sandbox(&st, "/workspace/", true, None).await
 }
 
 async fn sandbox_file(
     State(st): State<Arc<AppState>>,
     UrlPath(path): UrlPath<String>,
     uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     // 目录要带结尾斜杠，否则页面里的相对链接会解析到上一级
     let trailing = uri.path().ends_with('/');
-    serve_sandbox(&st, &format!("/{path}"), trailing).await
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    serve_sandbox(&st, &format!("/{path}"), trailing, range).await
 }
 
 /// 沙箱页面统一的响应头
@@ -545,7 +550,12 @@ fn sandbox_headers(res: &mut Response, mime: &str) {
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
 }
 
-async fn serve_sandbox(st: &Arc<AppState>, guest: &str, trailing: bool) -> Response {
+async fn serve_sandbox(
+    st: &Arc<AppState>,
+    guest: &str,
+    trailing: bool,
+    range: Option<String>,
+) -> Response {
     let Some(sb) = st.linux() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "Linux 沙箱未初始化").into_response();
     };
@@ -566,32 +576,86 @@ async fn serve_sandbox(st: &Arc<AppState>, guest: &str, trailing: bool) -> Respo
         }
         let index = host.join("index.html");
         if index.is_file() {
-            return serve_bytes(&index, "index.html").await;
+            return serve_bytes(&index, "index.html", None).await;
         }
         return dir_listing(guest, &host).await;
     }
 
-    if meta.len() > 64 << 20 {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "文件超过 64 MB").into_response();
-    }
-    serve_bytes(&host, guest).await
+    serve_bytes(&host, guest, range).await
 }
 
-async fn serve_bytes(host: &std::path::Path, name: &str) -> Response {
-    match tokio::fs::read(host).await {
-        Ok(body) => {
-            let mime = mime_guess::from_path(name).first_or_octet_stream();
-            let mime = if mime.type_() == "text" || mime.essence_str() == "application/javascript" {
-                format!("{mime}; charset=utf-8")
-            } else {
-                mime.to_string()
-            };
-            let mut res = body.into_response();
-            sandbox_headers(&mut res, &mime);
-            res
+/// 流式返回文件，支持 `Range`。
+///
+/// 音视频必须支持区间请求：<video> 拖进度条就是发 Range，服务端不认
+/// 的话只能从头播、拖不动。顺带大文件也不再整个读进内存。
+async fn serve_bytes(host: &std::path::Path, name: &str, range: Option<String>) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = match tokio::fs::File::open(host).await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    let mime = if mime.type_() == "text" || mime.essence_str() == "application/javascript" {
+        format!("{mime}; charset=utf-8")
+    } else {
+        mime.to_string()
+    };
+
+    let span = match range.as_deref().map(|r| parse_range(r, len)) {
+        Some(Some(s)) => Some(s),
+        Some(None) => {
+            let mut res = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes */{len}")) {
+                res.headers_mut().insert(axum::http::header::CONTENT_RANGE, v);
+            }
+            return res;
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        None => None,
+    };
+
+    let (status, start, count) = match span {
+        Some((a, b)) => (StatusCode::PARTIAL_CONTENT, a, b - a + 1),
+        None => (StatusCode::OK, 0, len),
+    };
+    if start > 0 && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    let stream = tokio_util::io::ReaderStream::new(file.take(count));
+    let mut res = (status, axum::body::Body::from_stream(stream)).into_response();
+    sandbox_headers(&mut res, &mime);
+    let h = res.headers_mut();
+    h.insert(axum::http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(v) = HeaderValue::from_str(&count.to_string()) {
+        h.insert(axum::http::header::CONTENT_LENGTH, v);
+    }
+    if let Some((a, b)) = span {
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes {a}-{b}/{len}")) {
+            h.insert(axum::http::header::CONTENT_RANGE, v);
+        }
+    }
+    res
+}
+
+/// `bytes=a-b` / `bytes=a-` / `bytes=-n` → 闭区间 `[a, b]`。
+/// 不满足（越界、多段）返回 None。
+fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') || len == 0 {
+        return None;
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (a, b) = match (a.trim(), b.trim()) {
+        ("", n) => {
+            let n: u64 = n.parse().ok()?;
+            (len.saturating_sub(n), len - 1)
+        }
+        (a, "") => (a.parse().ok()?, len - 1),
+        (a, b) => (a.parse().ok()?, b.parse::<u64>().ok()?.min(len - 1)),
+    };
+    (a <= b && a < len).then_some((a, b))
 }
 
 /// 没有 index.html 的目录：给一个简单的文件列表
@@ -776,7 +840,18 @@ fn cmd_name(c: &Command) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_origin;
+    use super::{is_loopback_origin, parse_range};
+
+    #[test]
+    fn range_header_parsing() {
+        assert_eq!(parse_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_range("bytes=900-", 1000), Some((900, 999)));
+        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(parse_range("bytes=990-5000", 1000), Some((990, 999)), "结尾越界要截到文件末尾");
+        assert_eq!(parse_range("bytes=1000-", 1000), None, "起点越界不满足");
+        assert_eq!(parse_range("bytes=0-1,5-9", 1000), None, "多段不支持");
+        assert_eq!(parse_range("items=0-1", 1000), None);
+    }
 
     #[test]
     fn only_loopback_origins_may_open_the_websocket() {

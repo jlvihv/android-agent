@@ -38,7 +38,13 @@ export type UiChunk =
       toolName: string;
       input: unknown;
     }
-  | { type: 'tool-output-available'; toolCallId: string; output: unknown }
+  | {
+      type: 'tool-output-available';
+      toolCallId: string;
+      output: unknown;
+      /** 工具还在跑，这是阶段性结果（bash 的实时输出）。最终结果不带它 */
+      preliminary?: boolean;
+    }
   | { type: 'tool-output-denied'; toolCallId: string }
   | {
       type: 'tool-approval-request';
@@ -275,7 +281,8 @@ export function applyChunk(msg: Message, c: UiChunk): void {
       const p = findTool(c.toolCallId);
       if (p) {
         p.output = c.output;
-        p.state = 'output';
+        // 阶段性结果只刷新输出，状态留在"执行中"
+        if (!c.preliminary) p.state = 'output';
       }
       break;
     }

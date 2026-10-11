@@ -6,7 +6,7 @@
    * 列表、引用可以嵌套，所以块和行内都是递归 snippet。
    */
   import { untrack } from 'svelte';
-  import { parse, sandboxUrl, type Block, type Span, type Align } from '../lib/markdown';
+  import { parse, sandboxUrl, mediaKind, type Block, type Span, type Align } from '../lib/markdown';
   import { openViewer } from '../lib/viewer.svelte.ts';
 
   let { text }: { text: string } = $props();
@@ -60,6 +60,19 @@
     {:else if s.t === 'strong'}<strong class="font-semibold">{@render spans(s.c)}</strong>
     {:else if s.t === 'em'}<em class="italic">{@render spans(s.c)}</em>
     {:else if s.t === 'del'}<del class="text-muted">{@render spans(s.c)}</del>
+    {:else if s.t === 'img' && mediaKind(s.src) !== 'image'}
+      <!-- 音视频：图片语法嵌进来，显示成播放器。preload=metadata 只拉开头，
+           服务端支持 Range，拖进度条不用整个下载 -->
+      {@const src = sandboxUrl(s.src) ?? s.src}
+      {#if mediaKind(s.src) === 'video'}
+        <!-- svelte-ignore a11y_media_has_caption -->
+        <video {src} controls playsinline preload="metadata" class="my-1 block max-h-80 w-full rounded-xl bg-black"></video>
+      {:else}
+        <span class="my-1 flex flex-col gap-1">
+          {#if s.alt}<span class="text-sm text-muted">{s.alt}</span>{/if}
+          <audio {src} controls preload="metadata" class="w-full"></audio>
+        </span>
+      {/if}
     {:else if s.t === 'img'}
       {@const local = sandboxUrl(s.src)}
       <!-- 沙箱里的图片点开看大图；外链图片只内嵌 -->

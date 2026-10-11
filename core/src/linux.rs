@@ -44,6 +44,16 @@ pub const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 /// `ls`、`cat`、`uname` 全部 "not found"，只有 `/bin/sh` 能跑。
 const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin";
 
+/// 沙箱里固定的工作目录。命令的 cwd、相对路径的基准都是它。
+///
+/// 安卓上挂的是手机内部存储的 `Agent/` 文件夹 —— 用户在文件管理器里能
+/// 直接看到 AI 的产出，App 卸载也不会丢。没有存储权限时（或桌面上）
+/// 退回 rootfs 里的同名目录。
+pub const WORKSPACE: &str = "/workspace";
+
+/// 手机内部存储整个挂在这里（`/storage/emulated/0`）
+pub const SHARED: &str = "/sdcard";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// proot 可执行文件。Android 上是 `<nativeLibraryDir>/libproot.so`
@@ -86,6 +96,32 @@ pub struct SandboxConfig {
     /// 额外环境变量
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// 挂到 `/workspace` 的宿主目录。None = 用 rootfs 里的 `/workspace`
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
+    /// 挂到 `/sdcard` 的宿主目录（手机内部存储）。None = 不挂
+    #[serde(default)]
+    pub shared: Option<PathBuf>,
+}
+
+impl SandboxConfig {
+    /// 接上（或断开）手机存储：整个存储挂 `/sdcard`，其中的 `Agent/` 挂
+    /// `/workspace`。建不了 `Agent/`（没权限）就都不挂，退回 rootfs。
+    pub fn with_shared_storage(mut self, storage: Option<&Path>) -> Self {
+        self.shared = None;
+        self.workspace = None;
+        if let Some(root) = storage {
+            let ws = root.join("Agent");
+            match std::fs::create_dir_all(&ws) {
+                Ok(()) => {
+                    self.shared = Some(root.to_path_buf());
+                    self.workspace = Some(ws);
+                }
+                Err(e) => tracing::warn!("建不了 {}（没有存储权限？）: {e}", ws.display()),
+            }
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +209,8 @@ impl LinuxSandbox {
             dns: Vec::new(),
             tz_offset_minutes: None,
             env: BTreeMap::new(),
+            workspace: None,
+            shared: None,
         });
         if let Err(e) = sb.prepare_rootfs() {
             tracing::warn!("准备 rootfs 失败: {e:#}");
@@ -192,11 +230,12 @@ impl LinuxSandbox {
     ///
     /// 目前做两件事：
     /// 1. `/etc/resolv.conf` —— 不写的话 `apk add` 直接挂
-    /// 2. `/root` 和 TMPDIR —— proot 的 `-w /root` 需要它存在
+    /// 2. `/root`、`/tmp`、挂载点 `/workspace` 和 `/sdcard`
+    ///    —— `-w /workspace` 需要它存在；挂载点事先建好比让 proot 虚拟出来稳
     pub fn prepare_rootfs(&self) -> anyhow::Result<()> {
         let rootfs = &self.cfg.rootfs;
 
-        for d in ["root", "tmp", "var/tmp"] {
+        for d in ["root", "tmp", "var/tmp", "workspace", "sdcard"] {
             std::fs::create_dir_all(rootfs.join(d))?;
         }
 
@@ -258,7 +297,7 @@ impl LinuxSandbox {
     ///
     /// 对应 OpenMinis `PRootKernel.buildProotCommand()`：
     /// ```text
-    /// <proot> -0 -l -r <rootfs> -b /dev -b /proc -b /sys -w /root
+    /// <proot> -0 -l -r <rootfs> -b /dev -b /proc -b /sys -w /workspace
     ///         [-b <host>:<linux> ...] /bin/sh -c "<script>"
     /// ```
     pub fn command_line(&self, script: &str) -> Vec<String> {
@@ -288,11 +327,17 @@ impl LinuxSandbox {
         for (host, guest) in &self.cfg.binds {
             arg!("-b", format!("{host}:{guest}"));
         }
+        if let Some(h) = &self.cfg.shared {
+            arg!("-b", format!("{}:{SHARED}", h.display()));
+        }
+        if let Some(h) = &self.cfg.workspace {
+            arg!("-b", format!("{}:{WORKSPACE}", h.display()));
+        }
 
         // 子进程随 proot 一起死，避免留下孤儿
         arg!("--kill-on-exit");
 
-        arg!("-w", "/root");
+        arg!("-w", WORKSPACE);
 
         arg!("/bin/sh", "-c", script);
 
@@ -347,6 +392,17 @@ impl LinuxSandbox {
 
     /// 在沙箱里跑一段 shell 脚本。
     pub async fn run(&self, script: &str, timeout: Duration) -> anyhow::Result<ExecResult> {
+        self.run_live(script, timeout, None).await
+    }
+
+    /// 同 `run`，但把输出**边跑边**交给 `live`（stdout/stderr 按到达顺序混在一起）。
+    /// 给前端实时显示用；最终结果照样完整返回。
+    pub async fn run_live(
+        &self,
+        script: &str,
+        timeout: Duration,
+        live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> anyhow::Result<ExecResult> {
         let argv = self.command_line(script);
         let (bin, args) = argv.split_first().expect("command_line 至少有一个元素");
 
@@ -374,8 +430,8 @@ impl LinuxSandbox {
         // 原来是 wait_with_output() —— 整段输出全攒在内存里。`yes`、
         // `cat /dev/urandom | base64` 这类命令 60 秒能吐出几个 GB，
         // 手机上直接 OOM 带走整个 App。
-        let out_task = tokio::spawn(Capture::read(child.stdout.take()));
-        let err_task = tokio::spawn(Capture::read(child.stderr.take()));
+        let out_task = tokio::spawn(Capture::read(child.stdout.take(), live.clone()));
+        let err_task = tokio::spawn(Capture::read(child.stderr.take(), live));
 
         let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
             Ok(r) => (Some(r?), false),
@@ -442,10 +498,16 @@ impl LinuxSandbox {
     // 文件访问
     // -----------------------------------------------------------------------
 
+    /// 是否挂了手机存储
+    pub fn has_shared_storage(&self) -> bool {
+        self.cfg.shared.is_some()
+    }
+
     /// 沙箱内路径 → 宿主机路径。
     ///
     /// - `/root/a.txt` → `<rootfs>/root/a.txt`
-    /// - `a.txt`（相对） → `<rootfs>/root/a.txt`（cwd 就是 `/root`）
+    /// - `a.txt`（相对） → 按 cwd `/workspace` 算
+    /// - `/workspace/…`、`/sdcard/…` → 挂载的宿主目录（有挂的话）
     ///
     /// 两道越界检查：先做**词法归一化**（处理 `.` 和 `..`），
     /// 文件存在时再 `canonicalize` 一次，堵住符号链接逃逸 ——
@@ -453,28 +515,26 @@ impl LinuxSandbox {
     pub fn resolve_path(&self, guest: &str) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(!guest.trim().is_empty(), "路径为空");
 
-        let root = lexical_normalize(&self.cfg.rootfs);
-        let joined = if guest.starts_with('/') {
-            root.join(guest.trim_start_matches('/'))
+        // 先在沙箱的视角里归一化，再决定落到哪个宿主目录
+        let abs = if guest.starts_with('/') {
+            PathBuf::from(guest)
         } else {
-            root.join("root").join(guest)
+            Path::new(WORKSPACE).join(guest)
         };
-        let norm = lexical_normalize(&joined);
+        let g = lexical_normalize(&abs);
 
-        anyhow::ensure!(
-            norm.starts_with(&root),
-            "路径越界，不允许走出沙箱: {guest}"
-        );
-
-        if let Ok(real) = norm.canonicalize() {
-            let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-            anyhow::ensure!(
-                real.starts_with(&real_root),
-                "符号链接指向沙箱外: {guest}"
-            );
+        let mounts = [(SHARED, &self.cfg.shared), (WORKSPACE, &self.cfg.workspace)];
+        for (at, host) in mounts {
+            let Some(host) = host else { continue };
+            if let Ok(rest) = g.strip_prefix(at) {
+                let root = lexical_normalize(host);
+                return confine(&root, &root.join(rest), guest);
+            }
         }
 
-        Ok(norm)
+        let root = lexical_normalize(&self.cfg.rootfs);
+        let rel = g.strip_prefix("/").unwrap_or(&g);
+        confine(&root, &root.join(rel), guest)
     }
 
     /// `edit` 工具：读文件 → 按原文替换 → 写回。
@@ -503,6 +563,17 @@ impl LinuxSandbox {
         std::fs::read_to_string(&host)
             .map_err(|e| anyhow::anyhow!("读取失败 {guest_path}: {e}"))
     }
+}
+
+/// `path` 必须落在 `root` 里面：词法上一次，存在的话再按真实路径查一次
+fn confine(root: &Path, path: &Path, guest: &str) -> anyhow::Result<PathBuf> {
+    let norm = lexical_normalize(path);
+    anyhow::ensure!(norm.starts_with(root), "路径越界，不允许走出沙箱: {guest}");
+    if let Ok(real) = norm.canonicalize() {
+        let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        anyhow::ensure!(real.starts_with(&real_root), "符号链接指向沙箱外: {guest}");
+    }
+    Ok(norm)
 }
 
 /// 词法归一化：处理 `.` / `..` / 重复分隔符，**不碰文件系统**。
@@ -545,7 +616,10 @@ struct Capture {
 const CAPTURE_LIMIT: usize = 4 << 20;
 
 impl Capture {
-    async fn read<R: tokio::io::AsyncRead + Unpin>(src: Option<R>) -> Capture {
+    async fn read<R: tokio::io::AsyncRead + Unpin>(
+        src: Option<R>,
+        live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> Capture {
         use tokio::io::AsyncReadExt;
         let mut cap = Capture::default();
         let Some(mut src) = src else { return cap };
@@ -553,7 +627,12 @@ impl Capture {
         loop {
             match src.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => cap.push(&chunk[..n]),
+                Ok(n) => {
+                    if let Some(tx) = &live {
+                        let _ = tx.send(chunk[..n].to_vec());
+                    }
+                    cap.push(&chunk[..n]);
+                }
             }
         }
         cap
@@ -670,7 +749,7 @@ mod tests {
         let total = CAPTURE_LIMIT * 3 + 123;
         let mut data = vec![b'x'; total - 4];
         data.extend_from_slice(b"END\n");
-        let cap = Capture::read(Some(&data[..])).await;
+        let cap = Capture::read(Some(&data[..]), None).await;
         assert!(cap.buf.len() <= CAPTURE_LIMIT, "内存要有上界");
         assert!(cap.buf.ends_with(b"END\n"), "尾巴不能丢");
         assert_eq!(cap.buf.len() as u64 + cap.dropped, total as u64);
@@ -688,6 +767,8 @@ mod tests {
             loader: None,
             loader32: None,
             env: BTreeMap::new(),
+            workspace: None,
+            shared: None,
         })
     }
 
@@ -701,7 +782,7 @@ mod tests {
         assert_eq!(&argv[5..11], &["-b", "/dev", "-b", "/proc", "-b", "/sys"]);
         assert_eq!(&argv[11..13], &["-b", "/host/share:/mnt/share"]);
         assert_eq!(argv[13], "--kill-on-exit");
-        assert_eq!(&argv[14..16], &["-w", "/root"]);
+        assert_eq!(&argv[14..16], &["-w", "/workspace"]);
         assert_eq!(&argv[16..], &["/bin/sh", "-c", "echo hi"]);
     }
 
@@ -739,6 +820,8 @@ mod tests {
             dns: vec![],
             tz_offset_minutes: None,
             env: BTreeMap::new(),
+            workspace: None,
+            shared: None,
         });
         let env: BTreeMap<_, _> = sb.guest_env().into_iter().collect();
 
@@ -830,6 +913,8 @@ mod tests {
                 loader: None,
                 loader32: None,
                 env: BTreeMap::new(),
+                workspace: None,
+                shared: None,
             })
         }
     }
@@ -846,8 +931,8 @@ mod tests {
         let sb = t.sandbox();
 
         assert_eq!(sb.resolve_path("/root/a.txt").unwrap(), t.dir.join("root/a.txt"));
-        // 相对路径以 /root 为 cwd
-        assert_eq!(sb.resolve_path("a.txt").unwrap(), t.dir.join("root/a.txt"));
+        // 相对路径以 /workspace 为 cwd（没挂手机存储时就是 rootfs 里的目录）
+        assert_eq!(sb.resolve_path("a.txt").unwrap(), t.dir.join("workspace/a.txt"));
         assert_eq!(
             sb.resolve_path("/etc/resolv.conf").unwrap(),
             t.dir.join("etc/resolv.conf")
@@ -855,19 +940,55 @@ mod tests {
     }
 
     #[test]
-    fn path_traversal_is_rejected() {
+    fn path_traversal_never_leaves_the_rootfs() {
         let t = TempRoot::new("escape");
         let sb = t.sandbox();
 
+        // 先在沙箱视角里归一化：和真实 Linux 一样，根目录的 `..` 还是根目录。
+        // 所以这些路径要么被拒，要么落在 rootfs 里 —— 绝不会到宿主机上去
         for bad in [
             "/../outside.txt",
             "/root/../../outside.txt",
             "../../outside.txt",
             "/root/../..",
         ] {
-            let r = sb.resolve_path(bad);
-            assert!(r.is_err(), "{bad} 应该被拒，但得到了 {:?}", r.ok());
+            if let Ok(p) = sb.resolve_path(bad) {
+                assert!(p.starts_with(&t.dir), "{bad} 解析到了 rootfs 外面: {}", p.display());
+            }
         }
+    }
+
+    #[test]
+    fn workspace_and_phone_storage_are_mounted_and_confined() {
+        let t = TempRoot::new("mounts");
+        let phone = t.dir.with_extension("phone");
+        let _ = std::fs::remove_dir_all(&phone);
+        std::fs::create_dir_all(&phone).unwrap();
+
+        let cfg = t.sandbox().config().clone().with_shared_storage(Some(&phone));
+        assert!(phone.join("Agent").is_dir(), "应该在手机存储里建好 Agent/");
+        let sb = LinuxSandbox::new(cfg);
+        assert!(sb.has_shared_storage());
+
+        let ws = phone.join("Agent");
+        assert_eq!(sb.resolve_path("/workspace/a/b.html").unwrap(), ws.join("a/b.html"));
+        assert_eq!(sb.resolve_path("b.html").unwrap(), ws.join("b.html"), "相对路径落在工作目录");
+        assert_eq!(sb.resolve_path("/sdcard/DCIM/x.jpg").unwrap(), phone.join("DCIM/x.jpg"));
+        // 想从挂载点 .. 出去：在沙箱视角里归一化后回到 rootfs，到不了宿主机
+        assert_eq!(sb.resolve_path("/sdcard/../etc/hosts").unwrap(), t.dir.join("etc/hosts"));
+        assert_eq!(sb.resolve_path("/workspace/../../x").unwrap(), t.dir.join("x"));
+
+        let argv = sb.command_line("true");
+        let joined = argv.join(" ");
+        assert!(joined.contains(&format!("-b {}:/sdcard", phone.display())));
+        assert!(joined.contains(&format!("-b {}:/workspace", ws.display())));
+
+        // 断开（权限被收回）：回到 rootfs 里的 /workspace
+        let off = LinuxSandbox::new(sb.config().clone().with_shared_storage(None));
+        assert!(!off.has_shared_storage());
+        assert_eq!(off.resolve_path("b.html").unwrap(), t.dir.join("workspace/b.html"));
+
+        let _ = std::fs::remove_dir_all(&phone);
     }
 
     #[test]
@@ -946,6 +1067,8 @@ mod tests {
             loader: None,
             loader32: None,
             env: BTreeMap::new(),
+            workspace: None,
+            shared: None,
         });
         sb.prepare_rootfs().unwrap();
 

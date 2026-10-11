@@ -13,7 +13,6 @@
 //! 审批可能发生在几分钟之后。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
@@ -550,16 +549,30 @@ pub const SYSTEM_PROMPT: &str = "\
 2. 用节点的索引 i 引用元素，不要猜坐标。\n\
 3. 每次设备操作的工具结果里都会带上操作后的最新界面，以它为准，\n\
    不要沿用对话历史里的旧界面描述。\n\
-4. 跑命令用 bash，改文件用 edit。沙箱内文件路径基于 /root。\n\
+4. 跑命令用 bash，改文件用 edit。\n\
 5. 装 Python 包优先 `apk add py3-*`，不要用 pip。\n\
+\n\
+工作目录（固定，不要换来换去）：\n\
+- 所有工作都在 /workspace 里做，命令默认就在这里执行。给每个任务建一个\n\
+  有意义的子目录（如 /workspace/天气网页），做完的成品留在里面。\n\
+- /workspace 就是手机内部存储的 Agent 文件夹：用户在手机的文件管理器里\n\
+  能直接看到，App 卸载也不会丢。\n\
+- 整个手机内部存储挂在 /sdcard，可以读写用户自己的文件\n\
+  （照片 /sdcard/DCIM，截图 /sdcard/Pictures，下载 /sdcard/Download）。\n\
+  动用户已有的文件前先说明要做什么，删除或覆盖前先确认。\n\
+- 手机存储不支持符号链接，也不能直接执行里面的文件（用 sh/python 运行脚本\n\
+  即可）。虚拟环境、node_modules、编译产物这类东西放 /root 下。\n\
+- 当前是否挂上了手机存储，见每轮开头的 <环境>。\n\
 \n\
 给用户看沙箱里的文件：\n\
 - 用 `sandbox:` 协议写 Markdown 链接或图片，路径就是沙箱内的绝对路径，例如\n\
-  `[打开报告](sandbox:/root/report/index.html)`、`![图表](sandbox:/root/chart.png)`。\n\
+  `[打开报告](sandbox:/workspace/报告/index.html)`、`![图表](sandbox:/workspace/图表/chart.png)`。\n\
 - 用户点链接会在 App 里直接打开：HTML 正常渲染、脚本能运行，页面里用相对路径\n\
-  引用的 css/js/图片也能加载；指向目录会列出文件。图片直接内嵌在回复里显示，\n\
-  png/jpg/gif/webp/svg 都可以，不需要转换格式。\n\
-- 做了网页、图表、图片等成品时，主动给出这样的链接，不要只把路径写成代码。\n\
+  引用的 css/js/图片也能加载；指向目录会列出文件。\n\
+- 图片、音频、视频都用图片语法 `![说明](sandbox:…)`：图片直接显示，音视频显示\n\
+  成播放器。图片 png/jpg/gif/webp/svg，音频 mp3/m4a/wav/ogg/flac，视频 mp4/webm/mov，\n\
+  都不需要转换格式。\n\
+- 做了网页、图表、图片、音视频等成品时，主动给出这样的链接，不要只把路径写成代码。\n\
 \n\
 回答要求：用中文，简洁直接，不要寒暄。";
 
@@ -567,19 +580,24 @@ pub const SYSTEM_PROMPT: &str = "\
 ///
 /// 生成一次就冻结进历史 —— **绝不**每轮重建 system prompt。
 pub fn context_block(core: &Core) -> String {
+    let sb = core.state.linux();
     context_block_from(
-        core.state.linux().map(|s| s.rootfs().to_path_buf()),
+        sb.as_ref().map(|s| s.has_shared_storage()),
         core.state.latest_snapshot().as_ref(),
     )
 }
 
 /// 拆出来是为了能在不构造 `Core` 的情况下测。
-fn context_block_from(linux_rootfs: Option<PathBuf>, screen: Option<&UiSnapshot>) -> String {
-    let linux = match linux_rootfs {
-        Some(p) => format!(
-            "Alpine Linux 沙箱可用，rootfs={}，cwd=/root。",
-            p.display()
-        ),
+///
+/// `linux`：None = 沙箱不可用；Some(true) = 挂了手机存储。
+fn context_block_from(linux: Option<bool>, screen: Option<&UiSnapshot>) -> String {
+    let linux = match linux {
+        Some(true) => "Linux 沙箱可用。/workspace = 手机内部存储的 Agent 文件夹；\
+                       整个手机内部存储挂在 /sdcard。"
+            .to_string(),
+        Some(false) => "Linux 沙箱可用。手机存储没有挂载（App 没有「所有文件访问权限」）：\
+                        /workspace 在 App 私有目录里，卸载会丢，/sdcard 不可用。"
+            .to_string(),
         None => "Linux 沙箱不可用（bash / edit 会报错）。".into(),
     };
 
@@ -786,7 +804,7 @@ pub async fn resolve_approval(
         .send(sse::tool_approval_response(approval_id, approved, ""));
 
     if approved {
-        let output = execute_tool(core, &p.name, &p.arguments).await;
+        let output = execute_tool(core, &p.name, &p.arguments, Some((&tx, &p.tool_call_id))).await;
         let _ = tx
             .send(sse::tool_output_available(&p.tool_call_id, output.clone()));
         append(
@@ -873,7 +891,8 @@ async fn drive(
 
             match kind {
                 Some(ToolKind::ReadOnly) => {
-                    let output = execute_tool(core, &call.name, &call.arguments).await;
+                    let output =
+                        execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))).await;
                     send(tx, sse::tool_output_available(&call.id, output.clone())).await;
                     append(
                         core,
@@ -888,7 +907,8 @@ async fn drive(
                 Some(ToolKind::SideEffecting) => {
                     if core.state.auto_approve() {
                         // 默认路径：直接执行，不打断 agent
-                        let output = execute_tool(core, &call.name, &call.arguments).await;
+                        let output =
+                        execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))).await;
                         send(tx, sse::tool_output_available(&call.id, output.clone())).await;
                         append(
                             core,
@@ -1205,6 +1225,82 @@ async fn send(tx: &mpsc::UnboundedSender<Value>, v: Value) {
     let _ = tx.send(v);
 }
 
+/// 把 bash 的实时输出攒一攒推给前端。
+///
+/// 不逐块推：一条 `apk add` 每秒几十块，前端每块都重排一次面板。攒
+/// LIVE_EVERY 推一次，每次推**到目前为止的尾部**（前端直接替换，不用拼）。
+/// 只留尾部 LIVE_TAIL 字节 —— 输出几 MB 的命令也不会每次推几 MB。
+async fn pump_live_output(
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Value>,
+    id: String,
+) {
+    const LIVE_EVERY: std::time::Duration = std::time::Duration::from_millis(120);
+    const LIVE_TAIL: usize = 32 * 1024;
+
+    let started = std::time::Instant::now();
+    let mut text = String::new();
+    // UTF-8 可能被切在块中间：不完整的尾巴留到下一块
+    let mut pending: Vec<u8> = Vec::new();
+    let mut dirty = false;
+    let mut tick = tokio::time::interval(LIVE_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let flush = |text: &str| {
+        let _ = tx.send(sse::tool_output_preliminary(
+            &id,
+            json!({
+                "output": text,
+                "running": true,
+                "wall_time_seconds": (started.elapsed().as_millis() as f64 / 100.0).round() / 10.0,
+            }),
+        ));
+    };
+
+    loop {
+        tokio::select! {
+            chunk = rx.recv() => match chunk {
+                Some(b) => {
+                    pending.extend_from_slice(&b);
+                    match std::str::from_utf8(&pending) {
+                        Ok(s) => {
+                            text.push_str(s);
+                            pending.clear();
+                        }
+                        Err(e) if e.error_len().is_none() => {
+                            let ok = e.valid_up_to();
+                            text.push_str(std::str::from_utf8(&pending[..ok]).unwrap_or(""));
+                            pending.drain(..ok);
+                        }
+                        Err(_) => {
+                            text.push_str(&String::from_utf8_lossy(&pending));
+                            pending.clear();
+                        }
+                    }
+                    if text.len() > LIVE_TAIL * 2 {
+                        let mut cut = text.len() - LIVE_TAIL;
+                        while !text.is_char_boundary(cut) {
+                            cut += 1;
+                        }
+                        text.drain(..cut);
+                    }
+                    dirty = true;
+                }
+                None => break,
+            },
+            _ = tick.tick() => {
+                if dirty {
+                    dirty = false;
+                    flush(&text);
+                }
+            }
+        }
+    }
+    if dirty {
+        flush(&text);
+    }
+}
+
 /// 把工具参数里的 `edits` 数组解成 `editor::Edit`。
 fn parse_edits(args: &Value) -> anyhow::Result<Vec<crate::editor::Edit>> {
     let arr = args
@@ -1233,7 +1329,13 @@ fn parse_edits(args: &Value) -> anyhow::Result<Vec<crate::editor::Edit>> {
 // 工具执行
 // ---------------------------------------------------------------------------
 
-async fn execute_tool(core: &Core, name: &str, arguments: &str) -> Value {
+/// `live`：(推给前端的通道, 工具调用 id)。给了就把 bash 的输出边跑边推过去。
+async fn execute_tool(
+    core: &Core,
+    name: &str,
+    arguments: &str,
+    live: Option<(&mpsc::UnboundedSender<Value>, &str)>,
+) -> Value {
     let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
 
     // bash / edit 不走设备（DeviceApi）：bash 起 proot 子进程，edit 直接改 rootfs 里的文件
@@ -1248,7 +1350,18 @@ async fn execute_tool(core: &Core, name: &str, arguments: &str) -> Value {
             .map(|s| std::time::Duration::from_secs_f64(s.clamp(1.0, 600.0)))
             .unwrap_or(linux::DEFAULT_TIMEOUT);
 
-        return match core.run_linux(script, timeout).await {
+        let res = match live {
+            Some((tx, id)) => {
+                let (btx, brx) = mpsc::unbounded_channel();
+                let pump = tokio::spawn(pump_live_output(brx, tx.clone(), id.to_string()));
+                let r = core.run_linux_live(script, timeout, btx).await;
+                // 等最后一批推完，再发最终结果，保证顺序
+                let _ = pump.await;
+                r
+            }
+            None => core.run_linux(script, timeout).await,
+        };
+        return match res {
             Ok(r) => json!({
                 "output": r.to_text(),
                 "exit_code": r.code,
@@ -1486,7 +1599,7 @@ mod tests {
         // 界面变了，但 system prompt 和之前的历史都不能变 ——
         // 变化只能出现在新追加的上下文消息里
         let a = context_block_from(None, None);
-        let b = context_block_from(Some(PathBuf::from("/x/rootfs")), None);
+        let b = context_block_from(Some(true), None);
         assert_ne!(a, b, "上下文块本身应该反映环境差异");
 
         let mut sess = ChatSession::default();

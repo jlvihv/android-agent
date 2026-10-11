@@ -59,6 +59,31 @@ class AgentApp : Application() {
         }
 
         fun context(): Context? = instance
+
+        /** 有没有权限直接读写整个内部存储 */
+        fun hasAllFilesAccess(ctx: Context): Boolean =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.os.Environment.isExternalStorageManager()
+            } else {
+                ctx.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+
+        /** 手机内部存储根目录；没权限时 null（沙箱的 /workspace 退回 App 私有目录） */
+        fun sharedStorage(ctx: Context): String? =
+            if (hasAllFilesAccess(ctx)) {
+                @Suppress("DEPRECATION")
+                android.os.Environment.getExternalStorageDirectory().absolutePath
+            } else {
+                null
+            }
+
+        /** 权限状态变了就重挂沙箱存储（Rust 侧没变化时什么都不做） */
+        fun syncSharedStorage(ctx: Context) {
+            if (!::core.isInitialized) return
+            runCatching { core.setSharedStorage(sharedStorage(ctx)) }
+                .onFailure { Log.w(TAG, "重挂存储失败", it) }
+        }
     }
 
     /**
@@ -147,6 +172,7 @@ class AgentApp : Application() {
             cacheDir = cacheDir.absolutePath,
             dnsServers = systemDnsServers(),
             tzOffsetMinutes = tzOffsetMinutes(),
+            sharedStorage = sharedStorage(this),
         )
     }
 
