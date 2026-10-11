@@ -18,6 +18,7 @@
     /prompt <文字> 运行时换系统提示词（不用重装 APK）
     /bash <命令>   直接进沙箱跑，绕过模型
     /dev {"type":"key","name":"back"}    直接发设备指令
+    /doctor       各部件体检（也可以直接 `just doctor`）
 """
 
 from __future__ import annotations
@@ -300,6 +301,59 @@ class Transcript:
 
 
 # ---------------------------------------------------------------------------
+# 写进哪个会话
+# ---------------------------------------------------------------------------
+
+# 调试专用会话的标题。**默认**用它，而不是用户当前打开的那条 ——
+# 踩过：一句测试消息被追加进了用户正在聊的会话里。
+SCRATCH = "调试（agentctl）"
+
+# None = 用服务端的当前活动会话（前端的默认行为）
+TARGET: str | None = None
+
+
+def pick_session(which: str) -> str | None:
+    """决定这一轮写进哪个会话，返回会话 id（None = 当前活动会话）。"""
+    if which == "active":
+        print(c(WARN, "⚠ --session active：会写进你当前打开的那条会话"), file=sys.stderr)
+        return None
+    if which not in ("", "scratch"):
+        # 显式给了 id 就**不动**活动会话 —— run_turn 是按 id 找会话的，
+        # 没必要顺手把用户正开着的那条切走。（要切用 /use）
+        return which
+
+    # find-or-create：同一条调试会话反复用，历史能连着，也不会在侧边栏堆一堆
+    code, d = call("GET", "/api/sessions")
+    was_active = None
+    if code == 200 and isinstance(d, dict):
+        for sess in d.get("sessions") or []:
+            if sess.get("title") == SCRATCH:
+                return str(sess["id"])
+            if sess.get("active"):
+                was_active = str(sess["id"])
+
+    # 服务端的「新建会话」会顺手把它设成活动会话。第一次建调试会话时把用户
+    # 原来那条**换回去** —— 打开 App 不该被我们从 CLI 里切走。（要切用 /use）
+    code, d = call("POST", "/api/sessions")
+    if code != 200 or not isinstance(d, dict):
+        print(c(WARN, f"建不了调试会话（{code}），改写到当前活动会话"), file=sys.stderr)
+        return None
+    sid = str(d.get("id"))
+    call("POST", "/api/sessions/rename", {"id": sid, "title": SCRATCH})
+    if was_active:
+        call("POST", "/api/sessions/activate", {"id": was_active})
+    print(c(DIM, f"建了一条调试会话「{SCRATCH}」—— 你的对话和当前打开的那条都不动"),
+          file=sys.stderr)
+    return sid
+
+
+def session_note() -> str:
+    if TARGET is None:
+        return c(WARN, "写进当前活动会话")
+    return c(DIM, f"会话 {TARGET}")
+
+
+# ---------------------------------------------------------------------------
 # 一个回合
 # ---------------------------------------------------------------------------
 
@@ -339,9 +393,12 @@ def do_turn(prompt: str, as_json: bool) -> int:
         print(c(DIM, "── 用户 ──"))
         print(prompt)
         print(c(DIM, "── agent ──"))
+    body: dict = {"text": prompt}
+    if TARGET:
+        body["session"] = TARGET
     dropped = False
     try:
-        for ch in sse("/api/chat", {"text": prompt}, timeout=TIMEOUT):
+        for ch in sse("/api/chat", body, timeout=TIMEOUT):
             tr.feed(ch)
     except Exception as e:  # noqa: BLE001
         dropped = True
@@ -376,6 +433,7 @@ HELP = f"""
   /wait                  等服务端当前回合跑完（并打出最终回答）
 
 {c('1', '看')}
+  /doctor [deep]         各部件体检：核心/模型/沙箱/设备/会话库（deep 会真跑一轮对话）
   /state                 服务端完整状态（/api/debug/state）
   /request [raw]         下一次会发给模型的完整请求体
   /prompt                看当前系统提示词
@@ -386,6 +444,8 @@ HELP = f"""
   /prompt -              从 stdin 读到 EOF（heredoc 好用）
   /prompt!               恢复成编译进去的那版
   /new                   新建会话      /use <id>   切会话     /clear  清空当前会话
+                         （默认写进「调试（agentctl）」那条会话，不动你正在聊的；
+                           /use active 改成写进当前活动会话）
 
 {c('1', '直连（绕过模型）')}
   /bash <命令>           在沙箱里跑命令（/api/linux）
@@ -498,6 +558,81 @@ def cmd_sessions() -> None:
         print(f" {mark} {s['id']}  {s.get('count', 0):3} 条  {s.get('title')}")
 
 
+def cmd_doctor(deep: bool = False) -> int:
+    """把「这台设备上各个部件还活着吗」过一遍。
+
+    只做**没有副作用**的检查：不按手机按键、不改文件、不装包。所以随时能跑，
+    也可以跑到一半 Ctrl-C。
+    只依赖 `/api/health`（连旧构建也有）+ 一条 `echo ok`，其余是加分项。
+    """
+    bad = 0
+
+    def row(name: str, good: bool, detail: str = "") -> None:
+        nonlocal bad
+        if not good:
+            bad += 1
+        print(f"  {c(OK, '✅') if good else c(BAD, '❌')} {name:<8} {detail}")
+
+    code, h = call("GET", "/api/health")
+    if code != 200 or not isinstance(h, dict):
+        row("核心", False, f"{BASE} 连不上（{code}）{str(h)[:120]}")
+        print(c(DIM, "  手机上跑着吗？先 `just wifi`；本机就 `just dev`"))
+        return 1
+    tag = "（mock 设备）" if h.get("mock") else ""
+    row("核心", True, f"v{h.get('version')} · {h.get('platform')} · 端口 {h.get('port')} {tag}")
+
+    llm = h.get("llm") or {}
+    row("模型", bool(llm), (f"{llm.get('name')} / {llm.get('model')}" if llm
+                            else "没配 —— 前端「模型设置」或 POST /api/llm"))
+
+    dev = h.get("device")
+    row("设备", bool(dev), str(dev) if dev else "没有设备实现（真机上＝无障碍服务没连）")
+
+    rootfs = (h.get("linux") or {}).get("rootfs")
+    row("沙箱", bool(rootfs), str(rootfs) if rootfs else "没配（真机上要等 rootfs 解压完）")
+
+    # 真跑一句。只读、无副作用 —— 但它是唯一能证明沙箱**真的能跑**的检查
+    t0 = time.time()
+    code, d = call("POST", "/api/linux", {"command": "echo ok"}, timeout=180)
+    dt = (time.time() - t0) * 1000
+    good = code == 200 and isinstance(d, dict) and bool(d.get("ok"))
+    row("跑命令", good,
+        f"{dt:.0f}ms · {str(d.get('output', '')).strip()!r}" if good else f"{code} {str(d)[:120]}")
+
+    code, ss = call("GET", "/api/sessions")
+    n = len(ss.get("sessions", [])) if code == 200 and isinstance(ss, dict) else None
+    row("会话库", n is not None, f"{n} 个会话" if n is not None else f"{code} {str(ss)[:80]}")
+
+    code, st = call("GET", "/api/debug/state")
+    if code == 200 and isinstance(st, dict):
+        row("调试接口", True, f"可用 · 提示词 {st.get('systemPrompt', {}).get('chars')} 字符"
+            + ("（运行时覆盖过）" if st.get("systemPrompt", {}).get("overridden") else ""))
+        if st.get("dataDir"):
+            print(c(DIM, f"           dataDir {st['dataDir']}"))
+        if st.get("turnActive"):
+            print(c(WARN, "           ⚠ 服务端此刻正在跑一个回合（/wait 等它）"))
+    else:
+        print(c(DIM, "  · 这台核心没有 /api/debug/* —— 装的是旧构建"))
+
+    if deep:
+        print(c(DIM, "  ── 真跑一轮对话（会花 token）──"))
+        tr = Transcript(live=False)
+        t0 = time.time()
+        try:
+            for ch in sse("/api/chat", {"text": "只回两个字：好了"}, timeout=300):
+                tr.feed(ch)
+        except Exception as e:  # noqa: BLE001
+            tr.errors.append(str(e))
+        dt = time.time() - t0
+        tools = [t["name"] for t in tr.tools.values()]
+        row("一轮对话", not tr.errors,
+            f"{dt:.1f}s · 工具 {tools or '无'} · {tr.summary() or '无用量'}")
+
+    print()
+    print(c(OK, "全部正常") if not bad else c(BAD, f"{bad} 项有问题"))
+    return 1 if bad else 0
+
+
 def handle_command(line: str) -> bool:
     """返回 False 表示要退出。"""
     cmd, _, rest = line.partition(" ")
@@ -507,6 +642,8 @@ def handle_command(line: str) -> bool:
         return False
     elif cmd == "/help":
         print(HELP)
+    elif cmd == "/doctor":
+        cmd_doctor(deep=(rest == "deep"))
     elif cmd == "/state":
         print_state()
     elif cmd == "/request":
@@ -536,8 +673,17 @@ def handle_command(line: str) -> bool:
         code, d = call("POST", "/api/sessions")
         print(c(OK, f"新会话 {d.get('id')}") if code == 200 else c(BAD, f"失败 {code}: {d}"))
     elif cmd == "/use":
-        code, d = call("POST", "/api/sessions/activate", {"id": rest})
-        print(c(OK, f"切到 {rest}") if code == 200 else c(BAD, f"失败 {code}: {d}"))
+        global TARGET
+        if rest == "active":
+            TARGET = None
+            print(c(WARN, "改成写进当前活动会话"))
+        else:
+            code, d = call("POST", "/api/sessions/activate", {"id": rest})
+            if code == 200:
+                TARGET = rest
+                print(c(OK, f"切到 {rest}"))
+            else:
+                print(c(BAD, f"失败 {code}: {d}"))
     elif cmd == "/clear":
         code, _ = call("POST", "/api/reset")
         print(c(OK, "当前会话已清空") if code == 204 else c(BAD, f"失败 {code}"))
@@ -562,7 +708,7 @@ def repl() -> int:
         where = "手机" if d.get("device") else ("本机 mock" if d.get("mock") else "本机（无设备）")
         print(c(DIM, f"连上 {BASE} · {where} · 会话 {d.get('sessions', {}).get('count')} 个"
                      f" · 模型 {(d.get('llm') or {}).get('model')}"))
-        print(c(DIM, "/help 看命令，Ctrl-D 退出"))
+        print(c(DIM, f"{session_note()} · /help 看命令，Ctrl-D 退出"))
 
     while True:
         try:
@@ -598,6 +744,10 @@ def main() -> int:
     ap.add_argument("--base", help=f"核心地址（默认 {BASE}，也可用 $AGENT_BASE）")
     ap.add_argument("--json", action="store_true", help="输出一整份机器可读转录")
     ap.add_argument("--timeout", type=float, default=1800.0, help="单个回合的总超时秒数")
+    ap.add_argument("--doctor", action="store_true", help="各部件体检一遍就退出")
+    ap.add_argument("--session", default="scratch", metavar="WHICH",
+                    help="写进哪个会话：scratch（默认，专用调试会话）/ active（当前活动会话）/ <会话 id>")
+    ap.add_argument("--deep", action="store_true", help="体检时另外真跑一轮对话（花 token）")
     args = ap.parse_args()
 
     global TIMEOUT
@@ -605,6 +755,13 @@ def main() -> int:
 
     if args.base:
         BASE = args.base.rstrip("/")
+
+    # 定好这一程写进哪个会话。默认是一条**专用调试会话** —— 直接在 CLI 里
+    # 发消息而不小心写进用户正在聊的那条，是真踩过的坑。
+    TARGET = pick_session(args.session)
+
+    if args.doctor:
+        return cmd_doctor(args.deep)
 
     if not args.prompt:
         # 没有提示词就进交互。从管道喂进来時每行当一条命令/一句话 ——

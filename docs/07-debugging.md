@@ -4,12 +4,22 @@
 > 一条 `adb forward` —— 不用在手机小键盘上打字，也不用来回重装 APK。
 
 ```sh
-just forward          # 端口是启动时随机分的，脚本从 logcat 里捞
+just doctor           # 各部件体检（核心/模型/沙箱/设备/会话库）
 just phone "在沙箱里建个 fizzbuzz 跑一下"
 just phone            # 交互模式，/help 看命令
+just open             # 把手机上的界面开到桌面浏览器（能用真 DevTools）
 ```
 
-本机的核心（`just dev`）直接连：
+改完代码回到「可调状态」只要一条：
+
+```sh
+just restart          # 重装 → 重启 App → 重新打开无障碍服务 → 转发端口
+```
+
+`force-stop` 会解绑无障碍服务，重启后不重新挂上，设备指令那条路就是死的 ——
+所以 `restart` 里带了 `dev_a11y_on`（它会保留你已有的其它无障碍服务）。
+
+本机的核心（`just dev`）也是同一条路，只是不用 adb：
 
 ```sh
 python3 scripts/agentctl.py "…"
@@ -19,22 +29,139 @@ python3 scripts/agentctl.py --json "…" # 一整份机器可读转录，给脚�
 
 ---
 
-## 1. 边界：什么不用重装，什么必须重装
+## 1. 连上手机：无线（WiFi）就够
+
+```sh
+# 首次配对。地址和 6 位码都在手机上：
+#   开发者选项 → 无线调试 → 使用配对码配对设备
+just wifi-pair 192.168.0.34:41241 123456
+
+# 之后每次
+just wifi
+
+# 或者经典办法：USB 插一次，之后就不用插了（自动取手机的 WiFi 地址）
+just wifi-tcpip
+```
+
+配对过一次就不用再管了：`forward` / `phone` / `doctor` / `open` 都只依赖 adb，
+**不关心底下是 USB 还是无线**。
+
+两个实测到的坑：
+
+- **发行版自带的 adb 可能没有 `adb mdns`**。这台机器上 `/usr/bin/adb`
+  （37.0.0-android-tools）就没有，而无线调试的自动发现全靠
+  `adb mdns services` 里那行 `_adb-tls-connect._tcp`。所以 `scripts/adb.sh`
+  会优先用 SDK 里那份（`$ANDROID_HOME/platform-tools/adb`）。
+  真正干活的是 adb **server**（5037 端口），客户端只是跟它说话 —— 别让旧客户端
+  抢先把 server 起来；要覆盖就 `AGENT_ADB=/path/to/adb just wifi`。
+- 无线下 `adb logcat` / `/proc/net/tcp` 都还能读（就是慢一点），所以端口发现照旧。
+
+### 本机端口固定 18787
+
+核心在设备侧 `bind 0`（每次重启都换端口），但**本机这一头固定 18787** ——
+脚本、书签、肌肉记忆里要的是一个稳定地址：
+
+```sh
+base=$(scripts/phone-forward.sh)   # → http://127.0.0.1:18787
+```
+
+`HOST_PORT=9000` 可以改。设备侧那个随机端口怎么找，见下。
+
+### 核心的端口是随机分的，怎么找
+
+核心 `bind 0` 让系统分配端口（硬编码端口在真机上可能被别的 App 占）。四种找法，
+`scripts/phone-port.sh` 按可靠性依次试：
+
+| # | 办法 | 什么时候有用 |
+|---|---|---|
+| 1 | 命令行参数 / `$PHONE_PORT` | 手动兜底，永远优先 |
+| 2 | `adb shell run-as <pkg> cat files/port` | App 启动时自己写的，最准最快 |
+| 3 | `/proc/net/tcp` 里按 uid 筛 `127.0.0.1` 的 `LISTEN` | **不依赖 App 配合**，任何构建都能用 |
+| 4 | `adb logcat` 里那行 `WebView 应指向 …` | 兜底 —— 环形缓冲会被冲掉（实测：App 明明跑着，logcat 里已经没有了） |
+
+第 3 条是「刚装完还没写 port 文件」时的活路：
+
+```sh
+uid=$(adb shell cmd package list packages -U dev.vihv.agent | sed -n 's/.*uid:\([0-9]*\).*/\1/p')
+adb shell cat /proc/net/tcp | awk -v u="$uid" '$4=="0A" && $8==u && $2 ~ /^0100007F:/ {print $2}'
+# 0100007F:91CB → 端口 0x91CB = 37323
+```
+
+---
+
+## 2. 什么能在电脑上调，什么必须在手机上
+
+| 功能 | 从电脑上 | 怎么做 |
+|---|---|---|
+| 对话 / agent 循环 | ✅ | `just phone "…"` |
+| 沙箱（`bash` 工具） | ✅ | `/bash <命令>` —— 真的在手机的 proot 里跑 |
+| 改文件（`edit` 工具） | ✅ | `POST /api/edit`，或者让它自己调 |
+| 设备指令 | ✅ | `/dev {"type":"key","name":"back"}`（坐标点击/滑动/按键/启动） |
+| 系统提示词迭代 | ✅ | `/prompt …` |
+| 看模型将看到什么 | ✅ | `/request` |
+| 会话 / 持久化 | ✅ | `/sessions`，或 `run-as … cat files/sessions.db` 拉下来看 |
+| 前端界面 | ✅ | `just open` → 桌面浏览器 + 真 DevTools |
+| 改 Rust / 装包 | ⚠️ 要重装 | `just android-install` |
+| 无障碍服务开关、存储权限 | ❌ | 只能在手机屏幕上点 |
+| 切后台保活 / force-stop 后恢复 | ❌ | 手机上手动（核心的会话库可以直接看） |
+| 触屏手势本身 | ❌ | 只能靠 `/dev` 里的坐标点击间接验证 |
+
+### 发消息写进哪条会话：默认**不碰你的**
+
+`agentctl` 默认用一条专用会话「调试（agentctl）」（没有就建一条，侧边栏里能看到），
+**不会**写进你当前打开的那条 —— 这是踩过坑才加的：一次真机调试里，一句测试消息
+被追加进了用户正在聊的会话。第一次创建时服务端会把它设成活动会话，客户端随后
+把你原来那条换回去。
+
+想写进当前会话得显式来：
+
+```sh
+just phone -- --session active "…"      # 写进你正在看的那条
+just phone -- --session <会话 id> "…"    # 写进指定的那条
+```
+
+---
+
+## 3. 一次体检：`just doctor`
+
+各部件挨个查一遍，**只做无副作用的检查**（不按手机按键、不改文件、不装包），
+所以随时能跑：
+
+```
+  ✅ 核心       v0.1.0 · android · 端口 37323
+  ✅ 模型       opencode-go / deepseek-v4.1-flash
+  ✅ 设备       accessibility
+  ✅ 沙箱       /data/user/0/dev.vihv.agent/files/alpine-rootfs
+  ✅ 跑命令      248ms · 'ok\n\n[exit 0]'
+  ✅ 会话库      4 个会话
+  ✅ 调试接口    可用 · 提示词 630 字符
+           dataDir /data/user/0/dev.vihv.agent/files
+```
+
+它只依赖 `/api/health`（旧构建也有）+ 一条 `echo ok`，其余是加分项 —— 所以对着一台
+装了旧构建的手机跑，它会明确告诉你「这台核心没有 /api/debug/*」。
+
+`just doctor --deep` 会另外**真跑一轮对话**（花 token），用来确认 LLM 那条链路。
+
+---
+
+## 4. 边界：什么不用重装，什么必须重装
 
 | | 要重装 APK 吗 |
 |---|---|
 | 调**系统提示词** | ❌ 不用（`/api/debug/system-prompt`，见下） |
 | 试沙箱、跑命令、看文件 | ❌ 不用 |
-| 读界面 / 发设备指令 | ❌ 不用 |
+| 发设备指令 | ❌ 不用 |
 | 看**下一次会发给模型的完整请求体** | ❌ 不用 |
 | 改 Rust 代码 | ✅ **要** —— 核心是 `.so`，只能重编重装 |
 
-也就是说：**提示词、工具描述、调试流程的迭代都不用重装**（提示词和工具描述现在都能
-在运行时换，见 §3）；只有改 Rust 逻辑才要。
+也就是说：**提示词和调试流程的迭代都不用重装**；只有改 Rust 逻辑才要。
+（改工具描述要重装 —— 工具表是编译进去的，但它和系统提示词一样属于「可缓存
+前缀」，改完先用 `/request` 确认序列化没变样，见 §6。）
 
 ---
 
-## 2. `/api/debug/*`：为了「看一眼现在什么情况」
+## 5. `/api/debug/*`：为了「看一眼现在什么情况」
 
 前端不用这三个接口，它们是给调试端的。
 
@@ -99,7 +226,7 @@ stream_options = {"include_usage": true}
 
 ---
 
-## 3. 工具描述怎么改（也要重装，但可以少重启几次）
+## 6. 工具描述怎么改（也要重装，但可以少重启几次）
 
 工具表（`bash` / `edit` 的描述和 schema）是编译进 `.so` 的，改它要重装。
 但它和系统提示词一样是**可缓存前缀的一部分**，所以改完先看 `/request`
@@ -117,7 +244,7 @@ cd core && cargo run -q --example dump_prompt
 
 ---
 
-## 4. 绕过模型直连（最常用的调试手段）
+## 7. 绕过模型直连（最常用的调试手段）
 
 模型不听话、或者只是想确认环境对不对的时候，别跟它绕：
 
@@ -142,7 +269,7 @@ exit=0 0.31s
 
 ---
 
-## 5. SSE 断了怎么办
+## 8. SSE 断了怎么办
 
 手机是手机会干的事：WebView 被切后台、Wi-Fi 抖一下、进程被系统压一下，
 **客户端这边的 SSE 都会断** —— 但服务端的回合不会停（前台服务保着进程，
@@ -159,7 +286,7 @@ exit=0 0.31s
 
 ---
 
-## 6. 安全边界
+## 9. 安全边界
 
 服务和调试接口都只听 `127.0.0.1`，没开 `0.0.0.0`；从电脑访问必须显式
 `adb forward`。

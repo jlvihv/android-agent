@@ -128,7 +128,7 @@ App 随时被杀都没关系。
 | [docs/04-android-shell.md](docs/04-android-shell.md) | Android 壳：三个架构决策的落点、真机踩到的 11 个坑 |
 | [docs/05-ui.md](docs/05-ui.md) | 界面：设计令牌、edge-to-edge、对话渲染 |
 | [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）与后台运行 |
-| [docs/07-debugging.md](docs/07-debugging.md) | 从电脑上驱动真机调试：adb forward + agentctl + `/api/debug/*` |
+| [docs/07-debugging.md](docs/07-debugging.md) | 无线调试 + agentctl + `/api/debug/*`：不重装 APK 也能调 |
 
 ## 脚本
 
@@ -137,19 +137,29 @@ App 随时被杀都没关系。
 | `just dev` | 起核心（桌面，mock 设备 + 本地 rootfs） |
 | `just web-dev` | 起 Vite（`/api` 代理到核心） |
 | `just test` | Rust 测试 |
-| `just smoke` | 端到端：读界面 → 执行 → 复述 |
+| `just smoke` | 端到端：一句话 → 工具执行 → 复述 |
 | `just android-assets` | 一次性：取 Alpine rootfs + proot 二进制 |
 | `just android-debug` | 完整 Android 构建 → APK |
+| `just android-install` | 构建 + 装到连着的手机 |
 | `python3 scripts/agentctl.py "…"` | 给 agent 一句话并打印转录；不带参数进交互模式（`--json` 机器可读） |
-| `just forward` | 把手机上核心的端口转发到本机（端口从 logcat 里捞） |
-| `just phone "…"` | 对手机上跑着的核心说话（自动 forward），不用重装 APK |
+
+对着**手机上**跑着的核心（无线调试就够，不用插线、也不用手点手机屏幕）：
+
+| 命令 | 作用 |
+|---|---|
+| `just wifi-pair <ip:port> <码>` | 首次配对（手机上开发者选项 → 无线调试） |
+| `just wifi` / `just wifi-tcpip` | 之后每次连上（后者：USB 插一次，以后自动） |
+| `just forward` | 把手机上核心的端口转发到本机 |
+| `just doctor [--deep]` | 各部件体检：核心/模型/沙箱/设备/会话库 |
+| `just phone "…"` | 和手机上的 agent 说话 |
+| `just open` | 把手机上的界面开到桌面浏览器（真 DevTools） |
 
 ## 构建 APK
 
 ```sh
 just android-assets     # 一次性
 just android-debug      # → android/app/build/outputs/apk/debug/app-debug.apk
-adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+just android-install     # 或 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 just android-log        # 看 agent 的日志
 ```
 

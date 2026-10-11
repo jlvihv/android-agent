@@ -5,6 +5,11 @@
 
 set shell := ["bash", "-uc"]
 
+# 没有这行的话，带 `*ARGS` 的 recipe 里 `"$@"` 是空的 —— just 默认只做
+# `{{...}}` 插值，不把参数传给 shell 的位置参数。踩过一次：`just phone --json "…"`
+# 静默地什么都没发出去（agentctl 收到空参数 → 进交互模式 → stdin 是管道 → 直接退出）。
+set positional-arguments
+
 core  := "core"
 web   := "web"
 and   := "android"
@@ -67,16 +72,47 @@ web-check:
 # 改 Rust 代码仍要重装（核心是 .so），但**调提示词、试沙箱、发设备指令、
 # 看请求体**都不用。
 
-# 把手机上核心的端口转发到本机（端口是启动时随机分的，从 logcat 里捞）
+# 无线调试：手机和电脑同一个 WiFi，手机上「开发者选项 → 无线调试」
 #
-#   just forward          # 自动找
-#   just forward 41234    # 手动指定
-forward port="":
+#   just wifi-pair 192.168.0.34:41234 123456   # 首次（地址和码在手机屏幕上）
+#   just wifi                                  # 之后每次
+#   just wifi-tcpip                            # 或者：USB 插一次，之后自动走 WiFi
+#
+# 配过一次就不用再管了 —— 下面的 forward / phone / doctor 只依赖 adb，
+# 不关心底下是 USB 还是无线。
+wifi:
+    scripts/phone-adb.sh connect
+
+wifi-pair addr code:
+    scripts/phone-adb.sh pair {{addr}} {{code}}
+
+wifi-tcpip:
+    scripts/phone-adb.sh tcpip
+
+# 换完 Rust / 前端代码之后，一条命令回到「可调状态」：
+# 重装 → 重启 App → 重新打开无障碍服务 → 转发端口
+#
+# 为什么要重新打开无障碍：force-stop 会解绑服务，重启后不重新挂上，
+# 设备指令那条路就是死的。dev.sh 里会保留用户已有的其它无障碍服务。
+restart:
     #!/usr/bin/env bash
     set -eu
-    p=$(scripts/phone-port.sh "{{port}}")
-    adb forward "tcp:$p" "tcp:$p" >/dev/null
-    echo "core → http://127.0.0.1:$p"
+    . scripts/dev.sh
+    dev_restart && dev_a11y_on
+
+# 把手机上核心的端口转发到本机（固定 18787；设备侧端口每次都变）
+forward:
+    scripts/phone-forward.sh
+
+# 手机上各个部件还活着吗（核心 / 模型 / 沙箱 / 设备 / 会话库）
+#
+#   just doctor          # 只做无副作用的检查
+#   just doctor --deep   # 另外真跑一轮对话（花 token）
+doctor *ARGS:
+    #!/usr/bin/env bash
+    set -eu
+    base=$(scripts/phone-forward.sh)
+    python3 scripts/agentctl.py --base "$base" --doctor "$@"
 
 # 对着**手机上**跑着的核心说话
 #
@@ -85,9 +121,19 @@ forward port="":
 phone *ARGS:
     #!/usr/bin/env bash
     set -eu
-    p=$(scripts/phone-port.sh)
-    adb forward "tcp:$p" "tcp:$p" >/dev/null
-    python3 scripts/agentctl.py --base "http://127.0.0.1:$p" "$@"
+    base=$(scripts/phone-forward.sh)
+    python3 scripts/agentctl.py --base "$base" "$@"
+
+# 把手机上的界面开到桌面浏览器
+#
+# 前端资源是编进 .so 的，所以这就是手机上 WebView 看到的那一份；
+# 好处是能用桌面 DevTools（元素审查、性能面板、网络）。
+open:
+    #!/usr/bin/env bash
+    set -eu
+    base=$(scripts/phone-forward.sh)
+    echo "$base"
+    (xdg-open "$base" >/dev/null 2>&1 || open "$base" >/dev/null 2>&1 || true) &
 
 # --- 桌面沙箱 --------------------------------------------------------------
 

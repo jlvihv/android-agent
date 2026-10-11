@@ -13,7 +13,9 @@
 
 set -u
 
-ADB="${ADB:-$HOME/Android/Sdk/platform-tools/adb}"
+# adb 用哪份、设备侧端口怎么找，都交给 scripts/ 里的共用脚本 ——
+# 这里不再自己判断（发行版自带的 adb 可能没有 `adb mdns`）。
+. "$(dirname "${BASH_SOURCE[0]}")/adb.sh"
 APK="${APK:-android/app/build/outputs/apk/debug/app-debug.apk}"
 PKG=dev.vihv.agent
 A11Y="$PKG/$PKG.AgentAccessibilityService"
@@ -45,10 +47,16 @@ dev_pick() {
   echo "设备: $DEV"
 }
 
-# 从 logcat 读 App 实际监听的端口
+# 设备侧端口。四级兜底在 scripts/phone-port.sh 里；
+# 刚 am start 完核心可能还没 bind，所以这里等一下。
 dev_port() {
-  "$ADB" -s "$DEV" logcat -d -s AgentApp 2>/dev/null \
-    | grep -o '127\.0\.0\.1:[0-9]*' | tail -1 | cut -d: -f2
+  local i p
+  for i in $(seq 20); do
+    p=$(ANDROID_SERIAL="$DEV" scripts/phone-port.sh 2>/dev/null || true)
+    [ -n "$p" ] && { echo "$p"; return 0; }
+    sleep 0.5
+  done
+  return 1
 }
 
 dev_restart() {
@@ -59,9 +67,8 @@ dev_restart() {
   "$ADB" -s "$DEV" shell am start -n "$PKG/.MainActivity" >/dev/null
   sleep 9
   PORT="$(dev_port)"
-  [ -n "$PORT" ] || { echo "拿不到端口，看 logcat -s AgentApp" >&2; return 1; }
-  "$ADB" -s "$DEV" forward --remove-all >/dev/null 2>&1
-  "$ADB" -s "$DEV" forward "tcp:$HOST_PORT" "tcp:$PORT" >/dev/null
+  [ -n "$PORT" ] || { echo "拿不到端口：App 起来了吗？看 logcat -s AgentApp" >&2; return 1; }
+  ANDROID_SERIAL="$DEV" HOST_PORT="$HOST_PORT" scripts/phone-forward.sh >/dev/null
   echo "http://127.0.0.1:$HOST_PORT  →  设备 :$PORT"
 }
 

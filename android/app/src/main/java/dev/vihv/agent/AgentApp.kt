@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.os.Build
 import android.util.Log
+import java.io.File
 import uniffi.agent_core.AgentCore
 import uniffi.agent_core.AndroidEnv
 import java.util.TimeZone
@@ -149,10 +150,18 @@ class AgentApp : Application() {
         // 3. 起 HTTP 服务。传 0 让系统分配端口 —— 硬编码端口在真机上
         //    可能被别的 App 占了。
         runCatching { port = core.start(0u.toUShort()).toInt() }
-            .onSuccess { Log.i(TAG, "WebView 应指向 http://127.0.0.1:$port") }
+            .onSuccess {
+                Log.i(TAG, "WebView 应指向 http://127.0.0.1:$port")
+                // 把端口落到 files/port。调试时 `adb shell run-as <pkg> cat
+                // files/port` 一条命令就拿到，不用去翻 logcat
+                // （logcat 环形缓冲会被冲掉 —— 实测踩过）。
+                // 见 scripts/phone-port.sh / docs/07-debugging.md。
+                runCatching { File(filesDir, "port").writeText(port.toString()) }
+            }
             .onFailure {
                 Log.e(TAG, "核心启动失败", it)
                 port = 0
+                runCatching { File(filesDir, "port").delete() }
             }
 
         // 4. 如果无障碍服务已经连上了（进程重启的情况），补一次注入

@@ -636,10 +636,14 @@ pub fn session_view(sess: &ChatSession) -> Vec<Value> {
 const MAX_STEPS: usize = 8;
 
 /// 跑一个用户回合，把 chunk 推到 `tx`。
+///
+/// `session`：指定写进哪个会话（调试端用 —— 见 `scripts/agentctl.py` 的
+/// `--session`）。`None` = 写当前活动会话，也就是前端的行为。
 pub async fn run_turn(
     core: &Core,
     provider: &Provider,
     user_text: &str,
+    session: Option<&str>,
     tx: mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
     core.state
@@ -651,7 +655,14 @@ pub async fn run_turn(
     let system_prompt = core.state.system_prompt();
     let sid = {
         let mut store = core.state.chat.write().await;
-        let sess = store.active_mut();
+        // 指定了会话就写它：调试端从 CLI 发消息时不该动用户正在看的那条会话。
+        let sess = match session {
+            Some(id) => match store.get_mut(id) {
+                Some(s) => s,
+                None => anyhow::bail!("没有这个会话: {id}"),
+            },
+            None => store.active_mut(),
+        };
         // 历史里只追加两类东西：待补的系统提示词（见 `ensure_system_prompt`）
         // 和这条用户消息。不插任何“每轮重发”的上下文块。
         ensure_system_prompt(sess, &system_prompt);

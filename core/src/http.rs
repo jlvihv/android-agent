@@ -184,6 +184,10 @@ struct ChatBody {
     /// 强制跑脚本化演示流（不花 token，用来验证协议链路）
     #[serde(default)]
     demo: bool,
+    /// 写进哪个会话。不给 = 当前活动会话（前端的行为）；
+    /// 调试端会指定一条专用会话，免得把测试消息混进用户正在聊的那条。
+    #[serde(default)]
+    session: Option<String>,
 }
 
 /// `POST /api/chat` → AI SDK UI Message Stream。
@@ -211,7 +215,15 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
             );
             tokio::spawn(async move {
                 let txc = tx.clone();
-                if let Err(e) = crate::agent::run_turn(&core, &p, &body.text, txc).await {
+                let r = crate::agent::run_turn(
+                    &core,
+                    &p,
+                    &body.text,
+                    body.session.as_deref(),
+                    txc,
+                )
+                .await;
+                if let Err(e) = r {
                     let _ = tx.send(sse::error(&format!("{e:#}")));
                 }
                 // tx 在这里 drop → 转发任务会补上 [DONE]
@@ -360,6 +372,14 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "rootfs": s.rootfs().display().to_string(),
             "sharedStorage": s.has_shared_storage(),
         })),
+        // 持久化目录（安卓上是 <filesDir>）。调试时要 adb pull 会话库 /
+        // 看 llm.json 就用它，不用猜路径。
+        "dataDir": st
+            .data_dir
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|p| p.display().to_string()),
         "llm": provider.map(|p| json!({
             "name": p.name,
             "model": p.model,
