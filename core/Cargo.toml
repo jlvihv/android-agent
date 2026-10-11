@@ -43,7 +43,6 @@ mime_guess = "2"
 # 装工具的进度、沙箱告警）在 logcat 里**全部看不到**。桌面装了 fmt subscriber，
 # 而系统里没有别的 log logger，所以不会重复打。
 tracing = { version = "0.1", features = ["log"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 http = "1"
@@ -75,10 +74,10 @@ uniffi = { version = "0.32", features = ["tokio"] }
 # rustls 而非 native-tls —— 避免 openssl 交叉编译，这是 Android/Rust 最容易卡死的地方。
 # byot（bring your own types）：官方逃生口，用来接住 DeepSeek 的
 # `reasoning_content`（自带类型里没这个字段，也没有 flatten extra）。
+# 只要 chat-completion（代码里没用 responses，开着它白白把一堆类型编进 .so）。
 async-openai = { version = "0.42", default-features = false, features = [
     "rustls",
     "chat-completion",
-    "responses",
     "byot",
 ] }
 
@@ -86,8 +85,17 @@ async-openai = { version = "0.42", default-features = false, features = [
 # 也走它（Rust 默认把 panic 打到 stderr，而安卓上 stderr 是丢掉的）
 log = "0.4"
 
+# 只桌面用（安卓走 tracing 的 log feature → android_logger）。
+# 放这里而不是普通依赖：否则 env-filter 会把 regex-automata/regex-syntax
+# 编进安卓的 .so（实测 ~0.2MB）。
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.14"
+# default-features = false：它的默认 feature 是 "regex"（env_filter，给
+# `with_filter` 用的）。我们只用 with_max_level/with_tag，关掉它就不会把
+# regex-automata/regex-syntax 编进 .so。
+android_logger = { version = "0.14", default-features = false }
 
 [profile.release]
 lto = true

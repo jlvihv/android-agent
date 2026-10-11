@@ -14,9 +14,12 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
-        // 只出这两个。armeabi-v7a 和 x86 跳过（决策 D9）。
+        // 只出 arm64-v8a。
+        //
+        // 之前带 x86_64 是为了模拟器，但代价是真机上白带一份 9.3MB 的核心
+        // （压缩后 ~4MB APK）。要跑模拟器时临时把 x86_64 加回来即可。
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += listOf("arm64-v8a")
         }
     }
 

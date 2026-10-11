@@ -167,7 +167,7 @@ android-bindings:
 
 # 2) 交叉编译 Rust 核心 → jniLibs
 #
-#    只出 arm64-v8a + x86_64（决策 D9）。
+#    只出 arm64-v8a（真机）。要跑模拟器就把 -t x86_64 加回来。
 #
 #    编完务必验 16KB 对齐（R1）—— Play 对 targetSdk 35+ 有要求。
 #    实测 cargo-ndk 4.x + NDK r27 已经默认对齐到 0x4000，但这个检查
@@ -178,7 +178,7 @@ android-libs:
     set -eu
     # cargo-ndk 同样要 cwd 在 crate 目录里
     cd {{core}}
-    cargo ndk -t arm64-v8a -t x86_64 -o ../{{jni}} build --release --lib
+    cargo ndk -t arm64-v8a -o ../{{jni}} build --release --lib
     echo "--- 16KB 对齐检查（Play 对 targetSdk 35+ 有要求，R1）---"
     # NDK 的预编译工具目录：Linux 是 linux-x86_64，macOS（含 Apple 芯片）是 darwin-x86_64
     host=linux-x86_64; [ "$(uname)" = Darwin ] && host=darwin-x86_64

@@ -39,8 +39,6 @@ uniffi::setup_scaffolding!();
 
 /// 初始化日志。安卓上同时输出到 logcat，桌面上输出到 stdout。
 pub fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-
     // panic hook。
     //
     // 必须装：Rust 的 panic 默认打到 stderr，而 **Android 上 stderr 是丢掉的**。
@@ -53,9 +51,6 @@ pub fn init_tracing() {
         #[cfg(not(target_os = "android"))]
         eprintln!("{msg}");
     }));
-
-    let filter = EnvFilter::try_from_env("AGENT_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info,agent_core=debug,axum=info"));
 
     #[cfg(target_os = "android")]
     {
@@ -82,15 +77,18 @@ pub fn init_tracing() {
         );
         // 这里**故意不装 tracing subscriber**：安卓上走 `tracing` 的 `log`
         // feature，事件直接交给上面那个 android_logger（见 Cargo.toml）。
-        // 以前 `let _ = filter;` 就这么把它丢了 —— 结果所有 tracing::info!
-        // （缓存命中率、装工具的进度、沙箱告警）在 logcat 里一条都看不到，
-        // 只剩 Kotlin 自己的日志。过滤粒度因此由 android_logger 的 level 决定
+        // 过滤粒度由 android_logger 的 level 决定
         // （AGENT_LOG=debug 或 setprop log.tag.agent-core DEBUG 都能调）。
-        let _ = filter;
+        //
+        // `tracing-subscriber` 因此是**非安卓依赖** —— 不然它会把
+        // regex-automata/regex-syntax 一起编进 .so（安卓上根本用不到）。
     }
 
     #[cfg(not(target_os = "android"))]
     {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_env("AGENT_LOG")
+            .unwrap_or_else(|_| EnvFilter::new("info,agent_core=debug,axum=info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
