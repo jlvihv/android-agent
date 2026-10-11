@@ -300,6 +300,14 @@ impl AppState {
         self.snapshot.read().ok().and_then(|g| g.clone())
     }
 
+    /// 有没有界面快照。
+    ///
+    /// `/api/health` 只是想知道「有没有」，用这个 —— `latest_snapshot()`
+    /// 会把整棵树（几百个节点加字符串）克隆一份。
+    pub fn has_snapshot(&self) -> bool {
+        self.snapshot.read().map(|g| g.is_some()).unwrap_or(false)
+    }
+
     pub fn linux(&self) -> Option<Arc<LinuxSandbox>> {
         self.linux.read().ok().and_then(|g| g.clone())
     }

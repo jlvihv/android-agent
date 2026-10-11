@@ -40,23 +40,35 @@
   // 消息本来只活在 JS 内存里，Activity 重建 / 刷新 / 从后台回来就空了。
   // 服务端一直留着，所以进来先拉一次。
   async function loadMessages() {
+    // 本地流正在跑：本地才是最新的，服务端那份是旧的。拉回来只会白传
+    // 一整段历史再丢掉 —— 干脆不发这个请求。
+    if (busy) return;
     try {
-      const r = await fetch('/api/session');
+      const r = await fetch(`/api/session?rev=${encodeURIComponent(rev)}`);
       if (!r.ok) return;
-      const raw = await r.text();
-      const d = JSON.parse(raw) as { messages: Message[]; busy: boolean };
+      const d = (await r.json()) as {
+        messages?: Message[];
+        busy: boolean;
+        unchanged?: boolean;
+        rev?: string;
+      };
       serverBusy = !!d.busy;
-      // 本地流还在跑就别覆盖，否则会把正在流式的消息对象换掉
-      if (busy || raw === lastRaw) return;
-      lastRaw = raw;
+      // 服务端说没变：连 JSON 里都不带 messages，什么都不用做
+      if (d.unchanged) return;
+      rev = d.rev ?? '';
       messages = reconcile(messages, d.messages ?? []);
     } catch {
       /* 拉不到就算了 */
     }
   }
 
-  /** 上次拉到的原样响应。轮询时没变化就什么都不做。 */
-  let lastRaw = '';
+  /**
+   * 上次拿到的会话版本号（服务端算的）。一致就不再重传整段历史。
+   *
+   * **切会话 / 新建 / 删除后必须清掉** —— 否则会拿旧会话的 rev 去比对新会话，
+   * 服务端一旦碰巧返回 unchanged，界面就卡在上一个会话的内容上。
+   */
+  let rev = '';
 
   /**
    * 能复用的旧消息对象原样留着。
@@ -84,6 +96,7 @@
 
   async function newSession() {
     await fetch('/api/sessions', { method: 'POST' });
+    rev = '';
     await Promise.all([loadSessions(), loadMessages()]);
     drawer = false;
   }
@@ -94,6 +107,7 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id }),
     });
+    rev = '';
     await Promise.all([loadSessions(), loadMessages()]);
     drawer = false;
   }
@@ -113,6 +127,7 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id }),
     });
+    rev = '';
     await Promise.all([loadSessions(), loadMessages()]);
   }
 

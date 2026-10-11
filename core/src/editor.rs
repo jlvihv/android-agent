@@ -124,12 +124,17 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
         .map(|e| Edit::new(lf(&e.old_text), lf(&e.new_text)))
         .collect();
 
+    // fuzzy 归一化要整文件扫一遍、再拼一份新字符串，**只算一次**。
+    // 原来它在三个地方各调一次（包括循环里每个 edit 一次）——
+    // E 个 edit 就是全文件拷贝 E 次。
+    let folded = fuzzy(&original);
+
     // 只要有一项在原文里找不到，就整体切到 fuzzy 模式
     let use_fuzzy = normalized
         .iter()
-        .any(|e| !original.contains(&e.old_text) && fuzzy(&original).contains(&fuzzy(&e.old_text)));
+        .any(|e| !original.contains(&e.old_text) && folded.contains(&fuzzy(&e.old_text)));
 
-    let base = if use_fuzzy { fuzzy(&original) } else { original.clone() };
+    let base: &str = if use_fuzzy { &folded } else { &original };
 
     // --- 逐个 edit 定位 ---
     let mut matches: Vec<Match> = Vec::new();
@@ -140,7 +145,7 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
             "edits[{index}].oldText 归一化后为空"
         );
 
-        let hits = occurrences(&base, &old);
+        let hits = occurrences(base, &old);
         anyhow::ensure!(!hits.is_empty(), "在 {path} 里找不到 edits[{index}]");
 
         // 唯一性：必须只出现一次。重复的话让模型补上下文，
@@ -149,7 +154,7 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
         let dup = if fuzzy_old.is_empty() {
             hits.len()
         } else {
-            occurrences(&fuzzy(&original), &fuzzy_old).len()
+            occurrences(&folded, &fuzzy_old).len()
         };
         anyhow::ensure!(
             dup == 1,

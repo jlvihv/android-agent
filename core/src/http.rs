@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -62,7 +62,7 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "platform": std::env::consts::OS,
         "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),
         "device": dev.map(|d| d.name()),
-        "hasSnapshot": st.latest_snapshot().is_some(),
+        "hasSnapshot": st.has_snapshot(),
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
         })),
@@ -292,22 +292,51 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
     Json(json!({ "ok": true })).into_response()
 }
 
-/// `GET /api/session` → 服务端的会话历史，转成前端 `Message[]` 的形状。
+/// `GET /api/session?rev=…` → 服务端的会话历史，转成前端 `Message[]` 的形状。
 ///
-/// 前端刷新/重建后用它恢复对话（否则消息只活在 JS 内存里）。
-async fn get_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+/// 前端刷新/重建后用它恢复对话（否则消息只活在 JS 内存里）；agent 在服务端
+/// 跑着时前端也会轮询它。
+///
+/// 轮询带上次拿到的 `rev`：一致就只回一句 `unchanged`。不然每次轮询都要把
+/// 整段历史（可能几百 KB）重新拼成 JSON 再传一遍 —— 一段长任务（比如一条
+/// 跑几分钟的 `apk add`）期间内容根本没变，而那要传几十次。
+async fn get_session(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<SessionQuery>,
+) -> impl IntoResponse {
+    let busy = st.turn_active.load(std::sync::atomic::Ordering::Relaxed);
+
+    // 读锁一直持到拼完 —— rev 和它对应的那份 messages 必须来自同一个瞬间，
+    // 不然客户端会存下一个「对不上的 rev」，之后就永远以为自己是最新的。
     let store = st.chat.read().await;
-    let msgs = store
-        .active_ref()
-        .map(crate::agent::session_view)
-        .unwrap_or_default();
+    let Some(sess) = store.active_ref() else {
+        return Json(json!({ "messages": [], "rev": "", "busy": busy }));
+    };
+    let rev = session_rev(sess);
+    if !q.rev.is_empty() && q.rev == rev {
+        return Json(json!({ "unchanged": true, "rev": rev, "busy": busy }));
+    }
+    let msgs = crate::agent::session_view(sess);
     drop(store);
+
     // busy 让前端知道「服务端还在跑」—— App 切到后台时 agent 不会停，
     // 切回来要能看出还在进行中，而不是以为卡住了。
-    Json(json!({
-        "messages": msgs,
-        "busy": st.turn_active.load(std::sync::atomic::Ordering::Relaxed),
-    }))
+    Json(json!({ "messages": msgs, "rev": rev, "busy": busy }))
+}
+
+#[derive(Deserialize)]
+struct SessionQuery {
+    /// 客户端上次拿到的版本号。空 = 全量要一份。
+    #[serde(default)]
+    rev: String,
+}
+
+/// 会话版本号。**只看元数据，不碰消息内容**，所以便宜。
+///
+/// 带 `id`：切换会话时长度和时间戳很容易撞车，撞了客户端就会一直拿着
+/// 上一个会话的消息不动。
+fn session_rev(sess: &crate::agent::ChatSession) -> String {
+    format!("{}:{}:{}", sess.id, sess.messages.len(), sess.updated_at)
 }
 
 /// `GET /api/sessions` → 侧边栏的「最近对话」列表
@@ -800,7 +829,8 @@ fn cmd_name(c: &Command) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_origin, parse_range};
+    use super::{is_loopback_origin, parse_range, session_rev};
+    use crate::agent::{ChatMessage, ChatSession};
 
     #[test]
     fn range_header_parsing() {
@@ -811,6 +841,30 @@ mod tests {
         assert_eq!(parse_range("bytes=1000-", 1000), None, "起点越界不满足");
         assert_eq!(parse_range("bytes=0-1,5-9", 1000), None, "多段不支持");
         assert_eq!(parse_range("items=0-1", 1000), None);
+    }
+
+    /// 版本号必须能反映「会话内容变了」，而且不同会话不能撞车。
+    ///
+    /// 它错了的后果很隐蔽：客户端发来的 rev 一旦与服务端算出的相同，
+    /// 就会收到 `unchanged`、界面永远停在一份旧消息上。
+    #[test]
+    fn session_rev_tracks_content_and_identity() {
+        let mut a = ChatSession::new();
+        let r0 = session_rev(&a);
+
+        // 新消息 → 变
+        a.messages.push(ChatMessage::User("问".into()));
+        let r1 = session_rev(&a);
+        assert_ne!(r0, r1);
+
+        // 内容不变 → 不变（轮询时靠这个省掉整段历史的传输）
+        assert_eq!(r1, session_rev(&a));
+
+        // 换个会话，即使消息数一样也不能相同（否则会卡在别的会话的内容上）
+        let mut b = ChatSession::new();
+        b.messages.push(ChatMessage::User("问".into()));
+        b.updated_at = a.updated_at;
+        assert_ne!(session_rev(&b), session_rev(&a));
     }
 
     #[test]

@@ -14,8 +14,9 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools,
-    CreateChatCompletionRequestArgs, FunctionCall, FunctionObjectArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions, ChatCompletionTool,
+    ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+    FunctionCall, FunctionObjectArgs,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -772,10 +773,8 @@ async fn drive(
 /// 抽成纯函数有两个理由：
 /// 1. 让「工具表也是可缓存前缀的一部分」这条不变式**可测** —— 只比
 ///    `messages` 不够，前一轮的完整请求体必须原样出现在后一轮里。
-/// 2. 序列化成 `Value` 之后才能补 `stream_options`：
-///    `ChatCompletionStreamOptions` 没有 derive Default，逐字段构造很脆，
-///    而 `create_stream_byot` 的 T0 只要 `Serialize`。
-fn build_request(sess: &ChatSession, model: &str) -> anyhow::Result<Value> {
+/// 2. 它直接产出**强类型**请求，交给 `create_stream_byot` 一次序列化。
+fn build_request(sess: &ChatSession, model: &str) -> anyhow::Result<CreateChatCompletionRequest> {
     let messages = build_messages(sess)?;
     let tools: Vec<ChatCompletionTools> = tools()
         .iter()
@@ -795,11 +794,16 @@ fn build_request(sess: &ChatSession, model: &str) -> anyhow::Result<Value> {
         .messages(messages)
         .tools(tools)
         .stream(true)
+        // 要 provider 在流末尾回报 token 用量。
+        //
+        // 用类型里的字段，**不要**先 `to_value` 再补键：那会把整份请求
+        // （含整段历史，可能几 MB）先物化成 Value 树、再序列化一次 ——
+        // 每个 step 白拷一遍最贵的东西（一个回合最多 8 个 step）。
+        .stream_options(ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        })
         .build()?;
-
-    // 要 provider 在流末尾回报 token 用量
-    let mut req = serde_json::to_value(&req)?;
-    req["stream_options"] = json!({ "include_usage": true });
     Ok(req)
 }
 
@@ -821,6 +825,7 @@ async fn stream_one(
     };
 
     let client = provider.client(&session_id)?;
+    // 强类型请求 → `create_stream_byot` 直接序列化，不做多余的 Value 中转。
     let mut stream = client
         .chat()
         .create_stream_byot::<_, StreamChunk>(req)
@@ -1346,7 +1351,8 @@ mod tests {
         let mut sess = ChatSession::default();
         ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
         sess.messages.push(ChatMessage::User("第一问".into()));
-        let req1 = build_request(&sess, "deepseek-v4.1-flash").unwrap();
+        // 转成 Value 是为了断言请求体本身；线上路径不经过这一步
+        let req1 = serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash").unwrap()).unwrap();
 
         sess.messages.push(ChatMessage::Assistant {
             content: "答".into(),
@@ -1362,11 +1368,13 @@ mod tests {
             content: "ok".into(),
         });
         sess.messages.push(ChatMessage::User("第二问".into()));
-        let req2 = build_request(&sess, "deepseek-v4.1-flash").unwrap();
+        let req2 = serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash").unwrap()).unwrap();
 
         assert_eq!(req1["tools"], req2["tools"], "工具表变了 → 整段前缀缓存失效");
         assert_eq!(req1["model"], req2["model"]);
         assert_eq!(req1["stream_options"], req2["stream_options"]);
+        // 用量上报是缓存命中率的唯一来源，不能因为换成强类型字段就丢了
+        assert_eq!(req1["stream_options"], json!({ "include_usage": true }));
         let a = req1["messages"].as_array().unwrap();
         let b = req2["messages"].as_array().unwrap();
         assert_eq!(&b[..a.len()], &a[..], "完整请求体不是前缀关系");
