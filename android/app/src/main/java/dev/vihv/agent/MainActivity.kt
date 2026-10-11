@@ -236,6 +236,7 @@ class MainActivity : Activity() {
 
     private fun registerBackCallback() {
         if (backCallback != null) return
+        Log.i(TAG, "注册系统返回回调（页面里有覆盖层，SDK ${Build.VERSION.SDK_INT}）")
         val cb: Any = if (Build.VERSION.SDK_INT >= 34) {
             // 跟手进度在 OnBackAnimationCallback（API 34 才有的子接口）上，
             // 不是藏在 OnBackInvokedCallback 里
@@ -264,6 +265,7 @@ class MainActivity : Activity() {
     private fun unregisterBackCallback() {
         val cb = backCallback ?: return
         backCallback = null
+        Log.i(TAG, "注销系统返回回调（覆盖层收干净了）")
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
         @Suppress("NewApi")
         onBackInvokedDispatcher.unregisterOnBackInvokedCallback(
@@ -273,6 +275,7 @@ class MainActivity : Activity() {
 
     /** 把手势进度交给页面（`web/src/lib/overlay.ts` 的 `__predictiveBack`） */
     private fun sendBack(phase: String, progress: Float) {
+        if (phase == "commit") Log.i(TAG, "返回手势完成 → 页面")
         web?.evaluateJavascript("window.__predictiveBack && window.__predictiveBack('$phase', $progress)", null)
     }
 

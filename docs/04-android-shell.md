@@ -362,9 +362,24 @@ start / progress(0..1) / cancel / commit  →  window.__predictiveBack(...)
 页面把它喂给栈顶覆盖层的位移（`web/src/lib/overlay.ts`），于是返回手势
 划到哪，抽屉/查看器就跟着挪到哪；松手完成就顺势关掉，撤回就弹回。
 
-**状态：Kotlin 侧编译通过（`:app:compileDebugKotlin`），真机手势还没验过**
-（需要 Android 13+ 设备；14+ 才有跟手那一段，Android 13 上系统里
-「预测性返回动画」还是个开发者选项）。
+### 真机验证（Pixel 10 / Android 17，API 37）
+
+用 `adb shell input swipe` 从屏幕左边缘往里划（系统把它当真手势），
+页面里装探针记录 `__predictiveBack` 的入参，壳里打了 logcat：
+
+| 场景 | 结果 |
+|---|---|
+| 开抽屉 | `setBackHandled(true)` → logcat「注册系统返回回调」 |
+| 抽屉上手势 | `start` + progress 0→0.71 共 60 帧 → `commit` → 抽屉关掉 |
+| 查看器上手势 | progress 0→0.78 共 180 帧，中途截图：查看器被推出 45% 露出后面的对话 |
+| 划出去再退回原处 | `cancel` → 查看器弹回原位，仍然开着 |
+| 没有覆盖层时按返回 | 回到桌面（回调已注销，整个手势交给系统） |
+
+`input swipe` 无论多短都会 commit（合成手势没有真正的手势取消），所以
+cancel 那行是用 `input motionevent DOWN/MOVE…/UP` 划出去再退回原处验的。
+
+一个反常量的地方：一次 1.5 秒的手势会送来 ~180 个 progress 回调（每秒 120
+次，比屏幕刷新率还密）。页面侧收到就是设一个 transform，没有额外开销。
 
 ---
 

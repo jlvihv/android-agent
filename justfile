@@ -214,7 +214,11 @@ android-assets:
       echo "⚠️  proot 是从 $OM 复制的 —— 发布前需自建"
     fi
 
-android-debug: android-bindings android-libs web-build
+# 顺序不能反：`android-libs` 会把 `web/dist` **在编译期嵌进 .so**
+# （rust-embed，见 core/src/assets.rs），所以必须先跑 web-build ——
+# 反过来写的话每次装上去的都是**上一次**的前端（踩过：Kotlin 改动生效了，
+# 但页面里 `window.__predictiveBack` 还是 undefined）。
+android-debug: android-bindings web-build android-libs
     #!/usr/bin/env bash
     set -eu
     . scripts/jdk.sh

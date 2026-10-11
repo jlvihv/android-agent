@@ -146,8 +146,9 @@ const cache = new Map<string, string | null>();
 
 async function getText(url: string): Promise<string | null> {
   try {
-    const r = await fetch(url, { credentials: 'omit' });
-    return r.ok ? await r.text() : null;
+    // 不看状态码：沙箱 404/403 的**响应体就是**查看器里要显示的那个
+    // 错误页（服务端自己生成的深色页），不取就只能按白底处理（踩过）
+    return await (await fetch(url, { credentials: 'omit' })).text();
   } catch {
     return null;
   }
