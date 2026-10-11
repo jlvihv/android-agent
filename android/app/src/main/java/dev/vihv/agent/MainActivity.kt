@@ -11,6 +11,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -42,6 +43,8 @@ class MainActivity : Activity() {
 
     private var web: WebView? = null
     private var fgsStarted = false
+    /** 已注册的系统返回回调（API 33+；类型用 Any 存，低版本设备不会碰到这个类） */
+    private var backCallback: Any? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -132,6 +135,15 @@ class MainActivity : Activity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
 
+        // 页面 → 壳的一根细线：告诉壳「现在有覆盖层要接返回键」。
+        //
+        // 为什么不直接看 web.canGoBack()：注册了系统返回回调，退出 App 那个
+        // 手势的动画就得我们画（否则屏幕上什么都不动）；所以只有真的有覆盖层
+        // 时才注册，其余时候把返回完全交给系统。
+        // 只会暴露给顶层页面（App 自己）；查看器里的 iframe 是 opaque origin，
+        // 够不到这个对象。
+        w.addJavascriptInterface(BackHost(), "AgentHost")
+
         w.webViewClient = object : WebViewClient() {
             /**
              * 外部链接交给系统浏览器。
@@ -189,7 +201,7 @@ class MainActivity : Activity() {
         setBackgroundColor(Color.BLACK)
     }
 
-    @Deprecated("平台在 API 33 弃用了它；我们不用 AndroidX，所以继续用")
+    @Deprecated("平台在 API 33 弃用了它；API 33+ 走下面的 OnBackInvokedCallback")
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
         val w = web
@@ -200,7 +212,72 @@ class MainActivity : Activity() {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 预测性返回（Android 13+ 的接口，14+ 才有跟手进度）
+    //
+    // 页面自己有覆盖层（抽屉/查看器/面板）时，它调 AgentHost.setBackHandled(true)，
+    // 我们就注册系统返回回调：手势的进度会一路发到页面，由页面把那一层
+    // 跟着手指挪 —— 也就是安卓原生的那种「跟手返回」。
+    //
+    // 没有覆盖层时不注册：让系统自己处理（退回桌面/上一个 App），
+    // 它会画它自己的预测性动画。
+    // -----------------------------------------------------------------------
+
+    /** 页面的 setBackHandled 会跑到 JavaBridge 线程上，得自己回主线程 */
+    inner class BackHost {
+        @JavascriptInterface
+        fun setBackHandled(handled: Boolean) {
+            runOnUiThread {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return@runOnUiThread
+                if (handled) registerBackCallback() else unregisterBackCallback()
+            }
+        }
+    }
+
+    private fun registerBackCallback() {
+        if (backCallback != null) return
+        val cb: Any = if (Build.VERSION.SDK_INT >= 34) {
+            // 跟手进度在 OnBackAnimationCallback（API 34 才有的子接口）上，
+            // 不是藏在 OnBackInvokedCallback 里
+            object : android.window.OnBackAnimationCallback {
+                override fun onBackStarted(backEvent: android.window.BackEvent) = sendBack("start", 0f)
+                override fun onBackProgressed(backEvent: android.window.BackEvent) =
+                    sendBack("progress", backEvent.progress)
+                override fun onBackCancelled() = sendBack("cancel", 1f)
+                override fun onBackInvoked() = sendBack("commit", 1f)
+            }
+        } else {
+            // API 33：只有回调本身，没有进度。页面收到 commit 照样会关，
+            // 只是没有跟手那一段
+            object : android.window.OnBackInvokedCallback {
+                override fun onBackInvoked() = sendBack("commit", 1f)
+            }
+        }
+        @Suppress("NewApi")
+        onBackInvokedDispatcher.registerOnBackInvokedCallback(
+            android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            cb as android.window.OnBackInvokedCallback,
+        )
+        backCallback = cb
+    }
+
+    private fun unregisterBackCallback() {
+        val cb = backCallback ?: return
+        backCallback = null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        @Suppress("NewApi")
+        onBackInvokedDispatcher.unregisterOnBackInvokedCallback(
+            cb as android.window.OnBackInvokedCallback,
+        )
+    }
+
+    /** 把手势进度交给页面（`web/src/lib/overlay.ts` 的 `__predictiveBack`） */
+    private fun sendBack(phase: String, progress: Float) {
+        web?.evaluateJavascript("window.__predictiveBack && window.__predictiveBack('$phase', $progress)", null)
+    }
+
     override fun onDestroy() {
+        unregisterBackCallback()
         web?.destroy()
         web = null
         super.onDestroy()

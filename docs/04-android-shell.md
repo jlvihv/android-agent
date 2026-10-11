@@ -338,6 +338,34 @@ align: 0x8
 
 不需要手动加 `-Wl,-z,max-page-size=16384`。`just android-libs` 里保留了这个检查。
 
+### 预测性返回（预测性返回手势 / predictive back）
+
+`android:enableOnBackInvokedCallback="true"`（Manifest，API 33+ 才看）。
+开了之后系统不再调 `onBackPressed()`，返回事件走 `OnBackInvokedDispatcher`。
+
+壳和页面之间靠一根细线（`MainActivity.BackHost`，`addJavascriptInterface` 成
+`window.AgentHost`）：**页面只在真有覆盖层时**调 `setBackHandled(true)`，壳才去
+注册回调。两个理由：
+
+1. 注册了就接管手势，系统自己的预测动画不会跑（官方文档明确写了）—— 而退出
+   App 的那个手势本来就该让系统画，所以在根页面上不注册
+2. 只有页面知道覆盖层（抽屉/查看器/面板）开没开；壳这边 `web.canGoBack()`
+   只能猜
+
+注册的回调（API 34+ 用 `OnBackAnimationCallback`，跟手进度在它的
+`onBackProgressed` 上；API 33 只有 `onBackInvoked`）把进度转给页面：
+
+```
+start / progress(0..1) / cancel / commit  →  window.__predictiveBack(...)
+```
+
+页面把它喂给栈顶覆盖层的位移（`web/src/lib/overlay.ts`），于是返回手势
+划到哪，抽屉/查看器就跟着挪到哪；松手完成就顺势关掉，撤回就弹回。
+
+**状态：Kotlin 侧编译通过（`:app:compileDebugKotlin`），真机手势还没验过**
+（需要 Android 13+ 设备；14+ 才有跟手那一段，Android 13 上系统里
+「预测性返回动画」还是个开发者选项）。
+
 ---
 
 ## 6. 设备操控的实现选择

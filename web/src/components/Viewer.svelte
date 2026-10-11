@@ -37,7 +37,7 @@
   const isWebPage = $derived(HTMLISH.test(path) || path.endsWith('/') || !HAS_EXT.test(path));
   const media = $derived(mediaKind(viewer.url ?? ''));
 
-  $effect(() => onBack(closeViewer));
+  $effect(() => onBack(closeViewer, drag));
 
   /**
    * 网页的底色。iframe 里那份文档是透明的（见 lib/pagebg.ts），

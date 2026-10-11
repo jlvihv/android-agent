@@ -41,9 +41,6 @@
     return () => cancelAnimationFrame(r);
   });
 
-  // 返回键关面板（带动画）
-  $effect(() => onBack(close));
-
   /**
    * 挂到 body 上。
    *
@@ -71,6 +68,9 @@
     p = 1;
     setTimeout(onclose, 280);
   }
+
+  // 返回键关面板（带动画）；拖拽三件套同时是「预测性返回」的跟手位移
+  $effect(() => onBack(close, drag));
 
   const drag = {
     axis: 'y' as const,
