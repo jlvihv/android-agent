@@ -7,8 +7,8 @@
 //! - 前端换任何 AI SDK 兼容客户端都能直接吃。我们选了 W2（自己写解析器，
 //!   见 `web/src/lib/sse.ts`），但协议是标准的，以后想换回 `@ai-sdk/svelte`
 //!   Rust 侧一行都不用改。
-//! - `tool-approval-request` / `tool-approval-response` 正好是我们要的人工审批流
-//! - reasoning / step / data-* 语义已经想好了，不用重新设计
+//! - reasoning / step / tool-output / data-* 语义已经想好了，不用重新设计
+//!   （协议里还有 `tool-approval-request|response`，我们用不上 —— 工具一律直接执行）
 //!
 //! 响应必须带 header `x-vercel-ai-ui-message-stream: v1`，流以 `[DONE]` 结尾。
 //!
@@ -135,29 +135,6 @@ pub fn tool_output_preliminary(tool_call_id: &str, output: Value) -> Value {
     })
 }
 
-pub fn tool_output_denied(tool_call_id: &str) -> Value {
-    json!({ "type": "tool-output-denied", "toolCallId": tool_call_id })
-}
-
-/// 请求人工审批。**省略 `isAutomatic`** 即表示需要显式批准。
-pub fn tool_approval_request(tool_call_id: &str, approval_id: &str, reason: &str) -> Value {
-    json!({
-        "type": "tool-approval-request",
-        "toolCallId": tool_call_id,
-        "approvalId": approval_id,
-        "reason": reason,
-    })
-}
-
-pub fn tool_approval_response(approval_id: &str, approved: bool, reason: &str) -> Value {
-    json!({
-        "type": "tool-approval-response",
-        "approvalId": approval_id,
-        "approved": approved,
-        "reason": reason,
-    })
-}
-
 // --- 自定义数据 -----------------------------------------------------------
 
 /// `data-*` 通道：推设备快照、日志等非 LLM 内容，前端 reducer 同样处理。
@@ -188,18 +165,6 @@ mod tests {
     fn done_marker_matches_spec() {
         assert_eq!(done_frame(), "data: [DONE]\n\n");
         assert_eq!(DONE, "[DONE]");
-    }
-
-    #[test]
-    fn approval_request_omits_is_automatic() {
-        let v = tool_approval_request("c1", "a1", "needs review");
-        assert_eq!(v["type"], "tool-approval-request");
-        assert_eq!(v["toolCallId"], "c1");
-        assert_eq!(v["approvalId"], "a1");
-        assert!(
-            v.get("isAutomatic").is_none(),
-            "省略 isAutomatic 才是需要显式批准"
-        );
     }
 
     #[test]

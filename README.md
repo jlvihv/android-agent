@@ -12,12 +12,12 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 
 | 部分 | 状态 |
 |---|---|
-| `core/` Rust | ✅ 62 个测试全过，clippy 干净 |
+| `core/` Rust | ✅ 80 个测试全过，clippy 干净 |
 | `web/` Svelte | ✅ 构建通过（57 KB JS / 21 KB gzip） |
 | `android/` 壳 | ✅ **真机验证通过** |
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
 | Linux 沙箱 | ✅ **Alpine 3.21 aarch64 在真机上跑起来**，`apk add` 可用 |
-| 设备操控 | ✅ 真机读 UI 树 + 点击 |
+| 设备操控 | ✅ 真机读 UI 树 + 点击（内核已有；暂不暴露给模型，见下） |
 | Prompt cache | ✅ 实测命中 73–87% |
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
 | 多会话 | ✅ 侧边栏「最近对话」，标题自动生成 |
@@ -86,18 +86,24 @@ python3 scripts/ask.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"
 4. **native 侧不反调 Java** —— Kotlin 把 UI 树拍平成 JSON 送进来
 5. **Kotlin 壳不写业务逻辑** —— 目标 < 800 行，不随功能增长
 6. **提示词前缀一个字都不能变** —— 见 [docs/03-prompt-cache.md](docs/03-prompt-cache.md)
-7. **所有操作直接放行** —— 无审批流程（`AppState::auto_approve`，一行可翻回来）
+7. **没有审批环节** —— 工具调用一律直接执行，服务端不保存「挂起等回复」的状态
 
 ## Agent 工具
 
+只给模型两个工具：
+
 | 工具 | 作用 |
 |---|---|
-| `device_snapshot` | 读当前界面的 UI 树 |
-| `device_tap` / `device_type` / `device_key` / `device_launch` | 操作界面 |
-| `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`） |
+| `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`），cwd 是 `/workspace` |
 | `edit` | 按原文精确替换编辑文件，返回 unified diff |
 
-全部自动执行，无审批（`AppState::auto_approve`，一行可翻回来）。
+设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**暂时不作为工具**暴露给模型。
+内核那条路还在（Kotlin 拍 UI 树 → `/api/command` → 回推快照），
+以后收进沙箱里的一个命令、由 `bash` 调用 —— 这样模型只需要理解 shell，
+工具表也能一直保持只有两个。
+
+工具调用一律直接执行，没有审批环节 —— 服务端因此不持有「挂起等回复」的状态，
+App 随时被杀都没关系。
 
 ## 文档
 

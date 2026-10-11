@@ -17,13 +17,7 @@
   import Sheet from './Sheet.svelte';
   import ThoughtLine from './ThoughtLine.svelte';
 
-  let {
-    messages,
-    ondecide,
-  }: {
-    messages: Message[];
-    ondecide: (msg: Message, part: ToolPart, approved: boolean) => void;
-  } = $props();
+  let { messages }: { messages: Message[] } = $props();
 
   let scroller: HTMLDivElement | null = $state(null);
 
@@ -48,16 +42,6 @@
         return firstLine(s(a.command)) || '执行命令';
       case 'edit':
         return `编辑 ${s(a.path) || '文件'}`;
-      case 'device_snapshot':
-        return '读取当前界面';
-      case 'device_tap':
-        return `点击节点 #${a.i ?? '?'}`;
-      case 'device_type':
-        return `向 #${a.i ?? '?'} 输入文字`;
-      case 'device_key':
-        return `按 ${s(a.name) || '键'}`;
-      case 'device_launch':
-        return `启动 ${s(a.package) || '应用'}`;
       default:
         return t.toolName || '工具调用';
     }
@@ -98,16 +82,6 @@
         return '执行命令';
       case 'edit':
         return '编辑文件';
-      case 'device_snapshot':
-        return '读取界面';
-      case 'device_tap':
-        return '点击';
-      case 'device_type':
-        return '输入文字';
-      case 'device_key':
-        return '按键';
-      case 'device_launch':
-        return '启动应用';
       default:
         return t.toolName || '工具调用';
     }
@@ -345,11 +319,7 @@
             >
               <Icon name="clock" size={16} class="shrink-0 text-faint" />
               <span class="truncate text-sm text-muted">{summarize(tool)}</span>
-              {#if tool.state === 'awaiting-approval'}
-                <span class="shrink-0 text-meta text-warn">待批准</span>
-              {:else if tool.state === 'denied'}
-                <span class="shrink-0 text-meta text-bad">已拒绝</span>
-              {:else if tool.state !== 'output' && !msg.done}
+              {#if tool.state !== 'output' && !msg.done}
                 <span class="shrink-0 text-meta text-faint">运行中</span>
               {/if}
               <Icon name="chevron" size={15} class="ml-auto shrink-0 text-faint" />
@@ -395,33 +365,6 @@
             class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5 whitespace-pre-wrap break-all">{primary(
               t,
             )}</pre>
-        {/if}
-
-        {#if t.approvalReason}
-          <p class="text-sm text-warn">{t.approvalReason}</p>
-        {/if}
-
-        {#if t.state === 'awaiting-approval'}
-          <div class="flex gap-2">
-            <button
-              onclick={() => {
-                ondecide(s.msg, t, true);
-                sheet = null;
-              }}
-              class="rounded-full bg-fg px-4 py-2 text-sm font-medium text-ink"
-            >
-              批准
-            </button>
-            <button
-              onclick={() => {
-                ondecide(s.msg, t, false);
-                sheet = null;
-              }}
-              class="rounded-full bg-control px-4 py-2 text-sm"
-            >
-              拒绝
-            </button>
-          </div>
         {/if}
 
         {#if res}

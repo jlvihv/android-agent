@@ -51,13 +51,13 @@ async fn stream_one(...) {
 
 ## 3. 正确的形状
 
+**系统提示词就是历史的第一条**，请求体 = 历史原样，不拼任何东西：
+
 ```
-[system]  SYSTEM_PROMPT              ← 静态常量，零插值，永远不变
-[system]  <环境>上下文#1</环境>        ← 第 1 轮生成后冻结进历史
+[system]  SYSTEM_PROMPT              ← 建会话时写入历史，之后不动
 [user]    U1
 [assistant] ...
-[tool]    ...（含操作后的最新界面）
-[system]  <环境>上下文#2</环境>        ← 第 2 轮才追加
+[tool]    ...（bash 输出 / edit 的 diff）
 [user]    U2
 ```
 
@@ -65,8 +65,9 @@ async fn stream_one(...) {
 
 1. **`SYSTEM_PROMPT` 是 `const &str`，不含任何 `{}` 插值。**
    不能有日期、时间、设备名、屏幕内容、当前目录 —— 任何运行期才知道的东西。
-2. **动态内容作为独立消息，追加在历史末尾。** 生成一次就冻结，
-   下一轮只往后加，不改前面。
+2. **历史只追加，不注入任何“每轮重发”的东西。**
+   需要环境信息（手机存储挂没挂、现在屏幕是什么）就让模型自己查：
+   一次 `ls` 的开销远小于每轮重发一段动态文本。
 3. **工具表顺序固定、序列化字节确定。** 工具定义也是可缓存前缀的一部分。
 
 对应代码（`core/src/agent.rs`）：
@@ -74,17 +75,56 @@ async fn stream_one(...) {
 ```rust
 pub const SYSTEM_PROMPT: &str = "你是运行在安卓手机上的操作助手……";  // 纯常量
 
-// run_turn：每轮往历史**追加**上下文 + 用户输入
-sess.messages.push(ChatMessage::System(context_block(core)));
+// run_turn：补上当前提示词（没出现过才追加），再追加用户输入
+ensure_system_prompt(sess, SYSTEM_PROMPT);
 sess.messages.push(ChatMessage::User(user_text.into()));
 
-// stream_one：直接拼，不做任何插值
-msgs.push(ChatMessage::System(SYSTEM_PROMPT.to_string()).to_openai()?);
-for m in &sess.messages { msgs.push(m.to_openai()?); }
+// build_messages：历史原样，一条不多一条不少
+sess.messages.iter().map(|m| m.to_openai()).collect()
 ```
 
-顺带一个细节：`ChatSession::provider_session`（作为 `x-opencode-session`
-发出去）**开一次就不变**。OpenCode Go 用它做缓存路由，每次换 ID 等于每次冷启动。
+因此请求体长度 == 历史长度。`the_request_is_the_history_verbatim` 守着这一点。
+
+### 3.1 改了系统提示词怎么办：**追加，不替换**
+
+这是把提示词放进历史的最大好处：**升级提示词不会动老会话的前缀**。
+
+```
+[system]  旧 SYSTEM_PROMPT          ← 保留
+[user]    U1
+[assistant] ...
+[system]  新 SYSTEM_PROMPT          ← ensure_system_prompt 追加在末尾
+[user]    U2
+```
+
+- 老前缀 `[旧提示词, U1, A1, …]` **原封不动** → 缓存照命中；
+- 新提示词作为一条 `system` 消息落在**新用户输入之前**；它一旦进历史就固化了，
+  下一轮开始就在缓存里；
+- 同一条提示词不会重复追加（`ensure_system_prompt` 先查历史里有没有）；
+- 历史里没任何提示词的老会话（比如以前存的）会自动被补上。
+
+推论：**提示词变了也不能轮换 `provider_session`** —— 那正是要保住的缓存路由。
+
+代价：历史里可能同时存在两条 system 消息，靠“后面那条更新”来生效。
+如果哪天发现模型不认，就把追加的那条包上标记（如
+`<系统提示词更新>…</系统提示词更新>`）—— 反正它进历史后就不再变。
+
+### 3.2 缓存路由 ID
+
+`ChatSession::provider_session`（作为 `x-opencode-session` 发出去）
+**开一次就不变**。OpenCode Go 用它做缓存路由，每次换 ID 等于每次冷启动。
+
+唯一该换的时机是「前缀的语义彻底断了」：历史被清空（`clear()`）、
+provider / model 换了（`/api/llm`）。这两种情况下代码会
+`rotate_provider_session()`，并且会落盘 —— `provider_session` 的 upsert
+原来漏了这一列，换过之后重启又会用回旧 id。
+
+### 3.3 两套缓存字段谁优先
+
+取命中数时要在
+`prompt_tokens_details.cached_tokens` 和 `prompt_cache_hit_tokens` 里取**大**的那个。
+用 `.or()` 的话，只要前者是 `Some(0)`（有些网关冷启动会填 0 而不是省略字段），
+后者报的真值就被吞掉，日志显示 0% —— 而这是唯一能证明缓存生效的数字。
 
 ---
 
@@ -136,26 +176,30 @@ req["stream_options"] = json!({ "include_usage": true });
 
 ## 5. 守住它的回归测试
 
-`core/src/agent.rs` 里有 5 条测试专门守这个不变式：
+`core/src/agent.rs` 里有 7 条测试专门守这些不变式：
 
 | 测试 | 守什么 |
 |---|---|
-| `message_prefix_is_stable_across_turns` | **核心**：第 2 轮的消息数组必须以第 1 轮为前缀 |
+| `message_prefix_is_stable_across_turns` | 第 2 轮的消息数组必须以第 1 轮为前缀 |
+| `a_prompt_change_is_appended_and_keeps_the_prefix` | **改了系统提示词也不动老前缀**：新提示词追加在末尾，第一条不替掉，也不重复追加 |
+| `full_request_body_is_prefix_stable_across_turns` | 不只比 `messages`，整份请求体（含 `tools` / `stream_options`）跨轮都得是前缀关系 |
 | `system_prompt_is_a_frozen_constant_with_no_interpolation` | `SYSTEM_PROMPT` 里不能有 `{`，也不能出现 `rootfs` / `/data/` / `Activity` / `1080` 这类运行期内容 |
-| `changing_the_screen_does_not_change_the_cached_prefix` | 环境变了，但前缀不能动 |
+| `the_request_is_the_history_verbatim` | 请求体长度 == 历史长度：不拼、不前置、不插上下文块 |
 | `tool_schema_order_and_names_are_fixed` | 工具表顺序钉死（想改顺序必须先改测试） |
 | `tool_schemas_serialize_byte_identically` | schema 序列化字节确定 |
+| `usage_understands_both_cache_field_styles` | 两套缓存字段都认，同时在时取大的那个 |
 
-`message_prefix_is_stable_across_turns` 是最重要的那条 ——
-它模拟两轮对话，断言第二轮消息数组的前 N 项与第一轮逐字节相同。
-任何人往 `SYSTEM_PROMPT` 里加插值、或重排历史，这条测试立刻红。
+`full_request_body_is_prefix_stable_across_turns` 是硬的那条：它不断言中间函数，
+而是直接断言**构造好的请求体**（`build_request()`，和 `stream_one` 走同一条路）
+跨轮的前缀关系 —— 工具表、字段省略行为、请求体字节序全在里面。
 
 ---
 
 ## 6. 顺带得到的副产品
 
 - `data-usage` 事件会推到前端，所以 UI 可以直接显示 token 用量和缓存命中率。
-- `finish_reason == "length"` 时会发 `data-warning`，
-  否则输出被 `max_tokens` 截断看起来就像模型话说到一半。
-- 每条工具结果里都带**操作后的最新界面**（`execute_tool` 的实现），
-  这样界面新鲜度不依赖 system prompt —— 既保住了缓存，又让模型看到真实状态。
+- `finish_reason == "length"` 时会发 `data-warning`，而且当轮的工具调用**全部作废**
+  —— 截断的 `arguments` JSON 很可能是半个对象，拿坏参数去执行比报错危险得多。
+- 环境（沙箱可不可用、手机存储挂没挂）**不进 prompt**：它在 `SYSTEM_PROMPT` 里只有
+  一句“不确定就先 `ls /sdcard`”。早先版本每轮追加一个 `<环境>` 消息，再往前还塞过
+  当前界面的 UI 树 —— 都是几百行文本每轮重发，纯烧 token，全删了。

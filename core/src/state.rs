@@ -207,11 +207,6 @@ pub struct AppState {
     /// Linux 沙箱。安卓上由 Kotlin 在 boot 时把 proot / rootfs 路径交进来；
     /// 桌面上由环境变量自动探测。
     pub linux: RwLock<Option<Arc<LinuxSandbox>>>,
-    /// 信任模式。
-    ///
-    /// **默认开启** —— agent 的所有操作直接放行，不弹审批。
-    /// 改回逐个人工审批只需把 `new(false)` 改掉（或以后接个 UI 开关）。
-    pub auto_approve: AtomicBool,
     /// LLM provider。
     ///
     /// 安卓上**没法用环境变量**（App 不继承 shell 环境），所以运行时
@@ -246,8 +241,6 @@ impl AppState {
             mock: AtomicBool::new(false),
             chat: tokio::sync::RwLock::new(SessionStore::default()),
             linux: RwLock::new(None),
-            // 默认全部放行
-            auto_approve: AtomicBool::new(true),
             llm: RwLock::new(None),
             data_dir: RwLock::new(None),
             turn_active: AtomicBool::new(false),
@@ -365,6 +358,20 @@ impl AppState {
         self.llm.read().ok().and_then(|g| g.clone())
     }
 
+    /// 给所有会话换一个 provider session id。
+    ///
+    /// 换 provider / model 之后，旧会话的缓存前缀对不上新模型了：
+    /// 继续用同一个 id，provider 侧要么白跑一次冷启动，要么命中不该命中的
+    /// 缓存条目。历史被清空（`ChatSession::clear`）时会话自己会换。
+    pub async fn rotate_provider_sessions(&self) {
+        let mut store = self.chat.write().await;
+        for s in &mut store.sessions {
+            s.rotate_provider_session();
+        }
+        drop(store);
+        self.mark_sessions_dirty();
+    }
+
     /// 设置 provider 并落盘。
     ///
     /// ⚠️ 目前是**明文**存在 App 私有目录里（受 Android 沙箱 + SELinux 保护）。
@@ -414,23 +421,6 @@ impl AppState {
             }
             Err(e) => self.log("warn", format!("llm.json 解析失败: {e}")),
         }
-    }
-
-    pub fn auto_approve(&self) -> bool {
-        self.auto_approve.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn set_auto_approve(&self, on: bool) {
-        self.auto_approve
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-        self.log(
-            "info",
-            if on {
-                "信任模式：已开启，工具调用不再逐个审批"
-            } else {
-                "信任模式：已关闭"
-            },
-        );
     }
 
     pub fn set_linux(&self, sb: Arc<LinuxSandbox>) {

@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::agent::{ChatMessage, ChatSession, PendingApproval, SessionStore};
+use crate::agent::{ChatMessage, ChatSession, SessionStore};
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -50,13 +50,6 @@ CREATE TABLE IF NOT EXISTS messages (
   seq        INTEGER NOT NULL,
   payload    TEXT NOT NULL,
   PRIMARY KEY (session_id, seq)
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS pending (
-  session_id  TEXT NOT NULL,
-  approval_id TEXT NOT NULL,
-  payload     TEXT NOT NULL,
-  PRIMARY KEY (session_id, approval_id)
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
@@ -136,24 +129,12 @@ impl Db {
                     .filter_map(|p| serde_json::from_str(&p).ok())
                     .collect();
 
-                let mut p = g
-                    .conn
-                    .prepare("SELECT approval_id, payload FROM pending WHERE session_id = ?1")?;
-                let pending: HashMap<String, PendingApproval> = p
-                    .query_map([&id], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                    })?
-                    .filter_map(|r| r.ok())
-                    .filter_map(|(k, v)| serde_json::from_str(&v).ok().map(|p| (k, p)))
-                    .collect();
-
                 store.sessions.push(ChatSession {
                     id,
                     title,
                     created_at: created_at.max(0) as u64,
                     updated_at: updated_at.max(0) as u64,
                     messages,
-                    pending,
                     provider_session,
                 });
             }
@@ -192,7 +173,8 @@ impl Db {
                  VALUES(?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE SET
                    title = excluded.title,
-                   updated_at = excluded.updated_at",
+                   updated_at = excluded.updated_at,
+                   provider_session = excluded.provider_session",
                 params![
                     s.id,
                     s.title,
@@ -219,15 +201,6 @@ impl Db {
                     ins.execute(params![s.id, i as i64, serde_json::to_string(m)?])?;
                 }
             }
-
-            // 待审批项整组替换（数量少）
-            tx.execute("DELETE FROM pending WHERE session_id = ?1", [&s.id])?;
-            for (k, p) in &s.pending {
-                tx.execute(
-                    "INSERT INTO pending(session_id, approval_id, payload) VALUES(?1, ?2, ?3)",
-                    params![s.id, k, serde_json::to_string(p)?],
-                )?;
-            }
         }
 
         // 已经删掉的会话，连带消息一起清
@@ -235,7 +208,6 @@ impl Db {
         if alive.is_empty() {
             tx.execute("DELETE FROM sessions", [])?;
             tx.execute("DELETE FROM messages", [])?;
-            tx.execute("DELETE FROM pending", [])?;
         } else {
             let list = alive
                 .iter()
@@ -244,7 +216,6 @@ impl Db {
                 .join(",");
             tx.execute(&format!("DELETE FROM sessions WHERE id NOT IN ({list})"), [])?;
             tx.execute(&format!("DELETE FROM messages WHERE session_id NOT IN ({list})"), [])?;
-            tx.execute(&format!("DELETE FROM pending WHERE session_id NOT IN ({list})"), [])?;
         }
 
         tx.execute(
@@ -267,7 +238,7 @@ impl Db {
     pub fn wipe(&self) -> Result<()> {
         let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
         g.conn.execute_batch(
-            "DELETE FROM sessions; DELETE FROM messages; DELETE FROM pending; DELETE FROM meta;",
+            "DELETE FROM sessions; DELETE FROM messages; DELETE FROM meta;",
         )?;
         Ok(())
     }
@@ -308,6 +279,23 @@ mod tests {
         assert_eq!(back.sessions[0].messages.len(), 3);
         assert_eq!(back.active, st.active);
         assert_eq!(back.sessions[0].title, "会话0");
+    }
+
+    /// `provider_session` 是缓存路由的锚点，换过了就必须落盘 ——
+    /// 不然重启后又用旧 id 去命中已经作废的前缀。
+    #[test]
+    fn a_rotated_provider_session_is_persisted() {
+        let db = Db::in_memory().unwrap();
+        let mut st = store_with(1, 1);
+        db.sync(&st).unwrap();
+        let before = db.load().unwrap().sessions[0].provider_session.clone();
+
+        st.sessions[0].rotate_provider_session();
+        let after = st.sessions[0].provider_session.clone();
+        assert_ne!(before, after, "应该换了新 id");
+
+        db.sync(&st).unwrap();
+        assert_eq!(db.load().unwrap().sessions[0].provider_session, after);
     }
 
     #[test]
@@ -435,27 +423,6 @@ mod tests {
         db.sync(&st).unwrap();
 
         assert_eq!(db.load().unwrap().active, target);
-    }
-
-    #[test]
-    fn pending_approvals_survive() {
-        let db = Db::in_memory().unwrap();
-        let mut st = SessionStore::default();
-        let id = st.create();
-        let s = st.sessions.iter_mut().find(|s| s.id == id).unwrap();
-        s.pending.insert(
-            "appr_1".into(),
-            PendingApproval {
-                tool_call_id: "c1".into(),
-                name: "bash".into(),
-                arguments: "{}".into(),
-            },
-        );
-        db.sync(&st).unwrap();
-
-        let back = db.load().unwrap();
-        assert_eq!(back.sessions[0].pending.len(), 1);
-        assert_eq!(back.sessions[0].pending["appr_1"].name, "bash");
     }
 
     #[test]

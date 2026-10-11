@@ -28,7 +28,6 @@ CREATE TABLE messages (
   session_id, seq, payload,        -- payload = ChatMessage 的 JSON
   PRIMARY KEY (session_id, seq)
 ) WITHOUT ROWID;
-CREATE TABLE pending (session_id, approval_id, payload, ...);
 CREATE TABLE meta (k, v);          -- 存 active session id
 ```
 

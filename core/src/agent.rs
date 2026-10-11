@@ -1,18 +1,14 @@
 //! Agent 主循环。
 //!
 //! 决策 D5 选了「自研薄 loop」而不是 `rig`，原因就在这个文件里：
-//! 每一个事件都要精确地转成 AI SDK UI Message Stream 的 chunk 推给前端，
-//! 而且工具调用要能**暂停等人审批**。框架会把 loop 包起来，反而挡路。
+//! 每一个事件都要精确地转成 AI SDK UI Message Stream 的 chunk 推给前端。
+//! 框架会把 loop 包起来，反而挡路。
 //!
-//! 工具分两类：
-//! - `ReadOnly`：自动执行，结果直接回灌给模型，循环继续
-//! - `NeedsApproval`：发 `tool-approval-request` 后**整个回合结束**，
-//!   等前端调 `/api/approve` 再从这个点继续
-//!
-//! 这样设计是为了让服务端**无长驻状态**：手机 App 随时可能被杀，
-//! 审批可能发生在几分钟之后。
+//! 工具调用**一律直接执行**，没有审批环节 —— 服务端因此没有「挂起等回复」
+//! 的状态，回合结束就是结束，手机 App 随时被杀都没关系。
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
@@ -26,7 +22,6 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::llm::Provider;
-use crate::state::{Command, UiSnapshot};
 use crate::{linux, sse, Core};
 
 // ---------------------------------------------------------------------------
@@ -92,12 +87,21 @@ pub struct CompletionTokensDetails {
 }
 
 impl Usage {
-    /// 命中的缓存 token 数（两套字段任取其一）
+    /// 命中的缓存 token 数。
+    ///
+    /// 两套字段都接。同时出现时取**大**的那个 —— 之前用 `.or()`，
+    /// 只要 OpenAI 系先报了 `cached_tokens: 0`（有些网关冷启动会填 0
+    /// 而不是省略），DeepSeek 系报的真值就被吞掉，日志变成「命中 0%」，
+    /// 而命中率正是判断缓存有没有生效的唯一硬证据。
     pub fn cached_tokens(&self) -> Option<u32> {
-        self.prompt_tokens_details
+        let openai = self
+            .prompt_tokens_details
             .as_ref()
-            .and_then(|d| d.cached_tokens)
-            .or(self.prompt_cache_hit_tokens)
+            .and_then(|d| d.cached_tokens);
+        match (openai, self.prompt_cache_hit_tokens) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     pub fn reasoning_tokens(&self) -> Option<u32> {
@@ -107,12 +111,15 @@ impl Usage {
     }
 
     /// 缓存命中率。provider 不报缓存字段时返回 None。
+    ///
+    /// 夹到 `[0,1]`：`prompt_tokens` 含不含缓存部分各厂商定义不同，
+    /// 有的实现里它是 miss-only，直接相除会得到 >100%。
     pub fn cache_hit_ratio(&self) -> Option<f64> {
         let hit = self.cached_tokens()? as f64;
         if self.prompt_tokens == 0 {
             return None;
         }
-        Some(hit / self.prompt_tokens as f64)
+        Some((hit / self.prompt_tokens as f64).clamp(0.0, 1.0))
     }
 }
 
@@ -169,75 +176,27 @@ struct FunctionChunk {
 // 工具注册表
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolKind {
-    /// 只读
-    ReadOnly,
-    /// 有副作用。
-    ///
-    /// 默认**自动执行**（`AppState::auto_approve` 为 true）。
-    /// 把 auto_approve 关掉就恢复成逐个人工审批。
-    SideEffecting,
-}
-
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
-    pub kind: ToolKind,
     pub schema: fn() -> Value,
 }
 
-pub fn tools() -> Vec<ToolSpec> {
+/// 工具表只建一次。
+///
+/// 每个 step 都要把整张表序列化进请求（含那段很长的 `bash` 描述），
+/// 工具表是**可缓存前缀的一部分**，只建一次也让「字节确定」更保险。
+static TOOLS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
+
+pub fn tools() -> &'static [ToolSpec] {
+    TOOLS.get_or_init(build_tools)
+}
+
+fn build_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
-            name: "device_snapshot",
-            description: "读取当前手机界面的 UI 树。返回节点列表，每个节点有索引 i、类名 c、文本 t、bounds b 和可交互标志 a。要点击任何东西之前必须先调用它。",
-            kind: ToolKind::ReadOnly,
-            schema: || json!({ "type": "object", "properties": {}, "required": [] }),
-        },
-        ToolSpec {
-            name: "device_tap",
-            description: "点击 UI 树中索引为 i 的节点。需要用户批准。",
-            kind: ToolKind::SideEffecting,
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": { "i": { "type": "integer", "description": "device_snapshot 返回的节点索引" } },
-                    "required": ["i"]
-                })
-            },
-        },
-        ToolSpec {
-            name: "device_type",
-            description: "向索引为 i 的输入框写入文本。需要用户批准。",
-            kind: ToolKind::SideEffecting,
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "i": { "type": "integer" },
-                        "text": { "type": "string" }
-                    },
-                    "required": ["i", "text"]
-                })
-            },
-        },
-        ToolSpec {
-            name: "device_key",
-            description: "按系统按键。name 取值：back / home / recents。需要用户批准。",
-            kind: ToolKind::SideEffecting,
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": { "name": { "type": "string", "enum": ["back", "home", "recents"] } },
-                    "required": ["name"]
-                })
-            },
-        },
-        ToolSpec {
             name: "bash",
-            description: "在设备上的 Alpine Linux 沙箱里执行 shell 命令。返回 stdout 和 stderr。输出截断到**最后** 2000 行或 50KB（先到者为准）；截断时完整输出会存到临时文件并返回路径。可选 timeout（秒，默认 60）。每次调用都是全新的进程：文件系统持久，shell 状态（变量、cwd、后台任务）不持久；cwd 是 /root。要点：ICMP/ping 被封，用 curl/wget；装 Python 包优先 `apk add py3-*` 而不是 pip（musllinux_aarch64 的 wheel 很少）；matplotlib 画图前先 `matplotlib.use('Agg')`；后台服务必须重定向 stdout/stderr，否则调用不会返回；搜索用 rg（`apk add ripgrep`），`rg -uuu` 才包含隐藏和忽略的文件。",
-            kind: ToolKind::SideEffecting,
+            description: "在设备上的 Alpine Linux 沙箱里执行 shell 命令。返回 stdout 和 stderr。输出截断到**最后** 2000 行或 50KB（先到者为准）；截断时完整输出会存到临时文件并返回路径。可选 timeout（秒，默认 60）。每次调用都是全新的进程：文件系统持久，shell 状态（变量、cwd、后台任务）不持久；cwd 是 /workspace，相对路径都相对它。要点：ICMP/ping 被封，用 curl/wget；装 Python 包优先 `apk add py3-*` 而不是 pip（musllinux_aarch64 的 wheel 很少）；matplotlib 画图前先 `matplotlib.use('Agg')`；后台服务必须重定向 stdout/stderr，否则调用不会返回；搜索用 rg（`apk add ripgrep`），`rg -uuu` 才包含隐藏和忽略的文件。",
             schema: || {
                 json!({
                     "type": "object",
@@ -252,12 +211,11 @@ pub fn tools() -> Vec<ToolSpec> {
         ToolSpec {
             name: "edit",
             description: "用一个或多个精确文本替换来编辑单个文件。每个 edits[].oldText 必须匹配**原始文件**中唯一且不重叠的区域：改同一处或相邻行时合并成一条，不要发出重叠或嵌套的 edits，也不要为了够到远处的改动而在 oldText 里塞一大段没变的内容。",
-            kind: ToolKind::SideEffecting,
             schema: || {
                 json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "文件路径（相对或绝对；相对路径基于 /root）" },
+                        "path": { "type": "string", "description": "文件路径（相对或绝对；相对路径基于 /workspace）" },
                         "edits": {
                             "type": "array",
                             "description": "一条或多条替换",
@@ -275,23 +233,7 @@ pub fn tools() -> Vec<ToolSpec> {
                 })
             },
         },
-        ToolSpec {
-            name: "device_launch",
-            description: "启动一个应用。需要用户批准。",
-            kind: ToolKind::SideEffecting,
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": { "package": { "type": "string", "description": "包名，如 com.android.settings" } },
-                    "required": ["package"]
-                })
-            },
-        },
     ]
-}
-
-fn find_tool(name: &str) -> Option<ToolSpec> {
-    tools().into_iter().find(|t| t.name == name)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,14 +313,7 @@ impl ChatMessage {
     }
 }
 
-/// 待审批的工具调用
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingApproval {
-    pub tool_call_id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
+/// 当前会话。
 #[derive(Default, Serialize, Deserialize)]
 pub struct ChatSession {
     pub id: String,
@@ -387,10 +322,13 @@ pub struct ChatSession {
     pub created_at: u64,
     pub updated_at: u64,
     pub messages: Vec<ChatMessage>,
-    /// approval_id -> 待审批调用
-    pub pending: HashMap<String, PendingApproval>,
     /// 给 provider 做 prompt cache 路由用的稳定会话 ID
     pub provider_session: String,
+}
+
+/// 新的 provider session id（作为 `x-opencode-session` 发出去）。
+fn new_provider_session() -> String {
+    format!("agent-core-{}", uuid::Uuid::now_v7())
 }
 
 fn now_ms() -> u64 {
@@ -409,9 +347,17 @@ impl ChatSession {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
-            pending: HashMap::new(),
-            provider_session: format!("agent-core-{}", uuid::Uuid::now_v7()),
+            provider_session: new_provider_session(),
         }
+    }
+
+    /// 换一个新的 provider session id。
+    ///
+    /// 什么时候要换：历史被清空、provider / model 变了、工具表变了 ——
+    /// 也就是「缓存前缀的语义变了」。**不能每轮都换**，那等于每次冷启动
+    /// （provider 靠这个 id 做缓存路由）。
+    pub fn rotate_provider_session(&mut self) {
+        self.provider_session = new_provider_session();
     }
 
     /// 第一条用户输入决定标题
@@ -428,9 +374,11 @@ impl ChatSession {
 
     pub fn clear(&mut self) {
         self.messages.clear();
-        self.pending.clear();
         self.title.clear();
         self.updated_at = now_ms();
+        // 历史清空了，前缀完全变了：继续用旧 id 就是「同 session 不同前缀」，
+        // 只会让 provider 白跑一次冷启动。
+        self.rotate_provider_session();
     }
 }
 
@@ -541,89 +489,54 @@ impl SessionStore {
 //   ...
 
 pub const SYSTEM_PROMPT: &str = "\
-你是运行在安卓手机上的操作助手，可以通过工具读取和操作手机界面，\n\
-也可以在 Alpine Linux 沙箱里执行命令、编辑文件。\n\
+你是运行在安卓手机上的操作助手：可以在 Alpine Linux 沙箱里跑命令、改文件、做出成品。\n\
 \n\
-工具使用原则：\n\
-1. 要点击任何东西之前，先调 device_snapshot 看清当前界面。\n\
-2. 用节点的索引 i 引用元素，不要猜坐标。\n\
-3. 每次设备操作的工具结果里都会带上操作后的最新界面，以它为准，\n\
-   不要沿用对话历史里的旧界面描述。\n\
-4. 跑命令用 bash，改文件用 edit。\n\
-5. 装 Python 包优先 `apk add py3-*`，不要用 pip。\n\
-\n\
-工作目录（固定，不要换来换去）：\n\
-- 所有工作都在 /workspace 里做，命令默认就在这里执行。给每个任务建一个\n\
-  有意义的子目录（如 /workspace/天气网页），做完的成品留在里面。\n\
-- /workspace 就是手机内部存储的 Agent 文件夹：用户在手机的文件管理器里\n\
-  能直接看到，App 卸载也不会丢。\n\
-- 整个手机内部存储挂在 /sdcard，可以读写用户自己的文件\n\
-  （照片 /sdcard/DCIM，截图 /sdcard/Pictures，下载 /sdcard/Download）。\n\
+- 跑命令用 bash，改文件用 edit。\n\
+- 工作目录固定在 /workspace，它就是手机内部存储的 Agent 文件夹：用户在手机\n\
+  文件管理器里能直接看到，App 卸载也不会丢。给每个任务建一个有意义的子目录\n\
+  （如 /workspace/天气网页），做完的成品留在里面。整个手机内部存储挂在 /sdcard，\n\
+  可以读写用户自己的文件；虚拟环境、node_modules、编译产物这类东西放 /root 下。\n\
   动用户已有的文件前先说明要做什么，删除或覆盖前先确认。\n\
-- 手机存储不支持符号链接，也不能直接执行里面的文件（用 sh/python 运行脚本\n\
-  即可）。虚拟环境、node_modules、编译产物这类东西放 /root 下。\n\
-- 当前是否挂上了手机存储，见每轮开头的 <环境>。\n\
-\n\
-给用户看沙箱里的文件：\n\
-- 用 `sandbox:` 协议写 Markdown 链接或图片，路径就是沙箱内的绝对路径，例如\n\
-  `[打开报告](sandbox:/workspace/报告/index.html)`、`![图表](sandbox:/workspace/图表/chart.png)`。\n\
-- 用户点链接会在 App 里直接打开：HTML 正常渲染、脚本能运行，页面里用相对路径\n\
-  引用的 css/js/图片也能加载；指向目录会列出文件。\n\
-- 图片、音频、视频都用图片语法 `![说明](sandbox:…)`：图片直接显示，音视频显示\n\
-  成播放器。图片 png/jpg/gif/webp/svg，音频 mp3/m4a/wav/ogg/flac，视频 mp4/webm/mov，\n\
-  都不需要转换格式。\n\
-- 做了网页、图表、图片、音视频等成品时，主动给出这样的链接，不要只把路径写成代码。\n\
+  手机存储可能没挂上（App 没有「所有文件访问权限」），不确定就先 `ls /sdcard`。\n\
+- 给用户看沙箱里的文件：用 `sandbox:` 协议写 Markdown 链接或图片，路径就是沙箱内\n\
+  的绝对路径，例如 `[打开报告](sandbox:/workspace/报告/index.html)`、\n\
+  `![图表](sandbox:/workspace/图表/chart.png)`。用户点链接会在 App 里直接打开\n\
+  （HTML 正常渲染，页面里用相对路径引用的 css/js/图片也能加载）。图片、音频、\n\
+  视频都用图片语法 `![说明](sandbox:…)`，不需要转换格式。做了成品要主动给出\n\
+  这样的链接，不要只把路径写成代码。\n\
 \n\
 回答要求：用中文，简洁直接，不要寒暄。";
 
-/// 每轮用户输入前插入的上下文块。
+/// 构造发给 provider 的消息数组 = **会话历史原样**。
 ///
-/// 生成一次就冻结进历史 —— **绝不**每轮重建 system prompt。
-pub fn context_block(core: &Core) -> String {
-    let sb = core.state.linux();
-    context_block_from(
-        sb.as_ref().map(|s| s.has_shared_storage()),
-        core.state.latest_snapshot().as_ref(),
-    )
-}
-
-/// 拆出来是为了能在不构造 `Core` 的情况下测。
-///
-/// `linux`：None = 沙箱不可用；Some(true) = 挂了手机存储。
-fn context_block_from(linux: Option<bool>, screen: Option<&UiSnapshot>) -> String {
-    let linux = match linux {
-        Some(true) => "Linux 沙箱可用。/workspace = 手机内部存储的 Agent 文件夹；\
-                       整个手机内部存储挂在 /sdcard。"
-            .to_string(),
-        Some(false) => "Linux 沙箱可用。手机存储没有挂载（App 没有「所有文件访问权限」）：\
-                        /workspace 在 App 私有目录里，卸载会丢，/sdcard 不可用。"
-            .to_string(),
-        None => "Linux 沙箱不可用（bash / edit 会报错）。".into(),
-    };
-
-    let screen = match screen {
-        Some(s) => summarize(s)["text"].as_str().unwrap_or("").to_string(),
-        None => "（还没有界面快照，需要时调 device_snapshot）".into(),
-    };
-
-    format!("<环境>\n{linux}\n\n<当前界面>\n{screen}\n</当前界面>\n</环境>")
-}
-
-/// 构造发给 provider 的消息数组。
-///
-/// **缓存不变式**：对同一个会话，后一轮的结果必须以前一轮的结果为**前缀**。
-/// 任何往 `SYSTEM_PROMPT` 里插值、或重排历史的行为都会破坏它 ——
-/// 一旦破坏，prompt cache 全部失效，成本直接涨 50 倍。
-/// `message_prefix_is_stable_across_turns` 就是守住这条的回归测试。
+/// 这里**不拼任何东西** —— 系统提示词是历史里的第一条（见
+/// `ensure_system_prompt`）。于是“后一轮以前一轮为前缀”是天然的：
+/// 请求体就是历史的单调扩展。
 fn build_messages(
     sess: &ChatSession,
 ) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
-    let mut msgs = Vec::with_capacity(sess.messages.len() + 1);
-    msgs.push(ChatMessage::System(SYSTEM_PROMPT.to_string()).to_openai()?);
-    for m in &sess.messages {
-        msgs.push(m.to_openai()?);
+    sess.messages.iter().map(|m| m.to_openai()).collect()
+}
+
+/// 保证历史里有当前版本的系统提示词。
+///
+/// 系统提示词**存在历史里**，不是发请求时才拼上去的 —— 这是为了“改了提示词
+/// 也不动老会话的前缀”：
+///
+/// - 老会话的前缀是 `[system: 旧提示词, U1, A1, …]`，原样保留 → 缓存照命中；
+/// - 当前提示词没在历史里出现过，就作为一条 `system` 消息**追加在末尾**
+///   （新用户输入之前）。它一旦落进历史就固化了，下一轮开始就在缓存里。
+/// - 同一条提示词不会重复追加。
+///
+/// 推论：`provider_session`**不能**因为提示词变了就轮换 —— 那正是要保住的缓存路由。
+fn ensure_system_prompt(sess: &mut ChatSession, prompt: &str) {
+    let present = sess
+        .messages
+        .iter()
+        .any(|m| matches!(m, ChatMessage::System(s) if s == prompt));
+    if !present {
+        sess.messages.push(ChatMessage::System(prompt.to_string()));
     }
-    Ok(msgs)
 }
 
 /// 把服务端会话转成前端 `Message[]` 的形状。
@@ -653,7 +566,7 @@ pub fn session_view(sess: &ChatSession) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for (i, m) in sess.messages.iter().enumerate() {
         match m {
-            // 上下文块（界面/环境快照）是给模型看的，不给用户看
+            // 系统提示词（第一条，以及后续的“提示词升级”）是给模型看的，不给用户看
             ChatMessage::System(_) => {}
 
             ChatMessage::User(text) => out.push(json!({
@@ -684,6 +597,7 @@ pub fn session_view(sess: &ChatSession) -> Vec<Value> {
                         "toolName": tc.name,
                         "inputText": "",
                         "input": parse(&tc.arguments),
+                        // 没有输出就是还在跑（服务端此刻正在执行）
                         "state": if output.is_some() { "output" } else { "ready" },
                         "output": output,
                     }));
@@ -732,9 +646,9 @@ pub async fn run_turn(
     let sid = {
         let mut store = core.state.chat.write().await;
         let sess = store.active_mut();
-        // 上下文作为独立消息，**放在用户输入之前**，且只生成这一次。
-        // 这样历史前缀单调增长，每轮都能命中上一轮的缓存。
-        sess.messages.push(ChatMessage::System(context_block(core)));
+        // 历史里只追加两类东西：待补的系统提示词（见 `ensure_system_prompt`）
+        // 和这条用户消息。不插任何“每轮重发”的上下文块。
+        ensure_system_prompt(sess, SYSTEM_PROMPT);
         sess.messages.push(ChatMessage::User(user_text.into()));
         sess.maybe_title(user_text);
         sess.updated_at = now_ms();
@@ -772,64 +686,6 @@ impl Drop for TurnGuard {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.0.state.mark_sessions_dirty();
     }
-}
-
-/// 审批结果回来之后，从这里继续。
-pub async fn resolve_approval(
-    core: &Core,
-    provider: &Provider,
-    approval_id: &str,
-    approved: bool,
-    tx: mpsc::UnboundedSender<Value>,
-) -> anyhow::Result<()> {
-    core.state
-        .turn_active
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    let _guard = TurnGuard(core.clone());
-    // 审批挂在哪个会话上就回到哪个会话，不管当前激活的是谁
-    let pending = {
-        let mut store = core.state.chat.write().await;
-        store
-            .sessions
-            .iter_mut()
-            .find_map(|s| s.pending.remove(approval_id).map(|p| (s.id.clone(), p)))
-    };
-    let Some((sid, p)) = pending else {
-        let _ = tx
-            .send(sse::error(&format!("未知的审批 ID: {approval_id}")));
-        return Ok(());
-    };
-
-    let _ = tx
-        .send(sse::tool_approval_response(approval_id, approved, ""));
-
-    if approved {
-        let output = execute_tool(core, &p.name, &p.arguments, Some((&tx, &p.tool_call_id))).await;
-        let _ = tx
-            .send(sse::tool_output_available(&p.tool_call_id, output.clone()));
-        append(
-            core,
-            &sid,
-            ChatMessage::Tool {
-                tool_call_id: p.tool_call_id.clone(),
-                content: output.to_string(),
-            },
-        )
-        .await;
-    } else {
-        let _ = tx.send(sse::tool_output_denied(&p.tool_call_id));
-        append(
-            core,
-            &sid,
-            ChatMessage::Tool {
-                tool_call_id: p.tool_call_id.clone(),
-                content: "用户拒绝了这个操作。请不要重试，改为向用户说明情况。".into(),
-            },
-        )
-        .await;
-    }
-
-    drive(core, provider, &sid, &tx).await
 }
 
 /// 一轮 LLM 调用的产出
@@ -883,95 +739,23 @@ async fn drive(
             return Ok(());
         }
 
-        let mut all_auto = true;
-        let mut pending_any = false;
-
-        for (idx, call) in calls.iter().enumerate() {
-            let kind = find_tool(&call.name).map(|t| t.kind);
-
-            match kind {
-                Some(ToolKind::ReadOnly) => {
-                    let output =
-                        execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))).await;
-                    send(tx, sse::tool_output_available(&call.id, output.clone())).await;
-                    append(
-                        core,
-                        sid,
-                        ChatMessage::Tool {
-                            tool_call_id: call.id.clone(),
-                            content: output.to_string(),
-                        },
-                    )
-                    .await;
-                }
-                Some(ToolKind::SideEffecting) => {
-                    if core.state.auto_approve() {
-                        // 默认路径：直接执行，不打断 agent
-                        let output =
-                        execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))).await;
-                        send(tx, sse::tool_output_available(&call.id, output.clone())).await;
-                        append(
-                            core,
-                            sid,
-                            ChatMessage::Tool {
-                                tool_call_id: call.id.clone(),
-                                content: output.to_string(),
-                            },
-                        )
-                        .await;
-                    } else {
-                        // 审批模式（auto_approve = false）
-                        all_auto = false;
-                        pending_any = true;
-                        let approval_id = format!("appr_{}", uuid::Uuid::now_v7());
-                        let reason = approval_reason(&call.name, &call.arguments);
-                        {
-                            let mut store = core.state.chat.write().await;
-                            let Some(sess) = store.get_mut(sid) else { break };
-                            sess.pending.insert(
-                                approval_id.clone(),
-                                PendingApproval {
-                                    tool_call_id: call.id.clone(),
-                                    name: call.name.clone(),
-                                    arguments: call.arguments.clone(),
-                                },
-                            );
-                        }
-                        send(
-                            tx,
-                            sse::tool_approval_request(&call.id, &approval_id, &reason),
-                        )
-                        .await;
-                    }
-                }
-                None => {
-                    // 模型编了一个不存在的工具，如实告诉它
-                    let msg = format!("错误：没有名为 {} 的工具", call.name);
-                    send(tx, sse::tool_output_available(&call.id, json!({ "error": msg }))).await;
-                    append(
-                        core,
-                        sid,
-                        ChatMessage::Tool {
-                            tool_call_id: call.id.clone(),
-                            content: msg,
-                        },
-                    )
-                    .await;
-                }
-            }
-            let _ = idx;
+        for call in &calls {
+            // 工具一律直接执行，没有审批环节。不存在的工具由 execute_tool
+            // 返回错误，模型看到「未知工具 X」自己会改。
+            let output =
+                execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))).await;
+            send(tx, sse::tool_output_available(&call.id, output.clone())).await;
+            append(
+                core,
+                sid,
+                ChatMessage::Tool {
+                    tool_call_id: call.id.clone(),
+                    content: output.to_string(),
+                },
+            )
+            .await;
         }
-
-        if pending_any {
-            // 停下等人。前端批准/拒绝后会打 /api/approve 继续。
-            send(tx, sse::finish()).await;
-            return Ok(());
-        }
-        if !all_auto {
-            send(tx, sse::finish()).await;
-            return Ok(());
-        }
-        // 全是只读工具 → 继续下一轮
+        // 工具结果回灌，继续下一轮
     }
 
     send(
@@ -983,23 +767,16 @@ async fn drive(
     Ok(())
 }
 
-/// 调一次 LLM，把 delta 转成 chunk 推出去，返回本轮产出。
-async fn stream_one(
-    core: &Core,
-    provider: &Provider,
-    sid: &str,
-    tx: &mpsc::UnboundedSender<Value>,
-) -> anyhow::Result<StepOutput> {
-    // SYSTEM_PROMPT 是静态常量，**这里不做任何插值** —— 见它上面的说明。
-    // 动态的界面/环境信息在 run_turn 里作为独立消息进历史，保证前缀可缓存。
-    let (messages, session_id) = {
-        let store = core.state.chat.read().await;
-        let sess = store
-            .get(sid)
-            .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-        (build_messages(sess)?, sess.provider_session.clone())
-    };
-
+/// 构造一次完整的请求体（含工具表）。
+///
+/// 抽成纯函数有两个理由：
+/// 1. 让「工具表也是可缓存前缀的一部分」这条不变式**可测** —— 只比
+///    `messages` 不够，前一轮的完整请求体必须原样出现在后一轮里。
+/// 2. 序列化成 `Value` 之后才能补 `stream_options`：
+///    `ChatCompletionStreamOptions` 没有 derive Default，逐字段构造很脆，
+///    而 `create_stream_byot` 的 T0 只要 `Serialize`。
+fn build_request(sess: &ChatSession, model: &str) -> anyhow::Result<Value> {
+    let messages = build_messages(sess)?;
     let tools: Vec<ChatCompletionTools> = tools()
         .iter()
         .map(|t| {
@@ -1014,18 +791,34 @@ async fn stream_one(
         .collect::<anyhow::Result<_>>()?;
 
     let req = CreateChatCompletionRequestArgs::default()
-        .model(provider.model.clone())
+        .model(model)
         .messages(messages)
         .tools(tools)
         .stream(true)
         .build()?;
 
-    // 要 provider 在流末尾回报 token 用量。
-    //
-    // `ChatCompletionStreamOptions` 没有 derive Default，逐字段构造很脆，
-    // 所以先序列化成 Value 再补一个键 —— `create_stream_byot` 的 T0 只要 Serialize。
+    // 要 provider 在流末尾回报 token 用量
     let mut req = serde_json::to_value(&req)?;
     req["stream_options"] = json!({ "include_usage": true });
+    Ok(req)
+}
+
+/// 调一次 LLM，把 delta 转成 chunk 推出去，返回本轮产出。
+async fn stream_one(
+    core: &Core,
+    provider: &Provider,
+    sid: &str,
+    tx: &mpsc::UnboundedSender<Value>,
+) -> anyhow::Result<StepOutput> {
+    // SYSTEM_PROMPT 是静态常量，**这里不做任何插值** —— 见它上面的说明。
+    // 动态的界面/环境信息在 run_turn 里作为独立消息进历史，保证前缀可缓存。
+    let (req, session_id) = {
+        let store = core.state.chat.read().await;
+        let sess = store
+            .get(sid)
+            .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+        (build_request(sess, &provider.model)?, sess.provider_session.clone())
+    };
 
     let client = provider.client(&session_id)?;
     let mut stream = client
@@ -1120,15 +913,6 @@ async fn stream_one(
         send(tx, c).await;
     }
 
-    // 被 max_tokens 截断时要告诉用户，否则看起来就像模型话说到一半
-    if finish.as_deref() == Some("length") {
-        send(
-            tx,
-            sse::data_part("warning", json!({ "message": "输出被 max_tokens 截断" })),
-        )
-        .await;
-    }
-
     // 把缓存命中情况摆出来 —— 这是验证 prompt cache 的唯一硬证据
     if let Some(u) = &usage {
         match u.cache_hit_ratio() {
@@ -1150,7 +934,7 @@ async fn stream_one(
     }
 
 
-    let calls: Vec<RecordedToolCall> = acc
+    let mut calls: Vec<RecordedToolCall> = acc
         .into_iter()
         .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
         .map(|(id, name, arguments)| RecordedToolCall {
@@ -1159,6 +943,32 @@ async fn stream_one(
             arguments,
         })
         .collect();
+
+    // 被输出长度上限截断时要告诉用户，否则看起来就像模型话说到一半。
+    //
+    // 而且这一轮的**工具调用全部作废**：截断意味着参数 JSON 很可能是半个
+    // 对象，而 `execute_tool` 遇到坏 JSON 会退化成 `{}` 再报「缺少参数」——
+    // 拿着坏参数去点手机，比直接说清楚要危险得多。
+    if finish.as_deref() == Some("length") {
+        let dropped = calls.len();
+        let message = if dropped > 0 {
+            format!("输出达到长度上限被截断，{dropped} 个不完整的工具调用已作废，请重试")
+        } else {
+            "输出达到长度上限被截断（provider 的 max_tokens）".to_string()
+        };
+        send(tx, sse::data_part("warning", json!({ "message": message }))).await;
+        for c in &calls {
+            send(
+                tx,
+                sse::tool_output_available(
+                    &c.id,
+                    json!({ "error": "输出被截断，本次工具调用已作废，请重试" }),
+                ),
+            )
+            .await;
+        }
+        calls.clear();
+    }
 
     for c in &calls {
         let input: Value = serde_json::from_str(&c.arguments).unwrap_or(json!({}));
@@ -1338,7 +1148,8 @@ async fn execute_tool(
 ) -> Value {
     let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
 
-    // bash / edit 不走设备（DeviceApi）：bash 起 proot 子进程，edit 直接改 rootfs 里的文件
+    // bash / edit 都不走设备（`DeviceApi`）：bash 起 proot 子进程，
+    // edit 直接改 rootfs 里的文件。
     if name == "bash" {
         let script = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if script.trim().is_empty() {
@@ -1394,134 +1205,9 @@ async fn execute_tool(
         };
     }
 
-    let cmd = match name {
-        "device_snapshot" => Command::Snapshot,
-        "device_tap" => match args.get("i").and_then(|v| v.as_u64()) {
-            Some(i) => Command::TapNode { i: i as u32 },
-            None => return json!({ "error": "缺少参数 i" }),
-        },
-        "device_type" => {
-            let i = args.get("i").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let text = args
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            Command::SetText { i, text }
-        }
-        "device_key" => Command::Key {
-            name: args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("back")
-                .to_string(),
-        },
-        "device_launch" => Command::Launch {
-            package: args
-                .get("package")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        },
-        other => return json!({ "error": format!("未知工具 {other}") }),
-    };
-
-    let ack = core.dispatch(cmd).await;
-
-    // 设备操作会改变界面。把**最新快照一并回给模型**，否则它只能拿
-    // 对话历史里的旧画面脉猜 —— 实测就会说出"已点击"却复述旧界面。
-    // 等一下是给设备侧读树/回推快照留时间。
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    match core.state.latest_snapshot() {
-        Some(snap) => {
-            let mut out = summarize(&snap);
-            out["result"] = ack;
-            out
-        }
-        None => ack,
-    }
-}
-
-/// 把 UI 树压成给模型看的紧凑文本。
-///
-/// 决策 D10 的落地：只保留可交互节点 + 有文本的节点，并且用
-/// `[i] Class "text" (x,y)` 这种紧凑格式，避免几百个节点撑爆上下文。
-pub fn summarize(snap: &UiSnapshot) -> Value {
-    let mut lines = vec![format!(
-        "包名: {}\nActivity: {}\n屏幕: {}x{}",
-        snap.package, snap.activity, snap.screen.w, snap.screen.h
-    )];
-
-    for n in &snap.nodes {
-        let interactive = n.a.interesting();
-        if !interactive && n.t.is_empty() {
-            continue;
-        }
-        let mut line = format!("[{}] {}", n.i, n.c);
-        if !n.t.is_empty() {
-            line.push_str(&format!(" \"{}\"", n.t.replace('\n', " ")));
-        }
-        if !n.id.is_empty() {
-            line.push_str(&format!(" id={}", n.id));
-        }
-        let [l, t, r, b] = n.b;
-        line.push_str(&format!(" ({},{},{},{})", l, t, r, b));
-        let mut caps = Vec::new();
-        if n.a.clickable {
-            caps.push("clickable");
-        }
-        if n.a.editable {
-            caps.push("editable");
-        }
-        if n.a.scrollable {
-            caps.push("scrollable");
-        }
-        if n.a.checkable {
-            caps.push("checkable");
-        }
-        if !n.a.enabled {
-            caps.push("disabled");
-        }
-        if !caps.is_empty() {
-            line.push_str(&format!(" [{}]", caps.join(",")));
-        }
-        if !n.s.is_empty() {
-            line.push_str(&format!(" {{{}}}", n.s));
-        }
-        lines.push(line);
-    }
-
-    json!({ "text": lines.join("\n"), "nodes": snap.nodes.len() })
-}
-
-fn approval_reason(name: &str, arguments: &str) -> String {
-    let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
-    match name {
-        "bash" => {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let head: String = cmd.chars().take(120).collect();
-            format!("在 Linux 沙箱里执行：{head}")
-        }
-        "edit" => format!(
-            "编辑文件 {}",
-            args.get("path").and_then(|v| v.as_str()).unwrap_or("")
-        ),
-        "device_tap" => format!(
-            "点击节点 {}（有副作用，会离开当前界面）",
-            args.get("i").map(|v| v.to_string()).unwrap_or_default()
-        ),
-        "device_type" => "向输入框写入文本".into(),
-        "device_key" => format!(
-            "按 {} 键",
-            args.get("name").and_then(|v| v.as_str()).unwrap_or("back")
-        ),
-        "device_launch" => format!(
-            "启动应用 {}",
-            args.get("package").and_then(|v| v.as_str()).unwrap_or("")
-        ),
-        _ => "该操作需要确认".into(),
-    }
+    // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）现在**不作为工具**
+    // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
+    json!({ "error": format!("未知工具 {name}") })
 }
 
 // ---------------------------------------------------------------------------
@@ -1547,13 +1233,12 @@ mod tests {
     fn message_prefix_is_stable_across_turns() {
         let mut sess = ChatSession::default();
 
-        // 第 1 轮
-        sess.messages
-            .push(ChatMessage::System(context_block_from(None, None)));
+        // 第 1 轮：run_turn 干的事
+        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
         sess.messages.push(ChatMessage::User("第一问".into()));
         let turn1 = wire(&sess);
 
-        // 第 2 轮：追加 assistant / tool / 新上下文 / 新用户输入
+        // 第 2 轮：追加 assistant / tool / 新用户输入
         sess.messages.push(ChatMessage::Assistant {
             content: "答".into(),
             reasoning: "想".into(),
@@ -1567,8 +1252,7 @@ mod tests {
             tool_call_id: "c1".into(),
             content: "ok".into(),
         });
-        sess.messages
-            .push(ChatMessage::System(context_block_from(None, None)));
+        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
         sess.messages.push(ChatMessage::User("第二问".into()));
         let turn2 = wire(&sess);
 
@@ -1578,6 +1262,41 @@ mod tests {
             &turn1[..],
             "第 2 轮不是以第 1 轮为前缀 → prompt cache 全部失效"
         );
+    }
+
+    /// 改了系统提示词之后，**老会话的前缀一个字都不能动**。
+    ///
+    /// 系统提示词存在历史里（第一条），新提示词是**追加上去的**一条 system
+    /// 消息 —— 老前缀原样保留（缓存照命中），模型也能看到新要求。
+    /// 绝不能把第一条替掉。
+    #[test]
+    fn a_prompt_change_is_appended_and_keeps_the_prefix() {
+        let mut sess = ChatSession::default();
+        ensure_system_prompt(&mut sess, "旧提示词");
+        sess.messages.push(ChatMessage::User("第一问".into()));
+        sess.messages.push(ChatMessage::Assistant {
+            content: "答".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+        });
+        let before = wire(&sess);
+
+        // 版本升级了，下一轮开工前
+        ensure_system_prompt(&mut sess, "新提示词");
+        let after = wire(&sess);
+        assert_eq!(&after[..before.len()], &before[..], "老前缀被动 → 缓存全废");
+        assert_eq!(after[0]["content"], "旧提示词", "第一条必须是旧的，不能替换");
+        assert_eq!(after.last().unwrap()["content"], "新提示词");
+
+        // 同一条提示词不能反复追加
+        let n = after.len();
+        ensure_system_prompt(&mut sess, "新提示词");
+        assert_eq!(wire(&sess).len(), n, "重复追加了同一条提示词");
+
+        // 再发一轮，前缀继续单调增长
+        sess.messages.push(ChatMessage::User("第二问".into()));
+        let next = wire(&sess);
+        assert_eq!(&next[..n], &after[..]);
     }
 
     #[test]
@@ -1595,48 +1314,94 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_screen_does_not_change_the_cached_prefix() {
-        // 界面变了，但 system prompt 和之前的历史都不能变 ——
-        // 变化只能出现在新追加的上下文消息里
-        let a = context_block_from(None, None);
-        let b = context_block_from(Some(true), None);
-        assert_ne!(a, b, "上下文块本身应该反映环境差异");
-
+    fn the_request_is_the_history_verbatim() {
+        // `build_messages` 就是「历史原样」：不拼、不前置、不插上下文块。
+        // 系统提示词是历史里的一条（`ensure_system_prompt` 注的），
+        // 所以 请求体长度 == 历史长度，一条不多一条不少。
         let mut sess = ChatSession::default();
-        sess.messages.push(ChatMessage::System(a));
-        sess.messages.push(ChatMessage::User("q".into()));
-        let before = wire(&sess);
-
+        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        sess.messages.push(ChatMessage::User("问".into()));
         sess.messages.push(ChatMessage::Assistant {
-            content: "a".into(),
+            content: "答".into(),
             reasoning: String::new(),
             tool_calls: vec![],
         });
-        sess.messages.push(ChatMessage::System(b));
-        let after = wire(&sess);
+        sess.messages.push(ChatMessage::User("再问".into()));
 
-        assert_eq!(&after[..before.len()], &before[..], "前缀被动了");
+        let w = wire(&sess);
+        assert_eq!(w.len(), sess.messages.len(), "请求体里多出了别的东西");
+        assert_eq!(w[0]["role"], "system");
+        assert_eq!(w[0]["content"], SYSTEM_PROMPT);
+        assert_eq!(
+            w.iter().filter(|m| m["role"] == "system").count(),
+            1,
+            "除了第一条，不该再有任何 system 消息"
+        );
+    }
+
+    /// 只比 `messages` 不够：工具表也是可缓存前缀的一部分。
+    /// 完整请求体（含 tools / stream_options）跨轮必须是前缀关系。
+    #[test]
+    fn full_request_body_is_prefix_stable_across_turns() {
+        let mut sess = ChatSession::default();
+        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        sess.messages.push(ChatMessage::User("第一问".into()));
+        let req1 = build_request(&sess, "deepseek-v4.1-flash").unwrap();
+
+        sess.messages.push(ChatMessage::Assistant {
+            content: "答".into(),
+            reasoning: "想".into(),
+            tool_calls: vec![RecordedToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            }],
+        });
+        sess.messages.push(ChatMessage::Tool {
+            tool_call_id: "c1".into(),
+            content: "ok".into(),
+        });
+        sess.messages.push(ChatMessage::User("第二问".into()));
+        let req2 = build_request(&sess, "deepseek-v4.1-flash").unwrap();
+
+        assert_eq!(req1["tools"], req2["tools"], "工具表变了 → 整段前缀缓存失效");
+        assert_eq!(req1["model"], req2["model"]);
+        assert_eq!(req1["stream_options"], req2["stream_options"]);
+        let a = req1["messages"].as_array().unwrap();
+        let b = req2["messages"].as_array().unwrap();
+        assert_eq!(&b[..a.len()], &a[..], "完整请求体不是前缀关系");
     }
 
     #[test]
     fn tool_schema_order_and_names_are_fixed() {
         // 工具表也是可缓存前缀的一部分。顺序必须稳定，
         // 所以这里把顺序钉死：谁想改都得先改这个测试。
+        //
+        // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）暂时**不作为工具**
+        // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
         let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
-        assert_eq!(
-            names,
-            vec![
-                "device_snapshot",
-                "device_tap",
-                "device_type",
-                "device_key",
-                "bash",
-                "edit",
-                "device_launch",
-            ]
-        );
+        assert_eq!(names, vec!["bash", "edit"]);
         // 重复调用必须完全一致
         assert_eq!(names, tools().iter().map(|t| t.name).collect::<Vec<_>>());
+    }
+
+    /// 删掉的设备工具不能在提示词里留名字。
+    ///
+    /// 留了模型就会去调一个不存在的工具，换回「错误：没有名为 device_snapshot
+    /// 的工具」，白烧一轮，而且这种提示词与实际工具表不一致的 bug 很难在真机上看出来。
+    #[test]
+    fn removed_device_tools_are_gone_from_prompt_and_registry() {
+        let gone = [
+            "device_snapshot",
+            "device_tap",
+            "device_type",
+            "device_key",
+            "device_launch",
+        ];
+        for g in gone {
+            assert!(!SYSTEM_PROMPT.contains(g), "提示词还在提 {g}");
+            assert!(!tools().iter().any(|t| t.name == g), "工具表里还有 {g}");
+        }
     }
 
     #[test]
@@ -1646,18 +1411,6 @@ mod tests {
         let twice = serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
             .unwrap();
         assert_eq!(once, twice);
-    }
-
-    #[test]
-    fn side_effecting_tools_are_the_ones_that_can_change_things() {
-        let side: Vec<&str> = tools()
-            .iter()
-            .filter(|t| t.kind == ToolKind::SideEffecting)
-            .map(|t| t.name)
-            .collect();
-        assert!(side.contains(&"bash"));
-        assert!(side.contains(&"edit"));
-        assert!(!side.contains(&"device_snapshot"), "读界面不该算有副作用");
     }
 
     #[test]
@@ -1794,6 +1547,26 @@ mod tests {
         .unwrap();
         assert_eq!(ds.cached_tokens(), Some(80));
         assert_eq!(ds.cache_hit_ratio(), Some(0.8));
+
+        // 两套字段同时出现、值不一致时取**大**的那个。之前用 `.or()`，
+        // OpenAI 系填了 `cached_tokens: 0`（而不是省略）就会把真值吞掉，
+        // 日志误报成 0% 命中 —— 而这是判断缓存有没有生效的唯一硬证据。
+        let both: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": { "cached_tokens": 0 },
+            "prompt_cache_hit_tokens": 768
+        }))
+        .unwrap();
+        assert_eq!(both.cached_tokens(), Some(768));
+        assert_eq!(both.cache_hit_ratio(), Some(0.768));
+
+        // 命中率夹在 0..1（有的实现里 prompt_tokens 是 miss-only）
+        let weird: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 250
+        }))
+        .unwrap();
+        assert_eq!(weird.cache_hit_ratio(), Some(1.0));
 
         // 冷启动
         let cold: Usage = serde_json::from_value(json!({

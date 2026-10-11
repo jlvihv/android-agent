@@ -293,15 +293,21 @@ Rust core                     ▼
 
 ```jsonc
 {
-  "name": "linux_run",
+  "name": "bash",
   "description": "在设备上的 Alpine Linux 沙箱里执行 shell 命令。可以装包(apk add)、跑 python/node、读写文件。",
-  "kind": "NeedsApproval",   // 有副作用
-  "schema": { "script": "string" }
+  "schema": { "command": "string", "timeout": "number?" }
 }
 ```
 
-这样 agent 就有了真正的计算机：读界面（`device_snapshot`）+ 操作界面（`device_tap`）
-+ **跑代码**（`linux_run`）。这三件加起来才是 OpenMinis 那个形态。
+（早期设计里工具分 `ReadOnly` / `NeedsApproval` 两类，后者要等用户点批准。
+审批环节后来整个删了：工具一律直接执行，`ToolKind` 也随之消失。）
+
+这样 agent 就有了真正的计算机：**跑代码**（`bash`）+ 沙箱里的文件系统，
+这才是 OpenMinis 那个形态。
+
+> 早期的设计把读界面 / 操作界面做成 `device_snapshot` / `device_tap` 两个工具。
+> 现在它们不作为工具暴露给模型了 —— 以后收进沙箱里的一个命令、由 `linux_run`
+> （现名 `bash`）调用，这样模型只需要理解 shell，工具表也只有两个。
 
 ### 决策点
 

@@ -139,7 +139,7 @@ genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B �
 |---|---|---|
 | Rust 侧 | 手写一个 SSE 编码器（~150 行），按规范吐 `data: {...}` | 自己设计事件类型 |
 | 前端 | `useChat` / assistant-ui 直接吃，零状态机 | 自己写流式状态机 |
-| 现成语义 | text / reasoning / tool-input / tool-output / **tool-approval** / step / error / data-* 全都有 | 全要自己定义 |
+| 现成语义 | text / reasoning / tool-input / tool-output / step / error / data-* 全都有 | 全要自己定义 |
 | 规范 | 公开文档化，其他语言后端已有先例（FastAPI 示例） | — |
 
 规范要点（已核实）：
@@ -148,11 +148,14 @@ genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B �
 - 结尾：`data: [DONE]`
 - 关键事件：`start` / `start-step` / `finish-step` / `finish` /
   `text-start|delta|end` / `reasoning-start|delta|end` /
-  `tool-input-start|delta|available` / `tool-output-available|denied` /
-  `tool-approval-request|response` / `error` / `abort` / `data-*`
+  `tool-input-start|delta|available` / `tool-output-available` /
+  `error` / `abort` / `data-*`
 
-**倾向：A**。这个协议的 `tool-approval-request` / `tool-approval-response` 正好就是我们要的审批流，
-白拿。
+**倾向：A**。协议公开且语义现成（工具输出、思考、步骤、`data-*` 都现成），
+前端换回官方 `@ai-sdk/svelte` 也不用改 Rust 侧。
+
+> 当初选它的一个理由是协议自带 `tool-approval-request|response`。后来审批环节整个
+> 删掉了（工具一律直接执行），但协议本身仍然值这个价。
 
 ### D8 — Rust ↔ Gradle 怎么串
 

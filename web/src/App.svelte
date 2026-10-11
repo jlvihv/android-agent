@@ -7,7 +7,7 @@
    * 没有魔法数字：尺寸走 Tailwind 刻度，顶部/底部由安全区给。
    */
   import { store } from './lib/store.svelte.ts';
-  import { consume, streamFrom, type Message, type ToolPart } from './lib/sse';
+  import { consume, streamFrom, type Message } from './lib/sse';
   import { uid } from './lib/uid';
   import Icon from './components/Icon.svelte';
   import Composer from './components/Composer.svelte';
@@ -205,15 +205,6 @@
   }
 
   const stop = () => controller?.abort();
-
-  function decide(msg: Message, part: ToolPart, approved: boolean) {
-    if (!part.approvalId || busy) return;
-    part.state = approved ? 'ready' : 'denied';
-    void run(store.resumeStreaming(msg), '/api/approve', {
-      approvalId: part.approvalId,
-      approved,
-    });
-  }
 </script>
 
 <div class="relative h-full overflow-hidden bg-ink" style:--composer-h="{composerH}px">
@@ -227,7 +218,7 @@
     {#if messages.length === 0}
       <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
     {:else}
-      <MessageList {messages} ondecide={decide} />
+      <MessageList {messages} />
     {/if}
   </main>
 

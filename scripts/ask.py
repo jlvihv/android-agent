@@ -20,7 +20,7 @@ def stream(path: str, body: dict) -> dict:
         data=json.dumps(body).encode(),
         headers={"content-type": "application/json"},
     )
-    text, reasoning, tools, outputs, approvals, errs = "", "", {}, {}, [], []
+    text, reasoning, tools, outputs, errs = "", "", {}, {}, []
     with urllib.request.urlopen(req, timeout=300) as r:
         buf = b""
         while True:
@@ -40,7 +40,6 @@ def stream(path: str, body: dict) -> dict:
                             "reasoning": reasoning,
                             "tools": tools,
                             "outputs": outputs,
-                            "approvals": approvals,
                             "errs": errs,
                         }
                     c = json.loads(p)
@@ -53,8 +52,6 @@ def stream(path: str, body: dict) -> dict:
                         tools[c["toolCallId"]] = (c["toolName"], c["input"])
                     elif t == "tool-output-available":
                         outputs[c["toolCallId"]] = c["output"]
-                    elif t == "tool-approval-request":
-                        approvals.append((c["approvalId"], c["toolCallId"], c["reason"]))
                     elif t == "error":
                         errs.append(c["errorText"])
     return {
@@ -62,7 +59,6 @@ def stream(path: str, body: dict) -> dict:
         "reasoning": reasoning,
         "tools": tools,
         "outputs": outputs,
-        "approvals": approvals,
         "errs": errs,
     }
 
@@ -77,7 +73,7 @@ def show(round_no: int, r: dict) -> None:
         out = r["outputs"].get(cid)
         arg = json.dumps(inp, ensure_ascii=False)
         if out is None:
-            print(f"🔧 {name}({arg})  ← 未执行（等审批）")
+            print(f"🔧 {name}({arg})  ← 未执行")
         else:
             body = json.dumps(out, ensure_ascii=False)
             if isinstance(out, dict) and "stdout" in out:
@@ -99,17 +95,6 @@ def main() -> int:
     show(1, r)
     if r["errs"]:
         return 1
-
-    # 自动批准，最多来回 6 次（一个回合可能触发多次工具审批）
-    for i in range(2, 8):
-        if not r["approvals"]:
-            break
-        aid = r["approvals"][0][0]
-        print(f"\n✅ 自动批准 {aid}")
-        r = stream("/api/approve", {"approvalId": aid, "approved": True})
-        show(i, r)
-        if r["errs"]:
-            return 1
 
     print()
     return 0

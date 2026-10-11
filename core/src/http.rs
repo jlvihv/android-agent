@@ -31,7 +31,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/edit", post(edit_file))
         .route("/api/llm", post(set_llm))
         .route("/api/chat", post(chat))
-        .route("/api/approve", post(approve))
         .route("/api/session", get(get_session))
         .route("/api/sessions", get(list_sessions).post(new_session))
         .route("/api/sessions/activate", post(activate_session))
@@ -67,7 +66,6 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
         })),
-        "autoApprove": st.auto_approve(),
         // 只报“配没配”，不泄 key
         "llm": provider.map(|p| json!({
             "name": p.name,
@@ -206,13 +204,6 @@ struct ChatBody {
     demo: bool,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApproveBody {
-    approval_id: String,
-    approved: bool,
-}
-
 /// `POST /api/chat` → AI SDK UI Message Stream。
 ///
 /// 配了 provider 就跑真实 agent loop（`agent.rs`），否则回退到脚本演示流。
@@ -260,40 +251,6 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     sse_response(rx)
 }
 
-/// `POST /api/approve` → 继续被挂起的回合。
-async fn approve(State(st): State<Arc<AppState>>, Json(body): Json<ApproveBody>) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
-    let core = Core {
-        state: st.clone(),
-    };
-
-    let Some(p) = st.llm().or_else(Provider::from_env) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "未配置 LLM provider（需要 OPENCODE_API_KEY 或 AGENT_LLM_API_KEY）",
-        )
-            .into_response();
-    };
-
-    let approval_id = body.approval_id.clone();
-    let approved = body.approved;
-    st.log(
-        "info",
-        format!("approve {approval_id} → {approved}"),
-    );
-
-    tokio::spawn(async move {
-        let txc = tx.clone();
-        if let Err(e) =
-            crate::agent::resolve_approval(&core, &p, &approval_id, approved, txc).await
-        {
-            let _ = tx.send(sse::error(&format!("{e:#}")));
-        }
-    });
-
-    sse_response(rx)
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LlmBody {
@@ -328,6 +285,9 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
     );
     let dir = st.data_dir.read().ok().and_then(|g| g.clone());
     st.set_llm(p, dir.as_deref());
+    // 换了 provider / model，缓存前缀的语义就变了：给所有会话换一个
+    // provider session id，否则 provider 侧会把新前缀路由到旧模型的缓存上。
+    st.rotate_provider_sessions().await;
 
     Json(json!({ "ok": true })).into_response()
 }

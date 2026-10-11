@@ -45,20 +45,6 @@ export type UiChunk =
       /** 工具还在跑，这是阶段性结果（bash 的实时输出）。最终结果不带它 */
       preliminary?: boolean;
     }
-  | { type: 'tool-output-denied'; toolCallId: string }
-  | {
-      type: 'tool-approval-request';
-      toolCallId: string;
-      approvalId: string;
-      reason?: string;
-      isAutomatic?: boolean;
-    }
-  | {
-      type: 'tool-approval-response';
-      approvalId: string;
-      approved: boolean;
-      reason?: string;
-    }
   | { type: `data-${string}`; data: unknown };
 
 const DONE = Symbol('done');
@@ -164,10 +150,8 @@ export type ToolPart = {
   /** 流式到达的原始 JSON 文本 */
   inputText: string;
   input: unknown;
-  state: 'streaming' | 'ready' | 'output' | 'denied' | 'awaiting-approval';
+  state: 'streaming' | 'ready' | 'output';
   output?: unknown;
-  approvalId?: string;
-  approvalReason?: string;
 };
 
 export type Part =
@@ -286,39 +270,6 @@ export function applyChunk(msg: Message, c: UiChunk): void {
       }
       break;
     }
-    case 'tool-output-denied': {
-      const p = findTool(c.toolCallId);
-      if (p) p.state = 'denied';
-      break;
-    }
-    case 'tool-approval-request': {
-      let p = findTool(c.toolCallId);
-      if (!p) {
-        p = {
-          type: 'tool',
-          toolCallId: c.toolCallId,
-          toolName: '',
-          inputText: '',
-          input: undefined,
-          state: 'awaiting-approval',
-        };
-        msg.parts.push(p);
-      }
-      // 省略 isAutomatic 才表示需要显式批准
-      p.state = c.isAutomatic ? 'ready' : 'awaiting-approval';
-      p.approvalId = c.approvalId;
-      p.approvalReason = c.reason;
-      break;
-    }
-    case 'tool-approval-response': {
-      const p = msg.parts.find(
-        (x): x is ToolPart =>
-          x.type === 'tool' && x.approvalId === c.approvalId,
-      );
-      if (p && !c.approved) p.state = 'denied';
-      break;
-    }
-
     case 'start-step':
       msg.steps += 1;
       break;

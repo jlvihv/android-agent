@@ -175,16 +175,6 @@ class AgentStore {
     return this.streaming!;
   }
 
-  /**
-   * 继续往一条已有的消息里追加流（审批通过后接着跑）。
-   * 比开新消息好：审批卡片和后续结果在同一个气泡里。
-   */
-  resumeStreaming(msg: Message): Message {
-    msg.done = false;
-    this.streaming = msg;
-    return this.streaming!;
-  }
-
   clearLogs(): void {
     this.logs = [];
     this.acks = [];

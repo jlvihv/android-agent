@@ -10,6 +10,7 @@
 //! 已知不支持：Anthropic / Gemini 的**原生**协议（需走中转或另加 adapter）。
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
@@ -158,18 +159,34 @@ impl Provider {
 
         // 把自建的 reqwest client 注入进去。
         // `Client::with_http_client` 是 async-openai 给的官方口子。
-        //
+        Ok(Client::with_config(cfg).with_http_client(shared_http()?))
+    }
+}
+
+/// 进程级共享的 HTTP client。
+///
+/// 之前每次 `stream_one` 都 `ClientBuilder::new()…build()` 造一个新的，而
+/// `reqwest::Client` 本身就是连接池 —— 等于每个 step 都重新做 TLS 握手，
+/// 完全丢掉 keep-alive。一个回合 5–8 次 LLM 调用，在手机网络上是白送的 RTT。
+///
+/// TLS 配置与 provider 无关（只用内嵌的 Mozilla 根证书，见 `tls_config`），
+/// 所以全进程共享一个就够。`reqwest::Client` 的内部是 Arc，克隆很便宜。
+fn shared_http() -> anyhow::Result<reqwest::Client> {
+    static HTTP: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    HTTP.get_or_init(|| {
+        let tls = Provider::tls_config().map_err(|e| format!("{e:#}"))?;
         // 注意：`tls_backend_preconfigured` **自己会包一层 Some** ——
         // 它的实现是 `let mut tls = Some(tls)` 然后 downcast 到
         // `Option<rustls::ClientConfig>`。所以这里要传裸值，包了就变成
         // `Option<Option<..>>`，downcast 失败，报
         // "Unknown TLS backend passed to `use_preconfigured_tls`"。
-        let http = reqwest::ClientBuilder::new()
-            .tls_backend_preconfigured(Self::tls_config()?)
-            .build()?;
-
-        Ok(Client::with_config(cfg).with_http_client(http))
-    }
+        reqwest::ClientBuilder::new()
+            .tls_backend_preconfigured(tls)
+            .build()
+            .map_err(|e| format!("{e:#}"))
+    })
+    .clone()
+    .map_err(|e| anyhow::anyhow!("建 HTTP client 失败: {e}"))
 }
 
 /// 构造一条最小的 chat 请求。存在的意义之一是让 `chat-completion`

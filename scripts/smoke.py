@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""端到端冒烟测试：真实 LLM + 审批流。
+"""端到端冒烟测试：真实 LLM + 工具执行。
 
 前提：core 已在 8787 跑着，且配好了 provider 环境变量。
 
@@ -7,8 +7,10 @@
     python3 scripts/smoke.py
 
 它会走完整条链路：
-    用户请求 → 模型读界面（只读，自动执行）→ 模型请求点击（需审批）
-    → 批准 → 设备执行 → 新快照 → 模型复述结果
+
+    用户请求 → 模型调 bash（跑命令）→ 结果回灌 → 模型给出最终答复
+
+工具一律直接执行，没有审批环节。
 """
 
 import json
@@ -26,7 +28,7 @@ def stream(path: str, body: dict) -> dict:
         data=json.dumps(body).encode(),
         headers={"content-type": "application/json"},
     )
-    text, reasoning, tools, approvals, errs = "", "", {}, [], []
+    text, reasoning, tools, errs = "", "", {}, []
     outputs: dict[str, object] = {}
     with urllib.request.urlopen(req, timeout=180) as r:
         buf = b""
@@ -47,7 +49,6 @@ def stream(path: str, body: dict) -> dict:
                             "reasoning": reasoning,
                             "tools": tools,
                             "outputs": outputs,
-                            "approvals": approvals,
                             "errs": errs,
                         }
                     c = json.loads(payload)
@@ -62,8 +63,6 @@ def stream(path: str, body: dict) -> dict:
                         outputs[c["toolCallId"]] = c["output"]
                         if c["toolCallId"] in tools:
                             tools[c["toolCallId"]][2] = c["output"]
-                    elif t == "tool-approval-request":
-                        approvals.append((c["approvalId"], c["toolCallId"], c["reason"]))
                     elif t == "error":
                         errs.append(c["errorText"])
     return {
@@ -71,7 +70,6 @@ def stream(path: str, body: dict) -> dict:
         "reasoning": reasoning,
         "tools": tools,
         "outputs": outputs,
-        "approvals": approvals,
         "errs": errs,
     }
 
@@ -85,10 +83,8 @@ def show(tag: str, r: dict) -> dict:
     for _cid, (name, inp, out) in r["tools"].items():
         state = "已执行" if out is not None else "未执行"
         print(f"[工具] {name}({json.dumps(inp, ensure_ascii=False)}) -> {state}")
-        if out and name == "device_snapshot":
-            print(f"       {str(out.get('text', ''))[:160]}...")
-    for aid, _cid, reason in r["approvals"]:
-        print(f"[待批] {aid} :: {reason}")
+        if out:
+            print(f"       {str(out)[:200]}")
     for e in r["errs"]:
         print(f"[错误] {e}")
     return r
@@ -96,39 +92,33 @@ def show(tag: str, r: dict) -> dict:
 
 def main() -> int:
     try:
-        r1 = show(
+        r = show(
             "第 1 轮：用户请求",
-            stream("/api/chat", {"text": "看看现在屏幕上有什么，然后点一下「打开设置」"}),
+            stream(
+                "/api/chat",
+                {
+                    "text": "在 /workspace 建一个 hello.sh，内容是 echo hello，"
+                    "运行它，然后把它改成输出 hello world 再跑一次。"
+                },
+            ),
         )
     except Exception as e:  # noqa: BLE001
         print(f"请求失败：{e}\n（core 起来了吗？provider 配了吗？）")
         return 1
 
-    if r1["errs"]:
-        return 1
-    if not r1["approvals"]:
-        print("\n❌ 没有产生审批请求 —— 模型没有按预期请求 device_tap")
+    if r["errs"]:
+        print(f"\n❌ 回合里有错误：{r['errs']}")
         return 1
 
-    aid, tap_call = r1["approvals"][0][0], r1["approvals"][0][1]
-    r2 = show(
-        f"第 2 轮：批准 {aid}",
-        stream("/api/approve", {"approvalId": aid, "approved": True}),
-    )
-
-    if r2["errs"]:
+    ran = sorted({name for name, _inp, out in r["tools"].values() if out is not None})
+    if "bash" not in ran:
+        print(f"\n❌ 没有看到 bash 成功执行（执行过的工具：{ran}）")
+        return 1
+    if not r["text"].strip():
+        print("\n❌ 模型没有给出最终答复")
         return 1
 
-    # 批准后 tap 必须真的执行，而且结果里要带上**操作后的新界面**
-    out = r2["outputs"].get(tap_call)
-    if out is None:
-        print("\n❌ 批准后 device_tap 没有执行")
-        return 1
-    if "settings" not in json.dumps(out, ensure_ascii=False).lower():
-        print(f"\n❌ tap 结果里没有操作后的新界面（模型会拿旧画面脉猜）：{out}")
-        return 1
-
-    print("\n✅ 全链路通过：读界面 → 请求点击 → 审批 → 执行 → 带新界面回灌 → 复述")
+    print(f"\n✅ 全链路通过：用户请求 → 工具执行（{', '.join(ran)}）→ 结果回灌 → 模型复述")
     return 0
 
 
