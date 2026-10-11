@@ -6,15 +6,16 @@
    *   全宽贴底，上圆角 22，底色 #20201f（正好是已有的 --color-surface）
    *   遮罩：页面底色 #151515 被压到 #0e0e0e ≈ 35% 黑
    *   抓手 36×5 居中，距面板顶 5.3
-   *   头部高 44，✕ 中心距左 38（= px-4 加 44 的命中区），标题 17px 半粗居中
-   *   头部下面没有分隔线
+   *   标题 17px 半粗居中，头部下面没有分隔线
    *
-   * 高度用 max-h 而不是像 Claude 那样固定 422：内容短不留一大片空白，
-   * 长就在面板内滚。面板是覆盖层，所以不影响正文布局。
+   * 没有关闭按钮：往下拉、点遮罩、按返回键都能关。
+   *
+   * 高度：最少 45%（Claude 固定 422/923 ≈ 46%），内容短也不会缩成一条；
+   * 最多 75%，再长就在面板内滚。
    */
   import type { Snippet } from 'svelte';
-  import Icon from './Icon.svelte';
   import { onBack } from '../lib/overlay';
+  import { dismissable, RELEASE } from '../lib/drag';
 
   let {
     title,
@@ -25,26 +26,17 @@
   let panel: HTMLDivElement | null = $state(null);
   let body: HTMLDivElement | null = $state(null);
 
-  /** 下拉位移。> 0 = 被手指往下拖了。 */
-  let dy = $state(typeof window === 'undefined' ? 600 : window.innerHeight);
-  /** 回弹动画开关。拖拽中必须关掉，否则跟手会卡。 */
-  let animate = $state(false);
+  /** 0 = 完全展开，1 = 完全收起（在屏幕外） */
+  let p = $state(1);
+  /** 跟手中：不能有过渡，否则手指和面板之间有延迟 */
   let dragging = $state(false);
-  let closing = $state(false);
-
-  let startY = 0;
-  let startAt = 0;
-  let panelH = 1;
+  let closing = false;
 
   // 进场：初始在屏幕外，等首帧画出来再滑进来。
   // 两层 rAF：第一层回调时初始位置还没提交，直接改会被合并成一帧、没有动画。
   $effect(() => {
     let r = requestAnimationFrame(() => {
-      r = requestAnimationFrame(() => {
-        panelH = panel?.offsetHeight ?? 400;
-        animate = true;
-        dy = 0;
-      });
+      r = requestAnimationFrame(() => (p = 0));
     });
     return () => cancelAnimationFrame(r);
   });
@@ -52,8 +44,17 @@
   // 返回键关面板（带动画）
   $effect(() => onBack(close));
 
-  // 拖到哪，遮罩淡到哪
-  const dim = $derived(Math.max(0, 1 - dy / panelH));
+  /**
+   * 挂到 body 上。
+   *
+   * 思考/工具面板是在消息列表里渲染的，而消息列表在 `<main class="z-0">`
+   * 里 —— 那是个独立的层叠上下文，里面的 z-50 再高也压不过外面 z-20 的
+   * 输入卡片，结果输入框叠在面板上面。搬到 body 下就和输入卡片平级比了。
+   */
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node);
+    return { destroy: () => node.remove() };
+  }
 
   /** 外部想关（比如保存成功）也走动画 */
   export function dismiss() {
@@ -63,85 +64,62 @@
   function close() {
     if (closing) return;
     closing = true;
-    animate = true;
-    panelH = panel?.offsetHeight ?? 400;
-    dy = panelH;
-    setTimeout(onclose, 180);
-  }
-
-  function down(e: PointerEvent) {
-    if (closing) return;
-    // 正文没滚到顶就不接管，让它自己滚
-    if (body && body.scrollTop > 0) return;
-    dragging = true;
-    animate = false;
-    startY = e.clientY;
-    startAt = Date.now();
-    panelH = panel?.offsetHeight ?? 400;
-    panel?.setPointerCapture(e.pointerId);
-  }
-
-  function move(e: PointerEvent) {
-    if (!dragging) return;
-    dy = Math.max(0, e.clientY - startY);
-  }
-
-  function up() {
-    if (!dragging) return;
     dragging = false;
-    animate = true;
-    const dt = Date.now() - startAt;
-    // 甩一下（快 + 有位移）或者拖过 1/3 就关
-    if ((dt < 250 && dy > 40) || dy > panelH / 3) close();
-    else dy = 0;
+    p = 1;
+    setTimeout(onclose, 280);
   }
+
+  const drag = {
+    axis: 'y' as const,
+    dir: 1 as const,
+    size: () => panel?.offsetHeight ?? 400,
+    // 正文没滚到顶时往下拉是在滚正文，不接管
+    canStart: (t: EventTarget | null) =>
+      !closing && !(body && body.contains(t as Node) && body.scrollTop > 0),
+    onStart: () => (dragging = true),
+    onMove: (v: number) => (p = v),
+    onEnd: (shouldClose: boolean) => {
+      dragging = false;
+      if (shouldClose) close();
+      else p = 0;
+    },
+  };
 </script>
 
-<!-- 遮罩。点它即关。 -->
-<button
-  class="fixed inset-0 z-40 bg-black/35 {animate ? 'transition-opacity duration-200' : ''}"
-  style:opacity={dim}
-  aria-label="关闭"
-  onclick={close}
-></button>
+<div use:portal class="contents">
+  <!-- 遮罩。点它即关；拖到哪淡到哪。 -->
+  <button
+    class="fixed inset-0 z-40 bg-black/35"
+    style:opacity={1 - p}
+    style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
+    aria-label="关闭"
+    onclick={close}
+  ></button>
 
-<div
-  bind:this={panel}
-  role="dialog"
-  aria-modal="true"
-  aria-label={title}
-  tabindex="-1"
-  onpointerdown={down}
-  onpointermove={move}
-  onpointerup={up}
-  onpointercancel={up}
-  style:transform="translateY({dy}px)"
-  class="fixed inset-x-0 bottom-0 z-50 flex max-h-[75vh] flex-col rounded-t-card bg-surface pt-1
-         {animate ? 'transition-transform duration-200 ease-out' : ''}"
->
-  <!-- 抓手 + 头部 = 下拉区域。touch-action:none 只加在这里，
-       正文要保持原生滚动。 -->
-  <div class="shrink-0 touch-none">
-    <div class="mx-auto h-1.5 w-9 rounded-full bg-control"></div>
-
-    <!-- ✕ 在左、标题居中。标题用 absolute 而不是 flex 居中 ——
-         这样它永远在屏幕正中，不受 ✕ 宽度影响。 -->
-    <div class="relative mt-3 flex h-11 items-center px-4">
-      <button class="-m-2 p-2 text-fg" aria-label="关闭" onclick={close}>
-        <Icon name="close" size={14} />
-      </button>
-      <h2
-        class="pointer-events-none absolute inset-x-0 truncate px-12 text-center text-[17px] font-semibold"
-      >
+  <div
+    bind:this={panel}
+    use:dismissable={drag}
+    role="dialog"
+    aria-modal="true"
+    aria-label={title}
+    tabindex="-1"
+    style:transform="translateY({p * 100}%)"
+    style:transition={dragging ? 'none' : RELEASE}
+    class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[75dvh] min-h-[45dvh] flex-col
+           rounded-t-card bg-surface pt-1 will-change-transform"
+  >
+    <div class="shrink-0">
+      <div class="mx-auto h-1.5 w-9 rounded-full bg-control"></div>
+      <h2 class="mt-3 flex h-11 items-center justify-center truncate px-12 text-[17px] font-semibold">
         {title}
       </h2>
     </div>
-  </div>
 
-  <div
-    bind:this={body}
-    class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
-  >
-    {@render children()}
+    <div
+      bind:this={body}
+      class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
+    >
+      {@render children()}
+    </div>
   </div>
 </div>

@@ -15,6 +15,7 @@
   import Icon from './Icon.svelte';
   import Markdown from './Markdown.svelte';
   import Sheet from './Sheet.svelte';
+  import ThoughtLine from './ThoughtLine.svelte';
 
   let {
     messages,
@@ -28,7 +29,7 @@
 
   /** 当前打开的面板。一次只有一个。 */
   let sheet = $state<
-    { kind: 'reasoning'; text: string } | { kind: 'tool'; msg: Message; tool: ToolPart } | null
+    { kind: 'reasoning'; part: { text: string } } | { kind: 'tool'; msg: Message; tool: ToolPart } | null
   >(null);
 
   /**
@@ -38,7 +39,8 @@
   function summarize(t: ToolPart): string {
     const a = (t.input ?? {}) as Record<string, unknown>;
     const s = (v: unknown) => (typeof v === 'string' ? v : '');
-    const firstLine = (v: string) => v.split('\n')[0].slice(0, 70);
+    // 只取第一行，长度交给 CSS 截断 —— 屏幕多宽就显示多少
+    const firstLine = (v: string) => v.split('\n')[0].trim();
 
     switch (t.toolName) {
       case 'bash':
@@ -239,7 +241,7 @@
 <div
   bind:this={scroller}
   {onscroll}
-  class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[var(--hdr)] pb-[calc(var(--composer-h,0px)+1rem)]"
+  class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[calc(var(--hdr)+var(--fade-top))] pb-[calc(var(--composer-h,0px)+1rem)]"
 >
 <div bind:this={content} class="flex flex-col gap-6">
   {#each messages as msg (msg.id)}
@@ -257,20 +259,21 @@
           {#if part.type === 'text'}
             <Markdown text={part.text} />
           {:else if part.type === 'reasoning'}
-            <!-- 一行摘要，点开面板看全文 -->
+            <!-- 一行：它此刻在想什么。点开面板看全文 -->
+            {@const live = !msg.done && i === msg.parts.length - 1}
             <button
-              onclick={() => (sheet = { kind: 'reasoning', text: part.text })}
-              class="flex w-full items-center gap-2 py-0.5 text-left"
+              onclick={() => (sheet = { kind: 'reasoning', part })}
+              class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
             >
               <Icon name="sparkle" size={16} class="shrink-0 text-faint" />
-              <span class="truncate text-sm text-muted">思考</span>
+              <ThoughtLine text={part.text} {live} />
               <Icon name="chevron" size={15} class="ml-auto shrink-0 text-faint" />
             </button>
           {:else if part.type === 'tool'}
             {@const tool = part}
             <button
               onclick={() => (sheet = { kind: 'tool', msg, tool })}
-              class="flex w-full items-center gap-2 py-0.5 text-left"
+              class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
             >
               <Icon name="clock" size={16} class="shrink-0 text-faint" />
               <span class="truncate text-sm text-muted">{summarize(tool)}</span>
@@ -310,7 +313,8 @@
 {#if sheet}
   {#if sheet.kind === 'reasoning'}
     <Sheet title="思考" onclose={() => (sheet = null)}>
-      <p class="text-[15px] leading-6 whitespace-pre-wrap">{sheet.text}</p>
+      <!-- 存的是 part 本身而不是文本副本：思考还在流式时打开，面板里也跟着长 -->
+      <div class="text-[15px] leading-6 text-fg/90"><Markdown text={sheet.part.text} /></div>
     </Sheet>
   {:else}
     <!-- 存成 const：sheet 是 $state，在 onclick 闭包里 TS 收窄不了 -->

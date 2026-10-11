@@ -246,7 +246,7 @@
   <!-- 头部浮在内容上 -->
   <header
     class="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-center justify-between
-           px-4 pb-2 pt-[calc(1.5rem+env(safe-area-inset-top))]"
+           px-4 pb-2 pt-[calc(0.5rem+env(safe-area-inset-top))]"
   >
     <button onclick={openDrawer} aria-label="菜单" class="pointer-events-auto p-1 text-fg">
       <Icon name="menu" size={17} />

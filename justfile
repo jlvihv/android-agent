@@ -13,7 +13,10 @@ jni   := mod / "src/main/jniLibs"
 assets := mod / "src/main/assets"
 
 # NDK：从 SDK 里挑版本号最高的那个，避免依赖环境变量
-ndk_home := env_var_or_default("AGENT_NDK_HOME", `ls -d "$HOME"/Android/Sdk/ndk/*/ 2>/dev/null | sort -V | tail -1`)
+# SDK：Linux 上习惯放 ~/Android/Sdk，macOS 上 Android Studio 默认放 ~/Library/Android/sdk
+sdk_home := env_var_or_default("ANDROID_HOME", `for d in "$HOME/Android/Sdk" "$HOME/Library/Android/sdk"; do [ -d "$d" ] && { echo "$d"; exit; }; done`)
+export ANDROID_HOME := sdk_home
+ndk_home := env_var_or_default("AGENT_NDK_HOME", `ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/*/ "$HOME"/Android/Sdk/ndk/*/ "$HOME"/Library/Android/sdk/ndk/*/ 2>/dev/null | sort -V | tail -1`)
 export ANDROID_NDK_HOME := ndk_home
 
 # JAVA_HOME 不在这里设。
@@ -82,8 +85,10 @@ android-bindings:
     # bindgen 会调 `cargo metadata`，必须在 crate 目录里跑
     cd {{core}}
     cargo build --lib
+    # 宿主动态库的扩展名：Linux .so / macOS .dylib
+    ext=so; [ "$(uname)" = Darwin ] && ext=dylib
     cargo run --features uniffi-bindgen --bin uniffi-bindgen -- \
-      generate --library target/debug/libagent_core.so \
+      generate --library "target/debug/libagent_core.$ext" \
       --language kotlin --out-dir ../{{mod}}/src/main/java
 
 # 2) 交叉编译 Rust 核心 → jniLibs
@@ -101,7 +106,9 @@ android-libs:
     cd {{core}}
     cargo ndk -t arm64-v8a -t x86_64 -o ../{{jni}} build --release --lib
     echo "--- 16KB 对齐检查（Play 对 targetSdk 35+ 有要求，R1）---"
-    "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+    # NDK 的预编译工具目录：Linux 是 linux-x86_64，macOS（含 Apple 芯片）是 darwin-x86_64
+    host=linux-x86_64; [ "$(uname)" = Darwin ] && host=darwin-x86_64
+    "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host/bin/llvm-readelf" \
       -l "../{{jni}}/arm64-v8a/libagent_core.so" \
       | awk '/LOAD/{print "  align: " $NF}' | sort -u
 

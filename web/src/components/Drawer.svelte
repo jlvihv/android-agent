@@ -2,7 +2,7 @@
   /**
    * 抽屉。结构对齐 Claude 的侧边栏：
    *
-   *   agent                              [×]
+   *   agent  v0.1.0
    *   📱 界面            ← 导航项（Claude 那边是 项目/Code/Artifacts/定时任务）
    *   📋 事件
    *   ────────────────────
@@ -15,11 +15,13 @@
    *
    * 动画：进出场是 Svelte 过渡（CSS 动画，跑在合成线程上）；
    * 往左拖可以跟手关掉。遮罩也在这里，跟面板一起淡入淡出。
+   * 没有关闭按钮：往左拖、点遮罩、按返回键都能关。
    */
   import { fade } from 'svelte/transition';
-  import { cubicIn, quintOut } from 'svelte/easing';
+  import { quintOut } from 'svelte/easing';
   import { store } from '../lib/store.svelte.ts';
   import { onBack } from '../lib/overlay';
+  import { dismissable, RELEASE } from '../lib/drag';
   import Icon from './Icon.svelte';
   import DevicePanel from './DevicePanel.svelte';
   import EventLog from './EventLog.svelte';
@@ -53,47 +55,29 @@
 
   // —— 拖拽关闭 ——
   //
-  // aside 上是 touch-action: pan-y：竖直方向交给浏览器滚列表（会收到
-  // pointercancel），水平方向的 pointermove 才归我们。
+  // 按住抽屉任何地方往左拖都跟手（包括会话列表上）；竖着划还是滚列表。
+  // 手势判定见 lib/drag.ts。
   let aside: HTMLElement | null = $state(null);
   /** 被往左拖出去的比例，0 = 完全展开，1 = 完全收起 */
   let off = $state(0);
   /** 跟手中：关掉回弹过渡，否则拖起来发黏 */
   let dragging = $state(false);
-  let drag: { id: number; x0: number; y0: number; t0: number; w: number; on: boolean } | null =
-    null;
 
-  function dragStart(e: PointerEvent) {
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    drag = { id: e.pointerId, x0: e.clientX, y0: e.clientY, t0: e.timeStamp, w: aside?.offsetWidth ?? 1, on: false };
-  }
-
-  function dragMove(e: PointerEvent) {
-    if (!drag || e.pointerId !== drag.id) return;
-    const dx = e.clientX - drag.x0;
-    if (!drag.on) {
-      // 先认方向：水平位移明显大于竖直才算拖抽屉
-      if (Math.abs(dx) < 8 || Math.abs(dx) < Math.abs(e.clientY - drag.y0)) return;
-      drag.on = true;
+  const drag = {
+    axis: 'x' as const,
+    dir: -1 as const,
+    size: () => aside?.offsetWidth ?? 1,
+    onStart: () => {
       dragging = true;
       clearTimeout(pressTimer);
-      aside?.setPointerCapture(e.pointerId);
-    }
-    off = Math.min(1, Math.max(0, -dx / drag.w));
-  }
-
-  function dragEnd(e: PointerEvent) {
-    if (!drag || e.pointerId !== drag.id) return;
-    const d = drag;
-    drag = null;
-    if (!d.on) return;
-    dragging = false;
-    // 拖完别把这次抬手当成点击
-    longPressed = true;
-    const v = off / Math.max(1, e.timeStamp - d.t0); // 每毫秒收起的比例
-    if (off > 0.35 || (v > 0.0015 && off > 0.08)) onclose();
-    else off = 0;
-  }
+    },
+    onMove: (v: number) => (off = v),
+    onEnd: (close: boolean) => {
+      dragging = false;
+      if (close) onclose();
+      else off = 0;
+    },
+  };
 
   /** 进场：从左边整个滑进来 */
   function slideIn(_: Element) {
@@ -104,12 +88,13 @@
     };
   }
 
-  /** 出场：从当前位置（可能被拖到一半）继续往左收 */
+  /** 出场：从当前位置（可能被拖到一半）继续往左收。
+   *  先快后慢 —— 拖完松手时手指本来就在动，减速收尾才接得住。 */
   function slideOut(_: Element) {
     const from = off;
     return {
-      duration: 220 * (1 - from) + 60,
-      easing: cubicIn,
+      duration: 240 * (1 - from) + 80,
+      easing: quintOut,
       css: (_t: number, u: number) => `transform: translateX(${-(from + (1 - from) * u) * 100}%)`,
     };
   }
@@ -157,8 +142,9 @@
 </script>
 
 <button
-  class="fixed inset-0 z-40 bg-black/50 {dragging ? '' : 'transition-opacity duration-200'}"
+  class="fixed inset-0 z-40 bg-black/50"
   style:opacity={1 - off}
+  style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
   aria-label="关闭"
   onclick={onclose}
   transition:fade|global={{ duration: 220 }}
@@ -166,25 +152,20 @@
 
 <aside
   bind:this={aside}
-  onpointerdown={dragStart}
-  onpointermove={dragMove}
-  onpointerup={dragEnd}
-  onpointercancel={dragEnd}
+  use:dismissable={drag}
   style:transform={off ? `translateX(${-off * 100}%)` : null}
-  class="fixed inset-y-0 left-0 z-50 flex w-[92%] touch-pan-y flex-col bg-[#111]
-         pt-[env(safe-area-inset-top)] {dragging ? '' : 'transition-transform duration-200 ease-out'}"
+  style:transition={dragging ? 'none' : RELEASE}
+  class="fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[92%] flex-col bg-[#111]
+         pt-[env(safe-area-inset-top)] will-change-transform"
   in:slideIn|global
   out:slideOut|global
 >
   {#if panel === null}
-    <div class="flex shrink-0 items-center px-5 pt-6 pb-4">
+    <div class="flex shrink-0 items-center px-5 pt-3 pb-4">
       <span class="text-2xl font-semibold tracking-tight">agent</span>
       <span class="ml-2 self-end pb-1 font-mono text-meta text-faint"
         >v{store.hello?.version ?? '…'}</span
       >
-      <button class="ml-auto p-1 text-muted" aria-label="关闭" onclick={onclose}>
-        <Icon name="close" size={20} />
-      </button>
     </div>
 
     <nav class="flex shrink-0 flex-col">
@@ -261,9 +242,6 @@
         <Icon name="back" size={20} />
       </button>
       <span class="text-base font-medium">{panel === 'device' ? '界面' : '事件'}</span>
-      <button class="ml-auto p-1 text-muted" aria-label="关闭" onclick={onclose}>
-        <Icon name="close" size={20} />
-      </button>
     </div>
     <div class="min-h-0 flex-1 border-t border-hairline">
       {#if panel === 'device'}<DevicePanel />{:else}<EventLog />{/if}

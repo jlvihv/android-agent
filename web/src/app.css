@@ -56,8 +56,19 @@ body,
  * 的上下留白和渐隐都得引用这两个值 —— 定义在这里避免同一个数写三遍。
  */
 :root {
-  --hdr: calc(3.5rem + env(safe-area-inset-top));
-  --composer-gap: calc(1rem + env(safe-area-inset-bottom));
+  /* 头部紧贴状态栏：上面只留 0.5rem。原来是 1.5rem，离通知栏太远，白占地方 */
+  --hdr: calc(2.75rem + env(safe-area-inset-top));
+  /* 头部下沿往下的渐隐长度。消息列表顶部留白要把它算进去，
+     否则第一条消息停在渐隐里，一进来就是半透明的 */
+  --fade-top: 1.25rem;
+  /* 键盘高度，main.ts 实时写。没键盘时是 0 */
+  --kb: 0px;
+  /* 输入卡片到屏幕底（或键盘顶）的距离。键盘弹起时手势条被键盘盖住了，
+     不用再让出安全区 */
+  --composer-gap: max(
+    calc(0.5rem + env(safe-area-inset-bottom)),
+    calc(var(--kb) + 0.5rem)
+  );
 }
 
 body {
@@ -117,9 +128,9 @@ a:focus {
   --a7: var(--color-ink);
 }
 
-/* 头部下方：头部区域全遮，往下 3rem 淡到全透明 */
+/* 头部下方：头部区域全遮，往下 --fade-top 淡到全透明 */
 .fade-top {
-  --l: 3rem;
+  --l: var(--fade-top);
   height: calc(var(--hdr) + var(--l));
   background: linear-gradient(
     to top,

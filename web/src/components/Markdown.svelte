@@ -2,9 +2,11 @@
   /**
    * 渲染 markdown 块。走 Svelte 组件而不是 {@html}：
    * 没有 XSS 面，样式也全在 Tailwind 里。
+   *
+   * 列表、引用可以嵌套，所以块和行内都是递归 snippet。
    */
   import { untrack } from 'svelte';
-  import { parse, type Span } from '../lib/markdown';
+  import { parse, type Block, type Span, type Align } from '../lib/markdown';
 
   let { text }: { text: string } = $props();
 
@@ -22,49 +24,131 @@
   });
   $effect(() => () => cancelAnimationFrame(raf));
 
-  const blocks = $derived(parse(shown));
+  const doc = $derived(parse(shown));
+
+  const HEADING = ['', 'text-xl', 'text-lg', 'text-base', 'text-base', 'text-sm', 'text-sm'];
+  const ALIGN: Record<string, string> = { left: 'text-left', center: 'text-center', right: 'text-right' };
+  const al = (a: Align) => (a ? ALIGN[a] : 'text-left');
+
+  /** 刚复制的那个代码块，显示"已复制"一会儿 */
+  let copied = $state<string | null>(null);
+
+  async function copy(v: string) {
+    try {
+      await navigator.clipboard.writeText(v);
+    } catch {
+      // 剪贴板 API 被拒（WebView 没焦点之类）：退回老办法
+      const ta = document.createElement('textarea');
+      ta.value = v;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    copied = v;
+    setTimeout(() => copied === v && (copied = null), 1500);
+  }
 </script>
 
 {#snippet spans(list: Span[])}
   {#each list as s}
     {#if s.t === 'text'}{s.v}
-    {:else if s.t === 'code'}<code class="rounded bg-control px-1 py-px font-mono text-[0.88em]">{s.v}</code>
-    {:else if s.t === 'strong'}<strong class="font-semibold">{s.v}</strong>
-    {:else if s.t === 'em'}<em class="italic">{s.v}</em>
-    {:else}<a href={s.href} class="underline decoration-faint underline-offset-2">{s.v}</a>
+    {:else if s.t === 'code'}<code class="rounded bg-control px-1 py-px font-mono text-[0.88em] break-words">{s.v}</code>
+    {:else if s.t === 'strong'}<strong class="font-semibold">{@render spans(s.c)}</strong>
+    {:else if s.t === 'em'}<em class="italic">{@render spans(s.c)}</em>
+    {:else if s.t === 'del'}<del class="text-muted">{@render spans(s.c)}</del>
+    {:else}<a
+        href={s.href}
+        target="_blank"
+        rel="noopener noreferrer"
+        class="break-all underline decoration-faint underline-offset-2">{@render spans(s.c)}</a
+      >
+    {/if}
+  {/each}
+{/snippet}
+
+{#snippet blocks(list: Block[])}
+  {#each list as b}
+    {#if b.t === 'p'}
+      <p class="whitespace-pre-wrap break-words">{@render spans(b.spans)}</p>
+    {:else if b.t === 'h'}
+      <p class="font-semibold {HEADING[b.level]} {b.level >= 4 ? 'text-muted' : ''} {b.level <= 2 ? 'mt-1' : ''}">
+        {@render spans(b.spans)}
+      </p>
+    {:else if b.t === 'hr'}
+      <hr class="my-1 border-hairline" />
+    {:else if b.t === 'code'}
+      <div class="overflow-hidden rounded-xl bg-hairline-soft">
+        <div class="flex items-center border-b border-hairline px-3 py-1 text-meta text-faint">
+          <span>{b.lang || '代码'}</span>
+          <button class="-mr-1.5 ml-auto px-1.5 py-0.5" onclick={() => copy(b.v)}>
+            {copied === b.v ? '已复制' : '复制'}
+          </button>
+        </div>
+        <pre class="overflow-x-auto px-3 py-2.5 font-mono text-[13px] leading-5">{b.v}</pre>
+      </div>
+    {:else if b.t === 'table'}
+      <!-- 宽表格在自己的框里横向滚动，不撑破页面 -->
+      <div class="-mx-1 overflow-x-auto px-1">
+        <table class="w-max min-w-full border-collapse text-sm leading-snug">
+          <thead>
+            <tr class="border-b border-control">
+              {#each b.head as cell, k}
+                <th class="px-2.5 py-1.5 font-semibold {al(b.align[k])}">{@render spans(cell)}</th>
+              {/each}
+            </tr>
+          </thead>
+          <tbody>
+            {#each b.rows as row}
+              <tr class="border-b border-hairline last:border-0">
+                {#each row as cell, k}
+                  <td class="px-2.5 py-1.5 align-top {al(b.align[k])}">{@render spans(cell)}</td>
+                {/each}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {:else if b.t === 'quote'}
+      <blockquote class="flex flex-col gap-2 border-l-2 border-control pl-3 text-muted">
+        {@render blocks(b.blocks)}
+      </blockquote>
+    {:else if b.t === 'list'}
+      {@const tag = b.ordered ? 'ol' : 'ul'}
+      <svelte:element
+        this={tag}
+        start={b.ordered && b.start !== 1 ? b.start : undefined}
+        class="flex flex-col pl-5 {b.tight ? 'gap-1' : 'gap-2.5'}
+               {b.ordered ? 'list-decimal' : 'list-disc'} marker:text-muted"
+      >
+        {#each b.items as it}
+          <li class={it.task === null ? '' : 'list-none -ml-5'}>
+            <div class="flex gap-2">
+              {#if it.task !== null}
+                <span
+                  class="mt-[0.3em] grid size-[1.05em] shrink-0 place-items-center rounded-[0.3em] border
+                         {it.task ? 'border-muted bg-muted text-ink' : 'border-faint'}"
+                >
+                  {#if it.task}
+                    <svg viewBox="0 0 12 12" class="size-[0.75em]"
+                      ><path d="M2.5 6.2 5 8.6l4.5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" /></svg
+                    >
+                  {/if}
+                </span>
+              {/if}
+              <div class="flex min-w-0 flex-1 flex-col {b.tight ? 'gap-1' : 'gap-2.5'}">
+                {@render blocks(it.blocks)}
+              </div>
+            </div>
+          </li>
+        {/each}
+      </svelte:element>
     {/if}
   {/each}
 {/snippet}
 
 <div class="flex flex-col gap-2.5">
-  {#each blocks as b}
-    {#if b.t === 'p'}
-      <p class="whitespace-pre-wrap break-words">{@render spans(b.spans)}</p>
-    {:else if b.t === 'h'}
-      <p class="font-semibold {b.level <= 2 ? 'text-lg' : 'text-base'}">{@render spans(b.spans)}</p>
-    {:else if b.t === 'code'}
-      <div class="overflow-hidden rounded-xl bg-hairline-soft">
-        {#if b.lang}
-          <p class="border-b border-hairline px-3 py-1.5 text-meta text-faint">{b.lang}</p>
-        {/if}
-        <pre class="overflow-x-auto px-3 py-2.5 font-mono text-[13px] leading-5">{b.v}</pre>
-      </div>
-    {:else if b.t === 'ul'}
-      <ul class="flex flex-col gap-1.5 pl-5">
-        {#each b.items as it}
-          <li class="list-disc whitespace-pre-wrap break-words">{@render spans(it)}</li>
-        {/each}
-      </ul>
-    {:else if b.t === 'ol'}
-      <ol class="flex flex-col gap-1.5 pl-5">
-        {#each b.items as it}
-          <li class="list-decimal whitespace-pre-wrap break-words">{@render spans(it)}</li>
-        {/each}
-      </ol>
-    {:else if b.t === 'quote'}
-      <blockquote class="border-l-2 border-hairline pl-3 text-muted">
-        {@render spans(b.spans)}
-      </blockquote>
-    {/if}
-  {/each}
+  {@render blocks(doc)}
 </div>

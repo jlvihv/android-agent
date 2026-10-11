@@ -128,6 +128,24 @@ class MainActivity : Activity() {
         }
 
         w.webViewClient = object : WebViewClient() {
+            /**
+             * 外部链接交给系统浏览器。
+             *
+             * 默认行为是在 WebView 里直接打开 —— 点一下消息里的链接，整个 App
+             * 界面就被那个网页替换掉了，只能按返回键回来。只有我们自己的
+             * 127.0.0.1 留在 WebView 里。
+             */
+            override fun shouldOverrideUrlLoading(
+                view: WebView?,
+                request: android.webkit.WebResourceRequest?,
+            ): Boolean {
+                val uri = request?.url ?: return false
+                if (uri.host == "127.0.0.1" && uri.port == port) return false
+                runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                    .onFailure { Log.w(TAG, "打不开链接 $uri", it) }
+                return true
+            }
+
             override fun onReceivedError(
                 view: WebView?,
                 request: android.webkit.WebResourceRequest?,

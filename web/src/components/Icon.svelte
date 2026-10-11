@@ -13,7 +13,6 @@
     | 'mic'
     | 'refresh'
     | 'back'
-    | 'close'
     | 'chevron'
     | 'sparkle'
     | 'clock'
@@ -73,10 +72,6 @@
 {:else if name === 'back'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <path d="M12.5 4.5 7 10l5.5 5.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
-  </svg>
-{:else if name === 'close'}
-  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
   </svg>
 {:else if name === 'pencil'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
