@@ -337,28 +337,48 @@ bash curl ca-certificates grep findutils jq git github-cli diffutils patch ripgr
 这样 agent 就有了真正的计算机：**跑代码**（`bash`）+ 沙箱里的文件系统，
 这才是 OpenMinis 那个形态。
 
-### 沙箱里没有浏览器：`$BROWSER` 垫片 + `/api/open`
+### 沙箱里没有浏览器，但手机上有：`agent-open`
 
 登录类命令（`gh auth login --web`、`python -m webbrowser`、`xdg-open`）原本在沙箱里
-全是 `not found` —— 沙箱里没有浏览器，可用户手里有。
+全是 `not found` —— 沙箱里没有浏览器，可用户手里这台手机有。
 
 `prepare_rootfs` 会写 `/usr/local/bin/agent-open`，以及 `xdg-open` /
 `sensible-browser` / `www-browser` / `x-www-browser` / `gnome-open` / `kde-open`
 六个转发垫片；`guest_env()` 把 `BROWSER` **强制**指过去（覆盖用户 dotfile 里的值，
 跟 OpenMinis `PRootKernel.kt:159` 的 T195 一个道理）。
 
-`agent-open` 不打开任何东西，它把 URL `POST` 给核心的 `/api/open`（跟沙箱里的
-`agent` 命令同一个通道：`AGENT_PORT` + `AGENT_TOKEN`）。核心只认 http(s)（不是给
-沙箱开任意 scheme 的后门），校验后广播 `Event::OpenUrl`；前端收到就尽力弹窗，被
-WebView 的弹窗策略拦下就留一条可点的横幅 —— 点一下走 `location.href`，
-`shouldOverrideUrlLoading` 把它交给系统浏览器，聊天页本身不动（那个回调返回 true）。
+它**真的会打开**：`agent-open` 只是三行壳，逻辑在 `agent open <uri>` 里 ——
+`POST /api/command`（`{"cmd":{"type":"open","url":…}}`）→ 设备通道 `Command::Open`
+→ Kotlin `UriLauncher`（`ACTION_VIEW`；`intent://` 走 `Intent.parseUri` 还原
+action/extras，没 App 接时退到 `S.browser_fallback_url`）。`http(s)` 找浏览器或
+对应的 App，`weixin://` / `androidamap://` 这类深链直接进 App 的具体页面（能带
+参数），`tel:` / `mailto:` / `geo:` / `market:` 各归各家。
+
+> 为什么 `agent-open` 这个小壳还在：`$BROWSER` 和那六个名字都得是**一个可执行
+> 文件**，写不了 `agent open`（不同调用方拆参数的方式还不一样，python 的
+> webbrowser 还会拿 `%s` 去替换）。逻辑只留一份，在 `agent open` 里。
+
+**不做 scheme 白名单**，跟 `agent command` 那条路一个立场：这是 agent 自己的手机，
+工具调用一律直接执行、没有审批环节；真打不开（没装那个 App、系统没有 handler）
+由系统报错回来，agent 看得到。用户点聊天里的链接走的是同一个 `UriLauncher`
+（那条路本来就是用户的明确动作）。
+
+> `launch`（按包名起 App，只能到首页）和 `open`（按 URI 到具体页面/动作）是两件事，
+> 都留在设备通道里：前者不需要知道对方的深链格式，后者能带参数。
+
+需要用户在**别的** App 里完成的事（典型是 `gh auth login --web`）：页面 `agent-open`
+会自己开，但**一次性码得 agent 在回复里告诉用户**；这种命令还要等用户操作，所以
+要后台跑（`> /tmp/x.log 2>&1 &`），之后再查日志收尾 —— 前台等会死锁（用户在码出现
+在聊天里之前根本看不到它）。
 
 另外 bash 结果里会带一个 `urls: [...]`（`urls` 模块扫输出里的 http(s) 网址）：
-gh 的设备码页是它自己 print 出来的 —— 不是所有 CLI 都会去调浏览器 —— 前端把这几条
-渲染成可点的药丸，用户不用手抄。
+gh 的设备码页是它自己 print 出来的（不是所有 CLI 都会去调浏览器），给模型一份去重、
+修过标点的清单，它拿这些去 `agent-open` 或在回复里给用户都不容易抄错。
 
-需要用户在浏览器里输码的命令（如 `gh auth login --web`）要给足 timeout（900 秒级）：
-命令会一直轮询到用户授权完，token 落在沙箱的 `/root/.config/gh/hosts.yml`（持久）。
+> 聊天里的链接原本点了没反应：`<a target="_blank">` 在 WebView 里算弹窗，而
+> `setSupportMultipleWindows` 默认 false、又没实现 `onCreateWindow` ——
+> browser 的 WebView 是靠注入 JS 把 `_blank` 掰成 `_self` 绕过去的，聊天这个没那套。
+> 现在 `MainActivity` 实现 `onCreateWindow`，和点链接一起走 `UriLauncher`。
 
 > 早期的设计把读界面 / 操作界面做成 `device_snapshot` / `device_tap` 两个工具。
 > 现在它们不作为工具暴露给模型了 —— 以后收进沙箱里的一个命令、由 `linux_run`

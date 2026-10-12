@@ -283,7 +283,14 @@ const URL_RE = /^https?:\/\/[^\s<>()（）「」，。；：！？、]+/;
 
 /** 只放行这些协议。javascript: 等一律当文字 */
 export function safeHref(href: string): string | null {
-  return /^(https?:|mailto:|sandbox:)/i.test(href.trim()) ? href.trim() : null;
+  const h = href.trim();
+  // 这几个不是「打开一个地址」，是拿页面的权限执行/读东西 —— 一律不渲染成链接
+  if (/^(javascript|data|file|content|blob|about):/i.test(h)) return null;
+  // 其余都放行：**用户点一个链接是明确的动作**，App 自定义 scheme
+  // （`weixin://`、`androidamap://`、`tel:`…）就该交给系统去挑对应的 App。
+  // 这条也是「模型把网址转述在回复里、用户自己点开」的前提 ——
+  // 沙箱里没有浏览器，我们也不会替用户打开任何东西。
+  return /^[a-z][a-z0-9+.-]*:/i.test(h) ? h : null;
 }
 
 /** 按扩展名判断媒体类型（图片语法 `![]()` 也用来嵌音视频） */

@@ -292,15 +292,6 @@
   // 不能只靠 `$effect(() => { if (drawer) ... })`：抽屉一直开着的时候
   // drawer 状态没变化，effect 不会重跑 —— 实测踩过（在别处新建了会话，
   // 抽屉里还是"还没有对话"）。
-  /** 横幅里只显示主机名：URL 可能很长，整条塞不下 */
-  const hostOf = (url: string): string => {
-    try {
-      return new URL(url).host;
-    } catch {
-      return url;
-    }
-  };
-
   function openDrawer() {
     drawer = true;
     void loadSessions();
@@ -467,27 +458,6 @@
       </button>
     </div>
   </header>
-
-  {#if store.openUrl}
-    {@const pending = store.openUrl}
-    <!-- 沙箱里有人要开浏览器（agent-open → /api/open）。自动弹窗可能被 WebView
-         的弹窗策略拦掉，所以留一条可点的横幅：点一下一定走系统浏览器。 -->
-    <div
-      class="absolute inset-x-0 top-11 z-30 mx-auto flex max-w-md items-center gap-3 rounded-xl
-             border border-hairline bg-control px-3 py-2 text-meta shadow-lg"
-    >
-      <span class="min-w-0 flex-1 truncate text-muted" title={pending.url}>
-        {pending.opened ? '已在浏览器打开' : '要在浏览器里打开'}
-        {hostOf(pending.url)}
-      </span>
-      <button class="shrink-0 text-ok" onclick={() => store.openExternal(pending.url)}>打开</button>
-      <button
-        class="shrink-0 text-faint"
-        onclick={() => store.dismissOpenUrl()}
-        aria-label="关闭">✕</button
-      >
-    </div>
-  {/if}
 
   <!-- 输入卡片也浮在内容上 -->
   <div class="absolute inset-x-0 bottom-0 z-20" bind:offsetHeight={composerH}>

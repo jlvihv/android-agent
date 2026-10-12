@@ -46,7 +46,6 @@ export type AgentEvent =
   | ({ type: 'device' } & DeviceInfo)
   | { type: 'log'; level: string; msg: string }
   | { type: 'agent'; chunk: Record<string, unknown> }
-  | { type: 'open_url'; url: string }
   | ({ type: 'ack' } & Ack);
 
 /** 前端 → Rust 的 WS 消息 */

@@ -531,10 +531,10 @@ class MainActivity : Activity() {
             ): Boolean {
                 val uri = request?.url ?: return false
                 if (uri.host == "127.0.0.1" && uri.port == port) return false
-                runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
-                    .onFailure { Log.w(TAG, "打不开链接 $uri", it) }
+                openExternally(uri)
                 return true
             }
+
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 // 页面自己挂载时也会问一次，这里防的是「状态刚好在页面加载那
@@ -572,6 +572,38 @@ class MainActivity : Activity() {
              *     直接拉 `ACTION_IMAGE_CAPTURE`（不经过文件选择器）
              *   - 照片 / 文件：`ACTION_OPEN_DOCUMENT`（见 `chooserIntent()`）
              */
+            /**
+             * 页面里的 `<a target="_blank">` / `window.open` 落在这里。
+             *
+             * 我们不给页面开新窗口，而不实现这个方法的话**弹窗会被直接丢掉**
+             * —— 消息里的链接点了没反应（browser 的 WebView 是靠注入 JS 把
+             * `_blank` 掰成 `_self` 绕开的，聊天这里没有那套）。
+             * 这里把弹窗要打开的 URL 接过来交给系统，跟点链接同一条路。
+             */
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?,
+            ): Boolean {
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                val probe = WebView(view?.context ?: return false)
+                probe.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        v: WebView?,
+                        request: android.webkit.WebResourceRequest?,
+                    ): Boolean {
+                        request?.url?.let(::openExternally)
+                        // 这个 WebView 只为接住 URL 而生，没上屏也不该继续加载
+                        v?.post { v.destroy() }
+                        return true
+                    }
+                }
+                transport.webView = probe
+                resultMsg.sendToTarget()
+                return true
+            }
+
             override fun onShowFileChooser(
                 webView: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
@@ -747,6 +779,18 @@ class MainActivity : Activity() {
      * `intent.data`、多选走 `intent.clipData`，而且支持可持久化读权限。
      * 代价是 UI 是「文件」而不是那个照片网格 —— 换可靠性值得。
      */
+    /**
+     * 把 URL 交给系统：浏览器或对应 App（`weixin://`、`androidamap://`、`tel:`…）。
+     *
+     * 两处用它：聊天里点链接（`shouldOverrideUrlLoading`）和页面弹窗
+     * （`onCreateWindow`）。agent 自己要求打开的那条路在 `UriLauncher` 上 ——
+     * 沙箱里的 `agent-open` / `$BROWSER` → `POST /api/open` → 设备通道。
+     */
+    private fun openExternally(uri: Uri) {
+        runCatching { UriLauncher.open(this, uri) }
+            .onFailure { Log.w(TAG, "打不开链接 $uri", it) }
+    }
+
     private fun chooserIntent(params: WebChromeClient.FileChooserParams): Intent {
         // acceptTypes 里可能有 `.pdf` 这种非 MIME 写法，DocumentsUI 会不认
         val mimes = params.acceptTypes.filter { it.contains('/') }

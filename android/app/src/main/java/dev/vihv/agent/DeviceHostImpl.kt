@@ -43,8 +43,10 @@ class DeviceHostImpl(
                 )
                 "key" -> service.pressKey(cmd.getString("name"))
                 "launch" -> service.launch(cmd.getString("package"))
-                else -> throw CoreException.Failed("未知指令: $type")
-            }
+                // 打开一个 URI：http(s) / App 深链 / intent:// / tel: ——
+                // 沙箱里的 agent-open（$BROWSER）走这里，见 UriLauncher
+                "open" -> UriLauncher.open(service, android.net.Uri.parse(cmd.getString("url")))
+                else -> throw CoreException.Failed("未知指令: $type")            }
         } catch (e: CoreException) {
             throw e
         } catch (t: Throwable) {

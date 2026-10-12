@@ -45,6 +45,16 @@ pub enum Command {
     Launch {
         package: String,
     },
+    /// 打开一个 URI：http(s)、App 深链（`weixin://`、`androidamap://`）、
+    /// `intent://…` 都算。
+    ///
+    /// 沙箱里没有浏览器，但手机上有 —— 沙箱里的 `xdg-open` / `$BROWSER`
+    /// （也就是 `agent-open`）最后就走到这里。跟 `Launch` 一样，**不设
+    /// scheme 白名单**：这是 agent 自己的手机，它想开什么就开什么；
+    /// 真打不开（没装那个 App、系统没 handler）由系统报错回来。
+    Open {
+        url: String,
+    },
 }
 
 fn default_swipe_ms() -> u32 {
@@ -153,14 +163,6 @@ pub enum Event {
         id: String,
         ok: bool,
         detail: String,
-    },
-    /// 沙箱里有人要“用浏览器打开这个网址”（`xdg-open` / `$BROWSER` →
-    /// `agent-open` → `POST /api/open`）。
-    ///
-    /// `gh auth login --web` 这类流程就靠它：沙箱里没有浏览器，但用户手里有，
-    /// 宿主收到就把页面推到他眼前。
-    OpenUrl {
-        url: String,
     },
 }
 

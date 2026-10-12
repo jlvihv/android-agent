@@ -45,6 +45,7 @@ impl DeviceApi for MockDevice {
             Command::Swipe { .. } => format!("mock: swiped #{}", s.commands),
             Command::Key { name } => format!("mock: pressed {name} #{}", s.commands),
             Command::Launch { package } => format!("mock: launched {package} #{}", s.commands),
+            Command::Open { url } => format!("mock: opened {url} #{}", s.commands),
         })
     }
 }

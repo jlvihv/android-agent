@@ -14,7 +14,6 @@
   import { tick } from 'svelte';
   import type { Message, ToolPart } from '../lib/sse';
   import { sandboxPath } from '../lib/markdown';
-  import { store } from '../lib/store.svelte.ts';
   import Icon from './Icon.svelte';
   import Markdown from './Markdown.svelte';
   import Sheet from './Sheet.svelte';
@@ -203,8 +202,6 @@
     path: string | null;
     /** 工具返回的图片在沙箱里的路径（read 读图才有） */
     image: string | null;
-    /** 输出里扫到的网址（见 Rust 的 `urls` 模块）：渲染成一键打开 */
-    links: string[];
   };
 
   /**
@@ -230,7 +227,6 @@
       diff: false,
       path: null,
       image: null,
-      links: [],
     });
 
     if (typeof o === 'string') return plain('输出', o);
@@ -275,22 +271,8 @@
 
     const image = typeof r.imagePath === 'string' ? r.imagePath : null;
 
-    // 输出里的网址（bash 结果带的）：沙箱里没有浏览器，这里给一键打开
-    const links = Array.isArray(r.urls)
-      ? (r.urls as unknown[]).filter((u): u is string => typeof u === 'string')
-      : [];
-
     if (typeof r.diff === 'string') {
-      return {
-        chips,
-        label: '改动',
-        failed: false,
-        body: r.diff,
-        diff: true,
-        path: null,
-        image,
-        links,
-      };
+      return { chips, label: '改动', failed: false, body: r.diff, diff: true, path: null, image };
     }
 
     if (typeof r.output === 'string') {
@@ -302,20 +284,10 @@
         diff: false,
         path: typeof r.full_output_path === 'string' ? r.full_output_path : null,
         image,
-        links,
       };
     }
 
-    return {
-      chips,
-      label: '结果',
-      failed: false,
-      body: kv(o),
-      diff: false,
-      path: null,
-      image,
-      links,
-    };
+    return { chips, label: '结果', failed: false, body: kv(o), diff: false, path: null, image };
   }
 
   /**
@@ -616,19 +588,6 @@
                 class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-all {res.failed
                   ? 'text-bad'
                   : ''}">{res.body}</pre>
-            {/if}
-
-            {#if res.links.length > 0}
-              <!-- 输出里出现的网址：沙箱里没有浏览器，给一键打开 -->
-              <div class="flex flex-wrap gap-1.5">
-                {#each res.links as url (url)}
-                  <button
-                    class="max-w-full truncate rounded-full bg-control px-2.5 py-1 text-meta text-ok"
-                    title={url}
-                    onclick={() => store.openExternal(url)}>{url}</button
-                  >
-                {/each}
-              </div>
             {/if}
 
             {#if res.path}

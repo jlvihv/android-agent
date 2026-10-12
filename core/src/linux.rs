@@ -281,6 +281,9 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #   agent doctor             各部件体检
 #   agent setup [--force|--list|包…]   装/看常用工具（rg fd jq git python3…）
 #   agent command <json>     操作这台手机，例如 '{"type":"key","name":"back"}'
+#   agent open <uri>         让手机打开它：http(s) / App 深链（weixin://、
+#                            androidamap://）/ intent:// / tel: …
+#                            （$BROWSER / xdg-open 最后也是走到它）
 #   agent browser <动作> [参数…]  驱动内置浏览器（真 WebView）：
 #       navigate <url> | get_backbone [深度] | click <选择器> | type <选择器> <文本>
 #       get_text [选择器] | get_readable | scroll [up|down] [像素]
@@ -355,11 +358,36 @@ case "$cmd" in
   {"type":"key","name":"back|home|recents|notifications"}
   {"type":"tap_xy","x":540,"y":1200}
   {"type":"swipe","x1":540,"y1":1800,"x2":540,"y2":600,"ms":300}
-  {"type":"launch","package":"com.android.settings"}
+  {"type":"launch","package":"com.android.settings"}  只到 App 首页
+  {"type":"open","url":"androidamap://navi?…"}         按 URI 到具体页面/动作
 EOT
       exit 2
     fi
     post /api/command "{\"cmd\":$2}"
+    ;;
+  open)
+    shift || true
+    uri=""
+    for a in "$@"; do
+      # 任何 `scheme:` 开头都接（tel: 这种没有 //；--flags 以 - 开头不会被误认）
+      case "$a" in [a-zA-Z]*:*) uri="$a"; break ;; esac
+    done
+    if [ -z "$uri" ]; then
+      # 不报错：这个命令也是 $BROWSER / xdg-open 的落点，
+      # 而它们常被链在脚本里（set -e 下报错会把调用方炸掉）
+      echo "agent open: 参数里没有 URI，跳过: $*" >&2
+      exit 0
+    fi
+    out=$(post /api/command "{\"cmd\":{\"type\":\"open\",\"url\":\"$(esc "$uri")\"}}")
+    case "$out" in
+      *'"ok":true'*)
+        echo "已让手机打开: $uri"
+        ;;
+      *)
+        detail=$(printf '%s' "$out" | sed -n 's/.*"detail":"\([^"]*\)".*/\1/p')
+        echo "没能打开（${detail:-没有响应}）：$uri" >&2
+        ;;
+    esac
     ;;
   get)  [ $# -ge 2 ] || { echo "用法：agent get /api/…" >&2; exit 2; }; get "$2" ;;
   post) [ $# -ge 3 ] || { echo "用法：agent post /api/… '{…}'" >&2; exit 2; }; post "$2" "$3" ;;
@@ -426,7 +454,7 @@ EOT
     post /api/websearch "$body"
     ;;
   help|-h|--help)
-    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,28p'
+    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,31p'
     ;;
   *)
     echo "不认识的子命令：$cmd（agent help）" >&2
@@ -435,53 +463,15 @@ EOT
 esac
 "##;
 
-/// 沙箱里的 `agent-open`：站在 `xdg-open` / `sensible-browser` / `$BROWSER`
-/// 的位置上。
+/// `$BROWSER` / `xdg-open` 的落点：转给 `agent open`（逻辑都在那边）。
 ///
-/// 它**不打开**任何东西 —— 沙箱里没有浏览器 —— 而是把 URL 报给宿主
-/// （`POST /api/open`，跟 `agent` 命令同一个通道），由宿主推到用户眼前。
-/// 手机上就是系统浏览器。
-///
-/// 为什么值得做：`gh auth login --web`、`python -m webbrowser`、`xdg-open`
-/// 这类都要用户去浏览器里看/输一次码。靠“URL 打在 stdout 里等用户自己复制”
-/// 能用，但把页面直接推过去差一个数量级（OpenMinis 的 `minis-open` 同思路）。
+/// 为什么留这个小壳而不是直接把 `BROWSER` 指到 `agent`：`$BROWSER` 和那几个
+/// 名字都得是**一个可执行文件**，写不了 `agent open`（不同调用方拆参数的方式
+/// 还不一样；python 的 webbrowser 会拿 `%s` 去替换）。
 const AGENT_OPEN: &str = r##"#!/bin/sh
-# agent-open —— 把 URL 交给宿主去打开。
-#
-#   agent-open <url>
-#
-# 也会以 xdg-open / sensible-browser / www-browser / x-www-browser /
-# gnome-open / kde-open 的身份被调用，参数里可能有 --flags，忽略非 URL 的。
-set -eu
-
-BASE="${AGENT_BASE:-http://127.0.0.1:${AGENT_PORT:-}}"
-if [ -z "$BASE" ] || [ "$BASE" = "http://127.0.0.1:" ]; then
-  echo "agent-open: AGENT_PORT 没设 —— 不是在 agent 的 bash 里跑？" >&2
-  exit 0
-fi
-AUTH="x-agent-token: ${AGENT_TOKEN:-}"
-
-url=""
-for a in "$@"; do
-  case "$a" in
-    http://*|https://*) url="$a"; break ;;
-  esac
-done
-if [ -z "$url" ]; then
-  # 文件/非 http 的打开请求我们没法处理。不报错：xdg-open 常被链在脚本里。
-  echo "agent-open: 不是 http(s) URL，跳过: $*" >&2
-  exit 0
-fi
-
-body=$(printf '{"url":"%s"}' "$(printf '%s' "$url" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')")
-if wget -q -T 30 -O - --header "$AUTH" --header 'content-type: application/json' \
-     --post-data "$body" "$BASE/api/open" >/dev/null 2>&1; then
-  echo "已在用户的浏览器里打开: $url"
-else
-  # 退一步：把网址说清楚，用户还能自己复制。仍然 exit 0 ——
-  # gh auth login 这类调用方不该因为“没人帮它开浏览器”就整体失败。
-  echo "agent-open: 没能让宿主打开，网址是: $url" >&2
-fi
+# agent-open —— 见 `agent open`。也会以 xdg-open / sensible-browser /
+# www-browser / x-www-browser / gnome-open / kde-open 的身份被调用。
+exec /usr/local/bin/agent open "$@"
 "##;
 
 /// 这六个名字都是“开浏览器”的常见入口（OpenMinis 垫的是同一组），全转发给
@@ -887,9 +877,9 @@ impl LinuxSandbox {
         env.insert("CHARSET".into(), "UTF-8".into());
         env.insert("LANG".into(), "C.UTF-8".into());
         env.insert("TERM".into(), "dumb".into()); // 非交互，别输出 ANSI
-                                                  // 沙箱里没有浏览器，但用户手里有：把 BROWSER 指到 agent-open，
-                                                  // `gh auth login --web` / python webbrowser / xdg-open 都会变成
-                                                  // 「请宿主打开」，登录页就真的出在用户面前。
+                                                  // 沙箱里没有浏览器，但用户手里有：把 BROWSER 指到 agent-open。它不会开
+                                                  // 任何东西，只把网址打回输出，由 agent 在回复里转告用户 ——
+                                                  // `gh auth login --web` / python webbrowser / xdg-open 都会走这里。
                                                   // 强制覆盖（不 putIfAbsent）：用户 dotfile 里的 BROWSER= 不该抢走它。
         env.insert("BROWSER".into(), "/usr/local/bin/agent-open".into());
         // 分页器会**挂住**（非交互环境没人按键），一次工具调用就废了
@@ -1521,12 +1511,18 @@ async fn drain(
     cap: &Mutex<Capture>,
     grace: Duration,
 ) -> Capture {
-    if tokio::time::timeout(grace, &mut task).await.is_err() {
-        // 管道还被孙进程占着：不等了，把已读到的拿走
-        task.abort();
+    match tokio::time::timeout(grace, &mut task).await {
+        // 任务自己收尾了 —— 注意：这时 `task` **已经被 poll 完**，
+        // 再来一个 `task.await` 会 panic（“polled after completion”），
+        // 而 release 是 `panic = "abort"` —— 每次 bash 调用都会把 App 干掉。
+        Ok(_) => {}
+        Err(_) => {
+            // 管道还被孙进程占着：不等了，但要把已读到的拿走。
+            // abort 之后才允许再 await（这时它确实还没完成）。
+            task.abort();
+            let _ = task.await;
+        }
     }
-    // abort 之后 await 保证任务真的停了，再取快照就不会跟它抢
-    let _ = task.await;
     std::mem::take(&mut *lock(cap))
 }
 
@@ -1738,6 +1734,17 @@ mod tests {
             "/bin/bash",
             "装了就该用 bash，不然模型写的 bash 语法白写"
         );
+    }
+
+    /// 管道正常关闭（常见情形）：drain 不能多 await 一次 —— 那条路上
+    /// `JoinHandle` 已经被 poll 完，再 poll 会 panic 掉整个 App。
+    #[tokio::test]
+    async fn drain_handles_a_task_that_finishes_in_time() {
+        let cap = Arc::new(Mutex::new(Capture::default()));
+        let task = tokio::spawn(Capture::read_into(Some(&b"hello\n"[..]), None, cap.clone()));
+        let got = drain(task, &cap, Duration::from_secs(5)).await;
+        assert_eq!(got.head, b"hello\n");
+        assert_eq!(got.dropped_bytes, 0);
     }
 
     /// 管道被孙进程占着不关时：等到 grace 也得把**已经读到的**交出来。
@@ -2450,8 +2457,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&t.dir);
     }
 
-    /// 沙箱里没有浏览器：`$BROWSER` 和 xdg-open 这些名字都得指向 `agent-open`，
-    /// 它再 `POST /api/open` 让宿主把页面推到用户面前（`gh auth login` 靠它）。
+    /// 沙箱里没有浏览器：`$BROWSER` 和 xdg-open 这些名字都指向 `agent-open`，
+    /// 它只把网址打回输出 —— 由 agent 在回复里转告用户（没有“自动打开”这回事）。
+    /// 另外这六个都是“开浏览器”的常见名字，至少别让调用方拿到 not found。
     #[test]
     fn rootfs_gets_the_browser_shims() {
         let t = TempRoot::new("open");
@@ -2461,8 +2469,8 @@ mod tests {
         let open = t.dir.join("usr/local/bin/agent-open");
         let body = std::fs::read_to_string(&open).expect("agent-open 没写进去");
         assert!(body.starts_with("#!/bin/sh"));
-        assert!(body.contains("/api/open"), "{body}");
-        assert!(body.contains("AGENT_PORT"), "{body}");
+        // 只剩一个薄壳：真正的逻辑在 `agent open` 里
+        assert!(body.contains("exec /usr/local/bin/agent open"), "{body}");
 
         for alias in [
             "xdg-open",
