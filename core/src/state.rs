@@ -180,6 +180,10 @@ pub struct AppState {
     /// agent loop **没有轮数上限**，所以必须有一个真的能停下来、而不只是
     /// 断开前端连接的开关 —— 否则模型空转时只能在后台烧 token。
     pub abort_turn: AtomicBool,
+    /// 配合 `abort_turn`：按停止时叫醒正在等的人（流式接收、跑着的 bash）。
+    /// 只有标志位的话，停止要等到「这一步流完 / 这条命令跑完」才生效 ——
+    /// 而 bash 的超时可以是 24 小时。
+    pub abort_notify: tokio::sync::Notify,
     /// 已上传但还没随消息发出去的附件：`id → Attachment`。
     ///
     /// 上传和发送是两个请求，中间隔着一个用户可能改主意的间隔，所以需
@@ -209,6 +213,7 @@ impl AppState {
             files: RwLock::new(None),
             pending_attachments: Mutex::new(HashMap::new()),
             abort_turn: AtomicBool::new(false),
+            abort_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -419,7 +424,10 @@ impl AppState {
         };
         match serde_json::to_vec_pretty(&rec) {
             Ok(body) => {
-                if let Err(e) = std::fs::write(&f, body) {
+                // 先写临时文件再 rename：直接覆盖时进程被杀，llm.json 就是半截，
+                // 下次启动解析失败 —— API key 跟着没了。
+                let tmp = dir.join("llm.json.tmp");
+                if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &f)) {
                     tracing::warn!("写 {} 失败: {e}", f.display());
                 }
             }
@@ -449,9 +457,11 @@ impl AppState {
             ),
         }
         if let Ok(mut g) = self.vision.write() {
-            *g = Some((key, vision));
+            *g = Some((key.clone(), vision));
         }
-        if resolved.is_some() {
+        // 判定要联网（最多十几秒），这期间用户可能已经换了模型：只在当前
+        // provider 还是**这一个**时才落盘，否则会把旧模型的能力写到新模型头上。
+        if resolved.is_some() && self.llm().is_some_and(|cur| vision_key(&cur) == key) {
             self.set_supports_images(vision, dir.as_deref());
         }
         vision
@@ -480,9 +490,9 @@ impl AppState {
             ),
         }
         if let Ok(mut g) = self.files.write() {
-            *g = Some((key, files));
+            *g = Some((key.clone(), files));
         }
-        if resolved.is_some() {
+        if resolved.is_some() && self.llm().is_some_and(|cur| files_key(&cur) == key) {
             self.set_supports_files(files, dir.as_deref());
         }
         files
@@ -492,6 +502,23 @@ impl AppState {
     pub fn request_abort(&self) {
         self.abort_turn
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.abort_notify.notify_waiters();
+    }
+
+    /// 等到用户按停止。已经按过就立刻返回。
+    ///
+    /// 先登记再看标志位：`notify_waiters` 不留许可，先看标志再登记的话，
+    /// 两步之间按下的停止就丢了。
+    pub async fn aborted(&self) {
+        loop {
+            let n = self.abort_notify.notified();
+            tokio::pin!(n);
+            n.as_mut().enable();
+            if self.abort_requested() {
+                return;
+            }
+            n.await;
+        }
     }
 
     pub fn abort_requested(&self) -> bool {

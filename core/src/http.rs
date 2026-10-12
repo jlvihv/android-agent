@@ -230,6 +230,14 @@ struct ChatBody {
 /// 配了 provider 就跑真实 agent loop（`agent.rs`），否则回退到脚本演示流。
 /// 两种情况下**输出格式完全一致**，所以前端不需要知道区别。
 async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Response {
+    // 一次只跑一个回合。`turn_active` / `abort_turn` 都是全局的：两个回合
+    // 并行时，后一个开头会把前一个的「停止」清掉，先结束的那个又会把
+    // 「进行中」清掉 —— 界面以为跑完了，另一个还在后台烧 token。
+    // 从后台切回来、本地没连着流的时候最容易撞上。
+    if st.turn_active.load(std::sync::atomic::Ordering::Relaxed) && !body.demo {
+        return (StatusCode::CONFLICT, "上一个回合还在运行，先停止它或等它结束").into_response();
+    }
+
     // 「新对话」的第一句：会话到这一刻才建（前端点按钮时只清空了视图）。
     // 指定了 session（调试端）就不动这个。
     if body.fresh && body.session.is_none() {
@@ -273,6 +281,12 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
 
     match provider {
         Some(p) => {
+            // 上面那次检查和这里之间可能挤进来另一个请求：这里才是真正占位
+            //（`run_turn` 的 TurnGuard 负责放开）
+            if st.turn_active.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return (StatusCode::CONFLICT, "上一个回合还在运行，先停止它或等它结束")
+                    .into_response();
+            }
             st.log(
                 "info",
                 format!("chat → {} / {}", p.name, p.model),

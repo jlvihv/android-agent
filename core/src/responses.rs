@@ -300,10 +300,13 @@ impl Mapper {
                 output_index,
                 arguments,
             } => {
-                if self.saw_args_delta.contains(&output_index) {
-                    None
-                } else {
+                // `insert` 返回 false = 之前已经有过参数（delta 或这一次）。
+                // 记下来，后面的 `output_item.done` 就不会把整段参数再拼一遍 ——
+                // 只发 done、不发 delta 的实现，原来会得到 `{…}{…}` 这种坏 JSON。
+                if self.saw_args_delta.insert(output_index) {
                     one(tool_delta(output_index, None, None, Some(arguments)))
+                } else {
+                    None
                 }
             }
             Event::ItemDone { output_index, item } if item.kind == "function_call" => {
@@ -319,7 +322,9 @@ impl Mapper {
                     ))
                 }
             }
-            Event::Completed { response } => finish_chunk(response, None),
+            // 给一个 finish_reason：`pump_frames` 靠它认出「流是正常结束的」
+            //（Responses 没有 `[DONE]`），没带用量的实现也不会被当成断流。
+            Event::Completed { response } => finish_chunk(response, Some("stop".to_string())),
             Event::Incomplete { response } => {
                 let reason = response
                     .incomplete_details
@@ -427,6 +432,50 @@ mod tests {
 
     fn req_json(r: &ResponsesRequest) -> Value {
         serde_json::to_value(r).unwrap()
+    }
+
+    /// 把一串事件喂给 Mapper，拼出每个工具调用最终的参数文本。
+    fn args_after(events: &[Value]) -> String {
+        let mut m = Mapper::default();
+        let mut args = String::new();
+        for e in events {
+            if let Some(c) = m.map(&e.to_string()).unwrap() {
+                for ch in c.choices {
+                    for tc in ch.delta.tool_calls.unwrap_or_default() {
+                        if let Some(a) = tc.function.and_then(|f| f.arguments) {
+                            args.push_str(&a);
+                        }
+                    }
+                }
+            }
+        }
+        args
+    }
+
+    #[test]
+    fn arguments_given_only_at_done_are_not_repeated_by_item_done() {
+        // 不发 delta、只在 done 里给整段参数的实现：args.done 和 output_item.done
+        // 都带着参数。原来两边各拼一遍，得到 `{…}{…}`。
+        let item = json!({ "type": "function_call", "call_id": "c1", "name": "bash",
+                           "arguments": r#"{"command":"ls"}"# });
+        let args = args_after(&[
+            json!({ "type": "response.output_item.added", "output_index": 0,
+                    "item": { "type": "function_call", "call_id": "c1", "name": "bash", "arguments": "" } }),
+            json!({ "type": "response.function_call_arguments.done", "output_index": 0,
+                    "arguments": r#"{"command":"ls"}"# }),
+            json!({ "type": "response.output_item.done", "output_index": 0, "item": item }),
+        ]);
+        assert_eq!(args, r#"{"command":"ls"}"#);
+    }
+
+    #[test]
+    fn completed_without_usage_still_marks_the_end_of_the_stream() {
+        let mut m = Mapper::default();
+        let c = m
+            .map(&json!({ "type": "response.completed", "response": {} }).to_string())
+            .unwrap()
+            .expect("completed 必须产出一帧，pump_frames 靠它认出正常结束");
+        assert!(c.choices[0].finish_reason.is_some());
     }
 
     #[test]

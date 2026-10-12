@@ -7,7 +7,8 @@
 //! 工具调用**一律直接执行**，没有审批环节 —— 服务端因此没有「挂起等回复」
 //! 的状态，回合结束就是结束，手机 App 随时被杀都没关系。
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -526,6 +527,81 @@ pub const SYSTEM_PROMPT: &str = "\
 \n\
 回答要言简意赅。";
 
+/// 回合被打断时留下的工具调用结果。
+///
+/// 正常情况下停止会把没跑完的调用补上结果（见 `drive`），这里是兜底：
+/// 进程在两步之间被杀、或者老版本留下的会话。
+const INTERRUPTED: &str = r#"{"error":"没有结果：回合被中断（用户停止或 App 被关闭）"}"#;
+
+/// 历史 + 给没有结果的工具调用补上「被中断」。
+///
+/// 两家协议都要求每个 tool call 后面跟着它的结果，缺一个整个请求就 400 ——
+/// 那条会话从此再也发不出消息。补的内容由历史推导、字节确定，不影响前缀缓存。
+/// 绝大多数时候没有缺口，直接借用原历史，不拷贝。
+fn with_tool_results(msgs: &[ChatMessage]) -> Vec<Cow<'_, ChatMessage>> {
+    let mut out: Vec<Cow<'_, ChatMessage>> = Vec::with_capacity(msgs.len());
+    let mut i = 0;
+    while i < msgs.len() {
+        out.push(Cow::Borrowed(&msgs[i]));
+        let ChatMessage::Assistant { tool_calls, .. } = &msgs[i] else {
+            i += 1;
+            continue;
+        };
+        i += 1;
+        let mut answered: HashSet<&str> = HashSet::new();
+        while let Some(ChatMessage::Tool { tool_call_id, .. }) = msgs.get(i) {
+            answered.insert(tool_call_id);
+            out.push(Cow::Borrowed(&msgs[i]));
+            i += 1;
+        }
+        for tc in tool_calls.iter().filter(|tc| !answered.contains(tc.id.as_str())) {
+            out.push(Cow::Owned(ChatMessage::Tool {
+                tool_call_id: tc.id.clone(),
+                content: INTERRUPTED.to_string(),
+                images: Vec::new(),
+            }));
+        }
+    }
+    out
+}
+
+/// 历史末尾那步如果有没结果的工具调用，就地补上（回合开始前调）。
+///
+/// 只补**末尾**：会话是只追加落盘的（`db.rs` 的水位线），往中间插会让库和
+/// 内存对不上。中间的缺口（老会话）交给 `with_tool_results` 在组请求时补。
+/// 落进历史而不只是组请求时补，是为了界面上那几个工具不再一直转圈。
+fn close_dangling_tail(sess: &mut ChatSession) {
+    let Some(at) = sess
+        .messages
+        .iter()
+        .rposition(|m| !matches!(m, ChatMessage::Tool { .. }))
+    else {
+        return;
+    };
+    let ChatMessage::Assistant { tool_calls, .. } = &sess.messages[at] else {
+        return;
+    };
+    let answered: HashSet<&str> = sess.messages[at + 1..]
+        .iter()
+        .filter_map(|m| match m {
+            ChatMessage::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let missing: Vec<String> = tool_calls
+        .iter()
+        .filter(|tc| !answered.contains(tc.id.as_str()))
+        .map(|tc| tc.id.clone())
+        .collect();
+    for id in missing {
+        sess.messages.push(ChatMessage::Tool {
+            tool_call_id: id,
+            content: INTERRUPTED.to_string(),
+            images: Vec::new(),
+        });
+    }
+}
+
 /// 构造发给 provider 的消息数组 = **会话历史原样**。
 ///
 /// 唯一的“拼”是图片 carrier：`read` 读到图时，tool 消息后面会多一条 `user`
@@ -537,17 +613,17 @@ fn build_messages(
     supports_images: bool,
     supports_files: bool,
 ) -> anyhow::Result<Vec<Message>> {
-    let msgs = &sess.messages;
+    let msgs = with_tool_results(&sess.messages);
     let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
     let mut i = 0;
     while i < msgs.len() {
         // 带附件的用户消息：正文 + 图片 / PDF 内容块拼在一条消息里。
-        if let ChatMessage::UserFiles { text, attachments } = &msgs[i] {
+        if let ChatMessage::UserFiles { text, attachments } = &*msgs[i] {
             out.push(user_message(text, attachments, supports_images, supports_files));
             i += 1;
             continue;
         }
-        if !matches!(msgs[i], ChatMessage::Tool { .. }) {
+        if !matches!(*msgs[i], ChatMessage::Tool { .. }) {
             out.push(msgs[i].to_openai());
             i += 1;
             continue;
@@ -560,7 +636,7 @@ fn build_messages(
         // 图绝不能插在第 1、2 个 tool 之间。
         let mut carriers: Vec<(String, ImagePart)> = Vec::new();
         while i < msgs.len() {
-            match &msgs[i] {
+            match &*msgs[i] {
                 ChatMessage::Tool {
                     tool_call_id,
                     content,
@@ -957,6 +1033,8 @@ pub async fn run_turn(
         };
         // 历史里只追加两类东西：待补的系统提示词（见 `ensure_system_prompt`）
         // 和这条用户消息。不插任何“每轮重发”的上下文块。
+        // 上一回合被打断（进程被杀）留下的半截工具调用，先补上结果
+        close_dangling_tail(sess);
         ensure_system_prompt(sess, &system_prompt);
         // 一条消息装下正文和附件（有附件时才用 `UserFiles`，空附件保持老形状，
         // 前缀不变）。
@@ -1011,6 +1089,8 @@ struct StepOutput {
     content: String,
     reasoning: String,
     calls: Vec<RecordedToolCall>,
+    /// 流到一半用户按了停止。已经流出来的正文/思考照样进历史，工具调用作废。
+    aborted: bool,
 }
 
 /// 真正的 loop：模型 → 工具 → 模型 …
@@ -1059,6 +1139,12 @@ async fn drive(
             .await;
         }
 
+        if step.aborted {
+            send(tx, sse::abort("已停止")).await;
+            send(tx, sse::finish()).await;
+            return Ok(());
+        }
+
         let calls = step.calls;
         if calls.is_empty() {
             // 模型不再要求工具 → 本回合结束
@@ -1066,17 +1152,23 @@ async fn drive(
             return Ok(());
         }
 
-        for call in &calls {
+        for (n, call) in calls.iter().enumerate() {
             // 用户按了停止：这一批剩下的工具不再执行
             if core.state.abort_requested() {
-                send(tx, sse::abort("已停止")).await;
-                send(tx, sse::finish()).await;
-                return Ok(());
+                return stop_with_pending(core, sid, tx, &calls[n..]).await;
             }
             // 工具一律直接执行，没有审批环节。不存在的工具由 execute_tool
             // 返回错误，模型看到「未知工具 X」自己会改。
-            let outcome =
-                execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))).await;
+            //
+            // 跑着的时候按停止要立刻生效：丢掉这个 future，bash 的子进程随之
+            // 被杀（`kill_on_drop`）。不这样的话，一条 `timeout: 3600` 的命令
+            // 按了停止也要等它自己跑完。
+            let outcome = tokio::select! {
+                o = execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))) => o,
+                _ = core.state.aborted() => {
+                    return stop_with_pending(core, sid, tx, &calls[n..]).await;
+                }
+            };
             send(
                 tx,
                 sse::tool_output_available(&call.id, outcome.result.clone()),
@@ -1095,6 +1187,35 @@ async fn drive(
         }
         // 工具结果回灌，继续下一轮
     }
+}
+
+/// 停在一批工具调用的中间：没跑完 / 没跑的那些也要有结果。
+///
+/// assistant 那条已经带着这些 tool call 进了历史，缺结果的话下一轮请求
+/// 直接 400，这条会话就再也发不出去了。
+async fn stop_with_pending(
+    core: &Core,
+    sid: &str,
+    tx: &mpsc::UnboundedSender<Value>,
+    pending: &[RecordedToolCall],
+) -> anyhow::Result<()> {
+    let stopped = json!({ "error": "用户已停止，这个工具没有执行完" });
+    for call in pending {
+        send(tx, sse::tool_output_available(&call.id, stopped.clone())).await;
+        append(
+            core,
+            sid,
+            ChatMessage::Tool {
+                tool_call_id: call.id.clone(),
+                content: stopped.to_string(),
+                images: Vec::new(),
+            },
+        )
+        .await;
+    }
+    send(tx, sse::abort("已停止")).await;
+    send(tx, sse::finish()).await;
+    Ok(())
 }
 
 /// 构造一次完整的 **Chat Completions** 请求体（含工具表）。
@@ -1153,8 +1274,8 @@ fn build_responses_input(
     supports_files: bool,
 ) -> Vec<InputItem> {
     let mut out: Vec<InputItem> = Vec::new();
-    for m in &sess.messages {
-        match m {
+    for m in with_tool_results(&sess.messages) {
+        match &*m {
             ChatMessage::System(s) => out.push(message_item("system", MessageContent::Text(s.clone()))),
             ChatMessage::User(s) => out.push(message_item("user", MessageContent::Text(s.clone()))),
             ChatMessage::UserFiles { text, attachments } => out.push(message_item(
@@ -1311,7 +1432,8 @@ async fn stream_one(
     //
     // 优先 Responses API（见 `ApiStyle`）：端点不支持（404/405）就退回
     // Chat Completions，并记住这个 base_url|model，后面不再白试。
-    let mut rx = match provider.transport() {
+    let open = async {
+    let rx = match provider.transport() {
         Transport::Responses => {
             let (req, session_id) = {
                 let store = core.state.chat.read().await;
@@ -1378,6 +1500,20 @@ async fn stream_one(
             provider.stream_chat(&req, &session_id).await?
         }
     };
+    Ok::<_, anyhow::Error>(rx)
+    };
+    // 等首包也可能很久（长上下文的预填充），这段也要能停
+    let mut rx = tokio::select! {
+        r = open => r?,
+        _ = core.state.aborted() => {
+            return Ok(StepOutput {
+                content: String::new(),
+                reasoning: String::new(),
+                calls: Vec::new(),
+                aborted: true,
+            });
+        }
+    };
 
     // 工具调用是分片到达的：按 index 累积
     let mut acc: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
@@ -1393,8 +1529,30 @@ async fn stream_one(
     let mut finish: Option<String> = None;
     let mut usage: Option<Usage> = None;
 
-    while let Some(item) = rx.recv().await {
+    let mut aborted = false;
+    loop {
+        let item = tokio::select! {
+            item = rx.recv() => match item {
+                Some(item) => item,
+                None => break,
+            },
+            // 流到一半按停止：已经流出来的留着，剩下的不要了
+            _ = core.state.aborted() => {
+                aborted = true;
+                break;
+            }
+        };
         let chunk = item?;
+        // 网关在流里直接报错（限流、上下文超限、response.failed）。不接的话
+        // 这一步就是个空回复，回合「正常结束」，用户只看到没反应。
+        if let Some(e) = &chunk.error {
+            let msg = e
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| e.to_string());
+            anyhow::bail!("provider 报错：{msg}");
+        }
         if chunk.usage.is_some() {
             usage = chunk.usage.clone();
         }
@@ -1500,6 +1658,21 @@ async fn stream_one(
     // 而且这一轮的**工具调用全部作废**：截断意味着参数 JSON 很可能是半个
     // 对象，而 `execute_tool` 遇到坏 JSON 会退化成 `{}` 再报「缺少参数」——
     // 拿着坏参数去点手机，比直接说清楚要危险得多。
+    // 停在半路：工具调用的参数多半是半截 JSON，一个都不能执行。
+    // 已经在界面上露头的那几个，告诉前端作废了，别一直转圈。
+    if aborted {
+        // `calls` 里只剩有 id 和名字的，正是发过 tool-input-start 的那些
+        for c in &calls {
+            send(tx, sse::tool_output_available(&c.id, json!({ "error": "已停止" }))).await;
+        }
+        return Ok(StepOutput {
+            content: text_acc,
+            reasoning: reason_acc,
+            calls: Vec::new(),
+            aborted: true,
+        });
+    }
+
     if finish.as_deref() == Some("length") {
         let dropped = calls.len();
         let message = if dropped > 0 {
@@ -1530,6 +1703,7 @@ async fn stream_one(
         content: text_acc,
         reasoning: reason_acc,
         calls,
+        aborted: false,
     })
 }
 
@@ -1908,6 +2082,142 @@ async fn read_image_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一个假的 Chat Completions 端点：先吐一句话，然后**永远不结束**。
+    /// 返回 base_url。
+    async fn hanging_provider() -> String {
+        use axum::response::sse::{Event as SseEvent, Sse};
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                let first = tokio_stream::iter([Ok::<_, std::convert::Infallible>(
+                    SseEvent::default().data(r#"{"choices":[{"delta":{"content":"想到一半"}}]}"#),
+                )]);
+                let forever = tokio_stream::pending();
+                Sse::new(tokio_stream::StreamExt::chain(first, forever))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// 停止必须在**流到一半**就生效，而不是等这一步自己流完 ——
+    /// 网络卡住或者模型想很久的时候，那可能是永远。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_interrupts_a_stream_that_never_ends_and_keeps_what_arrived() {
+        crate::llm::install_crypto_provider();
+        let base = hanging_provider().await;
+        let mut p = Provider::compatible("fake", base.clone(), "m", "k");
+        p.api_style = crate::llm::ApiStyle::Chat;
+
+        let core = Core::new();
+        // 能力判定直接给缓存，别让测试去连 models.dev
+        *core.state.vision.write().unwrap() = Some((format!("{base}|m"), false));
+        *core.state.files.write().unwrap() = Some((format!("{base}|m"), false));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let turn = {
+            let core = core.clone();
+            tokio::spawn(async move { run_turn(&core, &p, "你好", vec![], None, tx).await })
+        };
+        // 等第一段正文到了再按停止
+        loop {
+            let c = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("第一段正文一直没来")
+                .expect("流提前结束了");
+            if c["type"] == "text-delta" {
+                break;
+            }
+        }
+        core.state.request_abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), turn)
+            .await
+            .expect("按了停止，回合没停下来")
+            .unwrap()
+            .unwrap();
+
+        let store = core.state.chat.read().await;
+        let sess = store.active_ref().unwrap();
+        assert!(
+            matches!(sess.messages.last(), Some(ChatMessage::Assistant { content, .. }) if content == "想到一半"),
+            "已经流出来的那半句要留在历史里"
+        );
+        assert!(!core.state.turn_active.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    fn call(id: &str) -> RecordedToolCall {
+        RecordedToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        }
+    }
+
+    fn tool(id: &str) -> ChatMessage {
+        ChatMessage::Tool {
+            tool_call_id: id.into(),
+            content: "ok".into(),
+            images: vec![],
+        }
+    }
+
+    /// 停在一批工具中间（或进程被杀）之后，下一轮请求里每个 tool call
+    /// 都必须有结果 —— 缺一个，provider 就 400，这条会话再也发不出去。
+    #[test]
+    fn every_tool_call_has_a_result_even_after_an_interrupted_turn() {
+        let mut sess = ChatSession::default();
+        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        sess.messages.push(ChatMessage::User("跑三个".into()));
+        sess.messages.push(ChatMessage::Assistant {
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![call("c1"), call("c2"), call("c3")],
+        });
+        sess.messages.push(tool("c1"));
+        // c2、c3 没有结果；后面已经又来了一句（老会话的形状）
+        sess.messages.push(ChatMessage::User("继续".into()));
+
+        let w = wire(&sess);
+        let ids: Vec<&str> = w
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["c1", "c2", "c3"]);
+        assert_eq!(w.last().unwrap()["role"], "user", "补的结果要紧跟在那批调用后面");
+
+        let r = serde_json::to_value(build_responses_request(&sess, "m", true, true, None).unwrap()).unwrap();
+        let outs = r["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "function_call_output")
+            .count();
+        assert_eq!(outs, 3);
+    }
+
+    #[test]
+    fn a_dangling_tail_is_closed_in_the_history_itself() {
+        let mut sess = ChatSession::default();
+        sess.messages.push(ChatMessage::User("跑".into()));
+        sess.messages.push(ChatMessage::Assistant {
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![call("c1"), call("c2")],
+        });
+        sess.messages.push(tool("c1"));
+        close_dangling_tail(&mut sess);
+        assert_eq!(sess.messages.len(), 4);
+        assert!(matches!(&sess.messages[3], ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "c2"));
+
+        // 已经完整的不动
+        close_dangling_tail(&mut sess);
+        assert_eq!(sess.messages.len(), 4);
+    }
 
     fn wire(sess: &ChatSession) -> Vec<serde_json::Value> {
         build_messages(sess, true, true)

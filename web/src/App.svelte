@@ -255,7 +255,9 @@
 
   function send(attachments: Upload[]) {
     const text = input.trim();
-    if ((!text && attachments.length === 0) || busy) return;
+    // serverBusy：从后台切回来时本地没连着流，但服务端那个回合还在跑。
+    // 这时再发一条，服务端会回 409（一次只跑一个回合）。
+    if ((!text && attachments.length === 0) || busy || serverBusy) return;
     // 第一句发出去的时候才告诉服务端「开新会话」（fresh 是个一次性意图）
     const startFresh = fresh;
     fresh = false;
@@ -294,6 +296,8 @@
     // 否则前端显示停了，agent 还在后台一轮轮跑工具、烧 token。
     void fetch('/api/stop', { method: 'POST' });
     controller?.abort();
+    // 没连着流（从后台回来）时按的停止：马上拉一次，「运行中」尽快消失
+    if (!controller) setTimeout(() => void loadMessages(), 300);
   };
 </script>
 
@@ -348,7 +352,7 @@
 
     <Composer
       bind:value={input}
-      {busy}
+      busy={busy || serverBusy}
       onsend={send}
       onstop={stop}
       onmodel={() => (sheet = true)}

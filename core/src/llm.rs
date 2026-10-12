@@ -382,6 +382,12 @@ pub(crate) fn shared_http() -> anyhow::Result<reqwest::Client> {
         // "Unknown TLS backend passed to `use_preconfigured_tls`"。
         reqwest::ClientBuilder::new()
             .tls_backend_preconfigured(tls)
+            // 手机网络会无声无息地断（切 Wi-Fi/蜂窝、进电梯）：没有超时的话
+            // 连接就挂在那儿，回合永远「进行中」。读超时是**两次收到数据之间**
+            // 的间隔，不是整个回复的时长 —— 流式回复不会被它误杀；给得宽是因为
+            // 长上下文的首包（预填充）可能要等一阵。
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| format!("{e:#}"))
     })
