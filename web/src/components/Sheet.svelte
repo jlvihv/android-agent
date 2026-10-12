@@ -168,7 +168,7 @@
 <!-- 遮罩。点它即关；拖到哪淡到哪。 -->
 <button
   use:portal
-  class="fixed inset-0 z-40 bg-black/35"
+  class="fixed inset-0 z-40 bg-scrim"
   style:opacity={1 - p}
   style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
   aria-label="关闭"

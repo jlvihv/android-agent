@@ -227,7 +227,7 @@
 </script>
 
 <button
-  class="fixed inset-0 z-40 bg-black/50"
+  class="fixed inset-0 z-40 bg-scrim"
   style:opacity={1 - off}
   style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
   aria-label="关闭"
@@ -240,7 +240,7 @@
   use:dismissable={drag}
   style:transform={off ? `translateX(${-off * 100}%)` : null}
   style:transition={dragging ? 'none' : RELEASE}
-  class="fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[92%] flex-col bg-[#111]
+  class="fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[92%] flex-col bg-drawer
          pt-[env(safe-area-inset-top)] will-change-transform"
   in:slideIn|global
   out:slideOut|global
@@ -255,7 +255,7 @@
     spellcheck="false"
     autocomplete="off"
     aria-label="搜索对话"
-    class="search-input mx-4 mt-1 mb-3 shrink-0 rounded-full bg-[#1f1f1f] py-3 pr-4 pl-10 text-base
+    class="search-input mx-4 mt-1 mb-3 shrink-0 rounded-full bg-surface py-3 pr-4 pl-10 text-base
            text-fg placeholder:text-faint outline-none"
   />
 
@@ -275,7 +275,7 @@
           {#each g.hits as h, i (`${g.id}:${i}`)}
             <button
               onclick={() => onswitch(g.id)}
-              class="block w-full rounded-2xl px-3 py-2 text-left active:bg-[#2a2a28]"
+              class="block w-full rounded-2xl px-3 py-2 text-left active:bg-bubble"
             >
               <span class="line-clamp-2 text-sm"
                 ><span class="mr-1.5 text-meta text-faint"
@@ -298,7 +298,7 @@
             use:focusOnMount
             onblur={commitRename}
             onkeydown={(e) => e.key === 'Enter' && commitRename()}
-            class="my-1 w-full rounded-2xl bg-[#414141] px-3 py-3 text-base text-fg outline-none"
+            class="my-1 w-full rounded-2xl bg-active px-3 py-3 text-base text-fg outline-none"
           />
         {:else}
           <button
@@ -311,7 +311,7 @@
               onswitch(s.id);
             }}
             class="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left
-                   {s.active ? 'bg-[#414141]' : ''}"
+                   {s.active ? 'bg-active' : ''}"
           >
             <Icon name="chat" size={18} class="shrink-0 text-muted" />
             <span class="min-w-0 flex-1 truncate text-base">{s.title}</span>
@@ -341,7 +341,7 @@
       <span
         aria-hidden="true"
         title={store.device?.name ?? '未连接设备'}
-        class="absolute right-0.5 bottom-0.5 size-2.5 rounded-full ring-2 ring-[#111]
+        class="absolute right-0.5 bottom-0.5 size-2.5 rounded-full ring-2 ring-drawer
                {store.device?.connected ? 'bg-ok' : 'bg-faint'}"
       ></span>
     </button>
@@ -361,7 +361,7 @@
   <!-- 长按菜单。点别处关掉。 -->
   <button class="fixed inset-0 z-[60]" aria-label="关闭菜单" onclick={() => (menu = null)}></button>
   <div
-    class="fixed z-[61] w-40 overflow-hidden rounded-2xl bg-[#2a2a28] shadow-2xl shadow-black/60"
+    class="fixed z-[61] w-40 overflow-hidden rounded-2xl bg-bubble shadow-2xl shadow-black/60"
     style="left: min({m.x}px, calc(92vw - 10.5rem)); top: min({m.y}px, calc(100dvh - 8.5rem))"
   >
     <button
@@ -376,7 +376,7 @@
         ondelete(m.id);
         menu = null;
       }}
-      class="flex w-full items-center gap-3 px-4 py-3.5 text-left text-base text-[#da6262]"
+      class="flex w-full items-center gap-3 px-4 py-3.5 text-left text-base text-danger"
     >
       <Icon name="trash" size={18} />
       删除
