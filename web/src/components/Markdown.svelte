@@ -162,8 +162,12 @@
       >
         {#each b.items as it}
           <li class={it.task === null ? '' : 'list-none -ml-5'}>
-            <div class="flex gap-2">
-              {#if it.task !== null}
+            <!-- 复选框那一行才需要 flex 行（图标 + 正文并排）。普通项直接放正文：
+                 之前无论有没有复选框都套着这层 `flex gap-2`，而它对普通项是**完全
+                 透明的一层**（浏览器里实测：把它改成 display:contents，整页每个
+                 元素的盒子一个像素都不动）。见 docs/07-debugging.md 的 DOM 审计。 -->
+            {#if it.task !== null}
+              <div class="flex gap-2">
                 <span
                   class="mt-[0.3em] grid size-[1.05em] shrink-0 place-items-center rounded-[0.3em] border
                          {it.task ? 'border-muted bg-muted text-ink' : 'border-faint'}"
@@ -174,16 +178,26 @@
                     >
                   {/if}
                 </span>
-              {/if}
-              <div class="flex min-w-0 flex-1 flex-col {b.tight ? 'gap-1' : 'gap-2.5'}">
-                {@render blocks(it.blocks)}
+                {@render itemBody(it.blocks, b.tight)}
               </div>
-            </div>
+            {:else}
+              {@render itemBody(it.blocks, b.tight)}
+            {/if}
           </li>
         {/each}
       </svelte:element>
     {/if}
   {/each}
+{/snippet}
+
+{#snippet itemBody(inner: Block[], tight: boolean)}
+  <!-- 列表项的正文，**不能**跟上面那层复选框行一起合掉：
+       - 有复选框时它是 flex 行的 item，靠 `flex-1` 占满剩下的宽度（实测：去掉后正文从
+         354px 缩到 80px，工具行那种「图标 + 文字」的挤压就是这样来的）；
+       - 没复选框时它负责**多块之间**的间距（`gap-*`）。只有一个段落时看不出区别，
+         但一条列表项里有多个块很常见（「文字 + 嵌套列表」）。
+       （这两句都是 `just dom-audit` 的拔掉测试实测的，不是推的。） -->
+  <div class="flex min-w-0 flex-1 flex-col {tight ? 'gap-1' : 'gap-2.5'}">{@render blocks(inner)}</div>
 {/snippet}
 
 <!-- 块级内容分组。在 MessageList 里父级已经是 flex-col gap-2.5，看着像多余的一层，
