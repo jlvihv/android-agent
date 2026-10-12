@@ -30,6 +30,7 @@
     peek,
     slide = 1,
     minClass = 'min-h-[45dvh]',
+    padClass = 'px-3',
     children,
   }: {
     title: string;
@@ -46,6 +47,13 @@
      *  只在面板内部换页时有意义。 */
     slide?: number;
     minClass?: string;
+    /** 内容区的左右内边距，默认 `px-3`。
+     *
+     * 横向翻页的面板（「选择模型」）要传 `px-0`：它的内容是一整条 `w-[200%]`
+     * 轨道，边距挂在内容区上的话**两页交界处没有边距** —— 滑到中间时左页的
+     * 卡片和右页的卡片贴成一条（实测 x=12..399 连续无缝）。那两页自己带
+     * `px-3`，交界处才有 24px 的面板色。 */
+    padClass?: string;
     children: Snippet;
   } = $props();
 
@@ -201,7 +209,7 @@
   </div>
 
   <div
-    class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
+    class="min-h-0 flex-1 overflow-y-auto overscroll-contain {padClass} pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
   >
     {@render children()}
   </div>

@@ -204,6 +204,7 @@
   {peek}
   slide={page === 'sub' ? 1 : -1}
   minClass="min-h-0"
+  padClass="px-0"
   {onclose}
 >
   <!-- 视口：横向把另一页裁掉，高度跟着当前页（CSS 过渡） -->
@@ -218,7 +219,11 @@
       style:transform="translateX({-50 * at}%)"
       style:transition={peeking ? 'none' : `transform ${PAGE_MS}ms ${ease}`}
     >
-      <div class="w-1/2 shrink-0">
+      <!-- 每一页**自己**带 12px 外边距（所以 Sheet 那边传了 padClass="px-0"）。
+           挂在 Sheet 内容区上的话，两页交界处没有边距 —— 切换动画滑到中间时，
+           左页的卡片和右页的卡片会贴成**一整条**（实测 x=12..399 连续无缝）。
+           卡片带外边距，滑过去才像「整页替换」。 -->
+      <div class="w-1/2 shrink-0 px-3">
         <div bind:this={paneModels} class="flex flex-col gap-3">
           <!-- 模型提供商：切到第二页，选看哪家的模型 -->
           <button
@@ -289,7 +294,7 @@
         </div>
       </div>
 
-      <div class="w-1/2 shrink-0">
+      <div class="w-1/2 shrink-0 px-3">
         <div bind:this={paneSub} class="flex flex-col gap-3">
           {#if sub === 'providers'}
             <!-- 只列配好了 Key 的几家；加新的去设置页 -->
