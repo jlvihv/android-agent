@@ -95,9 +95,10 @@ pub fn is_known(id: &str) -> bool {
 pub fn provider(id: &str, creds: &Creds, model: &str) -> Option<Provider> {
     let (base_url, api_style) = match preset(id) {
         Some(p) => (p.base_url.to_string(), p.api_style),
-        None if id == CUSTOM && !creds.base_url.trim().is_empty() => {
-            (creds.base_url.trim().trim_end_matches('/').to_string(), ApiStyle::Auto)
-        }
+        None if id == CUSTOM && !creds.base_url.trim().is_empty() => (
+            creds.base_url.trim().trim_end_matches('/').to_string(),
+            ApiStyle::Auto,
+        ),
         None => return None,
     };
     let mut p = Provider::compatible(id, base_url, model, creds.api_key.clone());
@@ -107,7 +108,11 @@ pub fn provider(id: &str, creds: &Creds, model: &str) -> Option<Provider> {
 
 /// 一个 `Provider` 属于哪家：按 Base URL 认（老配置的 `name` 是随手填的，不可信）。
 pub fn identify(p: &Provider) -> &'static str {
-    let norm = |s: &str| s.trim_end_matches('/').trim_end_matches("/v1").to_ascii_lowercase();
+    let norm = |s: &str| {
+        s.trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_ascii_lowercase()
+    };
     let url = norm(&p.base_url);
     PRESETS
         .iter()
@@ -134,8 +139,21 @@ pub fn pick_default(id: &str, models: &[String]) -> Option<String> {
 /// 语音、画图、审核，选了也只会 400。按名字筛掉 —— 这些名字各家都很规整。
 pub fn is_chat_model(id: &str) -> bool {
     const NOT_CHAT: &[&str] = &[
-        "embed", "tts", "whisper", "transcribe", "dall-e", "image", "moderation", "realtime",
-        "audio", "sora", "davinci", "babbage", "instruct", "search-preview", "computer-use",
+        "embed",
+        "tts",
+        "whisper",
+        "transcribe",
+        "dall-e",
+        "image",
+        "moderation",
+        "realtime",
+        "audio",
+        "sora",
+        "davinci",
+        "babbage",
+        "instruct",
+        "search-preview",
+        "computer-use",
         "rerank",
     ];
     let id = id.to_ascii_lowercase();
@@ -144,7 +162,14 @@ pub fn is_chat_model(id: &str) -> bool {
 
 /// 界面上显示的 Key：只露最后 4 位。
 pub fn key_hint(key: &str) -> String {
-    let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("…{tail}")
 }
 
@@ -181,7 +206,11 @@ mod tests {
 
     #[test]
     fn the_default_model_follows_the_preference_list() {
-        let models = vec!["gpt-4.1".to_string(), "gpt-5.4".to_string(), "gpt-5".to_string()];
+        let models = vec![
+            "gpt-4.1".to_string(),
+            "gpt-5.4".to_string(),
+            "gpt-5".to_string(),
+        ];
         assert_eq!(pick_default("openai", &models).as_deref(), Some("gpt-5.4"));
         assert_eq!(pick_default(CUSTOM, &models).as_deref(), Some("gpt-4.1"));
         assert_eq!(pick_default("openai", &[]), None);
@@ -189,11 +218,24 @@ mod tests {
 
     #[test]
     fn non_chat_models_are_filtered_out() {
-        for id in ["text-embedding-3-small", "tts-1", "whisper-1", "dall-e-3", "gpt-image-1",
-                   "omni-moderation-latest", "gpt-4o-realtime-preview", "chatgpt-image-latest"] {
+        for id in [
+            "text-embedding-3-small",
+            "tts-1",
+            "whisper-1",
+            "dall-e-3",
+            "gpt-image-1",
+            "omni-moderation-latest",
+            "gpt-4o-realtime-preview",
+            "chatgpt-image-latest",
+        ] {
             assert!(!is_chat_model(id), "{id}");
         }
-        for id in ["gpt-5.4", "deepseek-v4-flash", "claude-sonnet-4-5", "qwen3.7-max"] {
+        for id in [
+            "gpt-5.4",
+            "deepseek-v4-flash",
+            "claude-sonnet-4-5",
+            "qwen3.7-max",
+        ] {
             assert!(is_chat_model(id), "{id}");
         }
     }

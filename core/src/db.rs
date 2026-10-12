@@ -120,7 +120,10 @@ impl Db {
 
     /// 读出全部会话。只在启动时调一次。
     pub fn load(&self) -> Result<SessionStore> {
-        let mut g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
 
         // 查询期间只借用 &*g；结束后才动 g.saved。
         // 不分开的话「借用 (*g).conn」和「可变借用 (*g).saved」会打架。
@@ -204,7 +207,10 @@ impl Db {
     /// 原来每次都给**每个**会话发一条 UPSERT，再拼一条 `NOT IN (全部 id)`，
     /// 会话一多，每 2 秒都在白写。
     pub fn sync(&self, store: &SessionStore) -> Result<()> {
-        let mut g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
 
         // 空会话不落盘（也把它上次可能写进去的旧行清掉，见下面的 gone）：
         // 「新对话」点了没说话、或 `/api/reset` 清空过，重启后不该又冒出来。
@@ -290,10 +296,15 @@ impl Db {
 
     /// 读一条设置（`meta` 表）。provider 配置、访问凭据都在这里。
     pub fn get_meta(&self, k: &str) -> Result<Option<String>> {
-        let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
         let v = g
             .conn
-            .query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get::<_, String>(0));
+            .query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| {
+                r.get::<_, String>(0)
+            });
         match v {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -303,14 +314,20 @@ impl Db {
 
     /// 删一条设置。
     pub fn delete_meta(&self, k: &str) -> Result<()> {
-        let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
         g.conn.execute("DELETE FROM meta WHERE k = ?1", [k])?;
         Ok(())
     }
 
     /// 写一条设置。单条 UPSERT，原子的。
     pub fn set_meta(&self, k: &str, v: &str) -> Result<()> {
-        let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
         g.conn.execute(
             "INSERT INTO meta(k, v) VALUES(?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             [k, v],
@@ -322,7 +339,10 @@ impl Db {
     ///
     /// 只清会话：`meta` 里还有 provider 配置和访问凭据，不能跟着没了。
     pub fn wipe(&self) -> Result<()> {
-        let mut g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
         g.conn.execute_batch(
             "DELETE FROM sessions; DELETE FROM messages; DELETE FROM meta WHERE k = 'active';",
         )?;
@@ -359,7 +379,11 @@ mod tests {
 
         db.wipe().unwrap();
         assert!(db.load().unwrap().sessions.is_empty());
-        assert_eq!(db.get_meta("llm").unwrap().as_deref(), Some("{}"), "provider 配置不该跟着会话一起清掉");
+        assert_eq!(
+            db.get_meta("llm").unwrap().as_deref(),
+            Some("{}"),
+            "provider 配置不该跟着会话一起清掉"
+        );
     }
 
     fn msg_user(t: &str) -> ChatMessage {

@@ -290,9 +290,7 @@ impl Provider {
         req: &ChatRequest,
         session_id: &str,
     ) -> Result<mpsc::UnboundedReceiver<anyhow::Result<StreamChunk>>, StreamError> {
-        let resp = self
-            .post_stream(&self.chat_url(), req, session_id)
-            .await?;
+        let resp = self.post_stream(&self.chat_url(), req, session_id).await?;
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let r = openai::pump_frames(resp, tx.clone(), |data| {

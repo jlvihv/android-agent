@@ -174,7 +174,10 @@ enum Event {
     #[serde(rename = "response.function_call_arguments.delta")]
     ArgsDelta { output_index: u32, delta: String },
     #[serde(rename = "response.function_call_arguments.done")]
-    ArgsDone { output_index: u32, arguments: String },
+    ArgsDone {
+        output_index: u32,
+        arguments: String,
+    },
     #[serde(rename = "response.completed")]
     Completed { response: ResponsePayload },
     #[serde(rename = "response.incomplete")]
@@ -284,18 +287,15 @@ impl Mapper {
                 content: Some(delta),
                 ..Delta::default()
             }),
-            Event::ReasoningSummaryDelta { delta } | Event::ReasoningDelta { delta } => one(Delta {
-                reasoning_content: Some(delta),
-                ..Delta::default()
-            }),
-            Event::ItemAdded { output_index, item } if item.kind == "function_call" => {
-                one(tool_delta(
-                    output_index,
-                    item.call_id,
-                    item.name,
-                    item.arguments,
-                ))
+            Event::ReasoningSummaryDelta { delta } | Event::ReasoningDelta { delta } => {
+                one(Delta {
+                    reasoning_content: Some(delta),
+                    ..Delta::default()
+                })
             }
+            Event::ItemAdded { output_index, item } if item.kind == "function_call" => one(
+                tool_delta(output_index, item.call_id, item.name, item.arguments),
+            ),
             Event::ArgsDelta {
                 output_index,
                 delta,
@@ -405,11 +405,7 @@ fn convert_usage(u: ResponsesUsage) -> Usage {
         completion_tokens: u.output_tokens,
         total_tokens: u.total_tokens,
         prompt_tokens_details: Some(PromptTokensDetails {
-            cached_tokens: Some(
-                u.input_tokens_details
-                    .map(|d| d.cached_tokens)
-                    .unwrap_or(0),
-            ),
+            cached_tokens: Some(u.input_tokens_details.map(|d| d.cached_tokens).unwrap_or(0)),
         }),
         completion_tokens_details: Some(CompletionTokensDetails {
             reasoning_tokens: Some(
@@ -424,11 +420,7 @@ fn convert_usage(u: ResponsesUsage) -> Usage {
 }
 
 fn clip(s: &str) -> &str {
-    let end = s
-        .char_indices()
-        .nth(200)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
+    let end = s.char_indices().nth(200).map(|(i, _)| i).unwrap_or(s.len());
     &s[..end]
 }
 

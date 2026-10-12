@@ -394,7 +394,11 @@ fn hit_snippet(text: &str, needle: &str) -> Option<String> {
         s.push('…');
     }
     // 换行拍平成空格，否则摘要里会带出多行
-    s.extend(raw[start..end].iter().map(|c| if *c == '\n' { ' ' } else { *c }));
+    s.extend(
+        raw[start..end]
+            .iter()
+            .map(|c| if *c == '\n' { ' ' } else { *c }),
+    );
     if end < raw.len() {
         s.push('…');
     }
@@ -455,7 +459,11 @@ impl SessionStore {
     pub fn delete(&mut self, id: &str) {
         self.sessions.retain(|s| s.id != id);
         if self.active == id {
-            self.active = self.sessions.first().map(|s| s.id.clone()).unwrap_or_default();
+            self.active = self
+                .sessions
+                .first()
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
         }
     }
 
@@ -600,7 +608,10 @@ fn with_tool_results(msgs: &[ChatMessage]) -> Vec<Cow<'_, ChatMessage>> {
             out.push(Cow::Borrowed(&msgs[i]));
             i += 1;
         }
-        for tc in tool_calls.iter().filter(|tc| !answered.contains(tc.id.as_str())) {
+        for tc in tool_calls
+            .iter()
+            .filter(|tc| !answered.contains(tc.id.as_str()))
+        {
             out.push(Cow::Owned(ChatMessage::Tool {
                 tool_call_id: tc.id.clone(),
                 content: INTERRUPTED.to_string(),
@@ -665,7 +676,12 @@ fn build_messages(
     while i < msgs.len() {
         // 带附件的用户消息：正文 + 图片 / PDF 内容块拼在一条消息里。
         if let ChatMessage::UserFiles { text, attachments } = &*msgs[i] {
-            out.push(user_message(text, attachments, supports_images, supports_files));
+            out.push(user_message(
+                text,
+                attachments,
+                supports_images,
+                supports_files,
+            ));
             i += 1;
             continue;
         }
@@ -966,9 +982,7 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
         }
     }
 
-    let parse = |s: &str| -> Value {
-        serde_json::from_str(s).unwrap_or_else(|_| json!(s))
-    };
+    let parse = |s: &str| -> Value { serde_json::from_str(s).unwrap_or_else(|_| json!(s)) };
 
     let mut out: Vec<Value> = Vec::new();
     for (i, m) in sess.messages.iter().enumerate().skip(from) {
@@ -999,7 +1013,9 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
             } => {
                 let mut parts: Vec<Value> = Vec::new();
                 if !reasoning.is_empty() {
-                    parts.push(json!({ "type": "reasoning", "id": format!("r{i}"), "text": reasoning }));
+                    parts.push(
+                        json!({ "type": "reasoning", "id": format!("r{i}"), "text": reasoning }),
+                    );
                 }
                 if !content.is_empty() {
                     parts.push(json!({ "type": "text", "id": format!("t{i}"), "text": content }));
@@ -1024,7 +1040,10 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
                 // 和流式时前端看到的一样。不合的话刷新前后排版不一致：
                 // 流式是一条消息里的几段，恢复出来是好几条消息、间距也不同。
                 if let Some(last) = out.last_mut().filter(|m| m["role"] == "assistant") {
-                    last["parts"].as_array_mut().expect("parts 是数组").extend(parts);
+                    last["parts"]
+                        .as_array_mut()
+                        .expect("parts 是数组")
+                        .extend(parts);
                     last["steps"] = json!(last["steps"].as_u64().unwrap_or(1) + 1);
                 } else {
                     out.push(json!({
@@ -1297,7 +1316,9 @@ pub fn build_responses_request(
         tools: tool_definitions_responses(),
         stream: true,
         store: false,
-        reasoning: effort.map(|e| Reasoning { effort: e.to_string() }),
+        reasoning: effort.map(|e| Reasoning {
+            effort: e.to_string(),
+        }),
     })
 }
 
@@ -1310,7 +1331,9 @@ fn build_responses_input(
     let mut out: Vec<InputItem> = Vec::new();
     for m in with_tool_results(&sess.messages) {
         match &*m {
-            ChatMessage::System(s) => out.push(message_item("system", MessageContent::Text(s.clone()))),
+            ChatMessage::System(s) => {
+                out.push(message_item("system", MessageContent::Text(s.clone())))
+            }
             ChatMessage::User(s) => out.push(message_item("user", MessageContent::Text(s.clone()))),
             ChatMessage::UserFiles { text, attachments } => out.push(message_item(
                 "user",
@@ -1409,7 +1432,10 @@ fn user_message_content(
                     Ok(url) => parts.push(input_image(url)),
                     Err(e) => {
                         tracing::warn!("附件读不到了 {}: {e}", a.path);
-                        parts.push(input_text(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
+                        parts.push(input_text(format!(
+                            "[附件 {} 已丢失，本轮没能附带]",
+                            a.name
+                        )));
                     }
                 }
             }
@@ -1425,7 +1451,10 @@ fn user_message_content(
                     Ok(url) => parts.push(input_file(&a.name, url)),
                     Err(e) => {
                         tracing::warn!("附件读不到了 {}: {e}", a.path);
-                        parts.push(input_text(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
+                        parts.push(input_text(format!(
+                            "[附件 {} 已丢失，本轮没能附带]",
+                            a.name
+                        )));
                     }
                 }
             }
@@ -1507,74 +1536,74 @@ async fn stream_one(
     }
 
     let open = async {
-    let rx = match provider.transport() {
-        Transport::Responses => {
-            let (req, session_id) = {
-                let store = core.state.chat.read().await;
-                let sess = store
-                    .get(sid)
-                    .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-                (
-                    build_responses_request(
-                        sess,
-                        &provider.model,
-                        supports_images,
-                        supports_files,
-                        provider.reasoning_effort.as_deref(),
-                    )?,
-                    sess.provider_session.clone(),
-                )
-            };
-            match provider.stream_responses(&req, &session_id).await {
-                Ok(rx) => rx,
-                Err(e) if e.is_unsupported_endpoint() => {
-                    crate::llm::mark_responses_unsupported(provider);
-                    tracing::info!(
-                        "{} 不支持 Responses API，退回 Chat Completions",
-                        provider.base_url
-                    );
-                    let (req, session_id) = {
-                        let store = core.state.chat.read().await;
-                        let sess = store
-                            .get(sid)
-                            .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-                        (
-                            build_request(
-                                sess,
-                                &provider.model,
-                                supports_images,
-                                supports_files,
-                                provider.reasoning_effort.as_deref(),
-                            )?,
-                            sess.provider_session.clone(),
-                        )
-                    };
-                    provider.stream_chat(&req, &session_id).await?
+        let rx = match provider.transport() {
+            Transport::Responses => {
+                let (req, session_id) = {
+                    let store = core.state.chat.read().await;
+                    let sess = store
+                        .get(sid)
+                        .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+                    (
+                        build_responses_request(
+                            sess,
+                            &provider.model,
+                            supports_images,
+                            supports_files,
+                            provider.reasoning_effort.as_deref(),
+                        )?,
+                        sess.provider_session.clone(),
+                    )
+                };
+                match provider.stream_responses(&req, &session_id).await {
+                    Ok(rx) => rx,
+                    Err(e) if e.is_unsupported_endpoint() => {
+                        crate::llm::mark_responses_unsupported(provider);
+                        tracing::info!(
+                            "{} 不支持 Responses API，退回 Chat Completions",
+                            provider.base_url
+                        );
+                        let (req, session_id) = {
+                            let store = core.state.chat.read().await;
+                            let sess = store
+                                .get(sid)
+                                .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+                            (
+                                build_request(
+                                    sess,
+                                    &provider.model,
+                                    supports_images,
+                                    supports_files,
+                                    provider.reasoning_effort.as_deref(),
+                                )?,
+                                sess.provider_session.clone(),
+                            )
+                        };
+                        provider.stream_chat(&req, &session_id).await?
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
             }
-        }
-        Transport::Chat => {
-            let (req, session_id) = {
-                let store = core.state.chat.read().await;
-                let sess = store
-                    .get(sid)
-                    .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-                (
-                    build_request(
-                        sess,
-                        &provider.model,
-                        supports_images,
-                        supports_files,
-                        provider.reasoning_effort.as_deref(),
-                    )?,
-                    sess.provider_session.clone(),
-                )
-            };
-            provider.stream_chat(&req, &session_id).await?
-        }
-    };
-    Ok::<_, anyhow::Error>(rx)
+            Transport::Chat => {
+                let (req, session_id) = {
+                    let store = core.state.chat.read().await;
+                    let sess = store
+                        .get(sid)
+                        .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+                    (
+                        build_request(
+                            sess,
+                            &provider.model,
+                            supports_images,
+                            supports_files,
+                            provider.reasoning_effort.as_deref(),
+                        )?,
+                        sess.provider_session.clone(),
+                    )
+                };
+                provider.stream_chat(&req, &session_id).await?
+            }
+        };
+        Ok::<_, anyhow::Error>(rx)
     };
     // 等首包也可能很久（长上下文的预填充），这段也要能停
     let mut rx = tokio::select! {
@@ -1591,11 +1620,11 @@ async fn stream_one(
 
     // 工具调用是分片到达的：按 index 累积
     let mut acc: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
-    // 每个工具调用是否已经告诉前端"开始了"。
-    //
-    // 之前要等这一步整个流完、才一次性发 tool-input-available —— 模型写
-    // 一条长命令（或一大段 edit）的那几秒里，界面上什么都没有。现在 id 和
-    // 名字一到就发 start，参数边到边发 delta，前端能边写边显示。
+                                                             // 每个工具调用是否已经告诉前端"开始了"。
+                                                             //
+                                                             // 之前要等这一步整个流完、才一次性发 tool-input-available —— 模型写
+                                                             // 一条长命令（或一大段 edit）的那几秒里，界面上什么都没有。现在 id 和
+                                                             // 名字一到就发 start，参数边到边发 delta，前端能边写边显示。
     let mut started: Vec<bool> = Vec::new();
     let mut blocks = BlockStream::default();
     let mut text_acc = String::new();
@@ -1716,7 +1745,6 @@ async fn stream_one(
         send(tx, sse::data_part("usage", serde_json::to_value(u)?)).await;
     }
 
-
     let mut calls: Vec<RecordedToolCall> = acc
         .into_iter()
         .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
@@ -1737,7 +1765,11 @@ async fn stream_one(
     if aborted {
         // `calls` 里只剩有 id 和名字的，正是发过 tool-input-start 的那些
         for c in &calls {
-            send(tx, sse::tool_output_available(&c.id, json!({ "error": "已停止" }))).await;
+            send(
+                tx,
+                sse::tool_output_available(&c.id, json!({ "error": "已停止" })),
+            )
+            .await;
         }
         return Ok(StepOutput {
             content: text_acc,
@@ -2143,7 +2175,11 @@ async fn execute_tool(
             .unwrap_or("")
             .to_string();
         // 每一跳都把落地点报出来：模型下一步要发请求/点链接时靠它判断自己在哪
-        if let Some(url) = res.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(url) = res
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             text.push_str(&format!("\nURL: {url}"));
         }
 
@@ -2386,7 +2422,10 @@ mod tests {
             matches!(sess.messages.last(), Some(ChatMessage::Assistant { content, .. }) if content == "想到一半"),
             "已经流出来的那半句要留在历史里"
         );
-        assert!(!core.state.is_busy(&sid), "回合结束要把会话从「进行中」里拿掉");
+        assert!(
+            !core.state.is_busy(&sid),
+            "回合结束要把会话从「进行中」里拿掉"
+        );
     }
 
     fn call(id: &str) -> RecordedToolCall {
@@ -2428,9 +2467,15 @@ mod tests {
             .map(|m| m["tool_call_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["c1", "c2", "c3"]);
-        assert_eq!(w.last().unwrap()["role"], "user", "补的结果要紧跟在那批调用后面");
+        assert_eq!(
+            w.last().unwrap()["role"],
+            "user",
+            "补的结果要紧跟在那批调用后面"
+        );
 
-        let r = serde_json::to_value(build_responses_request(&sess, "m", true, true, None).unwrap()).unwrap();
+        let r =
+            serde_json::to_value(build_responses_request(&sess, "m", true, true, None).unwrap())
+                .unwrap();
         let outs = r["input"]
             .as_array()
             .unwrap()
@@ -2452,7 +2497,9 @@ mod tests {
         sess.messages.push(tool("c1"));
         close_dangling_tail(&mut sess);
         assert_eq!(sess.messages.len(), 4);
-        assert!(matches!(&sess.messages[3], ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "c2"));
+        assert!(
+            matches!(&sess.messages[3], ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "c2")
+        );
 
         // 已经完整的不动
         close_dangling_tail(&mut sess);
@@ -2529,7 +2576,10 @@ mod tests {
         ensure_system_prompt(&mut sess, "新提示词");
         let after = wire(&sess);
         assert_eq!(&after[..before.len()], &before[..], "老前缀被动 → 缓存全废");
-        assert_eq!(after[0]["content"], "旧提示词", "第一条必须是旧的，不能替换");
+        assert_eq!(
+            after[0]["content"], "旧提示词",
+            "第一条必须是旧的，不能替换"
+        );
         assert_eq!(after.last().unwrap()["content"], "新提示词");
 
         // 同一条提示词不能反复追加
@@ -2591,9 +2641,10 @@ mod tests {
         ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
         sess.messages.push(ChatMessage::User("第一问".into()));
         // 转成 Value 是为了断言请求体本身；线上路径不经过这一步
-        let req1 =
-            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true, true, None).unwrap())
-                .unwrap();
+        let req1 = serde_json::to_value(
+            build_request(&sess, "deepseek-v4.1-flash", true, true, None).unwrap(),
+        )
+        .unwrap();
 
         sess.messages.push(ChatMessage::Assistant {
             content: "答".into(),
@@ -2610,11 +2661,15 @@ mod tests {
             images: vec![],
         });
         sess.messages.push(ChatMessage::User("第二问".into()));
-        let req2 =
-            serde_json::to_value(build_request(&sess, "deepseek-v4.1-flash", true, true, None).unwrap())
-                .unwrap();
+        let req2 = serde_json::to_value(
+            build_request(&sess, "deepseek-v4.1-flash", true, true, None).unwrap(),
+        )
+        .unwrap();
 
-        assert_eq!(req1["tools"], req2["tools"], "工具表变了 → 整段前缀缓存失效");
+        assert_eq!(
+            req1["tools"], req2["tools"],
+            "工具表变了 → 整段前缀缓存失效"
+        );
         assert_eq!(req1["model"], req2["model"]);
         assert_eq!(req1["stream_options"], req2["stream_options"]);
         // 用量上报是缓存命中率的唯一来源，不能因为换成强类型字段就丢了
@@ -2632,16 +2687,17 @@ mod tests {
         ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
         sess.messages.push(ChatMessage::User("嗨".into()));
 
-        let chat = serde_json::to_value(build_request(&sess, "m", true, true, None).unwrap())
-            .unwrap();
+        let chat =
+            serde_json::to_value(build_request(&sess, "m", true, true, None).unwrap()).unwrap();
         assert!(chat.get("reasoning_effort").is_none(), "{chat}");
         let resp =
             serde_json::to_value(build_responses_request(&sess, "m", true, true, None).unwrap())
                 .unwrap();
         assert!(resp.get("reasoning").is_none(), "{resp}");
 
-        let chat = serde_json::to_value(build_request(&sess, "m", true, true, Some("high")).unwrap())
-            .unwrap();
+        let chat =
+            serde_json::to_value(build_request(&sess, "m", true, true, Some("high")).unwrap())
+                .unwrap();
         assert_eq!(chat["reasoning_effort"], "high");
         let resp = serde_json::to_value(
             build_responses_request(&sess, "m", true, true, Some("low")).unwrap(),
@@ -2879,8 +2935,9 @@ mod tests {
     fn tool_schemas_serialize_byte_identically() {
         let once = serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
             .unwrap();
-        let twice = serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
-            .unwrap();
+        let twice =
+            serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
+                .unwrap();
         assert_eq!(once, twice);
     }
 
@@ -2935,13 +2992,21 @@ mod tests {
         assert!(parse_timeout(&json!({ "timeout": "600" })).is_none());
 
         // 普通值原样，长时间任务（比如 3 小时下载）完全允许
-        assert_eq!(parse_timeout(&json!({ "timeout": 600 })).unwrap().as_secs(), 600);
         assert_eq!(
-            parse_timeout(&json!({ "timeout": 10800 })).unwrap().as_secs(),
+            parse_timeout(&json!({ "timeout": 600 })).unwrap().as_secs(),
+            600
+        );
+        assert_eq!(
+            parse_timeout(&json!({ "timeout": 10800 }))
+                .unwrap()
+                .as_secs(),
             10800
         );
         // 超过上限就夹到 24h，而不是报错或无限大
-        assert_eq!(parse_timeout(&json!({ "timeout": 999_999_999 })).unwrap(), linux::MAX_TIMEOUT);
+        assert_eq!(
+            parse_timeout(&json!({ "timeout": 999_999_999 })).unwrap(),
+            linux::MAX_TIMEOUT
+        );
         assert!(linux::MAX_TIMEOUT >= std::time::Duration::from_secs(6 * 3600));
     }
 
@@ -2968,26 +3033,65 @@ mod tests {
         sess.messages = vec![
             ChatMessage::System("ctx".into()),
             ChatMessage::User("问".into()),
-            ChatMessage::Assistant { content: "先看看".into(), reasoning: "想1".into(), tool_calls: vec![call("c1")] },
-            ChatMessage::Tool { tool_call_id: "c1".into(), content: "{}".into(), images: vec![] },
-            ChatMessage::Assistant { content: "答".into(), reasoning: "想2".into(), tool_calls: vec![] },
+            ChatMessage::Assistant {
+                content: "先看看".into(),
+                reasoning: "想1".into(),
+                tool_calls: vec![call("c1")],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "c1".into(),
+                content: "{}".into(),
+                images: vec![],
+            },
+            ChatMessage::Assistant {
+                content: "答".into(),
+                reasoning: "想2".into(),
+                tool_calls: vec![],
+            },
             ChatMessage::User("再问".into()),
-            ChatMessage::Assistant { content: "再答".into(), reasoning: String::new(), tool_calls: vec![] },
+            ChatMessage::Assistant {
+                content: "再答".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
         ];
         let v = session_view(&sess);
         let roles: Vec<&str> = v.iter().map(|m| m["role"].as_str().unwrap()).collect();
-        assert_eq!(roles, ["user", "assistant", "user", "assistant"], "一个回合一条助手消息");
+        assert_eq!(
+            roles,
+            ["user", "assistant", "user", "assistant"],
+            "一个回合一条助手消息"
+        );
 
         let parts: Vec<String> = v[1]["parts"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|p| format!("{}:{}", p["type"].as_str().unwrap(), p["text"].as_str().unwrap_or("")))
+            .map(|p| {
+                format!(
+                    "{}:{}",
+                    p["type"].as_str().unwrap(),
+                    p["text"].as_str().unwrap_or("")
+                )
+            })
             .collect();
-        assert_eq!(parts, ["reasoning:想1", "text:先看看", "tool:", "reasoning:想2", "text:答"]);
+        assert_eq!(
+            parts,
+            [
+                "reasoning:想1",
+                "text:先看看",
+                "tool:",
+                "reasoning:想2",
+                "text:答"
+            ]
+        );
 
-        let ids: std::collections::HashSet<&str> =
-            v[1]["parts"].as_array().unwrap().iter().filter_map(|p| p["id"].as_str()).collect();
+        let ids: std::collections::HashSet<&str> = v[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["id"].as_str())
+            .collect();
         assert_eq!(ids.len(), 4, "合并后的思考/正文 id 不能撞");
     }
 
@@ -3085,7 +3189,10 @@ mod tests {
         assert_ne!(s1[0].1, s1[4].1, "思考和正文不同块");
 
         let s2 = ids(&step2);
-        assert_ne!(s1[0].1, s2[0].1, "第二步的思考不能和第一步同 id，否则前端会接到一起");
+        assert_ne!(
+            s1[0].1, s2[0].1,
+            "第二步的思考不能和第一步同 id，否则前端会接到一起"
+        );
         assert_ne!(s1[4].1, s2[3].1, "第二步的正文同理");
     }
 
@@ -3115,7 +3222,10 @@ mod tests {
         b.updated_at = 100;
         b.messages = vec![ChatMessage::User("写个 fizzbuzz".into())];
 
-        SessionStore { sessions: vec![a, b], active: String::new() }
+        SessionStore {
+            sessions: vec![a, b],
+            active: String::new(),
+        }
     }
 
     #[test]
@@ -3142,8 +3252,13 @@ mod tests {
 
         // 每个会话最多 3 条
         let mut many = ChatSession::new();
-        many.messages = (0..10).map(|i| ChatMessage::User(format!("命中 {i}"))).collect();
-        let store = SessionStore { sessions: vec![many], active: String::new() };
+        many.messages = (0..10)
+            .map(|i| ChatMessage::User(format!("命中 {i}")))
+            .collect();
+        let store = SessionStore {
+            sessions: vec![many],
+            active: String::new(),
+        };
         assert_eq!(store.search("命中", 3, 60).len(), 3);
         assert_eq!(store.search("命中", 3, 1).len(), 1, "总量封顶");
     }
@@ -3162,7 +3277,10 @@ mod tests {
             "开头".repeat(100),
             "尾巴".repeat(100)
         ))];
-        let store = SessionStore { sessions: vec![s], active: String::new() };
+        let store = SessionStore {
+            sessions: vec![s],
+            active: String::new(),
+        };
         let hits = store.search("测试", 3, 60);
         assert_eq!(hits.len(), 1);
         let snip = hits[0]["snippet"].as_str().unwrap();

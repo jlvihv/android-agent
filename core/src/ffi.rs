@@ -191,12 +191,16 @@ impl AgentCore {
 
     /// 注入浏览器实现。`AgentApp.onCreate` 里调（不依赖无障碍）。
     pub fn set_browser(&self, host: Box<dyn BrowserHost>) {
-        self.core.state.set_browser(std::sync::Arc::new(BrowserAdapter(host)));
+        self.core
+            .state
+            .set_browser(std::sync::Arc::new(BrowserAdapter(host)));
     }
 
     /// 注入回合状态的接收方。`AgentApp.onCreate` 里调。
     pub fn set_turn_host(&self, host: Box<dyn TurnHost>) {
-        self.core.state.set_turn_host(std::sync::Arc::new(TurnAdapter(host)));
+        self.core
+            .state
+            .set_turn_host(std::sync::Arc::new(TurnAdapter(host)));
     }
 
     /// 配置 Linux 沙箱。
@@ -281,14 +285,15 @@ mod tests {
         let adapter = HostAdapter(Box::new(FakeHost));
         // 内部 trait 是同步的，callback 也是同步的
         assert_eq!(adapter.name(), "fake");
-        assert!(adapter.execute(r#"{"type":"key","name":"back"}"#).unwrap().contains("back"));
+        assert!(adapter
+            .execute(r#"{"type":"key","name":"back"}"#)
+            .unwrap()
+            .contains("back"));
     }
 
     #[test]
     fn anyhow_errors_keep_the_cause_chain_in_the_message() {
-        let e: CoreError = anyhow::anyhow!("底层失败")
-            .context("外层操作")
-            .into();
+        let e: CoreError = anyhow::anyhow!("底层失败").context("外层操作").into();
         let msg = e.to_string();
         assert!(msg.contains("外层操作"), "{msg}");
         assert!(msg.contains("底层失败"), "{msg}");

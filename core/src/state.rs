@@ -26,7 +26,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
-    TapXy { x: i32, y: i32 },
+    TapXy {
+        x: i32,
+        y: i32,
+    },
     Swipe {
         x1: i32,
         y1: i32,
@@ -36,8 +39,12 @@ pub enum Command {
         ms: u32,
     },
     /// `back` / `home` / `recents` / `enter`
-    Key { name: String },
-    Launch { package: String },
+    Key {
+        name: String,
+    },
+    Launch {
+        package: String,
+    },
 }
 
 fn default_swipe_ms() -> u32 {
@@ -138,7 +145,9 @@ pub enum Event {
     },
     /// agent 事件。`chunk` 是 AI SDK UI Message Stream 的 chunk，原样透传
     /// （见 sse.rs）。前端不需要区分来源，统一走同一个 reducer。
-    Agent { chunk: serde_json::Value },
+    Agent {
+        chunk: serde_json::Value,
+    },
     /// 指令执行回执
     Ack {
         id: String,
@@ -403,7 +412,10 @@ impl AppState {
                         st.log("info", format!("从 sessions.db 恢复 {n} 个会话"));
                     }
                 }
-                Ok(Err(e)) => st.log("error", format!("读取会话失败，本次运行不落盘（免得覆盖掉库里的历史）: {e:#}")),
+                Ok(Err(e)) => st.log(
+                    "error",
+                    format!("读取会话失败，本次运行不落盘（免得覆盖掉库里的历史）: {e:#}"),
+                ),
                 Err(e) => st.log("error", format!("读取会话的任务挂了: {e}")),
             }
         });
@@ -434,7 +446,11 @@ impl AppState {
         let id = crate::providers::identify(p);
         let creds = crate::providers::Creds {
             api_key: p.api_key.clone(),
-            base_url: if id == crate::providers::CUSTOM { p.base_url.clone() } else { String::new() },
+            base_url: if id == crate::providers::CUSTOM {
+                p.base_url.clone()
+            } else {
+                String::new()
+            },
         };
         self.set_provider_creds(id, Some(creds));
     }
@@ -535,10 +551,13 @@ impl AppState {
     }
 
     pub fn auth(&self) -> Auth {
-        self.auth.read().map(|g| g.clone()).unwrap_or_else(|_| Auth {
-            token: Some(random_secret()),
-            sandbox_key: random_secret(),
-        })
+        self.auth
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| Auth {
+                token: Some(random_secret()),
+                sandbox_key: random_secret(),
+            })
     }
 
     /// 桌面开发用：`AGENT_TOKEN` 设了就要求凭据，没设就不设防。
@@ -579,7 +598,10 @@ impl AppState {
     }
 
     pub fn is_busy(&self, sid: &str) -> bool {
-        self.turns.lock().map(|g| g.contains_key(sid)).unwrap_or(false)
+        self.turns
+            .lock()
+            .map(|g| g.contains_key(sid))
+            .unwrap_or(false)
     }
 
     pub fn busy_sessions(&self) -> Vec<String> {
@@ -747,7 +769,8 @@ impl AppState {
             }
         }
         let dir = self.data_dir.read().ok().and_then(|g| g.clone());
-        let resolved = crate::models::vision_for(provider, &provider.model, false, dir.as_deref()).await;
+        let resolved =
+            crate::models::vision_for(provider, &provider.model, false, dir.as_deref()).await;
         let vision = resolved.unwrap_or(provider.supports_images);
         match resolved {
             Some(v) => tracing::info!("视觉能力自动判定: {} → {v}", provider.model),
@@ -780,7 +803,8 @@ impl AppState {
             }
         }
         let dir = self.data_dir.read().ok().and_then(|g| g.clone());
-        let resolved = crate::models::pdf_for(provider, &provider.model, false, dir.as_deref()).await;
+        let resolved =
+            crate::models::pdf_for(provider, &provider.model, false, dir.as_deref()).await;
         let files = resolved.unwrap_or(provider.supports_files);
         match resolved {
             Some(v) => tracing::info!("文档输入能力自动判定: {} → {v}", provider.model),
@@ -1000,10 +1024,18 @@ mod tests {
         st.open_db(&dir);
         let p = st.llm().expect("从 llm.json 恢复出 provider");
         assert_eq!((p.model.as_str(), p.api_key.as_str()), ("m1", "sk-1"));
-        assert!(!dir.join("llm.json").exists(), "明文 key 不该再留一份在文件里");
+        assert!(
+            !dir.join("llm.json").exists(),
+            "明文 key 不该再留一份在文件里"
+        );
         // 老配置记成「其他」那家已配置，设置页里看得到
-        let c = st.provider_creds("custom").expect("老配置要出现在设置页的服务商里");
-        assert_eq!((c.api_key.as_str(), c.base_url.as_str()), ("sk-1", "https://x/v1"));
+        let c = st
+            .provider_creds("custom")
+            .expect("老配置要出现在设置页的服务商里");
+        assert_eq!(
+            (c.api_key.as_str(), c.base_url.as_str()),
+            ("sk-1", "https://x/v1")
+        );
 
         // 改模型 → 存进库；重开之后还在，凭据也不变
         let mut p2 = p.clone();
@@ -1050,7 +1082,11 @@ mod tests {
             st.sessions_loaded.store(true, Ordering::Relaxed);
             let mut store = st.chat.write().await;
             let id = store.create();
-            store.get_mut(&id).unwrap().messages.push(crate::agent::ChatMessage::User("留着".into()));
+            store
+                .get_mut(&id)
+                .unwrap()
+                .messages
+                .push(crate::agent::ChatMessage::User("留着".into()));
             drop(store);
             st.save_sessions().unwrap();
         }

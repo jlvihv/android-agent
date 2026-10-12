@@ -297,16 +297,20 @@ impl Core {
             Ok(join) => join
                 .map_err(|e| anyhow::anyhow!("浏览器调用没能跑起来: {e}"))?
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
-            Err(_) => anyhow::bail!(
-                "浏览器动作超时（75s 没回来）—— 页面可能卡住了；重试或者换个做法"
-            ),
+            Err(_) => {
+                anyhow::bail!("浏览器动作超时（75s 没回来）—— 页面可能卡住了；重试或者换个做法")
+            }
         };
         Ok(serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "text": raw })))
     }
 
     /// 联网搜索。key 有就直连 Exa API，没有就走他们那个免 key 的公开 MCP
     /// 端点（按 IP 限流，见 `search` 模块）。
-    pub async fn search_web(&self, query: &str, num: usize) -> anyhow::Result<crate::search::Found> {
+    pub async fn search_web(
+        &self,
+        query: &str,
+        num: usize,
+    ) -> anyhow::Result<crate::search::Found> {
         let key = crate::search::read_key(&self.state);
         crate::search::run(query, num, key.as_deref()).await
     }
@@ -316,7 +320,11 @@ impl Core {
     /// **为什么落盘**：带图的消息进了历史之后，后面每一轮都要重发同一张图
     /// （prompt cache 靠字节一致）。消息本身只存路径，组装请求时再从盘上读 ——
     /// 否则 SQLite 里会不断累积 base64 大字符串，而且每轮还要重编码一遍。
-    pub async fn save_image(&self, bytes: Vec<u8>, mime: String) -> anyhow::Result<std::path::PathBuf> {
+    pub async fn save_image(
+        &self,
+        bytes: Vec<u8>,
+        mime: String,
+    ) -> anyhow::Result<std::path::PathBuf> {
         let dir = self
             .state
             .data_dir
@@ -599,7 +607,10 @@ async fn provision_tools(st: Arc<AppState>) {
             return;
         }
 
-        st.log("info", "正在给沙箱装常用工具（rg/fd/jq/git/python3…，首次几十秒）");
+        st.log(
+            "info",
+            "正在给沙箱装常用工具（rg/fd/jq/git/python3…，首次几十秒）",
+        );
         match sb.provision().await {
             Ok(r) if r.code == 0 => {
                 let last = r
@@ -618,11 +629,16 @@ async fn provision_tools(st: Arc<AppState>) {
                 );
             }
             Ok(r) => {
-                let tail: String = r.stdout.chars().rev().take(300).collect::<String>().chars().rev().collect();
-                st.log(
-                    "warn",
-                    format!("装常用工具失败（exit {}）：{tail}", r.code),
-                );
+                let tail: String = r
+                    .stdout
+                    .chars()
+                    .rev()
+                    .take(300)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                st.log("warn", format!("装常用工具失败（exit {}）：{tail}", r.code));
             }
             Err(e) => st.log("warn", format!("装常用工具失败：{e:#}")),
         }
@@ -646,7 +662,10 @@ mod tests {
     fn mock_device_takes_commands_and_reports_garbage() {
         let core = Core::with_mock();
         let dev = core.state.device().unwrap();
-        assert!(dev.execute(r#"{"type":"key","name":"back"}"#).unwrap().contains("back"));
+        assert!(dev
+            .execute(r#"{"type":"key","name":"back"}"#)
+            .unwrap()
+            .contains("back"));
         assert!(dev.execute("not json").is_err(), "非法指令必须报错");
     }
 

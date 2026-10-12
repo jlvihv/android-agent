@@ -143,9 +143,17 @@ async fn search_mcp(query: &str, num: usize) -> anyhow::Result<Found> {
     let content = payload
         .pointer("/result/content/0/text")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Exa MCP 没给内容：{}", text.chars().take(200).collect::<String>()))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Exa MCP 没给内容：{}",
+                text.chars().take(200).collect::<String>()
+            )
+        })?;
     if payload.pointer("/result/isError").and_then(|v| v.as_bool()) == Some(true) {
-        anyhow::bail!("Exa MCP 报错：{}", content.chars().take(300).collect::<String>());
+        anyhow::bail!(
+            "Exa MCP 报错：{}",
+            content.chars().take(300).collect::<String>()
+        );
     }
 
     Ok(Found {
@@ -306,8 +314,8 @@ async fn search_api(query: &str, num: usize, key: &str) -> anyhow::Result<Found>
         );
     }
 
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Exa API 的响应不是 JSON: {e}"))?;
+    let v: Value =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Exa API 的响应不是 JSON: {e}"))?;
     let mut hits = Vec::new();
     if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
         for item in arr.iter().take(num) {
@@ -330,7 +338,11 @@ async fn search_api(query: &str, num: usize, key: &str) -> anyhow::Result<Found>
                         .join(" ")
                 })
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| item.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                .or_else(|| {
+                    item.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string)
+                })
                 .unwrap_or_default();
             hits.push(Hit {
                 title,
@@ -382,7 +394,13 @@ mod tests {
     #[test]
     fn sse_and_plain_json_both_decode() {
         let sse = "event: message\ndata: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n\n";
-        assert_eq!(decode_rpc_body(sse).unwrap().pointer("/result/content/0/text").unwrap(), "hi");
+        assert_eq!(
+            decode_rpc_body(sse)
+                .unwrap()
+                .pointer("/result/content/0/text")
+                .unwrap(),
+            "hi"
+        );
         let plain = "{\"result\":{\"ok\":true}}";
         assert_eq!(decode_rpc_body(plain).unwrap()["result"]["ok"], true);
         assert!(decode_rpc_body("not json").is_err());

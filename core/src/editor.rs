@@ -68,13 +68,12 @@ fn fold_char(c: char) -> char {
         '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
         '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
         // 各种连字符/破折号/减号 → ASCII 减号
-        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' | '\u{2212}' => '-',
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+        | '\u{2212}' => '-',
         // 不换行空格 / 全角空格 → 普通空格
         '\u{00A0}' | '\u{3000}' => ' ',
         // 全角 ASCII（！到 ～）→ 半角
-        '\u{FF01}'..='\u{FF5E}' => {
-            char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
-        }
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
         other => other,
     }
 }
@@ -84,9 +83,7 @@ fn fuzzy(s: &str) -> String {
     let folded: String = s.chars().map(fold_char).collect();
     folded
         .split('\n')
-        .map(|line| {
-            line.trim_end_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
-        })
+        .map(|line| line.trim_end_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}'))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -116,7 +113,11 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
         anyhow::ensure!(!e.old_text.is_empty(), "edits[{i}].oldText 不能为空");
     }
 
-    let bom = if raw.starts_with('\u{FEFF}') { "\u{FEFF}" } else { "" };
+    let bom = if raw.starts_with('\u{FEFF}') {
+        "\u{FEFF}"
+    } else {
+        ""
+    };
     let original = lf(raw.strip_prefix('\u{FEFF}').unwrap_or(raw));
 
     let normalized: Vec<Edit> = edits
@@ -139,11 +140,12 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
     // --- 逐个 edit 定位 ---
     let mut matches: Vec<Match> = Vec::new();
     for (index, edit) in normalized.iter().enumerate() {
-        let old = if use_fuzzy { fuzzy(&edit.old_text) } else { edit.old_text.clone() };
-        anyhow::ensure!(
-            !old.is_empty(),
-            "edits[{index}].oldText 归一化后为空"
-        );
+        let old = if use_fuzzy {
+            fuzzy(&edit.old_text)
+        } else {
+            edit.old_text.clone()
+        };
+        anyhow::ensure!(!old.is_empty(), "edits[{index}].oldText 归一化后为空");
 
         let hits = occurrences(base, &old);
         anyhow::ensure!(!hits.is_empty(), "在 {path} 里找不到 edits[{index}]");
@@ -301,9 +303,7 @@ fn build_patch(path: &str, before: &str, after: &str) -> (usize, String) {
         } else {
             lines.len()
         };
-        (0..n)
-            .map(|i| (lines[i], i + 1 < lines.len()))
-            .collect()
+        (0..n).map(|i| (lines[i], i + 1 < lines.len())).collect()
     }
 
     let old = records(before);
@@ -400,8 +400,12 @@ mod tests {
 
     #[test]
     fn rejects_overlapping_edits() {
-        let err = apply("abcdef\n", &[Edit::new("abc", "X"), Edit::new("cde", "Y")], "t.txt")
-            .unwrap_err();
+        let err = apply(
+            "abcdef\n",
+            &[Edit::new("abc", "X"), Edit::new("cde", "Y")],
+            "t.txt",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("重叠"), "{err}");
     }
 
@@ -478,8 +482,15 @@ mod tests {
     fn fuzzy_does_not_restore_typography_into_new_text() {
         // 模型显式写了弯引号，就必须原样写进去，不能被"还原"成 ASCII
         let content = "let s = \"hi\";\n";
-        let out = ok(content, "let s = \u{201C}hi\u{201D};", "let s = \u{201C}bye\u{201D};");
-        assert!(out.contains('\u{201C}'), "newText 里的排版被改掉了: {out:?}");
+        let out = ok(
+            content,
+            "let s = \u{201C}hi\u{201D};",
+            "let s = \u{201C}bye\u{201D};",
+        );
+        assert!(
+            out.contains('\u{201C}'),
+            "newText 里的排版被改掉了: {out:?}"
+        );
     }
 
     #[test]

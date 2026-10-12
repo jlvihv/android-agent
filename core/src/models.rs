@@ -538,10 +538,22 @@ mod tests {
     fn pdf_comes_from_the_catalog_modalities() {
         let cat = catalog_fixture();
         let key = Some("opencode-go");
-        assert_eq!(model_pdf(find_model(&cat, key, "ds-pdf").unwrap()), Some(true));
-        assert_eq!(model_pdf(find_model(&cat, key, "ds-vision").unwrap()), Some(false));
+        assert_eq!(
+            model_pdf(find_model(&cat, key, "ds-pdf").unwrap()),
+            Some(true)
+        );
+        assert_eq!(
+            model_pdf(find_model(&cat, key, "ds-vision").unwrap()),
+            Some(false)
+        );
         // 图片和 PDF 是两件独立的事，不能互相推导
-        assert_eq!(model_vision(find_model(&cat, key, "ds-pdf").unwrap()), Some(false));
-        assert_eq!(model_pdf(find_model(&cat, key, "ds-text").unwrap()), Some(false));
+        assert_eq!(
+            model_vision(find_model(&cat, key, "ds-pdf").unwrap()),
+            Some(false)
+        );
+        assert_eq!(
+            model_pdf(find_model(&cat, key, "ds-text").unwrap()),
+            Some(false)
+        );
     }
 }

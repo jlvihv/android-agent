@@ -9,7 +9,11 @@
 use agent_core::agent::{tools, SYSTEM_PROMPT};
 
 fn main() {
-    let cjk = |s: &str| s.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+    let cjk = |s: &str| {
+        s.chars()
+            .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+            .count()
+    };
 
     let mut plain_chars = SYSTEM_PROMPT.chars().count();
     println!(
@@ -21,7 +25,10 @@ fn main() {
     for t in tools() {
         let schema = serde_json::to_string_pretty(&(t.schema)()).unwrap();
         let d = t.description.chars().count();
-        let s = serde_json::to_string(&(t.schema)()).unwrap().chars().count();
+        let s = serde_json::to_string(&(t.schema)())
+            .unwrap()
+            .chars()
+            .count();
         plain_chars += d + s + t.name.len();
         println!(
             "=== {name} · desc {d} 字符（汉字 {c}）· schema 紧凑 {s} 字符 ===",

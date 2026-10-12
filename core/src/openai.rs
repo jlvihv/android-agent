@@ -326,7 +326,9 @@ where
         Ok(c)
     };
     loop {
-        let Some(next) = stream.next().await else { break };
+        let Some(next) = stream.next().await else {
+            break;
+        };
         buf.extend_from_slice(&next?);
 
         while let Some((end, sep)) = frame_end(&buf) {
@@ -420,7 +422,10 @@ mod tests {
                 .unwrap(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = pump_frames(resp, tx, |d| Ok(Some(serde_json::from_str::<StreamChunk>(d)?))).await;
+        let r = pump_frames(resp, tx, |d| {
+            Ok(Some(serde_json::from_str::<StreamChunk>(d)?))
+        })
+        .await;
         let mut text = String::new();
         while let Ok(Ok(c)) = rx.try_recv() {
             for ch in c.choices {
@@ -444,7 +449,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_cut_before_the_end_is_an_error_not_a_short_reply() {
-        let (text, r) = pump(vec![b"data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n"]).await;
+        let (text, r) = pump(vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n",
+        ])
+        .await;
         assert_eq!(text, "half");
         assert!(r.is_err(), "没有 [DONE] 也没有 finish_reason，必须当断流");
 
@@ -490,7 +498,10 @@ mod tests {
         assert_eq!(v["role"], "user");
         assert_eq!(v["content"][0]["type"], "text");
         assert_eq!(v["content"][1]["type"], "image_url");
-        assert_eq!(v["content"][1]["image_url"]["url"], "data:image/png;base64,AAA");
+        assert_eq!(
+            v["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAA"
+        );
         assert_eq!(v["content"][2]["type"], "file");
         assert_eq!(v["content"][2]["file"]["filename"], "a.pdf");
     }

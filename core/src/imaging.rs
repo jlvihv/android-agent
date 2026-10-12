@@ -177,7 +177,9 @@ impl UrlCache {
             return; // 单个就超上限的不缓存（每次现读），别为它把别的全挤掉
         }
         while self.bytes + url.len() > URL_CACHE_MAX_BYTES {
-            let Some(old) = self.order.pop_front() else { break };
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
             if let Some(u) = self.map.remove(&old) {
                 self.bytes -= u.len();
             }

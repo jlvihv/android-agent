@@ -208,7 +208,7 @@ impl ExecResult {
         if !self.using_bash {
             s.push_str(
                 "\n[沙箱里还没有 bash：这条是 /bin/sh（busybox ash）跑的，[[ ]] / 数组 / \
-                 <<< / 进程替换这类 bash 语法会报 syntax error。装上：agent-setup --force]"
+                 <<< / 进程替换这类 bash 语法会报 syntax error。装上：agent-setup --force]",
             );
         }
         if s.is_empty() {
@@ -421,12 +421,12 @@ pub const TOOLSET: &[&str] = &[
     "findutils",       // GNU find
     "jq",              // JSON（模型处理 JSON 太频繁了）
     "git",
-    "ripgrep",         // rg
+    "ripgrep", // rg
     "fd",
     "tree",
-    "unzip",           // busybox 没有
+    "unzip", // busybox 没有
     "python3",
-    "openssl",         // 证书/小工具用得上
+    "openssl", // 证书/小工具用得上
 ];
 
 /// `agent-setup`：装上面那套（幂等）。
@@ -759,7 +759,11 @@ impl LinuxSandbox {
         // 进程替换、`<<<`），拿 ash 跑会报 "syntax error"。首次预装之前
         // （或者手动清了 rootfs）没有 bash，退回 /bin/sh（这时结果里会
         // 提醒模型去装，见 `ExecResult::to_text`）。
-        let shell = if self.has_bash() { "/bin/bash" } else { "/bin/sh" };
+        let shell = if self.has_bash() {
+            "/bin/bash"
+        } else {
+            "/bin/sh"
+        };
         arg!(shell, "-c", script);
 
         cmd
@@ -780,14 +784,14 @@ impl LinuxSandbox {
         env.insert("CHARSET".into(), "UTF-8".into());
         env.insert("LANG".into(), "C.UTF-8".into());
         env.insert("TERM".into(), "dumb".into()); // 非交互，别输出 ANSI
-        // 分页器会**挂住**（非交互环境没人按键），一次工具调用就废了
+                                                  // 分页器会**挂住**（非交互环境没人按键），一次工具调用就废了
         env.insert("PAGER".into(), "cat".into());
         env.insert("GIT_PAGER".into(), "cat".into());
         env.insert("NO_COLOR".into(), "1".into());
         env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
         env.insert("GOMAXPROCS".into(), "2".into()); // 手机上限
-        // proot 的 link2symlink 会留 .l2s.* 哨兵文件，uv 默认 hardlink
-        // 模式会二次 link 它们并拿到 EPERM
+                                                     // proot 的 link2symlink 会留 .l2s.* 哨兵文件，uv 默认 hardlink
+                                                     // 模式会二次 link 它们并拿到 EPERM
         env.insert("UV_LINK_MODE".into(), "symlink".into());
         // TZ 必须是 POSIX 格式（符号与 UTC 偏移相反）：musl 的 TZ 解析器
         // 认不出 "GMT+8" 这种带 +/- 的缩写
@@ -879,8 +883,16 @@ impl LinuxSandbox {
 
         // 管道可能被沙箱里的孙进程继承着不关 —— 别为它无限等
         let grace = Duration::from_secs(2);
-        let stdout = tokio::time::timeout(grace, out_task).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-        let stderr = tokio::time::timeout(grace, err_task).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+        let stdout = tokio::time::timeout(grace, out_task)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        let stderr = tokio::time::timeout(grace, err_task)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
         let (stdout_text, t1) = stdout.render();
         let (stderr_text, t2) = stderr.render();
         // 中间被扔掉（输出超过内存上限）也算截断
@@ -897,7 +909,11 @@ impl LinuxSandbox {
         };
 
         Ok(ExecResult {
-            code: if timed_out { -1 } else { status.code().unwrap_or(-1) },
+            code: if timed_out {
+                -1
+            } else {
+                status.code().unwrap_or(-1)
+            },
             stdout: stdout_text,
             stderr: stderr_text,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -1040,8 +1056,7 @@ impl LinuxSandbox {
     /// 写文件（`bash` 之外的小工具，也供测试用）
     pub fn read_file(&self, guest_path: &str) -> anyhow::Result<String> {
         let host = self.resolve_path(guest_path)?;
-        std::fs::read_to_string(&host)
-            .map_err(|e| anyhow::anyhow!("读取失败 {guest_path}: {e}"))
+        std::fs::read_to_string(&host).map_err(|e| anyhow::anyhow!("读取失败 {guest_path}: {e}"))
     }
 }
 
@@ -1559,7 +1574,10 @@ mod tests {
             Some("/cache/proot-tmp")
         );
         // 两者是不同的东西，都得有
-        assert_eq!(env.get("TMPDIR").map(String::as_str), Some("/cache/proot-tmp"));
+        assert_eq!(
+            env.get("TMPDIR").map(String::as_str),
+            Some("/cache/proot-tmp")
+        );
     }
 
     #[test]
@@ -1730,9 +1748,15 @@ mod tests {
         let t = TempRoot::new("paths");
         let sb = t.sandbox();
 
-        assert_eq!(sb.resolve_path("/root/a.txt").unwrap(), t.dir.join("root/a.txt"));
+        assert_eq!(
+            sb.resolve_path("/root/a.txt").unwrap(),
+            t.dir.join("root/a.txt")
+        );
         // 相对路径以 /workspace 为 cwd（没挂手机存储时就是 rootfs 里的目录）
-        assert_eq!(sb.resolve_path("a.txt").unwrap(), t.dir.join("workspace/a.txt"));
+        assert_eq!(
+            sb.resolve_path("a.txt").unwrap(),
+            t.dir.join("workspace/a.txt")
+        );
         assert_eq!(
             sb.resolve_path("/etc/resolv.conf").unwrap(),
             t.dir.join("etc/resolv.conf")
@@ -1753,7 +1777,11 @@ mod tests {
             "/root/../..",
         ] {
             if let Ok(p) = sb.resolve_path(bad) {
-                assert!(p.starts_with(&t.dir), "{bad} 解析到了 rootfs 外面: {}", p.display());
+                assert!(
+                    p.starts_with(&t.dir),
+                    "{bad} 解析到了 rootfs 外面: {}",
+                    p.display()
+                );
             }
         }
     }
@@ -1765,18 +1793,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&phone);
         std::fs::create_dir_all(&phone).unwrap();
 
-        let cfg = t.sandbox().config().clone().with_shared_storage(Some(&phone));
+        let cfg = t
+            .sandbox()
+            .config()
+            .clone()
+            .with_shared_storage(Some(&phone));
         assert!(phone.join("Agent").is_dir(), "应该在手机存储里建好 Agent/");
         let sb = LinuxSandbox::new(cfg);
         assert!(sb.has_shared_storage());
 
         let ws = phone.join("Agent");
-        assert_eq!(sb.resolve_path("/workspace/a/b.html").unwrap(), ws.join("a/b.html"));
-        assert_eq!(sb.resolve_path("b.html").unwrap(), ws.join("b.html"), "相对路径落在工作目录");
-        assert_eq!(sb.resolve_path("/sdcard/DCIM/x.jpg").unwrap(), phone.join("DCIM/x.jpg"));
+        assert_eq!(
+            sb.resolve_path("/workspace/a/b.html").unwrap(),
+            ws.join("a/b.html")
+        );
+        assert_eq!(
+            sb.resolve_path("b.html").unwrap(),
+            ws.join("b.html"),
+            "相对路径落在工作目录"
+        );
+        assert_eq!(
+            sb.resolve_path("/sdcard/DCIM/x.jpg").unwrap(),
+            phone.join("DCIM/x.jpg")
+        );
         // 想从挂载点 .. 出去：在沙箱视角里归一化后回到 rootfs，到不了宿主机
-        assert_eq!(sb.resolve_path("/sdcard/../etc/hosts").unwrap(), t.dir.join("etc/hosts"));
-        assert_eq!(sb.resolve_path("/workspace/../../x").unwrap(), t.dir.join("x"));
+        assert_eq!(
+            sb.resolve_path("/sdcard/../etc/hosts").unwrap(),
+            t.dir.join("etc/hosts")
+        );
+        assert_eq!(
+            sb.resolve_path("/workspace/../../x").unwrap(),
+            t.dir.join("x")
+        );
 
         let argv = sb.command_line("true");
         let joined = argv.join(" ");
@@ -1786,7 +1834,10 @@ mod tests {
         // 断开（权限被收回）：回到 rootfs 里的 /workspace
         let off = LinuxSandbox::new(sb.config().clone().with_shared_storage(None));
         assert!(!off.has_shared_storage());
-        assert_eq!(off.resolve_path("b.html").unwrap(), t.dir.join("workspace/b.html"));
+        assert_eq!(
+            off.resolve_path("b.html").unwrap(),
+            t.dir.join("workspace/b.html")
+        );
 
         let _ = std::fs::remove_dir_all(&phone);
     }
@@ -1815,11 +1866,17 @@ mod tests {
         let out = sb
             .edit_file(
                 "/root/conf.txt",
-                &[Edit::new("host=old", "host=new"), Edit::new("port=80", "port=443")],
+                &[
+                    Edit::new("host=old", "host=new"),
+                    Edit::new("port=80", "port=443"),
+                ],
             )
             .unwrap();
 
-        assert_eq!(sb.read_file("/root/conf.txt").unwrap(), "host=new\nport=443\n");
+        assert_eq!(
+            sb.read_file("/root/conf.txt").unwrap(),
+            "host=new\nport=443\n"
+        );
         assert_eq!(out.first_changed_line, 1);
         assert!(out.patch.contains("-host=old"));
         assert!(out.patch.contains("+host=new"));
@@ -1881,12 +1938,18 @@ mod tests {
         let t = TempRoot::new("readbad");
         let sb = t.sandbox();
 
-        let err = sb.read_text("/root/nope.txt", 1, None, false).unwrap_err().to_string();
+        let err = sb
+            .read_text("/root/nope.txt", 1, None, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("不存在"), "{err}");
         assert!(err.contains("bash"), "应该告诉模型替代做法: {err}");
 
         std::fs::write(t.dir.join("root/blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
-        let err = sb.read_text("/root/blob.bin", 1, None, false).unwrap_err().to_string();
+        let err = sb
+            .read_text("/root/blob.bin", 1, None, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("UTF-8"), "{err}");
     }
 
@@ -1950,7 +2013,11 @@ mod tests {
         }
 
         // 语法交给 sh -n 过一遍（busybox ash 的语法是 POSIX 子集，够了）
-        if let Ok(out) = std::process::Command::new("sh").arg("-n").arg(&cli).output() {
+        if let Ok(out) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&cli)
+            .output()
+        {
             assert!(
                 out.status.success(),
                 "shell 语法不过：{}",

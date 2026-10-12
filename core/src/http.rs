@@ -35,7 +35,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/llm", post(set_llm))
         .route("/api/models", get(get_models))
         .route("/api/providers", get(list_providers))
-        .route("/api/providers/{id}", post(save_provider).delete(delete_provider))
+        .route(
+            "/api/providers/{id}",
+            post(save_provider).delete(delete_provider),
+        )
         .route("/api/model", post(set_model))
         .route(
             "/api/attachment",
@@ -64,7 +67,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sandbox/{key}/", get(sandbox_root))
         .route("/sandbox/{key}/{*path}", get(sandbox_file))
         .fallback(crate::assets::serve)
-        .layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ))
         .with_state(state)
 }
 
@@ -88,7 +94,11 @@ const AUTH_HEADER: &str = "x-agent-token";
 
 /// 两个字符串是否相等，耗时和内容无关（别让比较的快慢泄露 token 的前缀）。
 fn same_secret(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// 请求里带的凭据：先看头，再看 cookie。
@@ -285,7 +295,10 @@ async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) ->
     if query.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "缺少 query").into_response();
     }
-    let num = body.get("num_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+    let num = body
+        .get("num_results")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5) as usize;
     match core.search_web(query, num).await {
         Ok(found) => Json(json!({
             "ok": true,
@@ -361,7 +374,10 @@ fn default_level() -> String {
     "info".into()
 }
 
-async fn device_log(State(st): State<Arc<AppState>>, Json(body): Json<LogBody>) -> impl IntoResponse {
+async fn device_log(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<LogBody>,
+) -> impl IntoResponse {
     st.log(&body.level, body.msg);
     StatusCode::NO_CONTENT
 }
@@ -427,7 +443,10 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
         Some(_) => match st.begin_turn(&sid) {
             Some(t) => Some(t),
             None => {
-                return (StatusCode::CONFLICT, "这个会话还有回合在运行，先停止它或等它结束")
+                return (
+                    StatusCode::CONFLICT,
+                    "这个会话还有回合在运行，先停止它或等它结束",
+                )
                     .into_response()
             }
         },
@@ -459,29 +478,16 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     }
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
-    let core = Core {
-        state: st.clone(),
-    };
+    let core = Core { state: st.clone() };
 
     match provider.zip(turn) {
         Some((p, turn)) => {
-            st.log(
-                "info",
-                format!("chat → {} / {}", p.name, p.model),
-            );
+            st.log("info", format!("chat → {} / {}", p.name, p.model));
             tokio::spawn(async move {
                 let txc = tx.clone();
                 // `run_turn` 的 TurnGuard 负责 end_turn
-                let r = crate::agent::run_turn(
-                    &core,
-                    &p,
-                    &body.text,
-                    attachments,
-                    &sid,
-                    turn,
-                    txc,
-                )
-                .await;
+                let r = crate::agent::run_turn(&core, &p, &body.text, attachments, &sid, turn, txc)
+                    .await;
                 if let Err(e) = r {
                     let _ = tx.send(sse::error(&format!("{e:#}")));
                 }
@@ -689,7 +695,9 @@ async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery
                     }
                     json!({ "id": id, "name": name, "models": v })
                 }
-                Err(e) => json!({ "id": id, "name": name, "models": [], "error": format!("{e:#}") }),
+                Err(e) => {
+                    json!({ "id": id, "name": name, "models": [], "error": format!("{e:#}") })
+                }
             }
         })
         .collect();
@@ -747,7 +755,12 @@ async fn list_providers(State(st): State<Arc<AppState>>) -> Response {
         .get(crate::providers::CUSTOM)
         .map(|c| c.base_url.clone())
         .unwrap_or_default();
-    rows.push(row(crate::providers::CUSTOM, crate::providers::CUSTOM_NAME, custom_url, None));
+    rows.push(row(
+        crate::providers::CUSTOM,
+        crate::providers::CUSTOM_NAME,
+        custom_url,
+        None,
+    ));
     Json(json!({ "providers": rows })).into_response()
 }
 
@@ -815,7 +828,14 @@ async fn save_provider(
             }
         }
     }
-    st.log("info", format!("已配置 {}（{} 个模型）", crate::providers::display_name(&id), ids.len()));
+    st.log(
+        "info",
+        format!(
+            "已配置 {}（{} 个模型）",
+            crate::providers::display_name(&id),
+            ids.len()
+        ),
+    );
     Json(json!({ "ok": true, "models": ids.len(), "current": switched })).into_response()
 }
 
@@ -823,7 +843,10 @@ async fn save_provider(
 ///
 /// 删的是当前在用的那家：切到另一家配好了的（它的首选模型）；一家都不剩
 /// 就清空当前 provider。
-async fn delete_provider(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<String>) -> Response {
+async fn delete_provider(
+    State(st): State<Arc<AppState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
     st.set_provider_creds(&id, None);
     let was_current = st
         .llm()
@@ -835,7 +858,9 @@ async fn delete_provider(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<S
             .read()
             .ok()
             .and_then(|g| g.iter().next().map(|(k, v)| (k.clone(), v.clone())));
-        match next.and_then(|(nid, c)| Some((nid.clone(), crate::providers::provider(&nid, &c, "")?))) {
+        match next
+            .and_then(|(nid, c)| Some((nid.clone(), crate::providers::provider(&nid, &c, "")?)))
+        {
             Some((nid, probe)) => {
                 let ids: Vec<String> = st
                     .models_of(&nid, &probe, false)
@@ -923,7 +948,11 @@ async fn get_attachment(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<St
     };
     match tokio::fs::read(&path).await {
         Ok(bytes) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("读附件失败: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读附件失败: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -940,7 +969,10 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
         // 换到另一家：用设置页存下的那家的 Key，思考强度沿用
         (Some(id), cur) if current_id != Some(id.as_str()) => {
             let Some(creds) = st.provider_creds(id) else {
-                return (StatusCode::BAD_REQUEST, format!("{} 还没有配置 API Key", crate::providers::display_name(id)))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("{} 还没有配置 API Key", crate::providers::display_name(id)),
+                )
                     .into_response();
             };
             let Some(mut p) = crate::providers::provider(id, &creds, "") else {
@@ -1154,26 +1186,22 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
     let images = st.cached_supports_images(&p);
     let files = st.cached_supports_files(&p);
     let body = match p.transport() {
-        crate::llm::Transport::Responses => {
-            crate::agent::build_responses_request(
-                &sess,
-                &p.model,
-                images,
-                files,
-                p.reasoning_effort.as_deref(),
-            )
-            .and_then(|r| Ok(serde_json::to_value(&r)?))
-        }
-        crate::llm::Transport::Chat => {
-            crate::agent::build_request(
-                &sess,
-                &p.model,
-                images,
-                files,
-                p.reasoning_effort.as_deref(),
-            )
-            .and_then(|r| Ok(serde_json::to_value(&r)?))
-        }
+        crate::llm::Transport::Responses => crate::agent::build_responses_request(
+            &sess,
+            &p.model,
+            images,
+            files,
+            p.reasoning_effort.as_deref(),
+        )
+        .and_then(|r| Ok(serde_json::to_value(&r)?)),
+        crate::llm::Transport::Chat => crate::agent::build_request(
+            &sess,
+            &p.model,
+            images,
+            files,
+            p.reasoning_effort.as_deref(),
+        )
+        .and_then(|r| Ok(serde_json::to_value(&r)?)),
     };
     match body {
         Ok(v) => Json(v).into_response(),
@@ -1241,7 +1269,9 @@ async fn list_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     drop(store);
     // 抽屉里给正在跑的会话打个点：切走了也知道它还在干活
     for s in &mut list {
-        let running = s["id"].as_str().is_some_and(|id| busy.iter().any(|b| b == id));
+        let running = s["id"]
+            .as_str()
+            .is_some_and(|id| busy.iter().any(|b| b == id));
         s["busy"] = json!(running);
     }
     Json(json!({ "sessions": list }))
@@ -1304,10 +1334,7 @@ struct RenameBody {
 }
 
 /// `POST /api/sessions/rename` → 重命名会话
-async fn rename_session(
-    State(st): State<Arc<AppState>>,
-    Json(body): Json<RenameBody>,
-) -> Response {
+async fn rename_session(State(st): State<Arc<AppState>>, Json(body): Json<RenameBody>) -> Response {
     let mut store = st.chat.write().await;
     match store.sessions.iter_mut().find(|s| s.id == body.id) {
         Some(s) => {
@@ -1558,8 +1585,14 @@ fn sandbox_headers(res: &mut Response, mime: &str) {
         ),
     );
     // 文件随时会被 AI 改写，别缓存
-    h.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
 }
 
 async fn serve_sandbox(
@@ -1570,7 +1603,11 @@ async fn serve_sandbox(
     range: Option<String>,
 ) -> Response {
     let Some(sb) = st.linux() else {
-        return sandbox_error(StatusCode::SERVICE_UNAVAILABLE, guest, "Linux 沙箱没有初始化。");
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            guest,
+            "Linux 沙箱没有初始化。",
+        );
     };
     let host = match sb.resolve_path(guest) {
         Ok(p) => p,
@@ -1623,7 +1660,8 @@ async fn serve_bytes(host: &std::path::Path, name: &str, range: Option<String>) 
         Some(None) => {
             let mut res = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
             if let Ok(v) = HeaderValue::from_str(&format!("bytes */{len}")) {
-                res.headers_mut().insert(axum::http::header::CONTENT_RANGE, v);
+                res.headers_mut()
+                    .insert(axum::http::header::CONTENT_RANGE, v);
             }
             return res;
         }
@@ -1641,7 +1679,10 @@ async fn serve_bytes(host: &std::path::Path, name: &str, range: Option<String>) 
     let mut res = (status, axum::body::Body::from_stream(stream)).into_response();
     sandbox_headers(&mut res, &mime);
     let h = res.headers_mut();
-    h.insert(axum::http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(
+        axum::http::header::ACCEPT_RANGES,
+        HeaderValue::from_static("bytes"),
+    );
     if let Ok(v) = HeaderValue::from_str(&count.to_string()) {
         h.insert(axum::http::header::CONTENT_LENGTH, v);
     }
@@ -1852,7 +1893,8 @@ mod tests {
         let app = axum::Router::new().route(
             "/v1/models",
             axum::routing::get(|h: axum::http::HeaderMap| async move {
-                let ok = h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer good");
+                let ok =
+                    h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer good");
                 if !ok {
                     return (axum::http::StatusCode::UNAUTHORIZED, "bad key").into_response();
                 }
@@ -1877,39 +1919,96 @@ mod tests {
         let st = crate::state::AppState::new();
         let upstream = fake_models_server().await;
         let (base, c) = serve(st.clone()).await;
-        let post = |path: &str, body: serde_json::Value| c.post(format!("{base}{path}")).json(&body).send();
+        let post = |path: &str, body: serde_json::Value| {
+            c.post(format!("{base}{path}")).json(&body).send()
+        };
 
-        let r = post("/api/providers/custom", serde_json::json!({ "apiKey": "bad", "baseUrl": upstream })).await.unwrap();
+        let r = post(
+            "/api/providers/custom",
+            serde_json::json!({ "apiKey": "bad", "baseUrl": upstream }),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.status().as_u16(), 400);
         assert!(r.text().await.unwrap().contains("API Key 不对"));
-        assert!(st.provider_creds("custom").is_none(), "验证没过的 Key 不能存");
+        assert!(
+            st.provider_creds("custom").is_none(),
+            "验证没过的 Key 不能存"
+        );
 
-        let r = post("/api/providers/custom", serde_json::json!({ "apiKey": "good", "baseUrl": upstream })).await.unwrap();
+        let r = post(
+            "/api/providers/custom",
+            serde_json::json!({ "apiKey": "good", "baseUrl": upstream }),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.status().as_u16(), 200);
         let p = st.llm().expect("第一次配好就该切过去，不用再选一次模型");
         assert_eq!((p.model.as_str(), p.api_key.as_str()), ("m-small", "good"));
 
-        let list: serde_json::Value = c.get(format!("{base}/api/providers")).send().await.unwrap().json().await.unwrap();
-        let custom = list["providers"].as_array().unwrap().iter().find(|r| r["id"] == "custom").unwrap().clone();
+        let list: serde_json::Value = c
+            .get(format!("{base}/api/providers"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let custom = list["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "custom")
+            .unwrap()
+            .clone();
         assert_eq!(custom["configured"], true);
         assert_eq!(custom["current"], true);
         assert_eq!(custom["keyHint"], "…good");
-        assert!(custom.get("apiKey").is_none() && !list.to_string().contains("\"good\""), "不能把 Key 回给前端");
+        assert!(
+            custom.get("apiKey").is_none() && !list.to_string().contains("\"good\""),
+            "不能把 Key 回给前端"
+        );
 
-        let m: serde_json::Value = c.get(format!("{base}/api/models")).send().await.unwrap().json().await.unwrap();
-        let ids: Vec<&str> = m["groups"][0]["models"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap()).collect();
+        let m: serde_json::Value = c
+            .get(format!("{base}/api/models"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ids: Vec<&str> = m["groups"][0]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, ["m-small", "m-big"], "embedding 这种不能聊的要筛掉");
         assert_eq!(m["provider"], "custom");
 
         // 没配过的那家：不能切过去
-        let r = post("/api/model", serde_json::json!({ "model": "gpt-5", "provider": "openai" })).await.unwrap();
+        let r = post(
+            "/api/model",
+            serde_json::json!({ "model": "gpt-5", "provider": "openai" }),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.status().as_u16(), 400);
 
-        let r = post("/api/model", serde_json::json!({ "model": "m-big", "provider": "custom" })).await.unwrap();
+        let r = post(
+            "/api/model",
+            serde_json::json!({ "model": "m-big", "provider": "custom" }),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.status().as_u16(), 200);
         assert_eq!(st.llm().unwrap().model, "m-big");
 
-        let r = c.delete(format!("{base}/api/providers/custom")).send().await.unwrap();
+        let r = c
+            .delete(format!("{base}/api/providers/custom"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status().as_u16(), 200);
         assert!(st.llm().is_none(), "一家都不剩了，当前 provider 也没了");
     }
@@ -1923,14 +2022,29 @@ mod tests {
         let (base, c) = serve(st).await;
 
         let status = |r: reqwest::Response| r.status().as_u16();
-        assert_eq!(status(c.get(format!("{base}/api/health")).send().await.unwrap()), 401);
         assert_eq!(
-            status(c.post(format!("{base}/api/linux")).body("{}").send().await.unwrap()),
+            status(c.get(format!("{base}/api/health")).send().await.unwrap()),
+            401
+        );
+        assert_eq!(
+            status(
+                c.post(format!("{base}/api/linux"))
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap()
+            ),
             401,
             "跑命令的接口尤其不能裸奔"
         );
         assert_eq!(
-            status(c.get(format!("{base}/api/health")).header("x-agent-token", "wrong").send().await.unwrap()),
+            status(
+                c.get(format!("{base}/api/health"))
+                    .header("x-agent-token", "wrong")
+                    .send()
+                    .await
+                    .unwrap()
+            ),
             401
         );
 
@@ -1947,7 +2061,10 @@ mod tests {
         assert_eq!(h["sandboxKey"], key.as_str());
 
         // App 的 WebView：/auth 种 cookie，再跳回首页
-        assert_eq!(status(c.get(format!("{base}/auth?t=nope")).send().await.unwrap()), 403);
+        assert_eq!(
+            status(c.get(format!("{base}/auth?t=nope")).send().await.unwrap()),
+            403
+        );
         let r = c.get(format!("{base}/auth?t=s3cret")).send().await.unwrap();
         assert!(r.status().is_redirection());
         assert_eq!(r.headers()["location"], "/", "地址栏里不该留着 token");
@@ -1956,7 +2073,13 @@ mod tests {
         assert!(cookie.contains("HttpOnly"), "页面里的 JS 不该读得到它");
         let pair = cookie.split(';').next().unwrap();
         assert_eq!(
-            status(c.get(format!("{base}/api/sessions")).header("cookie", pair).send().await.unwrap()),
+            status(
+                c.get(format!("{base}/api/sessions"))
+                    .header("cookie", pair)
+                    .send()
+                    .await
+                    .unwrap()
+            ),
             200
         );
 
@@ -1964,9 +2087,22 @@ mod tests {
         assert_ne!(status(c.get(format!("{base}/")).send().await.unwrap()), 401);
 
         // 沙箱文件看路径上的钥匙：错的就是没有（这里没起沙箱，对的钥匙会走到「沙箱没起来」）
-        assert_eq!(status(c.get(format!("{base}/sandbox/wrong/workspace/a.txt")).send().await.unwrap()), 404);
         assert_eq!(
-            status(c.get(format!("{base}/sandbox/{key}/workspace/a.txt")).send().await.unwrap()),
+            status(
+                c.get(format!("{base}/sandbox/wrong/workspace/a.txt"))
+                    .send()
+                    .await
+                    .unwrap()
+            ),
+            404
+        );
+        assert_eq!(
+            status(
+                c.get(format!("{base}/sandbox/{key}/workspace/a.txt"))
+                    .send()
+                    .await
+                    .unwrap()
+            ),
             503
         );
     }
@@ -1975,7 +2111,12 @@ mod tests {
     #[tokio::test]
     async fn a_busy_session_refuses_a_second_turn_but_others_do_not_care() {
         let st = crate::state::AppState::new();
-        *st.llm.write().unwrap() = Some(crate::llm::Provider::compatible("x", "http://127.0.0.1:9", "m", "k"));
+        *st.llm.write().unwrap() = Some(crate::llm::Provider::compatible(
+            "x",
+            "http://127.0.0.1:9",
+            "m",
+            "k",
+        ));
         let (a, b) = {
             let mut store = st.chat.write().await;
             (store.create(), store.create())
@@ -2022,7 +2163,11 @@ mod tests {
         assert_eq!(parse_range("bytes=0-99", 1000), Some((0, 99)));
         assert_eq!(parse_range("bytes=900-", 1000), Some((900, 999)));
         assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
-        assert_eq!(parse_range("bytes=990-5000", 1000), Some((990, 999)), "结尾越界要截到文件末尾");
+        assert_eq!(
+            parse_range("bytes=990-5000", 1000),
+            Some((990, 999)),
+            "结尾越界要截到文件末尾"
+        );
         assert_eq!(parse_range("bytes=1000-", 1000), None, "起点越界不满足");
         assert_eq!(parse_range("bytes=0-1,5-9", 1000), None, "多段不支持");
         assert_eq!(parse_range("items=0-1", 1000), None);
@@ -2064,10 +2209,21 @@ mod tests {
 
     #[test]
     fn only_loopback_origins_may_open_the_websocket() {
-        for ok in ["http://127.0.0.1:41209", "http://localhost:5173", "http://[::1]:8787", "http://127.0.0.1"] {
+        for ok in [
+            "http://127.0.0.1:41209",
+            "http://localhost:5173",
+            "http://[::1]:8787",
+            "http://127.0.0.1",
+        ] {
             assert!(is_loopback_origin(ok), "{ok}");
         }
-        for bad in ["null", "https://evil.example", "http://127.0.0.1.evil.example", "http://192.168.0.2:41209", ""] {
+        for bad in [
+            "null",
+            "https://evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://192.168.0.2:41209",
+            "",
+        ] {
             assert!(!is_loopback_origin(bad), "{bad}");
         }
     }
