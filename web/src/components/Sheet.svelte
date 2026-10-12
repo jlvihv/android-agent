@@ -16,13 +16,14 @@
   import type { Snippet } from 'svelte';
   import { fly } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
-  import { onBack } from '../lib/overlay';
-  import { dismissable, RELEASE } from '../lib/drag';
+  import { onBack, type Peek } from '../lib/overlay';
+  import { dismissable, RELEASE, PAGE_MS } from '../lib/drag';
 
   let {
     title,
     onclose,
     onback,
+    peek,
     slide = 1,
     minClass = 'min-h-[45dvh]',
     children,
@@ -34,6 +35,9 @@
      *  整个面板关掉。第二页不画返回箭头 —— 安卓本来就有返回键/返回手势，
      *  再画一个纯属重复。 */
     onback?: () => void;
+    /** 有 `onback` 时，预测性返回（跟手返回）驱动它，而不是把面板往下拉 ——
+     *  回上一页的跟手应该是「上一页从左边滑回来」，不是「面板要关了」。 */
+    peek?: Peek;
     /** 标题从哪边飞进来：1 = 从右（内容往左推，进第二页），-1 = 从左（退回）。
      *  只在面板内部换页时有意义。 */
     slide?: number;
@@ -42,7 +46,6 @@
   } = $props();
 
   let panel: HTMLDivElement | null = $state(null);
-  let body: HTMLDivElement | null = $state(null);
 
   /** 0 = 完全展开，1 = 完全收起（在屏幕外） */
   let p = $state(1);
@@ -106,15 +109,40 @@
     return true;
   };
 
-  $effect(() => onBack(goBack, drag));
+  /**
+   * 交给预测性返回的跟手位移。在第二页（有 `onback` + `peek`）时是页面自己的
+   * 横向回退，否则是面板下滑。手势开始那一刻定下来用哪个，整段手势不换；
+   * 按返回键（没有 start，直接 commit）就当场挑。
+   */
+  let active: Peek | null = null;
+  const pick = (): Peek => (onback && peek ? peek : drag);
+  const backPeek: Peek = {
+    onStart: () => (active = pick()).onStart(),
+    onMove: (v) => (active ?? pick()).onMove(v),
+    onEnd: (commit) => {
+      const a = active ?? pick();
+      active = null;
+      a.onEnd(commit);
+    },
+  };
+
+  $effect(() => onBack(goBack, backPeek));
+
+  /** 从手指落点往上到面板，有没有哪层已经滚过了（正文、或里面单独滚的清单）。
+   *  有的话往下拉是在把它滚回去，不是关面板。 */
+  function scrolled(t: EventTarget | null): boolean {
+    for (let n = t as HTMLElement | null; n && n !== panel; n = n.parentElement) {
+      if (n.scrollTop > 0) return true;
+    }
+    return false;
+  }
 
   const drag = {
     axis: 'y' as const,
     dir: 1 as const,
     size: () => panel?.offsetHeight ?? 400,
-    // 正文没滚到顶时往下拉是在滚正文，不接管
-    canStart: (t: EventTarget | null) =>
-      !closing && !(body && body.contains(t as Node) && body.scrollTop > 0),
+    // 正文（或里面单独滚的清单）没滚到顶时往下拉是在滚它，不接管
+    canStart: (t: EventTarget | null) => !closing && !scrolled(t),
     onStart: () => (dragging = true),
     onMove: (v: number) => (p = v),
     onEnd: (shouldClose: boolean) => {
@@ -156,8 +184,8 @@
       <div class="relative h-full overflow-hidden">
         {#key title}
           <h2
-            in:fly={{ x: 28 * slide, duration: 300, easing: cubicOut }}
-            out:fly={{ x: -28 * slide, duration: 300, easing: cubicOut }}
+            in:fly={{ x: 28 * slide, duration: PAGE_MS, easing: cubicOut }}
+            out:fly={{ x: -28 * slide, duration: PAGE_MS, easing: cubicOut }}
             class="absolute inset-0 flex items-center justify-center truncate px-12 text-[17px]
                    font-semibold"
           >
@@ -169,7 +197,6 @@
   </div>
 
   <div
-    bind:this={body}
     class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
   >
     {@render children()}

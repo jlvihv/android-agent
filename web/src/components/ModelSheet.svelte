@@ -24,6 +24,8 @@
   import Sheet from './Sheet.svelte';
   import { store } from '../lib/store.svelte.ts';
   import { EFFORTS, effortLabel } from '../lib/effort';
+  import { PAGE_MS } from '../lib/drag';
+  import type { Peek } from '../lib/overlay';
 
   let {
     onclose,
@@ -50,10 +52,35 @@
 
   const current = $derived(store.llm?.model ?? '');
   const effort = $derived(store.llm?.reasoningEffort ?? null);
-  /** 视口高度跟着当前页走：切页时整个面板一起长高/变矮 */
-  const height = $derived(page === 'effort' ? hEffort : hModels);
+  /** 预测性返回的进度（只在思考强度页）：0 = 原位，1 = 已完全回到第一页 */
+  let peekP = $state(0);
+  /** 跟手中：关掉过渡，不然手指和内容之间有延迟 */
+  let peeking = $state(false);
+
+  /** 0 = 在第一页，1 = 在第二页；跟手返回时介于两者之间 */
+  const at = $derived(page === 'effort' ? 1 - peekP : 0);
+  /** 视口高度跟着当前页走：切页时整个面板一起长高/变矮；跟手时按进度插值 */
+  const height = $derived(hModels + (hEffort - hModels) * at);
+  const ease = 'cubic-bezier(0.32,0.72,0,1)';
 
   const back = () => (page = 'models');
+
+  /**
+   * 思考强度页的跟手返回：第一页从左边跟着手指滑回来（和点进来时的方向相反），
+   * 面板本身不动。松手完成就接着滑完，撤回就弹回第二页。
+   */
+  const peek: Peek = {
+    onStart: () => {
+      peeking = true;
+      peekP = 0;
+    },
+    onMove: (v) => (peekP = v),
+    onEnd: (commit) => {
+      peeking = false;
+      if (commit) back();
+      peekP = 0;
+    },
+  };
 
   // 量两页的自然高度。两个 pane 都在 DOM 里（在轨道上），量的是它们各自
   // 不受视口限制时的高度。`models.length` / `loading` 是依赖：清单到位后要重量。
@@ -122,19 +149,22 @@
 <Sheet
   title={page === 'effort' ? '思考强度' : '选择模型'}
   onback={page === 'effort' ? back : undefined}
+  {peek}
   slide={page === 'effort' ? 1 : -1}
   minClass="min-h-0"
   {onclose}
 >
   <!-- 视口：横向把另一页裁掉，高度跟着当前页（CSS 过渡） -->
   <div
-    class="overflow-hidden transition-[height] duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]"
-    style:height={height ? `${height}px` : undefined}
+    class="overflow-hidden"
+    style:height={hModels ? `${height}px` : undefined}
+    style:transition={peeking ? 'none' : `height ${PAGE_MS}ms ${ease}`}
   >
     <!-- 两页并排，整条轨道平移：位移和高度都是原生 CSS 过渡 -->
     <div
-      class="flex w-[200%] transition-transform duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]"
-      style:transform="translateX({page === 'effort' ? '-50%' : '0%'})"
+      class="flex w-[200%]"
+      style:transform="translateX({-50 * at}%)"
+      style:transition={peeking ? 'none' : `transform ${PAGE_MS}ms ${ease}`}
     >
       <div class="w-1/2 shrink-0">
         <div bind:this={paneModels} class="flex flex-col gap-3">

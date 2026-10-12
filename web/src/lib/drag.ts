@@ -165,3 +165,5 @@ export function dismissable(node: HTMLElement, opts: DismissOpts) {
 
 /** 松手后的回弹/收起曲线：先快后慢，接得住手指的速度 */
 export const RELEASE = 'transform 280ms cubic-bezier(0.22, 1, 0.36, 1)';
+/** 面板内部换页（横移 + 标题飞入）的时长。300 太急，看不清是从哪页到哪页 */
+export const PAGE_MS = 450;
