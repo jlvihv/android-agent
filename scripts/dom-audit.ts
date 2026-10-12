@@ -47,6 +47,9 @@ const BASE = arg('base', process.env.AGENT_UI ?? 'http://127.0.0.1:5173');
 const CDP = arg('cdp', process.env.AGENT_CDP ?? 'http://127.0.0.1:9222');
 const SNAPSHOT = arg('snapshot', '');
 const DIFF = arg('diff', '');
+/** `--shot <目录>`：每屏存一张 png，用来肉眼对样式 */
+const SHOT = arg('shot', '');
+let shotN = 0;
 const QUIET_PANELS = argv.includes('--no-panels');
 const DEBUG = argv.includes('--debug');
 
@@ -252,6 +255,12 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let problems = 0;
 
 async function audit(label: string) {
+  if (SHOT) {
+    shotN++;
+    const s = await send('Page.captureScreenshot', { format: 'png' });
+    const name = `${String(shotN).padStart(2, '0')}-${label.replace(/[^\w\u4e00-\u9fa5]+/g, '-')}.png`;
+    writeFileSync(`${SHOT}/${name}`, Buffer.from(s.data, 'base64'));
+  }
   const r = await evaluate(`${pageAudit.toString()}\npageAudit()`);
   const f = r.funnel;
   console.log(`\n===== ${label} =====`);
@@ -367,6 +376,12 @@ if (!QUIET_PANELS) {
   await audit('抽屉');
   await click('设置', `document.querySelector('button[aria-label="设置"]')?.click(), 1`);
   await audit('设置页');
+  // 设置是全屏页（z-60），附件面板 z-50 在它**下面** —— 不先关掉它，
+  // 下一屏拍到的还是设置页（踩过）。关完设置再关抽屉，才看得到附件面板。
+  await click('关设置', `document.querySelector('button[aria-label="返回"]')?.click(), 1`);
+  await wait(600);
+  await click('关抽屉', `(() => { const b = [...document.querySelectorAll('button[aria-label="关闭"]')].find(x => (x.className||'').includes('bg-black/50')); if(!b) return 0; b.click(); return 1; })()`);
+  await wait(600);
   await click('附件 +', `document.querySelector('button[aria-label="添加文件"]')?.click(), 1`);
   await audit('附件面板');
 }
