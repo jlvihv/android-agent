@@ -125,10 +125,15 @@
   }
 </script>
 
-<!-- 输入卡片：文字在上、控件在下，整体是一块浮起的圆角面 -->
+<!-- 输入卡片：文字在上、控件在下，整体是一块浮起的圆角面。
+
+     间距不是拍脑袋的，是对着 Claude 安卓端量出来的（Pixel 9 截图，412dp 宽）：
+     卡片离屏幕左右 16、卡片内边距 8、圆钮直径 36、圆钮之间 8、文字区自己再
+     内缩 4（于是文字落在 12）、文字区到控件行 16。全都能落在 Tailwind 刻度上：
+     mx-4 / p-2 / size-9 / gap-2 / px-1 py-1 / gap-4。 -->
 <div
-  class="mx-5 mb-[var(--composer-gap)] flex flex-col gap-3
-         rounded-card border border-control bg-surface p-3"
+  class="mx-4 mb-[var(--composer-gap)] flex flex-col gap-4
+         rounded-card border border-control bg-surface p-2"
 >
   {#if chips.length > 0}
     <!-- 附件胶囊：上传中转圈 / 失败红条 / 成功给缩略图或文件名 -->
@@ -190,7 +195,7 @@
     placeholder="与 agent 对话…"
     onkeydown={onkeydown}
     spellcheck="false"
-    class="resize-none bg-transparent px-1 pt-1 text-base leading-6 text-fg
+    class="resize-none bg-transparent px-1 py-1 text-base leading-6 text-fg
            placeholder:text-muted outline-none"
     style="max-height: 8.5rem; overflow-y: auto"
   ></textarea>
