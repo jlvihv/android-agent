@@ -20,12 +20,19 @@
    *      切过去 —— Key 在设置页里各存一份，不用重填。那一页最后一行「管理模型
    *      提供商」打开设置页（添加 / 删除 Key）。
    *
+   * 清单本身是**全局缓存**的，不在这个组件里（见 `lib/models.svelte.ts`）：
+   * 面板每开一次都是一个新组件（`App.svelte` 里的 `{#if sheet}`），清单要是存在
+   * 组件里，打开时第一帧就只有「载入中…」一行，十几毫秒后 38 行到了面板再长高
+   * —— 那一下就是布局跳动。缓存放在组件外面，第一帧就有数据，高度一次到位。
+   *
    * 第二页没有返回箭头：安卓本来就有返回键/返回手势，再画一个纯属重复。
    * 返回键在 `Sheet` 里被接管（见它的 `onback`），按下是退回第一页。
    */
+  import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import Sheet from './Sheet.svelte';
   import { store } from '../lib/store.svelte.ts';
+  import { models, type Group, type Model } from '../lib/models.svelte.ts';
   import { EFFORTS, effortLabel } from '../lib/effort';
   import { PAGE_MS } from '../lib/drag';
   import type { Peek } from '../lib/overlay';
@@ -42,9 +49,6 @@
     rev?: number;
   } = $props();
 
-  type Model = { id: string; name: string };
-  /** 一家服务商的模型（`GET /api/models` 的 `groups`） */
-  type Group = { id: string; name: string; models: Model[]; error?: string };
   type Page = 'models' | 'sub';
   /** 第二页放什么。两个子页共用轨道上的第二个位置（不排成三页：从第一页到
    *  第三页会把中间那页也扫一遍）。返回时不清，让它滑出去时内容还在。 */
@@ -52,15 +56,12 @@
 
   let page = $state<Page>('models');
   let sub = $state<Sub>('effort');
-  let groups = $state<Group[]>([]);
-  /** 当前在用的是哪家（服务商 id） */
-  let currentProvider = $state<string | null>(null);
   /** 清单正在看哪家（模型提供商页选的）。默认是当前在用的那家。 */
   let viewing = $state<string | null>(null);
-  const shown = $derived(groups.find((g) => g.id === viewing) ?? groups[0] ?? null);
-  const modelCount = $derived(groups.reduce((n, g) => n + g.models.length, 0));
-  let loading = $state(true);
-  let err = $state('');
+  const shown = $derived(models.groups.find((g) => g.id === viewing) ?? models.groups[0] ?? null);
+  /** 当前在用的是哪家（服务商 id） */
+  const currentProvider = $derived(models.provider);
+  const modelCount = $derived(models.groups.reduce((n, g) => n + g.models.length, 0));
   let busy = $state(false);
   let scroller = $state<HTMLDivElement | null>(null);
   let paneModels = $state<HTMLDivElement | null>(null);
@@ -87,15 +88,10 @@
     page = 'sub';
   };
 
-  /** 在模型提供商页选了一家：回到清单，换成这家的模型 */
+  /** 在模型提供商页选了一家：回到清单，换成这家的模型（滚动交给下面的 effect） */
   function view(id: string) {
     viewing = id;
     back();
-    requestAnimationFrame(() => {
-      if (!scroller) return;
-      scroller.scrollTop = 0;
-      scroller.querySelector('[data-current="1"]')?.scrollIntoView({ block: 'center' });
-    });
   }
 
   /**
@@ -116,44 +112,57 @@
   };
 
   // 量两页的自然高度。两个 pane 都在 DOM 里（在轨道上），量的是它们各自
-  // 不受视口限制时的高度。`models.length` / `loading` 是依赖：清单到位后要重量。
+  // 不受视口限制时的高度。清单到位后（`loaded` / `modelCount`）要重量。
   $effect(() => {
     void modelCount;
-    void groups.length;
+    void models.loaded;
     void viewing;
     void sub;
-    void loading;
     if (paneModels) hModels = paneModels.offsetHeight;
     if (paneSub) hSub = paneSub.offsetHeight;
   });
 
+  // 清单交给全局缓存：新鲜的话**一个请求都不发**（打开面板就是瞬间的，没有
+  // 「载入中…」那一帧）；过期就先拿旧的渲染、背后悄悄重拉。
+  //
+  // 用 `untrack` 包住：`load()` 内部会同步读 `loaded` / `err`，不挡住的话这就是
+  // 一个依赖，拉失败时「write err → effect 重跑 → 再拉」能死循环。这块只该
+  // 跟着 `rev` 走。（渲染不受影响：模板直接读 `models.groups`，自己会更新。）
   $effect(() => {
     void rev;
-    void load();
+    void untrack(() => models.load(rev));
   });
 
-  async function load() {
-    loading = true;
-    err = '';
-    try {
-      const r = await fetch('/api/models');
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const d = (await r.json()) as { groups?: Group[]; provider?: string | null };
-      groups = d.groups ?? [];
-      currentProvider = d.provider ?? null;
-      // 正在看的那家还在就不动（设置页里改完 Key 回来别跳走），否则看当前这家
-      if (!groups.some((g) => g.id === viewing)) viewing = currentProvider ?? groups[0]?.id ?? null;
-    } catch (e) {
-      err = String(e);
-    } finally {
-      loading = false;
-    }
-    // 38 个模型，当前那个多半在折叠线以下 —— 不滚过去的话，打开面板
-    // 只看得到一屏陌生名字，还得自己找。下一帧再滚（行还没渲染完）。
-    requestAnimationFrame(() => {
-      scroller?.querySelector('[data-current="1"]')?.scrollIntoView({ block: 'center' });
-    });
+  // 正在看的那家还在就不动（设置页里改完 Key 回来别跳走），否则看当前这家。
+  // 写的是自己读的 `viewing` —— 对得上就不写，不会来回触发。
+  $effect(() => {
+    const gs = models.groups;
+    if (gs.length === 0) return;
+    if (!gs.some((g) => g.id === viewing)) viewing = models.provider ?? gs[0].id;
+  });
+
+  /**
+   * 把「当前在用的那个模型」滚到视野中间。
+   *
+   * 38 个模型，当前那个多半在折叠线以下 —— 不滚过去的话，打开面板只看得到
+   * 一屏陌生名字，还得自己找。**挂载时就要滚**：缓存命中时数据第一帧就在了，
+   * 等请求回来再滚的话，面板早画好了才动，又是一跳。
+   */
+  function scrollToCurrent() {
+    const s = scroller;
+    if (!s) return;
+    const cur = s.querySelector('[data-current="1"]');
+    // 找不到（当前模型不属于这家）：回到顶部，别停在上一家的位置
+    if (cur) cur.scrollIntoView({ block: 'center' });
+    else s.scrollTop = 0;
   }
+
+  // 清单到位、或者换了看哪家之后，下一帧再滚（行得先渲染出来）
+  $effect(() => {
+    void modelCount;
+    void viewing;
+    if (modelCount) requestAnimationFrame(scrollToCurrent);
+  });
 
   const isCurrent = (g: Group, m: Model) => g.id === currentProvider && m.id === current;
 
@@ -171,7 +180,7 @@
 
   async function apply(model: string, provider: string | null, e: string | null) {
     busy = true;
-    err = '';
+    models.err = '';
     try {
       const r = await fetch('/api/model', {
         method: 'POST',
@@ -179,10 +188,10 @@
         body: JSON.stringify({ model, provider: provider ?? undefined, reasoningEffort: e ?? '' }),
       });
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      currentProvider = provider;
+      models.setProvider(provider);
       await store.reloadHealth();
     } catch (e) {
-      err = String(e);
+      models.err = String(e);
     } finally {
       busy = false;
     }
@@ -229,7 +238,7 @@
             bind:this={scroller}
             class="max-h-[42dvh] overflow-y-auto overscroll-contain rounded-2xl bg-bubble"
           >
-            {#if loading && groups.length === 0}
+            {#if !models.loaded}
               <p class="px-4 py-3.5 text-base text-muted">载入中…</p>
             {:else if !shown}
               <!-- 一家都没配：直接带去设置页 -->
@@ -280,9 +289,9 @@
         <div bind:this={paneSub} class="flex flex-col gap-3">
           {#if sub === 'providers'}
             <!-- 只列配好了 Key 的几家；加新的去设置页 -->
-            {#if groups.length > 0}
+            {#if models.groups.length > 0}
               <div class="overflow-hidden rounded-2xl bg-bubble">
-                {#each groups as g (g.id)}
+                {#each models.groups as g (g.id)}
                   <button
                     onclick={() => view(g.id)}
                     class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
@@ -336,5 +345,5 @@
     </div>
   </div>
 
-  {#if err}<p class="px-1 pt-3 text-xs text-bad">{err}</p>{/if}
+  {#if models.err}<p class="px-1 pt-3 text-xs text-bad">{models.err}</p>{/if}
 </Sheet>

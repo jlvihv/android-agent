@@ -567,6 +567,10 @@ struct StopBody {
 ///
 /// 「选择模型」面板就靠它：几家的 `/models` 并行拉（各自有缓存，见
 /// `AppState::models_of`），拉不到的那家带着错误回来，不拖累别家。
+///
+/// 注意：面板前端**自己还有一层 10 分钟的缓存**（`web/src/lib/models.svelte.ts`），
+/// 正常打开面板根本不会发这个请求 —— 后端这层省的是「打扰上游」，
+/// 前端那层省的是「面板第一帧没数据 → 先渲染载入中再长高」的布局跳动。
 /// `models` 还是当前这家的清单（老客户端 / agentctl 用）。
 async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery>) -> Response {
     let current = st.llm().or_else(Provider::from_env);

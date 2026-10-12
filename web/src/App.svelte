@@ -6,6 +6,7 @@
    *
    * 没有魔法数字：尺寸走 Tailwind 刻度，顶部/底部由安全区给。
    */
+  import { untrack } from 'svelte';
   import { store } from './lib/store.svelte.ts';
   import { consume, streamFrom, type Message, type Part, type Upload } from './lib/sse';
   import { uid } from './lib/uid';
@@ -17,6 +18,7 @@
   import Settings from './components/Settings.svelte';
   import Viewer from './components/Viewer.svelte';
   import { viewer } from './lib/viewer.svelte.ts';
+  import { models } from './lib/models.svelte.ts';
 
   let input = $state('');
   /** 当前看着的这个会话，本地正连着它的流。 */
@@ -66,6 +68,23 @@
     settings = false;
     settingsRev++;
   };
+
+  /**
+   * 开机就把模型清单拉回来。
+   *
+   * 「选择模型」面板是「第一帧就得有数据」才不跳（见 `lib/models.svelte.ts`）——
+   * 等用户点开才拉的话，第一次打开还是会先渲染「载入中…」再长高。这里提前
+   * 拉一次，之后 10 分钟内打开面板都是瞬间的，一个请求也不发。
+   *
+   * 没配服务商就不拉（`/api/models` 也没东西可回）。
+   */
+  $effect(() => {
+    const on = !!store.llm;
+    const r = settingsRev;
+    if (!on) return;
+    // `untrack`：同 ModelSheet 里的理由，别把 `load()` 内部读的 `$state` 也变成依赖
+    void untrack(() => models.load(r));
+  });
 
   /** 输入区实际高度。消息列表的底部留白和底部渐隐都跟着它走。 */
   let composerH = $state(0);
