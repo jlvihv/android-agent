@@ -186,11 +186,11 @@ dev_shell 'uname -m'
 ```
 
 安卓上 App 不继承 shell 环境变量，所以 LLM 配置走 `POST /api/llm`
-（持久化到 `<filesDir>/llm.json`）。
+（存在 `sessions.db` 的 `meta` 表里；老版本的 `llm.json` 启动时自动迁进来再删掉）。
 
 模型能不能看图**自动判定**，不用配：`GET /api/models` 拉 provider 的模型清单，
 再查 [models.dev](https://models.dev) 目录里该模型的 `modalities.input` 有没有
-`image`。判定结果跟着 llm.json 落盘，下次启动直接用。`read` 读到的图片会作为
+`image`。判定结果跟着 provider 配置落盘，下次启动直接用。`read` 读到的图片会作为
 `image_url` 发给能看图的模型；查不到（目录里没这个模型）就沿用上次的值。
 
 PDF / 文档输入同理，看的是 `modalities.input` 里的 `pdf`（`/api/health` 的
@@ -198,7 +198,7 @@ PDF / 文档输入同理，看的是 `modalities.input` 里的 `pdf`（`/api/hea
 不支持 `file` 内容块的端点接了 PDF 会直接 400。
 
 界面里点输入卡片的模型药丸 = **选择模型**面板：上面是 `GET /api/models` 拉回来的
-清单（不写描述），下面两行是「思考强度」和「模型服务」。思考强度选完存进 llm.json，
+清单（不写描述），下面两行是「思考强度」和「模型服务」。思考强度选完跟着 provider 配置存进库，
 发请求时映射成 `reasoning_effort`（Chat Completions）或 `reasoning.effort`
 （Responses）；**默认档一个字段都不发**（严格网关会 400）。
 

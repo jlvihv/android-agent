@@ -34,6 +34,18 @@ class AgentApp : Application() {
             private set
 
         /**
+         * 本地 API 的凭据。WebView 先打开 `/auth?t=<它>` 种上 cookie，
+         * 之后 `/api/…` 才放行。
+         *
+         * 为什么要它：手机上任何有网络权限的 App 都能连 127.0.0.1，扫一遍端口
+         * 就能找到核心、在沙箱里跑命令（沙箱挂着整个内部存储）。
+         * 存在会话库里，跨重启不变。
+         */
+        @Volatile
+        var token: String? = null
+            private set
+
+        /**
          * 无障碍服务连上时调用。
          *
          * 注意时序：服务可能在 Application.onCreate 之前/之后连上，
@@ -149,6 +161,15 @@ class AgentApp : Application() {
 
         // 3. 起 HTTP 服务。传 0 让系统分配端口 —— 硬编码端口在真机上
         //    可能被别的 App 占了。
+        // setupLinux 里打开了会话库，凭据就在那里
+        token = runCatching { core.token() }.getOrNull()
+        token?.let { t ->
+            // 调试脚本（scripts/phone-token.sh）拿它：debug 包 run-as 读文件，
+            // release 包只能看 logcat —— 别的 App 读不到我们的日志，只有 adb 能。
+            runCatching { File(filesDir, "token").writeText(t) }
+            Log.i(TAG, "agent token: $t")
+        }
+
         runCatching { port = core.start(0u.toUShort()).toInt() }
             .onSuccess {
                 Log.i(TAG, "WebView 应指向 http://127.0.0.1:$port")

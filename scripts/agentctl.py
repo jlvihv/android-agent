@@ -55,6 +55,18 @@ OK = "32"
 # ---------------------------------------------------------------------------
 
 
+# 核心的 /api 要凭据（手机上别的 App 也能连 127.0.0.1）。`just phone` /
+# `just doctor` 会用 scripts/phone-token.sh 拿到再放进环境变量。
+TOKEN = os.environ.get("AGENT_TOKEN", "")
+
+
+def headers() -> dict:
+    h = {"content-type": "application/json"}
+    if TOKEN:
+        h["x-agent-token"] = TOKEN
+    return h
+
+
 def call(method: str, path: str, body=None, timeout: float = 60.0):
     """普通请求。返回 (状态码, 解析后的 body 或原始文本)。"""
     data = None if body is None else json.dumps(body).encode()
@@ -62,7 +74,7 @@ def call(method: str, path: str, body=None, timeout: float = 60.0):
         BASE + path,
         data=data,
         method=method,
-        headers={"content-type": "application/json"},
+        headers=headers(),
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -83,7 +95,7 @@ def sse(path: str, body, timeout: float = 1800.0):
     req = urllib.request.Request(
         BASE + path,
         data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
+        headers=headers(),
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         buf = b""
@@ -382,11 +394,16 @@ def session_note() -> str:
 
 
 def wait_until_idle(timeout: float = 1800.0) -> dict | None:
-    """轮询 /api/session 直到服务端不在跑。SSE 断了的时候用它兜底。"""
+    """轮询这一程的会话（`TARGET`；None = 活动会话）直到它不在跑。SSE 断了的时候用它兜底。
+
+    「进行中」是按会话记的（几个会话可以同时各跑一个），所以要问**自己那条**
+    会话 —— 不带 id 问到的是用户当前打开的那条。
+    """
+    path = "/api/session" + (f"?id={TARGET}" if TARGET else "")
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
-        code, d = call("GET", "/api/session")
+        code, d = call("GET", path)
         if code != 200 or not isinstance(d, dict):
             return None
         last = d
@@ -567,7 +584,10 @@ def cmd_bash(script: str) -> None:
 
 
 def cmd_cat(path: str) -> None:
-    code, raw = call("GET", "/sandbox" + (path if path.startswith("/") else "/" + path))
+    # 沙箱文件的 URL 带一把钥匙（/sandbox/<key>/…），从 health 拿
+    _, h = call("GET", "/api/health")
+    key = h.get("sandboxKey", "") if isinstance(h, dict) else ""
+    code, raw = call("GET", f"/sandbox/{key}" + (path if path.startswith("/") else "/" + path))
     if code != 200:
         print(c(BAD, f"失败 {code}: {raw}"))
         return
@@ -667,8 +687,8 @@ def cmd_doctor(deep: bool = False) -> int:
             + ("（运行时覆盖过）" if st.get("systemPrompt", {}).get("overridden") else ""))
         if st.get("dataDir"):
             print(c(DIM, f"           dataDir {st['dataDir']}"))
-        if st.get("turnActive"):
-            print(c(WARN, "           ⚠ 服务端此刻正在跑一个回合（/wait 等它）"))
+        if st.get("busySessions"):
+            print(c(WARN, f"           ⚠ 服务端此刻有 {len(st['busySessions'])} 个会话在跑回合（/wait 等它）"))
     else:
         print(c(DIM, "  · 这台核心没有 /api/debug/* —— 装的是旧构建"))
 
@@ -807,6 +827,7 @@ def main() -> int:
     )
     ap.add_argument("prompt", nargs="*", help="要发给 agent 的话；不给就进交互模式")
     ap.add_argument("--base", help=f"核心地址（默认 {BASE}，也可用 $AGENT_BASE）")
+    ap.add_argument("--token", help="核心的访问凭据（默认 $AGENT_TOKEN；手机上用 scripts/phone-token.sh 拿）")
     ap.add_argument("--json", action="store_true", help="输出一整份机器可读转录")
     ap.add_argument("--timeout", type=float, default=1800.0, help="单个回合的总超时秒数")
     ap.add_argument("--doctor", action="store_true", help="各部件体检一遍就退出")
@@ -820,6 +841,9 @@ def main() -> int:
 
     if args.base:
         BASE = args.base.rstrip("/")
+    if args.token:
+        global TOKEN
+        TOKEN = args.token
 
     # 定好这一程写进哪个会话。默认是一条**专用调试会话** —— 直接在 CLI 里
     # 发消息而不小心写进用户正在聊的那条，是真踩过的坑。

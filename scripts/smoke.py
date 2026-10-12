@@ -19,6 +19,10 @@ import urllib.request
 
 import os
 BASE = os.environ.get("AGENT_BASE", "http://127.0.0.1:8787")
+# 核心设了凭据时要带（桌面默认不设；对着手机跑见 scripts/phone-token.sh）
+HEADERS = {"content-type": "application/json"}
+if os.environ.get("AGENT_TOKEN"):
+    HEADERS["x-agent-token"] = os.environ["AGENT_TOKEN"]
 
 
 def stream(path: str, body: dict) -> dict:
@@ -26,7 +30,7 @@ def stream(path: str, body: dict) -> dict:
     req = urllib.request.Request(
         BASE + path,
         data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
+        headers=HEADERS,
     )
     text, reasoning, tools, errs = "", "", {}, []
     outputs: dict[str, object] = {}

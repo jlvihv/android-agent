@@ -138,26 +138,39 @@ pub struct AppState {
     pub mock: AtomicBool,
     /// 会话历史。用 tokio 的 RwLock，因为 agent loop 会跨 await 持有。
     /// 多会话。侧边栏的「最近对话」就是它。
-    pub chat: tokio::sync::RwLock<SessionStore>,
+    ///
+    /// 包一层 Arc 是为了启动时能拿一个 owned 写锁交给后台任务：会话从库里
+    /// 读出来之前，所有要读会话的请求都排队等它（见 `load_sessions`）。
+    pub chat: Arc<tokio::sync::RwLock<SessionStore>>,
     /// Linux 沙箱。安卓上由 Kotlin 在 boot 时把 proot / rootfs 路径交进来；
     /// 桌面上由环境变量自动探测。
     pub linux: RwLock<Option<Arc<LinuxSandbox>>>,
     /// LLM provider。
     ///
     /// 安卓上**没法用环境变量**（App 不继承 shell 环境），所以运行时
-    /// 通过 `POST /api/llm` 注入，并持久化到 `<filesDir>/llm.json`。
+    /// 通过 `POST /api/llm` 注入，存在会话库的 `meta` 表里（`llm` 这一行）。
     /// 桌面上启动时从环境变量播种。
     pub llm: RwLock<Option<Provider>>,
     /// 持久化目录（安卓上是 `<filesDir>`；桌面上为空则只存内存）
     pub data_dir: RwLock<Option<std::path::PathBuf>>,
     /// 会话库。`set_data_dir` 时打开。
     pub db: RwLock<Option<Arc<Db>>>,
-    /// 有回合正在跑。前端切回来时用它判断「还在进行中」还是「卡住了」。
+    /// 会话已经从库里读进内存了。
+    ///
+    /// 读之前（或者读失败了）**绝不能落盘**：`Db::sync` 会把内存里没有的
+    /// 会话从库里删掉 —— 拿一个空的 store 去同步，等于清空全部历史。
+    pub sessions_loaded: AtomicBool,
+    /// 正在跑的回合：会话 id → 这个回合的停止开关。
+    ///
+    /// 按会话分开：可以同时在几个会话里各跑一个回合，停止也只停那一个。
+    /// 同一个会话同时只能有一个（两个回合往同一段历史里交错追加就乱了）。
     ///
     /// 注意：agent 循环**不依赖** SSE 客户端。客户端断开时 `tx.send`
     /// 失败但被忽略，循环照跑、工具照执行、LLM 照调 —— 所以 App 切到
-    /// 后台 agent 是在继续干活的（前台服务保着进程）。
-    pub turn_active: AtomicBool,
+    /// 后台、或者切到别的会话，agent 都在继续干活（前台服务保着进程）。
+    pub turns: Mutex<HashMap<String, Arc<Turn>>>,
+    /// 本地 API 的访问凭据。见 `Auth`。
+    pub auth: RwLock<Auth>,
     /// 会话有改动，等着落盘。定时器每 2s 检查一次。
     ///
     /// 不用「改一次写一次」：一轮对话会产生几十次变更，每次都写盘太浪费。
@@ -175,15 +188,6 @@ pub struct AppState {
     pub vision: RwLock<Option<(String, bool)>>,
     /// PDF / 文档输入能力的自动判定结果，和 `vision` 分开存。
     pub files: RwLock<Option<(String, bool)>>,
-    /// 用户按了停止。回合循环每轮开始前 / 每个工具执行前都会看它。
-    ///
-    /// agent loop **没有轮数上限**，所以必须有一个真的能停下来、而不只是
-    /// 断开前端连接的开关 —— 否则模型空转时只能在后台烧 token。
-    pub abort_turn: AtomicBool,
-    /// 配合 `abort_turn`：按停止时叫醒正在等的人（流式接收、跑着的 bash）。
-    /// 只有标志位的话，停止要等到「这一步流完 / 这条命令跑完」才生效 ——
-    /// 而 bash 的超时可以是 24 小时。
-    pub abort_notify: tokio::sync::Notify,
     /// 已上传但还没随消息发出去的附件：`id → Attachment`。
     ///
     /// 上传和发送是两个请求，中间隔着一个用户可能改主意的间隔，所以需
@@ -201,19 +205,22 @@ impl AppState {
             device: RwLock::new(None),
             port: AtomicU16::new(0),
             mock: AtomicBool::new(false),
-            chat: tokio::sync::RwLock::new(SessionStore::default()),
+            chat: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
             linux: RwLock::new(None),
             llm: RwLock::new(None),
             data_dir: RwLock::new(None),
-            turn_active: AtomicBool::new(false),
+            sessions_loaded: AtomicBool::new(false),
+            turns: Mutex::new(HashMap::new()),
+            auth: RwLock::new(Auth {
+                token: None,
+                sandbox_key: random_secret(),
+            }),
             db: RwLock::new(None),
             sessions_dirty: AtomicBool::new(false),
             system_prompt: RwLock::new(None),
             vision: RwLock::new(None),
             files: RwLock::new(None),
             pending_attachments: Mutex::new(HashMap::new()),
-            abort_turn: AtomicBool::new(false),
-            abort_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -272,33 +279,135 @@ impl AppState {
         self.db.read().ok().and_then(|g| g.clone())
     }
 
-    /// 打开会话库并恢复会话。启动时调一次。
+    /// 打开会话库，读出 provider 配置和访问凭据。启动时调一次（主线程上）。
+    ///
+    /// **会话本身不在这里读**：历史一多（每条 bash 输出几十 KB），全读出来
+    /// 要几百毫秒，而这是在 `Application.onCreate` 里 —— 卡的是 App 启动。
+    /// 会话挪到 `load_sessions`，在后台读。
     pub fn open_db(&self, dir: &std::path::Path) {
         let path = dir.join("sessions.db");
         match Db::open(&path) {
             Ok(db) => {
                 let db = Arc::new(db);
-                match db.load() {
-                    Ok(store) => {
-                        let n = store.sessions.len();
-                        // blocking_write 在异步上下文里会 panic。启动时是从
-                        // Kotlin 主线程调进来的，没有 runtime —— 但还是挡一下。
-                        if tokio::runtime::Handle::try_current().is_ok() {
-                            tracing::warn!("在异步上下文里恢复会话，跳过");
-                        } else {
-                            *self.chat.blocking_write() = store;
-                            if n > 0 {
-                                self.log("info", format!("从 sessions.db 恢复 {n} 个会话"));
-                            }
-                        }
-                    }
-                    Err(e) => self.log("warn", format!("读取会话失败: {e:#}")),
-                }
+                self.load_llm(&db, dir);
+                self.load_auth(&db);
                 if let Ok(mut g) = self.db.write() {
                     *g = Some(db);
                 }
             }
             Err(e) => self.log("error", format!("打开 {} 失败: {e:#}", path.display())),
+        }
+    }
+
+    /// 在后台把会话从库里读进内存。`serve()` 起服务**之前**调。
+    ///
+    /// 同步拿下会话的写锁再交给后台任务：服务起来之后、读完之前进来的请求
+    /// 都会在锁上排队，而不是看到一个空的会话列表。
+    pub fn load_sessions(self: &Arc<Self>) {
+        let Some(db) = self.db() else {
+            // 没有库（桌面开发）：没什么要读的，内存里就是全部
+            self.sessions_loaded.store(true, Ordering::Relaxed);
+            return;
+        };
+        let Ok(mut guard) = self.chat.clone().try_write_owned() else {
+            tracing::warn!("会话被占用，没法在后台加载");
+            return;
+        };
+        let st = self.clone();
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || db.load()).await {
+                Ok(Ok(store)) => {
+                    let n = store.sessions.len();
+                    *guard = store;
+                    drop(guard);
+                    st.sessions_loaded.store(true, Ordering::Relaxed);
+                    if n > 0 {
+                        st.log("info", format!("从 sessions.db 恢复 {n} 个会话"));
+                    }
+                }
+                Ok(Err(e)) => st.log("error", format!("读取会话失败，本次运行不落盘（免得覆盖掉库里的历史）: {e:#}")),
+                Err(e) => st.log("error", format!("读取会话的任务挂了: {e}")),
+            }
+        });
+    }
+
+    /// 访问凭据：库里有就用，没有就生成一份存进去（跨重启不变，调试脚本
+    /// 拿一次就够）。
+    fn load_auth(&self, db: &Db) {
+        let get_or_make = |k: &str| -> String {
+            match db.get_meta(k) {
+                Ok(Some(v)) if !v.is_empty() => v,
+                _ => {
+                    let v = random_secret();
+                    if let Err(e) = db.set_meta(k, &v) {
+                        tracing::warn!("保存 {k} 失败: {e:#}");
+                    }
+                    v
+                }
+            }
+        };
+        let auth = Auth {
+            token: Some(get_or_make("token")),
+            sandbox_key: get_or_make("sandbox_key"),
+        };
+        if let Ok(mut g) = self.auth.write() {
+            *g = auth;
+        }
+    }
+
+    pub fn auth(&self) -> Auth {
+        self.auth.read().map(|g| g.clone()).unwrap_or_else(|_| Auth {
+            token: Some(random_secret()),
+            sandbox_key: random_secret(),
+        })
+    }
+
+    /// 桌面开发用：`AGENT_TOKEN` 设了就要求凭据，没设就不设防。
+    pub fn set_token(&self, token: Option<String>) {
+        if let Ok(mut g) = self.auth.write() {
+            g.token = token.filter(|t| !t.is_empty());
+        }
+    }
+
+    // —— 回合 ——
+
+    /// 在这个会话上开一个回合。已经有一个在跑就返回 None。
+    pub fn begin_turn(&self, sid: &str) -> Option<Arc<Turn>> {
+        let mut g = self.turns.lock().ok()?;
+        if g.contains_key(sid) {
+            return None;
+        }
+        let t = Arc::new(Turn::default());
+        g.insert(sid.to_string(), t.clone());
+        Some(t)
+    }
+
+    pub fn end_turn(&self, sid: &str) {
+        if let Ok(mut g) = self.turns.lock() {
+            g.remove(sid);
+        }
+    }
+
+    pub fn is_busy(&self, sid: &str) -> bool {
+        self.turns.lock().map(|g| g.contains_key(sid)).unwrap_or(false)
+    }
+
+    pub fn busy_sessions(&self) -> Vec<String> {
+        self.turns
+            .lock()
+            .map(|g| g.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 停这个会话正在跑的回合。返回有没有在跑。
+    pub fn request_abort(&self, sid: &str) -> bool {
+        let t = self.turns.lock().ok().and_then(|g| g.get(sid).cloned());
+        match t {
+            Some(t) => {
+                t.request_abort();
+                true
+            }
+            None => false,
         }
     }
 
@@ -339,6 +448,9 @@ impl AppState {
         let Some(db) = self.db() else {
             return Ok(());
         };
+        if !self.sessions_loaded.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let store = self
             .chat
             .try_read()
@@ -368,8 +480,8 @@ impl AppState {
     ///
     /// ⚠️ 目前是**明文**存在 App 私有目录里（受 Android 沙箱 + SELinux 保护）。
     /// 下一步应该用 Android Keystore 加密 —— 见 docs/04-android-shell.md 的债。
-    pub fn set_llm(&self, p: Provider, persist_dir: Option<&std::path::Path>) {
-        self.persist_provider(&p, persist_dir);
+    pub fn set_llm(&self, p: Provider) {
+        self.persist_provider(&p);
         let name = p.name.clone();
         let model = p.model.clone();
         if let Ok(mut g) = self.llm.write() {
@@ -379,13 +491,13 @@ impl AppState {
     }
 
     /// 只更新「能不能看图」并落盘（自动判定后调用），不重发配置日志。
-    pub fn set_supports_images(&self, vision: bool, persist_dir: Option<&std::path::Path>) {
+    pub fn set_supports_images(&self, vision: bool) {
         let Some(mut p) = self.llm() else { return };
         if p.supports_images == vision {
             return;
         }
         p.supports_images = vision;
-        self.persist_provider(&p, persist_dir);
+        self.persist_provider(&p);
         if let Ok(mut g) = self.llm.write() {
             *g = Some(p);
         }
@@ -393,22 +505,25 @@ impl AppState {
     }
 
     /// 只更新「能不能吃 PDF」并落盘（自动判定后调用），不重发配置日志。
-    pub fn set_supports_files(&self, files: bool, persist_dir: Option<&std::path::Path>) {
+    pub fn set_supports_files(&self, files: bool) {
         let Some(mut p) = self.llm() else { return };
         if p.supports_files == files {
             return;
         }
         p.supports_files = files;
-        self.persist_provider(&p, persist_dir);
+        self.persist_provider(&p);
         if let Ok(mut g) = self.llm.write() {
             *g = Some(p);
         }
         tracing::debug!("文档输入能力已记录: {files}");
     }
 
-    fn persist_provider(&self, p: &Provider, persist_dir: Option<&std::path::Path>) {
-        let Some(dir) = persist_dir else { return };
-        let f = dir.join("llm.json");
+    /// provider 配置存进会话库的 `meta` 表（桌面开发没有库，只留在内存里）。
+    ///
+    /// 一行 UPSERT 是原子的：原来写 llm.json 时进程被杀，文件就是半截，
+    /// 下次启动解析失败，API key 跟着没了。
+    fn persist_provider(&self, p: &Provider) {
+        let Some(db) = self.db() else { return };
         // 用独立的持久化结构，**不能**直接序列化 Provider ——
         // 它的 api_key 是 skip_serializing（防止泄给前端），
         // 直接存的话 key 就丢了。
@@ -422,16 +537,11 @@ impl AppState {
             api_style: p.api_style,
             reasoning_effort: p.reasoning_effort.clone(),
         };
-        match serde_json::to_vec_pretty(&rec) {
-            Ok(body) => {
-                // 先写临时文件再 rename：直接覆盖时进程被杀，llm.json 就是半截，
-                // 下次启动解析失败 —— API key 跟着没了。
-                let tmp = dir.join("llm.json.tmp");
-                if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &f)) {
-                    tracing::warn!("写 {} 失败: {e}", f.display());
-                }
-            }
-            Err(e) => tracing::warn!("序列化 provider 失败: {e}"),
+        let res = serde_json::to_string(&rec)
+            .map_err(anyhow::Error::from)
+            .and_then(|body| db.set_meta("llm", &body));
+        if let Err(e) = res {
+            tracing::warn!("保存 provider 失败: {e:#}");
         }
     }
 
@@ -462,7 +572,7 @@ impl AppState {
         // 判定要联网（最多十几秒），这期间用户可能已经换了模型：只在当前
         // provider 还是**这一个**时才落盘，否则会把旧模型的能力写到新模型头上。
         if resolved.is_some() && self.llm().is_some_and(|cur| vision_key(&cur) == key) {
-            self.set_supports_images(vision, dir.as_deref());
+            self.set_supports_images(vision);
         }
         vision
     }
@@ -493,37 +603,9 @@ impl AppState {
             *g = Some((key.clone(), files));
         }
         if resolved.is_some() && self.llm().is_some_and(|cur| files_key(&cur) == key) {
-            self.set_supports_files(files, dir.as_deref());
+            self.set_supports_files(files);
         }
         files
-    }
-
-    /// 用户请求停止当前回合（`POST /api/stop`）。
-    pub fn request_abort(&self) {
-        self.abort_turn
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.abort_notify.notify_waiters();
-    }
-
-    /// 等到用户按停止。已经按过就立刻返回。
-    ///
-    /// 先登记再看标志位：`notify_waiters` 不留许可，先看标志再登记的话，
-    /// 两步之间按下的停止就丢了。
-    pub async fn aborted(&self) {
-        loop {
-            let n = self.abort_notify.notified();
-            tokio::pin!(n);
-            n.as_mut().enable();
-            if self.abort_requested() {
-                return;
-            }
-            n.await;
-        }
-    }
-
-    pub fn abort_requested(&self) -> bool {
-        self.abort_turn
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 只看缓存/已存的值（同步，给组装请求和工具用，不做网络）。
@@ -561,11 +643,21 @@ impl AppState {
         crate::models::list(&provider, refresh, dir.as_deref()).await
     }
 
-    /// 启动时从磁盘恢复
-    pub fn load_llm(&self, dir: &std::path::Path) {
-        let f = dir.join("llm.json");
-        let Ok(body) = std::fs::read(&f) else { return };
-        match serde_json::from_slice::<PersistedProvider>(&body) {
+    /// 启动时从库里恢复 provider。
+    ///
+    /// 老版本存在 `<filesDir>/llm.json`：库里还没有时把它搬进来，然后删掉
+    /// 文件 —— 明文的 key 不该在两个地方各留一份。
+    fn load_llm(&self, db: &Db, dir: &std::path::Path) {
+        let raw = match db.get_meta("llm") {
+            Ok(Some(s)) => Some(s),
+            Ok(None) => migrate_llm_json(db, dir),
+            Err(e) => {
+                self.log("warn", format!("读取 provider 配置失败: {e:#}"));
+                None
+            }
+        };
+        let Some(raw) = raw else { return };
+        match serde_json::from_str::<PersistedProvider>(&raw) {
             Ok(rec) => {
                 let name = rec.name.clone();
                 let model = rec.model.clone();
@@ -578,16 +670,16 @@ impl AppState {
                 if let Ok(mut g) = self.vision.write() {
                     *g = Some((vision_key(&p), rec.supports_images));
                 }
-                // 刻意**不**给 `files` 填缓存：老 llm.json 里没有这个字段，
+                // 刻意**不**给 `files` 填缓存：老配置里没有这个字段，
                 // 填了就会把「从未判定过」当成「已判定为 false」，界面就一直
                 // 不显示文件入口。留给启动后的 `refresh_capabilities` 去查
                 // models.dev（磁盘有目录缓存，大多不联网）。
                 if let Ok(mut g) = self.llm.write() {
                     *g = Some(p);
                 }
-                self.log("info", format!("从 llm.json 恢复 LLM: {name} / {model}"));
+                self.log("info", format!("恢复 LLM 配置: {name} / {model}"));
             }
-            Err(e) => self.log("warn", format!("llm.json 解析失败: {e}")),
+            Err(e) => self.log("warn", format!("provider 配置解析失败: {e}")),
         }
     }
 
@@ -600,6 +692,90 @@ impl AppState {
     }
 }
 
+/// 老版本的 `llm.json` → 库。成功搬进去才删文件；返回搬进去的内容。
+fn migrate_llm_json(db: &Db, dir: &std::path::Path) -> Option<String> {
+    let f = dir.join("llm.json");
+    let body = std::fs::read_to_string(&f).ok()?;
+    // 坏文件不搬（搬进去也解析不了），留着给人看
+    serde_json::from_str::<PersistedProvider>(&body).ok()?;
+    match db.set_meta("llm", &body) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&f);
+            let _ = std::fs::remove_file(dir.join("llm.json.tmp"));
+            tracing::info!("llm.json 已迁移进 sessions.db");
+            Some(body)
+        }
+        Err(e) => {
+            tracing::warn!("迁移 llm.json 失败（下次启动再试）: {e:#}");
+            Some(body)
+        }
+    }
+}
+
+/// 随机凭据：122 位随机数的十六进制（UUID v4 去掉版本位之外全是随机的）。
+fn random_secret() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// 本地 API 的访问凭据。
+///
+/// 核心只听 127.0.0.1，但**手机上任何一个有网络权限的 App 都能连
+/// 127.0.0.1**，扫一遍端口就能找到我们 —— 然后调 `/api/linux` 在沙箱里跑
+/// 命令，而沙箱挂着整个内部存储（我们有「所有文件访问」权限）。所以：
+///
+/// - `token`：`/api/*` 要它。App 的 WebView 走 cookie（`/auth?t=` 种下，
+///   HttpOnly），沙箱里的 `agent` 命令和电脑上的调试脚本走 `x-agent-token`
+///   头。`None` = 不设防（桌面开发没设 `AGENT_TOKEN` 时）。
+/// - `sandbox_key`：沙箱文件走 `/sandbox/<key>/…`。单独一把，因为沙箱里
+///   生成的网页在 opaque origin 里，带不上 cookie；放在路径里，页面的相对
+///   路径（css/js/图片）自然继承。这把钥匙页面自己看得到，所以它**只**能
+///   读沙箱文件，开不了 `/api`。
+#[derive(Clone, Debug)]
+pub struct Auth {
+    pub token: Option<String>,
+    pub sandbox_key: String,
+}
+
+/// 一个正在跑的回合的停止开关。
+///
+/// agent loop **没有轮数上限**，所以必须有一个真的能停下来、而不只是
+/// 断开前端连接的开关 —— 否则模型空转时只能在后台烧 token。
+#[derive(Default)]
+pub struct Turn {
+    abort: AtomicBool,
+    /// 按停止时叫醒正在等的人（流式接收、跑着的 bash）。只有标志位的话，
+    /// 停止要等到「这一步流完 / 这条命令跑完」才生效 —— 而 bash 的超时
+    /// 可以是 24 小时。
+    notify: tokio::sync::Notify,
+}
+
+impl Turn {
+    pub fn request_abort(&self) {
+        self.abort.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    pub fn abort_requested(&self) -> bool {
+        self.abort.load(Ordering::Relaxed)
+    }
+
+    /// 等到用户按停止。已经按过就立刻返回。
+    ///
+    /// 先登记再看标志位：`notify_waiters` 不留许可，先看标志再登记的话，
+    /// 两步之间按下的停止就丢了。
+    pub async fn aborted(&self) {
+        loop {
+            let n = self.notify.notified();
+            tokio::pin!(n);
+            n.as_mut().enable();
+            if self.abort_requested() {
+                return;
+            }
+            n.await;
+        }
+    }
+}
+
 /// 视觉判定的缓存键：base_url + 模型名。任一变了就重算。
 fn vision_key(p: &Provider) -> String {
     format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
@@ -608,4 +784,94 @@ fn vision_key(p: &Provider) -> String {
 /// 文档输入判定的缓存键，和视觉那套分开存。
 fn files_key(p: &Provider) -> String {
     format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("agent-state-{tag}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 老版本把 provider（含明文 key）存在 llm.json：搬进库，然后删掉文件。
+    #[test]
+    fn llm_json_moves_into_the_database_and_the_file_goes_away() {
+        let dir = temp_dir("migrate");
+        std::fs::write(
+            dir.join("llm.json"),
+            r#"{"name":"go","base_url":"https://x/v1","model":"m1","api_key":"sk-1"}"#,
+        )
+        .unwrap();
+
+        let st = AppState::new();
+        st.open_db(&dir);
+        let p = st.llm().expect("从 llm.json 恢复出 provider");
+        assert_eq!((p.model.as_str(), p.api_key.as_str()), ("m1", "sk-1"));
+        assert!(!dir.join("llm.json").exists(), "明文 key 不该再留一份在文件里");
+
+        // 改模型 → 存进库；重开之后还在，凭据也不变
+        let mut p2 = p.clone();
+        p2.model = "m2".into();
+        st.set_llm(p2);
+        let token = st.auth().token;
+        let key = st.auth().sandbox_key;
+        drop(st);
+
+        let st = AppState::new();
+        st.open_db(&dir);
+        assert_eq!(st.llm().unwrap().model, "m2");
+        assert_eq!(st.auth().token, token, "凭据跨重启不变，调试脚本拿一次就够");
+        assert_eq!(st.auth().sandbox_key, key);
+        assert!(token.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turns_are_per_session() {
+        let st = AppState::new();
+        let a = st.begin_turn("a").unwrap();
+        assert!(st.begin_turn("a").is_none(), "同一个会话不能同时跑两个回合");
+        let b = st.begin_turn("b").unwrap();
+
+        assert!(st.request_abort("a"));
+        assert!(a.abort_requested());
+        assert!(!b.abort_requested(), "停 a 不能把 b 也停了");
+
+        st.end_turn("a");
+        assert!(!st.is_busy("a"));
+        assert!(st.is_busy("b"));
+        assert!(!st.request_abort("a"), "没在跑的会话：停止什么也不做");
+    }
+
+    /// 会话还没从库里读出来时绝不能落盘：`sync` 会把内存里没有的会话从
+    /// 库里删掉，拿空 store 去同步等于清空全部历史。
+    #[tokio::test]
+    async fn nothing_is_saved_before_the_sessions_are_loaded() {
+        let dir = temp_dir("load");
+        {
+            let st = AppState::new();
+            st.open_db(&dir);
+            st.sessions_loaded.store(true, Ordering::Relaxed);
+            let mut store = st.chat.write().await;
+            let id = store.create();
+            store.get_mut(&id).unwrap().messages.push(crate::agent::ChatMessage::User("留着".into()));
+            drop(store);
+            st.save_sessions().unwrap();
+        }
+
+        let st = AppState::new();
+        st.open_db(&dir);
+        // 还没 load_sessions：内存是空的，这时落盘必须什么都不做
+        st.save_sessions().unwrap();
+        st.load_sessions();
+        // 后台读完之前，读会话的人排队等，不会看到空列表
+        let store = st.chat.read().await;
+        assert_eq!(store.sessions.len(), 1);
+        assert!(st.sessions_loaded.load(Ordering::Relaxed));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

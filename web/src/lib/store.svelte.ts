@@ -37,6 +37,14 @@ class AgentStore {
    * 未配置 provider 时给个保守默认值。
    */
   capabilities = $state<{ vision: boolean; pdf: boolean }>({ vision: true, pdf: false });
+  /**
+   * 沙箱文件的钥匙：URL 是 `/sandbox/<key>/…`（见 `lib/markdown.ts` 的 `sandboxUrl`）。
+   *
+   * 为什么在路径里：沙箱里生成的网页跑在 opaque origin，带不上我们的 cookie，
+   * 而它的 css/js/图片是相对路径 —— 钥匙放在路径上，子资源自然继承。
+   * 从 `/api/health` 拿（那个接口要凭据，别的 App 拿不到）。
+   */
+  sandboxKey = $state('');
   logs = $state<LogItem[]>([]);
   acks = $state<(Ack & { ts: number })[]>([]);
   /** 当前正在流式接收的助手消息 */
@@ -107,8 +115,10 @@ class AgentStore {
           reasoningEffort?: string | null;
         } | null;
         capabilities?: { vision: boolean; pdf: boolean } | null;
+        sandboxKey?: string;
       };
       this.llm = h.llm ?? null;
+      if (h.sandboxKey) this.sandboxKey = h.sandboxKey;
       this.capabilities = h.capabilities ?? { vision: true, pdf: false };
     } catch {
       // health 失败不影响主流程

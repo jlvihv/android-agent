@@ -103,12 +103,13 @@ pub enum Part {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageUrl {
-    pub url: String,
+    /// 和缓存共享同一份（几 MB 的 base64），见 `imaging::cached_data_url`
+    pub url: std::sync::Arc<str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileData {
-    pub file_data: String,
+    pub file_data: std::sync::Arc<str>,
     pub filename: String,
 }
 

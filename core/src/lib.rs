@@ -163,7 +163,7 @@ impl Core {
         if let Ok(mut g) = self.state.data_dir.write() {
             *g = Some(dir.clone());
         }
-        self.state.load_llm(&dir);
+        // 库里有 provider 配置和访问凭据；会话本身在 serve() 里后台读
         self.state.open_db(&dir);
     }
 
@@ -173,6 +173,7 @@ impl Core {
         // 那是个新的 sandbox 实例）—— 不补这一下，沙箱里的 `agent` 命令
         // 就找不到核心。
         sb.set_agent_port(self.state.port.load(Ordering::Relaxed));
+        sb.set_agent_token(self.state.auth().token);
         if let Err(e) = sb.prepare_rootfs() {
             self.push_log("warn", &format!("准备 rootfs 失败: {e:#}"));
         }
@@ -402,9 +403,14 @@ impl Core {
         let actual = listener.local_addr()?.port();
         self.state.port.store(actual, Ordering::Relaxed);
 
+        // 会话在后台从库里读（不卡 App 启动）。必须在服务起来之前调：
+        // 它先占住会话的写锁，读完之前进来的请求排队等，而不是看到空列表。
+        self.state.load_sessions();
+
         // 沙箱里的 `agent` 命令要靠端口找到核心（见 linux.rs 的 AGENT_CLI）
         if let Some(sb) = self.state.linux() {
             sb.set_agent_port(actual);
+            sb.set_agent_token(self.state.auth().token);
         }
 
         // 后台把常用工具装上（rg/fd/jq/python3…）。幂等：装过就秒退。

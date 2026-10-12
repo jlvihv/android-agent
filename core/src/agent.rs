@@ -677,7 +677,7 @@ fn image_carrier(tool_call_id: &str, img: &ImagePart, supports_images: bool) -> 
         // 走缓存：每一步都要重新组装请求，不能每步都把同一张图重新 base64。
         // 字节仍然逐字一致（文件不变），prompt cache 照命中。
         match crate::imaging::cached_data_url(&img.path, &img.mime) {
-            Ok(url) => parts.push(image_part(&url)),
+            Ok(url) => parts.push(image_part(url)),
             Err(e) => {
                 tracing::warn!("图片读不到了 {}: {e}", img.path);
                 parts.push(text_part("[图片文件已丢失，本轮没能附带]".to_string()));
@@ -699,16 +699,16 @@ fn text_part(text: String) -> Part {
     Part::Text { text }
 }
 
-fn image_part(url: &str) -> Part {
+fn image_part(url: std::sync::Arc<str>) -> Part {
     Part::ImageUrl {
-        image_url: ImageUrl { url: url.to_string() },
+        image_url: ImageUrl { url },
     }
 }
 
-fn file_part(name: &str, data_url: &str) -> Part {
+fn file_part(name: &str, data_url: std::sync::Arc<str>) -> Part {
     Part::File {
         file: FileData {
-            file_data: data_url.to_string(),
+            file_data: data_url,
             filename: name.to_string(),
         },
     }
@@ -749,7 +749,7 @@ fn user_message(
                     continue;
                 }
                 match crate::imaging::cached_data_url(&a.path, &a.mime) {
-                    Ok(url) => parts.push(image_part(&url)),
+                    Ok(url) => parts.push(image_part(url)),
                     Err(e) => {
                         tracing::warn!("附件读不到了 {}: {e}", a.path);
                         parts.push(text_part(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
@@ -765,7 +765,7 @@ fn user_message(
                     continue;
                 }
                 match crate::imaging::cached_data_url(&a.path, &a.mime) {
-                    Ok(url) => parts.push(file_part(&a.name, &url)),
+                    Ok(url) => parts.push(file_part(&a.name, url)),
                     Err(e) => {
                         tracing::warn!("附件读不到了 {}: {e}", a.path);
                         parts.push(text_part(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
@@ -1000,41 +1000,31 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
 
 /// 跑一个用户回合，把 chunk 推到 `tx`。
 ///
-/// `session`：指定写进哪个会话（调试端用 —— 见 `scripts/agentctl.py` 的
-/// `--session`）。`None` = 写当前活动会话，也就是前端的行为。
+/// `sid`：写进哪个会话。`turn`：这个回合的停止开关 —— 由调用方用
+/// `AppState::begin_turn(sid)` 拿到（拿不到说明这个会话已经有回合在跑），
+/// 回合结束时这里负责 `end_turn`。
 pub async fn run_turn(
     core: &Core,
     provider: &Provider,
     user_text: &str,
     attachments: Vec<Attachment>,
-    session: Option<&str>,
+    sid: &str,
+    turn: std::sync::Arc<crate::state::Turn>,
     tx: mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
-    core.state
-        .turn_active
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    // 上一回合的「停止」不能把这一回合也停了
-    core.state
-        .abort_turn
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    let _guard = TurnGuard(core.clone());
+    let _guard = TurnGuard(core.clone(), sid.to_string());
     // 系统提示词可能被 /api/debug/system-prompt 覆盖过，所以不能直接用常量。
     // 在拿会话写锁之前先取出来，避免锁套锁。
     let system_prompt = core.state.system_prompt();
-    let sid = {
+    {
         let mut store = core.state.chat.write().await;
-        // 指定了会话就写它：调试端从 CLI 发消息时不该动用户正在看的那条会话。
-        let sess = match session {
-            Some(id) => match store.get_mut(id) {
-                Some(s) => s,
-                None => anyhow::bail!("没有这个会话: {id}"),
-            },
-            None => store.active_mut(),
+        let Some(sess) = store.get_mut(sid) else {
+            anyhow::bail!("没有这个会话: {sid}");
         };
-        // 历史里只追加两类东西：待补的系统提示词（见 `ensure_system_prompt`）
-        // 和这条用户消息。不插任何“每轮重发”的上下文块。
         // 上一回合被打断（进程被杀）留下的半截工具调用，先补上结果
         close_dangling_tail(sess);
+        // 历史里只追加两类东西：待补的系统提示词（见 `ensure_system_prompt`）
+        // 和这条用户消息。不插任何“每轮重发”的上下文块。
         ensure_system_prompt(sess, &system_prompt);
         // 一条消息装下正文和附件（有附件时才用 `UserFiles`，空附件保持老形状，
         // 前缀不变）。
@@ -1048,10 +1038,9 @@ pub async fn run_turn(
         }
         sess.maybe_title(user_text);
         sess.updated_at = now_ms();
-        sess.id.clone()
-    };
+    }
     core.state.mark_sessions_dirty();
-    drive(core, provider, &sid, &tx).await
+    drive(core, provider, sid, &turn, &tx).await
 }
 
 /// 往本回合所属的会话追加一条消息。
@@ -1070,16 +1059,14 @@ async fn append(core: &Core, sid: &str, m: ChatMessage) {
     core.state.mark_sessions_dirty();
 }
 
-/// 回合结束时清掉 busy 标志。用 Drop 保证任何路径（包括 panic 和
-/// 提前 return）都会清 —— 否则前端会一直显示「运行中」。
-struct TurnGuard(Core);
+/// 回合结束时把这个会话从「进行中」里拿掉。用 Drop 保证任何路径（包括
+/// panic 和提前 return）都会清 —— 否则前端会一直显示「运行中」，这个会话
+/// 也再也发不出消息。
+struct TurnGuard(Core, String);
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
-        self.0
-            .state
-            .turn_active
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.0.state.end_turn(&self.1);
         self.0.state.mark_sessions_dirty();
     }
 }
@@ -1098,6 +1085,7 @@ async fn drive(
     core: &Core,
     provider: &Provider,
     sid: &str,
+    turn: &crate::state::Turn,
     tx: &mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
     let message_id = uuid::Uuid::now_v7().to_string();
@@ -1107,14 +1095,14 @@ async fn drive(
     // 行为。唯一的出口是模型自己不再调工具，或者用户按停止
     //（`POST /api/stop` → `abort_requested`）。
     loop {
-        if core.state.abort_requested() {
+        if turn.abort_requested() {
             send(tx, sse::abort("已停止")).await;
             send(tx, sse::finish()).await;
             return Ok(());
         }
         send(tx, sse::start_step()).await;
 
-        let step_out = match stream_one(core, provider, sid, tx).await {
+        let step_out = match stream_one(core, provider, sid, turn, tx).await {
             Ok(c) => c,
             Err(e) => {
                 send(tx, sse::error(&format!("{e:#}"))).await;
@@ -1154,7 +1142,7 @@ async fn drive(
 
         for (n, call) in calls.iter().enumerate() {
             // 用户按了停止：这一批剩下的工具不再执行
-            if core.state.abort_requested() {
+            if turn.abort_requested() {
                 return stop_with_pending(core, sid, tx, &calls[n..]).await;
             }
             // 工具一律直接执行，没有审批环节。不存在的工具由 execute_tool
@@ -1165,7 +1153,7 @@ async fn drive(
             // 按了停止也要等它自己跑完。
             let outcome = tokio::select! {
                 o = execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))) => o,
-                _ = core.state.aborted() => {
+                _ = turn.aborted() => {
                     return stop_with_pending(core, sid, tx, &calls[n..]).await;
                 }
             };
@@ -1332,16 +1320,16 @@ fn input_text(text: String) -> InputPart {
     InputPart::Text { text }
 }
 
-fn input_image(url: &str) -> InputPart {
+fn input_image(url: std::sync::Arc<str>) -> InputPart {
     InputPart::Image {
-        image_url: url.to_string(),
+        image_url: url,
         detail: "auto".to_string(),
     }
 }
 
-fn input_file(name: &str, data_url: &str) -> InputPart {
+fn input_file(name: &str, data_url: std::sync::Arc<str>) -> InputPart {
     InputPart::File {
-        file_data: data_url.to_string(),
+        file_data: data_url,
         filename: name.to_string(),
     }
 }
@@ -1372,7 +1360,7 @@ fn user_message_content(
                     continue;
                 }
                 match crate::imaging::cached_data_url(&a.path, &a.mime) {
-                    Ok(url) => parts.push(input_image(&url)),
+                    Ok(url) => parts.push(input_image(url)),
                     Err(e) => {
                         tracing::warn!("附件读不到了 {}: {e}", a.path);
                         parts.push(input_text(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
@@ -1388,7 +1376,7 @@ fn user_message_content(
                     continue;
                 }
                 match crate::imaging::cached_data_url(&a.path, &a.mime) {
-                    Ok(url) => parts.push(input_file(&a.name, &url)),
+                    Ok(url) => parts.push(input_file(&a.name, url)),
                     Err(e) => {
                         tracing::warn!("附件读不到了 {}: {e}", a.path);
                         parts.push(input_text(format!("[附件 {} 已丢失，本轮没能附带]", a.name)));
@@ -1408,11 +1396,37 @@ fn tool_output(content: &str, images: &[ImagePart], supports_images: bool) -> To
     let mut parts: Vec<InputPart> = vec![input_text(content.to_string())];
     for img in images {
         match crate::imaging::cached_data_url(&img.path, &img.mime) {
-            Ok(url) => parts.push(input_image(&url)),
+            Ok(url) => parts.push(input_image(url)),
             Err(e) => tracing::warn!("图片读不到了 {}: {e}", img.path),
         }
     }
     ToolOutput::Parts(parts)
+}
+
+/// 这一段历史组请求时要内联的文件：`(路径, mime)`。和 `build_*` 里的取舍一致
+/// （模型不支持的模态不读）。
+fn inline_files(sess: &ChatSession, images: bool, pdfs: bool) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for m in &sess.messages {
+        match m {
+            ChatMessage::UserFiles { attachments, .. } => {
+                for a in attachments {
+                    let want = match a.kind {
+                        AttachmentKind::Image => images,
+                        AttachmentKind::Pdf => pdfs,
+                    };
+                    if want {
+                        out.push((a.path.clone(), a.mime.clone()));
+                    }
+                }
+            }
+            ChatMessage::Tool { images: imgs, .. } if images => {
+                out.extend(imgs.iter().map(|i| (i.path.clone(), i.mime.clone())));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// 调一次 LLM，把 delta 转成 chunk 推出去，返回本轮产出。
@@ -1420,6 +1434,7 @@ async fn stream_one(
     core: &Core,
     provider: &Provider,
     sid: &str,
+    turn: &crate::state::Turn,
     tx: &mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<StepOutput> {
     // 这个模型能不能看图 / 吃 PDF：自动判定（models.dev，带缓存 + 落盘）。
@@ -1432,6 +1447,19 @@ async fn stream_one(
     //
     // 优先 Responses API（见 `ApiStyle`）：端点不支持（404/405）就退回
     // Chat Completions，并记住这个 base_url|model，后面不再白试。
+    // 要内联的图片 / PDF 先在锁外读进缓存（见 `imaging::prewarm`）：
+    // 下面组请求时拿着会话的读锁，那时就全是缓存命中。
+    let files = {
+        let store = core.state.chat.read().await;
+        store
+            .get(sid)
+            .map(|s| inline_files(s, supports_images, supports_files))
+            .unwrap_or_default()
+    };
+    if !files.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || crate::imaging::prewarm(&files)).await;
+    }
+
     let open = async {
     let rx = match provider.transport() {
         Transport::Responses => {
@@ -1505,7 +1533,7 @@ async fn stream_one(
     // 等首包也可能很久（长上下文的预填充），这段也要能停
     let mut rx = tokio::select! {
         r = open => r?,
-        _ = core.state.aborted() => {
+        _ = turn.aborted() => {
             return Ok(StepOutput {
                 content: String::new(),
                 reasoning: String::new(),
@@ -1537,7 +1565,7 @@ async fn stream_one(
                 None => break,
             },
             // 流到一半按停止：已经流出来的留着，剩下的不要了
-            _ = core.state.aborted() => {
+            _ = turn.aborted() => {
                 aborted = true;
                 break;
             }
@@ -2113,14 +2141,16 @@ mod tests {
         p.api_style = crate::llm::ApiStyle::Chat;
 
         let core = Core::new();
+        let sid = core.state.chat.write().await.create();
+        let t = core.state.begin_turn(&sid).unwrap();
         // 能力判定直接给缓存，别让测试去连 models.dev
         *core.state.vision.write().unwrap() = Some((format!("{base}|m"), false));
         *core.state.files.write().unwrap() = Some((format!("{base}|m"), false));
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let turn = {
-            let core = core.clone();
-            tokio::spawn(async move { run_turn(&core, &p, "你好", vec![], None, tx).await })
+            let (core, sid, t) = (core.clone(), sid.clone(), t.clone());
+            tokio::spawn(async move { run_turn(&core, &p, "你好", vec![], &sid, t, tx).await })
         };
         // 等第一段正文到了再按停止
         loop {
@@ -2132,7 +2162,8 @@ mod tests {
                 break;
             }
         }
-        core.state.request_abort();
+        assert!(core.state.is_busy(&sid));
+        assert!(core.state.request_abort(&sid));
 
         tokio::time::timeout(std::time::Duration::from_secs(3), turn)
             .await
@@ -2146,7 +2177,7 @@ mod tests {
             matches!(sess.messages.last(), Some(ChatMessage::Assistant { content, .. }) if content == "想到一半"),
             "已经流出来的那半句要留在历史里"
         );
-        assert!(!core.state.turn_active.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!core.state.is_busy(&sid), "回合结束要把会话从「进行中」里拿掉");
     }
 
     fn call(id: &str) -> RecordedToolCall {

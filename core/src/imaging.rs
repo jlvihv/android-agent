@@ -11,10 +11,10 @@
 //! 上限按 **base64 字符数** 算（4_718_592 ≈ 4.5 MiB），因为发出去的是
 //! `data:` URL；按原始字节能塞下、编码成 base64 后却超了是最容易踩的坑。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Cursor, Read};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
@@ -132,22 +132,50 @@ pub fn data_url(mime: &str, bytes: &[u8]) -> String {
     )
 }
 
-/// data URL 进程内缓存的上限。超了就整个清掉重来（简单，不会无限涨）。
-const URL_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// data URL 进程内缓存的上限（按 base64 后的字节算）。
+///
+/// 原来是 32MB、超了整个清空：一个 32MB 的 PDF 编出来 43MB，**永远放不
+/// 进去**，于是每一步都重新读盘、重新 base64 一遍；图多的会话也会在
+/// 「装满 → 清空 → 重新装」之间来回抖。现在是 LRU：只挤掉最久没用的。
+const URL_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Default)]
 struct UrlCache {
-    map: HashMap<String, String>,
+    map: HashMap<String, Arc<str>>,
+    /// 最近用过的在后面
+    order: VecDeque<String>,
     bytes: usize,
+}
+
+impl UrlCache {
+    fn get(&mut self, path: &str) -> Option<Arc<str>> {
+        let url = self.map.get(path)?.clone();
+        if let Some(i) = self.order.iter().position(|p| p == path) {
+            let k = self.order.remove(i).expect("刚找到的下标");
+            self.order.push_back(k);
+        }
+        Some(url)
+    }
+
+    fn put(&mut self, path: &str, url: Arc<str>) {
+        if url.len() > URL_CACHE_MAX_BYTES || self.map.contains_key(path) {
+            return; // 单个就超上限的不缓存（每次现读），别为它把别的全挤掉
+        }
+        while self.bytes + url.len() > URL_CACHE_MAX_BYTES {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some(u) = self.map.remove(&old) {
+                self.bytes -= u.len();
+            }
+        }
+        self.bytes += url.len();
+        self.order.push_back(path.to_string());
+        self.map.insert(path.to_string(), url);
+    }
 }
 
 fn url_cache() -> &'static Mutex<UrlCache> {
     static C: OnceLock<Mutex<UrlCache>> = OnceLock::new();
-    C.get_or_init(|| {
-        Mutex::new(UrlCache {
-            map: HashMap::new(),
-            bytes: 0,
-        })
-    })
+    C.get_or_init(|| Mutex::new(UrlCache::default()))
 }
 
 /// 读文件 + base64 成 data URL，**带进程内缓存**。
@@ -156,26 +184,35 @@ fn url_cache() -> &'static Mutex<UrlCache> {
 /// 组装成请求，图片也就被重新编码一次。一条带图的会话跑 50 步，同一张图就
 /// 要 base64 50 遍 —— 纯浪费。
 ///
+/// 返回 `Arc<str>`：请求体里直接共享这一份，组装请求不再把几十 MB 的
+/// 字符串拷来拷去。
+///
 /// 缓存是安全的：文件是我们自己写出去的（uuid 文件名，写完不再改）。
-pub fn cached_data_url(path: &str, mime: &str) -> anyhow::Result<String> {
-    if let Ok(cache) = url_cache().lock() {
-        if let Some(url) = cache.map.get(path) {
-            return Ok(url.clone());
-        }
+pub fn cached_data_url(path: &str, mime: &str) -> anyhow::Result<Arc<str>> {
+    if let Some(url) = url_cache().lock().ok().and_then(|mut c| c.get(path)) {
+        return Ok(url);
     }
 
     let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("读取图片失败 {path}: {e}"))?;
-    let url = data_url(mime, &bytes);
+    let url: Arc<str> = data_url(mime, &bytes).into();
 
     if let Ok(mut cache) = url_cache().lock() {
-        if cache.bytes + url.len() > URL_CACHE_MAX_BYTES {
-            cache.map.clear();
-            cache.bytes = 0;
-        }
-        cache.bytes += url.len();
-        cache.map.insert(path.to_string(), url.clone());
+        cache.put(path, url.clone());
     }
     Ok(url)
+}
+
+/// 先把这些文件读进缓存（阻塞 I/O，调用方放进 `spawn_blocking`）。
+///
+/// 组请求时要拿着会话的读锁；第一次用到的图片 / PDF 要读盘 + base64，
+/// 几十 MB 的 PDF 能占住锁几百毫秒，期间别的会话都没法追加消息。
+/// 所以先在锁外把文件备好，组请求时全是缓存命中。
+pub fn prewarm(files: &[(String, String)]) {
+    for (path, mime) in files {
+        if let Err(e) = cached_data_url(path, mime) {
+            tracing::debug!("预读 {path} 失败（组请求时会降级成文字说明）: {e}");
+        }
+    }
 }
 
 fn fits_inline(raw: usize) -> bool {
@@ -310,6 +347,26 @@ fn try_jpeg(img: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_url_cache_evicts_the_least_recently_used_and_skips_giants() {
+        let mut c = UrlCache::default();
+        let third = URL_CACHE_MAX_BYTES / 3;
+        let blob = |n: usize| -> Arc<str> { "x".repeat(n).into() };
+        c.put("a", blob(third));
+        c.put("b", blob(third));
+        c.put("c", blob(third));
+        assert!(c.get("a").is_some()); // a 刚用过，b 变成最久没用的
+        c.put("d", blob(third));
+        assert!(c.get("b").is_none(), "该挤掉最久没用的 b");
+        assert!(c.get("a").is_some() && c.get("c").is_some() && c.get("d").is_some());
+
+        // 一个就超上限的：不缓存，也不能为它把别的全挤掉
+        c.put("huge", blob(URL_CACHE_MAX_BYTES + 1));
+        assert!(c.get("huge").is_none());
+        assert!(c.get("a").is_some());
+        assert!(c.bytes <= URL_CACHE_MAX_BYTES);
+    }
     use image::{Rgb, RgbImage};
 
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {

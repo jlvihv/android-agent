@@ -246,7 +246,12 @@ class MainActivity : Activity() {
             }
         }
 
-        w.loadUrl("http://127.0.0.1:$port")
+        // 先过 /auth：核心种上 HttpOnly cookie，再跳回首页。之后页面的
+        // fetch / WebSocket / <img> 都自动带着凭据，页面里的 JS 也读不到它。
+        val t = AgentApp.token
+        w.loadUrl(
+            if (t != null) "http://127.0.0.1:$port/auth?t=$t" else "http://127.0.0.1:$port",
+        )
         web = w
         return w
     }
@@ -302,19 +307,10 @@ class MainActivity : Activity() {
             }
             REQ_FILE -> {
                 fileCallback = null
+                // 不拿可持久化授权（takePersistableUriPermission）：页面在这次回调里
+                // 就把文件读走、传给核心了，用不着跨重启的权限。原来每选一次就攒
+                // 一条，系统那边的授权表只增不减。
                 val uris = urisFromChooserResult(resultCode, data)
-                // content:// 的读权限只对这次返回有效，但有些选择器（相册/
-                // 文件）会要求显式拿一次可持久权限；拿不到就算了，不报错。
-                uris?.forEach { uri ->
-                    if (uri.scheme == "content") {
-                        runCatching {
-                            contentResolver.takePersistableUriPermission(
-                                uri,
-                                Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                            )
-                        }
-                    }
-                }
                 Log.i(TAG, "文件选择返回 resultCode=$resultCode uris=${uris?.joinToString()}")
                 cb.onReceiveValue(uris)
             }

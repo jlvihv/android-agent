@@ -27,7 +27,14 @@
   import { dismissable, RELEASE } from '../lib/drag';
   import Icon from './Icon.svelte';
 
-  export type Session = { id: string; title: string; active: boolean; count: number };
+  export type Session = {
+    id: string;
+    title: string;
+    active: boolean;
+    count: number;
+    /** 这个会话有回合在跑（可以同时在几个会话里各跑一个） */
+    busy?: boolean;
+  };
   /** 搜索命中（GET /api/search） */
   export type Hit = { id: string; title: string; active: boolean; role: string; snippet: string };
 
@@ -304,7 +311,11 @@
                    {s.active ? 'bg-[#414141]' : ''}"
           >
             <Icon name="chat" size={18} class="shrink-0 text-muted" />
-            <span class="truncate text-base">{s.title}</span>
+            <span class="min-w-0 flex-1 truncate text-base">{s.title}</span>
+            {#if s.busy}
+              <!-- 还在跑：切走了也看得出来 -->
+              <span class="size-1.5 shrink-0 animate-pulse rounded-full bg-warn" aria-label="运行中"></span>
+            {/if}
           </button>
         {/if}
       {/each}

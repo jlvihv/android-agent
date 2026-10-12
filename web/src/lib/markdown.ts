@@ -20,6 +20,8 @@
  *     （服务端按路径直接映射），图片同理。
  */
 
+import { store } from './store.svelte.ts';
+
 export type Span =
   | { t: 'text'; v: string }
   | { t: 'code'; v: string }
@@ -293,7 +295,16 @@ export function mediaKind(url: string): 'image' | 'audio' | 'video' {
 }
 
 /**
- * `sandbox:` → 服务端的 `/sandbox/…` 路径。不是 sandbox 链接返回 null。
+ * 沙箱里的绝对路径 → 服务端的 URL（`/sandbox/<钥匙>/…`，见 `store.sandboxKey`）。
+ *
+ * 在模板里调它会跟踪 `store.sandboxKey`：钥匙到了，链接自己会更新。
+ */
+export function sandboxPath(guestPath: string): string {
+  return `/sandbox/${store.sandboxKey}${encodeURI(guestPath)}`;
+}
+
+/**
+ * `sandbox:` → 服务端的 `/sandbox/<钥匙>/…` 路径。不是 sandbox 链接返回 null。
  *
  * 宽松接受几种写法：`sandbox:/root/a.html`、`sandbox:///root/a.html`、
  * `sandbox:a.html`（相对路径按 /workspace 算，和沙箱里的 cwd 一致）。
@@ -312,7 +323,7 @@ export function sandboxUrl(href: string): string | null {
   } catch {
     /* 已经是编码好的或者有坏的 %，原样用 */
   }
-  return '/sandbox' + encodeURI(decoded) + tail;
+  return sandboxPath(decoded) + tail;
 }
 
 export function inline(src: string): Span[] {

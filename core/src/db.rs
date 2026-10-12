@@ -57,9 +57,32 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
 
 struct Inner {
     conn: Connection,
-    /// session_id -> 已经落盘的消息条数（水位线）。
-    /// 有它才能只追加新增的那些，而不是每次全量重写。
-    saved: HashMap<String, usize>,
+    /// session_id -> 上次落盘时的样子。
+    /// 有它才能只追加新增的消息、只更新改过的会话，而不是每次全量重写。
+    saved: HashMap<String, Saved>,
+    /// 上次落盘时的活动会话
+    saved_active: Option<String>,
+}
+
+/// 一个会话上次落盘时的状态。和内存里一样就整条跳过（不发任何 SQL）。
+#[derive(Clone, PartialEq)]
+struct Saved {
+    /// 已经落盘的消息条数（水位线）
+    len: usize,
+    updated_at: u64,
+    title: String,
+    provider_session: String,
+}
+
+impl Saved {
+    fn of(s: &ChatSession) -> Self {
+        Self {
+            len: s.messages.len(),
+            updated_at: s.updated_at,
+            title: s.title.clone(),
+            provider_session: s.provider_session.clone(),
+        }
+    }
 }
 
 pub struct Db {
@@ -77,6 +100,7 @@ impl Db {
             inner: Mutex::new(Inner {
                 conn,
                 saved: HashMap::new(),
+                saved_active: None,
             }),
         })
     }
@@ -89,6 +113,7 @@ impl Db {
             inner: Mutex::new(Inner {
                 conn,
                 saved: HashMap::new(),
+                saved_active: None,
             }),
         })
     }
@@ -99,6 +124,13 @@ impl Db {
 
         // 查询期间只借用 &*g；结束后才动 g.saved。
         // 不分开的话「借用 (*g).conn」和「可变借用 (*g).saved」会打架。
+        // 增量落盘只认识读进内存的会话：库里那些不会被读出来的行（空会话、
+        // 没有会话头的孤儿消息）以后就没人删了，读之前先清掉。
+        g.conn.execute_batch(
+            "DELETE FROM sessions WHERE id NOT IN (SELECT DISTINCT session_id FROM messages);
+             DELETE FROM messages WHERE session_id NOT IN (SELECT id FROM sessions);",
+        )?;
+
         let store = {
             let g = &*g;
             let mut store = SessionStore::default();
@@ -155,28 +187,47 @@ impl Db {
             store
         };
 
-        // 水位线 = 刚读出来的条数，这样下次 sync 只追加新增的
+        // 水位线 = 刚读出来的样子，这样下次 sync 只写新增的
         g.saved.clear();
         for s in &store.sessions {
-            g.saved.insert(s.id.clone(), s.messages.len());
+            g.saved.insert(s.id.clone(), Saved::of(s));
         }
+        g.saved_active = Some(store.active.clone());
 
         Ok(store)
     }
 
-    /// 增量落盘。每 2 秒被定时器调一次。
+    /// 增量落盘。每 2 秒被定时器调一次（有改动时）。
     ///
-    /// 只追加 `messages[saved_count..]` —— 这是用 SQLite 而不是 JSON 的
-    /// 全部意义所在。
+    /// 只写改过的：没变的会话一条 SQL 都不发；变了的只追加
+    /// `messages[水位线..]` —— 这是用 SQLite 而不是 JSON 的全部意义所在。
+    /// 原来每次都给**每个**会话发一条 UPSERT，再拼一条 `NOT IN (全部 id)`，
+    /// 会话一多，每 2 秒都在白写。
     pub fn sync(&self, store: &SessionStore) -> Result<()> {
         let mut g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
-        let saved = g.saved.clone();
 
-        let tx = g.conn.transaction()?;
-        // 空会话不落盘（也把它上次可能写进去的旧行清掉，见下面的 alive）：
+        // 空会话不落盘（也把它上次可能写进去的旧行清掉，见下面的 gone）：
         // 「新对话」点了没说话、或 `/api/reset` 清空过，重启后不该又冒出来。
         let keep: Vec<&ChatSession> = store.sessions.iter().filter(|s| s.has_content()).collect();
-        for s in &keep {
+        let changed: Vec<&ChatSession> = keep
+            .iter()
+            .copied()
+            .filter(|s| g.saved.get(&s.id) != Some(&Saved::of(s)))
+            .collect();
+        let gone: Vec<String> = g
+            .saved
+            .keys()
+            .filter(|id| !keep.iter().any(|s| &s.id == *id))
+            .cloned()
+            .collect();
+        let active_changed = g.saved_active.as_deref() != Some(store.active.as_str());
+        if changed.is_empty() && gone.is_empty() && !active_changed {
+            return Ok(());
+        }
+
+        let saved = g.saved.clone();
+        let tx = g.conn.transaction()?;
+        for s in &changed {
             tx.execute(
                 "INSERT INTO sessions(id, title, created_at, updated_at, provider_session)
                  VALUES(?1, ?2, ?3, ?4, ?5)
@@ -193,7 +244,7 @@ impl Db {
                 ],
             )?;
 
-            let mut done = saved.get(&s.id).copied().unwrap_or(0);
+            let mut done = saved.get(&s.id).map(|x| x.len).unwrap_or(0);
             // 会话被清空过（/api/reset）：消息变少了。不处理的话 done 还停在
             // 旧长度，新消息的 seq 从 0 开始会被 skip(done) 全部跳过不落盘，
             // 而库里的旧消息还在 —— 重启后清掉的对话又回来了。
@@ -212,43 +263,64 @@ impl Db {
             }
         }
 
-        // 已经删掉的会话（以及空会话），连带消息一起清
-        let alive: Vec<&str> = keep.iter().map(|s| s.id.as_str()).collect();
-        if alive.is_empty() {
-            tx.execute("DELETE FROM sessions", [])?;
-            tx.execute("DELETE FROM messages", [])?;
-        } else {
-            let list = alive
-                .iter()
-                .map(|id| format!("'{}'", id.replace('\'', "''")))
-                .collect::<Vec<_>>()
-                .join(",");
-            tx.execute(&format!("DELETE FROM sessions WHERE id NOT IN ({list})"), [])?;
-            tx.execute(&format!("DELETE FROM messages WHERE session_id NOT IN ({list})"), [])?;
+        // 删掉的会话（以及变空的会话），连带消息一起清
+        for id in &gone {
+            tx.execute("DELETE FROM messages WHERE session_id = ?1", [id])?;
+            tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         }
 
-        tx.execute(
-            "INSERT INTO meta(k, v) VALUES('active', ?1)
-             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            [&store.active],
-        )?;
+        if active_changed {
+            tx.execute(
+                "INSERT INTO meta(k, v) VALUES('active', ?1)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                [&store.active],
+            )?;
+        }
         tx.commit()?;
 
-        for s in &keep {
-            g.saved.insert(s.id.clone(), s.messages.len());
+        for s in &changed {
+            g.saved.insert(s.id.clone(), Saved::of(s));
         }
-        // 清掉已经不存在的会话（含空会话）的水位线
-        g.saved.retain(|id, _| keep.iter().any(|s| &s.id == id));
+        for id in &gone {
+            g.saved.remove(id);
+        }
+        g.saved_active = Some(store.active.clone());
+        Ok(())
+    }
 
+    /// 读一条设置（`meta` 表）。provider 配置、访问凭据都在这里。
+    pub fn get_meta(&self, k: &str) -> Result<Option<String>> {
+        let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let v = g
+            .conn
+            .query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get::<_, String>(0));
+        match v {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 写一条设置。单条 UPSERT，原子的。
+    pub fn set_meta(&self, k: &str, v: &str) -> Result<()> {
+        let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        g.conn.execute(
+            "INSERT INTO meta(k, v) VALUES(?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            [k, v],
+        )?;
         Ok(())
     }
 
     /// 清空全部会话（`/api/reset` 之外的重置用）
+    ///
+    /// 只清会话：`meta` 里还有 provider 配置和访问凭据，不能跟着没了。
     pub fn wipe(&self) -> Result<()> {
-        let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let mut g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
         g.conn.execute_batch(
-            "DELETE FROM sessions; DELETE FROM messages; DELETE FROM meta;",
+            "DELETE FROM sessions; DELETE FROM messages; DELETE FROM meta WHERE k = 'active';",
         )?;
+        g.saved.clear();
+        g.saved_active = None;
         Ok(())
     }
 }
@@ -259,6 +331,29 @@ impl Db {
 mod tests {
     use super::*;
     use crate::agent::RecordedToolCall;
+
+    /// 增量落盘：只改了标题（重命名不动 updated_at）也得写进去；
+    /// 删掉的会话要从库里清掉；清会话不能把 meta 里的配置一起清了。
+    #[test]
+    fn incremental_sync_catches_renames_deletes_and_keeps_settings() {
+        let db = Db::in_memory().unwrap();
+        db.set_meta("llm", "{}").unwrap();
+        let mut st = store_with(2, 3);
+        db.sync(&st).unwrap();
+
+        let (a, b) = (st.sessions[0].id.clone(), st.sessions[1].id.clone());
+        st.get_mut(&a).unwrap().title = "改过的名字".into();
+        st.delete(&b);
+        db.sync(&st).unwrap();
+
+        let back = db.load().unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].title, "改过的名字");
+
+        db.wipe().unwrap();
+        assert!(db.load().unwrap().sessions.is_empty());
+        assert_eq!(db.get_meta("llm").unwrap().as_deref(), Some("{}"), "provider 配置不该跟着会话一起清掉");
+    }
 
     fn msg_user(t: &str) -> ChatMessage {
         ChatMessage::User(t.into())

@@ -438,7 +438,8 @@ dev_shell 'uname -m'
 ```
 
 安卓上 App **不继承 shell 环境变量**，所以 LLM 配置走运行时接口
-`POST /api/llm`，并持久化到 `<filesDir>/llm.json`。
+`POST /api/llm`，存进 `sessions.db` 的 `meta` 表（`llm` 那一行；老版本的
+`llm.json` 启动时自动迁进来，然后删掉文件）。
 
 模型能不能看图不靠人配：`GET /api/models` 拉 provider 的 `/models` 清单，
 再查 models.dev 目录（缓存 48h）里该模型的 `modalities.input`，自动得出。
@@ -461,7 +462,7 @@ dev_shell 'uname -m'
    现在 `.so` **7.06 MB**（比之前大是因为加了 `image` 解码器），release APK **7.1 MB**。
    再省就得砍 `image` 的 webp/gif/bmp（~0.3MB）或绕过 reqwest 的
    `rustls-platform-verifier`（~0.1MB）。
-4. **API key 明文存在 `<filesDir>/llm.json`。** 受 Android 沙箱保护，
+4. **API key 明文存在 `sessions.db`（`meta` 表）里。** 受 Android 沙箱保护，
    但下一步应该用 Android Keystore 加密。
 5. **没有 Web 端的设置界面。** 目前只能用 `curl POST /api/llm` 配置。
    现在有 `GET /api/models`（带能否看图）+ `POST /api/model`，接一个

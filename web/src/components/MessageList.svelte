@@ -13,6 +13,7 @@
    */
   import { tick } from 'svelte';
   import type { Message, ToolPart } from '../lib/sse';
+  import { sandboxPath } from '../lib/markdown';
   import Icon from './Icon.svelte';
   import Markdown from './Markdown.svelte';
   import Sheet from './Sheet.svelte';
@@ -481,7 +482,7 @@
             {#if res.image}
               <!-- read 读到的图：直接展示原图（沙箱路由），模型看的是缩放后的那份 -->
               <img
-                src={`/sandbox${encodeURI(res.image)}`}
+                src={sandboxPath(res.image)}
                 alt="工具返回的图片"
                 class="max-h-80 w-auto self-start rounded-xl bg-hairline-soft object-contain"
               />

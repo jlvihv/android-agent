@@ -120,6 +120,13 @@ impl AgentCore {
         Ok(p)
     }
 
+    /// 本地 API 的凭据。WebView 要先打开 `/auth?t=<它>` 种上 cookie，
+    /// 之后 `/api/…` 才放行（见 `state::Auth`）。`setup_linux` 之后才有值
+    /// （它在会话库里，库是那时打开的）。
+    pub fn token(&self) -> Option<String> {
+        self.core.state.auth().token
+    }
+
     pub fn port(&self) -> u16 {
         self.core.port()
     }
@@ -145,7 +152,7 @@ impl AgentCore {
     ///   APK 安装器解压到可执行目录）
     /// - `rootfs` = `<filesDir>/alpine-rootfs`
     pub fn setup_linux(&self, env: AndroidEnv) -> Result<(), CoreError> {
-        // 顺便把持久化目录告诉核心，它会从 llm.json 恢复 provider
+        // 顺便把持久化目录告诉核心：它打开会话库，读出 provider 配置和凭据
         self.core
             .set_data_dir(std::path::PathBuf::from(&env.files_dir));
         let rootfs = std::path::Path::new(&env.files_dir).join("alpine-rootfs");

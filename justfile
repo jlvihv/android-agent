@@ -112,6 +112,7 @@ doctor *ARGS:
     #!/usr/bin/env bash
     set -eu
     base=$(scripts/phone-forward.sh)
+    export AGENT_TOKEN=$(scripts/phone-token.sh)
     python3 scripts/agentctl.py --base "$base" --doctor "$@"
 
 # 对着**手机上**跑着的核心说话
@@ -122,6 +123,7 @@ phone *ARGS:
     #!/usr/bin/env bash
     set -eu
     base=$(scripts/phone-forward.sh)
+    export AGENT_TOKEN=$(scripts/phone-token.sh)
     python3 scripts/agentctl.py --base "$base" "$@"
 
 # 把手机上的界面开到桌面浏览器
@@ -132,8 +134,10 @@ open:
     #!/usr/bin/env bash
     set -eu
     base=$(scripts/phone-forward.sh)
+    # 先过 /auth 种上 cookie（核心的 /api 要凭据），它会跳回首页
+    url="$base/auth?t=$(scripts/phone-token.sh)"
     echo "$base"
-    (xdg-open "$base" >/dev/null 2>&1 || open "$base" >/dev/null 2>&1 || true) &
+    (xdg-open "$url" >/dev/null 2>&1 || open "$url" >/dev/null 2>&1 || true) &
 
 # --- 桌面沙箱 --------------------------------------------------------------
 

@@ -19,19 +19,38 @@
   import { viewer } from './lib/viewer.svelte.ts';
 
   let input = $state('');
+  /** 当前看着的这个会话，本地正连着它的流。 */
   let busy = $state(false);
-  /** 服务端还在跑。App 切到后台时 agent 不停，切回来靠它判断"还在进行中"。 */
+  /** 服务端说当前会话还在跑。App 切到后台、或者从别的会话切回来时，
+   *  本地没连着流，靠它判断"还在进行中"（然后轮询）。 */
   let serverBusy = $state(false);
   let messages = $state<Message[]>([]);
   let sessions = $state<Session[]>([]);
-  let controller: AbortController | null = null;
+
+  /**
+   * 本地正连着的那条流。**只属于当前看着的会话**。
+   *
+   * 可以同时在几个会话里各跑一个回合（服务端按会话记）。切走的时候只是把
+   * 本地这条流断开（`detach`），服务端那个回合照跑；切回来靠轮询看进度。
+   */
+  type Run = { controller: AbortController };
+  let live: Run | null = null;
+
+  /** 不看这个会话了：断开本地的流，**不**停服务端的回合。 */
+  function detach() {
+    const r = live;
+    if (!r) return;
+    live = null;
+    busy = false;
+    r.controller.abort();
+  }
 
   /**
    * 点了「新对话」、但第一句还没发出去。
    *
    * 这时服务端**还没有**这个会话 —— 不这样就会变成：连点五次「新对话」，
    * 抽屉里多出五条「新对话」空记录。所以它只是一个本地意图，
-   * 跟着第一句话一起发给服务端（`/api/chat` 的 `fresh`）。
+   * 第一句话发出去之前才在服务端建（见 `ensureSession`）。
    */
   let fresh = $state(false);
 
@@ -138,7 +157,8 @@
   }
 
   function newSession() {
-    // **不请求服务端**：新会话到第一句话才建（`POST /api/chat` 的 fresh），
+    detach();
+    // **不请求服务端**：新会话到第一句话才建（`ensureSession`），
     // 这里只把本地视图清空 —— 点了不发就不会攒出一堆空会话。
     fresh = true;
     rev = '';
@@ -148,6 +168,7 @@
   }
 
   async function switchSession(id: string) {
+    detach();
     await fetch('/api/sessions/activate', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -170,6 +191,7 @@
   }
 
   async function deleteSession(id: string) {
+    if (id === sessionId) detach();
     await fetch('/api/sessions/delete', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -239,28 +261,45 @@
   // —— 对话 ——
 
   async function run(msg: Message, path: string, body: unknown) {
+    const me: Run = { controller: new AbortController() };
+    live = me;
     busy = true;
-    controller = new AbortController();
     try {
-      await consume(msg, streamFrom(path, body, controller.signal));
+      await consume(msg, streamFrom(path, body, me.controller.signal));
     } catch (e) {
-      if (!controller?.signal.aborted) msg.parts.push({ type: 'error', text: String(e) });
+      if (!me.controller.signal.aborted) msg.parts.push({ type: 'error', text: String(e) });
     } finally {
       msg.done = true;
-      busy = false;
-      controller = null;
+      // 已经被 detach（切走了）、或者后面又开了一条：别把别人的状态清掉
+      if (live === me) {
+        live = null;
+        busy = false;
+      }
       void loadSessions();
     }
   }
 
-  function send(attachments: Upload[]) {
+  /** 新会话到第一句话才在服务端建（点了「新对话」不发就不留痕）。 */
+  async function ensureSession(): Promise<string | null> {
+    if (!fresh && sessionId) return sessionId;
+    try {
+      const r = await fetch('/api/sessions', { method: 'POST' });
+      if (!r.ok) return null;
+      const { id } = (await r.json()) as { id: string };
+      fresh = false;
+      sessionId = id;
+      rev = '';
+      return id;
+    } catch {
+      return null;
+    }
+  }
+
+  async function send(attachments: Upload[]) {
     const text = input.trim();
-    // serverBusy：从后台切回来时本地没连着流，但服务端那个回合还在跑。
-    // 这时再发一条，服务端会回 409（一次只跑一个回合）。
+    // serverBusy：本地没连着流（从后台 / 别的会话切回来），但这个会话的回合
+    // 还在跑。这时再发一条，服务端会回 409（一个会话同时只跑一个回合）。
     if ((!text && attachments.length === 0) || busy || serverBusy) return;
-    // 第一句发出去的时候才告诉服务端「开新会话」（fresh 是个一次性意图）
-    const startFresh = fresh;
-    fresh = false;
     input = '';
 
     // 附件先作为 part 拼进本地气泡（和 session_view 恢复出来的形状一致）——
@@ -284,9 +323,18 @@
     });
     const msg = store.beginStreaming();
     messages.push(msg);
+    busy = true; // 建会话那一下也算在跑：别让人连点两次
+    const sid = await ensureSession();
+    if (!sid) {
+      busy = false;
+      msg.parts.push({ type: 'error', text: '建会话失败，再试一次' });
+      msg.done = true;
+      return;
+    }
     void run(msg, '/api/chat', {
       text,
-      fresh: startFresh,
+      // 明确写进哪个会话：回合在后台跑着时用户可能已经切走了
+      session: sid,
       attachments: attachments.map((a) => a.id),
     });
   }
@@ -294,10 +342,19 @@
   const stop = () => {
     // 服务端循环看不到 SSE 断连（tx.send 失败会被忽略），得显式告诉它停。
     // 否则前端显示停了，agent 还在后台一轮轮跑工具、烧 token。
-    void fetch('/api/stop', { method: 'POST' });
-    controller?.abort();
-    // 没连着流（从后台回来）时按的停止：马上拉一次，「运行中」尽快消失
-    if (!controller) setTimeout(() => void loadMessages(), 300);
+    // 只停**这个**会话的回合：别的会话在跑的不受影响。
+    void fetch('/api/stop', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(sessionId ? { session: sessionId } : {}),
+    });
+    const r = live;
+    live = null;
+    busy = false;
+    r?.controller.abort();
+    // 本地流断了，服务端收尾（补上「已停止」的工具结果）的那几条要拉回来；
+    // 没连着流时按的停止也一样：马上拉一次，「运行中」尽快消失
+    setTimeout(() => void loadMessages(), 300);
   };
 </script>
 

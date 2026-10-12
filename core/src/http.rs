@@ -54,11 +54,98 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/reset", post(reset))
         .route("/api/device/log", post(device_log))
         .route("/api/ws", get(ws_upgrade))
-        .route("/sandbox", get(sandbox_root))
-        .route("/sandbox/", get(sandbox_root))
-        .route("/sandbox/{*path}", get(sandbox_file))
+        .route("/auth", get(auth_login))
+        .route("/sandbox/{key}", get(sandbox_root))
+        .route("/sandbox/{key}/", get(sandbox_root))
+        .route("/sandbox/{key}/{*path}", get(sandbox_file))
         .fallback(crate::assets::serve)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
+// 鉴权
+// ---------------------------------------------------------------------------
+//
+// 威胁：手机上**任何**有网络权限的 App 都能连 127.0.0.1，扫一遍端口就能
+// 找到核心，然后 `/api/linux` 在沙箱里跑命令 —— 沙箱挂着整个内部存储。
+// 所以 `/api/*` 一律要凭据（见 `state::Auth`）：
+//
+// - App 的 WebView：Kotlin 打开 `/auth?t=<token>`，这里种一个 HttpOnly
+//   cookie 再跳回 `/`。之后 fetch / WebSocket / <img> 都自动带上，前端
+//   一行代码不用改；页面里的 JS（包括沙箱 iframe）也读不到它。
+// - 沙箱里的 `agent` 命令、电脑上的调试脚本：`x-agent-token` 头。
+//
+// 前端的静态资源（`/`、js、css）不设防：那是公开的代码，不含任何秘密。
+
+const AUTH_COOKIE: &str = "agent_token";
+const AUTH_HEADER: &str = "x-agent-token";
+
+/// 两个字符串是否相等，耗时和内容无关（别让比较的快慢泄露 token 的前缀）。
+fn same_secret(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// 请求里带的凭据：先看头，再看 cookie。
+fn presented_token(headers: &HeaderMap) -> Option<&str> {
+    if let Some(v) = headers.get(AUTH_HEADER).and_then(|v| v.to_str().ok()) {
+        return Some(v);
+    }
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == AUTH_COOKIE)
+        .map(|(_, v)| v)
+}
+
+async fn require_auth(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // 沙箱文件在 handler 里核对路径上的钥匙；静态资源和 /auth 本身不设防
+    if !req.uri().path().starts_with("/api/") {
+        return next.run(req).await;
+    }
+    let Some(token) = st.auth().token else {
+        return next.run(req).await; // 桌面开发没设 AGENT_TOKEN
+    };
+    match presented_token(req.headers()) {
+        Some(t) if same_secret(t, &token) => next.run(req).await,
+        _ => (StatusCode::UNAUTHORIZED, "需要凭据").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AuthQuery {
+    #[serde(default)]
+    t: String,
+}
+
+/// `GET /auth?t=<token>` → 种 cookie，跳回首页。App 启动时 Kotlin 打开的就是它。
+///
+/// 跳转是为了让地址栏里不留 token（WebView 的历史、页面的 `location` 都看不到）。
+async fn auth_login(State(st): State<Arc<AppState>>, Query(q): Query<AuthQuery>) -> Response {
+    let ok = match st.auth().token {
+        Some(token) => same_secret(&q.t, &token),
+        None => true,
+    };
+    if !ok {
+        return (StatusCode::FORBIDDEN, "凭据不对").into_response();
+    }
+    let mut res = axum::response::Redirect::to("/").into_response();
+    if let Some(token) = st.auth().token {
+        // SameSite=Strict：别的网站发来的请求（手机浏览器里的随便一个网页）
+        // 不带它。没有 Max-Age：会话 cookie，App 每次启动都会重新种。
+        let c = format!("{AUTH_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict");
+        if let Ok(v) = HeaderValue::from_str(&c) {
+            res.headers_mut().insert(header::SET_COOKIE, v);
+        }
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +183,9 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         })),
         // 界面靠它决定要不要显示「文件」那个附件入口
         "capabilities": capabilities,
+        // 沙箱文件的 URL 前缀要它（`/sandbox/<key>/…`）。这个接口本身要凭据，
+        // 所以只有 App 自己的页面拿得到。
+        "sandboxKey": st.auth().sandbox_key,
     }))
 }
 
@@ -230,20 +320,41 @@ struct ChatBody {
 /// 配了 provider 就跑真实 agent loop（`agent.rs`），否则回退到脚本演示流。
 /// 两种情况下**输出格式完全一致**，所以前端不需要知道区别。
 async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Response {
-    // 一次只跑一个回合。`turn_active` / `abort_turn` 都是全局的：两个回合
-    // 并行时，后一个开头会把前一个的「停止」清掉，先结束的那个又会把
-    // 「进行中」清掉 —— 界面以为跑完了，另一个还在后台烧 token。
-    // 从后台切回来、本地没连着流的时候最容易撞上。
-    if st.turn_active.load(std::sync::atomic::Ordering::Relaxed) && !body.demo {
-        return (StatusCode::CONFLICT, "上一个回合还在运行，先停止它或等它结束").into_response();
-    }
+    // 运行时配置优先（安卓），回退环境变量（桌面）
+    let provider = if body.demo {
+        None
+    } else {
+        st.llm().or_else(Provider::from_env)
+    };
 
+    // 写进哪个会话：指定的 > 新开一个 > 当前活动的。
+    //
     // 「新对话」的第一句：会话到这一刻才建（前端点按钮时只清空了视图）。
-    // 指定了 session（调试端）就不动这个。
-    if body.fresh && body.session.is_none() {
+    // 前端现在会先 `POST /api/sessions` 拿到 id 再发，`fresh` 留给老客户端。
+    let sid = {
         let mut store = st.chat.write().await;
-        store.create();
-    }
+        match &body.session {
+            Some(id) if store.get(id).is_some() => id.clone(),
+            Some(id) => {
+                return (StatusCode::NOT_FOUND, format!("没有这个会话: {id}")).into_response()
+            }
+            None if body.fresh => store.create(),
+            None => store.active_mut().id.clone(),
+        }
+    };
+
+    // 一个会话同时只跑一个回合（两个回合往同一段历史里交错追加就乱了）；
+    // 不同会话可以各跑各的。
+    let turn = match &provider {
+        Some(_) => match st.begin_turn(&sid) {
+            Some(t) => Some(t),
+            None => {
+                return (StatusCode::CONFLICT, "这个会话还有回合在运行，先停止它或等它结束")
+                    .into_response()
+            }
+        },
+        None => None,
+    };
 
     // 取出这条消息带的附件。刚从上传接口存进来的，按 id 取走（取走就从
     // pending 里消失，同一份附件不会被两条消息重复引用）。
@@ -257,11 +368,13 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
             match pending.remove(id) {
                 Some(a) => attachments.push(a),
                 None => {
+                    drop(pending);
+                    st.end_turn(&sid);
                     return (
                         StatusCode::BAD_REQUEST,
                         format!("附件已失效（{id}），请重新添加"),
                     )
-                        .into_response()
+                        .into_response();
                 }
             }
         }
@@ -272,33 +385,22 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
         state: st.clone(),
     };
 
-    // 运行时配置优先（安卓），回退环境变量（桌面）
-    let provider = if body.demo {
-        None
-    } else {
-        st.llm().or_else(Provider::from_env)
-    };
-
-    match provider {
-        Some(p) => {
-            // 上面那次检查和这里之间可能挤进来另一个请求：这里才是真正占位
-            //（`run_turn` 的 TurnGuard 负责放开）
-            if st.turn_active.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                return (StatusCode::CONFLICT, "上一个回合还在运行，先停止它或等它结束")
-                    .into_response();
-            }
+    match provider.zip(turn) {
+        Some((p, turn)) => {
             st.log(
                 "info",
                 format!("chat → {} / {}", p.name, p.model),
             );
             tokio::spawn(async move {
                 let txc = tx.clone();
+                // `run_turn` 的 TurnGuard 负责 end_turn
                 let r = crate::agent::run_turn(
                     &core,
                     &p,
                     &body.text,
                     attachments,
-                    body.session.as_deref(),
+                    &sid,
+                    turn,
                     txc,
                 )
                 .await;
@@ -415,8 +517,7 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
     if let Some(e) = body.reasoning_effort {
         p.reasoning_effort = crate::llm::normalize_effort(&e);
     }
-    let dir = st.data_dir.read().ok().and_then(|g| g.clone());
-    st.set_llm(p.clone(), dir.as_deref());
+    st.set_llm(p.clone());
     // 自动判定这个模型能不能吃图片 / PDF（查 models.dev），结果落盘。
     // 不劳烦用户配 —— 这是模型自己的属性。
     let vision = st.supports_images_for(&p).await;
@@ -432,10 +533,26 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
 ///
 /// agent loop 没有轮数上限，前端那个「停止」按钮必须真的把服务端循环停下来，
 /// 而不只是断开 SSE（循环看不到断连，会继续跑、继续烧 token）。
-async fn stop_turn(State(st): State<Arc<AppState>>) -> Response {
-    st.request_abort();
-    st.log("info", "用户请求停止当前回合");
-    Json(json!({ "ok": true })).into_response()
+async fn stop_turn(State(st): State<Arc<AppState>>, body: Option<Json<StopBody>>) -> Response {
+    // 不指定会话 = 当前活动会话（老客户端 / 调试脚本）
+    let sid = match body.and_then(|Json(b)| b.session) {
+        Some(id) => id,
+        None => match st.chat.read().await.active_ref() {
+            Some(s) => s.id.clone(),
+            None => return Json(json!({ "ok": true, "running": false })).into_response(),
+        },
+    };
+    let running = st.request_abort(&sid);
+    if running {
+        st.log("info", "用户请求停止回合");
+    }
+    Json(json!({ "ok": true, "running": running })).into_response()
+}
+
+#[derive(Deserialize)]
+struct StopBody {
+    #[serde(default)]
+    session: Option<String>,
 }
 
 /// `GET /api/models` → 当前 provider 的模型清单（带 vision 判定）。
@@ -542,8 +659,7 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
     if let Some(e) = body.reasoning_effort {
         p.reasoning_effort = crate::llm::normalize_effort(&e);
     }
-    let dir = st.data_dir.read().ok().and_then(|g| g.clone());
-    st.set_llm(p.clone(), dir.as_deref());
+    st.set_llm(p.clone());
     let vision = st.supports_images_for(&p).await;
     let pdf = st.supports_files_for(&p).await;
     st.rotate_provider_sessions().await;
@@ -569,14 +685,19 @@ async fn get_session(
     State(st): State<Arc<AppState>>,
     Query(q): Query<SessionQuery>,
 ) -> impl IntoResponse {
-    let busy = st.turn_active.load(std::sync::atomic::Ordering::Relaxed);
-
     // 读锁一直持到拼完 —— rev 和它对应的那份 messages 必须来自同一个瞬间，
     // 不然客户端会存下一个「对不上的 rev」，之后就永远以为自己是最新的。
     let store = st.chat.read().await;
-    let Some(sess) = store.active_ref() else {
-        return Json(json!({ "messages": [], "rev": "", "busy": busy }));
+    // 不指定 = 当前活动会话（界面）；调试脚本指定自己那条调试会话
+    let sess = match q.id.as_deref() {
+        Some(id) => store.get(id),
+        None => store.active_ref(),
     };
+    let Some(sess) = sess else {
+        return Json(json!({ "messages": [], "rev": "", "busy": false }));
+    };
+    // 「进行中」看的是**这个**会话：别的会话在跑不影响这里发消息
+    let busy = st.is_busy(&sess.id);
     let rev = session_rev(sess);
     if !q.rev.is_empty() && q.rev == rev {
         return Json(json!({ "unchanged": true, "rev": rev, "busy": busy }));
@@ -639,6 +760,9 @@ struct SessionQuery {
     /// 客户端上次拿到的版本号。空 = 全量要一份。
     #[serde(default)]
     rev: String,
+    /// 要哪个会话。不给 = 当前活动会话。
+    #[serde(default)]
+    id: Option<String>,
 }
 
 /// 会话版本号。**只看元数据，不碰消息内容**，所以便宜。
@@ -682,7 +806,7 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "port": st.port.load(std::sync::atomic::Ordering::Relaxed),
         "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),
         "device": st.device().map(|d| d.name()),
-        "turnActive": st.turn_active.load(std::sync::atomic::Ordering::Relaxed),
+        "busySessions": st.busy_sessions(),
         "sessions": sessions,
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
@@ -816,8 +940,16 @@ async fn debug_set_system_prompt(
 
 /// `GET /api/sessions` → 侧边栏的「最近对话」列表
 async fn list_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let busy = st.busy_sessions();
     let store = st.chat.read().await;
-    Json(json!({ "sessions": store.list() }))
+    let mut list = store.list();
+    drop(store);
+    // 抽屉里给正在跑的会话打个点：切走了也知道它还在干活
+    for s in &mut list {
+        let running = s["id"].as_str().is_some_and(|id| busy.iter().any(|b| b == id));
+        s["busy"] = json!(running);
+    }
+    Json(json!({ "sessions": list }))
 }
 
 /// `GET /api/search?q=…` → 跨会话搜消息正文。
@@ -998,23 +1130,34 @@ fn is_loopback_origin(origin: &str) -> bool {
 // 读不到 /api/*、连不上 WebSocket（见 ws_upgrade 的 Origin 检查），
 // 只能看。路径越界和符号链接逃逸由 LinuxSandbox::resolve_path 挡。
 
-async fn sandbox_root(State(st): State<Arc<AppState>>) -> Response {
-    serve_sandbox(&st, "/workspace/", true, None).await
+/// 路径上的沙箱钥匙对不对（见 `state::Auth`）。不对一律 404，不说为什么。
+fn sandbox_key_ok(st: &AppState, key: &str) -> bool {
+    same_secret(key, &st.auth().sandbox_key)
+}
+
+async fn sandbox_root(State(st): State<Arc<AppState>>, UrlPath(key): UrlPath<String>) -> Response {
+    if !sandbox_key_ok(&st, &key) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    serve_sandbox(&st, &key, "/workspace/", true, None).await
 }
 
 async fn sandbox_file(
     State(st): State<Arc<AppState>>,
-    UrlPath(path): UrlPath<String>,
+    UrlPath((key, path)): UrlPath<(String, String)>,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    if !sandbox_key_ok(&st, &key) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // 目录要带结尾斜杠，否则页面里的相对链接会解析到上一级
     let trailing = uri.path().ends_with('/');
     let range = headers
         .get(axum::http::header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    serve_sandbox(&st, &format!("/{path}"), trailing, range).await
+    serve_sandbox(&st, &key, &format!("/{path}"), trailing, range).await
 }
 
 /// 沙箱文件的 Content-Type。
@@ -1126,6 +1269,7 @@ fn sandbox_headers(res: &mut Response, mime: &str) {
 
 async fn serve_sandbox(
     st: &Arc<AppState>,
+    key: &str,
     guest: &str,
     trailing: bool,
     range: Option<String>,
@@ -1151,7 +1295,7 @@ async fn serve_sandbox(
 
     if meta.is_dir() {
         if !trailing {
-            let to = format!("/sandbox{}/", guest.trim_end_matches('/'));
+            let to = format!("/sandbox/{key}{}/", guest.trim_end_matches('/'));
             return axum::response::Redirect::to(&to).into_response();
         }
         let index = host.join("index.html");
@@ -1394,6 +1538,122 @@ fn cmd_name(c: &Command) -> &'static str {
 mod tests {
     use super::{is_loopback_origin, parse_range, parse_rev, session_rev};
     use crate::agent::{ChatMessage, ChatSession};
+
+    /// 起一个真的核心服务，返回 (base, 不跟随跳转的 client)。
+    async fn serve(st: std::sync::Arc<crate::state::AppState>) -> (String, reqwest::Client) {
+        crate::llm::install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, super::router(st)).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        (format!("http://{addr}"), client)
+    }
+
+    /// 手机上别的 App 能连 127.0.0.1：没凭据的请求一律挡在 `/api` 外面。
+    #[tokio::test]
+    async fn the_api_needs_a_token_and_the_app_gets_it_as_a_cookie() {
+        let st = crate::state::AppState::new();
+        st.set_token(Some("s3cret".into()));
+        let key = st.auth().sandbox_key;
+        let (base, c) = serve(st).await;
+
+        let status = |r: reqwest::Response| r.status().as_u16();
+        assert_eq!(status(c.get(format!("{base}/api/health")).send().await.unwrap()), 401);
+        assert_eq!(
+            status(c.post(format!("{base}/api/linux")).body("{}").send().await.unwrap()),
+            401,
+            "跑命令的接口尤其不能裸奔"
+        );
+        assert_eq!(
+            status(c.get(format!("{base}/api/health")).header("x-agent-token", "wrong").send().await.unwrap()),
+            401
+        );
+
+        // 沙箱里的 agent 命令 / 调试脚本：带头
+        let h: serde_json::Value = c
+            .get(format!("{base}/api/health"))
+            .header("x-agent-token", "s3cret")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(h["sandboxKey"], key.as_str());
+
+        // App 的 WebView：/auth 种 cookie，再跳回首页
+        assert_eq!(status(c.get(format!("{base}/auth?t=nope")).send().await.unwrap()), 403);
+        let r = c.get(format!("{base}/auth?t=s3cret")).send().await.unwrap();
+        assert!(r.status().is_redirection());
+        assert_eq!(r.headers()["location"], "/", "地址栏里不该留着 token");
+        let cookie = r.headers()["set-cookie"].to_str().unwrap().to_string();
+        assert!(cookie.starts_with("agent_token=s3cret;"), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "页面里的 JS 不该读得到它");
+        let pair = cookie.split(';').next().unwrap();
+        assert_eq!(
+            status(c.get(format!("{base}/api/sessions")).header("cookie", pair).send().await.unwrap()),
+            200
+        );
+
+        // 前端的静态资源不设防
+        assert_ne!(status(c.get(format!("{base}/")).send().await.unwrap()), 401);
+
+        // 沙箱文件看路径上的钥匙：错的就是没有（这里没起沙箱，对的钥匙会走到「沙箱没起来」）
+        assert_eq!(status(c.get(format!("{base}/sandbox/wrong/workspace/a.txt")).send().await.unwrap()), 404);
+        assert_eq!(
+            status(c.get(format!("{base}/sandbox/{key}/workspace/a.txt")).send().await.unwrap()),
+            503
+        );
+    }
+
+    /// 不同会话可以各跑一个回合；同一个会话不行。
+    #[tokio::test]
+    async fn a_busy_session_refuses_a_second_turn_but_others_do_not_care() {
+        let st = crate::state::AppState::new();
+        *st.llm.write().unwrap() = Some(crate::llm::Provider::compatible("x", "http://127.0.0.1:9", "m", "k"));
+        let (a, b) = {
+            let mut store = st.chat.write().await;
+            (store.create(), store.create())
+        };
+        let _running = st.begin_turn(&a).unwrap();
+        let (base, c) = serve(st.clone()).await;
+
+        let r = c
+            .post(format!("{base}/api/chat"))
+            .json(&serde_json::json!({ "text": "再来", "session": a }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 409);
+
+        // b 不受 a 影响：能开始（provider 是个连不上的地址，回合会以报错结束）
+        let r = c
+            .post(format!("{base}/api/chat"))
+            .json(&serde_json::json!({ "text": "你好", "session": b }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let _ = r.text().await; // 等这个回合结束
+        assert!(st.is_busy(&a), "b 的回合结束不能把 a 的「进行中」清掉");
+        assert!(!st.is_busy(&b));
+
+        // 停 b（没在跑）不影响 a
+        let r: serde_json::Value = c
+            .post(format!("{base}/api/stop"))
+            .json(&serde_json::json!({ "session": b }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r["running"], false);
+        assert!(!_running.abort_requested());
+    }
 
     #[test]
     fn range_header_parsing() {

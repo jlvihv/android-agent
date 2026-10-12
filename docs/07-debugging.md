@@ -67,6 +67,23 @@ base=$(scripts/phone-forward.sh)   # → http://127.0.0.1:18787
 
 `HOST_PORT=9000` 可以改。设备侧那个随机端口怎么找，见下。
 
+### 核心的接口要凭据
+
+手机上任何有网络权限的 App 都能连 127.0.0.1，扫一遍端口就能找到核心、调
+`/api/linux` 在沙箱里跑命令（沙箱挂着整个内部存储）。所以 `/api/*` 一律要凭据
+（`core/src/state.rs` 的 `Auth`）：
+
+- App 的 WebView：Kotlin 先打开 `/auth?t=<token>`，核心种一个 HttpOnly cookie
+  再跳回首页。页面的 JS 读不到它。
+- 沙箱里的 `agent` 命令：环境变量 `AGENT_TOKEN`，走 `x-agent-token` 头。
+- 电脑上的脚本：`scripts/phone-token.sh` 拿（debug 包 `run-as` 读 `files/token`，
+  release 包看 logcat 里的 `agent token: …`）。`just phone` / `just doctor` /
+  `just open` 已经自己拿了；Vite 对着真机开发时 `AGENT_TOKEN=$(scripts/phone-token.sh)`。
+- 沙箱文件走 `/sandbox/<sandboxKey>/…`：另一把钥匙（`/api/health` 里有），只能读沙箱文件。
+
+凭据存在 `sessions.db` 里，跨重启不变。桌面的 `agent-dev` 默认不设防，
+设了 `AGENT_TOKEN` 就和手机上一样。
+
 ### 核心的端口是随机分的，怎么找
 
 核心 `bind 0` 让系统分配端口（硬编码端口在真机上可能被别的 App 占）。四种找法，
@@ -252,7 +269,7 @@ cd core && cargo run -q --example dump_prompt
 | 命令 | 作用 |
 |---|---|
 | `/bash <命令>` | 在沙箱里直接跑（走 `/api/linux`，和 `bash` 工具同一条路） |
-| `/cat <沙箱路径>` | 看沙箱里的文件（走 `/sandbox/…`，和给用户看的链接同一条路） |
+| `/cat <沙箱路径>` | 看沙箱里的文件（走 `/sandbox/<key>/…`，和给用户看的链接同一条路） |
 | `/dev {"type":"key","name":"back"}` | 直接发设备指令 |
 | `/state` | 服务端状态 |
 | `/new` `/use <id>` `/sessions` `/clear` | 会话管理 |

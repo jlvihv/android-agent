@@ -199,6 +199,8 @@ pub struct LinuxSandbox {
     /// 核心 HTTP 服务的端口。`agent` 命令靠它找到「自己」（见 `AGENT_CLI`）。
     /// 0 = 还不知道（核心还没 bind），这时不注入环境变量。
     agent_port: AtomicU16,
+    /// 核心接口的凭据（`AGENT_TOKEN`）。见 `state::Auth`。
+    agent_token: std::sync::RwLock<Option<String>>,
 }
 
 /// 沙箱里的 `agent` 命令。
@@ -236,6 +238,8 @@ if [ -z "$BASE" ] || [ "$BASE" = "http://127.0.0.1:" ]; then
   echo "AGENT_PORT 没设 —— 不是在 agent 的 bash 里跑？" >&2
   exit 1
 fi
+# 核心的接口要凭据（手机上别的 App 也能连 127.0.0.1）。App 通过环境变量给。
+AUTH="x-agent-token: ${AGENT_TOKEN:-}"
 
 # 「改自己身份」的接口不从这儿走：别让网页里的一段话把 agent 自己改了。
 guard() {
@@ -250,12 +254,12 @@ guard() {
 
 get() {
   guard "$1"
-  wget -q -T 120 -O - "$BASE$1" || { echo "GET $1 失败" >&2; exit 1; }
+  wget -q -T 120 -O - --header "$AUTH" "$BASE$1" || { echo "GET $1 失败" >&2; exit 1; }
 }
 
 post() {
   guard "$1"
-  wget -q -T 120 -O - --header 'content-type: application/json' --post-data "$2" "$BASE$1" \
+  wget -q -T 120 -O - --header "$AUTH" --header 'content-type: application/json' --post-data "$2" "$BASE$1" \
     || { echo "POST $1 失败" >&2; exit 1; }
 }
 
@@ -437,12 +441,20 @@ impl LinuxSandbox {
         Self {
             cfg,
             agent_port: AtomicU16::new(0),
+            agent_token: std::sync::RwLock::new(None),
         }
     }
 
     /// 核心 bind 成功后告诉沙箱自己的端口 —— 沙箱里的 `agent` 命令要靠它。
     pub fn set_agent_port(&self, port: u16) {
         self.agent_port.store(port, Ordering::Relaxed);
+    }
+
+    /// 沙箱里的 `agent` 命令调核心接口要带的凭据。
+    pub fn set_agent_token(&self, token: Option<String>) {
+        if let Ok(mut g) = self.agent_token.write() {
+            *g = token;
+        }
     }
 
     /// rootfs 齐了吗（安卓上解压是后台做的，之前只是个空壳）。
@@ -686,6 +698,9 @@ impl LinuxSandbox {
         if port != 0 {
             env.insert("AGENT_PORT".into(), port.to_string());
             env.insert("AGENT_BASE".into(), format!("http://127.0.0.1:{port}"));
+        }
+        if let Some(t) = self.agent_token.read().ok().and_then(|g| g.clone()) {
+            env.insert("AGENT_TOKEN".into(), t);
         }
 
         // 给 guest 程序用的临时目录

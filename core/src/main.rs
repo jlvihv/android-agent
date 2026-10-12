@@ -20,11 +20,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(8787);
 
     let core = agent_core::Core::with_mock();
+    // 桌面上默认不设防（只有自己在用）；设了 AGENT_TOKEN 就和手机上一样要凭据
+    let token = std::env::var("AGENT_TOKEN").ok().filter(|t| !t.is_empty());
+    core.state.set_token(token.clone());
     let actual = core.serve(port).await.context("启动 HTTP 服务失败")?;
 
     println!();
     println!("  android-agent core v{}", agent_core::VERSION);
-    println!("  → http://127.0.0.1:{actual}");
+    match &token {
+        Some(t) => println!("  → http://127.0.0.1:{actual}/auth?t={t}"),
+        None => println!("  → http://127.0.0.1:{actual}"),
+    }
     println!("  （mock 设备已启用；Ctrl-C 退出）");
     println!();
 

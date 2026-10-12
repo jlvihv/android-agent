@@ -106,9 +106,16 @@ pub enum InputPart {
     #[serde(rename = "input_text")]
     Text { text: String },
     #[serde(rename = "input_image")]
-    Image { image_url: String, detail: String },
+    Image {
+        /// 和缓存共享同一份（见 `imaging::cached_data_url`）
+        image_url: std::sync::Arc<str>,
+        detail: String,
+    },
     #[serde(rename = "input_file")]
-    File { file_data: String, filename: String },
+    File {
+        file_data: std::sync::Arc<str>,
+        filename: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
