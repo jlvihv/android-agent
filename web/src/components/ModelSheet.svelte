@@ -223,7 +223,7 @@
           <!-- 模型提供商：切到第二页，选看哪家的模型 -->
           <button
             onclick={() => openSub('providers')}
-            class="flex w-full items-center gap-3 rounded-2xl bg-bubble px-4 py-3.5 text-left
+            class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left
                    active:bg-control"
           >
             <span class="shrink-0 text-[17px]">模型提供商</span>
@@ -234,21 +234,25 @@
           </button>
 
           <!-- 模型清单：自己滚，别把下面那块顶出屏幕 -->
+          <!-- 卡片语言照 Claude 的「选择模型」面板实测：面板底色是 ink（#151515），
+               卡片是 surface（#20201f），行之间是 **2px 的面板色** —— 不是 1px 的
+               hairline，那 2px 实测就是 #151515，看着像「行之间有缝」。
+               卡片自己的内边距是 14px（px-3.5）。 -->
           <div
             bind:this={scroller}
-            class="max-h-[42dvh] overflow-y-auto overscroll-contain rounded-2xl bg-bubble"
+            class="max-h-[42dvh] overflow-y-auto overscroll-contain rounded-2xl bg-surface"
           >
             {#if !models.loaded}
-              <p class="px-4 py-3.5 text-base text-muted">载入中…</p>
+              <p class="px-3.5 py-4 text-base text-muted">载入中…</p>
             {:else if !shown}
               <!-- 一家都没配：直接带去设置页 -->
-              <button onclick={onconfig} class="flex w-full flex-col gap-0.5 px-4 py-3.5 text-left active:bg-control">
+              <button onclick={onconfig} class="flex w-full flex-col gap-0.5 px-3.5 py-4 text-left active:bg-control">
                 <span class="text-[17px]">还没有配置模型提供商</span>
                 <span class="text-meta text-accent">去设置里填一个 API Key</span>
               </button>
             {:else}
               {#if shown.error}
-                <p class="border-b border-hairline px-4 py-3 text-meta leading-relaxed text-bad">
+                <p class="border-b-2 border-ink px-3.5 py-3 text-meta leading-relaxed text-bad">
                   拉不到模型：{shown.error}
                 </p>
               {/if}
@@ -257,12 +261,12 @@
                   data-current={isCurrent(shown, m) ? '1' : undefined}
                   onclick={() => pickModel(shown, m)}
                   disabled={busy}
-                  class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
+                  class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                          text-left last:border-b-0 active:bg-control"
                 >
                   <span class="min-w-0 flex-1 truncate text-[17px]">{m.name}</span>
                   {#if isCurrent(shown, m)}
-                    <Icon name="check" size={17} class="shrink-0 text-fg" />
+                    <Icon name="check" size={17} class="shrink-0 text-accent" />
                   {/if}
                 </button>
               {/each}
@@ -272,7 +276,7 @@
           <!-- 思考强度：切到第二页 -->
           <button
             onclick={() => openSub('effort')}
-            class="flex w-full items-center rounded-2xl bg-bubble px-4 py-3.5 text-left
+            class="flex w-full items-center rounded-2xl bg-surface px-3.5 py-4 text-left
                    active:bg-control"
           >
             <span class="text-[17px]">思考强度</span>
@@ -290,11 +294,11 @@
           {#if sub === 'providers'}
             <!-- 只列配好了 Key 的几家；加新的去设置页 -->
             {#if models.groups.length > 0}
-              <div class="overflow-hidden rounded-2xl bg-bubble">
+              <div class="overflow-hidden rounded-2xl bg-surface">
                 {#each models.groups as g (g.id)}
                   <button
                     onclick={() => view(g.id)}
-                    class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
+                    class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                            text-left last:border-b-0 active:bg-control"
                   >
                     <span class="min-w-0 flex-1">
@@ -304,7 +308,7 @@
                       </span>
                     </span>
                     {#if g.id === shown?.id}
-                      <Icon name="check" size={17} class="shrink-0 text-fg" />
+                      <Icon name="check" size={17} class="shrink-0 text-accent" />
                     {/if}
                   </button>
                 {/each}
@@ -313,24 +317,24 @@
 
             <button
               onclick={onconfig}
-              class="flex w-full items-center gap-3 rounded-2xl bg-bubble px-4 py-3.5 text-left
+              class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left
                      active:bg-control"
             >
               <span class="text-[17px]">管理模型提供商</span>
               <Icon name="chevron" size={16} class="ml-auto shrink-0 text-muted" />
             </button>
           {:else}
-            <div class="overflow-hidden rounded-2xl bg-bubble">
+            <div class="overflow-hidden rounded-2xl bg-surface">
               {#each EFFORTS as e (e.label)}
                 <button
                   onclick={() => pickEffort(e.value)}
                   disabled={busy}
-                  class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
+                  class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                          text-left last:border-b-0 active:bg-control"
                 >
                   <span class="min-w-0 flex-1 truncate text-[17px]">{e.label}</span>
                   {#if e.value === effort}
-                    <Icon name="check" size={17} class="shrink-0 text-fg" />
+                    <Icon name="check" size={17} class="shrink-0 text-accent" />
                   {/if}
                 </button>
               {/each}

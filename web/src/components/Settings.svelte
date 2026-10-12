@@ -63,11 +63,11 @@
 
 <Page title="设置" {onclose}>
   <h2 class="px-1 pt-2 pb-2 text-meta text-muted">模型提供商</h2>
-  <div class="overflow-hidden rounded-2xl bg-bubble">
+  <div class="overflow-hidden rounded-2xl bg-surface">
     {#each rows as p (p.id)}
       <button
         onclick={() => (open = p)}
-        class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5 text-left
+        class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left
                last:border-b-0 active:bg-control"
       >
         <span class="min-w-0 flex-1">

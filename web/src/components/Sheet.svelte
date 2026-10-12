@@ -2,11 +2,15 @@
   /**
    * 底部弹出面板（覆盖层）。一次只装**一个**东西 —— 一段思考，或一次工具调用。
    *
-   * 尺寸按 Claude 的「摘要」面板实测（1080×2424 @420dpi → 411×923 css）：
-   *   全宽贴底，上圆角 22，底色 #20201f（正好是已有的 --color-surface）
+   * 尺寸按 Claude 的「选择模型」面板实测（1080×2424 @420dpi → 411×923 css）：
+   *   全宽贴底，上圆角 **rounded-4xl（32px）**。实测 Claude 是 43px（对整条弧
+   *   最小二乘拟合，RMS 残差 0.6px）—— 不追像素对齐，取刻度里最接近的一档
+   *   底色 **#151515**（= --color-ink，和页面底色同一个值）—— 面板是靠遮罩把页面
+   *   压暗才「浮」起来的，不是自己变亮；里面的卡片才是 #20201f（= --color-surface）
    *   遮罩：页面底色 #151515 被压到 #0e0e0e ≈ 35% 黑
    *   抓手 36×5 居中，距面板顶 5.3
    *   标题 17px 半粗居中，头部下面没有分隔线
+   *   左右内边距 **12px**（卡片距屏幕边 12；卡片自己的内边距是 14px）
    *
    * 没有关闭按钮：往下拉、点遮罩、按返回键都能关。
    *
@@ -174,7 +178,7 @@
   style:transform="translateY({p * 100}%)"
   style:transition={dragging ? 'none' : RELEASE}
   class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[75dvh] {minClass} flex-col
-         rounded-t-card bg-surface pt-1 will-change-transform"
+         rounded-t-4xl bg-ink pt-1 will-change-transform"
 >
   <div class="shrink-0">
     <div class="mx-auto h-1.5 w-9 rounded-full bg-control"></div>
@@ -197,7 +201,7 @@
   </div>
 
   <div
-    class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
+    class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] selectable"
   >
     {@render children()}
   </div>

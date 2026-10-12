@@ -25,10 +25,10 @@
 </script>
 
 <Sheet title="添加到会话" {onclose} minClass="min-h-0">
-  <div class="flex gap-2.5">
+  <div class="flex gap-3">
     <button
       onclick={() => onpick('camera')}
-      class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-bubble py-5
+      class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
              text-sm text-fg active:opacity-80"
     >
       <span class="grid size-11 place-items-center rounded-full bg-control">
@@ -39,7 +39,7 @@
 
     <button
       onclick={() => onpick('photo')}
-      class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-bubble py-5
+      class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
              text-sm text-fg active:opacity-80"
     >
       <span class="grid size-11 place-items-center rounded-full bg-control">
@@ -52,7 +52,7 @@
     {#if store.capabilities.pdf}
       <button
         onclick={() => onpick('file')}
-        class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-bubble py-5
+        class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
                text-sm text-fg active:opacity-80"
       >
         <span class="grid size-11 place-items-center rounded-full bg-control">

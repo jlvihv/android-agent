@@ -79,7 +79,7 @@
           autocorrect="off"
           spellcheck="false"
           inputmode="url"
-          class="rounded-2xl bg-bubble px-4 py-3.5 text-[17px] outline-none placeholder:text-faint"
+          class="rounded-2xl bg-surface px-4 py-3.5 text-[17px] outline-none placeholder:text-faint"
         />
         <span class="px-1 text-meta text-faint">任何 OpenAI 兼容的端点：Ollama、中转站、公司网关…</span>
       </label>
@@ -95,7 +95,7 @@
         autocorrect="off"
         spellcheck="false"
         onkeydown={(e) => e.key === 'Enter' && save()}
-        class="rounded-2xl bg-bubble px-4 py-3.5 text-[17px] outline-none placeholder:text-faint"
+        class="rounded-2xl bg-surface px-4 py-3.5 text-[17px] outline-none placeholder:text-faint"
       />
       {#if provider.keyUrl}
         <!-- 外链：WebView 会把它交给系统浏览器（MainActivity.shouldOverrideUrlLoading） -->

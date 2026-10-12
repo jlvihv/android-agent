@@ -28,7 +28,10 @@
   --color-ok: #7fb37f;
   --color-warn: #d9b87f;
   --color-bad: #d98a8a;
-  --color-accent: #5fa564;
+  /* 选中 / 链接。实测 Claude「选择模型」面板里的勾选和脚注链接都是这个蓝
+     （#6da7ec）—— 原来是绿，只有“连接正常”那个状态点在用；那个改用 --color-ok，
+     语义上也更对（绿 = 状态，蓝 = 可点/已选）。 */
+  --color-accent: #6da7ec;
 
   /* 只有三档圆角 */
   --radius-card: 22px;

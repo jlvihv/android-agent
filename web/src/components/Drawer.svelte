@@ -342,7 +342,7 @@
         aria-hidden="true"
         title={store.device?.name ?? '未连接设备'}
         class="absolute right-0.5 bottom-0.5 size-2.5 rounded-full ring-2 ring-[#111]
-               {store.device?.connected ? 'bg-accent' : 'bg-faint'}"
+               {store.device?.connected ? 'bg-ok' : 'bg-faint'}"
       ></span>
     </button>
 
