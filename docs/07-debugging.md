@@ -106,6 +106,41 @@ adb shell cat /proc/net/tcp | awk -v u="$uid" '$4=="0A" && $8==u && $2 ~ /^01000
 
 ---
 
+## 1b. 模拟器：UI 验收别动用户的手机
+
+```sh
+just emu start     # 起（无窗口，KVM 加速；20 秒开机）
+just emu wait      # 等开机完成
+just emu-install   # 装 **debug** 包（WebView DevTools + run-as 都开着）
+just emu stop
+```
+
+AVD 是 `agent-x86`（1080×2400 / density 420 / 4G RAM）。为什么要它：
+
+- **真机是无线调试**：手机一睡、用户一用、VPN 一抖，链路就掉，`adb devices`
+  还会卡在 mdns 发现上。要连得上就用 `adb connect <ip>:<port>` 直连
+  （端口可以 `adb mdns services` 问，或 `just wifi`）。
+- **不能在用户正用手机时拿 `input tap` 去戳屏幕** —— 有一次盲戳坐标直接把用户
+  切到了 X。UI 验收（面板、手势、截图）必须在自己的设备上。
+
+### 两个必须知道的坑
+
+**① 沙箱在模拟器上跑不了。** proot 和 Alpine rootfs 都是 aarch64 的
+（`android-assets` 从 OpenMinis 拷的就是 arm64），x86_64 上 exec 不了。
+`/api/linux` 会干净地返回 503 + `No such file or directory`（不崩）。
+所以模拟器能验：**UI / 浏览器 / 搜索 / LLM / 会话库**；不能验：bash / edit / read。
+
+**② DNS 必须指到局域网 DNS。** 宿主机上跑着 Clash（TUN + **fake-IP**）：任何
+走隧道出去的 :53 都被它接管，域名全解析成 `198.18.x.x`。`ping` 无所谓（Clash
+自己会映射），但 **Chromium 会拒掉这类地址**（非公网可路由），WebView 直接
+`ERR_NAME_NOT_RESOLVED`；换成系统 DoT 也没用 —— Chromium 用自带的 AsyncDns，
+绕过系统解析。所以 `scripts/emu.sh` 里固定加了
+`-dns-server ${AGENT_EMU_DNS:-192.168.0.1}`（局域网 DNS，拿真实 IP；流量照旧
+走 Clash 出去）。换网络时改这个变量。
+
+顺带：模拟器上 `input tap` 的坐标是**设备像素**，位置别写死 —— 先 `screencap`
+看一眼，或者优先用 `am start --ez <键> true` 这种自带的口子（看板就有一个）。
+
 ## 2. 什么能在电脑上调，什么必须在手机上
 
 | 功能 | 从电脑上 | 怎么做 |

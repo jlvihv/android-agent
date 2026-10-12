@@ -46,9 +46,17 @@ case "${1:-status}" in
     #   软件绘制 —— 两样都不需要窗口。
     # -gpu swiftshader_indirect：host 上没有能用的 GL，软渲染最稳。
     # -no-snapshot-save：每次干净启动（省得把上次的脏状态带进验收）。
+    # -dns-server：**必须指到局域网 DNS**，不能让它用宿主机那份。
+    #   宿主机上跑着 Clash（TUN + fake-IP），任何走隧道出去的 :53 都被它接管，
+    #   域名全部解析成 198.18.x.x。ping 无所谓，但 **Chromium 会拒掉这类地址**
+    #   （非公网可路由），WebView 直接 ERR_NAME_NOT_RESOLVED —— 而 Chromium 用
+    #   的是自带的 AsyncDns，绕过系统的 DoT。指到局域网 DNS 就拿到真实 IP，
+    #   然后流量照旧走 Clash 出去。
+    #   换网络时改 AGENT_EMU_DNS。
     nohup "$EMU" -avd "$AVD" -port "$PORT" \
       -no-window -no-audio -no-boot-anim -no-snapshot-save \
       -gpu swiftshader_indirect -netdelay none -netspeed full \
+      -dns-server "${AGENT_EMU_DNS:-192.168.0.1}" \
       >/tmp/agent-emu.log 2>&1 &
     say "后台起来了（日志 /tmp/agent-emu.log），等开机用：scripts/emu.sh wait"
     ;;

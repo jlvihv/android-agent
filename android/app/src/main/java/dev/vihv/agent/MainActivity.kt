@@ -177,11 +177,20 @@ class MainActivity : Activity() {
                 View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
         }
         // 深色背景 → 状态栏图标保持亮色。默认就是这个，显式写一下防止被系统改。
+        //
+        // ⚠️ 必须包起来：`window.insetsController` 在 **decor view 还没建出来**时
+        // 会 NPE —— 不是返回 null，而是它内部 `mDecor.getWindowInsetsController()`
+        // 直接抛（PhoneWindow.getInsetsController），所以 `?.` 拦不住。
+        // 实测 API 35 模拟器上 onCreate 里调到这行就崩、**整个进程跟着死**
+        // （真机 API 36 上碰巧没崩，所以一直没发现）。
+        // 它只管图标亮不亮，崩掉不值得。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.insetsController?.setSystemBarsAppearance(
-                0,
-                android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS,
-            )
+            runCatching {
+                window.insetsController?.setSystemBarsAppearance(
+                    0,
+                    android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS,
+                )
+            }.onFailure { Log.w(TAG, "设置状态栏外观失败（decor 还没建好？）", it) }
         }
     }
 
