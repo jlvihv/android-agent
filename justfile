@@ -66,6 +66,28 @@ web-build:
 web-check:
     cd {{web}} && bun run check
 
+# --- 前端 DOM 审计 --------------------------------------------------------
+#
+# 用**真实渲染树**找「多余的 HTML 层级」。全本地：假 LLM（受控内容）+ 一个独立的核心
+# 实例 + vite + headless Chrome —— 不碰手机、不碰 adb、不花 token。
+#
+# 判据两道：静态筛候选（只有一个子元素、无自有文字、盒子与子元素完全重合、无视觉副作用），
+# 再对每个做**拔掉测试**（改成 display:contents 后比对整页每个元素的盒子）。
+#
+# 为什么不能只读源码：静态看着「盒子完全重合」的层，可能是父级 flex 的 item（被拉伸）、
+# 或者子元素靠它的 flex-1 撑宽 —— 删了就变（实测 359 → 335.5px）。
+#
+#   just dom-audit                  # 全量（会话区 + 各个面板）
+#   just dom-audit --no-panels      # 只看会话区
+#   just dom-audit --snapshot /tmp/a.json   # 导几何快照
+#   just dom-audit --diff /tmp/a.json       # 改完前端验证「布局一个像素都没动」
+#
+# 细节见 docs/07-debugging.md。
+dom-audit *ARGS:
+    #!/usr/bin/env bash
+    set -eu
+    scripts/dom-audit.sh "$@"
+
 # --- 对着真机调试 ----------------------------------------------------------
 #
 # 核心是个只听 127.0.0.1 的 HTTP 服务，所以 adb forward 一下就能从电脑驱动它。

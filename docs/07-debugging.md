@@ -117,7 +117,7 @@ adb shell cat /proc/net/tcp | awk -v u="$uid" '$4=="0A" && $8==u && $2 ~ /^01000
 | 系统提示词迭代 | ✅ | `/prompt …` |
 | 看模型将看到什么 | ✅ | `/request` |
 | 会话 / 持久化 | ✅ | `/sessions`，或 `run-as … cat files/sessions.db` 拉下来看 |
-| 前端界面 | ✅ | `just open` → 桌面浏览器 + 真 DevTools |
+| 前端界面 | ✅ | `just open` → 桌面浏览器 + 真 DevTools；审 DOM 层级用 `just dom-audit`（§11） |
 | 模型查看/操作自己 | ✅ | 沙箱里的 `agent` 命令（见 §8） |
 | 改 Rust / 装包 | ⚠️ 要重装 | `just android-install` |
 | 无障碍服务开关、存储权限 | ❌ | 只能在手机屏幕上点 |
@@ -368,3 +368,69 @@ python3 openssl`（约 75MB，只在首次下载）。细节和三个坑（apk �
 `POST /api/llm`（可以改 base_url 和 key）本来就是更大的面，所以调试接口没有
 引入新的信任假设 —— 但如果以后要把核心做成给别人装的 App，这一整块
 （`/api/llm` + `/api/debug/*`）都该加个 token。
+
+---
+
+## 11. 审前端 DOM：`just dom-audit`
+
+找「多余的 HTML 层级」不用读源码猜 —— 用**真实渲染树**测。全本地，不碰手机、不花 token：
+
+```sh
+just dom-audit                  # 全量：会话区 + 各个面板
+just dom-audit --no-panels      # 只看会话区
+```
+
+它起四个进程（跑完自动收，端口自动挑空闲的 —— dev 机器上常年躺着别人家的 5173）：
+
+| 进程 | 端口 | 干什么 |
+|---|---|---|
+| 假 LLM | 8790 | `scripts/fixture-llm.ts`：给界面提供**受控内容**（先发一个真 `bash` 工具调用，再回一段 Markdown 夹具） |
+| 核心 | 8791 | 独立实例，LLM 走 `AGENT_LLM_*` 环境变量（**只在内存里**，不读不写你的 sessions.db，也不动 8787 那个） |
+| vite | 5173+ | 代理 `/api` 到核心；**改前端源码不用重编 Rust** |
+| Chrome | 9222 | headless + CDP，被审的就是它这份渲染树 |
+
+判据两道：
+
+1. **静态筛候选**：只有一个元素子节点、没有自有文字、盒子与子元素**完全重合**、不是滚动容器、
+   计算样式里没有任何有视觉或层叠上下文副作用的属性。
+2. **拔掉测试**：把候选的 `display` 改成 `contents`（这一层不再产生盒子），比对**整页每个元素**
+   的盒子 —— 一个像素都没动，才算真多余。
+
+第二道不能省：静态看着「完全重合」的层，可能是父级 flex 的 item（被拉伸），或者子元素靠它的
+`flex-1` 撑宽 —— 删了就变。实测：Markdown 列表项里那层 `div.flex.min-w-0.flex-1` 静态上完全
+重合，拔掉后段落宽度 359 → 335.5px。**只有动态测能分辨。**
+
+### 报告是「候选」，不是判决书
+
+拔掉测试只对**当前状态**有效，而且它只看几何。下面三类它看不见，动手删之前必须回源码确认：
+
+- 只承载**可继承**样式的层（font-size / color / leading）—— `display:contents` 不丢继承。
+- 只当 JS 钩子的层（`bind:this` / `bind:clientWidth`）—— 比如 ThoughtLine 那两层 span。
+- **语义必需**的层（`li` / `tr` / `td`）—— 几何上透明，但删了 DOM 就不合法。
+
+反过来也一样：这一屏里惰性的层，换个内容可能就有用了（`#app` 那个 div 就时灵时不灵）。
+
+### 改完前端，验证「布局一个像素都没动」
+
+```sh
+just dom-audit --snapshot /tmp/before.json   # 改之前
+# …改代码…
+just dom-audit --diff /tmp/before.json       # 改之后
+```
+
+快照按**文字**做锚点，不是按元素序号：删掉一层冗余 div，后面元素的下标会整体移一位，
+按序号比全是假阳性；而冗余层自己没有文字，进不了快照，真正该在位的段落/列表项/按钮都带文字。
+
+### 坑（踩过的）
+
+- **别用核心自带的脚本化演示流审界面**（`POST /api/chat {"demo":true}`）：那条路**不落库**，
+  而前端在流结束后会用服务端的会话视图覆盖本地消息（`loadMessages`）—— 演示内容会被立刻
+  冲掉，界面回到空态。它只验协议链路。夹具要发**真的**工具调用，走真实 agent loop。
+- **判据里不要看 `border*Style` / `outlineWidth`**：Tailwind preflight 把所有元素的
+  `border-style` 设成 `solid`（宽度 0，不渲染），Chrome 的 `outline-width` 恒为 `3px`
+  （`outline-style` 是 `none`，也不渲染）。带上这两个，**所有**元素都会被判成「有副作用」，
+  报告直接归零。
+- 夹具那个 `bash` 调用要真跑，得有 rootfs（`just linux-setup`）。没装也能跑完，
+  只是工具行会显示执行失败。
+
+---
