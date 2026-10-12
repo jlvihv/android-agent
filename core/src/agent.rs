@@ -106,6 +106,7 @@ fn build_tools() -> Vec<ToolSpec> {
             name: "browser",
             description: "在真浏览器（WebView）里打开网页并操作它：点、输入、滚动、读页面结构、抽正文、截图。\
 要用登录态、要看 JS 渲染出来的内容（SPA）、要填表单/点按钮，只能用它 —— curl 拿不到这些。\
+多标签：new_tab 开一只新的（默认操作总是落在当前标签上），list_tabs 看有哪些、当前是哪只。\
 典型顺序：navigate → get_backbone（拿到可点的 selector 和页面结构）→ click / type →\
 再 get_backbone 或 get_readable 确认。**读文章用 get_readable，别用 get_text**（后者带导航/页脚）。\
 只是抓一篇静态文章的话，bash 里的 curl 更快。",
@@ -115,8 +116,8 @@ fn build_tools() -> Vec<ToolSpec> {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；get_readable=抽正文（文章页用它，比 get_text 干净得多）；get_text=读整页/某元素的文本；click=点 selector 或坐标；type=往 selector 里输入；press=按键（Enter 会提交表单、 Tab 移焦）；find_elements=列出 selector 匹配到的元素（几个、各自坐标）；scroll=滚动；screenshot=截图（full_page=true 截整页）；set_user_agent=切桌面/移动版；back=后退；wait_for_dom_stable=等动态内容安定下来；js=在页面里执行一段 JS（返回值 JSON 化后给你）",
-                            "enum": ["navigate", "get_backbone", "get_readable", "get_text", "click", "type", "press", "find_elements", "scroll", "screenshot", "set_user_agent", "back", "wait_for_dom_stable", "js"]
+                            "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；get_readable=抽正文（文章页用它，比 get_text 干净得多）；get_text=读整页/某元素的文本；click=点 selector 或坐标；type=往 selector 里输入；press=按键（Enter 会提交表单、 Tab 移焦）；find_elements=列出 selector 匹配到的元素（几个、各自坐标）；scroll=滚动；screenshot=截图（full_page=true 截整页）；set_user_agent=切桌面/移动版；back=后退；wait_for_dom_stable=等动态内容安定下来；js=在页面里执行一段 JS（返回值 JSON 化后给你）；new_tab=开新标签（可带 url）；list_tabs=列出所有标签；switch_tab / close_tab=切到 / 关掉某只标签",
+                            "enum": ["navigate", "get_backbone", "get_readable", "get_text", "click", "type", "press", "find_elements", "scroll", "screenshot", "set_user_agent", "back", "wait_for_dom_stable", "js", "new_tab", "list_tabs", "switch_tab", "close_tab"]
                         },
                         "url": { "type": "string", "description": "navigate 的目标。没写协议头就按 https 补" },
                         "selector": { "type": "string", "description": "CSS selector。get_backbone 给出的 sel 可以直接用" },
@@ -124,6 +125,7 @@ fn build_tools() -> Vec<ToolSpec> {
                         "key": { "type": "string", "description": "press 要按的键", "enum": ["Enter", "Tab", "Escape", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"] },
                         "user_agent": { "type": "string", "description": "set_user_agent 的档（会连着视口一起换，然后重载）", "enum": ["mobile", "desktop"] },
                         "full_page": { "type": "boolean", "description": "screenshot：true = 整页（上限 8000px），否则只截视口" },
+                        "tab": { "type": "integer", "description": "对哪只标签操作（默认当前那只）。给了就先切过去；id 从 new_tab / list_tabs 来。close_tab 不带 tab 就是关当前这只" },
                         "x": { "type": "integer", "description": "click 的 X 坐标（和 y 一起用，代替 selector）" },
                         "y": { "type": "integer", "description": "click 的 Y 坐标" },
                         "script": { "type": "string", "description": "js 动作要执行的代码。可以是 async，允许 await 和顶层 return" },

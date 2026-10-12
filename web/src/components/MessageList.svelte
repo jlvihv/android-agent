@@ -79,10 +79,16 @@
       back: '后退',
       wait_for_dom_stable: '等页面安定',
       js: '执行 JS',
+      new_tab: '开新标签',
+      list_tabs: '列出标签',
+      switch_tab: '切标签',
+      close_tab: '关标签',
     };
     const target = s(a.url) || s(a.selector) || (a.x !== undefined ? `${a.x},${a.y}` : '');
     const one = target.split('\n')[0].trim();
-    return `${label[action] ?? action} ${one}`.trim();
+    // 多标签时把"对哪只标签"带上 —— 同一行里 action 和对象要够判断
+    const tab = a.tab !== undefined ? `#${a.tab} ` : '';
+    return `${tab}${label[action] ?? action} ${one}`.trim();
   }
 
   /**
@@ -153,6 +159,9 @@
     if (action === 'type') return `${s(a.selector)} ← ${s(a.text)}`;
     if (action === 'click' && !s(a.selector)) return `(${a.x}, ${a.y})`;
     if (action === 'press') return s(a.key);
+    if (action === 'new_tab') return s(a.url);
+    if (action === 'switch_tab' || action === 'close_tab') return a.tab !== undefined ? `#${a.tab}` : '';
+    if (action === 'list_tabs' || action === 'wait_for_dom_stable') return '';
     if (action === 'set_user_agent') return s(a.user_agent);
     if (action === 'screenshot') return a.full_page === true ? '整页' : '';
     if (action === 'get_readable' || action === 'back') return '';

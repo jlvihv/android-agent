@@ -80,6 +80,12 @@ class BrowserController(private val app: Application) : BrowserHost {
         private const val FULL_PAGE_MAX_PX = 8_000
 
         /**
+         * 标签页上限。每只 WebView 都要占一块渲染内存，而且模型同时盯三页就已经
+         * 转不过来了；OpenMinis 那边也是 3 起步。满了就让模型先关一只。
+         */
+        private const val MAX_TABS = 4
+
+        /**
          * 桌面版的 UA 和视口。
          *
          * **两个必须一起换**：只换 UA 不换视口的话，桌面版布局塞进 411px 宽，
@@ -103,16 +109,85 @@ class BrowserController(private val app: Application) : BrowserHost {
     @Volatile
     private var defaultUa: String = DEFAULT_MOBILE_UA
 
-    /** 主线程独占。其它线程只读（构建完成后指针就不再变，除了换新的）*/
+    /**
+     * 一个标签页：一只 WebView + 它自己的加载进度 / 错误 / 死活。
+     *
+     * 为什么这些都挂在 tab 上而不是控制器上：多个标签页会**同时**在加载。
+     * 计数器和错误如果还是全局的，一个后台标签的加载就会把前台的等待骗过去
+     * （`awaitLoad` 看到计数变了就以为自己的页好了）。
+     */
+    private class Tab(val id: Int, val web: WebView) {
+        /** 页每次开始加载 +1（`onPageStarted`）*/
+        val started = AtomicInteger()
+
+        /** 页每次加载结束 +1（`onPageFinished` / 主文档出错 / 渲染进程死）*/
+        val finished = AtomicInteger()
+
+        /**
+         * 渲染进程死了（`onRenderProcessGone`）或 JS 一直不回调。
+         * 已死的 WebView 调什么都不会有反应，只能整只换掉（[ensureWeb]）。
+         */
+        @Volatile
+        var dead = false
+
+        /** 主文档的加载错误，navigate 读了报给模型 */
+        @Volatile
+        var lastError: String? = null
+    }
+
+    /** 主线程独占：所有标签页（顺序就是面板上从左到右）。 */
+    private val tabs = mutableListOf<Tab>()
+
+    /** 主线程独占：当前标签在 [tabs] 里的下标 */
+    private var currentIdx = 0
+
+    /** 标签 id 只增不重用 —— 模型提到"标签 2"时不会指向另一只页 */
+    private var nextTabId = 1
+
+    /**
+     * 当前动作操作的那只 WebView。
+     *
+     * 保留这个字段（而不是每处都写 `curTab()?.web`）是为了让下面几十个动作方法
+     * 不用改；它只在主线程换，其它线程只读。
+     */
     @Volatile
     private var web: WebView? = null
 
-    /**
-     * 渲染进程死了（`onRenderProcessGone`）或 JS 一直不回调。
-     * 已死的 WebView 调什么都不会有反应，只能整只换掉（[ensureWeb]）。
-     */
+    /** 当前动作的目标标签。一个动作从开始到结束都认它 */
     @Volatile
-    private var dead = false
+    private var active: Tab? = null
+
+    /** 主线程：当前标签 */
+    private fun curTab(): Tab? = tabs.getOrNull(currentIdx)
+
+    /**
+     * 断言自己在主线程。
+     *
+     * 为什么值得写：面板那几个入口（[pageState] / [selectTabFromUi] / [attachTo]）
+     * 是**从主线程**调的，而动作那几个入口是从 Rust 的 spawn_blocking 线程调的、
+     * 内部用 [onMain] 跳过去。两种姿势写混的后果很重：主线程里调 [onMain] 会
+     * “自己等自己” 10 秒，然后抛异常 → **点一下标签条就闪退**（实测）。
+     * 有这行断言，就变成一眼能看懂的报错。
+     */
+    private fun onMainThread(): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper()) {
+            "这个方法只能在主线程调（面板入口）；从别的线程来要用 onMain { }"
+        }
+        return true
+    }
+
+    /** 主线程：换当前标签，并把 [web] / [active] 同步过去 */
+    private fun setCurrent(i: Int) {
+        if (tabs.isEmpty()) {
+            currentIdx = 0
+            web = null
+            active = null
+            return
+        }
+        currentIdx = i.coerceIn(0, tabs.size - 1)
+        web = tabs[currentIdx].web
+        active = tabs[currentIdx]
+    }
 
     /**
      * 正在跑一个动作。给看板面板显示“agent 正在操作…”用。
@@ -124,24 +199,14 @@ class BrowserController(private val app: Application) : BrowserHost {
     var busy: Boolean = false
         private set
 
-    /**
-     * 主文档的加载错误（onReceivedError 给的），navigate 会读出来报给模型
-     */
-    @Volatile
-    private var lastError: String? = null
-
     // 页面加载的进度计数。为什么不用 CountDownLatch：一次动作（点击）**可能**
     // 触发导航，也可能不触发，而导航还可能重定向好几次（多次 start/finish）。
-    // 计数器比一次性闩好描述这类事：
-    //
-    //   navStarted  页每次开始加载 +1（`onPageStarted`）
-    //   navFinished 页每次加载结束 +1（`onPageFinished` / 主文档出错 / 渲染进程死）
-    //
-    // 判据“一次加载跑完了” = `started > 快照 && finished >= started`。
-    private val navStarted = AtomicInteger()
-    private val navFinished = AtomicInteger()
-
-    private fun navCounters(): Pair<Int, Int> = navStarted.get() to navFinished.get()
+    // 计数器比一次性闩好描述这类事。判据“一次加载跑完了” =
+    // `started > 快照 && finished >= started`。
+    private fun navCounters(): Pair<Int, Int> {
+        val t = active ?: return 0 to 0
+        return t.started.get() to t.finished.get()
+    }
 
     /** 等加载结束。`started0` 是动作前的 `navStarted` 快照 */
     private fun awaitLoad(started0: Int, maxMs: Long): Boolean {
@@ -243,9 +308,65 @@ class BrowserController(private val app: Application) : BrowserHost {
     /** agent 到底有没有开过页面（没开过就不要打开看板）。 */
     fun hasPage(): Boolean = web != null
 
-    /** 当前 URL / 标题 / 忙不忙，给面板的头用。**只在主线程调**。 */
-    fun pageState(): Triple<String, String, Boolean> =
-        Triple(web?.url ?: "", web?.title ?: "", busy)
+    /**
+     * 给面板的头用的状态：URL / 标题 / 忙不忙 / 各标签的短名 + 当前是第几个。
+     * **只在主线程调**。
+     */
+    fun pageState(): PanelState {
+        onMainThread()
+        val labels = tabs.map { t ->
+            val u = runCatching { t.web.url }.getOrNull().orEmpty()
+            val host = u.substringAfter("://", "").substringBefore('/').removePrefix("www.")
+            when {
+                host.isEmpty() -> "新标签"
+                // IP（含端口）不截：`127.0.0.1:3392` 截一下就看不出是哪儿了
+                host[0].isDigit() -> host
+                // 域名只留最后两段：en.wikipedia.org → wikipedia.org
+                else -> host.split('.').takeLast(2).joinToString(".")
+            }
+        }
+        return PanelState(
+            url = web?.url ?: "",
+            title = web?.title ?: "",
+            busy = busy,
+            currentIdx = currentIdx,
+            labels = labels,
+        )
+    }
+
+    /**
+     * 面板上点了某个标签。**必须主线程调**（点它的地方就是主线程）。
+     *
+     * agent 正在跑动作时忽略这次点击（tryLock 拿不到就返回）—— 那时的页面
+     * 是它在操作，半路把当前标签换掉会让它的下一步落在错的页上。
+     */
+    fun selectTabFromUi(idx: Int) {
+        onMainThread()
+        if (!lock.tryLock()) return
+        try {
+            setCurrent(idx)
+            refreshAttached()
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /** 面板正挂着的容器（没有就是 null）。**主线程独占**。 */
+    private var panelHolder: android.view.ViewGroup? = null
+
+    /** 切/关标签之后，把面板里的那只换成新的当前标签。**主线程调**。 */
+    private fun refreshAttached() {
+        panelHolder?.let { attachTo(it) }
+    }
+
+    data class PanelState(
+        val url: String,
+        val title: String,
+        val busy: Boolean,
+        val currentIdx: Int,
+        /** 每个标签一个短名（域名），顺序就是面板上从左到右 */
+        val labels: List<String>,
+    )
 
     /**
      * 把这只 WebView 临时挂进一个容器，让用户看 / 接管。**主线程调**。
@@ -255,6 +376,8 @@ class BrowserController(private val app: Application) : BrowserHost {
      * 绝不另建一只，否则用户看到的和 agent 操作的不是同一个页面。
      */
     fun attachTo(container: android.view.ViewGroup) {
+        onMainThread()
+        panelHolder = container
         val w = web ?: return
         (w.parent as? android.view.ViewGroup)?.removeView(w)
         container.removeAllViews()
@@ -270,6 +393,8 @@ class BrowserController(private val app: Application) : BrowserHost {
 
     /** 从面板上摘下来，还它一个无头身。**主线程调**。 */
     fun detach() {
+        onMainThread()
+        panelHolder = null
         val w = web ?: return
         (w.parent as? android.view.ViewGroup)?.removeView(w)
         Log.i(TAG, "面板已摘下（agent 继续跑在无头模式）")
@@ -279,7 +404,28 @@ class BrowserController(private val app: Application) : BrowserHost {
         val name = a.optString("action")
         Log.i(TAG, "action=$name ${a.toString().take(200)}")
 
-        lastError = null
+        // 标签管理那几个动作**不要**顺手建标签：模型问“有哪些标签”不该因此多出
+        // 一只空标签（踩过：list_tabs 之前先跑 ensureWeb，结果每次列完都多一只）。
+        val managesTabs = name == "new_tab" || name == "list_tabs" ||
+            name == "close_tab" || name == "switch_tab"
+
+        // 给了 `tab` 就先**切过去**再操作（和点浏览器的标签一个语义）。
+        // 这样“当前标签”永远就是动作实际发生的那一只，模型不用在脑子里记账。
+        if (a.has("tab") && !managesTabs) {
+            val want = a.optInt("tab")
+            val ok = onMain {
+                val at = tabs.indexOfFirst { it.id == want }
+                if (at >= 0) { setCurrent(at); true } else false
+            } as? Boolean ?: false
+            if (!ok) {
+                return err("没有标签 ${want}（当前有：${onMain { tabs.map { it.id } } ?: emptyList<Int>()}）")
+            }
+        } else if (!managesTabs) {
+            // 没给 tab：确保当前标签存在（第一次用浏览器时这里建第一只）
+            runCatching { ensureWeb() }
+        }
+
+        curTab()?.lastError = null
 
         val out: JSONObject = when (name) {
             "navigate" -> navigate(a.optString("url"))
@@ -296,8 +442,16 @@ class BrowserController(private val app: Application) : BrowserHost {
             "find_elements" -> findElements(a.optString("selector"))
             "set_user_agent" -> setUserAgent(a.optString("user_agent"))
             "js" -> runJs(a.optString("script"))
+            "new_tab" -> newTab(a.optString("url").ifEmpty { null })
+            "list_tabs" -> listTabs()
+            "switch_tab" -> switchTab(a.optInt("tab", -1))
+            "close_tab" -> closeTab(a.optInt("tab", 0))
             else -> return err("未知动作: $name")
         }
+
+        // 每个动作回都带上"我在哪只标签上"：模型多标签时靠它记账
+        out.put("tab", onMain { curTab()?.id } ?: 0)
+        out.put("tabs", onMain { tabs.size } ?: 0)
 
         // 吞掉的对话框每轮报一次，然后清空（模型知道被拦了什么就够）
         val d = drainDialogs()
@@ -319,27 +473,68 @@ class BrowserController(private val app: Application) : BrowserHost {
      */
     private fun ensureWeb(): WebView {
         val got = onMain {
-            val cur = web
-            if (cur != null && !dead) {
-                cur
-            } else {
-                if (cur != null) {
-                    Log.w(TAG, "丢弃坏掉的 WebView，重开一只")
-                    runCatching { cur.destroy() }
-                    web = null
-                }
-                dead = false
-                val w = buildWebView()
-                web = w
-                w
+            var t = curTab()
+            if (t == null) {
+                // 一个标签都没有（刚启动，或者刚把所有标签关光）
+                t = createTab(null)
+                tabs.add(t)
+                setCurrent(tabs.size - 1)
+            } else if (t.dead) {
+                Log.w(TAG, "标签 ${t.id} 坏了，就地重开一只")
+                val at = currentIdx
+                val keep = runCatching { t.web.url }.getOrNull()
+                runCatching { t.web.destroy() }
+                val fresh = createTab(keep)
+                tabs[at] = fresh
+                setCurrent(at)
+                t = fresh
             }
+            active = t
+            t.web
         }
         if (got is WebView) return got
         throw IllegalStateException("WebView 建不出来（上一行日志里有原因）")
     }
 
-    private fun buildWebView(): WebView {
+    // -----------------------------------------------------------------------
+    // 标签页
+    // -----------------------------------------------------------------------
+
+    /** 建新标签（给模型和面板用）。**主线程调** */
+    private fun newTabAt(url: String?): Tab {
+        val t = createTab(url)
+        tabs.add(t)
+        setCurrent(tabs.size - 1)
+        return t
+    }
+
+    /** 关一只标签（给模型和面板用）。**主线程调** */
+    private fun dropTab(tab: Tab) {
+        val at = tabs.indexOf(tab)
+        if (at < 0) return
+        tabs.removeAt(at)
+        // 面板正挂着它的话先摘下来，再销毁
+        (tab.web.parent as? android.view.ViewGroup)?.removeView(tab.web)
+        runCatching { tab.web.destroy() }
+        if (currentIdx >= at) setCurrent(currentIdx - 1) else setCurrent(currentIdx)
+        Log.i(TAG, "关掉标签 ${tab.id}（剩 ${tabs.size} 只）")
+    }
+
+    /**
+     * 建一只标签页（新 WebView + 把回调挂到**它自己的**计数器上）。
+     *
+     * 先建 WebView、再建 Tab、再 `configure`，是因为回调要引用 tab 的计数器；
+     * 反过来（先 tab 后 view）在 Kotlin 里就得用可空变量兜圈子。
+     */
+    private fun createTab(url: String?): Tab {
         val v = WebView(app)
+        val tab = Tab(nextTabId++, v)
+        configureWebView(v, tab)
+        if (!url.isNullOrEmpty()) v.loadUrl(url)
+        return tab
+    }
+
+    private fun configureWebView(v: WebView, tab: Tab) {
         // 记住手机自己的 UA：切到桌面版之后还能切回来
         defaultUa = v.settings.userAgentString ?: DEFAULT_MOBILE_UA
         v.settings.apply {
@@ -387,7 +582,7 @@ class BrowserController(private val app: Application) : BrowserHost {
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
-                navFinished.incrementAndGet()
+                tab.finished.incrementAndGet()
             }
 
             override fun onReceivedError(
@@ -397,8 +592,8 @@ class BrowserController(private val app: Application) : BrowserHost {
             ) {
                 // 只记主文档：子资源失败（一张图 404）不该让整个 navigate 变红
                 if (request?.isForMainFrame == true) {
-                    lastError = "加载失败: ${error?.description}（${error?.errorCode}）"
-                    navFinished.incrementAndGet()
+                    tab.lastError = "加载失败: ${error?.description}（${error?.errorCode}）"
+                    tab.finished.incrementAndGet()
                 }
             }
 
@@ -411,15 +606,15 @@ class BrowserController(private val app: Application) : BrowserHost {
                 view: WebView?,
                 detail: android.webkit.RenderProcessGoneDetail?,
             ): Boolean {
-                Log.w(TAG, "渲染进程没了（crashed=${detail?.didCrash()}），下次换一只")
-                dead = true
-                navFinished.incrementAndGet()
+                Log.w(TAG, "标签 ${tab.id} 的渲染进程没了（crashed=${detail?.didCrash()}），下次换一只")
+                tab.dead = true
+                tab.finished.incrementAndGet()
                 return true
             }
 
             /** 每页开始加载时把 target=_blank 掰成 _self（见 installTargetFix） */
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                navStarted.incrementAndGet()
+                tab.started.incrementAndGet()
                 view?.evaluateJavascript(TARGET_FIX_JS, null)
             }
         }
@@ -476,7 +671,6 @@ class BrowserController(private val app: Application) : BrowserHost {
 
         // 关键一步：给它一个尺寸，否则视口是 0×0
         applyViewport(v, null)
-        return v
     }
 
     private fun record(msg: String) {
@@ -496,13 +690,22 @@ class BrowserController(private val app: Application) : BrowserHost {
     // 动作
     // -----------------------------------------------------------------------
 
+    /**
+     * 归一化 URL：没写协议头按 https 补；不是 http(s) 就返回 null。
+     * 挡的是 `file://`（读本地文件）、`javascript:`、`intent://`（拉起别的 App）这些。
+     */
+    private fun normalizeUrl(raw: String): String? {
+        val url = raw.trim()
+        if (url.isEmpty()) return null
+        val target = if (url.contains("://")) url else "https://$url"
+        val scheme = runCatching { android.net.Uri.parse(target).scheme?.lowercase() }.getOrNull()
+        return if (scheme == "http" || scheme == "https") target else null
+    }
+
     private fun navigate(urlRaw: String?): JSONObject {
         val url = (urlRaw ?: "").trim()
         if (url.isEmpty()) return errObj("缺少参数 url")
-        // 没写协议头按 https 补；只认 http(s)，挡掉 file:// / javascript: 之类
-        val target = if (url.contains("://")) url else "https://$url"
-        val scheme = runCatching { android.net.Uri.parse(target).scheme?.lowercase() }.getOrNull()
-        if (scheme != "http" && scheme != "https") return errObj("只支持 http/https：$url")
+        val target = normalizeUrl(url) ?: return errObj("只支持 http/https：$url")
 
         val w = ensureWeb()
         val snap = navCounters().first
@@ -523,7 +726,7 @@ class BrowserController(private val app: Application) : BrowserHost {
             append(realUrl)
             if (title.isNotEmpty()) append("\n标题：$title")
             if (!finished) append("\n（页面可能还在加载）")
-            lastError?.let { append("\n$it") }
+            active?.lastError?.let { append("\n$it") }
         }
         return ok(text, realUrl, title)
     }
@@ -646,6 +849,98 @@ class BrowserController(private val app: Application) : BrowserHost {
             append("）")
         }
         return ok("$head\n$text")
+    }
+
+    // -----------------------------------------------------------------------
+    // 标签页动作
+    // -----------------------------------------------------------------------
+
+    /** 开一只新标签（可选直接打开 url） */
+    private fun newTab(url: String?): JSONObject {
+        val have = onMain { tabs.size } as? Int ?: 0
+        if (have >= MAX_TABS) {
+            return errObj(
+                "标签太多（上限 $MAX_TABS）。先 close_tab 关掉不用的，或者 list_tabs 看看现在有哪些。",
+            )
+        }
+        val target = if (url.isNullOrEmpty()) null else normalizeUrl(url)
+        if (!url.isNullOrEmpty() && target == null) return errObj("只支持 http/https：$url")
+
+        val t = onMain { newTabAt(null) } as? Tab ?: return errObj("开标签失败")
+        if (target != null) {
+            // 先建空标签切过去，再自己 loadUrl：这样计数器的快照一定是这只页的
+            val snap = navCounters().first
+            onMain { t.web.loadUrl(target) }
+            awaitLoad(snap, NAV_TIMEOUT_MS)
+            awaitDomStable(SETTLE_BUDGET_MS)
+        }
+        onMain { refreshAttached() }
+        val info = pageInfo()
+        val what = if (target != null) "已打开 $target" else "空白页（接着用 navigate）"
+        return ok(
+            "开了标签 ${t.id}（共 ${onMain { tabs.size }} 只）：$what",
+            info?.optString("url").orEmpty(),
+            info?.optString("title").orEmpty(),
+        )
+    }
+
+    /** 列出所有标签。多标签时模型靠它记账 */
+    private fun listTabs(): JSONObject {
+        val out = onMain {
+            val cur = curTab()?.id
+            if (tabs.isEmpty()) return@onMain "（一个标签都没有）"
+            tabs.joinToString("\n") { t ->
+                val u = runCatching { t.web.url }.getOrNull().orEmpty()
+                val ti = runCatching { t.web.title }.getOrNull().orEmpty()
+                val mark = if (t.id == cur) "→" else " "
+                val title = if (ti.isBlank()) "(空)" else ti.take(60)
+                "$mark 标签 ${t.id}：$title — ${u.take(110)}"
+            }
+        } as? String ?: ""
+        val cur = onMain { curTab()?.id } ?: 0
+        return ok("共 ${onMain { tabs.size }} 只（当前是标签 $cur）：\n$out")
+    }
+
+    /** 切到某只标签 */
+    private fun switchTab(id: Int): JSONObject {
+        val okSwitch = onMain {
+            val at = tabs.indexOfFirst { it.id == id }
+            if (at < 0) return@onMain false
+            setCurrent(at)
+            refreshAttached()
+            true
+        } as? Boolean ?: false
+        if (!okSwitch) {
+            val have = onMain { tabs.map { it.id } } ?: emptyList<Int>()
+            return errObj("没有标签 $id（现有：$have；用 list_tabs 看）")
+        }
+        val info = pageInfo()
+        return ok(
+            "切到标签 $id",
+            info?.optString("url").orEmpty(),
+            info?.optString("title").orEmpty(),
+        )
+    }
+
+    /** 关一只标签。不给 `tab` 就是关当前这只 */
+    private fun closeTab(id: Int): JSONObject {
+        val target = if (id > 0) id else (onMain { curTab()?.id } as? Int ?: 0)
+        if (target == 0) return errObj("没有标签可关（用 list_tabs 看）")
+        val okClose = onMain {
+            val t = tabs.firstOrNull { it.id == target } ?: return@onMain false
+            dropTab(t)
+            refreshAttached()
+            true
+        } as? Boolean ?: false
+        if (!okClose) return errObj("没有标签 $target")
+        val left = onMain { tabs.size } as? Int ?: 0
+        if (left == 0) return ok("关掉标签 $target，现在一个标签都不剩了（下一次动作会开一只新的）")
+        val info = pageInfo()
+        return ok(
+            "关掉标签 $target，剩 $left 只（当前是标签 ${onMain { curTab()?.id } ?: 0}）",
+            info?.optString("url").orEmpty(),
+            info?.optString("title").orEmpty(),
+        )
     }
 
     /** 等 DOM 安定（动态内容/无限滚动靠它）。`timeout` 秒，默认 10 */
@@ -960,7 +1255,7 @@ class BrowserController(private val app: Application) : BrowserHost {
             }
         }
         if (!latch.await(timeout, TimeUnit.MILLISECONDS)) {
-            dead = true
+            active?.dead = true
             throw IllegalStateException("页面 ${timeout / 1000}s 没响应（渲染进程可能卡住了）")
         }
         return out ?: "null"
@@ -1007,8 +1302,8 @@ class BrowserController(private val app: Application) : BrowserHost {
             }
         }
         if (!latch.await(timeout, TimeUnit.MILLISECONDS)) {
-            dead = true
-            Log.w(TAG, "主线程 ${timeout}ms 没响应（标记 WebView 已坏）")
+            active?.dead = true
+            Log.w(TAG, "主线程 ${timeout}ms 没响应（标记当前标签已坏）")
             throw IllegalStateException("WebView 主线程 ${timeout / 1000}s 没响应")
         }
         return out

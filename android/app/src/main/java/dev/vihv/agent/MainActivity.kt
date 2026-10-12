@@ -80,6 +80,10 @@ class MainActivity : Activity() {
     private var browserTitle: TextView? = null
     private var browserUrl: TextView? = null
     private var browserState: TextView? = null
+    /** 标签条：只有多于一只标签时才显示 */
+    private var tabChips: android.widget.LinearLayout? = null
+    /** 标签条的签名（标签短名 + 当前下标）。没变就不重建 */
+    private var chipsSig = ""
     private var panelVisible = false
     /** 面板开着时注册的返回回调（优先级比页面那层高） */
     private var panelBack: Any? = null
@@ -276,6 +280,12 @@ class MainActivity : Activity() {
         bar.addView(close)
 
         val divider = View(this).apply { setBackgroundColor(getColor(R.color.hairline)) }
+        // 标签条：多标签时才出现（一只的时候它没有信息量）
+        tabChips = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            visibility = View.GONE
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+        }
         browserHolder = FrameLayout(this)
 
         val column = android.widget.LinearLayout(this).apply {
@@ -283,6 +293,7 @@ class MainActivity : Activity() {
         }
         column.addView(bar)
         column.addView(divider, android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1))
+        column.addView(tabChips)
         column.addView(
             browserHolder,
             android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
@@ -377,12 +388,59 @@ class MainActivity : Activity() {
             if (!panelVisible) return
             val st = AgentApp.browser?.pageState()
             if (st != null) {
-                browserTitle?.text = st.second.ifBlank { "agent 的浏览器" }
-                browserUrl?.text = st.first
-                browserState?.text = if (st.third) "agent 正在操作…" else "空闲"
+                browserTitle?.text = st.title.ifBlank { "agent 的浏览器" }
+                browserUrl?.text = st.url
+                browserState?.text = if (st.busy) "agent 正在操作…" else "空闲"
+                syncTabChips(st)
             }
             panelTick.postDelayed(this, 500)
         }
+    }
+
+    /**
+     * 标签条。只在「标签数 + 当前下标」变了才重建 —— 这个函数每 500ms 被调一次，
+     * 每次都 removeAllViews 会让用户点中的那颗按钮在手指底下消失。
+     */
+    private fun syncTabChips(st: BrowserController.PanelState) {
+        val row = tabChips ?: return
+        val sig = st.labels.joinToString("|") + "#" + st.currentIdx
+        if (sig == chipsSig) return
+        chipsSig = sig
+
+        row.removeAllViews()
+        if (st.labels.size <= 1) {
+            row.visibility = View.GONE
+            return
+        }
+        row.visibility = View.VISIBLE
+        st.labels.forEachIndexed { i, label ->
+            val on = i == st.currentIdx
+            val chip = TextView(this).apply {
+                text = "${i + 1} $label"
+                textSize = 11f
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                gravity = android.view.Gravity.CENTER
+                setPadding(dp(8), dp(5), dp(8), dp(5))
+                setTextColor(getColor(if (on) R.color.fg else R.color.muted))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dp(9).toFloat()
+                    setColor(getColor(if (on) R.color.hairline else android.R.color.transparent))
+                }
+                setOnClickListener { switchTabFromUi(i) }
+            }
+            row.addView(
+                chip,
+                android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { marginEnd = dp(4) },
+            )
+        }
+    }
+
+    /** 面板上点了某只标签。agent 正在跑动作时它会被忽略（见 selectTabFromUi）。 */
+    private fun switchTabFromUi(i: Int) {
+        AgentApp.browser?.selectTabFromUi(i)
+        chipsSig = "" // 强制下一拍重建（高亮要立刻跟上）
     }
 
     private fun registerPanelBack() {
