@@ -69,6 +69,22 @@ class MainActivity : Activity() {
     /** 相机拍下的那张图落在 MediaStore 里的 URI（取消时要删掉） */
     private var cameraUri: Uri? = null
 
+    // —— 浏览器看板（agent 那只无头 WebView 的观察窗口）——
+    //
+    // 为什么是**原生** View 而不是页面里的一块 HTML：要显示的是另一只真 WebView，
+    // 而 WebView 不能嵌在网页里。所以这一层盖在 UI WebView 上面，需要时把 agent
+    // 那只 WebView `addView` 进来，关掉再摘下去 —— **同一只**，不另建，
+    // 否则用户看到的和 agent 操作的不是同一个页面（见 docs/08）。
+    private var browserPanel: FrameLayout? = null
+    private var browserHolder: FrameLayout? = null
+    private var browserTitle: TextView? = null
+    private var browserUrl: TextView? = null
+    private var browserState: TextView? = null
+    private var panelVisible = false
+    /** 面板开着时注册的返回回调（优先级比页面那层高） */
+    private var panelBack: Any? = null
+    private val panelTick = android.os.Handler(android.os.Looper.getMainLooper())
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         edgeToEdge()
@@ -79,11 +95,16 @@ class MainActivity : Activity() {
         if (port == 0) {
             setContentView(errorView("核心没起来。看 logcat 里 AgentApp 的报错。"))
         } else {
-            setContentView(buildWebView(port))
+            setContentView(buildRoot(buildWebView(port)))
         }
 
         // 两个设置页只能一个一个来：先存储（沙箱干活的地方），下次启动再无障碍
         if (!maybeAskAllFilesAccess()) maybeOpenAccessibilitySettings()
+
+        // 冷启动也认这个 extra（见 onNewIntent）
+        if (intent?.getBooleanExtra("browser", false) == true) {
+            window.decorView.post { showBrowserPanel() }
+        }
     }
 
     override fun onResume() {
@@ -91,6 +112,20 @@ class MainActivity : Activity() {
         current = this
         // 从设置页回来时权限可能刚打开：重挂沙箱的 /sdcard 和 /workspace
         AgentApp.syncSharedStorage(this)
+    }
+
+    /**
+     * `adb shell am start -n dev.vihv.agent/.MainActivity --ez browser true`
+     * 直接打开浏览器看板。
+     *
+     * 为什么要留这个口子：看板是给**人**看的，但它自己（头部那个地球按钮）
+     * 只能用手点 —— 而调试/验收时不该去戳用户正在用的手机的屏幕。
+     * 和 `files/port`、`agentctl` 同一个思路：能在 adb 里做的事就不靠摸屏幕。
+     * 没开过页面时它只会提示一句（和点地球一样）。
+     */
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent?.getBooleanExtra("browser", false) == true) showBrowserPanel()
     }
 
     override fun onPause() {
@@ -149,6 +184,220 @@ class MainActivity : Activity() {
             )
         }
     }
+
+    /**
+     * 根容器：UI 的 WebView + 盖在它上面的浏览器看板。
+     *
+     * 看板平时 `GONE`，所以常态下这层包装不花任何代价。
+     */
+    private fun buildRoot(ui: WebView): View {
+        val root = FrameLayout(this)
+        root.addView(
+            ui,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        val panel = buildBrowserPanel()
+        browserPanel = panel
+        root.addView(
+            panel,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        return root
+    }
+
+    /**
+     * 浏览器看板。头一行放标题/URL/agent 状态 + 关闭，下面全是给 agent 那只
+     * WebView 的位置。
+     *
+     * 尺寸单位刻意用 `dp()`（不是 px）：这里量的是手机屏幕，不是网页。
+     */
+    private fun buildBrowserPanel(): FrameLayout {
+        val panel = FrameLayout(this).apply {
+            setBackgroundColor(getColor(R.color.ink))
+            visibility = View.GONE
+        }
+
+        val bar = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(8), dp(8), dp(8))
+        }
+        val col = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+        }
+        browserTitle = TextView(this).apply {
+            setTextColor(getColor(R.color.fg))
+            textSize = 15f
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            text = "agent 的浏览器"
+        }
+        browserUrl = TextView(this).apply {
+            setTextColor(getColor(R.color.muted))
+            textSize = 11f
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        col.addView(browserTitle)
+        col.addView(browserUrl)
+
+        browserState = TextView(this).apply {
+            setTextColor(getColor(R.color.muted))
+            textSize = 11f
+            setPadding(dp(8), 0, dp(8), 0)
+        }
+        val close = TextView(this).apply {
+            text = "关闭"
+            setTextColor(getColor(R.color.muted))
+            textSize = 13f
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setOnClickListener { hideBrowserPanel() }
+        }
+        bar.addView(
+            col,
+            android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        bar.addView(browserState)
+        bar.addView(close)
+
+        val divider = View(this).apply { setBackgroundColor(getColor(R.color.hairline)) }
+        browserHolder = FrameLayout(this)
+
+        val column = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+        }
+        column.addView(bar)
+        column.addView(divider, android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1))
+        column.addView(
+            browserHolder,
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
+        )
+        panel.addView(
+            column,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+
+        // 边到边：头要让开状态栏，底部让开手势条（和网页里的
+        // env(safe-area-inset-*) 是同一份信息，只是这边拿不到 CSS 变量）
+        panel.setOnApplyWindowInsetsListener { _, insets ->
+            applyPanelInsets(insets)
+            insets
+        }
+        return panel
+    }
+
+    private fun applyPanelInsets(insets: android.view.WindowInsets? = null) {
+        // 三个来源依次回退：参数 → 面板自己的 → Activity 的。
+        // 面板 `GONE` 的时候 `rootWindowInsets` 可能是 null，所以必须有
+        // 最后一层 —— 否则头部会钻到状态栏下面去。
+        val i = insets ?: browserPanel?.rootWindowInsets ?: window.decorView.rootWindowInsets ?: return
+        val top: Int
+        val bottom: Int
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bars = i.getInsets(android.view.WindowInsets.Type.systemBars())
+            top = bars.top
+            bottom = bars.bottom
+        } else {
+            @Suppress("DEPRECATION")
+            run {
+                top = i.systemWindowInsetTop
+                bottom = i.systemWindowInsetBottom
+            }
+        }
+        // 头本就自带上内边距，只把状态栏那一段加上去
+        (browserPanel?.getChildAt(0) as? android.widget.LinearLayout)?.let { column ->
+            column.setPadding(0, top, 0, 0)
+        }
+        browserHolder?.setPadding(0, 0, 0, bottom)
+    }
+
+    /** 打开看板。没开过页面就不开（没东西可看）。 */
+    private fun showBrowserPanel() {
+        val panel = browserPanel ?: return
+        val holder = browserHolder ?: return
+        val browser = AgentApp.browser
+        if (browser == null || !browser.hasPage()) {
+            android.widget.Toast.makeText(this, "agent 还没打开过网页", android.widget.Toast.LENGTH_SHORT)
+                .show()
+            return
+        }
+        if (panelVisible) return
+        panelVisible = true
+        browser.attachTo(holder)
+        applyPanelInsets()
+        panel.visibility = View.VISIBLE
+        // 从屏幕外滑上来：和页面里的面板同一个手感（in/out 都用位移）
+        panel.translationY = resources.displayMetrics.heightPixels.toFloat()
+        panel.animate().translationY(0f).setDuration(200).start()
+        // 刚变可见时 insets 可能还没派发过，补一次
+        panel.post { applyPanelInsets() }
+        registerPanelBack()
+        panelTick.post(pollPanel)
+        Log.i(TAG, "打开浏览器看板")
+    }
+
+    private fun hideBrowserPanel() {
+        val panel = browserPanel ?: return
+        if (!panelVisible) return
+        panelVisible = false
+        panelTick.removeCallbacks(pollPanel)
+        unregisterPanelBack()
+        val off = panel.height.toFloat().coerceAtLeast(
+            resources.displayMetrics.heightPixels.toFloat(),
+        )
+        panel.animate().translationY(off).setDuration(180).withEndAction {
+            panel.visibility = View.GONE
+            // 摘下来：agent 接着在无头模式辇（不重载、状态不丢）
+            AgentApp.browser?.detach()
+        }.start()
+        Log.i(TAG, "收起浏览器看板")
+    }
+
+    /** 每半秒刷新头的标题/URL/状态。面板不开时不跑。 */
+    private val pollPanel = object : Runnable {
+        override fun run() {
+            if (!panelVisible) return
+            val st = AgentApp.browser?.pageState()
+            if (st != null) {
+                browserTitle?.text = st.second.ifBlank { "agent 的浏览器" }
+                browserUrl?.text = st.first
+                browserState?.text = if (st.third) "agent 正在操作…" else "空闲"
+            }
+            panelTick.postDelayed(this, 500)
+        }
+    }
+
+    private fun registerPanelBack() {
+        if (panelBack != null || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val cb = android.window.OnBackInvokedCallback { hideBrowserPanel() }
+        @Suppress("NewApi")
+        onBackInvokedDispatcher.registerOnBackInvokedCallback(
+            android.window.OnBackInvokedDispatcher.PRIORITY_OVERLAY,
+            cb,
+        )
+        panelBack = cb
+    }
+
+    private fun unregisterPanelBack() {
+        val cb = panelBack ?: return
+        panelBack = null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        @Suppress("NewApi")
+        onBackInvokedDispatcher.unregisterOnBackInvokedCallback(
+            cb as android.window.OnBackInvokedCallback,
+        )
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private fun buildWebView(port: Int): WebView {
         val w = WebView(this)
@@ -528,6 +777,11 @@ class MainActivity : Activity() {
         fileCallback?.onReceiveValue(null)
         fileCallback = null
         unregisterBackCallback()
+        // 看板：把 agent 那只 WebView 摘下来，别让它挂在一个马上要销毁的容器上。
+        // **不销毁它** —— 它属于应用进程，回合可能还在跑（见 BrowserController）。
+        panelTick.removeCallbacks(pollPanel)
+        unregisterPanelBack()
+        AgentApp.browser?.detach()
         web?.destroy()
         web = null
         super.onDestroy()

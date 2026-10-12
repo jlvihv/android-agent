@@ -18,8 +18,10 @@ android {
         //
         // 之前带 x86_64 是为了模拟器，但代价是真机上白带一份 9.3MB 的核心
         // （压缩后 ~4MB APK）。要跑模拟器时临时把 x86_64 加回来即可。
+        // 出哪些 ABI 由 AGENT_ABIS 决定（见 justfile）：默认只出 arm64，
+        // 模拟器要 x86_64 时 `AGENT_ABIS=arm64-v8a,x86_64 just emu-install`
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += (System.getenv("AGENT_ABIS") ?: "arm64-v8a").split(",")
         }
     }
 

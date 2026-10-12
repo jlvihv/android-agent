@@ -33,6 +33,16 @@ class AgentApp : Application() {
             private set
 
         /**
+         * agent 的浏览器。MainActivity 的看板面板要挂的就是它那只 WebView。
+         *
+         * `onCreate` 里建（不依赖无障碍）；没调过 `browser` 工具时它只是个空壳，
+         * WebView 是懒建的（`hasPage()` 为 false）。
+         */
+        @Volatile
+        var browser: BrowserController? = null
+            private set
+
+        /**
          * 本地 API 的凭据。WebView 先打开 `/auth?t=<它>` 种上 cookie，
          * 之后 `/api/…` 才放行。
          *
@@ -126,8 +136,11 @@ class AgentApp : Application() {
         //     **刻意不和「设备」（无障碍）绑在一起**：浏览器不需要无障碍权限，
         //     关掉无障碍也该能用。WebView 本身是懒建的 —— 不调 `browser` 工具
         //     就不会多出这只 WebView。
-        runCatching { core.setBrowser(BrowserController(this)) }
-            .onFailure { Log.w(TAG, "浏览器注入失败", it) }
+        runCatching {
+            val b = BrowserController(this)
+            browser = b
+            core.setBrowser(b)
+        }.onFailure { Log.w(TAG, "浏览器注入失败", it) }
 
         // 1c. 回合开始/结束的通知方 —— 拉/收前台服务（见 AgentForegroundService）。
         //     同样不依赖无障碍：切后台保活跟读屏是两件事。

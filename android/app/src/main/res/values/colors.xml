@@ -3,6 +3,12 @@
     <!-- 和 web 侧的设计令牌 ink 一致：暖调近黑，不是纯黑 -->
     <color name="ink">#FF151515</color>
 
+    <!-- 下面几个和 web/src/app.css 的设计令牌一一对应（原生面板用得到）。
+         只补需要的三个：文字、次要文字、分隔线。 -->
+    <color name="fg">#FFF9F9F7</color>
+    <color name="muted">#FF97958D</color>
+    <color name="hairline">#FF262624</color>
+
     <!-- 应用图标的底色。就是 ink —— 图标和 App 同一个底色 -->
     <color name="ic_launcher_background">#FF151515</color>
 </resources>

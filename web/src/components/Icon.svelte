@@ -39,6 +39,7 @@
     | 'image'
     | 'file'
     | 'check'
+    | 'globe'
     | 'close';
 
   let { name, size = 20, class: cls = '' }: { name: Name; size?: number; class?: string } =
@@ -220,6 +221,14 @@
       stroke-linejoin="round"
     />
     <path d="M11.6 2.7v4.1h4.1" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+  </svg>
+{:else if name === 'globe'}
+  <!-- 地球：外圆 ∅15（墨迹 15 + 1.8 = 16.8，跟 gear/newchat 同档），
+       里头一条赤道 + 一个经线圈（rx 3.6 ≈ 外圆半径的一半，看得到“球”感）。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.8" />
+    <ellipse cx="10" cy="10" rx="3.6" ry="7.5" stroke="currentColor" stroke-width="1.8" />
+    <path d="M2.5 10h15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
   </svg>
 {:else if name === 'close'}
   <!-- 叉：两条对角线，墨迹 11.6×11.6（跟 send 同档）。 -->

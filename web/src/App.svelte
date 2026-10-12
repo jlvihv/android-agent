@@ -19,6 +19,7 @@
   import Viewer from './components/Viewer.svelte';
   import { viewer } from './lib/viewer.svelte.ts';
   import { models } from './lib/models.svelte.ts';
+  import { openAgentBrowser } from './lib/overlay';
 
   let input = $state('');
   /** 当前看着的这个会话，本地正连着它的流。 */
@@ -412,14 +413,27 @@
     </button>
     <!-- 右上角 = 新对话（对齐 Claude 移动端：左边菜单，右边开新会话）。
          设备状态点挪进抽屉左下角的设置按钮（作为角标）。 -->
-    <button
-      onclick={newSession}
-      aria-label="新对话"
-      title="新对话"
-      class="pointer-events-auto p-1 text-fg"
-    >
-      <Icon name="newchat" size={20} />
-    </button>
+    <div class="pointer-events-auto flex items-center gap-1">
+      <!-- agent 的浏览器：它自己在后台开了网页时，用户可以看看它在干什么、
+           也能自己接着操作（壳里那块是**同一只** WebView）。没开过页面时
+           壳会提示一句，不会静默失败。 -->
+      <button
+        onclick={openAgentBrowser}
+        aria-label="看 agent 的浏览器"
+        title="看 agent 的浏览器"
+        class="p-1 text-fg"
+      >
+        <Icon name="globe" size={20} />
+      </button>
+      <button
+        onclick={newSession}
+        aria-label="新对话"
+        title="新对话"
+        class="p-1 text-fg"
+      >
+        <Icon name="newchat" size={20} />
+      </button>
+    </div>
   </header>
 
   <!-- 输入卡片也浮在内容上 -->

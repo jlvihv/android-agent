@@ -115,6 +115,16 @@ class BrowserController(private val app: Application) : BrowserHost {
     private var dead = false
 
     /**
+     * 正在跑一个动作。给看板面板显示“agent 正在操作…”用。
+     *
+     * **不用它去堵用户的手**：用户和 agent 看的是同一个页面，本来就会互相影响
+     * （OpenMinis 是在忙的时候禁掉面板上的控件，但我们这层只是“看”，先不再加锁）。
+     */
+    @Volatile
+    var busy: Boolean = false
+        private set
+
+    /**
      * 主文档的加载错误（onReceivedError 给的），navigate 会读出来报给模型
      */
     @Volatile
@@ -214,13 +224,55 @@ class BrowserController(private val app: Application) : BrowserHost {
         }
 
         lock.withLock {
+            busy = true
             return try {
                 dispatch(action)
             } catch (t: Throwable) {
                 Log.w(TAG, "动作失败: $actionJson", t)
                 err(t.message ?: t.toString())
+            } finally {
+                busy = false
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 给看板面板（MainActivity）用的几个接口。都在主线程调。
+    // -----------------------------------------------------------------------
+
+    /** agent 到底有没有开过页面（没开过就不要打开看板）。 */
+    fun hasPage(): Boolean = web != null
+
+    /** 当前 URL / 标题 / 忙不忙，给面板的头用。**只在主线程调**。 */
+    fun pageState(): Triple<String, String, Boolean> =
+        Triple(web?.url ?: "", web?.title ?: "", busy)
+
+    /**
+     * 把这只 WebView 临时挂进一个容器，让用户看 / 接管。**主线程调**。
+     *
+     * 这就是“无头”和“可见”之间唯一的关系：同一只 WebView，需要给人看的时候
+     * 才临时挂上窗口，关掉面板就摘下来 —— agent 照跑（页面不重载、状态不丢）。
+     * 绝不另建一只，否则用户看到的和 agent 操作的不是同一个页面。
+     */
+    fun attachTo(container: android.view.ViewGroup) {
+        val w = web ?: return
+        (w.parent as? android.view.ViewGroup)?.removeView(w)
+        container.removeAllViews()
+        container.addView(
+            w,
+            android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        Log.i(TAG, "面板已挂上（当前 ${w.url}）")
+    }
+
+    /** 从面板上摘下来，还它一个无头身。**主线程调**。 */
+    fun detach() {
+        val w = web ?: return
+        (w.parent as? android.view.ViewGroup)?.removeView(w)
+        Log.i(TAG, "面板已摘下（agent 继续跑在无头模式）")
     }
 
     private fun dispatch(a: JSONObject): String {

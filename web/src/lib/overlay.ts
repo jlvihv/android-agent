@@ -44,9 +44,18 @@ const stack: Layer[] = [];
 let skip = 0;
 
 /** 壳暴露给页面的钩子（桌面浏览器上没有）。见 MainActivity.kt 的 BackHost */
-type BackHost = { setBackHandled?: (handled: boolean) => void };
+type BackHost = {
+  setBackHandled?: (handled: boolean) => void;
+  /** 开 agent 的浏览器看板（没开过页面时壳会自己提示） */
+  openBrowser?: () => void;
+};
 const host = (): BackHost | undefined =>
   (globalThis as { AgentHost?: BackHost }).AgentHost;
+
+/** 头部的地球按钮调它。桌面（没有壳）上什么都不做。 */
+export function openAgentBrowser(): void {
+  host()?.openBrowser?.();
+}
 
 /**
  * 告诉壳「现在有没有覆盖层要接返回键」。

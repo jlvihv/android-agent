@@ -13,6 +13,9 @@ set positional-arguments
 core  := "core"
 web   := "web"
 and   := "android"
+# 出哪些 ABI。默认只出 arm64 —— 真机上白带一份 x86_64 是 ~4MB。
+# 模拟器要 x86_64：`AGENT_ABIS=arm64-v8a,x86_64 just emu-install`
+abis  := env_var_or_default("AGENT_ABIS", "arm64-v8a")
 mod   := and / "app"
 jni   := mod / "src/main/jniLibs"
 assets := mod / "src/main/assets"
@@ -204,7 +207,8 @@ android-libs:
     set -eu
     # cargo-ndk 同样要 cwd 在 crate 目录里
     cd {{core}}
-    cargo ndk -t arm64-v8a -o ../{{jni}} build --release --lib
+    ts=(); IFS=',' read -ra arr <<< "{{abis}}"; for a in "${arr[@]}"; do ts+=(-t "$a"); done
+    cargo ndk "${ts[@]}" -o ../{{jni}} build --release --lib
     echo "--- 16KB 对齐检查（Play 对 targetSdk 35+ 有要求，R1）---"
     # NDK 的预编译工具目录：Linux 是 linux-x86_64，macOS（含 Apple 芯片）是 darwin-x86_64
     host=linux-x86_64; [ "$(uname)" = Darwin ] && host=darwin-x86_64
@@ -275,6 +279,33 @@ android-install-release: android-release
 
 android-log:
     adb logcat -s AgentApp AgentA11y AgentDeviceHost Rootfs AgentMain
+
+# --- 模拟器（x86_64）------------------------------------------------------
+#
+# 真机是无线调试：手机一睡、用户一用、VPN 一抖，链路就掉，而且**不能在用户
+# 正用手机时拿 input tap 去戳界面**。所以"改完就看"的 UI 验收放模拟器上。
+#
+# 限制：**沙箱跑不了**（proot + rootfs 都是 aarch64）。能验 UI / 浏览器 /
+# 搜索 / LLM，不能验 bash / edit / read。见 scripts/emu.sh 顶部。
+emu *ARGS:
+    scripts/emu.sh {{ARGS}}
+
+# 模拟器上装 **debug** 包，不是 release：
+#   - WebView DevTools 开着（debug 才开）→ 可以用 CDP 精确驱动页面，
+#     不用拿 `input tap` 盲戳坐标
+#   - debug 可以用 `run-as` 读 App 私有文件（token / 会话库 / 截图）
+emu-install:
+    #!/usr/bin/env bash
+    set -eu
+    scripts/emu.sh start
+    scripts/emu.sh wait
+    export AGENT_ABIS=arm64-v8a,x86_64
+    export ANDROID_SERIAL="$(scripts/emu.sh serial)"
+    just android-debug
+    . scripts/jdk.sh
+    cd {{and}} && ./gradlew :app:installDebug
+    "$ANDROID_HOME/platform-tools/adb" -s "$ANDROID_SERIAL" shell am start -n dev.vihv.agent/.MainActivity >/dev/null
+    echo "装好了：export ANDROID_SERIAL=$ANDROID_SERIAL"
 
 # --- 验证 ------------------------------------------------------------------
 
