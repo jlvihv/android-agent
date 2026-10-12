@@ -178,6 +178,19 @@
       .join('\n');
   }
 
+  /** 人类可读的字节数，跟核心 reader::fmt_size 一致 */
+  function fmtBytes(n: number): string {
+    if (!Number.isFinite(n) || n < 0) return '?';
+    for (const [unit, div] of [
+      ['GB', 1024 ** 3],
+      ['MB', 1024 ** 2],
+      ['KB', 1024],
+    ] as const) {
+      if (n >= div) return `${(n / div).toFixed(1)}${unit}`;
+    }
+    return `${Math.round(n)}B`;
+  }
+
   type Chip = { text: string; tone: 'ok' | 'bad' | 'warn' | 'plain' };
 
   type Result = {
@@ -238,6 +251,15 @@
       chips.push({ text: `${r.wall_time_seconds}s`, tone: 'plain' });
     }
     if (r.truncated === true) chips.push({ text: '已截断', tone: 'warn' });
+
+    // read：整个文件多大（行数 / 字节数），据此知道还要读几轮
+    if (typeof r.totalLines === 'number') {
+      const size = typeof r.totalBytes === 'number' ? ` · ${fmtBytes(r.totalBytes)}` : '';
+      chips.push({ text: `${r.totalLines} 行${size}`, tone: 'plain' });
+    } else if (typeof r.imagePath === 'string' && typeof r.totalBytes === 'number') {
+      // 图片：原文件多大（本身在正文里也会写一遍）
+      chips.push({ text: fmtBytes(r.totalBytes), tone: 'plain' });
+    }
 
     // edit
     if (typeof r.message === 'string') chips.push({ text: r.message, tone: 'plain' });

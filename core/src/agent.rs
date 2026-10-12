@@ -50,14 +50,15 @@ fn build_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read",
-            description: "读取文件。输出截断到 2000 行或 50KB，被截断时末尾会写明用哪个 offset 续读。图片（png/jpg/gif/webp/bmp）会缩放后直接发给你（offset/limit 对图片无效），看截图/照片/图表用它。改文件前先用它确认原文。",
+            description: "读取文本或图片。读取文本时，输出截断到 2000 行或 50KB，被截断时末尾会写明用哪个 offset 续读；结果里的 totalLines / totalBytes 是整个文本文件的行数和字节数，据此决定继续读还是改用 bash 的 rg/sed 局部读。读取图片时（png/jpg/gif/webp/bmp）可能会缩放（offset/limit 对图片无效），结果里的 totalBytes 是原图片文件大小。",
             schema: || {
                 json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "文件路径（相对或绝对；相对路径基于 /workspace）" },
                         "offset": { "type": "integer", "description": "起始行号，从 1 开始（可选，默认 1）" },
-                        "limit": { "type": "integer", "description": "最多读取的行数（可选，默认读到截断上限）" }
+                        "limit": { "type": "integer", "description": "最多读取的行数（可选，默认读到截断上限）" },
+                        "numbered": { "type": "boolean", "description": "给每行加 cat -n 同款行号（可选，默认关）" }
                     },
                     "required": ["path"]
                 })
@@ -65,13 +66,13 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里跑 shell 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出取**尾部**（最后 2000 行或 50KB），截断时完整输出存临时文件并返回路径。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3。要点：ping 被封用 curl；Python 包优先 `apk add py3-*`；matplotlib 先 `use('Agg')`；后台服务要重定向 stdout/stderr；搜索用 `rg -uuu`。",
+            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出取**尾部**（最后 2000 行或 50KB），截断时完整输出存临时文件并返回路径。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3。要点：ping 被封用 curl；Python 包优先 `apk add py3-*`；matplotlib 先 `use('Agg')`；后台服务要重定向 stdout/stderr；搜索用 `rg -uuu`。",
             schema: || {
                 json!({
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "要执行的 shell 命令" },
-                        "timeout": { "type": "number", "description": "超时秒数（**必填**）。先估算这条命令要跑多久；下载/编译/装包可能几千秒。宁可估大：估小了会被中途杀掉，多估不会真等。上限 86400（24h）。" }
+                        "timeout": { "type": "number", "description": "超时秒数。先估算这条命令要跑多久，上限 86400（24h）。" }
                     },
                     "required": ["command", "timeout"]
                 })
@@ -104,12 +105,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "browser",
-            description: "在真浏览器（WebView）里打开网页并操作它：点、输入、滚动、读页面结构、抽正文、截图。\
-要用登录态、要看 JS 渲染出来的内容（SPA）、要填表单/点按钮，只能用它 —— curl 拿不到这些。\
-多标签：new_tab 开一只新的（默认操作总是落在当前标签上），list_tabs 看有哪些、当前是哪只。\
-典型顺序：navigate → get_backbone（拿到可点的 selector 和页面结构）→ click / type →\
-再 get_backbone 或 get_readable 确认。**读文章用 get_readable，别用 get_text**（后者带导航/页脚）。\
-只是抓一篇静态文章的话，bash 里的 curl 更快。",
+            description: "在真浏览器（WebView）里打开网页并操作它。多标签：new_tab 开一只新的（默认操作总是落在当前标签上），list_tabs 看有哪些、当前是哪只。典型顺序：navigate → get_backbone（拿到可点的 selector 和页面结构）→ click / type → 再 get_backbone 或 get_readable 确认。读文章用 get_readable，别用 get_text（后者带导航/页脚）。",
             schema: || {
                 json!({
                     "type": "object",
@@ -140,10 +136,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "search",
-            description: "联网搜索（Exa）：给一句自然语言描述的检索意图，拿回标题 + 链接 + 摘要片段。\
-**当下的事实、新闻、版本号、文档位置，先搜再答** —— 别凭记忆。片段不够时再拿链接去读全文：\
-静态页面用 bash 的 curl，要登录态 / JS 渲染 / 要点按钮用 browser 打开。\
-写检索意图而不是关键词（“对比 React 和 Vue 性能的文章”比“React Vue 性能”准）。",
+            description: "联网搜索（Exa）：给一句自然语言描述的检索意图，拿回标题 + 链接 + 摘要片段。写检索意图而不是关键词。",
             schema: || {
                 json!({
                     "type": "object",
@@ -1974,6 +1967,14 @@ fn parse_limit(args: &Value) -> anyhow::Result<Option<usize>> {
     }
 }
 
+/// `read` 的 numbered：可选布尔开关，默认关。不是布尔（模型给了字符串之类）
+/// 就当没给 —— 一个可选开关写错不该让整次 read 失败。
+fn parse_numbered(args: &Value) -> bool {
+    args.get("numbered")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // 工具执行
 // ---------------------------------------------------------------------------
@@ -2015,12 +2016,14 @@ async fn execute_tool(
             Ok(l) => l,
             Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
         };
+        let numbered = parse_numbered(&args);
 
-        return match core.read_any(path, offset, limit).await {
+        return match core.read_any(path, offset, limit, numbered).await {
             Ok(linux::ReadResult::Text(view)) => ToolOutcome::json(json!({
                 "output": view.content,
                 "truncated": view.truncated,
                 "totalLines": view.total_lines,
+                "totalBytes": view.total_bytes,
             })),
             Ok(linux::ReadResult::Image(img)) => read_image_outcome(core, path, img).await,
             Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
@@ -2202,7 +2205,7 @@ fn format_hits(found: &crate::search::Found) -> String {
 /// （`read_any` 会把它映射到 rootfs），复用 `read` 的图片管线：解码 → 缩到
 /// 2000 → 重编码 → 落盘。返回 `None` 表示这张图没拿到（调用方在文本里标明）。
 async fn browser_image(core: &Core, guest_path: &str) -> Option<ImagePart> {
-    let img = match core.read_any(guest_path, 0, None).await {
+    let img = match core.read_any(guest_path, 0, None, false).await {
         Ok(crate::linux::ReadResult::Image(img)) => img,
         Ok(_) => {
             tracing::warn!("浏览器截图不是图片: {guest_path}");
@@ -2254,8 +2257,9 @@ async fn read_image_outcome(
         .unwrap_or(true);
 
     let mime = img.mime.clone();
+    let size = crate::reader::fmt_size(img.source_bytes);
     let original = format!("{}×{}", img.original_width, img.original_height);
-    let mut output = format!("读取图片 {mime}（{original}");
+    let mut output = format!("读取图片 {mime}（{original}，{size}");
     if (img.width, img.height) != (img.original_width, img.original_height) {
         output.push_str(&format!("，已缩到 {}×{}", img.width, img.height));
     }
@@ -2269,6 +2273,7 @@ async fn read_image_outcome(
             "output": output,
             "imagePath": guest_path,
             "imageMime": mime,
+            "totalBytes": img.source_bytes,
             "truncated": false,
         }));
     }
@@ -2281,6 +2286,7 @@ async fn read_image_outcome(
                 "imageMime": mime.clone(),
                 "imageWidth": img.width,
                 "imageHeight": img.height,
+                "totalBytes": img.source_bytes,
                 "truncated": false,
             }),
             images: vec![ImagePart {
@@ -2297,6 +2303,7 @@ async fn read_image_outcome(
                 "output": output,
                 "imagePath": guest_path,
                 "imageMime": mime,
+                "totalBytes": img.source_bytes,
                 "truncated": false,
             }))
         }
@@ -2890,10 +2897,12 @@ mod tests {
 
     #[test]
     fn parse_offset_and_limit_match_the_schema() {
-        // 缺省 → 第 1 行、读到上限
+        // 缺省 → 第 1 行、读到上限、不加行号
         assert_eq!(parse_offset(&json!({})), 1);
         assert_eq!(parse_limit(&json!({})).unwrap(), None);
         assert_eq!(parse_limit(&json!({ "limit": null })).unwrap(), None);
+        assert!(!parse_numbered(&json!({})));
+        assert!(!parse_numbered(&json!({ "numbered": null })));
 
         assert_eq!(parse_offset(&json!({ "offset": 42 })), 42);
         // 非法/越界的 offset 退回第 1 行，不报错（模型偶发写 0）
@@ -2905,6 +2914,11 @@ mod tests {
         assert_eq!(parse_limit(&json!({ "limit": 0 })).unwrap(), Some(0));
         assert!(parse_limit(&json!({ "limit": -1 })).is_err());
         assert!(parse_limit(&json!({ "limit": "5" })).is_err());
+
+        assert!(parse_numbered(&json!({ "numbered": true })));
+        // 类型写错当没给，不报错
+        assert!(!parse_numbered(&json!({ "numbered": "true" })));
+        assert!(!parse_numbered(&json!({ "numbered": 1 })));
     }
 
     #[test]

@@ -142,6 +142,16 @@ def compact_args(v) -> str:
     return s if len(s) <= 300 else s[:300] + "…"
 
 
+def fmt_bytes(n) -> str:
+    """人类可读的字节数，跟核心 reader::fmt_size 一致。"""
+    if not isinstance(n, (int, float)) or n < 0:
+        return "?"
+    for unit, div in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+        if n >= div:
+            return f"{n / div:.1f}{unit}"
+    return f"{int(n)}B"
+
+
 def fmt_tool_output(name: str, out) -> str:
     if not isinstance(out, dict):
         return "   " + str(out)[:2000]
@@ -162,8 +172,12 @@ def fmt_tool_output(name: str, out) -> str:
                 str(out.get("imageMime", "图片")),
                 f"{out.get('imageWidth', '?')}×{out.get('imageHeight', '?')}",
             ]
+            if isinstance(out.get("totalBytes"), (int, float)):
+                bits.append(fmt_bytes(out["totalBytes"]))
         else:
             bits = [f"{out.get('totalLines', '?')} 行"]
+            if isinstance(out.get("totalBytes"), (int, float)):
+                bits.append(fmt_bytes(out["totalBytes"]))
             if out.get("truncated"):
                 bits.append("已截断")
         head = "   " + c(OK, " ".join(bits))

@@ -27,7 +27,10 @@ pub const MAX_DIM: u32 = 2000;
 /// 内联 base64 的字符数上限（OpenMinis 同款 4.5 MiB）
 pub const MAX_INLINE_BYTES: usize = 4_718_592;
 /// JPEG 质量档位（PNG 塞不下就依次往下试）
-const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
+///
+/// 必须从高到低：循环命中即返回，先试高质量才能“同等尺寸下尽量保真”。
+/// （曾经写成 `[80, 85, …]`，`85` 永远轮不到，是条死条目。）
+const JPEG_QUALITIES: [u8; 5] = [85, 80, 70, 55, 40];
 /// 源文件字节上限：再大就不读进内存了（正常手机图片不会到这）
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 /// 像素上限。解码是一整张放进内存（RGBA 4 字节/像素），一亿像素就是 400MB，
@@ -47,6 +50,9 @@ pub struct Encoded {
     /// 原图尺寸（按 EXIF 转正后的显示尺寸）
     pub original_width: u32,
     pub original_height: u32,
+    /// 原文件有多大（解码前的字节数）。缩放/重编码后依然能告诉模型
+    /// 「这份图原本多大」，让它判断要不要先在沙箱里缩一下再读。
+    pub source_bytes: usize,
 }
 
 /// 看魔数判断是不是认识的图片格式。不是图片返回 `None`（当文本读）。
@@ -244,6 +250,7 @@ fn encode(source: &[u8], source_mime: &str) -> anyhow::Result<Encoded> {
                 height: h,
                 original_width: w,
                 original_height: h,
+                source_bytes: source.len(),
             });
         }
     }
@@ -290,6 +297,7 @@ fn encode(source: &[u8], source_mime: &str) -> anyhow::Result<Encoded> {
                     height: th,
                     original_width: ow,
                     original_height: oh,
+                    source_bytes: source.len(),
                 });
             }
         }
@@ -303,6 +311,7 @@ fn encode(source: &[u8], source_mime: &str) -> anyhow::Result<Encoded> {
                         height: th,
                         original_width: ow,
                         original_height: oh,
+                        source_bytes: source.len(),
                     });
                 }
             }
@@ -444,6 +453,7 @@ mod tests {
         assert_eq!(e.mime, "image/png");
         assert_eq!((e.width, e.height), (64, 48));
         assert_eq!((e.original_width, e.original_height), (64, 48));
+        assert_eq!(e.source_bytes, bytes.len());
         assert!(fits_inline(e.bytes.len()));
     }
 
@@ -460,8 +470,20 @@ mod tests {
             e.height
         );
         assert_eq!((e.original_width, e.original_height), (2500, 2500));
+        // 缩放/重编码后，原始文件大小仍然如实报出来
+        assert_eq!(e.source_bytes, bytes.len());
         assert!(fits_inline(e.bytes.len()));
         assert_eq!(mime_of(&e.bytes), Some(e.mime.as_str()));
+    }
+
+    #[test]
+    fn jpeg_qualities_are_tried_from_high_to_low() {
+        // 循环命中即返回：顺序写反了低质量会盖掉高质量（`[80, 85, …]` 里的 85
+        // 永远轮不到），所以顺序本身就是要守住的行为。
+        assert!(
+            JPEG_QUALITIES.windows(2).all(|w| w[0] > w[1]),
+            "{JPEG_QUALITIES:?}"
+        );
     }
 
     #[test]

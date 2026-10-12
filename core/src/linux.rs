@@ -971,6 +971,7 @@ impl LinuxSandbox {
         guest_path: &str,
         offset: usize,
         limit: Option<usize>,
+        numbered: bool,
     ) -> anyhow::Result<ReadResult> {
         let host = self.resolve_readable(guest_path)?;
         // 先嗅头（只读 12 字节）再决定走哪条路：不能为了判断“是不是图片”
@@ -981,7 +982,9 @@ impl LinuxSandbox {
             }
         }
         let text = read_utf8(&host, guest_path)?;
-        Ok(ReadResult::Text(reader::read(&text, guest_path, offset, limit)?))
+        Ok(ReadResult::Text(reader::read(
+            &text, guest_path, offset, limit, numbered,
+        )?))
     }
 
     /// 纯文本那条路（测试与内部用）。
@@ -990,10 +993,11 @@ impl LinuxSandbox {
         guest_path: &str,
         offset: usize,
         limit: Option<usize>,
+        numbered: bool,
     ) -> anyhow::Result<ReadView> {
         let host = self.resolve_readable(guest_path)?;
         let text = read_utf8(&host, guest_path)?;
-        reader::read(&text, guest_path, offset, limit)
+        reader::read(&text, guest_path, offset, limit, numbered)
     }
 
     fn resolve_readable(&self, guest_path: &str) -> anyhow::Result<PathBuf> {
@@ -1531,7 +1535,7 @@ mod tests {
         std::fs::write(t.dir.join("workspace/a.txt"), "l0\nl1\nl2\nl3\n").unwrap();
 
         // 相对路径按 cwd `/workspace` 算
-        let v = sb.read_text("a.txt", 2, Some(2)).unwrap();
+        let v = sb.read_text("a.txt", 2, Some(2), false).unwrap();
         assert!(v.content.starts_with("l1\nl2"), "{}", v.content);
         assert!(v.content.contains("offset=4"), "{}", v.content);
     }
@@ -1553,12 +1557,12 @@ mod tests {
         let t = TempRoot::new("readbad");
         let sb = t.sandbox();
 
-        let err = sb.read_text("/root/nope.txt", 1, None).unwrap_err().to_string();
+        let err = sb.read_text("/root/nope.txt", 1, None, false).unwrap_err().to_string();
         assert!(err.contains("不存在"), "{err}");
         assert!(err.contains("bash"), "应该告诉模型替代做法: {err}");
 
         std::fs::write(t.dir.join("root/blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
-        let err = sb.read_text("/root/blob.bin", 1, None).unwrap_err().to_string();
+        let err = sb.read_text("/root/blob.bin", 1, None, false).unwrap_err().to_string();
         assert!(err.contains("UTF-8"), "{err}");
     }
 

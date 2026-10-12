@@ -255,20 +255,21 @@ impl Core {
     /// 读沙箱里的文件（`read` 工具）。
     ///
     /// 图片（`ReadResult::Image`）已经解码/缩放好、可以直接内联；
-    /// 其余是带 offset/limit/截断提示的文本。和 `edit_file` 一样是同步
+    /// 其余是带 offset/limit/numbered/截断提示的文本。和 `edit_file` 一样是同步
     /// 本地 I/O，包一层 `spawn_blocking` 免得占住 tokio 的 worker（只有 2 个）。
     pub async fn read_any(
         &self,
         path: &str,
         offset: usize,
         limit: Option<usize>,
+        numbered: bool,
     ) -> anyhow::Result<linux::ReadResult> {
         let sb = self
             .state
             .linux()
             .ok_or_else(|| anyhow::anyhow!("Linux 沙箱未初始化"))?;
         let path = path.to_string();
-        tokio::task::spawn_blocking(move || sb.read_any(&path, offset, limit)).await?
+        tokio::task::spawn_blocking(move || sb.read_any(&path, offset, limit, numbered)).await?
     }
 
     /// 跑一个浏览器动作，返回结果 JSON。
