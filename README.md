@@ -201,7 +201,7 @@ PDF / 文档输入同理，看的是 `modalities.input` 里的 `pdf`（`/api/hea
 不支持 `file` 内容块的端点接了 PDF 会直接 400。
 
 界面里点输入卡片的模型药丸 = **选择模型**面板：上面是 `GET /api/models` 拉回来的
-清单（按服务商分组，不写描述），下面两行是「思考强度」和「模型服务」（打开设置页）。思考强度选完跟着 provider 配置存进库，
+清单（不写描述），上面一行「模型提供商」切换看哪家的模型（只列配好了 Key 的），下面一行是「思考强度」。思考强度选完跟着 provider 配置存进库，
 发请求时映射成 `reasoning_effort`（Chat Completions）或 `reasoning.effort`
 （Responses）；**默认档一个字段都不发**（严格网关会 400）。
 

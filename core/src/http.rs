@@ -524,7 +524,7 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
         p.reasoning_effort = crate::llm::normalize_effort(&e);
     }
     st.set_llm(p.clone());
-    // 设置页的「模型服务」里也要看得到这一家
+    // 设置页的「模型提供商」里也要看得到这一家
     st.adopt_provider(&p);
     // 自动判定这个模型能不能吃图片 / PDF（查 models.dev），结果落盘。
     // 不劳烦用户配 —— 这是模型自己的属性。
@@ -640,7 +640,7 @@ async fn switch_provider(st: &Arc<AppState>, p: &Provider) -> (bool, bool) {
     (vision, pdf)
 }
 
-/// `GET /api/providers` → 设置页「模型服务」那一栏：内置的几家 + 其他。
+/// `GET /api/providers` → 设置页「模型提供商」那一栏：内置的几家 + 其他。
 ///
 /// 只回「配没配」和 Key 的最后 4 位，不回 Key 本身。
 async fn list_providers(State(st): State<Arc<AppState>>) -> Response {

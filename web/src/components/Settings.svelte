@@ -17,9 +17,9 @@
 
 <script lang="ts">
   /**
-   * 设置页。从抽屉左下角的齿轮、或者选择模型面板最下面的「模型服务」进来。
+   * 设置页。从抽屉左下角的齿轮、或者选择模型面板里「模型提供商」页最下面的「管理模型提供商」进来。
    *
-   * 现在只有「模型服务」一栏：内置几家服务商，每家只填 API Key；Base URL、
+   * 现在只有「模型提供商」一栏：内置几家服务商，每家只填 API Key；Base URL、
    * 协议都内置好了，模型清单自动拉（见 core/src/providers.rs）。几家可以
    * 同时配好，在选择模型面板里点哪家的模型就切到哪家。
    */
@@ -62,7 +62,7 @@
 </script>
 
 <Page title="设置" {onclose}>
-  <h2 class="px-1 pt-2 pb-2 text-meta text-muted">模型服务</h2>
+  <h2 class="px-1 pt-2 pb-2 text-meta text-muted">模型提供商</h2>
   <div class="overflow-hidden rounded-2xl bg-bubble">
     {#each rows as p (p.id)}
       <button

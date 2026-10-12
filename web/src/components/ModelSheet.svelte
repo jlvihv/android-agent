@@ -15,9 +15,10 @@
    *      任意清单（OpenCode Go 有 38 个），没有描述可写，也不该编。
    *   2. **模型清单单独滚动**：38 行会把「思考强度」推到屏幕外，得先划过 38 行
    *      才点得到。给清单一个高度上限（内容在里面滚），下面两块就永远在视野里。
-   *   3. **几家服务商的模型都在这一个清单里**，按家分组（只配了一家就不显示组名）。
-   *      点哪家的模型就切到哪家 —— Key 在设置页里各存一份。
-   *   4. 最后那块是「模型服务」：打开设置页（配 Key 的地方）。
+   *   3. 清单上面多一行「**模型提供商**」：点进去（和思考强度一样横移到第二页）
+   *      只列配好了 Key 的几家，选一家，清单就换成那家的模型。点了模型才真的
+   *      切过去 —— Key 在设置页里各存一份，不用重填。那一页最后一行「管理模型
+   *      提供商」打开设置页（添加 / 删除 Key）。
    *
    * 第二页没有返回箭头：安卓本来就有返回键/返回手势，再画一个纯属重复。
    * 返回键在 `Sheet` 里被接管（见它的 `onback`），按下是退回第一页。
@@ -35,7 +36,7 @@
     rev = 0,
   }: {
     onclose: () => void;
-    /** 「模型服务」→ 打开设置页（各家的 API Key） */
+    /** 「管理模型提供商」→ 打开设置页（各家的 API Key） */
     onconfig: () => void;
     /** 设置页关掉时会变：Key 可能改了，清单要重拉 */
     rev?: number;
@@ -44,39 +45,61 @@
   type Model = { id: string; name: string };
   /** 一家服务商的模型（`GET /api/models` 的 `groups`） */
   type Group = { id: string; name: string; models: Model[]; error?: string };
-  type Page = 'models' | 'effort';
+  type Page = 'models' | 'sub';
+  /** 第二页放什么。两个子页共用轨道上的第二个位置（不排成三页：从第一页到
+   *  第三页会把中间那页也扫一遍）。返回时不清，让它滑出去时内容还在。 */
+  type Sub = 'effort' | 'providers';
 
   let page = $state<Page>('models');
+  let sub = $state<Sub>('effort');
   let groups = $state<Group[]>([]);
   /** 当前在用的是哪家（服务商 id） */
   let currentProvider = $state<string | null>(null);
+  /** 清单正在看哪家（模型提供商页选的）。默认是当前在用的那家。 */
+  let viewing = $state<string | null>(null);
+  const shown = $derived(groups.find((g) => g.id === viewing) ?? groups[0] ?? null);
   const modelCount = $derived(groups.reduce((n, g) => n + g.models.length, 0));
   let loading = $state(true);
   let err = $state('');
   let busy = $state(false);
   let scroller = $state<HTMLDivElement | null>(null);
   let paneModels = $state<HTMLDivElement | null>(null);
-  let paneEffort = $state<HTMLDivElement | null>(null);
+  let paneSub = $state<HTMLDivElement | null>(null);
   let hModels = $state(0);
-  let hEffort = $state(0);
+  let hSub = $state(0);
 
   const current = $derived(store.llm?.model ?? '');
   const effort = $derived(store.llm?.reasoningEffort ?? null);
-  /** 预测性返回的进度（只在思考强度页）：0 = 原位，1 = 已完全回到第一页 */
+  /** 预测性返回的进度（只在第二页）：0 = 原位，1 = 已完全回到第一页 */
   let peekP = $state(0);
   /** 跟手中：关掉过渡，不然手指和内容之间有延迟 */
   let peeking = $state(false);
 
   /** 0 = 在第一页，1 = 在第二页；跟手返回时介于两者之间 */
-  const at = $derived(page === 'effort' ? 1 - peekP : 0);
+  const at = $derived(page === 'sub' ? 1 - peekP : 0);
   /** 视口高度跟着当前页走：切页时整个面板一起长高/变矮；跟手时按进度插值 */
-  const height = $derived(hModels + (hEffort - hModels) * at);
+  const height = $derived(hModels + (hSub - hModels) * at);
   const ease = 'cubic-bezier(0.32,0.72,0,1)';
 
   const back = () => (page = 'models');
+  const openSub = (s: Sub) => {
+    sub = s;
+    page = 'sub';
+  };
+
+  /** 在模型提供商页选了一家：回到清单，换成这家的模型 */
+  function view(id: string) {
+    viewing = id;
+    back();
+    requestAnimationFrame(() => {
+      if (!scroller) return;
+      scroller.scrollTop = 0;
+      scroller.querySelector('[data-current="1"]')?.scrollIntoView({ block: 'center' });
+    });
+  }
 
   /**
-   * 思考强度页的跟手返回：第一页从左边跟着手指滑回来（和点进来时的方向相反），
+   * 第二页的跟手返回：第一页从左边跟着手指滑回来（和点进来时的方向相反），
    * 面板本身不动。松手完成就接着滑完，撤回就弹回第二页。
    */
   const peek: Peek = {
@@ -97,9 +120,11 @@
   $effect(() => {
     void modelCount;
     void groups.length;
+    void viewing;
+    void sub;
     void loading;
     if (paneModels) hModels = paneModels.offsetHeight;
-    if (paneEffort) hEffort = paneEffort.offsetHeight;
+    if (paneSub) hSub = paneSub.offsetHeight;
   });
 
   $effect(() => {
@@ -116,6 +141,8 @@
       const d = (await r.json()) as { groups?: Group[]; provider?: string | null };
       groups = d.groups ?? [];
       currentProvider = d.provider ?? null;
+      // 正在看的那家还在就不动（设置页里改完 Key 回来别跳走），否则看当前这家
+      if (!groups.some((g) => g.id === viewing)) viewing = currentProvider ?? groups[0]?.id ?? null;
     } catch (e) {
       err = String(e);
     } finally {
@@ -163,10 +190,10 @@
 </script>
 
 <Sheet
-  title={page === 'effort' ? '思考强度' : '选择模型'}
-  onback={page === 'effort' ? back : undefined}
+  title={page === 'sub' ? (sub === 'effort' ? '思考强度' : '模型提供商') : '选择模型'}
+  onback={page === 'sub' ? back : undefined}
   {peek}
-  slide={page === 'effort' ? 1 : -1}
+  slide={page === 'sub' ? 1 : -1}
   minClass="min-h-0"
   {onclose}
 >
@@ -184,51 +211,58 @@
     >
       <div class="w-1/2 shrink-0">
         <div bind:this={paneModels} class="flex flex-col gap-3">
-          <!-- 模型清单：自己滚，别把下面两块顶出屏幕 -->
+          <!-- 模型提供商：切到第二页，选看哪家的模型 -->
+          <button
+            onclick={() => openSub('providers')}
+            class="flex w-full items-center gap-3 rounded-2xl bg-bubble px-4 py-3.5 text-left
+                   active:bg-control"
+          >
+            <span class="shrink-0 text-[17px]">模型提供商</span>
+            <span class="ml-auto flex min-w-0 items-center gap-0.5 text-[17px] text-muted">
+              <span class="truncate">{shown?.name ?? '未配置'}</span>
+              <Icon name="chevron" size={16} class="shrink-0" />
+            </span>
+          </button>
+
+          <!-- 模型清单：自己滚，别把下面那块顶出屏幕 -->
           <div
             bind:this={scroller}
             class="max-h-[42dvh] overflow-y-auto overscroll-contain rounded-2xl bg-bubble"
           >
             {#if loading && groups.length === 0}
               <p class="px-4 py-3.5 text-base text-muted">载入中…</p>
-            {:else if groups.length === 0}
+            {:else if !shown}
               <!-- 一家都没配：直接带去设置页 -->
               <button onclick={onconfig} class="flex w-full flex-col gap-0.5 px-4 py-3.5 text-left active:bg-control">
-                <span class="text-[17px]">还没有配置模型服务</span>
+                <span class="text-[17px]">还没有配置模型提供商</span>
                 <span class="text-meta text-accent">去设置里填一个 API Key</span>
               </button>
             {:else}
-              {#each groups as g (g.id)}
-                <!-- 只配了一家就不显示组名（就是一个普通清单） -->
-                {#if groups.length > 1}
-                  <p class="sticky top-0 z-10 bg-bubble px-4 pt-3 pb-1.5 text-meta text-muted">{g.name}</p>
-                {/if}
-                {#if g.error}
-                  <p class="border-b border-hairline px-4 py-3 text-meta leading-relaxed text-bad">
-                    拉不到模型：{g.error}
-                  </p>
-                {/if}
-                {#each g.models as m (m.id)}
-                  <button
-                    data-current={isCurrent(g, m) ? '1' : undefined}
-                    onclick={() => pickModel(g, m)}
-                    disabled={busy}
-                    class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
-                           text-left active:bg-control"
-                  >
-                    <span class="min-w-0 flex-1 truncate text-[17px]">{m.name}</span>
-                    {#if isCurrent(g, m)}
-                      <Icon name="check" size={17} class="shrink-0 text-fg" />
-                    {/if}
-                  </button>
-                {/each}
+              {#if shown.error}
+                <p class="border-b border-hairline px-4 py-3 text-meta leading-relaxed text-bad">
+                  拉不到模型：{shown.error}
+                </p>
+              {/if}
+              {#each shown.models as m (m.id)}
+                <button
+                  data-current={isCurrent(shown, m) ? '1' : undefined}
+                  onclick={() => pickModel(shown, m)}
+                  disabled={busy}
+                  class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
+                         text-left last:border-b-0 active:bg-control"
+                >
+                  <span class="min-w-0 flex-1 truncate text-[17px]">{m.name}</span>
+                  {#if isCurrent(shown, m)}
+                    <Icon name="check" size={17} class="shrink-0 text-fg" />
+                  {/if}
+                </button>
               {/each}
             {/if}
           </div>
 
           <!-- 思考强度：切到第二页 -->
           <button
-            onclick={() => (page = 'effort')}
+            onclick={() => openSub('effort')}
             class="flex w-full items-center rounded-2xl bg-bubble px-4 py-3.5 text-left
                    active:bg-control"
           >
@@ -239,42 +273,64 @@
             </span>
           </button>
 
-          <!-- 模型服务：打开设置页（各家的 API Key） -->
-          <button
-            onclick={onconfig}
-            class="flex w-full items-center gap-3 rounded-2xl bg-bubble px-4 py-3.5 text-left
-                   active:bg-control"
-          >
-            <span class="text-[17px]">模型服务</span>
-            <span class="ml-auto min-w-0 truncate text-[17px] text-muted">
-              {groups.length > 0 ? `${groups.length} 家` : '未配置'}
-            </span>
-            <Icon name="chevron" size={16} class="shrink-0 text-muted" />
-          </button>
         </div>
       </div>
 
       <div class="w-1/2 shrink-0">
-        <div bind:this={paneEffort} class="flex flex-col gap-3">
-          <div class="overflow-hidden rounded-2xl bg-bubble">
-            {#each EFFORTS as e (e.label)}
-              <button
-                onclick={() => pickEffort(e.value)}
-                disabled={busy}
-                class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
-                       text-left last:border-b-0 active:bg-control"
-              >
-                <span class="min-w-0 flex-1 truncate text-[17px]">{e.label}</span>
-                {#if e.value === effort}
-                  <Icon name="check" size={17} class="shrink-0 text-fg" />
-                {/if}
-              </button>
-            {/each}
-          </div>
+        <div bind:this={paneSub} class="flex flex-col gap-3">
+          {#if sub === 'providers'}
+            <!-- 只列配好了 Key 的几家；加新的去设置页 -->
+            {#if groups.length > 0}
+              <div class="overflow-hidden rounded-2xl bg-bubble">
+                {#each groups as g (g.id)}
+                  <button
+                    onclick={() => view(g.id)}
+                    class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
+                           text-left last:border-b-0 active:bg-control"
+                  >
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-[17px]">{g.name}</span>
+                      <span class="block truncate text-meta {g.error ? 'text-bad' : 'text-muted'}">
+                        {g.error ? '拉不到模型' : g.id === currentProvider ? '正在使用' : `${g.models.length} 个模型`}
+                      </span>
+                    </span>
+                    {#if g.id === shown?.id}
+                      <Icon name="check" size={17} class="shrink-0 text-fg" />
+                    {/if}
+                  </button>
+                {/each}
+              </div>
+            {/if}
 
-          <p class="px-1 text-meta leading-relaxed text-muted">
-            档位越高，模型想得越久：回复更充分，也更慢。有些服务不认识这个参数，会直接忽略。
-          </p>
+            <button
+              onclick={onconfig}
+              class="flex w-full items-center gap-3 rounded-2xl bg-bubble px-4 py-3.5 text-left
+                     active:bg-control"
+            >
+              <span class="text-[17px]">管理模型提供商</span>
+              <Icon name="chevron" size={16} class="ml-auto shrink-0 text-muted" />
+            </button>
+          {:else}
+            <div class="overflow-hidden rounded-2xl bg-bubble">
+              {#each EFFORTS as e (e.label)}
+                <button
+                  onclick={() => pickEffort(e.value)}
+                  disabled={busy}
+                  class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
+                         text-left last:border-b-0 active:bg-control"
+                >
+                  <span class="min-w-0 flex-1 truncate text-[17px]">{e.label}</span>
+                  {#if e.value === effort}
+                    <Icon name="check" size={17} class="shrink-0 text-fg" />
+                  {/if}
+                </button>
+              {/each}
+            </div>
+
+            <p class="px-1 text-meta leading-relaxed text-muted">
+              档位越高，模型想得越久：回复更充分，也更慢。有些服务不认识这个参数，会直接忽略。
+            </p>
+          {/if}
         </div>
       </div>
     </div>

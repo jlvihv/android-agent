@@ -56,7 +56,7 @@
 
   let drawer = $state(false);
   let sheet = $state(false);
-  /** 设置页。可以从抽屉的齿轮进，也可以从模型面板的「模型服务」进 ——
+  /** 设置页。可以从抽屉的齿轮进，也可以从模型面板「模型提供商」页的「管理模型提供商」进 ——
    *  后者是叠在模型面板上面的，关掉之后回到模型面板。每层各自在
    *  lib/overlay.ts 里登记，返回键先关最上面那层。 */
   let settings = $state(false);
