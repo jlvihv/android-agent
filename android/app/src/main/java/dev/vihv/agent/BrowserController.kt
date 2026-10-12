@@ -57,8 +57,11 @@ class BrowserController(private val app: Application) : BrowserHost {
         /** navigate 等 `onPageFinished` 的上限。等不到不算失败（SPA 经常不触发） */
         private const val NAV_TIMEOUT_MS = 25_000L
 
-        /** 页面停止后额外等一会儿再读 DOM：JS 渲染（SPA）大多在这一小段里完成 */
-        private const val SETTLE_MS = 400L
+        /** 页面停止后至少再等这么一会儿：JS 渲染（SPA）大多在这一小段里完成 */
+        private const val SETTLE_MS = 300L
+
+        /** 动作后的“等页面安定”预算：先用短的，不够再显式调 wait_for_dom_stable */
+        private const val SETTLE_BUDGET_MS = 4_000L
 
         /** 骨架树给模型的文本上限（它会进历史，按钱算） */
         private const val BACKBONE_MAX_CHARS = 12_000
@@ -123,24 +126,49 @@ class BrowserController(private val app: Application) : BrowserHost {
     }
 
     /**
-     * 动作之后等页面安定：先看它跳没跳。
+     * 等页面安定：DOM 的“指纹”连续 3 次读数一致才算稳。
      *
-     * 只 sleep 固定时间的话读到的还是**上一页**的 url/title，模型会以为没跳
-     * （实测踩过：点了一个外站链接，返回的 url 还是原来那个）。
+     * **为什么在 App 侧轮询，而不是在页面里 `setTimeout` 自己退**：页面在不挂窗口
+     * 的 WebView 里（大概率还切了后台）会被 Chromium 把定时器节流到秒级 ——
+     * 写在页面里的轮询会又慢又不准。App 侧注入是主动执行的，不受这个影响。
+     *
+     * 指纹用「元素个数 + 可见文字长度 + 滚动高度」：三个都能被内容变化推动，
+     * 而计算它们不需要序列化整个 DOM（重页面 serialize 一次就卡住了）。
      */
-    private fun settleAfterAction(started0: Int) {
-        // 最多等 1.2s 看有没有开始加载（点击后跳页很快就会触发）
-        val deadline = System.currentTimeMillis() + 1200
-        var navigating = false
+    private fun awaitDomStable(timeoutMs: Long) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var last = ""
+        var same = 0
         while (System.currentTimeMillis() < deadline) {
-            if (navCounters().first > started0) {
-                navigating = true
-                break
+            val sig = runCatching { eval(DOM_SIG_JS) }.getOrNull()
+            if (sig == null) return // 页面可能正在换文档（导航），当作“还在动”
+            if (sig == last && sig != "null") {
+                same++
+                if (same >= 3) return
+            } else {
+                same = 0
             }
+            last = sig
+            Thread.sleep(250)
+        }
+    }
+
+    /** 动作之后的统一“安定”流程：先看它跳没跳，再等 DOM 稳。*/
+    private fun settleAfterAction(started0: Int) {
+        val navigating = waitForNavStart(started0, 1200)
+        if (navigating) awaitLoad(started0, 20_000)
+        else Thread.sleep(SETTLE_MS)
+        awaitDomStable(SETTLE_BUDGET_MS)
+    }
+
+    /** 等一次新的页面加载开始。`true` = 真的开始加载了 */
+    private fun waitForNavStart(started0: Int, maxMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + maxMs
+        while (System.currentTimeMillis() < deadline) {
+            if (navCounters().first > started0) return true
             Thread.sleep(60)
         }
-        if (navigating) awaitLoad(started0, 20_000)
-        Thread.sleep(SETTLE_MS)
+        return false
     }
 
     /** 页面弹过的 alert/confirm/prompt。它们被我们吞掉了，得让模型知道 */
@@ -186,6 +214,8 @@ class BrowserController(private val app: Application) : BrowserHost {
             "click" -> click(a)
             "type" -> type(a.optString("selector"), a.optString("text"))
             "get_text" -> getText(a.optString("selector").ifEmpty { null })
+            "get_readable" -> getReadable()
+            "wait_for_dom_stable" -> waitForDomStable(a)
             "scroll" -> scroll(a)
             "screenshot" -> screenshot()
             "back" -> goBack()
@@ -414,7 +444,7 @@ class BrowserController(private val app: Application) : BrowserHost {
             Log.i(TAG, "等 onPageFinished 超时，照样往下读")
         }
         // JS 渲染出来的内容大多在这一小段里出现
-        Thread.sleep(SETTLE_MS)
+        awaitDomStable(SETTLE_BUDGET_MS)
 
         val info = pageInfo()
         val title = info?.optString("title").orEmpty()
@@ -441,7 +471,8 @@ class BrowserController(private val app: Application) : BrowserHost {
                     scrollY: Math.round(window.scrollY),
                     scrollHeight: document.documentElement.scrollHeight,
                     innerWidth: window.innerWidth,
-                    innerHeight: window.innerHeight
+                    innerHeight: window.innerHeight,
+                    elements: document.querySelectorAll('*').length
                   });
                 })()
                 """.trimIndent(),
@@ -484,8 +515,10 @@ class BrowserController(private val app: Application) : BrowserHost {
 
         settleAfterAction(snap)
         val info = pageInfo()
+        val matched = out.optInt("matched", 1)
+        val extra = if (matched > 1) "（selector 匹配到 $matched 个，点的是第一个）" else ""
         return ok(
-            "已点击 <${out.optString("tag")}> ${out.optString("text").take(80)}",
+            "已点击 <${out.optString("tag")}> ${out.optString("text").take(80)}$extra",
             info?.optString("url").orEmpty(),
             info?.optString("title").orEmpty(),
         )
@@ -498,7 +531,9 @@ class BrowserController(private val app: Application) : BrowserHost {
         val out = evalToJson(typeJs(sel, text.orEmpty())) ?: return errObj("输入失败")
         out.optString("error").takeIf { it.isNotEmpty() }?.let { return errObj(it) }
         settleAfterAction(snap)
-        return ok("已往 ${sel} 输入 ${out.optInt("length")} 个字符")
+        val matched = out.optInt("matched", 1)
+        val extra = if (matched > 1) "（selector 匹配到 $matched 个，填的是第一个）" else ""
+        return ok("已往 ${sel} 输入 ${out.optInt("length")} 个字符$extra")
     }
 
     private fun getText(sel: String?): JSONObject {
@@ -512,6 +547,51 @@ class BrowserController(private val app: Application) : BrowserHost {
         }
         val head = if (sel.isNullOrEmpty()) "整页正文" else "$sel 的文本"
         return ok("$head（${out.optInt("length")} 字）：\n$text")
+    }
+
+    /**
+     * 抽正文（文章页用它，不要用 get_text）。
+     *
+     * `get_text` 给的是整个 body 的 innerText，导航/页脚/推荐位/广告语全在上面 ——
+     * 实测一篇 CNBC 报道拿回 6415 字，一半是菜单和免责声明。这里先找“最像正文的
+     * 容器”（段落密度 + 链接密度惩罚），再按文档顺序只取标题/段落/列表项/引用/代码，
+     * 顺带去重、去掉导航块。
+     */
+    private fun getReadable(): JSONObject {
+        ensureWeb()
+        val out = evalToJson(READABLE_JS) ?: return errObj("抽正文失败")
+        out.optString("error").takeIf { it.isNotEmpty() }?.let { return errObj(it) }
+
+        val title = out.optString("title")
+        val desc = out.optString("description")
+        var text = out.optString("text")
+        val chars = out.optInt("length")
+        if (text.length > TEXT_MAX_CHARS) {
+            text = text.take(TEXT_MAX_CHARS) + "\n…（已截断）"
+        }
+        val head = buildString {
+            append("正文")
+            if (title.isNotEmpty()) append("：【$title】")
+            append("（原文 $chars 字，来源 ${out.optString("source")}")
+            append(if (desc.isNotEmpty()) "；描述：${desc.take(160)}" else "")
+            append("）")
+        }
+        return ok("$head\n$text")
+    }
+
+    /** 等 DOM 安定（动态内容/无限滚动靠它）。`timeout` 秒，默认 10 */
+    private fun waitForDomStable(a: JSONObject): JSONObject {
+        ensureWeb()
+        val seconds = a.optInt("timeout", 10).coerceIn(1, 30)
+        val t0 = System.currentTimeMillis()
+        awaitDomStable(seconds * 1000L)
+        val ms = System.currentTimeMillis() - t0
+        val info = pageInfo()
+        return ok(
+            "等了 ${ms}ms，页面安定（元素 ${info?.optInt("elements") ?: 0} 个）",
+            info?.optString("url").orEmpty(),
+            info?.optString("title").orEmpty(),
+        )
     }
 
     private fun scroll(a: JSONObject): JSONObject {
@@ -761,12 +841,13 @@ class BrowserController(private val app: Application) : BrowserHost {
 
     private fun clickSelJs(selector: String): String = """
         (function() {
-          var el = document.querySelector('${jsQuote(selector)}');
-          if (!el) return JSON.stringify({error: '没找到元素: ${jsQuote(selector)}'});
+          var list = document.querySelectorAll('${jsQuote(selector)}');
+          if (!list.length) return JSON.stringify({error: '没找到元素: ${jsQuote(selector)}'});
+          var el = list[0];
           if (el.disabled) return JSON.stringify({error: '元素是 disabled 的'});
           el.scrollIntoView({block: 'center'});
           ${CLICK_EVENTS}
-          return JSON.stringify({clicked: true, tag: el.tagName, text: (el.innerText || el.value || '').substring(0, 100)});
+          return JSON.stringify({clicked: true, matched: list.length, tag: el.tagName, text: (el.innerText || el.value || '').substring(0, 100)});
         })()
     """.trimIndent()
 
@@ -791,8 +872,9 @@ class BrowserController(private val app: Application) : BrowserHost {
      */
     private fun typeJs(selector: String, text: String): String = """
         (function() {
-          var el = document.querySelector('${jsQuote(selector)}');
-          if (!el) return JSON.stringify({error: '没找到元素: ${jsQuote(selector)}'});
+          var list = document.querySelectorAll('${jsQuote(selector)}');
+          if (!list.length) return JSON.stringify({error: '没找到元素: ${jsQuote(selector)}'});
+          var el = list[0];
           var val = '${jsQuote(text)}';
           el.focus();
           if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
@@ -822,7 +904,7 @@ class BrowserController(private val app: Application) : BrowserHost {
           // 丢掉焦点：很多表单/搜索框是 onblur 才提交或校验的
           el.dispatchEvent(new FocusEvent('blur', {bubbles: true, relatedTarget: null}));
           el.blur();
-          return JSON.stringify({typed: true, length: val.length});
+          return JSON.stringify({typed: true, matched: list.length, length: val.length});
         })()
     """.trimIndent()
 
@@ -1073,6 +1155,137 @@ class BrowserController(private val app: Application) : BrowserHost {
     """.trimIndent()
 
     /**
+     * 抽正文。思路（Readability 的简化版，只留真管用的那几条）：
+     *
+     * 1. 候选容器：article / main / [role=main] / div / section / td。
+     * 2. 打分：里面的 `<p>`（≥ 25 字，不在 nav/footer/aside/header/form 里）
+     *    每个算 1 + min(字数/100, 3)；再加一点总长度的分。
+     * 3. **链接密度惩罚**：整块里链接文字占比 > 50% 的多半是导航/列表页，×0.3。
+     * 4. 输出不取整个容器的 innerText（那还会带上里面的分享按钮、相关阅读），
+     *    而是按文档顺序只取 h1-h3 / p / li / blockquote / pre / figcaption，
+     *    跳过导航块；块里只有一个链占主体时把链接地址附在后面。
+     *
+     * 分太低（< 6）就退回 body —— 那就是 `get_text` 的行为，但模型已明确
+     * 要求“正文”，总比返回空好。
+     */
+    private val READABLE_JS = """
+        (function() {
+          var SKIP_TAGS = {NAV:1, FOOTER:1, ASIDE:1, HEADER:1, FORM:1, SCRIPT:1, STYLE:1, NOSCRIPT:1, IFRAME:1, BUTTON:1, SELECT:1};
+          // 块自身的类名像“周边”的：整块不要
+          var JUNK = /(^|[\s_-])(nav|menu|sidebar|footer|header|comment|share|sharing|social|promo|ads?|advert|breadcrumb|cookie|consent|privacy|legal|terms|gdpr|ccpa|disclaimer|banner|subscribe|newsletter|signup|login|paywall|related|recommend|popup|modal|toolbar|masthead)([\s_-]|$)/i;
+          // 候选容器的正/负信号（Readability 的做法：同一份分数，类名不同差 10 倍）
+          var POS = /(^|[\s_-])(article|body|content|entry|main|page|post|story|text|blog|read)([\s_-]|$)/i;
+          var NEG = /(^|[\s_-])(nav|menu|sidebar|footer|comment|promo|related|recommend|popular|banner|cookie|consent|privacy|legal|terms|gdpr|subscribe|newsletter|signup|login|paywall|popup|modal|advert|ads?|social|share|widget|tool|tags)([\s_-]|$)/i;
+          function t(el) { return (el.innerText || el.textContent || '').trim(); }
+          function names(el) {
+            return (typeof el.className === 'string' ? el.className : '') + ' ' +
+                   (el.id || '') + ' ' + (el.getAttribute ? (el.getAttribute('role') || '') : '');
+          }
+          function inChrome(el) {
+            try { return !!el.closest('nav, footer, aside, header, form, [aria-hidden="true"]'); } catch (e) { return false; }
+          }
+          // 自己或**上面 6 层**里任何一层像周边，就当周边。
+          // 只查自己不够 —— 实测 CNBC 的 cookie 声明是一堆正常 <p>，包在一个
+          // `#...CookieNotice` 的壳里，段落自己的类名毫无异常。
+          function junk(el) {
+            var cur = el, depth = 0;
+            while (cur && cur !== document.body && depth++ < 6) {
+              if (JUNK.test(names(cur))) return true;
+              cur = cur.parentElement;
+            }
+            return false;
+          }
+          function hidden(el) {
+            var st = getComputedStyle(el);
+            return st.display === 'none' || st.visibility === 'hidden';
+          }
+          function bad(el) { return SKIP_TAGS[el.tagName] || inChrome(el) || hidden(el) || junk(el); }
+          function weight(el) {
+            var s = names(el);
+            if (NEG.test(s)) return 0.15;
+            if (POS.test(s)) return 2;
+            return 1;
+          }
+
+          var h1 = null;
+          var hs = document.querySelectorAll('h1');
+          for (var i = 0; i < hs.length; i++) {
+            if (!bad(hs[i]) && t(hs[i]).length > 3) { h1 = hs[i]; break; }
+          }
+
+          var cands = document.querySelectorAll('article, main, [role=main], div, section, td');
+          var best = null, bestScore = 0;
+          for (var i = 0; i < cands.length; i++) {
+            var c = cands[i];
+            if (bad(c)) continue;
+            var ps = c.querySelectorAll('p');
+            if (!ps.length) continue;
+            var s = 0;
+            for (var j = 0; j < ps.length; j++) {
+              var p = ps[j];
+              if (bad(p)) continue;
+              var pt = t(p);
+              if (pt.length < 25) continue;
+              s += 1 + Math.min(pt.length / 100, 3);
+            }
+            if (s <= 0) continue;
+            s *= weight(c);
+            // 页面主标题在哪个块里 —— 强信号，正文容器几乎一定包含它
+            if (h1 && c.contains(h1)) s += 20;
+            var all = t(c);
+            var linkLen = 0;
+            var as = c.querySelectorAll('a');
+            for (var k = 0; k < as.length; k++) linkLen += t(as[k]).length;
+            if (all.length > 0 && linkLen / all.length > 0.5) s *= 0.3;
+            s += Math.min(all.length / 1000, 5);
+            if (s > bestScore) { bestScore = s; best = c; }
+          }
+
+          var host = best, source = 'best-block';
+          if (!host || bestScore < 6) { host = document.body; source = 'body(fallback)'; }
+
+          var chunks = [];
+          var nodes = host.querySelectorAll('h1, h2, h3, p, li, blockquote, pre, figcaption');
+          for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            if (bad(n)) continue;
+            if (n.tagName === 'LI' && n.querySelector('p')) continue;
+            var txt = t(n);
+            if (!txt || txt.length < 2) continue;
+            if (n.tagName === 'PRE') { chunks.push('```\n' + (n.innerText || '') + '\n```'); continue; }
+            if (n.tagName === 'H1' || n.tagName === 'H2' || n.tagName === 'H3') { chunks.push('## ' + txt); continue; }
+            if (chunks.length > 400) break;
+            var links = n.querySelectorAll('a[href]');
+            if (links.length === 1 && t(links[0]).length > txt.length * 0.6) {
+              try {
+                var u = new URL(links[0].href);
+                var where = (u.host === location.host) ? (u.pathname + (u.search || '')) : (u.host + u.pathname);
+                chunks.push(txt + '  [' + where + ']');
+                continue;
+              } catch (e) {}
+            }
+            chunks.push(txt);
+          }
+          var out = [];
+          for (var i = 0; i < chunks.length; i++) {
+            if (i > 0 && chunks[i] === chunks[i - 1]) continue;
+            out.push(chunks[i]);
+          }
+          var body = out.join('\n\n');
+          var title = document.title || '';
+          if (h1) { var ht = t(h1); if (ht && title.indexOf(ht) < 0) title = ht + ' — ' + title; }
+          var md = document.querySelector('meta[name="description"]');
+          return JSON.stringify({
+            text: body.substring(0, 60000),
+            length: body.length,
+            title: title.substring(0, 200),
+            description: md ? (md.content || '').substring(0, 300) : '',
+            source: source
+          });
+        })()
+    """.trimIndent()
+
+    /**
      * 页面里的 `target=_blank` / `window.open` 不另开窗口（我们的 WebView 没有
      * 多窗口能力，点了会**什么都不发生** —— 模型只会看到"点了但没反应"）。
      * 每页开始加载时把 `_blank` 掰成 `_self`，链接就在原地打开。
@@ -1113,4 +1326,10 @@ class BrowserController(private val app: Application) : BrowserHost {
           return JSON.stringify({pending: 0, ok: (typeof v.ok === 'string' ? v.ok : JSON.stringify(v.ok))});
         })()
     """.trimIndent()
+
+    /** DOM 指纹：元素个数 + 可见文字长度 + 滚动高度。变了就说明还没稳 */
+    private val DOM_SIG_JS =
+        "(function(){var b=document.body;if(!b)return 'null';" +
+            "return document.querySelectorAll('*').length+':'+(b.innerText||'').length+':'+" +
+            "(document.documentElement.scrollHeight||0);})()"
 }

@@ -67,12 +67,14 @@
     const label: Record<string, string> = {
       navigate: '打开',
       get_backbone: '读结构',
+      get_readable: '抽正文',
+      get_text: '读文本',
       click: '点击',
       type: '输入',
-      get_text: '读文本',
       scroll: '滚动',
       screenshot: '截图',
       back: '后退',
+      wait_for_dom_stable: '等页面安定',
       js: '执行 JS',
     };
     const target = s(a.url) || s(a.selector) || (a.x !== undefined ? `${a.x},${a.y}` : '');
@@ -147,6 +149,7 @@
     if (action === 'js') return s(a.script);
     if (action === 'type') return `${s(a.selector)} ← ${s(a.text)}`;
     if (action === 'click' && !s(a.selector)) return `(${a.x}, ${a.y})`;
+    if (action === 'get_readable' || action === 'screenshot' || action === 'back') return '';
     return s(a.selector) || JSON.stringify(a, null, 2);
   }
 

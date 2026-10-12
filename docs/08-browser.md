@@ -42,7 +42,7 @@ POST /api/browser ─┘                                        ├─ BrowserCo
   ② 走到一次工具调用要花一整轮 LLM，调试时不现实 —— 有个能直接打的入口，
   改一行 JS 就能立刻验。
 - **`browser` 工具**：`action` 枚举 + 可选参数。动作是
-  `navigate / get_backbone / click / type / get_text / scroll / screenshot / back / js`。
+  `navigate / get_backbone / get_readable / get_text / click / type / scroll / screenshot / back / wait_for_dom_stable / js`。
   描述里写清"什么时候用它、什么时候 curl 更快"，这决定模型会不会用对。
 
 ## 4. 无头 WebView 必须自己做的事
@@ -80,7 +80,46 @@ POST /api/browser ─┘                                        ├─ BrowserCo
 压过的图，历史里存的也是压过的那份。**截图不会自动附**：它进历史就破坏
 prompt cache（见 03），想看画面要显式调 `screenshot`。
 
-## 6. `get_backbone`：模型"看"页面的主要方式
+## 6. `get_readable`：读文章用这个，别用 `get_text`
+
+`get_text` 给的是整个 body 的 innerText —— 导航、页脚、推荐位、cookie 声明全在
+上面。实测一篇 CNBC 报道拿回 **6597 字，一半是菜单和免责声明**。
+
+`get_readable` 抽正文（Readability 的简化版，只留真管用的那几条）：
+
+1. 候选容器：`article / main / [role=main] / div / section / td`。
+2. 打分：里面的 `<p>`（≥ 25 字）每个算 `1 + min(字数/100, 3)`。
+3. **正/负类名权重**：类名/id 命中 `article|body|content|story…` ×2，
+   命中 `cookie|consent|privacy|nav|comment|promo…` ×0.15。同一份分数差十倍。
+4. **包含页面 `h1` 的容器 +20** —— 正文容器几乎一定含着主标题。
+5. 链接密度 > 50% 的块 ×0.3（那是导航/列表）。
+6. 输出不取整个容器的 innerText，而是按文档顺序只取
+   `h1-h3 / p / li / blockquote / pre / figcaption`，并跳过导航块；
+   块里只有一个链接占主体时把地址附上（搜索页/目录页用）。
+
+**踩过的坑**：第一版把 CNBC 的 cookie 声明当成了正文 —— 它段落又长又多，
+分数比正文还高。两个修正缺一不可：① 周边判断要查**上面 6 层祖先**的类名
+（cookie 的壳在很上面，`p` 自己的类名毫无异常）；② 前面那套权重。
+修完同一页：**4426 字的干净正文**（标题、导语、段落、无菜单无 cookie）。
+
+## 7. 等页面安定：不要在页面里 `setTimeout`
+
+`navigate` / `click` / `type` 之后都要“等页面安定”，否则读到的是半渲的动态内容。
+判据是 **DOM 指纹连续 3 次一致**（元素个数 + 可见文字长度 + 滚动高度）。
+
+关键：**在 App 侧轮询，不在页面里等**。不挂窗口的 WebView（大概率还切了后台）
+会被 Chromium 把定时器节流到秒级，页面内轮询又慢又不准；App 侧注入是主动执行的。
+代价是每个动作多几次往返（毫秒级）。
+
+需要更久就显式调 `wait_for_dom_stable`（`timeout` 秒，默认 10、上限 30）。
+
+## 8. selector 匹配多个要说话
+
+`click` / `type` 用 `querySelectorAll(...)[0]`，但**结果里会写“匹配到 N 个，
+点的是第一个”** —— 模型拿到这句话才知道自己可能点错了，该换更精确的 selector
+还是用坐标。默默只点第一个，它就无从判断。
+
+## 9. `get_backbone`：模型"看"页面的主要方式
 
 不把 HTML 丢给模型（太大、全是噪音），抽一棵可见元素树：
 
@@ -102,7 +141,7 @@ prompt cache（见 03），想看画面要显式调 `screenshot`。
 锚点还会带上跨域域名（`-> www.cnbc.com /2026/…`），否则模型只看到
 `/2026/…` 以为还在本站。
 
-## 7. 已知边界
+## 10. 已知边界
 
 - **单标签**。一个进程一只 WebView、一把锁串行化动作（两个动作交叉执行会让
   `navigate A → click` 点到别的页面上）。多标签要引入池 + 归属（OpenMinis 那套）。
@@ -113,7 +152,7 @@ prompt cache（见 03），想看画面要显式调 `screenshot`。
 所以动作仍尽量幂等，进度靠会话历史恢复。
 - **吞掉的弹窗**只报"页面弹窗已自动关闭"，不做交互。
 
-## 8. 怎么调
+## 11. 怎么调
 
 不用花 token，也不用装 APK 之外的东西：
 
@@ -123,6 +162,8 @@ just phone                       # 交互模式
   /bash agent browser navigate https://example.com
   /bash agent browser get_backbone 2
   /bash agent browser get_text '#main'
+  /bash agent browser get_readable                 # 文章页抽正文
+  /bash agent browser wait_for_dom_stable 10       # 等动态内容安定
   /bash agent browser click 'a[href="/next"]'
   /bash agent browser screenshot                  # 存 /root/.browser/
   /bash agent browser js 'return document.title'

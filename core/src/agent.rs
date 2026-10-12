@@ -104,18 +104,19 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "browser",
-            description: "在真浏览器（WebView）里打开网页并操作它：点、输入、滚动、读页面骨架、截图。\
+            description: "在真浏览器（WebView）里打开网页并操作它：点、输入、滚动、读页面结构、抽正文、截图。\
 要用登录态、要看 JS 渲染出来的内容（SPA）、要填表单/点按钮，只能用它 —— curl 拿不到这些。\
 典型顺序：navigate → get_backbone（拿到可点的 selector 和页面结构）→ click / type →\
-再 get_backbone 确认。只是抓一篇静态文章的话，bash 里的 curl 更快。",
+再 get_backbone 或 get_readable 确认。**读文章用 get_readable，别用 get_text**（后者带导航/页脚）。\
+只是抓一篇静态文章的话，bash 里的 curl 更快。",
             schema: || {
                 json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；click=点 selector 或坐标；type=往 selector 里输入文本；get_text=读正文（不给 selector 就是整页）；scroll=滚动；screenshot=截图（模型能看到图）；back=后退；js=在页面里执行一段 JS（返回值 JSON 化后给你）",
-                            "enum": ["navigate", "get_backbone", "click", "type", "get_text", "scroll", "screenshot", "back", "js"]
+                            "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；get_readable=抽正文（文章页用它，比 get_text 干净得多）；get_text=读整页/某元素的文本；click=点 selector 或坐标；type=往 selector 里输入；scroll=滚动；screenshot=截图（模型能看到图）；back=后退；wait_for_dom_stable=等动态内容安定下来；js=在页面里执行一段 JS（返回值 JSON 化后给你）",
+                            "enum": ["navigate", "get_backbone", "get_readable", "get_text", "click", "type", "scroll", "screenshot", "back", "wait_for_dom_stable", "js"]
                         },
                         "url": { "type": "string", "description": "navigate 的目标。没写协议头就按 https 补" },
                         "selector": { "type": "string", "description": "CSS selector。get_backbone 给出的 sel 可以直接用" },
@@ -125,7 +126,8 @@ fn build_tools() -> Vec<ToolSpec> {
                         "script": { "type": "string", "description": "js 动作要执行的代码。可以是 async，允许 await 和顶层 return" },
                         "direction": { "type": "string", "description": "scroll 方向", "enum": ["up", "down"] },
                         "amount": { "type": "integer", "description": "scroll 每次滚多少像素（默认 500）" },
-                        "max_depth": { "type": "integer", "description": "get_backbone 的树深度（默认 5）" }
+                        "max_depth": { "type": "integer", "description": "get_backbone 的树深度（默认 5）" },
+                        "timeout": { "type": "integer", "description": "wait_for_dom_stable 等几秒（默认 10，上限 30）" }
                     },
                     "required": ["action"]
                 })

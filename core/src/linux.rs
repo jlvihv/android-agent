@@ -340,8 +340,13 @@ EOT
         if [ -n "${2:-}" ]; then body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\",\"amount\":$2}"; else body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\"}"; fi ;;
       screenshot) body='{"action":"screenshot"}' ;;
       back)       body='{"action":"back"}' ;;
+      get_readable) body='{"action":"get_readable"}' ;;
+      wait_for_dom_stable)
+        if [ -n "${1:-}" ]; then body="{\"action\":\"wait_for_dom_stable\",\"timeout\":$1}"; else body='{"action":"wait_for_dom_stable"}'; fi ;;
       js)         body="{\"action\":\"js\",\"script\":\"$(esc "${1:-}")\"}" ;;
-      *)          body="$act" ;;
+      # 第一眼像 JSON 就原样发（复杂参数走这条）；否则当成不带参数的 action 名
+      \{*) body="$act" ;;
+      *)   body="{\"action\":\"$(esc "$act")\"}" ;;
     esac
     post /api/browser "$body"
     ;;
