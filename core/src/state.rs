@@ -154,6 +154,14 @@ pub enum Event {
         ok: bool,
         detail: String,
     },
+    /// 沙箱里有人要“用浏览器打开这个网址”（`xdg-open` / `$BROWSER` →
+    /// `agent-open` → `POST /api/open`）。
+    ///
+    /// `gh auth login --web` 这类流程就靠它：沙箱里没有浏览器，但用户手里有，
+    /// 宿主收到就把页面推到他眼前。
+    OpenUrl {
+        url: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

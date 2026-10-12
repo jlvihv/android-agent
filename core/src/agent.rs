@@ -66,7 +66,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3/diff/patch。Python 包优先 `apk add py3-*`；后台服务要重定向 stdout/stderr。",
+            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。已预装 bash/curl/git/gh/jq/rg/fd/tree/unzip/python3/diff/patch。沙箱里没有浏览器：`xdg-open <url>` 会把页面交给用户的手机打开。Python 包优先 `apk add py3-*`；后台服务要重定向 stdout/stderr。",
             schema: || {
                 json!({
                     "type": "object",
@@ -80,7 +80,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit",
-            description: "改文件：edits 做精确替换（一个或多个；相邻改动合并成一条，不要为了够到远处的改动而在 oldText 里塞大段没变的内容）。新建文件：只给 content（全文），文件已存在会报错 —— 要改已有文件请先 read 再用 edits。edits 与 content 只能给一个。",
+            description: "改文件：edits 做精确替换（一个或多个；相邻改动合并成一条，不要为了够到远处的改动而在 oldText 里塞大段没变的内容）。新建文件：只给 content（全文），文件已存在会报错。edits 与 content 互斥。",
             schema: || {
                 json!({
                     "type": "object",
@@ -579,6 +579,9 @@ pub const SYSTEM_PROMPT: &str = "\
   图片/音频/视频都用图片语法 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
 - 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、\n\
   `agent command`（按键/点击/滑动/启动应用），`agent help` 看全部。\n\
+- 沙箱里**没有浏览器**：`xdg-open <url>`（`$BROWSER` 同一个）会让用户的手机\n\
+  打开这个页面。需要在浏览器里登录/授权的东西（如 `gh auth login --web`）就用它，\n\
+  并给足 timeout（900 秒级）：用户输完码，命令会自己跑完。\n\
 \n\
 回答要言简意赅。";
 
@@ -2121,15 +2124,21 @@ async fn execute_tool(
             None => core.run_linux(script, timeout).await,
         };
         return match res {
-            Ok(r) => ToolOutcome::json(json!({
-                "output": r.to_text(),
-                "exit_code": r.code,
-                "truncated": r.truncated,
-                "timed_out": r.timed_out,
-                "signal": r.signal,
-                "full_output_path": r.full_output_path,
-                "wall_time_seconds": (r.duration_ms as f64) / 1000.0,
-            })),
+            Ok(r) => {
+                let text = r.to_text();
+                ToolOutcome::json(json!({
+                    // 输出里的网址给前端做成一键打开（见 `urls` 模块）——
+                    // 沙箱里没有浏览器，但用户手里有
+                    "urls": crate::urls::extract(&text),
+                    "output": text,
+                    "exit_code": r.code,
+                    "truncated": r.truncated,
+                    "timed_out": r.timed_out,
+                    "signal": r.signal,
+                    "full_output_path": r.full_output_path,
+                    "wall_time_seconds": (r.duration_ms as f64) / 1000.0,
+                }))
+            }
             Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
         };
     }

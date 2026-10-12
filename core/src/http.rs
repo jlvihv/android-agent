@@ -32,6 +32,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/websearch", post(web_search))
         .route("/api/websearch/config", post(set_search_config))
         .route("/api/edit", post(edit_file))
+        .route("/api/open", post(open_url))
         .route("/api/llm", post(set_llm))
         .route("/api/models", get(get_models))
         .route("/api/providers", get(list_providers))
@@ -265,6 +266,36 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
         .into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
     }
+}
+
+/// 沙箱里的 `agent-open`（也就是 `xdg-open` / `sensible-browser` / `$BROWSER`）
+/// 打过来的：请宿主帮我把这个网址打开。
+///
+/// 为什么要有它：沙箱里没有浏览器，而 `gh auth login --web` 这类流程必须让
+/// 用户去浏览器输一次码。靠“把 URL 打到 stdout 里、等用户自己复制”也能用，
+/// 但把页面直接推到用户眼前差一个数量级（OpenMinis 就是这么干的）。
+///
+/// **只认 http/https**：这不是给沙箱开任意 scheme / intent 的后门。
+#[derive(serde::Deserialize)]
+struct OpenBody {
+    url: String,
+}
+
+async fn open_url(State(st): State<Arc<AppState>>, Json(body): Json<OpenBody>) -> Response {
+    let url = body.url.trim();
+    let http = url.starts_with("http://") || url.starts_with("https://");
+    if !http || url.len() > 2048 {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("只接受 http(s) URL：{url}"),
+        )
+            .into_response();
+    }
+    st.log("info", format!("在浏览器里打开 {url}"));
+    st.emit(Event::OpenUrl {
+        url: url.to_string(),
+    });
+    Json(json!({ "ok": true, "url": url })).into_response()
 }
 
 /// `POST /api/browser` → 直接跑一个浏览器动作（对应 `browser` 工具）。
@@ -2226,6 +2257,49 @@ mod tests {
             "",
         ] {
             assert!(!is_loopback_origin(bad), "{bad}");
+        }
+    }
+
+    /// `/api/open`：沙箱里的 `agent-open`（也就是 `$BROWSER` / `xdg-open`）用它的。
+    /// 两个要求：只认 http(s)（不是给沙箱开任意 scheme 的后门）、要把事件
+    /// 广播出去（前端靠它把页面推到用户眼前）。
+    #[tokio::test]
+    async fn open_url_only_accepts_http_and_broadcasts_it() {
+        let st = crate::state::AppState::new();
+        let mut rx = st.tx.subscribe();
+        let (base, c) = serve(st.clone()).await;
+        let post = |url: &str| {
+            let c = c.clone();
+            let base = base.clone();
+            let url = url.to_string();
+            async move {
+                c.post(format!("{base}/api/open"))
+                    .json(&serde_json::json!({ "url": url }))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let r = post("https://github.com/login/device").await;
+        assert_eq!(r.status().as_u16(), 200);
+        // 前面还会播一条 Log（“在浏览器里打开 …”，给日志面板看的），跳过它
+        let mut got = None;
+        for _ in 0..5 {
+            match rx.recv().await.expect("应该广播出去") {
+                crate::state::Event::OpenUrl { url } => {
+                    got = Some(url);
+                    break;
+                }
+                crate::state::Event::Log { .. } => continue,
+                other => panic!("期望 OpenUrl，拿到 {other:?}"),
+            }
+        }
+        assert_eq!(got.as_deref(), Some("https://github.com/login/device"));
+
+        for bad in ["file:///etc/passwd", "javascript:alert(1)", "minis://x", ""] {
+            let r = post(bad).await;
+            assert_eq!(r.status().as_u16(), 400, "{bad} 不该被接受");
         }
     }
 }

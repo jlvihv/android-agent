@@ -316,7 +316,7 @@ minirootfs 里**只有 busybox**：没有 python、没有 curl、没有 jq，`gr
 （`prepare_rootfs` 写进 `/usr/local/bin/agent-setup`，清单在 `linux.rs` 的 `TOOLSET`）：
 
 ```
-bash curl ca-certificates grep findutils jq git ripgrep fd tree unzip python3 openssl
+bash curl ca-certificates grep findutils jq git github-cli diffutils patch ripgrep fd tree unzip python3 openssl
 ```
 
 三个实现上的坑：
@@ -336,6 +336,29 @@ bash curl ca-certificates grep findutils jq git ripgrep fd tree unzip python3 op
 
 这样 agent 就有了真正的计算机：**跑代码**（`bash`）+ 沙箱里的文件系统，
 这才是 OpenMinis 那个形态。
+
+### 沙箱里没有浏览器：`$BROWSER` 垫片 + `/api/open`
+
+登录类命令（`gh auth login --web`、`python -m webbrowser`、`xdg-open`）原本在沙箱里
+全是 `not found` —— 沙箱里没有浏览器，可用户手里有。
+
+`prepare_rootfs` 会写 `/usr/local/bin/agent-open`，以及 `xdg-open` /
+`sensible-browser` / `www-browser` / `x-www-browser` / `gnome-open` / `kde-open`
+六个转发垫片；`guest_env()` 把 `BROWSER` **强制**指过去（覆盖用户 dotfile 里的值，
+跟 OpenMinis `PRootKernel.kt:159` 的 T195 一个道理）。
+
+`agent-open` 不打开任何东西，它把 URL `POST` 给核心的 `/api/open`（跟沙箱里的
+`agent` 命令同一个通道：`AGENT_PORT` + `AGENT_TOKEN`）。核心只认 http(s)（不是给
+沙箱开任意 scheme 的后门），校验后广播 `Event::OpenUrl`；前端收到就尽力弹窗，被
+WebView 的弹窗策略拦下就留一条可点的横幅 —— 点一下走 `location.href`，
+`shouldOverrideUrlLoading` 把它交给系统浏览器，聊天页本身不动（那个回调返回 true）。
+
+另外 bash 结果里会带一个 `urls: [...]`（`urls` 模块扫输出里的 http(s) 网址）：
+gh 的设备码页是它自己 print 出来的 —— 不是所有 CLI 都会去调浏览器 —— 前端把这几条
+渲染成可点的药丸，用户不用手抄。
+
+需要用户在浏览器里输码的命令（如 `gh auth login --web`）要给足 timeout（900 秒级）：
+命令会一直轮询到用户授权完，token 落在沙箱的 `/root/.config/gh/hosts.yml`（持久）。
 
 > 早期的设计把读界面 / 操作界面做成 `device_snapshot` / `device_tap` 两个工具。
 > 现在它们不作为工具暴露给模型了 —— 以后收进沙箱里的一个命令、由 `linux_run`

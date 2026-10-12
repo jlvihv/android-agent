@@ -32,6 +32,7 @@ pub mod responses;
 pub mod search;
 pub mod sse;
 pub mod state;
+pub mod urls;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

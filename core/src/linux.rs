@@ -435,6 +435,60 @@ EOT
 esac
 "##;
 
+/// 沙箱里的 `agent-open`：站在 `xdg-open` / `sensible-browser` / `$BROWSER`
+/// 的位置上。
+///
+/// 它**不打开**任何东西 —— 沙箱里没有浏览器 —— 而是把 URL 报给宿主
+/// （`POST /api/open`，跟 `agent` 命令同一个通道），由宿主推到用户眼前。
+/// 手机上就是系统浏览器。
+///
+/// 为什么值得做：`gh auth login --web`、`python -m webbrowser`、`xdg-open`
+/// 这类都要用户去浏览器里看/输一次码。靠“URL 打在 stdout 里等用户自己复制”
+/// 能用，但把页面直接推过去差一个数量级（OpenMinis 的 `minis-open` 同思路）。
+const AGENT_OPEN: &str = r##"#!/bin/sh
+# agent-open —— 把 URL 交给宿主去打开。
+#
+#   agent-open <url>
+#
+# 也会以 xdg-open / sensible-browser / www-browser / x-www-browser /
+# gnome-open / kde-open 的身份被调用，参数里可能有 --flags，忽略非 URL 的。
+set -eu
+
+BASE="${AGENT_BASE:-http://127.0.0.1:${AGENT_PORT:-}}"
+if [ -z "$BASE" ] || [ "$BASE" = "http://127.0.0.1:" ]; then
+  echo "agent-open: AGENT_PORT 没设 —— 不是在 agent 的 bash 里跑？" >&2
+  exit 0
+fi
+AUTH="x-agent-token: ${AGENT_TOKEN:-}"
+
+url=""
+for a in "$@"; do
+  case "$a" in
+    http://*|https://*) url="$a"; break ;;
+  esac
+done
+if [ -z "$url" ]; then
+  # 文件/非 http 的打开请求我们没法处理。不报错：xdg-open 常被链在脚本里。
+  echo "agent-open: 不是 http(s) URL，跳过: $*" >&2
+  exit 0
+fi
+
+body=$(printf '{"url":"%s"}' "$(printf '%s' "$url" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')")
+if wget -q -T 30 -O - --header "$AUTH" --header 'content-type: application/json' \
+     --post-data "$body" "$BASE/api/open" >/dev/null 2>&1; then
+  echo "已在用户的浏览器里打开: $url"
+else
+  # 退一步：把网址说清楚，用户还能自己复制。仍然 exit 0 ——
+  # gh auth login 这类调用方不该因为“没人帮它开浏览器”就整体失败。
+  echo "agent-open: 没能让宿主打开，网址是: $url" >&2
+fi
+"##;
+
+/// 这六个名字都是“开浏览器”的常见入口（OpenMinis 垫的是同一组），全转发给
+/// `agent-open`。
+const BROWSER_SHIM: &str =
+    "#!/bin/sh\n# 见 agent-open；这些名字都是“开浏览器”的常见入口。\nexec /usr/local/bin/agent-open \"$@\"\n";
+
 /// 预装的工具。**改这里就够了** —— `agent-setup` 脚本是从它生成的。
 ///
 /// 为什么预装：Alpine minirootfs 里只有 busybox（没有 python、没有 curl、
@@ -442,6 +496,7 @@ esac
 /// 后面每个回合就不用自己 `apk add`，也不会因为工具的小脾气卡住。
 ///
 /// 增删请顺手想一下体积：手机上这是要下载的（约 75MB），别把 ffmpeg 塞进来。
+/// 清单里最大的一块是 `github-cli`（单它装完就 44 MiB）。
 pub const TOOLSET: &[&str] = &[
     "bash",            // 提示词里让模型用 bash，沙箱里原来只有 ash
     "curl",            // 比 busybox wget 好用得多
@@ -450,9 +505,10 @@ pub const TOOLSET: &[&str] = &[
     "findutils",       // GNU find
     "jq",              // JSON（模型处理 JSON 太频繁了）
     "git",
-    "diffutils", // diff/cmp：改文件前后对比、自己生成 patch
-    "patch",     // 应用 diff（模型写/接补丁时用得上）
-    "ripgrep",   // rg
+    "github-cli", // gh：不用手掰 API / 开网页就能看 issue/PR、克隆、下 release
+    "diffutils",  // diff/cmp：改文件前后对比、自己生成 patch
+    "patch",      // 应用 diff（模型写/接补丁时用得上）
+    "ripgrep",    // rg
     "fd",
     "tree",
     "unzip", // busybox 没有
@@ -483,7 +539,7 @@ MARK=/etc/agent-tools
 VERSION=__VERSION__
 BASE="__PACKAGES__"
 # 装完必须能找到这些命令（ca-certificates 没有命令，单独查证书包）
-CHECK="bash curl grep find jq git rg fd tree unzip python3 openssl diff patch"
+CHECK="bash curl grep find jq git gh rg fd tree unzip python3 openssl diff patch"
 CA=/etc/ssl/certs/ca-certificates.crt
 
 missing() {
@@ -674,6 +730,22 @@ impl LinuxSandbox {
 
         // 沙箱里的 `agent` 命令：让模型能查看 / 操作自己
         write_if_changed(&rootfs.join("usr/local/bin/agent"), AGENT_CLI, true)?;
+        // 开浏览器：$BROWSER / xdg-open 都指向它（见 AGENT_OPEN）
+        write_if_changed(&rootfs.join("usr/local/bin/agent-open"), AGENT_OPEN, true)?;
+        for alias in [
+            "xdg-open",
+            "sensible-browser",
+            "www-browser",
+            "x-www-browser",
+            "gnome-open",
+            "kde-open",
+        ] {
+            write_if_changed(
+                &rootfs.join("usr/local/bin").join(alias),
+                BROWSER_SHIM,
+                true,
+            )?;
+        }
         // 预装工具的那个脚本（App 启动后会自动跑一次，也可以手动跑）
         write_if_changed(
             &rootfs.join("usr/local/bin/agent-setup"),
@@ -815,7 +887,12 @@ impl LinuxSandbox {
         env.insert("CHARSET".into(), "UTF-8".into());
         env.insert("LANG".into(), "C.UTF-8".into());
         env.insert("TERM".into(), "dumb".into()); // 非交互，别输出 ANSI
-                                                  // 分页器会**挂住**（非交互环境没人按键），一次工具调用就废了
+                                                  // 沙箱里没有浏览器，但用户手里有：把 BROWSER 指到 agent-open，
+                                                  // `gh auth login --web` / python webbrowser / xdg-open 都会变成
+                                                  // 「请宿主打开」，登录页就真的出在用户面前。
+                                                  // 强制覆盖（不 putIfAbsent）：用户 dotfile 里的 BROWSER= 不该抢走它。
+        env.insert("BROWSER".into(), "/usr/local/bin/agent-open".into());
+        // 分页器会**挂住**（非交互环境没人按键），一次工具调用就废了
         env.insert("PAGER".into(), "cat".into());
         env.insert("GIT_PAGER".into(), "cat".into());
         env.insert("NO_COLOR".into(), "1".into());
@@ -1787,6 +1864,14 @@ mod tests {
             env.get("TMPDIR").map(String::as_str),
             Some("/cache/proot-tmp")
         );
+
+        // 沙箱里没有浏览器：$BROWSER 指向 agent-open，沙箱里任何“开浏览器”
+        // 的调用（gh auth login / python webbrowser / xdg-open）都会变成
+        // “请宿主打开”。
+        assert_eq!(
+            env.get("BROWSER").map(String::as_str),
+            Some("/usr/local/bin/agent-open")
+        );
     }
 
     #[test]
@@ -2343,7 +2428,15 @@ mod tests {
         }
 
         // 清单得真管用：模型最常碰的几样必须在
-        for want in ["ripgrep", "fd", "jq", "python3", "curl", "bash"] {
+        for want in [
+            "ripgrep",
+            "fd",
+            "jq",
+            "python3",
+            "curl",
+            "bash",
+            "github-cli",
+        ] {
             assert!(TOOLSET.contains(&want), "预装清单里少了 {want}");
         }
 
@@ -2353,6 +2446,58 @@ mod tests {
         assert!(!sb.is_provisioned(), "老版本的标记不该算装过");
         std::fs::write(t.dir.join("etc/agent-tools"), TOOLSET.len().to_string()).unwrap();
         assert!(sb.is_provisioned());
+
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    /// 沙箱里没有浏览器：`$BROWSER` 和 xdg-open 这些名字都得指向 `agent-open`，
+    /// 它再 `POST /api/open` 让宿主把页面推到用户面前（`gh auth login` 靠它）。
+    #[test]
+    fn rootfs_gets_the_browser_shims() {
+        let t = TempRoot::new("open");
+        let sb = t.sandbox();
+        sb.prepare_rootfs().unwrap();
+
+        let open = t.dir.join("usr/local/bin/agent-open");
+        let body = std::fs::read_to_string(&open).expect("agent-open 没写进去");
+        assert!(body.starts_with("#!/bin/sh"));
+        assert!(body.contains("/api/open"), "{body}");
+        assert!(body.contains("AGENT_PORT"), "{body}");
+
+        for alias in [
+            "xdg-open",
+            "sensible-browser",
+            "www-browser",
+            "x-www-browser",
+            "gnome-open",
+            "kde-open",
+        ] {
+            let p = t.dir.join("usr/local/bin").join(alias);
+            let shim =
+                std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{alias} 没写进去: {e}"));
+            assert!(
+                shim.contains("exec /usr/local/bin/agent-open"),
+                "{alias}: {shim}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+                assert_eq!(mode & 0o111, 0o111, "{alias} 必须可执行");
+            }
+        }
+
+        if let Ok(out) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&open)
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "agent-open 语法不过：{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&t.dir);
     }

@@ -19,6 +19,21 @@ export type LogItem = { id: number; ts: number; level: string; msg: string };
 
 let logSeq = 0;
 
+/**
+ * 尽力开一个新窗口；返回是否成功。
+ *
+ * 专给「没有用户手势」的自动打开用 —— 失败时**不能**退化成同帧导航，
+ * 那会把用户的聊天页导航走（桌面浏览器上尤其明显）。用户点了才走
+ * `AgentStore.openExternal`。
+ */
+function tryOpenNewWindow(url: string): boolean {
+  try {
+    return !!window.open(url, '_blank', 'noopener,noreferrer');
+  } catch {
+    return false;
+  }
+}
+
 class AgentStore {
   connected = $state(false);
   hello = $state<Hello | null>(null);
@@ -47,6 +62,13 @@ class AgentStore {
   sandboxKey = $state('');
   logs = $state<LogItem[]>([]);
   acks = $state<(Ack & { ts: number })[]>([]);
+  /**
+   * 沙箱里有人要用浏览器打开网址（`agent-open` → `POST /api/open`）。
+   *
+   * `opened` = 自动弹窗成功；false 时界面留一条可点的横幅，用户点一下一定开
+   * （`gh auth login` 的登录页就是靠这个送到眼前的）。
+   */
+  openUrl = $state<{ url: string; opened: boolean } | null>(null);
   /** 当前正在流式接收的助手消息 */
   streaming = $state<Message | null>(null);
 
@@ -155,7 +177,34 @@ class AgentStore {
       case 'agent':
         if (this.streaming) applyChunk(this.streaming, ev.chunk as never);
         break;
+
+      case 'open_url': {
+        // 沙箱里有人要开浏览器（agent-open → /api/open）。
+        //
+        // 先尽力直接开：手机上 WebView 的弹窗策略不一定允许**没有用户手势**
+        // 的 window.open，被拦了就留一条可点的横幅（见 App.svelte）。
+        const opened = tryOpenNewWindow(ev.url);
+        this.openUrl = { url: ev.url, opened };
+        break;
+      }
     }
+  }
+
+  /**
+   * 打开一个外部链接（用户点的时候用）。
+   *
+   * 先试新窗口（桌面浏览器：新标签页）。安卓 WebView 默认
+   * `setSupportMultipleWindows(false)`，`window.open` 会直接返回 null 什么也不干，
+   * 这时退成**同帧导航** —— MainActivity 的 `shouldOverrideUrlLoading` 会把它
+   * 交给系统浏览器，而聊天页自己不动（那个回调返回 true，不真的加载）。
+   */
+  openExternal(url: string): void {
+    if (tryOpenNewWindow(url)) return;
+    location.href = url;
+  }
+
+  dismissOpenUrl(): void {
+    this.openUrl = null;
   }
 
   pushLog(level: string, msg: string): void {
