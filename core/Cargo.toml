@@ -95,6 +95,26 @@ lto = true
 codegen-units = 1
 strip = true
 opt-level = "s"
-# 注意：不要设 panic = "abort"。D1 选了进程内 .so，
-# 需要在 FFI 边界 catch_unwind 兜住 panic，否则一个 Rust panic 会带走整个 App。
-panic = "unwind"
+# **panic 就崩**，不兜。
+#
+# 一整套理由都指向它：
+#
+# - 兜 panic 等于让库把它**悄悄吞掉**：tokio 里任务默默死掉、uniffi 把它翻成
+#   一句没头没尾的异常，前端看到的只是「流断在半路 / 一句话都没有」。实测
+#   踩过（`/api/chat` 只发出 start/start-step 就没了），根因在 stderr 里，
+#   而安卓的 stderr 是丢掉的 —— 那种失败比崩溃难查得多。
+# - 我们自己的代码基本不 panic：生产代码里只有 6 处 unwrap/expect，且都是
+#   内部不变量（`find(|s| s.id == id).unwrap()` 这种刚查过就取）。会 panic
+#   就是 bug，就该崩出来。
+# - 第三方解码器（image / zune_jpeg / png）的**解码 API 本来就是 `Result`**，
+#   畸形输入走 `Err`；真 panic 是它们的 bug —— 那就修 / 换 / 自己写，
+#   不要盖毯子（曾为这个加过一层 `catch_unwind`，已去掉，见 imaging.rs）。
+#
+# 副作用（都是想要的）：`catch_unwind` 全部失效、`Mutex` 中毒从此不可能、
+# 栈回溯不用留 —— `.eh_frame` / `.eh_frame_hdr` / `.gcc_except_table` 连同
+# 一堆清理代码全省掉。实测 `.so` 7.78MB → 6.72MB，打进 APK 少 ~388KB。
+#
+# 注意：`cargo test` 走 dev profile（unwind），**运行时行为测不到** ——
+# 别以为测试过了就等于 release 也会 abort。`lib.rs` 里有一个测试专门
+# 盯着这一行配置，防止它被无声改回去。
+panic = "abort"

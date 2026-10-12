@@ -46,8 +46,27 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 | 省电 | 单进程 | 多一个常驻进程 |
 
 **倾向：A（进程内）**。理由：单进程省电、不需要 `extractNativeLibs`、日志统一、启动快。
-缓解崩溃风险：`std::panic::set_hook` + `catch_unwind`，关键路径不 panic。
-若你更看重"核心可热替换/崩溃隔离"，选 B，我按 B 设计也行。
+
+**崩溃策略：`panic = "abort"` —— panic 就崩，不兜。**
+
+一开始写的是「`set_hook` + `catch_unwind`，关键路径不 panic」，那样是错的：兜住的
+panic 会退化成前端一句没头没尾的报错、或者干脆静默断流（实测踩过：`/api/chat`
+只发出 `start`/`start-step` 就没了）。根因在 stderr 里，而**安卓的 stderr 是丢掉的**
+—— 那种失败比崩溃难查得多。
+
+中间还试过一版「编译期 `unwind` + hook 里 abort，只给第三方解码器开一个宽容区」，
+后来也去掉了：`image` / `zune_jpeg` / `png` 的**解码 API 本来就是 `Result`**，
+畸形输入走 `Err`；会 panic 是它们的 bug。**对一个 bug 的正确反应是暴露它然后修/换，
+不是盖毯子** —— 盖住之后，这类 bug 永远只在用户那里变成一句看不懂的报错。
+
+结论：`panic = "abort"`，`catch_unwind` 一律不用。真出现解码器 panic，logcat 里会有
+`RUST PANIC` + 那个 crate 的源码路径（版本号就在路径里），照着去修、去换、或者自己写一个。
+
+代价 / 收益：`.eh_frame` / `.eh_frame_hdr` / `.gcc_except_table` 和一堆清理代码全省掉，
+`.so` 7.78MB → 6.72MB，打进 APK 少 ~388KB。`Mutex` 中毒也从此不可能发生。
+同样的理由写在 `core/Cargo.toml` 的 `[profile.release]` 里。
+
+若你更看重「核心可热替换/崩溃隔离」，选 B，我按 B 设计也行。
 
 ---
 

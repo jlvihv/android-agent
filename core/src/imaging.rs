@@ -107,16 +107,25 @@ pub fn load_if_image_bytes(source: &[u8]) -> anyhow::Result<Option<Encoded>> {
         return Ok(None);
     };
 
-    // 第三方解码器碰到损坏/恶意文件时，**有极小概率是 panic 而不是返回 Err**。
-    // 兜住它：一个坏图片最坏只该让 `read` 报错，不该把一个回合（甚至进程）
-    // 带走。和 FFI 边界上 `catch_unwind` 同一个理由。
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        encode(source, source_mime)
-    })) {
-        Ok(Ok(img)) => Ok(Some(img)),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow::anyhow!("图片解码时内部出错（文件可能损坏）")),
-    }
+    // **故意不兜 panic**（release 是 `panic = "abort"`，见 Cargo.toml）。
+    //
+    // 这里曾经套过一层 `catch_unwind`，理由是「`image` / `zune_jpeg` / `png`
+    // 的解码器碰到畸形文件时可能 panic 而不是返回 Err，一张坏图不该带走
+    // 整个 App」。那个理由站不住：
+    //
+    // - 这些解码器的**公开 API 本来就是 `Result`**，畸形输入走 `Err`；
+    //   会 panic 就是它们的 bug（上游靠 fuzz 一个个抓）。
+    // - 对一个 bug 的正确反应是让它暴露、然后修掉，不是给它盖毯子。盖上
+    //   之后这类 bug 永远只在用户那里变成「read 报了个看不懂的错」，我们
+    //   这边一点信号都没有 —— 正好是这套策略要防的事。
+    //
+    // 所以真遇到解码器 panic 时：logcat 里会有 `RUST PANIC` + 那个 crate 的
+    // 源码路径（版本号就在路径里，例如 `zune-jpeg-0.5.15/src/…`），顺着找过去，
+    // 然后**修 / 换 / 自己写**那个解码器，而不是把 abort 改回去。
+    //
+    // 上面那两道防线保留：`dimensions()` 预检 + `Limits`（宽高/分配上限）把
+    // 畸形输入变成正常的 `Err`，那是防患于未然，和「兜 panic」不是一回事。
+    encode(source, source_mime).map(Some)
 }
 
 /// 原始字节的 base64 长度（不真的编码，只算长度）

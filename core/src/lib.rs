@@ -41,6 +41,17 @@ pub use state::{AppState, Command, DeviceApi, Event, VERSION};
 // 之后 `uniffi-bindgen generate --library` 才能从 .so 里读出元数据。
 uniffi::setup_scaffolding!();
 
+/// 打一条无论如何都要看到的日志。
+///
+/// 安卓走 logcat（stderr 根本收不到），桌面走 stderr（可能还没有 logger）。
+/// panic hook 用它 —— 那条日志是进程死掉前最后一次说话。
+fn shout(msg: &str) {
+    #[cfg(target_os = "android")]
+    log::error!("{msg}");
+    #[cfg(not(target_os = "android"))]
+    eprintln!("{msg}");
+}
+
 /// 初始化日志。安卓上同时输出到 logcat，桌面上输出到 stdout。
 pub fn init_tracing() {
     // rustls 的 crypto provider 必须在**建任何 reqwest client 之前**装好，
@@ -49,17 +60,21 @@ pub fn init_tracing() {
     // 放在这里是因为桌面 / 安卓两条启动路径都会先调它。
     crate::llm::install_crypto_provider();
 
-    // panic hook。
+    // panic hook。它只负责**说话**，不负责决定死活 ——
+    // 死活由 `[profile.release] panic = "abort"` 定死（见 Cargo.toml）：
+    // panic 就是崩，没有第二种可能，`catch_unwind` 全部失效。
     //
-    // 必须装：Rust 的 panic 默认打到 stderr，而 **Android 上 stderr 是丢掉的**。
-    // 不装的话任务里 panic 了只会看到流莫名断掉，完全查不出原因
-    // （实测踩过：只有 start/start-step 然后就 [DONE]）。
+    // 必须说话：Rust 的 panic 默认打到 stderr，而 **Android 上 stderr 是
+    // 丢掉的**。不装 hook 的话，任务里 panic 了只会看到流莫名断掉，完全
+    // 查不出原因（实测踩过：只有 start/start-step 然后就 [DONE]）。
+    //
+    // 这也是进程死掉**之前**唯一一次说话的机会：这条 log 后面紧跟着就是
+    // debuggerd 的 tombstone。别删。
+    //
+    // 日志里带 panic 位置（`file:line`，包括依赖的源码路径和版本号），
+    // 所以即使 `strip = true` 没符号可回溯，也能定位到是哪个 crate 炸的。
     std::panic::set_hook(Box::new(|info| {
-        let msg = format!("RUST PANIC: {info}");
-        #[cfg(target_os = "android")]
-        log::error!("{msg}");
-        #[cfg(not(target_os = "android"))]
-        eprintln!("{msg}");
+        shout(&format!("RUST PANIC: {info}"));
     }));
 
     #[cfg(target_os = "android")]
@@ -632,5 +647,26 @@ mod tests {
         let dev = core.state.device().unwrap();
         assert!(dev.execute(r#"{"type":"key","name":"back"}"#).unwrap().contains("back"));
         assert!(dev.execute("not json").is_err(), "非法指令必须报错");
+    }
+
+    /// 崩溃策略是「panic 就崩」。
+    ///
+    /// 为什么只能拿配置来断言：`panic = "abort"` 写在 `[profile.release]` 里，
+    /// 而 `cargo test` 走 dev profile（unwind）—— 运行时行为在这条路径上
+    /// 根本测不到。这个决定被来回改过好几次，所以至少把配置钉住。
+    #[test]
+    fn release_aborts_on_panic() {
+        let cargo = include_str!("../Cargo.toml");
+        let release = cargo
+            .split("[profile.release]")
+            .nth(1)
+            .expect("Cargo.toml 里找不到 [profile.release]");
+        // 只看第一个下一个 section 之前的部分
+        let release = release.split("\n[").next().unwrap();
+        assert!(
+            release.contains("panic = \"abort\""),
+            "[profile.release] 必须是 panic = \"abort\"：panic 要被砸出来，\
+             不能留给 tokio / uniffi 悄悄吞掉（见 Cargo.toml 那段注释）"
+        );
     }
 }
