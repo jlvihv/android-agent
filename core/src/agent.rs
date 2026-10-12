@@ -66,7 +66,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出取**尾部**（最后 2000 行或 50KB），截断时完整输出存临时文件并返回路径。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3。要点：ping 被封用 curl；Python 包优先 `apk add py3-*`；matplotlib 先 `use('Agg')`；后台服务要重定向 stdout/stderr；搜索用 `rg -uuu`。",
+            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3。Python 包优先 `apk add py3-*`；后台服务要重定向 stdout/stderr。",
             schema: || {
                 json!({
                     "type": "object",
@@ -1839,6 +1839,10 @@ async fn send(tx: &mpsc::UnboundedSender<Value>, v: Value) {
 /// 不逐块推：一条 `apk add` 每秒几十块，前端每块都重排一次面板。攒
 /// LIVE_EVERY 推一次，每次推**到目前为止的尾部**（前端直接替换，不用拼）。
 /// 只留尾部 LIVE_TAIL 字节 —— 输出几 MB 的命令也不会每次推几 MB。
+///
+/// 这里留尾，而 `bash` 的**最终结果**是「首尾各 100 行」（`linux::Capture::render`），
+/// 是故意的：最终结果是给模型看的一次快照，两头都要；这块是给盯着屏幕的人看
+/// 的进度，要的是「现在跑到哪了」。
 async fn pump_live_output(
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
     tx: mpsc::UnboundedSender<Value>,

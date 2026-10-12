@@ -53,10 +53,23 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 /// 让模型改用 `sed -n` / `head` / `rg` 局部读。
 const MAX_TEXT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// 回给模型的输出上限。超过就只留**尾部**。
-/// 命令的错误和结论通常在末尾，砍尾部等于砍掉最有用的信息。
+/// 回给模型的输出上限：**超过 `MAX_OUTPUT_LINES` 行或 `MAX_OUTPUT_BYTES` 字节**
+/// 才算截断。
+///
+/// 截断后的呈现是首尾各留 `HEAD_LINES` / `TAIL_LINES` 行、中间用
+/// `[省略 N 行]` 顶掉：头是命令的开场（版本号、表头、第一条结果），尾是结论
+/// 和报错 —— 两头都有用，所以不像 `read` 那样只看头（bash 的输出没地方续读，
+/// 只能靠 `/tmp` 里那份完整输出）。字节预算由两侧平分，保证两边都能露脸。
+///
+/// 触发线故意留得很宽（2000 行 / 50KB）：1999 行的文件应该一次就看全，
+/// 否则模型得反复 offset 续读，比多给几千行贵得多。
 pub const MAX_OUTPUT_LINES: usize = 2000;
 pub const MAX_OUTPUT_BYTES: usize = 50 * 1024;
+/// 截断时首/尾各留多少行
+pub const HEAD_LINES: usize = 100;
+pub const TAIL_LINES: usize = 100;
+/// 截断时分给首/尾各一侧的字节预算（给 `[省略 N 行]` 和换行留点余量）
+const SIDE_BYTES: usize = (MAX_OUTPUT_BYTES - 256) / 2;
 
 /// Alpine 的 PATH。
 ///
@@ -161,6 +174,10 @@ pub struct ExecResult {
     pub timed_out: bool,
     /// 输出被截断时，完整输出落在沙箱内的这个路径上，模型可以再去读/ grep
     pub full_output_path: Option<String>,
+    /// 这次用的是不是真 bash。false = 没装 bash，退回了 `/bin/sh`（busybox
+    /// ash），此时 `to_text` 会明说一句并让模型去装 —— 否则它写 bash 语法
+    /// 只会拿到一句莫名其妙的 `syntax error`。
+    pub using_bash: bool,
 }
 
 impl ExecResult {
@@ -178,13 +195,21 @@ impl ExecResult {
             s.push_str(&self.stderr);
         }
         if self.truncated {
-            s.push_str("\n[输出已截断，只保留尾部]");
+            s.push_str("\n[输出已截断]");
             if let Some(p) = &self.full_output_path {
                 s.push_str(&format!("\n[完整输出在 {p}]"));
             }
         }
         if self.timed_out {
             s.push_str("\n[超时，已终止]");
+        }
+        // 没 bash 就直说，并给出装它的命令。藏在提示词里没用 —— 模型只会在
+        // 碰到 `syntax error` 时一头雾水。
+        if !self.using_bash {
+            s.push_str(
+                "\n[沙箱里还没有 bash：这条是 /bin/sh（busybox ash）跑的，[[ ]] / 数组 / \
+                 <<< / 进程替换这类 bash 语法会报 syntax error。装上：agent-setup --force]"
+            );
         }
         if s.is_empty() {
             s.push_str("(无输出)");
@@ -679,12 +704,17 @@ impl LinuxSandbox {
         vec!["1.1.1.1".into(), "8.8.8.8".into()]
     }
 
+    /// 沙箱里有没有真 bash（没装就只能退回 ash，见 `command_line`）。
+    pub fn has_bash(&self) -> bool {
+        self.cfg.rootfs.join("bin/bash").is_file()
+    }
+
     /// 构造完整命令行。抽出来单独测试，不需要真的跑 proot。
     ///
     /// 对应 OpenMinis `PRootKernel.buildProotCommand()`：
     /// ```text
     /// <proot> -0 -l -r <rootfs> -b /dev -b /proc -b /sys -w /workspace
-    ///         [-b <host>:<linux> ...] /bin/sh -c "<script>"
+    ///         [-b <host>:<linux> ...] [/bin/bash | /bin/sh] -c "<script>"
     /// ```
     pub fn command_line(&self, script: &str) -> Vec<String> {
         let mut cmd: Vec<String> = Vec::with_capacity(20);
@@ -727,12 +757,9 @@ impl LinuxSandbox {
 
         // 装过 bash 就用 bash：模型写的命令常带 bash 语法（`[[ ]]`、数组、
         // 进程替换、`<<<`），拿 ash 跑会报 "syntax error"。首次预装之前
-        // （或者手动清了 rootfs）没有 bash，退回 /bin/sh。
-        let shell = if self.cfg.rootfs.join("bin/bash").is_file() {
-            "/bin/bash"
-        } else {
-            "/bin/sh"
-        };
+        // （或者手动清了 rootfs）没有 bash，退回 /bin/sh（这时结果里会
+        // 提醒模型去装，见 `ExecResult::to_text`）。
+        let shell = if self.has_bash() { "/bin/bash" } else { "/bin/sh" };
         arg!(shell, "-c", script);
 
         cmd
@@ -811,6 +838,7 @@ impl LinuxSandbox {
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     ) -> anyhow::Result<ExecResult> {
         let argv = self.command_line(script);
+        let using_bash = self.has_bash();
         let (bin, args) = argv.split_first().expect("command_line 至少有一个元素");
 
         let mut cmd = tokio::process::Command::new(bin);
@@ -832,7 +860,7 @@ impl LinuxSandbox {
         let started = Instant::now();
         let mut child = cmd.spawn()?;
 
-        // 边跑边读，内存里只留尾巴（见 `Capture`）。
+        // 边跑边读，内存里只留**首尾两端**（见 `Capture`）。
         //
         // 原来是 wait_with_output() —— 整段输出全攒在内存里。`yes`、
         // `cat /dev/urandom | base64` 这类命令 60 秒能吐出几个 GB，
@@ -853,49 +881,49 @@ impl LinuxSandbox {
         let grace = Duration::from_secs(2);
         let stdout = tokio::time::timeout(grace, out_task).await.ok().and_then(|r| r.ok()).unwrap_or_default();
         let stderr = tokio::time::timeout(grace, err_task).await.ok().and_then(|r| r.ok()).unwrap_or_default();
-        let dropped = stdout.dropped + stderr.dropped;
-        let out = std::process::Output {
-            status: status.unwrap_or_default(),
-            stdout: stdout.buf,
-            stderr: stderr.buf,
-        };
-
-        let (stdout, t1) = tail_clamp(&out.stdout);
-        let (stderr, t2) = tail_clamp(&out.stderr);
+        let (stdout_text, t1) = stdout.render();
+        let (stderr_text, t2) = stderr.render();
+        // 中间被扔掉（输出超过内存上限）也算截断
+        let dropped = stdout.dropped_bytes + stderr.dropped_bytes;
         let truncated = t1 || t2 || dropped > 0;
+        let status = status.unwrap_or_default();
 
-        // 截断了就把完整输出落进沙箱的 /tmp，并告诉模型路径 ——
+        // 截断了就把捕获到的输出落进沙箱的 /tmp，并告诉模型路径 ——
         // 它可以再用 grep/sed 去翻，不用把几十 MB 塞回上下文
         let full_output_path = if truncated {
-            self.spill_full_output(&out.stdout, &out.stderr)
+            self.spill_captured(&stdout, &stderr)
         } else {
             None
         };
 
         Ok(ExecResult {
-            code: if timed_out { -1 } else { out.status.code().unwrap_or(-1) },
-            stdout,
-            stderr,
+            code: if timed_out { -1 } else { status.code().unwrap_or(-1) },
+            stdout: stdout_text,
+            stderr: stderr_text,
             duration_ms: started.elapsed().as_millis() as u64,
             truncated,
             // 超时也把已经产出的输出带回去 —— 原来直接丢空，模型只知道
             // "超时了"，看不到卡在哪一步
             timed_out,
             full_output_path,
+            using_bash,
         })
     }
 
-    /// 把完整输出写进 rootfs 的 `/tmp`，返回沙箱内的路径。
-    fn spill_full_output(&self, stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    /// 把捕获到的输出写进 rootfs 的 `/tmp`，返回沙箱内的路径。
+    ///
+    /// 中间被扔掉过的话（输出超过内存上限）在文件里也标出来，免得模型
+    /// grep 的时候以为前后是连着的。
+    fn spill_captured(&self, stdout: &Capture, stderr: &Capture) -> Option<String> {
         let name = format!("agent-out-{}.log", uuid::Uuid::now_v7());
         let host = self.cfg.rootfs.join("tmp").join(&name);
         std::fs::create_dir_all(host.parent()?).ok()?;
 
-        let mut body = Vec::with_capacity(stdout.len() + stderr.len() + 32);
-        body.extend_from_slice(stdout);
+        let mut body = Vec::new();
+        stdout.write_to(&mut body);
         if !stderr.is_empty() {
             body.extend_from_slice(b"\n--- stderr ---\n");
-            body.extend_from_slice(stderr);
+            stderr.write_to(&mut body);
         }
         std::fs::write(&host, body).ok()?;
         Some(format!("/tmp/{name}"))
@@ -1079,17 +1107,26 @@ fn is_alpine_rootfs(rootfs: &Path) -> bool {
     rootfs.join("bin/busybox").is_file() || rootfs.join("etc/alpine-release").is_file()
 }
 
-/// 一路输出的尾巴。超过 `CAPTURE_LIMIT` 就把前一半扔掉，只记扔了多少。
+/// 一路输出里保留的两端：**头部**和**尾部**。
 ///
-/// 回给模型的最多 50 KB，落盘的完整输出也只需要"足够翻查"，所以 4 MB
-/// 的尾巴足够；关键是内存有上界。
+/// 回给模型的是「首 100 行 + `[省略 N 行]` + 尾 100 行」（见 `render`），
+/// 所以两端都得留着。超过内存上限时扔的是**中间**：头部攒满 `CAPTURE_HEAD`
+/// 就封口（切在行边界上），后面的进尾部；尾部超过 `CAPTURE_TAIL` 就从最旧的
+/// 一端挤掉，挤掉多少记在 `dropped_*` 里。
+///
+/// 内存上界 = `CAPTURE_HEAD + CAPTURE_TAIL`，跟原来一个 4 MB 的缓冲一样。
 #[derive(Default)]
 struct Capture {
-    buf: Vec<u8>,
-    dropped: u64,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    /// 中间扔掉的字节数
+    dropped_bytes: u64,
+    /// 中间扔掉的整行数；单行超长、只能从行中间扔时算不进来
+    dropped_lines: u64,
 }
 
-const CAPTURE_LIMIT: usize = 4 << 20;
+const CAPTURE_HEAD: usize = 2 << 20;
+const CAPTURE_TAIL: usize = 2 << 20;
 
 impl Capture {
     async fn read<R: tokio::io::AsyncRead + Unpin>(
@@ -1115,58 +1152,212 @@ impl Capture {
     }
 
     fn push(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
-        if self.buf.len() > CAPTURE_LIMIT {
-            let cut = self.buf.len() - CAPTURE_LIMIT / 2;
-            self.buf.drain(..cut);
-            self.dropped += cut as u64;
-        }
-    }
-}
-
-/// 只留**尾部**：先砍行数，再砍字节。
-///
-/// 与头截断相比，尾巴里有报错信息和最终结论 —— 那些才是模型需要的。
-///
-/// 保留末尾换行（用 `lines()` + `join()` 会把它吃掉）。
-fn tail_clamp(bytes: &[u8]) -> (String, bool) {
-    let text = String::from_utf8_lossy(bytes);
-    let mut truncated = false;
-
-    // 行数：'\n' 的个数，再加上末尾那段没有换行的
-    let newlines = text.matches('\n').count();
-    let lines = newlines + usize::from(!text.is_empty() && !text.ends_with('\n'));
-
-    let mut s: String = if lines > MAX_OUTPUT_LINES {
-        truncated = true;
-        let drop = lines - MAX_OUTPUT_LINES;
-        // 第 drop 个 '\n' 之后就是保留区的起点
-        let mut seen = 0usize;
-        let mut cut = 0usize;
-        for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' {
-                seen += 1;
-                if seen == drop {
-                    cut = i + 1;
-                    break;
+        let mut rest = data;
+        if self.head.len() < CAPTURE_HEAD {
+            let take = (CAPTURE_HEAD - self.head.len()).min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            // 头刚封口：把最后那半行挪进尾部，让头停在行边界上
+            if self.head.len() >= CAPTURE_HEAD {
+                if let Some(nl) = self.head.iter().rposition(|&b| b == b'\n') {
+                    let leftover = self.head.split_off(nl + 1);
+                    self.tail.extend_from_slice(&leftover);
                 }
             }
         }
-        text[cut..].to_string()
-    } else {
-        text.into_owned()
-    };
-
-    if s.len() > MAX_OUTPUT_BYTES {
-        truncated = true;
-        let mut start = s.len() - MAX_OUTPUT_BYTES;
-        while start < s.len() && !s.is_char_boundary(start) {
-            start += 1;
+        if !rest.is_empty() {
+            self.push_tail(rest);
         }
-        s = s[start..].to_string();
     }
 
-    (s, truncated)
+    /// 往尾部追加；超过 `CAPTURE_TAIL` 就从最旧的一端挤掉。
+    fn push_tail(&mut self, data: &[u8]) {
+        self.tail.extend_from_slice(data);
+        if self.tail.len() <= CAPTURE_TAIL {
+            return;
+        }
+        // 挤到行边界（整行扔）；单行超长找不到换行，就按字节扔 ——
+        // 但别整段都丢，那样尾部就永远攒不起来了
+        let excess = self.tail.len() - CAPTURE_TAIL;
+        let cut = match self.tail[excess..].iter().position(|&b| b == b'\n') {
+            Some(i) => excess + i + 1,
+            None => excess,
+        };
+        self.dropped_lines += self.tail[..cut].iter().filter(|&&b| b == b'\n').count() as u64;
+        self.dropped_bytes += cut as u64;
+        self.tail.drain(..cut);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.is_empty() && self.tail.is_empty()
+    }
+
+    /// 渲染成给模型看的样子：首 `HEAD_LINES` 行 + `[省略 N 行]` + 尾 `TAIL_LINES` 行。
+    ///
+    /// 没超上限就原样返回。第二个返回值是「有没有截断」。
+    fn render(&self) -> (String, bool) {
+        if self.is_empty() {
+            return (String::new(), false);
+        }
+        let head = String::from_utf8_lossy(&self.head);
+        let head_lines = real_lines(&head);
+        // 尾部为空 = 没扔过中间：整份输出都在 `head` 里，首尾取自同一份
+        let split = !self.tail.is_empty();
+        if !split && head_lines.len() <= MAX_OUTPUT_LINES && head.len() <= MAX_OUTPUT_BYTES {
+            return (head.into_owned(), false);
+        }
+
+        let tail_text = String::from_utf8_lossy(&self.tail);
+        let tail_lines = if split {
+            real_lines(&tail_text)
+        } else {
+            Vec::new()
+        };
+
+        let (head_out, head_shown) = head_part(&head_lines, HEAD_LINES, SIDE_BYTES);
+        let (tail_out, tail_shown) = if split {
+            tail_part(&tail_lines, TAIL_LINES, SIDE_BYTES)
+        } else {
+            // 同一份行：尾部只能取头没拿走的那些
+            tail_part(&head_lines[head_shown..], TAIL_LINES, SIDE_BYTES)
+        };
+
+        // 省略了多少行：头尾没展示的 + 中间扔掉的
+        // （没分家时首尾取自同一份行，尾巴拿走的那些不能重复计入“省略”）
+        let omitted_lines = if split {
+            (head_lines.len() - head_shown)
+                + self.dropped_lines as usize
+                + (tail_lines.len() - tail_shown)
+        } else {
+            head_lines.len() - head_shown - tail_shown
+        };
+        // 省略了多少字节：留下的里没展示的 + 中间扔掉的
+        let kept = (self.head.len() + self.tail.len()) as u64;
+        let shown = (head_out.len() + tail_out.len()) as u64;
+        let omitted_bytes = kept.saturating_sub(shown) + self.dropped_bytes;
+
+        // 正常报「省略 N 行」；单行超长、整行数不出来时退回报字节
+        let marker = if omitted_lines > 0 {
+            format!("[省略 {omitted_lines} 行]")
+        } else {
+            format!("[省略 {}]", crate::reader::fmt_size(omitted_bytes as usize))
+        };
+
+        let mut out = String::with_capacity(head_out.len() + tail_out.len() + marker.len() + 4);
+        if !head_out.is_empty() {
+            out.push_str(&head_out);
+            out.push('\n');
+        }
+        out.push_str(&marker);
+        out.push('\n');
+        out.push_str(&tail_out);
+        // 原文结尾有换行就保留
+        let ended_nl = if split {
+            tail_text.ends_with('\n')
+        } else {
+            head.ends_with('\n')
+        };
+        if ended_nl && !tail_out.is_empty() {
+            out.push('\n');
+        }
+        (out, true)
+    }
+
+    /// 落盘用：头 +（中间扔掉的提示）+ 尾。
+    ///
+    /// 中间扔过东西就必须标出来，不然模型 grep 这份文件会以为前后是连着的。
+    fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.head);
+        if self.tail.is_empty() {
+            return;
+        }
+        if self.dropped_bytes > 0 {
+            let note = if self.dropped_lines > 0 {
+                format!(
+                    "\n[... 中间省略 {} 行 / {} ...]\n",
+                    self.dropped_lines,
+                    crate::reader::fmt_size(self.dropped_bytes as usize)
+                )
+            } else {
+                format!(
+                    "\n[... 中间省略 {} ...]\n",
+                    crate::reader::fmt_size(self.dropped_bytes as usize)
+                )
+            };
+            out.extend_from_slice(note.as_bytes());
+        }
+        out.extend_from_slice(&self.tail);
+    }
+}
+
+/// 按 `reader` 的规则拆行：结尾 `\n` 切出来的空串不算一行。
+fn real_lines(text: &str) -> Vec<&str> {
+    match text.strip_suffix('\n') {
+        Some(t) => t.split('\n').collect(),
+        None => text.split('\n').collect(),
+    }
+}
+
+/// 取头部 ≤`want` 行、≤`budget` 字节。返回 (正文, 算作「已展示」的行数)。
+///
+/// 第一行就超预算时给它的前半截 —— 宁可给半行，也别让模型什么都看不到
+/// （省掉的那部分会进 `[省略 …]`）。
+fn head_part(lines: &[&str], want: usize, budget: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for line in lines.iter().take(want) {
+        let sep = usize::from(shown > 0);
+        if out.len() + sep + line.len() > budget {
+            if shown == 0 {
+                out.push_str(clip_head(line, budget));
+                return (out, 1);
+            }
+            break;
+        }
+        if shown > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+        shown += 1;
+    }
+    (out, shown)
+}
+
+/// 取尾部 ≤`want` 行、≤`budget` 字节（从后往前凑，返回时顺序正常）。
+fn tail_part(lines: &[&str], want: usize, budget: usize) -> (String, usize) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev().take(want) {
+        let sep = usize::from(!kept.is_empty());
+        if used + sep + line.len() > budget {
+            if kept.is_empty() {
+                return (clip_tail(line, budget).to_string(), 1);
+            }
+            break;
+        }
+        used += sep + line.len();
+        kept.push(line);
+    }
+    kept.reverse();
+    (kept.join("\n"), kept.len())
+}
+
+/// `s` 的前 `budget` 字节（不切开多字节字符）
+fn clip_head(s: &str, budget: usize) -> &str {
+    let mut end = budget.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// `s` 的后 `budget` 字节（不切开多字节字符）
+fn clip_tail(s: &str, budget: usize) -> &str {
+    let mut start = s.len().saturating_sub(budget);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
 }
 
 /// 设备当前时区的 POSIX TZ 串。
@@ -1220,15 +1411,23 @@ fn parse_posix_tz(s: &str) -> Option<i32> {
 mod tests {
 
     #[tokio::test]
-    async fn capture_keeps_memory_bounded_and_keeps_the_tail() {
+    async fn capture_keeps_both_ends_and_counts_the_middle() {
         // 模拟一个狂吐输出的命令：远超上限
-        let total = CAPTURE_LIMIT * 3 + 123;
-        let mut data = vec![b'x'; total - 4];
+        let total = CAPTURE_HEAD + CAPTURE_TAIL + 10_000;
+        let mut data = b"START\n".to_vec();
+        data.resize(total - 4, b'\n');
         data.extend_from_slice(b"END\n");
         let cap = Capture::read(Some(&data[..]), None).await;
-        assert!(cap.buf.len() <= CAPTURE_LIMIT, "内存要有上界");
-        assert!(cap.buf.ends_with(b"END\n"), "尾巴不能丢");
-        assert_eq!(cap.buf.len() as u64 + cap.dropped, total as u64);
+        assert!(cap.head.starts_with(b"START\n"), "头部不能丢");
+        assert!(cap.tail.ends_with(b"END\n"), "尾部不能丢");
+        assert!(cap.head.len() <= CAPTURE_HEAD, "内存要有上界");
+        assert!(cap.tail.len() <= CAPTURE_TAIL, "内存要有上界");
+        assert!(cap.dropped_bytes > 0, "中间确实扔了");
+        // 丢掉的部分就是中间那段，不多不少
+        assert_eq!(
+            cap.head.len() as u64 + cap.tail.len() as u64 + cap.dropped_bytes,
+            total as u64
+        );
     }
     use super::*;
 
@@ -1269,6 +1468,52 @@ mod tests {
         let nasty = "echo \"a b\"; ls | grep x; echo '$(whoami)'";
         let argv = sandbox().command_line(nasty);
         assert_eq!(argv.last().unwrap(), nasty);
+    }
+
+    /// 没 bash 退回 ash、装了就用 bash —— 两条路都要盯住。
+    #[test]
+    fn command_line_uses_bash_once_it_is_installed() {
+        let t = TempRoot::new("shellbash");
+        let sb = t.sandbox();
+        let shell_of = |argv: Vec<String>| {
+            let i = argv.iter().position(|a| a == "-c").expect("-c 一定在");
+            argv[i - 1].clone()
+        };
+        assert_eq!(
+            shell_of(sb.command_line("true")),
+            "/bin/sh",
+            "没装就退回 ash"
+        );
+        std::fs::write(t.dir.join("bin/bash"), b"").unwrap();
+        assert_eq!(
+            shell_of(sb.command_line("true")),
+            "/bin/bash",
+            "装了就该用 bash，不然模型写的 bash 语法白写"
+        );
+    }
+
+    /// 没 bash 时结果里必须明说，并给出装它的命令。
+    #[test]
+    fn missing_bash_is_announced_with_the_fix() {
+        let mut r = ExecResult {
+            code: 0,
+            stdout: "hi\n".into(),
+            stderr: String::new(),
+            duration_ms: 0,
+            truncated: false,
+            timed_out: false,
+            full_output_path: None,
+            using_bash: false,
+        };
+        let text = r.to_text();
+        assert!(text.contains("/bin/sh"), "{text}");
+        assert!(text.contains("agent-setup --force"), "{text}");
+        assert!(text.contains("syntax error"), "{text}");
+
+        // 有 bash 时别唠叨
+        r.using_bash = true;
+        let text = r.to_text();
+        assert!(!text.contains("agent-setup"), "{text}");
     }
 
     #[test]
@@ -1325,34 +1570,113 @@ mod tests {
         assert_eq!(parse_posix_tz("CST-8"), Some(480));
     }
 
-    #[test]
-    fn tail_clamp_keeps_the_end_not_the_start() {
-        // 报错和结论在尾巴里，所以砍头不砍尾
-        let mut body = String::new();
-        for i in 0..(MAX_OUTPUT_LINES + 50) {
-            body.push_str(&format!("line {i}\n"));
-        }
-        let (out, truncated) = tail_clamp(body.as_bytes());
-        assert!(truncated);
-        assert!(out.contains(&format!("line {}\n", MAX_OUTPUT_LINES + 49)), "最后一行丢了");
-        assert!(!out.contains("line 0\n"), "开头没被砍掉");
-        assert!(out.lines().count() <= MAX_OUTPUT_LINES);
+    fn render_of(n: usize, body: impl Fn(usize) -> String) -> (String, bool) {
+        let text: String = (0..n).map(body).collect();
+        let mut cap = Capture::default();
+        cap.push(text.as_bytes());
+        cap.render()
     }
 
     #[test]
-    fn tail_clamp_respects_utf8_boundaries() {
-        let big = "中".repeat(MAX_OUTPUT_BYTES); // 每个 3 字节，必超
-        let (out, truncated) = tail_clamp(big.as_bytes());
+    fn render_keeps_head_and_tail_with_a_marker() {
+        // 跨过 2000 行才截断；截断后首尾各 100 行
+        let n = MAX_OUTPUT_LINES + 500;
+        let (out, truncated) = render_of(n, |i| format!("line {i}\n"));
         assert!(truncated);
-        assert!(out.len() <= MAX_OUTPUT_BYTES);
-        assert!(out.chars().all(|c| c == '中'), "切出了半个字符");
+        assert!(out.starts_with("line 0\n"), "{out}");
+        assert!(out.contains("line 99\n"), "头要留 100 行：{out}");
+        assert!(!out.contains("line 100\n"), "第 101 行不该在：{out}");
+        assert!(
+            out.contains(&format!("[省略 {} 行]", n - HEAD_LINES - TAIL_LINES)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("line {}\n", n - 1)),
+            "尾要留到最后一行：{out}"
+        );
+        assert!(!out.contains(&format!("line {}\n", n - 101)), "{out}");
+        // 首 100 + 标记 + 尾 100
+        assert_eq!(out.lines().count(), HEAD_LINES + TAIL_LINES + 1);
     }
 
     #[test]
-    fn tail_clamp_leaves_small_output_alone() {
-        let (out, truncated) = tail_clamp(b"hello\nworld\n");
-        assert_eq!(out, "hello\nworld\n");
+    fn render_of_1999_lines_is_left_alone() {
+        // 触发线是 2000 行：差一行不该被省成 200 行，否则模型得反复续读
+        let (out, truncated) = render_of(MAX_OUTPUT_LINES - 1, |i| format!("line {i}\n"));
         assert!(!truncated);
+        assert!(!out.contains("[省略"), "{out}");
+        assert!(out.contains(&format!("line {}\n", MAX_OUTPUT_LINES - 2)));
+        assert_eq!(out.lines().count(), MAX_OUTPUT_LINES - 1);
+    }
+
+    #[test]
+    fn render_of_a_split_capture_shows_both_ends() {
+        // 中间被扔掉过（超过内存上限）：头尾分别来自两块缓冲
+        let mut cap = Capture::default();
+        cap.head.extend_from_slice(b"head-line\n");
+        cap.tail.extend_from_slice(b"tail-line\n");
+        cap.dropped_lines = 42;
+        cap.dropped_bytes = 1234;
+        let (out, truncated) = cap.render();
+        assert!(truncated);
+        assert!(out.starts_with("head-line\n"), "{out}");
+        assert!(out.ends_with("tail-line\n"), "{out}");
+        assert!(out.contains("[省略 42 行]"), "{out}");
+    }
+
+    #[test]
+    fn render_shares_the_byte_budget_between_both_ends() {
+        // 每行 ~1KB × 300 行：行数没到、字节先超，两侧各分一半预算
+        let (out, truncated) = render_of(300, |i| format!("line{i}{}\n", "x".repeat(990)));
+        assert!(truncated);
+        assert!(out.len() <= MAX_OUTPUT_BYTES, "{} 字节", out.len());
+        assert!(!out.starts_with("[省略"), "第一行就得留下：{out}");
+        assert!(out.contains("line0"), "{out}");
+        assert!(out.contains("line299"), "{out}");
+        assert!(out.contains("[省略 "));
+    }
+
+    #[test]
+    fn render_never_splits_a_multibyte_char() {
+        // 一整行 150KB 的中文：两侧只能按字节给半行，不能切出半个字
+        let (out, truncated) = render_of(1, |_| "中".repeat(MAX_OUTPUT_BYTES));
+        assert!(truncated);
+        assert!(out.len() <= MAX_OUTPUT_BYTES, "{} 字节", out.len());
+        assert!(!out.contains('\u{fffd}'), "切出了半个字符");
+        // 一行都放不下时退回报字节，而不是「省略 0 行」
+        assert!(
+            out.contains("[省略 ") && !out.contains("[省略 0 行]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn render_of_a_few_lines_stays_verbatim() {
+        let (out, truncated) = render_of(3, |i| format!("line {i}\n"));
+        assert_eq!(out, "line 0\nline 1\nline 2\n");
+        assert!(!truncated);
+        // 空输出还是空
+        assert_eq!(Capture::default().render(), (String::new(), false));
+    }
+
+    #[test]
+    fn spilled_file_marks_the_gap_it_could_not_keep() {
+        // 中间扔过东西 → 文件里也要断开，不能看着像连着的
+        let mut cap = Capture::default();
+        cap.head.extend_from_slice(b"head\n");
+        cap.tail.extend_from_slice(b"tail\n");
+        cap.dropped_bytes = 4 << 20;
+        let mut body = Vec::new();
+        cap.write_to(&mut body);
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("中间省略 4.0MB"), "{body}");
+
+        // 没扔过东西（总量不到上限）就不该凭空出现省略提示
+        let mut cap = Capture::default();
+        cap.push(b"hello\nworld\n");
+        let mut body = Vec::new();
+        cap.write_to(&mut body);
+        assert_eq!(String::from_utf8(body).unwrap(), "hello\nworld\n");
     }
 
     // --- 路径解析 ---------------------------------------------------------
