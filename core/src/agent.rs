@@ -80,7 +80,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit",
-            description: "用一个或多个精确替换编辑单个文件。相邻改动合并成一条；不要为了够到远处的改动而在 oldText 里塞大段没变的内容。",
+            description: "改文件：edits 做精确替换（一个或多个；相邻改动合并成一条，不要为了够到远处的改动而在 oldText 里塞大段没变的内容）。新建文件：只给 content（全文），文件已存在会报错 —— 要改已有文件请先 read 再用 edits。edits 与 content 只能给一个。",
             schema: || {
                 json!({
                     "type": "object",
@@ -88,7 +88,7 @@ fn build_tools() -> Vec<ToolSpec> {
                         "path": { "type": "string", "description": "文件路径（相对或绝对；相对路径基于 /workspace）" },
                         "edits": {
                             "type": "array",
-                            "description": "一条或多条替换",
+                            "description": "一条或多条替换（改已有文件时用）",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -97,9 +97,10 @@ fn build_tools() -> Vec<ToolSpec> {
                                 },
                                 "required": ["oldText", "newText"]
                             }
-                        }
+                        },
+                        "content": { "type": "string", "description": "新文件的全文（新建时用；父目录会按需创建，文件已存在则报错）" }
                     },
-                    "required": ["path", "edits"]
+                    "required": ["path"]
                 })
             },
         },
@@ -1947,6 +1948,31 @@ async fn pump_live_output(
 }
 
 /// 把工具参数里的 `edits` 数组解成 `editor::Edit`。
+/// `edit` 的两个模式：`content` 是新建、`edits` 是改；只能给一个。
+#[derive(Debug)]
+enum EditMode<'a> {
+    Create(&'a str),
+    Replace,
+}
+
+fn edit_mode(args: &Value) -> anyhow::Result<EditMode<'_>> {
+    match (args.get("content"), args.get("edits")) {
+        (Some(content), None) => {
+            let text = content
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("content 必须是字符串"))?;
+            Ok(EditMode::Create(text))
+        }
+        (None, Some(_)) => Ok(EditMode::Replace),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("edits 和 content 只能给一个：改已有文件用 edits，新建文件用 content")
+        }
+        (None, None) => {
+            anyhow::bail!("缺少 edits 或 content：改已有文件用 edits，新建文件用 content")
+        }
+    }
+}
+
 fn parse_edits(args: &Value) -> anyhow::Result<Vec<crate::editor::Edit>> {
     let arr = args
         .get("edits")
@@ -2113,6 +2139,24 @@ async fn execute_tool(
         if path.is_empty() {
             return ToolOutcome::json(json!({ "error": "缺少参数 path" }));
         }
+
+        // 两个模式：`edits` 改已有文件，`content` 新建文件。只能给一个 ——
+        // 两个都给 / 都不给都报错，不做“聪明”的猜测（猜错了要么盖掉原文、
+        // 要么改到错的地方）。
+        let mode = match edit_mode(&args) {
+            Ok(m) => m,
+            Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+        };
+        if let EditMode::Create(content) = mode {
+            return match core.create_file(path, content).await {
+                Ok(c) => ToolOutcome::json(json!({
+                    "ok": true,
+                    "message": format!("已创建 {path}（{} 行 / {} 字节）", c.lines, c.bytes),
+                })),
+                Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+            };
+        }
+
         let edits = match parse_edits(&args) {
             Ok(e) => e,
             Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
@@ -2941,6 +2985,32 @@ mod tests {
             serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
                 .unwrap();
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn edit_mode_picks_create_or_replace_and_rejects_ambiguous_args() {
+        assert!(matches!(
+            edit_mode(&json!({ "content": "x" })),
+            Ok(EditMode::Create("x"))
+        ));
+        assert!(matches!(
+            edit_mode(&json!({ "edits": [] })),
+            Ok(EditMode::Replace)
+        ));
+
+        // 两个都给：不做猜测，直接报错（猜错了要么盖掉原文、要么改错地方）
+        let both = edit_mode(&json!({ "content": "x", "edits": [] }))
+            .unwrap_err()
+            .to_string();
+        assert!(both.contains("只能给一个"), "{both}");
+
+        let neither = edit_mode(&json!({ "path": "a" })).unwrap_err().to_string();
+        assert!(neither.contains("缺少"), "{neither}");
+
+        let bad = edit_mode(&json!({ "content": 42 }))
+            .unwrap_err()
+            .to_string();
+        assert!(bad.contains("字符串"), "{bad}");
     }
 
     #[test]

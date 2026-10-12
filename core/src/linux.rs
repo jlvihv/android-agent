@@ -95,6 +95,16 @@ pub enum ReadResult {
     Image(crate::imaging::Encoded),
 }
 
+/// `edit` 工具的 create 模式建出来的文件。
+///
+/// 只回「建好了、多少行 / 字节」：内容是模型自己刚写进来的，原样回显纯属浪费
+/// 上下文（`edit` 回 diff 是因为它没写过改动后的全文）。
+#[derive(Debug)]
+pub struct CreatedFile {
+    pub lines: usize,
+    pub bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// proot 可执行文件。Android 上是 `<nativeLibraryDir>/libproot.so`
@@ -994,6 +1004,18 @@ impl LinuxSandbox {
     /// 文件存在时再 `canonicalize` 一次，堵住符号链接逃逸 ——
     /// Alpine 里大量条目是指向绝对路径的符号链接。
     pub fn resolve_path(&self, guest: &str) -> anyhow::Result<PathBuf> {
+        self.resolve_path_kind(guest, false)
+    }
+
+    /// 目标还**不存在**（`edit` 的 create 模式）时的路径解析。
+    ///
+    /// `confine` 的真实路径检查靠 `canonicalize`，新文件查不了 —— 得往上找
+    /// 最近一个存在的祖先（见 `confine_new`）。
+    pub fn resolve_new_path(&self, guest: &str) -> anyhow::Result<PathBuf> {
+        self.resolve_path_kind(guest, true)
+    }
+
+    fn resolve_path_kind(&self, guest: &str, for_new: bool) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(!guest.trim().is_empty(), "路径为空");
 
         // 先在沙箱的视角里归一化，再决定落到哪个宿主目录
@@ -1004,18 +1026,26 @@ impl LinuxSandbox {
         };
         let g = lexical_normalize(&abs);
 
+        let check = |root: &Path, target: PathBuf| -> anyhow::Result<PathBuf> {
+            if for_new {
+                confine_new(root, &target, guest)
+            } else {
+                confine(root, &target, guest)
+            }
+        };
+
         let mounts = [(SHARED, &self.cfg.shared), (WORKSPACE, &self.cfg.workspace)];
         for (at, host) in mounts {
             let Some(host) = host else { continue };
             if let Ok(rest) = g.strip_prefix(at) {
                 let root = lexical_normalize(host);
-                return confine(&root, &root.join(rest), guest);
+                return check(&root, root.join(rest));
             }
         }
 
         let root = lexical_normalize(&self.cfg.rootfs);
         let rel = g.strip_prefix("/").unwrap_or(&g);
-        confine(&root, &root.join(rel), guest)
+        check(&root, root.join(rel))
     }
 
     /// `edit` 工具：读文件 → 按原文替换 → 写回。
@@ -1025,7 +1055,7 @@ impl LinuxSandbox {
         let host = self.resolve_path(guest_path)?;
         anyhow::ensure!(
             host.is_file(),
-            "不是文件或不存在: {guest_path}（要新建文件请用 bash 的 cat/tee）"
+            "不是文件或不存在: {guest_path}（要新建文件就给 content，不要用 edits）"
         );
 
         let raw = std::fs::read_to_string(&host)
@@ -1036,6 +1066,30 @@ impl LinuxSandbox {
             .map_err(|e| anyhow::anyhow!("写入失败 {guest_path}: {e}"))?;
 
         Ok(outcome)
+    }
+
+    /// `edit` 工具的 create 模式：新建一个文件（父目录按需建）。
+    ///
+    /// 已存在就报错，**不静默覆盖** —— 想改已有文件应该先 `read` 再用 `edits`，
+    /// 那样改错了还能在 diff 里看出来；直接盖掉等于把原文扔了。
+    pub fn create_file(&self, guest_path: &str, content: &str) -> anyhow::Result<CreatedFile> {
+        let host = self.resolve_new_path(guest_path)?;
+        anyhow::ensure!(
+            !host.exists(),
+            "已存在: {guest_path}（content 只用于新建；要改它请先 read，再用 edits）"
+        );
+
+        if let Some(dir) = host.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| anyhow::anyhow!("建目录失败 {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&host, content)
+            .map_err(|e| anyhow::anyhow!("写入失败 {guest_path}: {e}"))?;
+
+        Ok(CreatedFile {
+            lines: content.lines().count(),
+            bytes: content.len(),
+        })
     }
 
     /// `read` 工具：先嗅魔数，是图片就走图片那条路（缩放 + 内联），
@@ -1097,6 +1151,38 @@ fn confine(root: &Path, path: &Path, guest: &str) -> anyhow::Result<PathBuf> {
     if let Ok(real) = norm.canonicalize() {
         let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         anyhow::ensure!(real.starts_with(&real_root), "符号链接指向沙箱外: {guest}");
+    }
+    Ok(norm)
+}
+
+/// 给**还不存在**的目标做 confinement。
+///
+/// 目标自己 `canonicalize` 不了，就往上找最近一个存在的祖先，看它的真实路径
+/// 在不在沙箱里。这步不能省：模型能在沙箱里 `ln -s /etc /workspace/link`，而
+/// 我们是在**宿主**上按路径写文件的 —— 不查就写到沙箱外面去了。
+///
+/// （`read` / `edit` 那条路不用它：文件已存在，`confine` 的 `canonicalize`
+/// 已经兜住了。所以它是给 create 专用。）
+fn confine_new(root: &Path, path: &Path, guest: &str) -> anyhow::Result<PathBuf> {
+    let norm = lexical_normalize(path);
+    anyhow::ensure!(norm.starts_with(root), "路径越界，不允许走出沙箱: {guest}");
+    let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let mut probe = norm.clone();
+    while probe.starts_with(root) {
+        match probe.canonicalize() {
+            Ok(real) => {
+                anyhow::ensure!(real.starts_with(&real_root), "符号链接指向沙箱外: {guest}");
+                return Ok(norm);
+            }
+            // 连 root 都不存在（沙箱还没起）就无从检查，交给后面的 IO 报错
+            Err(_) if probe == root => break,
+            Err(_) => {
+                if !probe.pop() {
+                    break;
+                }
+            }
+        }
     }
     Ok(norm)
 }
@@ -2014,7 +2100,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("不存在"), "{err}");
-        assert!(err.contains("bash"), "错误信息应该告诉模型该怎么办: {err}");
+        assert!(
+            err.contains("content"),
+            "错误信息应该告诉模型怎么新建: {err}"
+        );
     }
 
     #[test]
@@ -2074,6 +2163,75 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    // --- edit 的 create 模式 ---------------------------------------------
+
+    #[test]
+    fn create_file_writes_new_files_and_makes_parent_dirs() {
+        let t = TempRoot::new("create");
+        let sb = t.sandbox();
+
+        // 相对路径按 /workspace 算；父目录不存在也得能建（模型常写 a/b/c.py）
+        let made = sb.create_file("sub/dir/a.py", "print('hi')\n").unwrap();
+        assert_eq!((made.lines, made.bytes), (1, 12));
+        assert_eq!(
+            std::fs::read_to_string(t.dir.join("workspace/sub/dir/a.py")).unwrap(),
+            "print('hi')\n"
+        );
+
+        // 空文件也算建出来
+        let made = sb.create_file("/root/empty", "").unwrap();
+        assert_eq!((made.lines, made.bytes), (0, 0));
+        assert!(t.dir.join("root/empty").is_file());
+    }
+
+    #[test]
+    fn create_file_refuses_to_overwrite_and_says_what_to_do() {
+        let t = TempRoot::new("createexists");
+        let sb = t.sandbox();
+        std::fs::write(t.dir.join("root/a.txt"), "原文").unwrap();
+
+        let err = sb
+            .create_file("/root/a.txt", "盖掉")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("已存在"), "{err}");
+        assert!(err.contains("edits"), "要告诉模型怎么改：{err}");
+        // 原文一个字都不能动
+        assert_eq!(
+            std::fs::read_to_string(t.dir.join("root/a.txt")).unwrap(),
+            "原文"
+        );
+    }
+
+    #[test]
+    fn create_file_refuses_to_escape_through_a_symlink_or_dotdot() {
+        let t = TempRoot::new("createlink");
+        let sb = t.sandbox();
+        let outside = std::env::temp_dir().join(format!("agent-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // 词法越界（`..`）到不了外面：沙箱视角里 `/root/../..` 就是 `/`
+        sb.create_file("/root/../../escape.txt", "x").unwrap();
+        assert!(
+            t.dir.join("escape.txt").is_file(),
+            "`..` 应该被夹在 rootfs 里，落到 <rootfs>/escape.txt"
+        );
+
+        // 符号链接越界：模型能在沙箱里 `ln -s <外面> /workspace/link`，
+        // 而我们是在宿主上按路径写的 —— 必须往上找真实路径查一遍
+        std::fs::create_dir_all(t.dir.join("workspace")).unwrap();
+        std::os::unix::fs::symlink(&outside, t.dir.join("workspace/link")).unwrap();
+        let err = sb
+            .create_file("/workspace/link/evil.txt", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("沙箱外"), "{err}");
+        assert!(!outside.join("evil.txt").exists(), "不能写到沙箱外面去");
+
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

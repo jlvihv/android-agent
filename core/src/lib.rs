@@ -449,6 +449,22 @@ impl Core {
         tokio::task::spawn_blocking(move || sb.edit_file(&path, &edits)).await?
     }
 
+    /// 新建一个文件（`edit` 工具的 create 模式）。同步本地 I/O，同 `edit_file`
+    /// 包一层 `spawn_blocking`，免得占住 tokio 的 worker（只有 2 个）。
+    pub async fn create_file(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> anyhow::Result<linux::CreatedFile> {
+        let sb = self
+            .state
+            .linux()
+            .ok_or_else(|| anyhow::anyhow!("Linux 沙箱未初始化"))?;
+        let path = path.to_string();
+        let content = content.to_string();
+        tokio::task::spawn_blocking(move || sb.create_file(&path, &content)).await?
+    }
+
     pub fn port(&self) -> u16 {
         self.state.port.load(Ordering::Relaxed)
     }

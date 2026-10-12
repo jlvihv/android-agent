@@ -108,7 +108,7 @@ just phone                                   # 交互模式，/help 看命令
 |---|---|
 | `read` | 读文件：文本带 `offset` / `limit` / `numbered`（`numbered=true` 加 `cat -n` 同款行号；截断到 2000 行或 50KB），结果里附 `totalLines` / `totalBytes`（整个文件多大）；**图片缩放后直接发给模型看** |
 | `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`），cwd 是 `/workspace` |
-| `edit` | 按原文精确替换编辑文件，返回 unified diff |
+| `edit` | 改文件：按原文精确替换，返回 unified diff；新建文件：只给 `content` |
 
 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不作为工具**暴露给模型。
 以后收进沙箱里的一个命令、由 `bash` 调用 —— 这样模型只需要理解 shell。
