@@ -26,6 +26,7 @@ pub mod llm;
 pub mod mock;
 pub mod models;
 pub mod openai;
+pub mod providers;
 pub mod reader;
 pub mod responses;
 pub mod sse;
@@ -144,6 +145,12 @@ impl Core {
         core.state.mock.store(true, Ordering::Relaxed);
         let dev = mock::MockDevice::new();
         core.state.set_device(dev);
+
+        // 桌面：环境变量里配了 LLM 就当成一个已配置的服务商（没有库，只在内存里）
+        if let Some(p) = crate::llm::Provider::from_env() {
+            core.state.adopt_provider(&p);
+            core.state.set_llm(p);
+        }
 
         // 桌面：如果环境里能找到 proot + rootfs，就把 Linux 沙箱也接上
         if let Some(sb) = linux::LinuxSandbox::from_env() {

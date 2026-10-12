@@ -14,7 +14,7 @@
   import MessageList from './components/MessageList.svelte';
   import Drawer, { type Session } from './components/Drawer.svelte';
   import ModelSheet from './components/ModelSheet.svelte';
-  import LlmSheet from './components/LlmSheet.svelte';
+  import Settings from './components/Settings.svelte';
   import Viewer from './components/Viewer.svelte';
   import { viewer } from './lib/viewer.svelte.ts';
 
@@ -56,10 +56,16 @@
 
   let drawer = $state(false);
   let sheet = $state(false);
-  /** 「模型服务」（Base URL / API Key）。独立于 `sheet`：它叠在模型面板上面，
-   *  关掉之后回到模型面板，而不是一路全关。两层各自在 lib/overlay.ts 里登记，
-   *  返回键先关上面这层。 */
-  let config = $state(false);
+  /** 设置页。可以从抽屉的齿轮进，也可以从模型面板的「模型服务」进 ——
+   *  后者是叠在模型面板上面的，关掉之后回到模型面板。每层各自在
+   *  lib/overlay.ts 里登记，返回键先关最上面那层。 */
+  let settings = $state(false);
+  /** 设置页每关一次加一：Key 可能改了，模型面板据此重拉清单 */
+  let settingsRev = $state(0);
+  const closeSettings = () => {
+    settings = false;
+    settingsRev++;
+  };
 
   /** 输入区实际高度。消息列表的底部留白和底部渐隐都跟着它走。 */
   let composerH = $state(0);
@@ -425,11 +431,12 @@
     onswitch={switchSession}
     ondelete={deleteSession}
     onrename={renameSession}
+    onsettings={() => (settings = true)}
   />
 {/if}
 
-{#if sheet}<ModelSheet onclose={close} onconfig={() => (config = true)} />{/if}
+{#if sheet}<ModelSheet onclose={close} onconfig={() => (settings = true)} rev={settingsRev} />{/if}
 
-{#if config}<LlmSheet onclose={() => (config = false)} />{/if}
+{#if settings}<Settings onclose={closeSettings} />{/if}
 
 {#if viewer.url}<Viewer />{/if}

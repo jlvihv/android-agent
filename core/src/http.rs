@@ -31,6 +31,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/edit", post(edit_file))
         .route("/api/llm", post(set_llm))
         .route("/api/models", get(get_models))
+        .route("/api/providers", get(list_providers))
+        .route("/api/providers/{id}", post(save_provider).delete(delete_provider))
         .route("/api/model", post(set_model))
         .route(
             "/api/attachment",
@@ -453,6 +455,10 @@ struct ModelsQuery {
 #[serde(rename_all = "camelCase")]
 struct ModelBody {
     model: String,
+    /// 哪家的模型（服务商 id）。不给 = 当前这家。给了另一家就切过去
+    /// （用设置页存下的那家的 Key）。
+    #[serde(default)]
+    provider: Option<String>,
     /// 思考强度。不传 = 不动；空串 = 清掉（回到默认档）。
     #[serde(default)]
     reasoning_effort: Option<String>,
@@ -518,6 +524,8 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
         p.reasoning_effort = crate::llm::normalize_effort(&e);
     }
     st.set_llm(p.clone());
+    // 设置页的「模型服务」里也要看得到这一家
+    st.adopt_provider(&p);
     // 自动判定这个模型能不能吃图片 / PDF（查 models.dev），结果落盘。
     // 不劳烦用户配 —— 这是模型自己的属性。
     let vision = st.supports_images_for(&p).await;
@@ -555,26 +563,220 @@ struct StopBody {
     session: Option<String>,
 }
 
-/// `GET /api/models` → 当前 provider 的模型清单（带 vision 判定）。
+/// `GET /api/models` → 所有配好了的服务商的模型清单，按家分组。
 ///
-/// 设置界面/CLI 拿它列模型、看哪些能看图。`/api/llm` 配的模型也在里面。
+/// 「选择模型」面板就靠它：几家的 `/models` 并行拉（各自有缓存，见
+/// `AppState::models_of`），拉不到的那家带着错误回来，不拖累别家。
+/// `models` 还是当前这家的清单（老客户端 / agentctl 用）。
 async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery>) -> Response {
-    let Some(p) = st.llm().or_else(Provider::from_env) else {
-        return (StatusCode::BAD_REQUEST, "还没有配置 LLM").into_response();
-    };
-    match st.list_models(q.refresh).await {
-        Ok(models) => Json(json!({
-            "current": p.model,
-            "name": p.name,
-            "baseUrl": p.base_url,
-            "vision": st.cached_supports_images(&p),
-            "pdf": st.cached_supports_files(&p),
-            "reasoningEffort": p.reasoning_effort,
-            "models": models,
-        }))
-        .into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    let current = st.llm().or_else(Provider::from_env);
+    let current_id = current.as_ref().map(crate::providers::identify);
+    let store = st.providers.read().map(|g| g.clone()).unwrap_or_default();
+
+    let mut jobs = tokio::task::JoinSet::new();
+    for (id, creds) in store {
+        let Some(p) = crate::providers::provider(&id, &creds, "") else {
+            continue;
+        };
+        let st = st.clone();
+        let refresh = q.refresh;
+        jobs.spawn(async move {
+            let r = st.models_of(&id, &p, refresh).await;
+            (id, r)
+        });
     }
+    let mut got: Vec<(String, anyhow::Result<Vec<crate::models::ModelInfo>>)> =
+        jobs.join_all().await;
+    // 按设置页里的顺序排：内置的几家在前，「其他」最后
+    let order = |id: &str| {
+        crate::providers::PRESETS
+            .iter()
+            .position(|p| p.id == id)
+            .unwrap_or(usize::MAX)
+    };
+    got.sort_by_key(|(id, _)| order(id));
+
+    let mut current_models = serde_json::Value::Array(vec![]);
+    let groups: Vec<serde_json::Value> = got
+        .into_iter()
+        .map(|(id, r)| {
+            let name = crate::providers::display_name(&id);
+            match r {
+                Ok(models) => {
+                    let v = json!(models);
+                    if current_id == Some(id.as_str()) {
+                        current_models = v.clone();
+                    }
+                    json!({ "id": id, "name": name, "models": v })
+                }
+                Err(e) => json!({ "id": id, "name": name, "models": [], "error": format!("{e:#}") }),
+            }
+        })
+        .collect();
+
+    Json(json!({
+        "current": current.as_ref().map(|p| p.model.clone()),
+        "provider": current_id,
+        "name": current.as_ref().map(|p| p.name.clone()),
+        "baseUrl": current.as_ref().map(|p| p.base_url.clone()),
+        "vision": current.as_ref().map(|p| st.cached_supports_images(p)),
+        "pdf": current.as_ref().map(|p| st.cached_supports_files(p)),
+        "reasoningEffort": current.as_ref().and_then(|p| p.reasoning_effort.clone()),
+        "groups": groups,
+        "models": current_models,
+    }))
+    .into_response()
+}
+
+/// 换成这个 provider：存下来、判定能力、给会话换 provider session id。
+async fn switch_provider(st: &Arc<AppState>, p: &Provider) -> (bool, bool) {
+    st.set_llm(p.clone());
+    // 自动判定这个模型能不能吃图片 / PDF（查 models.dev），结果落盘。
+    let vision = st.supports_images_for(p).await;
+    let pdf = st.supports_files_for(p).await;
+    // 换了 provider / model，缓存前缀的语义就变了：给所有会话换一个
+    // provider session id，否则 provider 侧会把新前缀路由到旧模型的缓存上。
+    st.rotate_provider_sessions().await;
+    (vision, pdf)
+}
+
+/// `GET /api/providers` → 设置页「模型服务」那一栏：内置的几家 + 其他。
+///
+/// 只回「配没配」和 Key 的最后 4 位，不回 Key 本身。
+async fn list_providers(State(st): State<Arc<AppState>>) -> Response {
+    let current = st.llm().map(|p| crate::providers::identify(&p));
+    let store = st.providers.read().map(|g| g.clone()).unwrap_or_default();
+    let row = |id: &str, name: &str, base_url: String, key_url: Option<&str>| {
+        let creds = store.get(id);
+        json!({
+            "id": id,
+            "name": name,
+            "baseUrl": base_url,
+            "keyUrl": key_url,
+            "configured": creds.is_some(),
+            "keyHint": creds.map(|c| crate::providers::key_hint(&c.api_key)),
+            "current": current == Some(id),
+            "custom": id == crate::providers::CUSTOM,
+        })
+    };
+    let mut rows: Vec<serde_json::Value> = crate::providers::PRESETS
+        .iter()
+        .map(|p| row(p.id, p.name, p.base_url.to_string(), Some(p.key_url)))
+        .collect();
+    let custom_url = store
+        .get(crate::providers::CUSTOM)
+        .map(|c| c.base_url.clone())
+        .unwrap_or_default();
+    rows.push(row(crate::providers::CUSTOM, crate::providers::CUSTOM_NAME, custom_url, None));
+    Json(json!({ "providers": rows })).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderBody {
+    /// 空 = 不改（已经配过时，比如只改「其他」的 Base URL）
+    #[serde(default)]
+    api_key: String,
+    /// 只有「其他」用
+    #[serde(default)]
+    base_url: String,
+}
+
+/// `POST /api/providers/{id}` → 存一家的 Key。**先验证**（拉一次 `/models`），
+/// 不对就不存。
+///
+/// 还没有在用的模型（第一次配）、或者改的就是当前这家：顺手切过去 ——
+/// 填完 Key 就能直接聊，不用再去选一次模型。
+async fn save_provider(
+    State(st): State<Arc<AppState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<ProviderBody>,
+) -> Response {
+    if !crate::providers::is_known(&id) {
+        return (StatusCode::NOT_FOUND, "没有这个服务商").into_response();
+    }
+    let old = st.provider_creds(&id);
+    let api_key = match body.api_key.trim() {
+        "" => match &old {
+            Some(c) => c.api_key.clone(),
+            None => return (StatusCode::BAD_REQUEST, "API Key 不能为空").into_response(),
+        },
+        k => k.to_string(),
+    };
+    let creds = crate::providers::Creds {
+        api_key,
+        base_url: body.base_url.trim().trim_end_matches('/').to_string(),
+    };
+    let Some(probe) = crate::providers::provider(&id, &creds, "") else {
+        return (StatusCode::BAD_REQUEST, "Base URL 不能为空").into_response();
+    };
+    if let Err(e) = crate::models::verify(&probe).await {
+        return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
+    }
+
+    st.set_provider_creds(&id, Some(creds.clone()));
+    let models = st.models_of(&id, &probe, true).await.unwrap_or_default();
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+
+    // 第一次配 / 改的就是当前这家 → 切过去（当前这家保留原来选的模型）
+    let current = st.llm();
+    let current_id = current.as_ref().map(crate::providers::identify);
+    let mut switched = false;
+    if current.is_none() || current_id == Some(id.as_str()) {
+        let model = match &current {
+            Some(c) if current_id == Some(id.as_str()) => Some(c.model.clone()),
+            _ => crate::providers::pick_default(&id, &ids),
+        };
+        if let Some(model) = model {
+            if let Some(mut p) = crate::providers::provider(&id, &creds, &model) {
+                p.reasoning_effort = current.and_then(|c| c.reasoning_effort);
+                switch_provider(&st, &p).await;
+                switched = true;
+            }
+        }
+    }
+    st.log("info", format!("已配置 {}（{} 个模型）", crate::providers::display_name(&id), ids.len()));
+    Json(json!({ "ok": true, "models": ids.len(), "current": switched })).into_response()
+}
+
+/// `DELETE /api/providers/{id}` → 删掉一家的 Key。
+///
+/// 删的是当前在用的那家：切到另一家配好了的（它的首选模型）；一家都不剩
+/// 就清空当前 provider。
+async fn delete_provider(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<String>) -> Response {
+    st.set_provider_creds(&id, None);
+    let was_current = st
+        .llm()
+        .is_some_and(|p| crate::providers::identify(&p) == id);
+    if was_current {
+        let effort = st.llm().and_then(|p| p.reasoning_effort);
+        let next = st
+            .providers
+            .read()
+            .ok()
+            .and_then(|g| g.iter().next().map(|(k, v)| (k.clone(), v.clone())));
+        match next.and_then(|(nid, c)| Some((nid.clone(), crate::providers::provider(&nid, &c, "")?))) {
+            Some((nid, probe)) => {
+                let ids: Vec<String> = st
+                    .models_of(&nid, &probe, false)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|m| m.id)
+                    .collect();
+                let mut p = probe;
+                p.model = crate::providers::pick_default(&nid, &ids).unwrap_or_default();
+                p.reasoning_effort = effort;
+                if p.model.is_empty() {
+                    st.clear_llm();
+                } else {
+                    switch_provider(&st, &p).await;
+                }
+            }
+            None => st.clear_llm(),
+        }
+    }
+    Json(json!({ "ok": true })).into_response()
 }
 
 /// `POST /api/attachment` → 上传一个附件（图片 / PDF）。
@@ -652,20 +854,33 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
     if body.model.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "model 不能为空").into_response();
     }
-    let Some(mut p) = st.llm().or_else(Provider::from_env) else {
-        return (StatusCode::BAD_REQUEST, "还没有配置 LLM").into_response();
+    let current = st.llm().or_else(Provider::from_env);
+    let current_id = current.as_ref().map(crate::providers::identify);
+    let mut p = match (&body.provider, current) {
+        // 换到另一家：用设置页存下的那家的 Key，思考强度沿用
+        (Some(id), cur) if current_id != Some(id.as_str()) => {
+            let Some(creds) = st.provider_creds(id) else {
+                return (StatusCode::BAD_REQUEST, format!("{} 还没有配置 API Key", crate::providers::display_name(id)))
+                    .into_response();
+            };
+            let Some(mut p) = crate::providers::provider(id, &creds, "") else {
+                return (StatusCode::BAD_REQUEST, "这家服务商的配置不完整").into_response();
+            };
+            p.reasoning_effort = cur.and_then(|c| c.reasoning_effort);
+            p
+        }
+        (_, Some(cur)) => cur,
+        (_, None) => return (StatusCode::BAD_REQUEST, "还没有配置 LLM").into_response(),
     };
     p.model = body.model.trim().to_string();
     if let Some(e) = body.reasoning_effort {
         p.reasoning_effort = crate::llm::normalize_effort(&e);
     }
-    st.set_llm(p.clone());
-    let vision = st.supports_images_for(&p).await;
-    let pdf = st.supports_files_for(&p).await;
-    st.rotate_provider_sessions().await;
+    let (vision, pdf) = switch_provider(&st, &p).await;
     Json(json!({
         "ok": true,
         "model": p.model,
+        "provider": crate::providers::identify(&p),
         "vision": vision,
         "pdf": pdf,
         "reasoningEffort": p.reasoning_effort,
@@ -1550,6 +1765,73 @@ mod tests {
             .build()
             .unwrap();
         (format!("http://{addr}"), client)
+    }
+
+    /// 假的 OpenAI 兼容服务：`/models` 只认 `Bearer good`，返回两个能聊的模型 + 一个 embedding。
+    async fn fake_models_server() -> String {
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|h: axum::http::HeaderMap| async move {
+                let ok = h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer good");
+                if !ok {
+                    return (axum::http::StatusCode::UNAUTHORIZED, "bad key").into_response();
+                }
+                axum::Json(serde_json::json!({ "data": [
+                    { "id": "m-small" }, { "id": "m-big" }, { "id": "text-embedding-3-small" }
+                ] }))
+                .into_response()
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}/v1")
+    }
+
+    use axum::response::IntoResponse;
+
+    /// 设置页的流程：错的 Key 不存；第一次配好就切过去；清单只留能聊的；
+    /// 删掉当前这家，当前 provider 跟着清空。
+    #[tokio::test]
+    async fn configuring_a_provider_validates_the_key_and_lists_its_models() {
+        let st = crate::state::AppState::new();
+        let upstream = fake_models_server().await;
+        let (base, c) = serve(st.clone()).await;
+        let post = |path: &str, body: serde_json::Value| c.post(format!("{base}{path}")).json(&body).send();
+
+        let r = post("/api/providers/custom", serde_json::json!({ "apiKey": "bad", "baseUrl": upstream })).await.unwrap();
+        assert_eq!(r.status().as_u16(), 400);
+        assert!(r.text().await.unwrap().contains("API Key 不对"));
+        assert!(st.provider_creds("custom").is_none(), "验证没过的 Key 不能存");
+
+        let r = post("/api/providers/custom", serde_json::json!({ "apiKey": "good", "baseUrl": upstream })).await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let p = st.llm().expect("第一次配好就该切过去，不用再选一次模型");
+        assert_eq!((p.model.as_str(), p.api_key.as_str()), ("m-small", "good"));
+
+        let list: serde_json::Value = c.get(format!("{base}/api/providers")).send().await.unwrap().json().await.unwrap();
+        let custom = list["providers"].as_array().unwrap().iter().find(|r| r["id"] == "custom").unwrap().clone();
+        assert_eq!(custom["configured"], true);
+        assert_eq!(custom["current"], true);
+        assert_eq!(custom["keyHint"], "…good");
+        assert!(custom.get("apiKey").is_none() && !list.to_string().contains("\"good\""), "不能把 Key 回给前端");
+
+        let m: serde_json::Value = c.get(format!("{base}/api/models")).send().await.unwrap().json().await.unwrap();
+        let ids: Vec<&str> = m["groups"][0]["models"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["m-small", "m-big"], "embedding 这种不能聊的要筛掉");
+        assert_eq!(m["provider"], "custom");
+
+        // 没配过的那家：不能切过去
+        let r = post("/api/model", serde_json::json!({ "model": "gpt-5", "provider": "openai" })).await.unwrap();
+        assert_eq!(r.status().as_u16(), 400);
+
+        let r = post("/api/model", serde_json::json!({ "model": "m-big", "provider": "custom" })).await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(st.llm().unwrap().model, "m-big");
+
+        let r = c.delete(format!("{base}/api/providers/custom")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert!(st.llm().is_none(), "一家都不剩了，当前 provider 也没了");
     }
 
     /// 手机上别的 App 能连 127.0.0.1：没凭据的请求一律挡在 `/api` 外面。

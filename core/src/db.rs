@@ -301,6 +301,13 @@ impl Db {
         }
     }
 
+    /// 删一条设置。
+    pub fn delete_meta(&self, k: &str) -> Result<()> {
+        let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        g.conn.execute("DELETE FROM meta WHERE k = ?1", [k])?;
+        Ok(())
+    }
+
     /// 写一条设置。单条 UPSERT，原子的。
     pub fn set_meta(&self, k: &str, v: &str) -> Result<()> {
         let g = self.inner.lock().map_err(|_| anyhow::anyhow!("db 锁坏了"))?;

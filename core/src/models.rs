@@ -212,6 +212,23 @@ pub async fn list(
     }
 }
 
+/// 验证 Key：直接拉一次 `/models`，**不**退回 models.dev 目录。
+///
+/// `list()` 拉不到会用目录兜底 —— 那是为了「网络抖一下也有清单可选」，但拿来
+/// 验证 Key 就会把一个错的 Key 当成对的。返回模型数。
+pub async fn verify(provider: &Provider) -> anyhow::Result<usize> {
+    match fetch_models(provider).await {
+        Ok(v) => Ok(v.len()),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("401") || msg.contains("403") {
+                anyhow::bail!("API Key 不对（服务商拒绝了：{msg}）");
+            }
+            Err(e.context("连不上服务商"))
+        }
+    }
+}
+
 async fn fetch_models(provider: &Provider) -> anyhow::Result<Vec<RawModel>> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
     let http = crate::llm::shared_http()?;

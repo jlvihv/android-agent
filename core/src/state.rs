@@ -151,6 +151,16 @@ pub struct AppState {
     /// 通过 `POST /api/llm` 注入，存在会话库的 `meta` 表里（`llm` 这一行）。
     /// 桌面上启动时从环境变量播种。
     pub llm: RwLock<Option<Provider>>,
+    /// 每家服务商存下来的 Key（`meta` 表的 `providers`）。见 `providers` 模块。
+    ///
+    /// `llm` 是「当前在用的那一个」（含模型），这里是「配好了的全部」：
+    /// 选择模型面板把这几家的模型都列出来，点哪个就切到哪家。
+    pub providers: RwLock<crate::providers::Store>,
+    /// 各家的模型清单：服务商 id → (拉的时间, 清单)。
+    ///
+    /// 打开选择模型面板要拉好几家的 `/models`，每次都等网络太慢；
+    /// 清单十分钟内不会变，换 Key 时清掉。
+    pub model_lists: Mutex<HashMap<String, (std::time::Instant, Vec<crate::models::ModelInfo>)>>,
     /// 持久化目录（安卓上是 `<filesDir>`；桌面上为空则只存内存）
     pub data_dir: RwLock<Option<std::path::PathBuf>>,
     /// 会话库。`set_data_dir` 时打开。
@@ -208,6 +218,8 @@ impl AppState {
             chat: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
             linux: RwLock::new(None),
             llm: RwLock::new(None),
+            providers: RwLock::new(Default::default()),
+            model_lists: Mutex::new(HashMap::new()),
             data_dir: RwLock::new(None),
             sessions_loaded: AtomicBool::new(false),
             turns: Mutex::new(HashMap::new()),
@@ -290,6 +302,7 @@ impl AppState {
             Ok(db) => {
                 let db = Arc::new(db);
                 self.load_llm(&db, dir);
+                self.load_providers(&db);
                 self.load_auth(&db);
                 if let Ok(mut g) = self.db.write() {
                     *g = Some(db);
@@ -329,6 +342,107 @@ impl AppState {
                 Err(e) => st.log("error", format!("读取会话的任务挂了: {e}")),
             }
         });
+    }
+
+    /// 各家的 Key。老版本只有一个 provider（`llm`）：库里还没有 `providers`
+    /// 时，把它记成对应那家（按 Base URL 认）已配置。
+    fn load_providers(&self, db: &Db) {
+        let store: crate::providers::Store = match db.get_meta("providers") {
+            Ok(Some(s)) => serde_json::from_str(&s).unwrap_or_else(|e| {
+                tracing::warn!("providers 解析失败: {e}");
+                Default::default()
+            }),
+            _ => Default::default(),
+        };
+        if let Ok(mut g) = self.providers.write() {
+            *g = store;
+        }
+        if self.providers.read().map(|g| g.is_empty()).unwrap_or(false) {
+            if let Some(p) = self.llm() {
+                self.adopt_provider(&p);
+            }
+        }
+    }
+
+    /// 把一个已经在用的 provider 记成「这家已配置」（迁移老配置 / 桌面环境变量）。
+    pub fn adopt_provider(&self, p: &Provider) {
+        let id = crate::providers::identify(p);
+        let creds = crate::providers::Creds {
+            api_key: p.api_key.clone(),
+            base_url: if id == crate::providers::CUSTOM { p.base_url.clone() } else { String::new() },
+        };
+        self.set_provider_creds(id, Some(creds));
+    }
+
+    pub fn provider_creds(&self, id: &str) -> Option<crate::providers::Creds> {
+        self.providers.read().ok()?.get(id).cloned()
+    }
+
+    /// 存 / 删一家的 Key（`None` = 删），落库，并清掉它的模型清单缓存。
+    pub fn set_provider_creds(&self, id: &str, creds: Option<crate::providers::Creds>) {
+        if let Ok(mut g) = self.providers.write() {
+            match creds {
+                Some(c) => {
+                    g.insert(id.to_string(), c);
+                }
+                None => {
+                    g.remove(id);
+                }
+            }
+        }
+        if let Ok(mut g) = self.model_lists.lock() {
+            g.remove(id);
+        }
+        let Some(db) = self.db() else { return };
+        let body = self
+            .providers
+            .read()
+            .ok()
+            .and_then(|g| serde_json::to_string(&*g).ok());
+        if let Some(body) = body {
+            if let Err(e) = db.set_meta("providers", &body) {
+                tracing::warn!("保存服务商的 Key 失败: {e:#}");
+            }
+        }
+    }
+
+    /// 一家的可对话模型清单（带缓存）。`refresh` = 不要缓存。
+    pub async fn models_of(
+        &self,
+        id: &str,
+        provider: &Provider,
+        refresh: bool,
+    ) -> anyhow::Result<Vec<crate::models::ModelInfo>> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(600);
+        if !refresh {
+            let hit = self.model_lists.lock().ok().and_then(|g| {
+                g.get(id)
+                    .filter(|(at, _)| at.elapsed() < TTL)
+                    .map(|(_, v)| v.clone())
+            });
+            if let Some(v) = hit {
+                return Ok(v);
+            }
+        }
+        let dir = self.data_dir.read().ok().and_then(|g| g.clone());
+        let mut list = crate::models::list(provider, refresh, dir.as_deref()).await?;
+        list.retain(|m| crate::providers::is_chat_model(&m.id));
+        if let Ok(mut g) = self.model_lists.lock() {
+            g.insert(id.to_string(), (std::time::Instant::now(), list.clone()));
+        }
+        Ok(list)
+    }
+
+    /// 不再有当前 provider（删掉了最后一个配好的服务商）。
+    pub fn clear_llm(&self) {
+        if let Ok(mut g) = self.llm.write() {
+            *g = None;
+        }
+        if let Some(db) = self.db() {
+            if let Err(e) = db.delete_meta("llm") {
+                tracing::warn!("清掉 provider 配置失败: {e:#}");
+            }
+        }
     }
 
     /// 访问凭据：库里有就用，没有就生成一份存进去（跨重启不变，调试脚本
@@ -811,6 +925,9 @@ mod tests {
         let p = st.llm().expect("从 llm.json 恢复出 provider");
         assert_eq!((p.model.as_str(), p.api_key.as_str()), ("m1", "sk-1"));
         assert!(!dir.join("llm.json").exists(), "明文 key 不该再留一份在文件里");
+        // 老配置记成「其他」那家已配置，设置页里看得到
+        let c = st.provider_creds("custom").expect("老配置要出现在设置页的服务商里");
+        assert_eq!((c.api_key.as_str(), c.base_url.as_str()), ("sk-1", "https://x/v1"));
 
         // 改模型 → 存进库；重开之后还在，凭据也不变
         let mut p2 = p.clone();

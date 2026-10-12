@@ -464,6 +464,5 @@ dev_shell 'uname -m'
    `rustls-platform-verifier`（~0.1MB）。
 4. **API key 明文存在 `sessions.db`（`meta` 表）里。** 受 Android 沙箱保护，
    但下一步应该用 Android Keystore 加密。
-5. **没有 Web 端的设置界面。** 目前只能用 `curl POST /api/llm` 配置。
-   现在有 `GET /api/models`（带能否看图）+ `POST /api/model`，接一个
-   模型选择页只差前端。
+5. ~~**没有 Web 端的设置界面。**~~ 已处理：设置页里按服务商填 API Key
+   （见 docs/05-ui.md「设置页」），`POST /api/llm` 只留给脚本 / 桌面开发。

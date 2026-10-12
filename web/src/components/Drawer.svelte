@@ -45,6 +45,7 @@
     onswitch,
     ondelete,
     onrename,
+    onsettings,
   }: {
     sessions: Session[];
     onclose: () => void;
@@ -52,6 +53,8 @@
     onswitch: (id: string) => void;
     ondelete: (id: string) => void;
     onrename: (id: string, title: string) => void;
+    /** 左下角的齿轮 → 设置页 */
+    onsettings: () => void;
   } = $props();
 
   // —— 搜索 ——
@@ -325,10 +328,11 @@
   <div
     class="flex shrink-0 items-center gap-3 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
   >
-    <!-- 左下角 = 设置。图标本身说明用途；功能待接（点开还没东西）。
+    <!-- 左下角 = 设置。图标本身说明用途。
          连接状态当角标挂在这个按钮上，顺手保留了原来那个点的信息。 -->
     <button
       type="button"
+      onclick={onsettings}
       aria-label="设置"
       title="设置"
       class="relative grid size-11 shrink-0 place-items-center rounded-full bg-hairline text-muted"

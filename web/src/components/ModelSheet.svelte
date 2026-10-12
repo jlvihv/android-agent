@@ -9,13 +9,15 @@
    * JS 只做两件事：记「现在哪一页」、量一下两页的自然高度（`height: auto → auto`
    * 没法过渡，只能给它一个具体数值）。
    *
-   * 布局照着 Claude 的「选择模型」面板，三处不同：
+   * 布局照着 Claude 的「选择模型」面板，几处不同：
    *   1. **不写模型描述**。Claude 每行下面有一句「适用于复杂工作与日常任务」；
    *      那是给它几个自家模型手写的，我们这里是 provider `/models` 拉回来的
    *      任意清单（OpenCode Go 有 38 个），没有描述可写，也不该编。
    *   2. **模型清单单独滚动**：38 行会把「思考强度」推到屏幕外，得先划过 38 行
    *      才点得到。给清单一个高度上限（内容在里面滚），下面两块就永远在视野里。
-   *   3. 最后那块从「更多模型」改成「模型服务」—— 我们要有个地方进 Base URL。
+   *   3. **几家服务商的模型都在这一个清单里**，按家分组（只配了一家就不显示组名）。
+   *      点哪家的模型就切到哪家 —— Key 在设置页里各存一份。
+   *   4. 最后那块是「模型服务」：打开设置页（配 Key 的地方）。
    *
    * 第二页没有返回箭头：安卓本来就有返回键/返回手势，再画一个纯属重复。
    * 返回键在 `Sheet` 里被接管（见它的 `onback`），按下是退回第一页。
@@ -30,17 +32,25 @@
   let {
     onclose,
     onconfig,
+    rev = 0,
   }: {
     onclose: () => void;
-    /** 「模型服务」→ 打开 provider 配置（Base URL / API Key） */
+    /** 「模型服务」→ 打开设置页（各家的 API Key） */
     onconfig: () => void;
+    /** 设置页关掉时会变：Key 可能改了，清单要重拉 */
+    rev?: number;
   } = $props();
 
   type Model = { id: string; name: string };
+  /** 一家服务商的模型（`GET /api/models` 的 `groups`） */
+  type Group = { id: string; name: string; models: Model[]; error?: string };
   type Page = 'models' | 'effort';
 
   let page = $state<Page>('models');
-  let models = $state<Model[]>([]);
+  let groups = $state<Group[]>([]);
+  /** 当前在用的是哪家（服务商 id） */
+  let currentProvider = $state<string | null>(null);
+  const modelCount = $derived(groups.reduce((n, g) => n + g.models.length, 0));
   let loading = $state(true);
   let err = $state('');
   let busy = $state(false);
@@ -85,13 +95,15 @@
   // 量两页的自然高度。两个 pane 都在 DOM 里（在轨道上），量的是它们各自
   // 不受视口限制时的高度。`models.length` / `loading` 是依赖：清单到位后要重量。
   $effect(() => {
-    void models.length;
+    void modelCount;
+    void groups.length;
     void loading;
     if (paneModels) hModels = paneModels.offsetHeight;
     if (paneEffort) hEffort = paneEffort.offsetHeight;
   });
 
   $effect(() => {
+    void rev;
     void load();
   });
 
@@ -101,8 +113,9 @@
     try {
       const r = await fetch('/api/models');
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const d = (await r.json()) as { models: Model[] };
-      models = d.models ?? [];
+      const d = (await r.json()) as { groups?: Group[]; provider?: string | null };
+      groups = d.groups ?? [];
+      currentProvider = d.provider ?? null;
     } catch (e) {
       err = String(e);
     } finally {
@@ -115,28 +128,31 @@
     });
   }
 
-  /** 换模型：强度字段跟着一起发（空串 = 保持默认档，不传 = 不动）。 */
-  async function pickModel(id: string) {
-    if (busy || id === current) return;
-    await apply(id, effort);
+  const isCurrent = (g: Group, m: Model) => g.id === currentProvider && m.id === current;
+
+  /** 换模型（可能换到另一家）：强度字段跟着一起发（空串 = 保持默认档）。 */
+  async function pickModel(g: Group, m: Model) {
+    if (busy || isCurrent(g, m)) return;
+    await apply(m.id, g.id, effort);
   }
 
-  /** 换强度：模型字段照原样带上。 */
+  /** 换强度：模型和服务商照原样带上。 */
   async function pickEffort(value: string | null) {
     if (busy || value === effort) return;
-    await apply(current, value);
+    await apply(current, currentProvider, value);
   }
 
-  async function apply(model: string, e: string | null) {
+  async function apply(model: string, provider: string | null, e: string | null) {
     busy = true;
     err = '';
     try {
       const r = await fetch('/api/model', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model, reasoningEffort: e ?? '' }),
+        body: JSON.stringify({ model, provider: provider ?? undefined, reasoningEffort: e ?? '' }),
       });
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      currentProvider = provider;
       await store.reloadHealth();
     } catch (e) {
       err = String(e);
@@ -173,24 +189,39 @@
             bind:this={scroller}
             class="max-h-[42dvh] overflow-y-auto overscroll-contain rounded-2xl bg-bubble"
           >
-            {#if loading}
+            {#if loading && groups.length === 0}
               <p class="px-4 py-3.5 text-base text-muted">载入中…</p>
-            {:else if models.length === 0}
-              <p class="px-4 py-3.5 text-base text-muted">没拿到模型列表</p>
+            {:else if groups.length === 0}
+              <!-- 一家都没配：直接带去设置页 -->
+              <button onclick={onconfig} class="flex w-full flex-col gap-0.5 px-4 py-3.5 text-left active:bg-control">
+                <span class="text-[17px]">还没有配置模型服务</span>
+                <span class="text-meta text-accent">去设置里填一个 API Key</span>
+              </button>
             {:else}
-              {#each models as m (m.id)}
-                <button
-                  data-current={m.id === current ? '1' : undefined}
-                  onclick={() => pickModel(m.id)}
-                  disabled={busy}
-                  class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
-                         text-left last:border-b-0 active:bg-control"
-                >
-                  <span class="min-w-0 flex-1 truncate text-[17px]">{m.name}</span>
-                  {#if m.id === current}
-                    <Icon name="check" size={17} class="shrink-0 text-fg" />
-                  {/if}
-                </button>
+              {#each groups as g (g.id)}
+                <!-- 只配了一家就不显示组名（就是一个普通清单） -->
+                {#if groups.length > 1}
+                  <p class="sticky top-0 z-10 bg-bubble px-4 pt-3 pb-1.5 text-meta text-muted">{g.name}</p>
+                {/if}
+                {#if g.error}
+                  <p class="border-b border-hairline px-4 py-3 text-meta leading-relaxed text-bad">
+                    拉不到模型：{g.error}
+                  </p>
+                {/if}
+                {#each g.models as m (m.id)}
+                  <button
+                    data-current={isCurrent(g, m) ? '1' : undefined}
+                    onclick={() => pickModel(g, m)}
+                    disabled={busy}
+                    class="flex w-full items-center gap-3 border-b border-hairline px-4 py-3.5
+                           text-left active:bg-control"
+                  >
+                    <span class="min-w-0 flex-1 truncate text-[17px]">{m.name}</span>
+                    {#if isCurrent(g, m)}
+                      <Icon name="check" size={17} class="shrink-0 text-fg" />
+                    {/if}
+                  </button>
+                {/each}
               {/each}
             {/if}
           </div>
@@ -208,7 +239,7 @@
             </span>
           </button>
 
-          <!-- 模型服务：Base URL / API Key（原来的模型设置） -->
+          <!-- 模型服务：打开设置页（各家的 API Key） -->
           <button
             onclick={onconfig}
             class="flex w-full items-center gap-3 rounded-2xl bg-bubble px-4 py-3.5 text-left
@@ -216,7 +247,7 @@
           >
             <span class="text-[17px]">模型服务</span>
             <span class="ml-auto min-w-0 truncate text-[17px] text-muted">
-              {store.llm?.baseUrl?.replace(/^https?:\/\//, '') ?? '未配置'}
+              {groups.length > 0 ? `${groups.length} 家` : '未配置'}
             </span>
             <Icon name="chevron" size={16} class="shrink-0 text-muted" />
           </button>
