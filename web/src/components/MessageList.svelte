@@ -46,9 +46,36 @@
         return firstLine(s(a.command)) || '执行命令';
       case 'edit':
         return `编辑 ${s(a.path) || '文件'}`;
+      case 'browser':
+        return `浏览器 ${browserSummary(a)}`;
       default:
         return t.toolName || '工具调用';
     }
+  }
+
+  /**
+   * 浏览器那一行：动作 + 目标。
+   *
+   * 目标按动作取一个（url / selector / x,y）—— 这一行是折叠状态下**唯一**
+   * 能看到的东西，把 action 和它的对象放在一起才有信息量。
+   */
+  function browserSummary(a: Record<string, unknown>): string {
+    const s = (v: unknown) => (typeof v === 'string' ? v : '');
+    const action = s(a.action) || '?';
+    const label: Record<string, string> = {
+      navigate: '打开',
+      get_backbone: '读结构',
+      click: '点击',
+      type: '输入',
+      get_text: '读文本',
+      scroll: '滚动',
+      screenshot: '截图',
+      back: '后退',
+      js: '执行 JS',
+    };
+    const target = s(a.url) || s(a.selector) || (a.x !== undefined ? `${a.x},${a.y}` : '');
+    const one = target.split('\n')[0].trim();
+    return `${label[action] ?? action} ${one}`.trim();
   }
 
   /**
@@ -88,6 +115,8 @@
         return '执行命令';
       case 'edit':
         return '编辑文件';
+      case 'browser':
+        return '浏览器';
       default:
         return t.toolName || '工具调用';
     }
@@ -100,8 +129,20 @@
     if (t.toolName === 'read') return s(a.path);
     if (t.toolName === 'bash') return s(a.command);
     if (t.toolName === 'edit') return s(a.path);
+    if (t.toolName === 'browser') return browserPrimary(a);
     if (t.input !== undefined) return JSON.stringify(t.input, null, 2);
     return t.inputText ?? '';
+  }
+
+  /** 浏览器面板正文：动作 + 参数。截图那一条的图片由下面的 imagePath 分支渲染 */
+  function browserPrimary(a: Record<string, unknown>): string {
+    const s = (v: unknown) => (typeof v === 'string' ? v : '');
+    const action = s(a.action);
+    if (action === 'navigate') return s(a.url);
+    if (action === 'js') return s(a.script);
+    if (action === 'type') return `${s(a.selector)} ← ${s(a.text)}`;
+    if (action === 'click' && !s(a.selector)) return `(${a.x}, ${a.y})`;
+    return s(a.selector) || JSON.stringify(a, null, 2);
   }
 
   const asText = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v, null, 2));

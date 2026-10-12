@@ -102,6 +102,35 @@ fn build_tools() -> Vec<ToolSpec> {
                 })
             },
         },
+        ToolSpec {
+            name: "browser",
+            description: "在真浏览器（WebView）里打开网页并操作它：点、输入、滚动、读页面骨架、截图。\
+要用登录态、要看 JS 渲染出来的内容（SPA）、要填表单/点按钮，只能用它 —— curl 拿不到这些。\
+典型顺序：navigate → get_backbone（拿到可点的 selector 和页面结构）→ click / type →\
+再 get_backbone 确认。只是抓一篇静态文章的话，bash 里的 curl 更快。",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；click=点 selector 或坐标；type=往 selector 里输入文本；get_text=读正文（不给 selector 就是整页）；scroll=滚动；screenshot=截图（模型能看到图）；back=后退；js=在页面里执行一段 JS（返回值 JSON 化后给你）",
+                            "enum": ["navigate", "get_backbone", "click", "type", "get_text", "scroll", "screenshot", "back", "js"]
+                        },
+                        "url": { "type": "string", "description": "navigate 的目标。没写协议头就按 https 补" },
+                        "selector": { "type": "string", "description": "CSS selector。get_backbone 给出的 sel 可以直接用" },
+                        "text": { "type": "string", "description": "type 要输入的文本" },
+                        "x": { "type": "integer", "description": "click 的 X 坐标（和 y 一起用，代替 selector）" },
+                        "y": { "type": "integer", "description": "click 的 Y 坐标" },
+                        "script": { "type": "string", "description": "js 动作要执行的代码。可以是 async，允许 await 和顶层 return" },
+                        "direction": { "type": "string", "description": "scroll 方向", "enum": ["up", "down"] },
+                        "amount": { "type": "integer", "description": "scroll 每次滚多少像素（默认 500）" },
+                        "max_depth": { "type": "integer", "description": "get_backbone 的树深度（默认 5）" }
+                    },
+                    "required": ["action"]
+                })
+            },
+        },
     ]
 }
 
@@ -2035,9 +2064,105 @@ async fn execute_tool(
         };
     }
 
+    if name == "browser" {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        if action.is_empty() {
+            return ToolOutcome::json(json!({ "error": "缺少参数 action" }));
+        }
+
+        let res = match core.browser(&args.to_string()).await {
+            Ok(v) => v,
+            Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+        };
+
+        if res.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let why = res
+                .get("text")
+                .or_else(|| res.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("浏览器动作失败");
+            return ToolOutcome::json(json!({ "error": why }));
+        }
+
+        let mut text = res
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // 每一跳都把落地点报出来：模型下一步要发请求/点链接时靠它判断自己在哪
+        if let Some(url) = res.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            text.push_str(&format!("\nURL: {url}"));
+        }
+
+        let mut out = ToolOutcome::json(json!({
+            "ok": true,
+            "output": text,
+            "truncated": false,
+        }));
+
+        // 截图（只有 screenshot 动作有）：走 `read` 同一条图片管线 ——
+        // 解码、缩到 2000、重新编码后落盘，所以历史里存的是压过的那份。
+        if let Some(p) = res.get("image").and_then(|v| v.as_str()) {
+            match browser_image(core, p).await {
+                Some(img) => {
+                    out.result["imagePath"] = json!(p);
+                    out.images.push(img);
+                }
+                None => {
+                    let t = out.result["output"].as_str().unwrap_or("").to_string();
+                    out.result["output"] = json!(format!("{t}\n[截图没能读出来，没发给模型]"));
+                }
+            }
+        }
+
+        return out;
+    }
+
     // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）现在**不作为工具**
     // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
     ToolOutcome::json(json!({ "error": format!("未知工具 {name}") }))
+}
+
+/// 浏览器截图 → 挂到工具结果上。
+///
+/// Kotlin 把截图落在沙箱里的 `/root/.browser/…`，这里按**沙箱路径**读进来
+/// （`read_any` 会把它映射到 rootfs），复用 `read` 的图片管线：解码 → 缩到
+/// 2000 → 重编码 → 落盘。返回 `None` 表示这张图没拿到（调用方在文本里标明）。
+async fn browser_image(core: &Core, guest_path: &str) -> Option<ImagePart> {
+    let img = match core.read_any(guest_path, 0, None).await {
+        Ok(crate::linux::ReadResult::Image(img)) => img,
+        Ok(_) => {
+            tracing::warn!("浏览器截图不是图片: {guest_path}");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("读浏览器截图失败 {guest_path}: {e:#}");
+            return None;
+        }
+    };
+
+    let supports_images = core
+        .state
+        .llm()
+        .map(|p| core.state.cached_supports_images(&p))
+        .unwrap_or(true);
+    if !supports_images {
+        return None;
+    }
+
+    let mime = img.mime.clone();
+    match core.save_image(img.bytes, mime.clone()).await {
+        Ok(stored) => Some(ImagePart {
+            path: stored.display().to_string(),
+            mime,
+            source: guest_path.to_string(),
+            tool: "browser".to_string(),
+        }),
+        Err(e) => {
+            tracing::warn!("浏览器截图落盘失败: {e:#}");
+            None
+        }
+    }
 }
 
 /// 图片结果：缩好的字节落盘（历史回放时还要重发），回给模型一段能读的说明
@@ -2642,7 +2767,7 @@ mod tests {
         // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）暂时**不作为工具**
         // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
         let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["read", "bash", "edit"]);
+        assert_eq!(names, vec!["read", "bash", "edit", "browser"]);
         // 重复调用必须完全一致
         assert_eq!(names, tools().iter().map(|t| t.name).collect::<Vec<_>>());
     }

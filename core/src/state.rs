@@ -71,6 +71,33 @@ pub trait DeviceApi: Send + Sync + 'static {
 }
 
 // ---------------------------------------------------------------------------
+// 浏览器能力（同样是决策 D2 的落点，但刻意和 DeviceApi 分开）
+// ---------------------------------------------------------------------------
+
+/// 由 Kotlin 实现：一个真 WebView 上的浏览器动作。
+///
+/// **为什么不挂在 `DeviceApi` 上**：浏览器不需要无障碍服务 —— 关掉无障碍
+/// 也该能用，而设备那条路是 `onDeviceReady` 才注进来的（见 `AgentApp`）。
+/// 两件事的可用条件不同，就不该共用一个开关。
+///
+/// 接口形状照抄 `DeviceApi`（JSON 进、JSON 出），加动作不用动 FFI 定义。
+///
+/// 与 `DeviceApi` 的两点不同：
+///
+/// - 实现方**会阻塞**（WebView 只能在主线程碰，Kotlin 侧要等它），所以
+///   调用方必须走 `spawn_blocking`，见 `Core::browser`。
+/// - 一次调用是**秒级**的（navigate 要等页面），不是几百毫秒。
+pub trait BrowserApi: Send + Sync + 'static {
+    /// 执行一个动作（`BrowserAction` 的 JSON），返回结果 JSON。
+    ///
+    /// 约定的返回形状（Kotlin 侧负责填）：
+    /// `{"ok":bool, "text":…, "url":…, "title":…, "image":"<沙箱路径>", "error":…}`
+    fn execute(&self, action_json: &str) -> Result<String, String>;
+}
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Rust → 前端：事件
 // ---------------------------------------------------------------------------
 
@@ -134,6 +161,9 @@ struct PersistedProvider {
 pub struct AppState {
     pub tx: broadcast::Sender<Event>,
     pub device: RwLock<Option<Arc<dyn DeviceApi>>>,
+    /// 浏览器实现。和 `device` 分开：它的可用条件是无障碍无关的
+    /// （见 `BrowserApi` 的说明）。
+    pub browser: RwLock<Option<Arc<dyn BrowserApi>>>,
     pub port: AtomicU16,
     pub mock: AtomicBool,
     /// 会话历史。用 tokio 的 RwLock，因为 agent loop 会跨 await 持有。
@@ -213,6 +243,7 @@ impl AppState {
         Arc::new(Self {
             tx,
             device: RwLock::new(None),
+            browser: RwLock::new(None),
             port: AtomicU16::new(0),
             mock: AtomicBool::new(false),
             chat: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
@@ -268,6 +299,16 @@ impl AppState {
             name: String::new(),
             mock: false,
         });
+    }
+
+    pub fn browser(&self) -> Option<Arc<dyn BrowserApi>> {
+        self.browser.read().ok().and_then(|g| g.clone())
+    }
+
+    pub fn set_browser(&self, b: Arc<dyn BrowserApi>) {
+        if let Ok(mut g) = self.browser.write() {
+            *g = Some(b);
+        }
     }
 
     pub fn set_device(&self, dev: Arc<dyn DeviceApi>) {

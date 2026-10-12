@@ -121,6 +121,14 @@ class AgentApp : Application() {
             return
         }
 
+        // 1b. 接上浏览器。
+        //
+        //     **刻意不和「设备」（无障碍）绑在一起**：浏览器不需要无障碍权限，
+        //     关掉无障碍也该能用。WebView 本身是懒建的 —— 不调 `browser` 工具
+        //     就不会多出这只 WebView。
+        runCatching { core.setBrowser(BrowserController(this)) }
+            .onFailure { Log.w(TAG, "浏览器注入失败", it) }
+
         // 2. 配 Linux 沙箱。
         //    安卓上 proot 必须住在 nativeLibraryDir（那里才允许 exec），
         //    rootfs 在 filesDir（靠 proot 的 loader mmap，不靠 exec）。

@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::llm::Provider;
@@ -28,6 +28,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health))
         .route("/api/command", post(post_command))
         .route("/api/linux", post(bash_run))
+        .route("/api/browser", post(browser_action))
         .route("/api/edit", post(edit_file))
         .route("/api/llm", post(set_llm))
         .route("/api/models", get(get_models))
@@ -249,6 +250,25 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
             "wall_time_seconds": (r.duration_ms as f64) / 1000.0,
         }))
         .into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `POST /api/browser` → 直接跑一个浏览器动作（对应 `browser` 工具）。
+///
+/// body 就是工具参数的形状（`{action, url, selector, …}`），返回 Kotlin 给的
+/// 结果 JSON。
+///
+/// 为什么要有这个入口：
+///
+/// 1. 沙箱里的 `agent browser` 走它 —— 于是 bash 也能脚本化地驱动浏览器
+///    （批量抓、循环翻页），截图落在 /root/.browser 里能直接用别的工具处理。
+/// 2. 走到一次工具调用要花一整轮 LLM（钱 + 时间），调试浏览器时不现实。
+///    有个能直接打的入口，改一行 JS 就能立刻验。
+async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let core = Core { state: st.clone() };
+    match core.browser(&body.to_string()).await {
+        Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
     }
 }

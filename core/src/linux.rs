@@ -227,6 +227,11 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #   agent doctor             各部件体检
 #   agent setup [--force|--list|包…]   装/看常用工具（rg fd jq git python3…）
 #   agent command <json>     操作这台手机，例如 '{"type":"key","name":"back"}'
+#   agent browser <动作> [参数…]  驱动内置浏览器（真 WebView）：
+#       navigate <url> | get_backbone [深度] | click <选择器> | type <选择器> <文本>
+#       get_text [选择器] | scroll [up|down] [像素] | screenshot | back | js '<代码>'
+#     输出是核心给的原始 JSON；screenshot 把图存到 /root/.browser/。
+#     其他参数直接给 JSON：agent browser '{"action":"click","x":100,"y":200}'
 #   agent get <path>         直接 GET 自己的接口（逃生口）
 #   agent post <path> <json> 直接 POST
 #
@@ -298,8 +303,48 @@ EOT
     ;;
   get)  [ $# -ge 2 ] || { echo "用法：agent get /api/…" >&2; exit 2; }; get "$2" ;;
   post) [ $# -ge 3 ] || { echo "用法：agent post /api/… '{…}'" >&2; exit 2; }; post "$2" "$3" ;;
+  browser)
+    shift || true
+    act="${1:-}"; shift || true
+    usage() {
+      cat >&2 <<'EOT'
+用法：agent browser <动作> [参数…]
+  navigate <url>                   打开网页
+  get_backbone [深度]              读页面结构（含可点的 selector）
+  click <选择器>                    点击（也可以用 JSON 给 x/y）
+  type <选择器> <文本>              往输入框里填
+  get_text [选择器]                 读正文
+  scroll [up|down] [像素]           滚动
+  screenshot                       截图（存 /root/.browser/）
+  back                             后退
+  js '<代码>'                      在页面里跑一段 JS
+EOT
+    }
+    case "$act" in
+      ""|help|-h|--help) usage; exit 2 ;;
+    esac
+    # 参数里的 \ 和 " 要先转义，否则拼出来的 JSON 是坏的。
+    # 参数长得复杂（要 x/y、要多个字段）就直接给 JSON：agent browser '{"action":…}'
+    esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+    case "$act" in
+      navigate) body="{\"action\":\"navigate\",\"url\":\"$(esc "${1:-}")\"}" ;;
+      get_backbone)
+        if [ -n "${1:-}" ]; then body="{\"action\":\"get_backbone\",\"max_depth\":$1}"; else body='{"action":"get_backbone"}'; fi ;;
+      click)    body="{\"action\":\"click\",\"selector\":\"$(esc "${1:-}")\"}" ;;
+      type)     body="{\"action\":\"type\",\"selector\":\"$(esc "${1:-}")\",\"text\":\"$(esc "${2:-}")\"}" ;;
+      get_text)
+        if [ -n "${1:-}" ]; then body="{\"action\":\"get_text\",\"selector\":\"$(esc "$1")\"}"; else body='{"action":"get_text"}'; fi ;;
+      scroll)
+        if [ -n "${2:-}" ]; then body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\",\"amount\":$2}"; else body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\"}"; fi ;;
+      screenshot) body='{"action":"screenshot"}' ;;
+      back)       body='{"action":"back"}' ;;
+      js)         body="{\"action\":\"js\",\"script\":\"$(esc "${1:-}")\"}" ;;
+      *)          body="$act" ;;
+    esac
+    post /api/browser "$body"
+    ;;
   help|-h|--help)
-    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,21p'
+    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,25p'
     ;;
   *)
     echo "不认识的子命令：$cmd（agent help）" >&2

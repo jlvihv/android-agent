@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use crate::linux::SandboxConfig;
-use crate::state::DeviceApi;
+use crate::state::{BrowserApi, DeviceApi};
 use crate::Core;
 
 /// 统一的错误类型。`flat_error` 让 Kotlin 侧只拿到一个异常类 + 消息字符串，
@@ -93,6 +93,33 @@ impl DeviceApi for HostAdapter {
     }
 }
 
+/// 浏览器能力接口，**由 Kotlin 实现**。
+///
+/// 和 `DeviceHost` 是两条独立的路：这个不依赖无障碍服务，`AgentApp.onCreate`
+/// 就注入了（而设备要等服务连上）。
+///
+/// 实现者注意两点：
+///
+/// - `execute` 会被 Rust 从 `spawn_blocking` 线程调用，**不是主线程**；
+///   而 WebView 只能在主线程碰，所以实现里要自己 post 回主线程再等结果。
+/// - 一次调用是**秒级**的（navigate 要等页面加载）。阻塞那个后台线程没问题，
+///   但必须带硬超时 —— Rust 侧也有一个兜底（`Core::browser`）。
+#[uniffi::export(callback_interface)]
+pub trait BrowserHost: Send + Sync {
+    /// 执行一个动作（JSON），返回结果 JSON。形状见 `BrowserApi::execute`。
+    fn execute(&self, action_json: String) -> Result<String, CoreError>;
+}
+
+struct BrowserAdapter(Box<dyn BrowserHost>);
+
+impl BrowserApi for BrowserAdapter {
+    fn execute(&self, action_json: &str) -> Result<String, String> {
+        self.0
+            .execute(action_json.to_string())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// 核心句柄。Kotlin 持有它，生命周期跟 Application 一致。
 #[derive(uniffi::Object)]
 pub struct AgentCore {
@@ -143,6 +170,11 @@ impl AgentCore {
     /// 无障碍服务断开时调用
     pub fn clear_device(&self) {
         self.core.state.clear_device();
+    }
+
+    /// 注入浏览器实现。`AgentApp.onCreate` 里调（不依赖无障碍）。
+    pub fn set_browser(&self, host: Box<dyn BrowserHost>) {
+        self.core.state.set_browser(std::sync::Arc::new(BrowserAdapter(host)));
     }
 
     /// 配置 Linux 沙箱。

@@ -255,6 +255,38 @@ impl Core {
         tokio::task::spawn_blocking(move || sb.read_any(&path, offset, limit)).await?
     }
 
+    /// 跑一个浏览器动作，返回结果 JSON。
+    ///
+    /// 三层保护，缺一层就可能把整个回合卡死：
+    ///
+    /// 1. `spawn_blocking`：Kotlin 侧要 post 到主线程等 WebView 做完（秒级），
+    ///    直接在 tokio worker 上等会把（只有两个的）worker 占死。
+    /// 2. 这里包一层 `timeout`：Kotlin 自己的硬超时是主要手段，但万一它没回来
+    ///    （WebView 卡住/进程状态不对），agent 不能陪着一起挂。
+    /// 3. 超时只意味着**不再等**，那个阻塞线程还会跑完 —— 可以接受，因为
+    ///    Kotlin 实现里有自己的动作超时，不会无限跑下去。
+    pub async fn browser(&self, action_json: &str) -> anyhow::Result<serde_json::Value> {
+        let host = self
+            .state
+            .browser()
+            .ok_or_else(|| anyhow::anyhow!("浏览器不可用（壳没接上）"))?;
+        let action = action_json.to_string();
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(75),
+            tokio::task::spawn_blocking(move || host.execute(&action)),
+        )
+        .await;
+        let raw = match joined {
+            Ok(join) => join
+                .map_err(|e| anyhow::anyhow!("浏览器调用没能跑起来: {e}"))?
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            Err(_) => anyhow::bail!(
+                "浏览器动作超时（75s 没回来）—— 页面可能卡住了；重试或者换个做法"
+            ),
+        };
+        Ok(serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "text": raw })))
+    }
+
     /// 把要内联给模型的图片字节落盘，返回绝对路径。
     ///
     /// **为什么落盘**：带图的消息进了历史之后，后面每一轮都要重发同一张图
