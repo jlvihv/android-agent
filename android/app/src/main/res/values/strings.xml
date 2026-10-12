@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">agent</string>
+    <string name="notif_channel_turn">agent 正在运行</string>
+    <string name="notif_turn_title">agent 正在处理</string>
+    <string name="notif_turn_text">点开回到对话（后台跑动时不会被系统回收）</string>
     <string name="accessibility_summary">让 agent 读取屏幕内容并执行点击</string>
     <string name="accessibility_description">开启后，agent 可以读取当前界面的元素并代为点击、输入。数据全部留在本机，不会上传。</string>
 </resources>

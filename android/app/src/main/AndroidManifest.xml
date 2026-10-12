@@ -15,6 +15,15 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
 
+    <!-- 回合进行中的前台服务。为什么只要 SPECIAL_USE：它是一个「自用工具在
+         跑活」的服务，不属于任何一个预设分类（媒体/定位/数据同步都不对）。
+         以前是常驻，现在是回合开始起、结束停 —— 见 AgentForegroundService。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 通知权限。没有它 Android 13+ 不显示那个通知（服务照样跑，只是用户看不见）。
+         只在真的起回合时问一次，不在启动时问。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:name=".AgentApp"
         android:allowBackup="false"
@@ -49,6 +58,16 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 回合进行中保活。`exported="false"`：只有我们自己能起它 -->
+        <service
+            android:name=".AgentForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="agent turn in progress (sandbox commands and web browsing on behalf of the user)" />
         </service>
     </application>
 </manifest>

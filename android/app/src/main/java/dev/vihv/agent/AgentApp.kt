@@ -129,6 +129,11 @@ class AgentApp : Application() {
         runCatching { core.setBrowser(BrowserController(this)) }
             .onFailure { Log.w(TAG, "浏览器注入失败", it) }
 
+        // 1c. 回合开始/结束的通知方 —— 拉/收前台服务（见 AgentForegroundService）。
+        //     同样不依赖无障碍：切后台保活跟读屏是两件事。
+        runCatching { core.setTurnHost(TurnHostImpl(this)) }
+            .onFailure { Log.w(TAG, "回合通知方注入失败", it) }
+
         // 2. 配 Linux 沙箱。
         //    安卓上 proot 必须住在 nativeLibraryDir（那里才允许 exec），
         //    rootfs 在 filesDir（靠 proot 的 loader mmap，不靠 exec）。

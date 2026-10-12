@@ -40,11 +40,25 @@ class MainActivity : Activity() {
         private const val PREFS = "agent"
         private const val KEY_ASKED_A11Y = "asked_accessibility"
         private const val KEY_ASKED_FILES = "asked_all_files"
+        private const val KEY_ASKED_NOTIF = "asked_notifications"
         private const val REQ_STORAGE = 2
         /** 页面 `<input type=file>` 选文件 */
         private const val REQ_FILE = 3
         /** 页面 `<input capture>` 拉起相机 */
         private const val REQ_CAMERA = 4
+        /** Android 13+ 的通知权限（回合进行中的前台服务要用）*/
+        private const val REQ_NOTIF = 5
+
+        /**
+         * 当前活着的 Activity。
+         *
+         * 只给一件事用：回合开始时（Rust 从后台线程通知过来）问一次通知权限 ——
+         * 权限弹窗只能从 Activity 发，而那是唯一一个“人就在看着”的时机。
+         * `singleTask` + 只存一个，所以不用担心泄漏（onPause 就清）。
+         */
+        @Volatile
+        var current: MainActivity? = null
+            private set
     }
 
     private var web: WebView? = null
@@ -74,8 +88,35 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        current = this
         // 从设置页回来时权限可能刚打开：重挂沙箱的 /sdcard 和 /workspace
         AgentApp.syncSharedStorage(this)
+    }
+
+    override fun onPause() {
+        if (current === this) current = null
+        super.onPause()
+    }
+
+    /**
+     * 回合开始时问一次通知权限（Android 13+）。
+     *
+     * 为什么是**回合开始时**而不是启动时：这个权限只为「回合进行中的通知」存在，
+     * 那时弹出来用户能立刻看见后果（通知栏上就有一条），不至于莫名其妙。
+     * 只问一次，拒了就不再扰（服务照样跑，只是看不见那条通知）。
+     */
+    fun maybeAskNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        if (prefs.getBoolean(KEY_ASKED_NOTIF, false)) return
+        prefs.edit().putBoolean(KEY_ASKED_NOTIF, true).apply()
+        runCatching { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF) }
+            .onFailure { Log.w(TAG, "申请通知权限失败", it) }
     }
 
     /**

@@ -70,6 +70,21 @@ pub trait DeviceApi: Send + Sync + 'static {
     }
 }
 
+/// 平回开始/结束的通知方（由 Kotlin 实现）。
+///
+/// 只为一件事：**回合进行中把前台服务挂上**，让进程别被系统回收。
+/// 以前是常驻服务 + 常驻通知，那个通知没有任何信息量；现在回合开始起、
+/// 结束停，通知只在真有东西在跑的时候出现。
+///
+/// 为什么需要它：切到后台的回合一旦进程被杀，浏览器那只 WebView（页面、
+/// 登录态）就没了，正在跑的 bash 也死。会话历史能告诉你“做到哪一步”。
+///
+/// 实现方**不能阻塞** —— 这是从 agent 的 tokio 线程上直接调的。
+pub trait TurnApi: Send + Sync + 'static {
+    /// `true` = 有回合在跑（可能不止一个会话）。实现应当幂等。
+    fn turn(&self, active: bool);
+}
+
 // ---------------------------------------------------------------------------
 // 浏览器能力（同样是决策 D2 的落点，但刻意和 DeviceApi 分开）
 // ---------------------------------------------------------------------------
@@ -164,6 +179,8 @@ pub struct AppState {
     /// 浏览器实现。和 `device` 分开：它的可用条件是无障碍无关的
     /// （见 `BrowserApi` 的说明）。
     pub browser: RwLock<Option<Arc<dyn BrowserApi>>>,
+    /// 回合开始/结束的接收方（前台服务用）。见 `TurnApi`。
+    pub turn: RwLock<Option<Arc<dyn TurnApi>>>,
     pub port: AtomicU16,
     pub mock: AtomicBool,
     /// 会话历史。用 tokio 的 RwLock，因为 agent loop 会跨 await 持有。
@@ -244,6 +261,7 @@ impl AppState {
             tx,
             device: RwLock::new(None),
             browser: RwLock::new(None),
+            turn: RwLock::new(None),
             port: AtomicU16::new(0),
             mock: AtomicBool::new(false),
             chat: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
@@ -308,6 +326,12 @@ impl AppState {
     pub fn set_browser(&self, b: Arc<dyn BrowserApi>) {
         if let Ok(mut g) = self.browser.write() {
             *g = Some(b);
+        }
+    }
+
+    pub fn set_turn_host(&self, t: Arc<dyn TurnApi>) {
+        if let Ok(mut g) = self.turn.write() {
+            *g = Some(t);
         }
     }
 
@@ -534,6 +558,8 @@ impl AppState {
         }
         let t = Arc::new(Turn::default());
         g.insert(sid.to_string(), t.clone());
+        drop(g);
+        self.notify_turn();
         Some(t)
     }
 
@@ -541,6 +567,15 @@ impl AppState {
         if let Ok(mut g) = self.turns.lock() {
             g.remove(sid);
         }
+        self.notify_turn();
+    }
+
+    /// 把“还有没有回合在跑”告诉壳（前台服务跟这个走）。
+    fn notify_turn(&self) {
+        let Some(h) = self.turn.read().ok().and_then(|g| g.clone()) else {
+            return;
+        };
+        h.turn(!self.busy_sessions().is_empty());
     }
 
     pub fn is_busy(&self, sid: &str) -> bool {
