@@ -75,12 +75,33 @@ class BrowserController(private val app: Application) : BrowserHost {
 
         /** 截图压缩质量。截图进的是模型上下文，不是相册 */
         private const val SHOT_QUALITY = 80
+
+        /** 整页截图的高度上限（物理像素）。1080×8000 的 ARGB 位图 ≈ 34MB */
+        private const val FULL_PAGE_MAX_PX = 8_000
+
+        /**
+         * 桌面版的 UA 和视口。
+         *
+         * **两个必须一起换**：只换 UA 不换视口的话，桌面版布局塞进 411px 宽，
+         * 排版比移动版还乱。视口是 CSS px，1180×820 接近一台笔记本。
+         */
+        private const val DESKTOP_UA =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+        private val DESKTOP_VIEWPORT = 1180 to 820
+
+        /** 拿不到系统 UA 时的兑底（正常应总是能拿到）*/
+        private const val DEFAULT_MOBILE_UA =
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
     }
 
     /** 串行化动作。见类注释 */
     private val lock = ReentrantLock()
 
     private val main = Handler(Looper.getMainLooper())
+
+    /** 手机自己的 UA（建 WebView 时记下来，切桌面版后能切回）*/
+    @Volatile
+    private var defaultUa: String = DEFAULT_MOBILE_UA
 
     /** 主线程独占。其它线程只读（构建完成后指针就不再变，除了换新的）*/
     @Volatile
@@ -217,8 +238,11 @@ class BrowserController(private val app: Application) : BrowserHost {
             "get_readable" -> getReadable()
             "wait_for_dom_stable" -> waitForDomStable(a)
             "scroll" -> scroll(a)
-            "screenshot" -> screenshot()
+            "screenshot" -> screenshot(a.optBoolean("full_page", false))
             "back" -> goBack()
+            "press" -> press(a.optString("key"))
+            "find_elements" -> findElements(a.optString("selector"))
+            "set_user_agent" -> setUserAgent(a.optString("user_agent"))
             "js" -> runJs(a.optString("script"))
             else -> return err("未知动作: $name")
         }
@@ -263,11 +287,9 @@ class BrowserController(private val app: Application) : BrowserHost {
     }
 
     private fun buildWebView(): WebView {
-        val dm = app.resources.displayMetrics
-        val w = dm.widthPixels.coerceAtLeast(320)
-        val h = dm.heightPixels.coerceAtLeast(640)
-
         val v = WebView(app)
+        // 记住手机自己的 UA：切到桌面版之后还能切回来
+        defaultUa = v.settings.userAgentString ?: DEFAULT_MOBILE_UA
         v.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -401,12 +423,7 @@ class BrowserController(private val app: Application) : BrowserHost {
         }
 
         // 关键一步：给它一个尺寸，否则视口是 0×0
-        v.measure(
-            View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY),
-        )
-        v.layout(0, 0, w, h)
-        Log.i(TAG, "WebView ${w}×${h}px（视口 ${w / dm.density}×${h / dm.density} CSS px）")
+        applyViewport(v, null)
         return v
     }
 
@@ -580,6 +597,112 @@ class BrowserController(private val app: Application) : BrowserHost {
     }
 
     /** 等 DOM 安定（动态内容/无限滚动靠它）。`timeout` 秒，默认 10 */
+    /**
+     * 按一个键。最常见的是搜索框填完要回车。
+     *
+     * 一个必须自己补的事：**合成事件不会触发表单的隐式提交**。
+     * 真浏览器里“在输入框里敲回车 → 提交表单”是 trusted event 的行为，
+     * `dispatchEvent` 出来的 keydown 不会引发它。所以 Enter 要显式
+     * `form.requestSubmit()`（没有就点 submit 按钮）—— 两件事都做：
+     * 很多现代站是自己在 keydown 里听 Enter，两条路各盖一半。
+     *
+     * Tab 同理：合成事件不移动焦点，得自己算可聚焦元素列表。
+     */
+    private fun press(key: String?): JSONObject {
+        val k = (key ?: "").trim()
+        if (k.isEmpty()) return errObj("缺少参数 key")
+        ensureWeb()
+        val snap = navCounters().first
+        val out = evalToJson(pressJs(k)) ?: return errObj("按键失败")
+        out.optString("error").takeIf { it.isNotEmpty() }?.let { return errObj(it) }
+        settleAfterAction(snap)
+        val acted = out.optString("acted")
+        val tail = if (acted.isEmpty()) "" else "（$acted）"
+        return ok("已按 $k，焦点在 <${out.optString("tag")}>$tail")
+    }
+
+    /** 列出 selector 匹配到的元素（多少个、各自的文字/坐标） */
+    private fun findElements(selector: String?): JSONObject {
+        if (selector.isNullOrEmpty()) return errObj("缺少参数 selector")
+        ensureWeb()
+        val out = evalToJson(findElementsJs(selector)) ?: return errObj("查找失败")
+        out.optString("error").takeIf { it.isNotEmpty() }?.let { return errObj(it) }
+
+        val count = out.optInt("count")
+        val shown = out.optInt("shown")
+        val items = out.optJSONArray("items")
+        val sb = StringBuilder()
+        sb.append("$selector 匹配 $count 个")
+        if (shown < count) sb.append("，列前 $shown 个")
+        sb.append("（x,y 可直接给 click；看不见的先 scroll）\n")
+        if (items != null) {
+            for (i in 0 until items.length()) {
+                val it = items.optJSONObject(i) ?: continue
+                val vis = if (it.optBoolean("visible")) "可见" else "不可见"
+                sb.append("${it.optInt("i")}. <${it.optString("tag")}> ${it.optString("text").take(60)}")
+                sb.append(" | x,y=${it.optInt("x")},${it.optInt("y")} ${it.optInt("w")}x${it.optInt("h")} $vis\n")
+                val href = it.optString("href")
+                if (href.isNotEmpty()) sb.append("   -> ${href.take(140)}\n")
+            }
+        }
+        return ok(sb.toString().trimEnd())
+    }
+
+    /**
+     * 切 UA（`mobile` / `desktop`）。连着**视口一起切** —— 只换 UA 不换视口
+     * 反而更糟：桌面版布局塞进 411px 宽，排版比移动版还乱。
+     *
+     * 换完要重载页面（UA 是请求头，不重载不生效），然后等加载。
+     */
+    private fun setUserAgent(profile: String?): JSONObject {
+        val want = (profile ?: "").trim().lowercase()
+        if (want != "mobile" && want != "desktop") {
+            return errObj("user_agent 只能是 mobile 或 desktop")
+        }
+        val w = ensureWeb()
+        val snap = navCounters().first
+        onMain {
+            w.settings.userAgentString = if (want == "desktop") DESKTOP_UA else defaultUa
+            applyViewport(w, if (want == "desktop") DESKTOP_VIEWPORT else null)
+            w.reload()
+        }
+        awaitLoad(snap, NAV_TIMEOUT_MS)
+        awaitDomStable(SETTLE_BUDGET_MS)
+        val info = pageInfo()
+        return ok(
+            "已切到${if (want == "desktop") "桌面" else "移动"}版（UA + 视口都换了，页面已重载）",
+            info?.optString("url").orEmpty(),
+            info?.optString("title").orEmpty(),
+        )
+    }
+
+    /**
+     * 给 View 一个视口。`null` = 手机屏幕那么大（默认）。
+     *
+     * 尺寸单位是 **CSS px**，要乘 density 变成物理像素 —— WebView 的
+     * `innerWidth` 是 `view 宽 / density`，不乘的话页面看到的视口窄一半。
+     */
+    private fun applyViewport(w: WebView, css: Pair<Int, Int>?) {
+        val dm = app.resources.displayMetrics
+        // 默认（null）= 手机屏幕，直接用物理像素 —— 别绕一圈 CSS px 再乘回去：
+        // 两次取整会把视口缩小一像素（实测 411.4 → 410）
+        val pw: Int
+        val ph: Int
+        if (css == null) {
+            pw = dm.widthPixels.coerceAtLeast(320)
+            ph = dm.heightPixels.coerceAtLeast(640)
+        } else {
+            pw = (css.first * dm.density).toInt().coerceAtLeast(320)
+            ph = (css.second * dm.density).toInt().coerceAtLeast(320)
+        }
+        w.measure(
+            View.MeasureSpec.makeMeasureSpec(pw, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(ph, View.MeasureSpec.EXACTLY),
+        )
+        w.layout(0, 0, pw, ph)
+        Log.i(TAG, "视口 ${pw / dm.density}×${ph / dm.density} CSS px（$pw×${ph}px）")
+    }
+
     private fun waitForDomStable(a: JSONObject): JSONObject {
         ensureWeb()
         val seconds = a.optInt("timeout", 10).coerceIn(1, 30)
@@ -672,11 +795,11 @@ class BrowserController(private val app: Application) : BrowserHost {
      * 空白**（魔改版的解法是临时搭一个私有虚拟显示，代价是 300 行和一堆 OEM
      * 兼容问题 —— 先不做，等真的挡住事了再说）。
      */
-    private fun screenshot(): JSONObject {
+    private fun screenshot(fullPage: Boolean = false): JSONObject {
         val w = ensureWeb()
         val dm = app.resources.displayMetrics
         val pxW = w.width
-        val pxH = w.height
+        val baseH = w.height
 
         // 滚动的补偿：`View.draw(Canvas)` 不做父容器的 translate，
         // 直接画的话内容会往下偏一个 scrollY（顶部空白、底部被裁）。
@@ -687,6 +810,32 @@ class BrowserController(private val app: Application) : BrowserHost {
             a.getInt(0) to a.getInt(1)
         }.getOrDefault(0 to 0)
 
+        // 整页截图：把 View 临时拉高到全文档高度（`View.draw` 只画自己的矩形），
+        // 画完再恢复。高度封顶 8000px —— 1080×8000 的 ARGB 位图已经 34MB，
+        // 再高在手机上就是赌博（而且 Chromium 重新栅格化整页也很费时间）。
+        var pxH = baseH
+        var clipped = false
+        if (fullPage) {
+            val cssH = runCatching {
+                JSONObject(
+                    eval("(function(){return JSON.stringify({h:Math.max(document.documentElement.scrollHeight,document.body.scrollHeight)});})()"),
+                ).optInt("h", 0)
+            }.getOrDefault(0)
+            val want = (cssH * dm.density).toInt()
+            pxH = want.coerceIn(baseH, FULL_PAGE_MAX_PX)
+            clipped = want > FULL_PAGE_MAX_PX
+            if (pxH > baseH) {
+                onMain {
+                    w.measure(
+                        View.MeasureSpec.makeMeasureSpec(pxW, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(pxH, View.MeasureSpec.EXACTLY),
+                    )
+                    w.layout(0, 0, pxW, pxH)
+                }
+                Thread.sleep(400) // 等重排完再画
+            }
+        }
+
         val bmp = onMain {
             val b = Bitmap.createBitmap(pxW, pxH, Bitmap.Config.ARGB_8888)
             val c = Canvas(b)
@@ -694,6 +843,18 @@ class BrowserController(private val app: Application) : BrowserHost {
             w.draw(c)
             b
         } as? Bitmap ?: return errObj("截图失败")
+
+        // 恢复原尺寸（后续动作还得用正常视口）
+        if (pxH != baseH) {
+            onMain {
+                w.measure(
+                    View.MeasureSpec.makeMeasureSpec(pxW, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(baseH, View.MeasureSpec.EXACTLY),
+                )
+                w.layout(0, 0, pxW, baseH)
+            }
+            runCatching { eval("window.scrollTo(${scroll.first}, ${scroll.second})") }
+        }
 
         val saved: File? = try {
             val dir = File(RootfsInstaller.rootfsDir(app), "root/.browser")
@@ -711,8 +872,10 @@ class BrowserController(private val app: Application) : BrowserHost {
 
         val guest = "$SHOT_GUEST_DIR/${saved.name}"
         val info = pageInfo()
+        val kind = if (fullPage) "整页" else "视口"
+        val cut = if (clipped) "（页面更长，截到 ${FULL_PAGE_MAX_PX}px 为止）" else ""
         return ok(
-            "已截图 ${saved.length() / 1024}KB（视口 ${pxW}×${pxH}px）",
+            "已截图 ${saved.length() / 1024}KB（$kind ${pxW}×${pxH}px$cut）",
             info?.optString("url").orEmpty(),
             info?.optString("title").orEmpty(),
         ).put("image", guest)
@@ -968,6 +1131,110 @@ class BrowserController(private val app: Application) : BrowserHost {
             })()
         """.trimIndent()
     }
+
+    /**
+     * 按键。合成事件不会引发“隐式提交”和“Tab 移焦”，这两件事自己补（见 [press]）。
+     */
+    private fun pressJs(key: String): String = """
+        (function() {
+          var name = '${jsQuote(key)}';
+          var CODES = {
+            Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, ' ': 32,
+            ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+            PageUp: 33, PageDown: 34, Home: 36, End: 35
+          };
+          var code = CODES[name];
+          if (code === undefined) return JSON.stringify({error: '不支持的按键: ' + name + '（支持 Enter Tab Escape Backspace Delete Space Arrow* PageUp PageDown Home End）'});
+          var el = document.activeElement || document.body;
+          function mk(type) {
+            var e = new KeyboardEvent(type, {
+              key: name, code: name, keyCode: code, which: code,
+              bubbles: true, cancelable: true, view: window
+            });
+            // 很多只想跑在页面里的旧代码读 keyCode/which，而构造函数里给的值
+            // 在部分 Chromium 版本上不会真的落到属性上 —— 手动盖一层。
+            try {
+              Object.defineProperty(e, 'keyCode', {get: function() { return code; }});
+              Object.defineProperty(e, 'which', {get: function() { return code; }});
+            } catch (err) {}
+            return e;
+          }
+          var target = (el === document.body) ? document : el;
+          target.dispatchEvent(mk('keydown'));
+          target.dispatchEvent(mk('keypress'));
+          target.dispatchEvent(mk('keyup'));
+
+          var acted = '';
+          if (name === 'Enter') {
+            // 合成 keydown 不会触发表单的隐式提交，得显式来一下：
+            // 有的站是自己在 keydown 里处理的（上面那三个事件已经够了），
+            // 有的是真表单提交 —— 两条路都盖住。
+            var form = el.form || (el.closest && el.closest('form'));
+            if (form) {
+              try {
+                if (typeof form.requestSubmit === 'function') { form.requestSubmit(); acted = '已提交表单'; }
+                else {
+                  var b = form.querySelector('button[type=submit], input[type=submit]');
+                  if (b) { b.click(); acted = '已点提交键'; }
+                }
+              } catch (err) { acted = '提交表单失败: ' + err.message; }
+            }
+          }
+          if (name === 'Tab') {
+            var all = document.querySelectorAll('a[href], button, input, select, textarea, [tabindex]');
+            var list = [];
+            for (var i = 0; i < all.length; i++) {
+              var e2 = all[i];
+              if (e2.disabled || e2.tabIndex < 0) continue;
+              var st = getComputedStyle(e2);
+              if (st.display === 'none' || st.visibility === 'hidden') continue;
+              list.push(e2);
+            }
+            var at = list.indexOf(el);
+            if (list.length) {
+              var next = list[(at + 1 + list.length) % list.length];
+              try { next.focus(); acted = '焦点移到 <' + next.tagName + '>'; } catch (err) {}
+            }
+          }
+          if (name === 'Escape' && document.activeElement && document.activeElement.blur) {
+            try { document.activeElement.blur(); acted = '已取消焦点'; } catch (err) {}
+          }
+          return JSON.stringify({pressed: name, tag: el.tagName, acted: acted});
+        })()
+    """.trimIndent()
+
+    /**
+     * 列出一个 selector 匹配到的元素。
+     *
+     * 坐标给的是**视口坐标**（`click` 的 x/y 要的正是它）；同时给 pageY，
+     * 让模型知道要滚多远。
+     */
+    private fun findElementsJs(selector: String): String = """
+        (function() {
+          var all = document.querySelectorAll('${jsQuote(selector)}');
+          var sx = window.scrollX || 0, sy = window.scrollY || 0;
+          var items = [];
+          var limit = Math.min(all.length, 20);
+          for (var i = 0; i < limit; i++) {
+            var el = all[i];
+            var r = el.getBoundingClientRect();
+            var st = getComputedStyle(el);
+            items.push({
+              i: i,
+              tag: el.tagName,
+              text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().substring(0, 80),
+              href: (el.href || '').substring(0, 200),
+              x: Math.round(r.x + r.width / 2),
+              y: Math.round(r.y + r.height / 2),
+              w: Math.round(r.width), h: Math.round(r.height),
+              pageY: Math.round(r.top + sy),
+              visible: r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight &&
+                       st.display !== 'none' && st.visibility !== 'hidden'
+            });
+          }
+          return JSON.stringify({count: all.length, shown: limit, items: items, scrollY: Math.round(sy)});
+        })()
+    """.trimIndent()
 
     /**
      * 页面骨架（模型“看”页面的主要方式）。

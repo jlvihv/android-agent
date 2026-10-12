@@ -229,7 +229,9 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #   agent command <json>     操作这台手机，例如 '{"type":"key","name":"back"}'
 #   agent browser <动作> [参数…]  驱动内置浏览器（真 WebView）：
 #       navigate <url> | get_backbone [深度] | click <选择器> | type <选择器> <文本>
-#       get_text [选择器] | scroll [up|down] [像素] | screenshot | back | js '<代码>'
+#       get_text [选择器] | get_readable | scroll [up|down] [像素]
+#       screenshot [true=整页] | press Enter | find_elements <选择器> | user_agent mobile|desktop
+#       back | wait_for_dom_stable [秒] | js '<代码>'
 #     输出是核心给的原始 JSON；screenshot 把图存到 /root/.browser/。
 #     其他参数直接给 JSON：agent browser '{"action":"click","x":100,"y":200}'
 #   agent search <检索意图> [条数]   联网搜索（Exa），拿标题 + 链接 + 片段
@@ -317,11 +319,16 @@ EOT
   get_backbone [深度]              读页面结构（含可点的 selector）
   click <选择器>                    点击（也可以用 JSON 给 x/y）
   type <选择器> <文本>              往输入框里填
-  get_text [选择器]                 读正文
+  get_text [选择器]                 读整页/某元素的文本（带导航页脚；文章用 get_readable）
+  get_readable                     抽正文（文章页用这个）
   scroll [up|down] [像素]           滚动
-  screenshot                       截图（存 /root/.browser/）
+  screenshot [true]                截图（true = 整页）；存 /root/.browser/
+  press <键名>                      按键：Enter（会提交表单）/Tab/Escape/方向键…
+  find_elements <选择器>            列出匹配到的元素（个数 + 坐标，坐标可直接给 click）
+  user_agent mobile|desktop        切 UA + 视口（会重载页面）
   back                             后退
-  js '<代码>'                      在页面里跑一段 JS
+  wait_for_dom_stable [秒]         等动态内容安定（默认 10）
+  js '<代码>'                      在页面里跑一段 JS（可以 await）
 EOT
     }
     case "$act" in
@@ -338,9 +345,13 @@ EOT
         if [ -n "${1:-}" ]; then body="{\"action\":\"get_text\",\"selector\":\"$(esc "$1")\"}"; else body='{"action":"get_text"}'; fi ;;
       scroll)
         if [ -n "${2:-}" ]; then body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\",\"amount\":$2}"; else body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\"}"; fi ;;
-      screenshot) body='{"action":"screenshot"}' ;;
+      screenshot)
+        if [ -n "${1:-}" ]; then body="{\"action\":\"screenshot\",\"full_page\":$1}"; else body='{"action":"screenshot"}'; fi ;;
       back)       body='{"action":"back"}' ;;
       get_readable) body='{"action":"get_readable"}' ;;
+      press)      body="{\"action\":\"press\",\"key\":\"$(esc "${1:-}")\"}" ;;
+      find_elements|find) body="{\"action\":\"find_elements\",\"selector\":\"$(esc "${1:-}")\"}" ;;
+      user_agent|ua) body="{\"action\":\"set_user_agent\",\"user_agent\":\"$(esc "${1:-}")\"}" ;;
       wait_for_dom_stable)
         if [ -n "${1:-}" ]; then body="{\"action\":\"wait_for_dom_stable\",\"timeout\":$1}"; else body='{"action":"wait_for_dom_stable"}'; fi ;;
       js)         body="{\"action\":\"js\",\"script\":\"$(esc "${1:-}")\"}" ;;
@@ -361,7 +372,7 @@ EOT
     post /api/websearch "$body"
     ;;
   help|-h|--help)
-    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,26p'
+    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,28p'
     ;;
   *)
     echo "不认识的子命令：$cmd（agent help）" >&2

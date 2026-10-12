@@ -71,8 +71,11 @@
       get_text: '读文本',
       click: '点击',
       type: '输入',
+      press: '按键',
+      find_elements: '找元素',
       scroll: '滚动',
       screenshot: '截图',
+      set_user_agent: '切UA',
       back: '后退',
       wait_for_dom_stable: '等页面安定',
       js: '执行 JS',
@@ -149,7 +152,10 @@
     if (action === 'js') return s(a.script);
     if (action === 'type') return `${s(a.selector)} ← ${s(a.text)}`;
     if (action === 'click' && !s(a.selector)) return `(${a.x}, ${a.y})`;
-    if (action === 'get_readable' || action === 'screenshot' || action === 'back') return '';
+    if (action === 'press') return s(a.key);
+    if (action === 'set_user_agent') return s(a.user_agent);
+    if (action === 'screenshot') return a.full_page === true ? '整页' : '';
+    if (action === 'get_readable' || action === 'back') return '';
     return s(a.selector) || JSON.stringify(a, null, 2);
   }
 

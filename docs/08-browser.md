@@ -42,7 +42,7 @@ POST /api/browser ─┘                                        ├─ BrowserCo
   ② 走到一次工具调用要花一整轮 LLM，调试时不现实 —— 有个能直接打的入口，
   改一行 JS 就能立刻验。
 - **`browser` 工具**：`action` 枚举 + 可选参数。动作是
-  `navigate / get_backbone / get_readable / get_text / click / type / scroll / screenshot / back / wait_for_dom_stable / js`。
+  `navigate / get_backbone / get_readable / get_text / click / type / press / find_elements / scroll / screenshot / set_user_agent / back / wait_for_dom_stable / js`。
   描述里写清"什么时候用它、什么时候 curl 更快"，这决定模型会不会用对。
 
 ## 4. 无头 WebView 必须自己做的事
@@ -141,7 +141,35 @@ prompt cache（见 03），想看画面要显式调 `screenshot`。
 锚点还会带上跨域域名（`-> www.cnbc.com /2026/…`），否则模型只看到
 `/2026/…` 以为还在本站。
 
-## 10. 已知边界
+## 10. 操作能力：按键 / 找元素 / 切 UA / 整页截图
+
+**`press`**（Enter / Tab / Escape / 方向键 / PageUp·Down / Home / End）。
+两个必须自己补的事：
+
+- **合成事件不会触发表单的隐式提交。** "在输入框里敲回车 → 提交"是 trusted
+  event 的行为，`dispatchEvent` 出来的 keydown 不会引发它。所以 Enter 要显式
+  `form.requestSubmit()`（没有就点 submit 按钮）。两件都做：很多现代站是自己
+  在 keydown 里听 Enter，两条路各盖一半。
+- **Tab 也不会移焦**，得自己算可聚焦元素列表再 `focus()`。
+
+`keyCode` / `which` 在构造函数里给的值，部分 Chromium 版本不会真的落到属性上，
+得用 `Object.defineProperty` 手动盖一层（页面上还活着的旧代码读这两个）。
+
+**`find_elements`**：一个 selector 匹配到几个、各自长什么样。坐标给的是
+**视口坐标**（`click` 的 `x/y` 要的正是它），同时给 `pageY` 让模型知道要滚多远。
+backbone 太大、或者只想确认"到底有几个"时用它。
+
+**`set_user_agent`**：`mobile` / `desktop`。**UA 和视口必须一起换** —— 只换 UA
+的话，桌面版布局塞进 411px 宽，比移动版还乱。换完要重载（UA 是请求头，不重载
+不生效）。默认那档直接用屏幕物理像素，不绕一圈 CSS px 再乘回去（两次取整会
+少一个像素：411.4 → 410）。
+
+**整页截图**（`screenshot full_page=true`）：`View.draw` 只画自己的矩形，所以把
+View 临时拉高到全文档高度、画完再恢复。高度封顶 **8000px**（1080×8000 的 ARGB
+位图已经 34MB，再高就是拿内存赌），截不全时结果里会写明。实测维基百科一篇
+1080×7315 完整截下（含信息框），539KB。
+
+## 11. 已知边界
 
 - **单标签**。一个进程一只 WebView、一把锁串行化动作（两个动作交叉执行会让
   `navigate A → click` 点到别的页面上）。多标签要引入池 + 归属（OpenMinis 那套）。
@@ -152,7 +180,7 @@ prompt cache（见 03），想看画面要显式调 `screenshot`。
 所以动作仍尽量幂等，进度靠会话历史恢复。
 - **吞掉的弹窗**只报"页面弹窗已自动关闭"，不做交互。
 
-## 11. 怎么调
+## 12. 怎么调
 
 不用花 token，也不用装 APK 之外的东西：
 
@@ -164,6 +192,10 @@ just phone                       # 交互模式
   /bash agent browser get_text '#main'
   /bash agent browser get_readable                 # 文章页抽正文
   /bash agent browser wait_for_dom_stable 10       # 等动态内容安定
+  /bash agent browser press Enter                  # 搜索框填完回车（会提交表单）
+  /bash agent browser find_elements 'a[href]'      # 有几个、各自坐标
+  /bash agent browser user_agent desktop           # 切桌面版（UA + 视口）
+  /bash agent browser screenshot true              # 整页截图
   /bash agent browser click 'a[href="/next"]'
   /bash agent browser screenshot                  # 存 /root/.browser/
   /bash agent browser js 'return document.title'
