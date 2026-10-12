@@ -120,6 +120,12 @@ AVD 是 `agent-x86`（1080×2400 / density 420 / 4G RAM）。为什么要它：
 - **真机是无线调试**：手机一睡、用户一用、VPN 一抖，链路就掉，`adb devices`
   还会卡在 mdns 发现上。要连得上就用 `adb connect <ip>:<port>` 直连
   （端口可以 `adb mdns services` 问，或 `just wifi`）。
+- **但更常见的原因是手机自己在内存里挣扎**（实测一次：11.0G/11.5G 已用、
+  swap 4.8G/5.8G，系统在换页）。表现很像"我们的 bug"：App 进程活着、核心的
+  端口在 LISTEN，但 connect 上去没有任何响应、logcat 里连启动日志都刷没了
+  （logd 被刷爆），有几次干脆卡在启动的 WebView provider 加载上。判断方法：
+  `adb shell "top -b -n1 | head -5"` 看 Mem/Swap。这种情况 force-stop 再起一次
+  往往能好；不要以为是代码坏了。
 - **不能在用户正用手机时拿 `input tap` 去戳屏幕** —— 有一次盲戳坐标直接把用户
   切到了 X。UI 验收（面板、手势、截图）必须在自己的设备上。
 

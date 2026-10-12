@@ -1135,12 +1135,16 @@ class BrowserController(private val app: Application) : BrowserHost {
     }
 
     /**
-     * 截图：**软件绘制**（`View.draw`），不需要窗口、不需要屏幕亮着。
+     * 截图：两条路，先 GPU 后软件。
      *
-     * 已知边界：Chromium 收到软件绘制会在 CPU 上重新栅格化，所以 DOM、普通
-     * 图片、2D canvas 都在，但 **WebGL / `<video>` 这类只有 GPU 才有的层会是
-     * 空白**（魔改版的解法是临时搭一个私有虚拟显示，代价是 300 行和一堆 OEM
-     * 兼容问题 —— 先不做，等真的挡住事了再说）。
+     * 1. **GPU 合成**（[HeadlessCapture]）：临时搭一个私有虚拟显示 + 窗口，把
+     *    WebView 挂上去让真合成器画一帧、读回来。WebGL / `<video>` 只有这条路
+     *    有画面。代价是 200 行和一堆平台坑，所以失败就退回下一条。
+     * 2. **软件绘制**（`View.draw`）：不需要窗口、不需要屏幕亮着，DOM/普通图片/
+     *    2D canvas 都在，但 **WebGL / `<video>` 是空白**。
+     *
+     * 退回很常见，不是异常：整页截图超过虚拟显示的单边上限（4096）、面板正挂着
+     * 这只 WebView、或者这台设备建不出虚拟显示。结果文本里会写明走的哪条。
      */
     private fun screenshot(fullPage: Boolean = false): JSONObject {
         val w = ensureWeb()
@@ -1183,13 +1187,18 @@ class BrowserController(private val app: Application) : BrowserHost {
             }
         }
 
-        val bmp = onMain {
+        // 先试 **GPU 合成器**（WebGL / `<video>` 只有它有），拿不到再退回软件绘制。
+        // 退回很常见：整页截图超过虚拟显示的单边上限、面板正挂着它、
+        // 或者这台设备建不出虚拟显示 —— 那些情况以前什么样现在还什么样。
+        val gpu = HeadlessCapture.capture(app, w, pxW, pxH)
+
+        val bmp = gpu ?: (onMain {
             val b = Bitmap.createBitmap(pxW, pxH, Bitmap.Config.ARGB_8888)
             val c = Canvas(b)
             c.translate(-(scroll.first * dm.density), -(scroll.second * dm.density))
             w.draw(c)
             b
-        } as? Bitmap ?: return errObj("截图失败")
+        } as? Bitmap) ?: return errObj("截图失败")
 
         // 恢复原尺寸（后续动作还得用正常视口）
         if (pxH != baseH) {
@@ -1221,8 +1230,9 @@ class BrowserController(private val app: Application) : BrowserHost {
         val info = pageInfo()
         val kind = if (fullPage) "整页" else "视口"
         val cut = if (clipped) "（页面更长，截到 ${FULL_PAGE_MAX_PX}px 为止）" else ""
+        val how = if (gpu != null) "GPU 合成" else "软件绘制"
         return ok(
-            "已截图 ${saved.length() / 1024}KB（$kind ${pxW}×${pxH}px$cut）",
+            "已截图 ${saved.length() / 1024}KB（$kind ${pxW}×${pxH}px，$how$cut）",
             info?.optString("url").orEmpty(),
             info?.optString("title").orEmpty(),
         ).put("image", guest)
