@@ -48,6 +48,8 @@
         return `编辑 ${s(a.path) || '文件'}`;
       case 'browser':
         return `浏览器 ${browserSummary(a)}`;
+      case 'search':
+        return `搜索 ${firstLine(s(a.query))}`.trim();
       default:
         return t.toolName || '工具调用';
     }
@@ -117,6 +119,8 @@
         return '编辑文件';
       case 'browser':
         return '浏览器';
+      case 'search':
+        return '联网搜索';
       default:
         return t.toolName || '工具调用';
     }
@@ -130,6 +134,7 @@
     if (t.toolName === 'bash') return s(a.command);
     if (t.toolName === 'edit') return s(a.path);
     if (t.toolName === 'browser') return browserPrimary(a);
+    if (t.toolName === 'search') return s(a.query);
     if (t.input !== undefined) return JSON.stringify(t.input, null, 2);
     return t.inputText ?? '';
   }

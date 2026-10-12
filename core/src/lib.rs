@@ -29,6 +29,7 @@ pub mod openai;
 pub mod providers;
 pub mod reader;
 pub mod responses;
+pub mod search;
 pub mod sse;
 pub mod state;
 
@@ -285,6 +286,13 @@ impl Core {
             ),
         };
         Ok(serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "text": raw })))
+    }
+
+    /// 联网搜索。key 有就直连 Exa API，没有就走他们那个免 key 的公开 MCP
+    /// 端点（按 IP 限流，见 `search` 模块）。
+    pub async fn search_web(&self, query: &str, num: usize) -> anyhow::Result<crate::search::Found> {
+        let key = crate::search::read_key(&self.state);
+        crate::search::run(query, num, key.as_deref()).await
     }
 
     /// 把要内联给模型的图片字节落盘，返回绝对路径。

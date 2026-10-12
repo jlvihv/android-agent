@@ -131,6 +131,23 @@ fn build_tools() -> Vec<ToolSpec> {
                 })
             },
         },
+        ToolSpec {
+            name: "search",
+            description: "联网搜索（Exa）：给一句自然语言描述的检索意图，拿回标题 + 链接 + 摘要片段。\
+**当下的事实、新闻、版本号、文档位置，先搜再答** —— 别凭记忆。片段不够时再拿链接去读全文：\
+静态页面用 bash 的 curl，要登录态 / JS 渲染 / 要点按钮用 browser 打开。\
+写检索意图而不是关键词（“对比 React 和 Vue 性能的文章”比“React Vue 性能”准）。",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "检索意图（自然语言）" },
+                        "num_results": { "type": "integer", "description": "要几条（默认 5，上限 20）" }
+                    },
+                    "required": ["query"]
+                })
+            },
+        },
     ]
 }
 
@@ -2064,6 +2081,28 @@ async fn execute_tool(
         };
     }
 
+    if name == "search" {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        if query.trim().is_empty() {
+            return ToolOutcome::json(json!({ "error": "缺少参数 query" }));
+        }
+        let num = args
+            .get("num_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as usize;
+
+        return match core.search_web(query, num).await {
+            Ok(found) => ToolOutcome::json(json!({
+                "ok": true,
+                "output": format_hits(&found),
+                "count": found.hits.len(),
+                "provider": found.provider,
+                "truncated": false,
+            })),
+            Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+        };
+    }
+
     if name == "browser" {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
         if action.is_empty() {
@@ -2121,6 +2160,33 @@ async fn execute_tool(
     // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）现在**不作为工具**
     // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
     ToolOutcome::json(json!({ "error": format!("未知工具 {name}") }))
+}
+
+/// 搜索结果 → 模型看的文本。
+///
+/// 这段文字会进历史、进提示词缓存，所以**按钱算**：每条片段截到 400 字、
+/// 整段封顶 4000 字。要更多就让模型自己挑一条去 curl / browser 读全文 ——
+/// 把十篇全文（几十 KB）塞进历史才是真浪费。
+fn format_hits(found: &crate::search::Found) -> String {
+    if found.hits.is_empty() {
+        return "没搜到结果。换个说法，或者用 browser 打开搜索引擎自己翻。".to_string();
+    }
+    let mut out = String::new();
+    for (i, h) in found.hits.iter().enumerate() {
+        let snip: String = h.snippet.chars().take(400).collect();
+        out.push_str(&format!(
+            "{}. {}\n   {}\n   {}\n",
+            i + 1,
+            h.title,
+            h.url,
+            snip
+        ));
+        if out.chars().count() > 4000 {
+            out.push_str("…（结果太长，已截断；调小 num_results 或换更准的说法）\n");
+            break;
+        }
+    }
+    out
 }
 
 /// 浏览器截图 → 挂到工具结果上。
@@ -2767,7 +2833,7 @@ mod tests {
         // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）暂时**不作为工具**
         // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
         let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["read", "bash", "edit", "browser"]);
+        assert_eq!(names, vec!["read", "bash", "edit", "browser", "search"]);
         // 重复调用必须完全一致
         assert_eq!(names, tools().iter().map(|t| t.name).collect::<Vec<_>>());
     }

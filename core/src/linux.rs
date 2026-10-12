@@ -232,6 +232,7 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #       get_text [选择器] | scroll [up|down] [像素] | screenshot | back | js '<代码>'
 #     输出是核心给的原始 JSON；screenshot 把图存到 /root/.browser/。
 #     其他参数直接给 JSON：agent browser '{"action":"click","x":100,"y":200}'
+#   agent search <检索意图> [条数]   联网搜索（Exa），拿标题 + 链接 + 片段
 #   agent get <path>         直接 GET 自己的接口（逃生口）
 #   agent post <path> <json> 直接 POST
 #
@@ -270,6 +271,9 @@ post() {
 
 # 把一行 JSON 摊开，方便人看（没有 jq，纯 shell）
 fmt() { tr ',' '\n' | tr -d '{}"' | sed 's/^[[:space:]]*//; /^[[:space:]]*$/d'; }
+
+# 参数里的反斜杠和引号要先转义，否则拼出来的 JSON 是坏的（browser / search 都用）
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 cmd="${1:-help}"
 case "$cmd" in
@@ -323,9 +327,7 @@ EOT
     case "$act" in
       ""|help|-h|--help) usage; exit 2 ;;
     esac
-    # 参数里的 \ 和 " 要先转义，否则拼出来的 JSON 是坏的。
     # 参数长得复杂（要 x/y、要多个字段）就直接给 JSON：agent browser '{"action":…}'
-    esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
     case "$act" in
       navigate) body="{\"action\":\"navigate\",\"url\":\"$(esc "${1:-}")\"}" ;;
       get_backbone)
@@ -343,8 +345,18 @@ EOT
     esac
     post /api/browser "$body"
     ;;
+  search)
+    shift || true
+    if [ -z "${1:-}" ]; then
+      echo "用法：agent search <检索意图> [条数]" >&2
+      exit 2
+    fi
+    q=$(esc "$1")
+    if [ -n "${2:-}" ]; then body="{\"query\":\"$q\",\"num_results\":$2}"; else body="{\"query\":\"$q\"}"; fi
+    post /api/websearch "$body"
+    ;;
   help|-h|--help)
-    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,25p'
+    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,26p'
     ;;
   *)
     echo "不认识的子命令：$cmd（agent help）" >&2

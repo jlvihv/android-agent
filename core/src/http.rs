@@ -29,6 +29,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/command", post(post_command))
         .route("/api/linux", post(bash_run))
         .route("/api/browser", post(browser_action))
+        .route("/api/websearch", post(web_search))
+        .route("/api/websearch/config", post(set_search_config))
         .route("/api/edit", post(edit_file))
         .route("/api/llm", post(set_llm))
         .route("/api/models", get(get_models))
@@ -270,6 +272,60 @@ async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>
     match core.browser(&body.to_string()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `POST /api/websearch` → 联网搜索（对应 `search` 工具）。
+///
+/// body：`{query, num_results?}`。和 `/api/browser` 一样的理由存在：
+/// 调试、以及让沙箱里的 `agent search` 能直接用。
+async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let core = Core { state: st.clone() };
+    let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    if query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "缺少 query").into_response();
+    }
+    let num = body.get("num_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+    match core.search_web(query, num).await {
+        Ok(found) => Json(json!({
+            "ok": true,
+            "provider": found.provider,
+            "count": found.hits.len(),
+            "results": found.hits,
+        }))
+        .into_response(),
+        // 429 之类的“能自己恢复”的失败：200 + error 字段，调用方（模型/CLI）
+        // 看得到原因和解法，而不是一句 500
+        Err(e) => Json(json!({ "ok": false, "error": format!("{e:#}") })).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchConfigBody {
+    #[serde(default)]
+    exa_api_key: String,
+}
+
+/// `POST /api/websearch/config` → 存 Exa 的 key（会话库的 `search` 行）。
+///
+/// 空字符串就是清掉。为什么不给前端做界面：这是“免费用完了才需要”的逃生口，
+/// 先用 curl / agentctl 设一下就够（见 docs/09）。
+async fn set_search_config(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<SearchConfigBody>,
+) -> Response {
+    let Some(db) = st.db.read().ok().and_then(|g| g.clone()) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "会话库没打开").into_response();
+    };
+    let key = body.exa_api_key.trim();
+    let rec = json!({ "exaApiKey": key });
+    match db.set_meta("search", &rec.to_string()) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "configured": !key.is_empty(),
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
 }
 

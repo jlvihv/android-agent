@@ -346,7 +346,11 @@ where
     }
     // 连接在结束标记之前断了（切网络、网关超时）。不报错的话，这half回复
     // 会被当成完整的一步：half的工具参数照样拿去执行，回合「正常」结束。
-    drop(on_chunk);
+    //
+    // 原来这里有一行 `drop(on_chunk)`：`on_chunk` 闭包可变借走了 `terminal`，
+    // 想手动在读 `terminal` 前把借还了。现在不需要 —— NLL 在闭包最后一次使用
+    // （上面那个 `handle_frame`）之后就把借结束了；而 clippy 的 `drop_non_drop`
+    // 还会报它（闭包不是 `Drop` 类型，那句只是延长了自己的生命周期）。
     anyhow::ensure!(terminal, "连接在回复结束前断开了");
     Ok(())
 }
