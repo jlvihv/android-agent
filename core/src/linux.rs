@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -178,6 +179,9 @@ pub struct ExecResult {
     /// ash），此时 `to_text` 会明说一句并让模型去装 —— 否则它写 bash 语法
     /// 只会拿到一句莫名其妙的 `syntax error`。
     pub using_bash: bool,
+    /// 被信号杀掉时的信号号（正常退出是 `None`）。没有它的话，`exit -1`
+    /// 分不清「被 OOM 杀了」和「proot 自己崩了」。
+    pub signal: Option<i32>,
 }
 
 impl ExecResult {
@@ -201,7 +205,10 @@ impl ExecResult {
             }
         }
         if self.timed_out {
-            s.push_str("\n[超时，已终止]");
+            // 说清「下面是半截的」，否则模型会当成完整输出，再按它推理
+            s.push_str("\n[超时，已终止：下面是到被终止为止的输出，可能不全]");
+        } else if let Some(sig) = self.signal {
+            s.push_str(&format!("\n[被信号 {sig} 终止：{}]", signal_hint(sig)));
         }
         // 没 bash 就直说，并给出装它的命令。藏在提示词里没用 —— 模型只会在
         // 碰到 `syntax error` 时一头雾水。
@@ -216,6 +223,18 @@ impl ExecResult {
         }
         s.push_str(&format!("\n[exit {}]", self.code));
         s
+    }
+}
+
+/// 信号号只是个数，模型要的是「它为什么死了」。
+fn signal_hint(sig: i32) -> &'static str {
+    match sig {
+        6 => "abort，多半是断言/内存越界",
+        9 => "SIGKILL，多半是被 OOM 杀了",
+        11 => "SIGSEGV，段错误",
+        13 => "SIGPIPE，管道对面先退出了（比如 head 已读完）",
+        15 => "SIGTERM，被要求退出",
+        _ => "未知信号",
     }
 }
 
@@ -421,7 +440,9 @@ pub const TOOLSET: &[&str] = &[
     "findutils",       // GNU find
     "jq",              // JSON（模型处理 JSON 太频繁了）
     "git",
-    "ripgrep", // rg
+    "diffutils", // diff/cmp：改文件前后对比、自己生成 patch
+    "patch",     // 应用 diff（模型写/接补丁时用得上）
+    "ripgrep",   // rg
     "fd",
     "tree",
     "unzip", // busybox 没有
@@ -452,7 +473,7 @@ MARK=/etc/agent-tools
 VERSION=__VERSION__
 BASE="__PACKAGES__"
 # 装完必须能找到这些命令（ca-certificates 没有命令，单独查证书包）
-CHECK="bash curl grep find jq git rg fd tree unzip python3 openssl"
+CHECK="bash curl grep find jq git rg fd tree unzip python3 openssl diff patch"
 CA=/etc/ssl/certs/ca-certificates.crt
 
 missing() {
@@ -869,8 +890,19 @@ impl LinuxSandbox {
         // 原来是 wait_with_output() —— 整段输出全攒在内存里。`yes`、
         // `cat /dev/urandom | base64` 这类命令 60 秒能吐出几个 GB，
         // 手机上直接 OOM 带走整个 App。
-        let out_task = tokio::spawn(Capture::read(child.stdout.take(), live.clone()));
-        let err_task = tokio::spawn(Capture::read(child.stderr.take(), live));
+        // 边跑边读；结果塞进共享的 `Capture`（为什么要共享见 `drain`）。
+        let out_cap = Arc::new(Mutex::new(Capture::default()));
+        let err_cap = Arc::new(Mutex::new(Capture::default()));
+        let out_task = tokio::spawn(Capture::read_into(
+            child.stdout.take(),
+            live.clone(),
+            out_cap.clone(),
+        ));
+        let err_task = tokio::spawn(Capture::read_into(
+            child.stderr.take(),
+            live,
+            err_cap.clone(),
+        ));
 
         let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
             Ok(r) => (Some(r?), false),
@@ -881,18 +913,11 @@ impl LinuxSandbox {
             }
         };
 
-        // 管道可能被沙箱里的孙进程继承着不关 —— 别为它无限等
+        // 管道可能被沙箱里的孙进程继承着不关（`nohup … &`）—— 别为它无限
+        // 等，但也**别把已经读到的丢了**（见 `drain`）。
         let grace = Duration::from_secs(2);
-        let stdout = tokio::time::timeout(grace, out_task)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-        let stderr = tokio::time::timeout(grace, err_task)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
+        let stdout = drain(out_task, &out_cap, grace).await;
+        let stderr = drain(err_task, &err_cap, grace).await;
         let (stdout_text, t1) = stdout.render();
         let (stderr_text, t2) = stderr.render();
         // 中间被扔掉（输出超过内存上限）也算截断
@@ -908,12 +933,17 @@ impl LinuxSandbox {
             None
         };
 
+        // 信号：超时那次是我们自己 SIGKILL 的，报了反而混淆
+        use std::os::unix::process::ExitStatusExt;
+        let signal = if timed_out { None } else { status.signal() };
+
         Ok(ExecResult {
             code: if timed_out {
                 -1
             } else {
                 status.code().unwrap_or(-1)
             },
+            signal,
             stdout: stdout_text,
             stderr: stderr_text,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -1144,13 +1174,18 @@ const CAPTURE_HEAD: usize = 2 << 20;
 const CAPTURE_TAIL: usize = 2 << 20;
 
 impl Capture {
-    async fn read<R: tokio::io::AsyncRead + Unpin>(
+    /// 边读边往里塞；`live` 是给前端的实时副本。
+    ///
+    /// 结果放在共享的 `Arc<Mutex<Capture>>` 里、而不是当返回值：管道可能被
+    /// 孙进程继承着不关（`nohup … &`），读任务会一直卡在 `read()` 上 —— 父
+    /// 进程等不到它，但**已经读到的输出必须拿得走**（见 `drain`）。
+    async fn read_into<R: tokio::io::AsyncRead + Unpin>(
         src: Option<R>,
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-    ) -> Capture {
+        cap: Arc<Mutex<Capture>>,
+    ) {
         use tokio::io::AsyncReadExt;
-        let mut cap = Capture::default();
-        let Some(mut src) = src else { return cap };
+        let Some(mut src) = src else { return };
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             match src.read(&mut chunk).await {
@@ -1159,11 +1194,10 @@ impl Capture {
                     if let Some(tx) = &live {
                         let _ = tx.send(chunk[..n].to_vec());
                     }
-                    cap.push(&chunk[..n]);
+                    lock(&cap).push(&chunk[..n]);
                 }
             }
         }
-        cap
     }
 
     fn push(&mut self, data: &[u8]) {
@@ -1305,6 +1339,34 @@ impl Capture {
     }
 }
 
+/// 拿 `Capture` 的锁；被上个任务的 panic 毒到了也照样用（里面只有字节，
+/// 没有需要维持的不变式）。
+fn lock(cap: &Mutex<Capture>) -> MutexGuard<'_, Capture> {
+    cap.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 等读任务收尾，把捕获到的输出取走。
+///
+/// 正常情况下管道会 EOF、任务自己结束。被孙进程占着的话最多等 `grace`，
+/// 超时就 abort 掉任务 —— 要的是**已读到的输出**，不是干净的收尾。
+///
+/// 原来这里是「等 2 秒，超时就用 `unwrap_or_default()`」：那个默认值是**空的
+/// `Capture`**，等于把 2 秒内已经读到的输出全扔了。一条 `nohup x &` 就能让
+/// 模型看到空输出，而且看不出来为什么。
+async fn drain(
+    mut task: tokio::task::JoinHandle<()>,
+    cap: &Mutex<Capture>,
+    grace: Duration,
+) -> Capture {
+    if tokio::time::timeout(grace, &mut task).await.is_err() {
+        // 管道还被孙进程占着：不等了，把已读到的拿走
+        task.abort();
+    }
+    // abort 之后 await 保证任务真的停了，再取快照就不会跟它抢
+    let _ = task.await;
+    std::mem::take(&mut *lock(cap))
+}
+
 /// 按 `reader` 的规则拆行：结尾 `\n` 切出来的空串不算一行。
 fn real_lines(text: &str) -> Vec<&str> {
     match text.strip_suffix('\n') {
@@ -1425,6 +1487,14 @@ fn parse_posix_tz(s: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
 
+    /// 测试用：正常读完一份内存里的字节（不关心管道被占着的情形）。
+    async fn read_all(data: &[u8]) -> Capture {
+        let cap = Arc::new(Mutex::new(Capture::default()));
+        Capture::read_into(Some(data), None, cap.clone()).await;
+        let out = std::mem::take(&mut *lock(&cap));
+        out
+    }
+
     #[tokio::test]
     async fn capture_keeps_both_ends_and_counts_the_middle() {
         // 模拟一个狂吐输出的命令：远超上限
@@ -1432,7 +1502,7 @@ mod tests {
         let mut data = b"START\n".to_vec();
         data.resize(total - 4, b'\n');
         data.extend_from_slice(b"END\n");
-        let cap = Capture::read(Some(&data[..]), None).await;
+        let cap = read_all(&data).await;
         assert!(cap.head.starts_with(b"START\n"), "头部不能丢");
         assert!(cap.tail.ends_with(b"END\n"), "尾部不能丢");
         assert!(cap.head.len() <= CAPTURE_HEAD, "内存要有上界");
@@ -1507,6 +1577,58 @@ mod tests {
         );
     }
 
+    /// 管道被孙进程占着不关时：等到 grace 也得把**已经读到的**交出来。
+    ///
+    /// 原来这段是 `timeout(...).unwrap_or_default()` —— 默认值是空 `Capture`，
+    /// 一条 `nohup x &` 就能让输出凭空消失。
+    #[tokio::test]
+    async fn captured_output_survives_a_pipe_that_never_closes() {
+        use tokio::io::AsyncWriteExt;
+        let (mut w, r) = tokio::io::duplex(4096);
+        let cap = Arc::new(Mutex::new(Capture::default()));
+        let task = tokio::spawn(Capture::read_into(Some(r), None, cap.clone()));
+        w.write_all(b"partial output\n").await.unwrap();
+        // 写端不关（就像还在跑的后台进程），读任务永远等不到 EOF
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let got = drain(task, &cap, Duration::from_millis(100)).await;
+        assert!(
+            got.head.starts_with(b"partial output\n"),
+            "已经读到的输出不能扔：{:?}",
+            String::from_utf8_lossy(&got.head)
+        );
+    }
+
+    /// 失败必须响亮：超时要说明输出是半截的，被杀要说清是哪个信号。
+    #[test]
+    fn killed_or_timed_out_is_loud() {
+        let mut r = ExecResult {
+            code: -1,
+            stdout: "half\n".into(),
+            stderr: String::new(),
+            duration_ms: 10,
+            truncated: false,
+            timed_out: true,
+            full_output_path: None,
+            using_bash: true,
+            signal: Some(9),
+        };
+        let text = r.to_text();
+        assert!(text.contains("超时"), "{text}");
+        assert!(text.contains("可能不全"), "超时要说清输出是半截的：{text}");
+        assert!(
+            !text.contains("被信号"),
+            "超时的信号是我们自己发的，别重复报：{text}"
+        );
+        assert!(text.contains("half"), "输出不能丢：{text}");
+
+        // 不是超时、但被信号带走：要说清是哪个信号、大概为什么
+        r.timed_out = false;
+        let text = r.to_text();
+        assert!(text.contains("被信号 9"), "{text}");
+        assert!(text.contains("OOM"), "信号要翻译成人话：{text}");
+    }
+
     /// 没 bash 时结果里必须明说，并给出装它的命令。
     #[test]
     fn missing_bash_is_announced_with_the_fix() {
@@ -1519,6 +1641,7 @@ mod tests {
             timed_out: false,
             full_output_path: None,
             using_bash: false,
+            signal: None,
         };
         let text = r.to_text();
         assert!(text.contains("/bin/sh"), "{text}");

@@ -66,7 +66,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3。Python 包优先 `apk add py3-*`；后台服务要重定向 stdout/stderr。",
+            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。已预装 bash/curl/git/jq/rg/fd/tree/unzip/python3/diff/patch。Python 包优先 `apk add py3-*`；后台服务要重定向 stdout/stderr。",
             schema: || {
                 json!({
                     "type": "object",
@@ -2099,6 +2099,8 @@ async fn execute_tool(
                 "output": r.to_text(),
                 "exit_code": r.code,
                 "truncated": r.truncated,
+                "timed_out": r.timed_out,
+                "signal": r.signal,
                 "full_output_path": r.full_output_path,
                 "wall_time_seconds": (r.duration_ms as f64) / 1000.0,
             })),

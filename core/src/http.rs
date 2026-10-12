@@ -259,6 +259,7 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
             "truncated": r.truncated,
             "full_output_path": r.full_output_path,
             "timed_out": r.timed_out,
+            "signal": r.signal,
             "wall_time_seconds": (r.duration_ms as f64) / 1000.0,
         }))
         .into_response(),
