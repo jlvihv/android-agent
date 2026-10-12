@@ -42,6 +42,7 @@ pub struct EditOutcome {
     pub first_changed_line: usize,
 }
 
+#[derive(Debug, Clone)]
 struct Match {
     start: usize,
     end: usize,
@@ -181,8 +182,11 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
     }
 
     // --- 应用 ---
-    let changed = if !use_fuzzy {
-        replace_all(&original, matches.iter(), 0)
+    //
+    // 两件事一起做：算出新内容，并留下每处改动在**原文**坐标系里的范围 +
+    // 新文本（`patch_changes`），给 `build_patch` 切 hunk 用。
+    let (changed, patch_changes) = if !use_fuzzy {
+        (replace_all(&original, matches.iter(), 0), matches.clone())
     } else {
         // fuzzy 模式：base 的坐标和 original 不一样，不能直接按字节偏移替换。
         // 做法是按**行窗口**分组：被改动的行整行从 base 取（已归一化），
@@ -217,6 +221,7 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
         }
 
         let mut result = original.clone();
+        let mut patch_changes: Vec<Match> = Vec::new();
         for (span, members) in groups.iter().rev() {
             let b_start = base_starts[*span.start()];
             let b_end = base_starts
@@ -234,8 +239,16 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
                 .unwrap_or(original.len());
 
             result.replace_range(o_start..o_end, &replacement);
+            // fuzzy 那套的 `matches` 是 base 的坐标，patch 要的是**原文**坐标：
+            // 直接记下这个行窗口在原文里的范围和它的新文本
+            patch_changes.push(Match {
+                start: o_start,
+                end: o_end,
+                replacement,
+            });
         }
-        result
+        patch_changes.sort_by_key(|m| m.start);
+        (result, patch_changes)
     };
 
     anyhow::ensure!(changed != original, "{path} 没有实际改动（替换后内容一致）");
@@ -249,7 +262,7 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
         _ => "\n",
     };
 
-    let (first_changed_line, patch) = build_patch(path, &original, &changed);
+    let (first_changed_line, patch) = build_patch(path, &original, &patch_changes);
 
     Ok(EditOutcome {
         content: format!("{bom}{}", changed.replace('\n', ending)),
@@ -287,11 +300,22 @@ fn line_starts(lines: &[&str]) -> Vec<usize> {
 // unified diff
 // ---------------------------------------------------------------------------
 
-/// 生成最小 unified patch。
+/// unified diff 里每处改动带几行上下文
+const CONTEXT: usize = 4;
+
+/// 生成 unified patch：**每处改动一个 hunk**，各带 `CONTEXT` 行上下文。
 ///
-/// 刻意只出**单个 hunk**（取 4 行上下文），代价可控、输出有界 ——
-/// 我们只需要给用户和模型看"改了什么"，不需要给 `patch(1)` 用。
-fn build_patch(path: &str, before: &str, after: &str) -> (usize, String) {
+/// 为什么不再搞公共前缀/后缀合成一个 hunk：那样「改开头 + 改结尾」会把中间
+/// 整段都列成 `-`/`+`。实测 2000 行的文件改第 5 行和第 1990 行 → 3983 行
+/// patch（几乎把文件抄两遍），而这段是要进模型上下文的。
+///
+/// 改动位置直接用 `edit` 定位的结果（`changes`，**原文**坐标系的字节范围 +
+/// 新文本），不用再跑一遍 diff 算法。输出是标准 unified diff 形状：前端照旧
+/// 按 `+`/`-` 上色，`patch(1)` 也有机会吃得下（有测试拿真的 `patch` 验）。
+///
+/// 靠得近的两处改动会并进同一个 hunk（上下文会互相盖住），代价是它们中间那几
+/// 行会成对成 `-`/`+` 出现 —— 不最小，但是对的。
+fn build_patch(path: &str, original: &str, changes: &[Match]) -> (usize, String) {
     /// (行内容, 该行是否带换行符)
     fn records(text: &str) -> Vec<(&str, bool)> {
         if text.is_empty() {
@@ -306,34 +330,44 @@ fn build_patch(path: &str, before: &str, after: &str) -> (usize, String) {
         (0..n).map(|i| (lines[i], i + 1 < lines.len())).collect()
     }
 
-    let old = records(before);
-    let new = records(after);
-
-    let mut prefix = 0usize;
-    while prefix < old.len().min(new.len()) && old[prefix] == new[prefix] {
-        prefix += 1;
-    }
-    let mut suffix = 0usize;
-    while suffix < old.len().min(new.len()).saturating_sub(prefix)
-        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-
-    let start = prefix.saturating_sub(4);
-    let old_end = old.len().min(old.len() - suffix + 4);
-    let new_end = new.len().min(new.len() - suffix + 4);
-    let old_count = old_end - start;
-    let new_count = new_end - start;
-
-    let old_hdr = if old_count == 0 { start } else { start + 1 };
-    let new_hdr = if new_count == 0 { start } else { start + 1 };
-
     let mut out = String::new();
     out.push_str(&format!("--- {path}\n+++ {path}\n"));
-    out.push_str(&format!(
-        "@@ -{old_hdr},{old_count} +{new_hdr},{new_count} @@\n"
-    ));
+    if changes.is_empty() || original.is_empty() {
+        return (1, out);
+    }
+
+    // 每行起始的字节偏移（结尾换行切出来的空串不算一行）
+    let mut starts = vec![0usize];
+    for (i, b) in original.bytes().enumerate() {
+        if b == b'\n' && i + 1 < original.len() {
+            starts.push(i + 1);
+        }
+    }
+    let line_of = |pos: usize| -> usize {
+        match starts.binary_search(&pos) {
+            Ok(i) => i,
+            Err(ip) => ip.saturating_sub(1),
+        }
+    };
+    let line_end = |line: usize| starts.get(line + 1).copied().unwrap_or(original.len());
+
+    // 改动按起点排序（调用方本来就是顺序的，这里只做保险）
+    let mut order: Vec<usize> = (0..changes.len()).collect();
+    order.sort_by_key(|&i| changes[i].start);
+
+    // 靠得近的改动并成一个 hunk：否则两段 hunk 的上下文会互相盖住
+    let mut regions: Vec<(usize, usize, Vec<usize>)> = Vec::new(); // (首行, 末行, 成员)
+    for i in order {
+        let first = line_of(changes[i].start);
+        let last = line_of(changes[i].end.saturating_sub(1).max(changes[i].start));
+        match regions.last_mut() {
+            Some((_, prev_last, members)) if first <= *prev_last + 2 * CONTEXT => {
+                *prev_last = (*prev_last).max(last);
+                members.push(i);
+            }
+            _ => regions.push((first, last, vec![i])),
+        }
+    }
 
     let emit = |kind: char, rec: (&str, bool), out: &mut String| {
         out.push(kind);
@@ -344,20 +378,58 @@ fn build_patch(path: &str, before: &str, after: &str) -> (usize, String) {
         }
     };
 
-    for rec in &old[start..prefix] {
-        emit(' ', *rec, &mut out);
-    }
-    for rec in &old[prefix..old.len() - suffix] {
-        emit('-', *rec, &mut out);
-    }
-    for rec in &new[prefix..new.len() - suffix] {
-        emit('+', *rec, &mut out);
-    }
-    for rec in &old[old.len() - suffix..old_end] {
-        emit(' ', *rec, &mut out);
+    let first_changed_line = regions[0].0 + 1;
+    // 前面几处改动让行号涨/降了多少：新文件那边的行号要加上它
+    let mut delta: isize = 0;
+    for (first, last, members) in &regions {
+        let (first, last) = (*first, *last);
+        let ctx_first = first.saturating_sub(CONTEXT);
+        let ctx_last = (last + CONTEXT).min(starts.len() - 1);
+        let a_start = starts[first];
+        let b_end = line_end(last);
+
+        let before = records(&original[starts[ctx_first]..a_start]);
+        let removed = records(&original[a_start..b_end]);
+        let after = records(&original[b_end..line_end(ctx_last)]);
+        let new_middle = replace_all(
+            &original[a_start..b_end],
+            members.iter().map(|&i| &changes[i]),
+            a_start,
+        );
+        let added = records(&new_middle);
+
+        let old_count = before.len() + removed.len() + after.len();
+        let new_count = before.len() + added.len() + after.len();
+        // 计数为 0 时，unified diff 约定给的起点是「插入点的前一行」
+        let old_start = if old_count == 0 {
+            ctx_first
+        } else {
+            ctx_first + 1
+        };
+        let new_start = if new_count == 0 {
+            (ctx_first as isize + delta).max(0) as usize
+        } else {
+            (ctx_first as isize + 1 + delta).max(0) as usize
+        };
+        out.push_str(&format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+        ));
+        for rec in &before {
+            emit(' ', *rec, &mut out);
+        }
+        for rec in &removed {
+            emit('-', *rec, &mut out);
+        }
+        for rec in &added {
+            emit('+', *rec, &mut out);
+        }
+        for rec in &after {
+            emit(' ', *rec, &mut out);
+        }
+        delta += new_count as isize - old_count as isize;
     }
 
-    (prefix + 1, out)
+    (first_changed_line, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +585,109 @@ mod tests {
             "{}",
             out.patch
         );
+    }
+
+    #[test]
+    fn patch_has_one_hunk_per_change_not_one_huge_one() {
+        // 改开头 + 改结尾：掐前缀/后缀那种做法会把中间 1980 行都列成 -/+
+        let mut body = String::new();
+        for i in 0..2000 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        let out = apply(
+            &body,
+            &[
+                Edit::new("line 5\n", "LINE 5\n"),
+                Edit::new("line 1990\n", "LINE 1990\n"),
+            ],
+            "big.txt",
+        )
+        .unwrap();
+        assert_eq!(
+            out.patch.matches("@@ ").count(),
+            2,
+            "两处改动应该是两个 hunk：\n{}",
+            out.patch
+        );
+        assert!(
+            out.patch.lines().count() < 40,
+            "patch 不该把整份文件抄进来（现在 {} 行）",
+            out.patch.lines().count()
+        );
+        assert!(out.patch.contains("-line 5") && out.patch.contains("+LINE 5"));
+        assert!(out.patch.contains("-line 1990") && out.patch.contains("+LINE 1990"));
+        assert_eq!(out.first_changed_line, 6);
+    }
+
+    #[test]
+    fn patch_merges_changes_close_enough_to_share_context() {
+        // 靠得近的两处：并进一个 hunk，别输出两段互相盖住的上下文。
+        // 代价是中间那行会成对成 -/+（不最小，但是对的）
+        let out = apply(
+            "a\nb\nc\nd\ne\nf\n",
+            &[Edit::new("a", "A"), Edit::new("c", "C")],
+            "f.txt",
+        )
+        .unwrap();
+        assert_eq!(out.patch.matches("@@ ").count(), 1, "{}", out.patch);
+        assert!(out.patch.contains("-a") && out.patch.contains("+A"));
+        assert!(out.patch.contains("-c") && out.patch.contains("+C"));
+        assert!(
+            out.patch.contains("-b") && out.patch.contains("+b"),
+            "{}",
+            out.patch
+        );
+    }
+
+    /// 生成的 patch 要能被**真的 `patch(1)`** 吃下去。
+    ///
+    /// 之前那个版本注释里就写明了「不需要给 patch(1) 用」；现在是标准形状，
+    /// 所以拿真工具验一下，而不是照形状猜。环境里没有 patch 就跳过。
+    #[test]
+    fn patch_is_applicable_by_real_patch() {
+        if std::process::Command::new("patch")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("跳过：环境里没有 patch");
+            return;
+        }
+        let cases: [&str; 3] = [
+            "a\nb\nc\nd\ne\nf\ng\n", // 单处
+            "a\nb\nc\nd\ne\nf\ng\n", // 两处相距远（两个 hunk，行号要累加）
+            "one\ntwo\n",            // 行数变化（2 行 → 3 行）
+        ];
+        let edits: [&[Edit]; 3] = [
+            &[Edit::new("b", "B")],
+            &[Edit::new("b", "B"), Edit::new("f", "F")],
+            &[Edit::new("one\ntwo\n", "1\n2\n3\n")],
+        ];
+        for (i, (before, edits)) in cases.iter().zip(edits).enumerate() {
+            let out = apply(before, edits, "f.txt").unwrap();
+            let dir = std::env::temp_dir().join(format!("agent-patch-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), before).unwrap();
+            std::fs::write(dir.join("p.diff"), &out.patch).unwrap();
+
+            let got = std::process::Command::new("patch")
+                .current_dir(&dir)
+                .args(["-p0", "-i", "p.diff"])
+                .output()
+                .unwrap();
+            assert!(
+                got.status.success(),
+                "patch 没吃下这个 diff（case {i}）：\n{}\n{}\n--- patch ---\n{}",
+                String::from_utf8_lossy(&got.stdout),
+                String::from_utf8_lossy(&got.stderr),
+                out.patch
+            );
+            let patched = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+            let want = out.content.trim_start_matches('\u{FEFF}');
+            assert_eq!(patched, want, "打过补丁的内容不对（case {i}）");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
