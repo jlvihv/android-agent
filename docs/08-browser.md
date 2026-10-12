@@ -242,6 +242,17 @@ agent 有一只自己的无头 WebView（第 2 节），而**同一个实例**�
 两个入口：
 
 - 头部的地球按钮（页面 → `AgentHost.openBrowser()` → 壳）
+  > 坑：页面那边写的是 `host()?.openBrowser?.()`（桌面浏览器上壳不存在，
+  > 要能跑）。所以壳里**忘了实现 `openBrowser()` 时不会报错** —— 按钮
+  > 点下去静默无反应，看着像坏的。加/改 `AgentHost` 的方法时对着
+  > `web/src/lib/overlay.ts` 的 `BackHost` 声明核一遍。
+  >
+  > **这个按钮只在 agent 真开着页面时才出现**（以前常驻，没页面时点它
+  > 只会弹一句提示）。状态在壳这边（`AgentApp.browser.hasPage()`），所以
+  > 两条腿：页面加载时同步拉一次（`AgentHost.hasBrowser()`），之后壳推
+  > `window.__browserAvailable` —— `BrowserController.onPagesChanged`
+  > 挂在 `setCurrent` 上（标签集合和 `web` 唯一的改动点），所以「开第一只
+  > 标签 / 把标签关光」都会立刻反映到头部。
 - `adb shell am start -n dev.vihv.agent/.MainActivity --ez browser true`
   —— 调试/验收用。看板是给人看的，但自己只能用手点，而**验收不该去戳用户
   正在用的手机屏幕**；能在 adb 里做的事就别靠摸屏幕（和 `files/port`、

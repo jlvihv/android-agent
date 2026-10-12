@@ -19,7 +19,7 @@
   import Viewer from './components/Viewer.svelte';
   import { viewer } from './lib/viewer.svelte.ts';
   import { models } from './lib/models.svelte.ts';
-  import { openAgentBrowser } from './lib/overlay';
+  import { agentHasBrowser, openAgentBrowser } from './lib/overlay';
 
   let input = $state('');
   /** 当前看着的这个会话，本地正连着它的流。 */
@@ -85,6 +85,26 @@
     if (!on) return;
     // `untrack`：同 ModelSheet 里的理由，别把 `load()` 内部读的 `$state` 也变成依赖
     void untrack(() => models.load(r));
+  });
+
+  /**
+   * agent 有没有开着浏览器 —— 有才显示头部那个地球按钮。
+   *
+   * 状态在**壳**那边（`AgentApp.browser.hasPage()`，见 BrowserController）：
+   * agent 调 `browser` 工具会懒建一只 WebView，把标签关光又回到「没有」。
+   * 所以两条腿：挂载时同步拉一次（`AgentHost.hasBrowser`），之后壳推
+   * `window.__browserAvailable`（见 MainActivity 的 `pushBrowserAvailable`）。
+   */
+  let browserAvailable = $state(false);
+  $effect(() => {
+    // 先挂上推送口，再拉一次初始值：同一个 tick 里不会漏掉中间那一下
+    window.__browserAvailable = (on) => {
+      browserAvailable = !!on;
+    };
+    browserAvailable = agentHasBrowser();
+    return () => {
+      delete window.__browserAvailable;
+    };
   });
 
   /** 输入区实际高度。消息列表的底部留白和底部渐隐都跟着它走。 */
@@ -415,16 +435,19 @@
          设备状态点挪进抽屉左下角的设置按钮（作为角标）。 -->
     <div class="pointer-events-auto flex items-center gap-1">
       <!-- agent 的浏览器：它自己在后台开了网页时，用户可以看看它在干什么、
-           也能自己接着操作（壳里那块是**同一只** WebView）。没开过页面时
-           壳会提示一句，不会静默失败。 -->
-      <button
-        onclick={openAgentBrowser}
-        aria-label="看 agent 的浏览器"
-        title="看 agent 的浏览器"
-        class="p-1 text-fg"
-      >
-        <Icon name="globe" size={20} />
-      </button>
+           也能自己接着操作（壳里那块是**同一只** WebView）。
+           **只在它真开着页面时才出现** —— 没开过页面时点它只会弹一句
+           「还没打开过网页」，那就不该显示（也少一个常驻图标）。 -->
+      {#if browserAvailable}
+        <button
+          onclick={openAgentBrowser}
+          aria-label="看 agent 的浏览器"
+          title="看 agent 的浏览器"
+          class="p-1 text-fg"
+        >
+          <Icon name="globe" size={20} />
+        </button>
+      {/if}
       <button
         onclick={newSession}
         aria-label="新对话"

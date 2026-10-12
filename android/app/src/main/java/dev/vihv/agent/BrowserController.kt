@@ -182,11 +182,13 @@ class BrowserController(private val app: Application) : BrowserHost {
             currentIdx = 0
             web = null
             active = null
+            onPagesChanged?.invoke()
             return
         }
         currentIdx = i.coerceIn(0, tabs.size - 1)
         web = tabs[currentIdx].web
         active = tabs[currentIdx]
+        onPagesChanged?.invoke()
     }
 
     /**
@@ -304,6 +306,16 @@ class BrowserController(private val app: Application) : BrowserHost {
     // -----------------------------------------------------------------------
     // 给看板面板（MainActivity）用的几个接口。都在主线程调。
     // -----------------------------------------------------------------------
+
+    /**
+     * `hasPage()` 可能变了就回调一次（开第一只标签 / 把标签关光）。
+     * **主线程**调。
+     *
+     * MainActivity 的头部靠它决定显不显示「看浏览器」那个地球按钮：
+     * 没开过页面时按钮点了只会弹一句「还没打开过网页」，那就不如不显示。
+     * `setCurrent` 是标签集合和 [web] 唯一的改动点，挂在那里就覆盖全了。
+     */
+    var onPagesChanged: (() -> Unit)? = null
 
     /** agent 到底有没有开过页面（没开过就不要打开看板）。 */
     fun hasPage(): Boolean = web != null

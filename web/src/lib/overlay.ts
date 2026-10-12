@@ -48,6 +48,8 @@ type BackHost = {
   setBackHandled?: (handled: boolean) => void;
   /** 开 agent 的浏览器看板（没开过页面时壳会自己提示） */
   openBrowser?: () => void;
+  /** agent 现在有没有开着的浏览器页面（头部的地球按钮据此显隐）。同步返回 */
+  hasBrowser?: () => boolean;
 };
 const host = (): BackHost | undefined =>
   (globalThis as { AgentHost?: BackHost }).AgentHost;
@@ -55,6 +57,15 @@ const host = (): BackHost | undefined =>
 /** 头部的地球按钮调它。桌面（没有壳）上什么都不做。 */
 export function openAgentBrowser(): void {
   host()?.openBrowser?.();
+}
+
+/**
+ * agent 现在有没有开着的浏览器页面（决定头部那个地球按钮显不显示）。
+ *
+ * 桌面浏览器上没有壳，返回 false —— 按钮不出现，本来也没东西可看。
+ */
+export function agentHasBrowser(): boolean {
+  return host()?.hasBrowser?.() === true;
 }
 
 /**
@@ -73,6 +84,12 @@ export type PredictivePhase = 'start' | 'progress' | 'cancel' | 'commit';
 declare global {
   interface Window {
     __predictiveBack?: (phase: PredictivePhase, progress?: number) => void;
+    /**
+     * 壳推过来的「agent 有没有开着浏览器」。见 MainActivity.kt 的
+     * `pushBrowserAvailable` —— agent 第一次开页面、或者把标签关光时各推一次。
+     * 页面加载时自己还会用 `AgentHost.hasBrowser()` 拉一次。
+     */
+    __browserAvailable?: (on: boolean) => void;
   }
 }
 

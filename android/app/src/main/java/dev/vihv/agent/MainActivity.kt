@@ -102,6 +102,12 @@ class MainActivity : Activity() {
             setContentView(buildRoot(buildWebView(port)))
         }
 
+        // 头部的地球按钮只在 agent 真开着浏览器时才显示。状态在壳这边
+        // （`AgentApp.browser.hasPage()`），所以由壳推给页面；页面加载时
+        // 还会自己问一次（见 `AgentHost.hasBrowser`）。
+        // `onDestroy` 里要把它置回 null：浏览器比 Activity 活得久。
+        AgentApp.browser?.onPagesChanged = { pushBrowserAvailable() }
+
         // 两个设置页只能一个一个来：先存储（沙箱干活的地方），下次启动再无障碍
         if (!maybeAskAllFilesAccess()) maybeOpenAccessibilitySettings()
 
@@ -340,6 +346,20 @@ class MainActivity : Activity() {
         browserHolder?.setPadding(0, 0, 0, bottom)
     }
 
+    /**
+     * 告诉页面「agent 有没有开着浏览器」—— 头部那个地球按钮据此显隐。
+     *
+     * 页面加载时会自己问一次（`AgentHost.hasBrowser()`），这里管的是**页面活着
+     * 的时候状态变了**（agent 第一次开页面 / 把标签关光）。
+     */
+    private fun pushBrowserAvailable() {
+        val on = AgentApp.browser?.hasPage() == true
+        web?.evaluateJavascript(
+            "window.__browserAvailable && window.__browserAvailable($on)",
+            null,
+        )
+    }
+
     /** 打开看板。没开过页面就不开（没东西可看）。 */
     private fun showBrowserPanel() {
         val panel = browserPanel ?: return
@@ -514,6 +534,12 @@ class MainActivity : Activity() {
                 runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
                     .onFailure { Log.w(TAG, "打不开链接 $uri", it) }
                 return true
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                // 页面自己挂载时也会问一次，这里防的是「状态刚好在页面加载那
+                // 一下变了」：补推一次，删掉也不会错，只是少一层保险。
+                pushBrowserAvailable()
             }
 
             override fun onReceivedError(
@@ -783,7 +809,7 @@ class MainActivity : Activity() {
     // 它会画它自己的预测性动画。
     // -----------------------------------------------------------------------
 
-    /** 页面的 setBackHandled 会跑到 JavaBridge 线程上，得自己回主线程 */
+    /** 页面的方法调用会跑到 JavaBridge 线程上，得自己回主线程 */
     inner class BackHost {
         @JavascriptInterface
         fun setBackHandled(handled: Boolean) {
@@ -792,6 +818,28 @@ class MainActivity : Activity() {
                 if (handled) registerBackCallback() else unregisterBackCallback()
             }
         }
+
+        /**
+         * 头部的地球按钮（页面 → `AgentHost.openBrowser()`）。
+         *
+         * 没有它的话，页面那边是 `host()?.openBrowser?.()` —— 打了可选链，
+         * 壳没实现就**静默什么都不发生**，按钮看着像坏的（就是这么踩的）。
+         * 没开过页面时 `showBrowserPanel` 会弹一句「agent 还没打开过网页」。
+         */
+        @JavascriptInterface
+        fun openBrowser() {
+            runOnUiThread { showBrowserPanel() }
+        }
+
+        /**
+         * agent 现在有没有开着的浏览器页面。头部那个地球按钮据此决定显不显示。
+         *
+         * 页面加载时同步问一次；之后的变化由壳**推**给它
+         * （`window.__browserAvailable`，见 [pushBrowserAvailable]）。
+         * 同步返回一个 boolean，不碰 UI，所以不用回主线程。
+         */
+        @JavascriptInterface
+        fun hasBrowser(): Boolean = AgentApp.browser?.hasPage() == true
     }
 
     private fun registerBackCallback() {
@@ -849,6 +897,8 @@ class MainActivity : Activity() {
         panelTick.removeCallbacks(pollPanel)
         unregisterPanelBack()
         AgentApp.browser?.detach()
+        // 浏览器属应用进程（比 Activity 活得久），回调别留着拽住这个 Activity
+        AgentApp.browser?.onPagesChanged = null
         web?.destroy()
         web = null
         super.onDestroy()
