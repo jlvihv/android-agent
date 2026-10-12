@@ -29,7 +29,7 @@
     <button
       onclick={() => onpick('camera')}
       class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
-             text-sm text-fg active:opacity-80"
+             text-sm text-fg"
     >
       <span class="grid size-11 place-items-center rounded-full bg-control">
         <Icon name="camera" size={20} />
@@ -40,7 +40,7 @@
     <button
       onclick={() => onpick('photo')}
       class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
-             text-sm text-fg active:opacity-80"
+             text-sm text-fg"
     >
       <span class="grid size-11 place-items-center rounded-full bg-control">
         <Icon name="image" size={20} />
@@ -53,7 +53,7 @@
       <button
         onclick={() => onpick('file')}
         class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
-               text-sm text-fg active:opacity-80"
+               text-sm text-fg"
       >
         <span class="grid size-11 place-items-center rounded-full bg-control">
           <Icon name="file" size={20} />

@@ -108,17 +108,35 @@ textarea {
 /*
  * 触屏上不要任何 hover / 按压高亮 —— 界面保持安静。
  *
- * 代码里本来就没写 `hover:` 类，但 WebView 里 tap 完 :hover 会**粘在**
- * 元素上（经典的 sticky hover），而且 `button:active` 的提亮在手指按住
- * 期间一直亮着，看着就像 hover。所以这里显式清掉，而不是靠“反正没写”。
+ * 两道防线：
+ *
+ * 1. 把 `active` / `hover` / `focus` 几个变体**整体改写成「永远不匹配」**
+ *    （`:not(*)` 对任何元素都为假）。这样以后即使有人又写了
+ *    `active:bg-control` / `active:opacity-80`，编译出来也不匹配任何元素，
+ *    等于没写。变体默认就是 `&:active` 这种真实伪类，光靠下面第 2 条的
+ *    `filter` / `outline` 是拦不住 `background-color`、`opacity`、`transform`
+ *    这些属性的 —— 之前那批复发的高亮就是这么漏出来的。
+ *    禁用「变体」而不是删掉写下的类名：类名会被重新加回来，变体关掉之后
+ *    加回来也无效。
+ *
+ * 2. 真机上还有两个不是「我们写的类」带来的高亮：WebView 里 tap 完
+ *    `:hover` 会**粘在**元素上（经典 sticky hover），以及浏览器默认的
+ *    focus 外框。这条按元素兜底清掉。
  */
+@custom-variant active (&:not(*));
+@custom-variant hover (&:not(*));
+@custom-variant focus (&:not(*));
+@custom-variant focus-visible (&:not(*));
+
 button:active,
 button:hover,
 button:focus,
+button:focus-visible,
 input:focus,
 textarea:focus,
 a:hover,
-a:focus {
+a:focus,
+a:focus-visible {
   filter: none;
   outline: none;
 }

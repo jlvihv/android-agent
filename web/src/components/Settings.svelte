@@ -68,7 +68,7 @@
       <button
         onclick={() => (open = p)}
         class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left
-               last:border-b-0 active:bg-control"
+               last:border-b-0"
       >
         <span class="min-w-0 flex-1">
           <span class="block truncate text-[17px]">{p.name}</span>

@@ -275,7 +275,7 @@
           {#each g.hits as h, i (`${g.id}:${i}`)}
             <button
               onclick={() => onswitch(g.id)}
-              class="block w-full rounded-2xl px-3 py-2 text-left active:bg-bubble"
+              class="block w-full rounded-2xl px-3 py-2 text-left"
             >
               <span class="line-clamp-2 text-sm"
                 ><span class="mr-1.5 text-meta text-faint"

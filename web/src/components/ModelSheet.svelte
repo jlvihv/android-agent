@@ -228,8 +228,7 @@
           <!-- 模型提供商：切到第二页，选看哪家的模型 -->
           <button
             onclick={() => openSub('providers')}
-            class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left
-                   active:bg-control"
+            class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left"
           >
             <span class="shrink-0 text-[17px]">模型提供商</span>
             <span class="ml-auto flex min-w-0 items-center gap-0.5 text-[17px] text-muted">
@@ -251,7 +250,7 @@
               <p class="px-3.5 py-4 text-base text-muted">载入中…</p>
             {:else if !shown}
               <!-- 一家都没配：直接带去设置页 -->
-              <button onclick={onconfig} class="flex w-full flex-col gap-0.5 px-3.5 py-4 text-left active:bg-control">
+              <button onclick={onconfig} class="flex w-full flex-col gap-0.5 px-3.5 py-4 text-left">
                 <span class="text-[17px]">还没有配置模型提供商</span>
                 <span class="text-meta text-accent">去设置里填一个 API Key</span>
               </button>
@@ -267,7 +266,7 @@
                   onclick={() => pickModel(shown, m)}
                   disabled={busy}
                   class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
-                         text-left last:border-b-0 active:bg-control"
+                         text-left last:border-b-0"
                 >
                   <span class="min-w-0 flex-1 truncate text-[17px]">{m.name}</span>
                   {#if isCurrent(shown, m)}
@@ -281,8 +280,7 @@
           <!-- 思考强度：切到第二页 -->
           <button
             onclick={() => openSub('effort')}
-            class="flex w-full items-center rounded-2xl bg-surface px-3.5 py-4 text-left
-                   active:bg-control"
+            class="flex w-full items-center rounded-2xl bg-surface px-3.5 py-4 text-left"
           >
             <span class="text-[17px]">思考强度</span>
             <span class="ml-auto flex items-center gap-0.5 text-[17px] text-muted">
@@ -304,7 +302,7 @@
                   <button
                     onclick={() => view(g.id)}
                     class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
-                           text-left last:border-b-0 active:bg-control"
+                           text-left last:border-b-0"
                   >
                     <span class="min-w-0 flex-1">
                       <span class="block truncate text-[17px]">{g.name}</span>
@@ -322,8 +320,7 @@
 
             <button
               onclick={onconfig}
-              class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left
-                     active:bg-control"
+              class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left"
             >
               <span class="text-[17px]">管理模型提供商</span>
               <Icon name="chevron" size={16} class="ml-auto shrink-0 text-muted" />
@@ -335,7 +332,7 @@
                   onclick={() => pickEffort(e.value)}
                   disabled={busy}
                   class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
-                         text-left last:border-b-0 active:bg-control"
+                         text-left last:border-b-0"
                 >
                   <span class="min-w-0 flex-1 truncate text-[17px]">{e.label}</span>
                   {#if e.value === effort}
