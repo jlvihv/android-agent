@@ -3,6 +3,15 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+/** 要出哪些 ABI（`AGENT_ABIS=arm64-v8a,x86_64 just emu-install` 那种）。 */
+val agentAbis =
+    (System.getenv("AGENT_ABIS") ?: "arm64-v8a")
+        .split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+/** AGP 认得的全部 ABI，用来算出「不在 agentAbis 里的」。 */
+val knownAbis =
+    listOf("arm64-v8a", "armeabi-v7a", "armeabi", "x86", "x86_64", "mips", "mips64")
+
 android {
     namespace = "dev.vihv.agent"
     compileSdk = 36
@@ -21,7 +30,7 @@ android {
         // 出哪些 ABI 由 AGENT_ABIS 决定（见 justfile）：默认只出 arm64，
         // 模拟器要 x86_64 时 `AGENT_ABIS=arm64-v8a,x86_64 just emu-install`
         ndk {
-            abiFilters += (System.getenv("AGENT_ABIS") ?: "arm64-v8a").split(",")
+            abiFilters += agentAbis
         }
     }
 
@@ -52,6 +61,14 @@ android {
 
     packaging {
         jniLibs {
+            // 不在 ABI 清单里的 .so 明确排掉。
+            //
+            // 主要针对 JNA 那个 AAR 自带的 armeabi / mips / x86 等（它全 ABI
+            // 都带）。**注意**：这条排不掉 `jniLibs/` 里别的 ABI 造成的那块
+            // APK 零填充 —— 那个坑在 `mergeDebugNativeLibs` 那一层，
+            // 真正的修法在 justfile 的 `android-libs` 里清目录。
+            excludes += knownAbis.filterNot { it in agentAbis }.map { "lib/$it/**" }
+
             // ⚠️ 关键：必须是 true。
             //
             // 默认（false）时 .so 留在 APK 里由 linker 直接 mmap，磁盘上

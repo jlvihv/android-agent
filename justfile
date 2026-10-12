@@ -208,6 +208,23 @@ android-libs:
     # cargo-ndk 同样要 cwd 在 crate 目录里
     cd {{core}}
     ts=(); IFS=',' read -ra arr <<< "{{abis}}"; for a in "${arr[@]}"; do ts+=(-t "$a"); done
+
+    # 先清掉不在本次 ABI 清单里的目录。
+    #
+    # 为什么必须清：`abiFilters` 只在**打包那一步**过滤，
+    # `mergeDebugNativeLibs` 照样把 jniLibs/ 里别的 ABI 合进来。
+    # jniLibs/ 是生成物，`git status` 看不出来，`packaging.jniLibs.excludes`
+    # 也排不掉（试过）。这里是唯一的源头。
+    #
+    # 注：这只能防「多带了一个 ABI」。APK 里那块 ~3.5MB 全零空洞还有第二个
+    # 成因（增量打包），见 `android-debug` / `android-release` 里的 `rm -rf`。
+    for d in ../{{jni}}/*/; do
+      [ -d "$d" ] || continue
+      a=$(basename "$d"); keep=0
+      for k in "${arr[@]}"; do [ "$k" = "$a" ] && keep=1; done
+      [ "$keep" = 1 ] || { echo "  清掉不在 ABI 清单里的 \"$a\"（见 docs/01 的 ABI 说明）"; rm -rf "$d"; }
+    done
+
     cargo ndk "${ts[@]}" -o ../{{jni}} build --release --lib
     echo "--- 16KB 对齐检查（Play 对 targetSdk 35+ 有要求，R1）---"
     # NDK 的预编译工具目录：Linux 是 linux-x86_64，macOS（含 Apple 芯片）是 darwin-x86_64
@@ -248,10 +265,16 @@ android-assets:
 # （rust-embed，见 core/src/assets.rs），所以必须先跑 web-build ——
 # 反过来写的话每次装上去的都是**上一次**的前端（踩过：Kotlin 改动生效了，
 # 但页面里 `window.__predictiveBack` 还是 undefined）。
+#
+# 下面是 assemble 前先删掉上一版的 APK / 打包中间产物 —— **不是**多此一举：
+# AGP 的**增量打包**在原生 .so 变动时会留一块全零空洞。实测连着构建两次，
+# debug 包从 9.0MB 涨到 12.6MB，多出来的 ~3.5MB 全是 0（入口在 `git status`
+# 里完全看不出来）。每次从零打一遍的代价不到 1 秒。
 android-debug: android-bindings web-build android-libs
     #!/usr/bin/env bash
     set -eu
     . scripts/jdk.sh
+    rm -rf {{and}}/app/build/outputs/apk/debug {{and}}/app/build/intermediates/apk/debug
     cd {{and}} && ./gradlew :app:assembleDebug
     echo "APK: {{and}}/app/build/outputs/apk/debug/app-debug.apk"
 
@@ -264,10 +287,13 @@ android-install: android-debug
 # release APK：R8 混淆/压缩 + 用 debug key 签（本地能直接装）。
 # 原生核心两者都是 release（android-libs 里的 `--release`），区别只在
 # Kotlin/dex 那层和签名。
+#
+# assemble 前同样删一遍（理由见 android-debug 上面那段）。
 android-release: android-bindings web-build android-libs
     #!/usr/bin/env bash
     set -eu
     . scripts/jdk.sh
+    rm -rf {{and}}/app/build/outputs/apk/release {{and}}/app/build/intermediates/apk/release
     cd {{and}} && ./gradlew :app:assembleRelease
     echo "APK: {{and}}/app/build/outputs/apk/release/app-release.apk"
 
