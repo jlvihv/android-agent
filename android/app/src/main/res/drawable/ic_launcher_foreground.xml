@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  应用图标的前景层（自适应图标）。
+
+  画布 108×108，**内容全部落在中心 r=36 的圆内** —— 自适应图标的外圈 18dp 会被
+  启动器的遮罩裁掉，而且 Pixel 默认是**圆形**遮罩：只满足「72×72 安全区」不够，
+  圆角方形的四个角仍会被切。所以机器人是照内切圆摆的。
+
+  配色就是 App 自己的令牌（web/src/app.css）：头 #f9f9f7（fg）、眼睛 #151515（ink）、
+  天线那颗点 #6da7ec（accent）。深底 + 亮脑袋，48px 下还认得出。
+
+  改图标改这里，然后按 icon-src/README.md 重渲染 PNG。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 天线：杆（圆头） -->
+    <path
+        android:pathData="M54,41 L54,33"
+        android:strokeColor="#f9f9f7"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round" />
+    <!-- 天线顶上的点 -->
+    <path
+        android:fillColor="#6da7ec"
+        android:pathData="M54,29 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+
+    <!-- 脑袋：54×45 的圆角方，r=16 -->
+    <path
+        android:fillColor="#f9f9f7"
+        android:pathData="M43,41 L65,41 A16,16 0 0 1 81,57 L81,70 A16,16 0 0 1 65,86 L43,86 A16,16 0 0 1 27,70 L27,57 A16,16 0 0 1 43,41 Z" />
+
+    <!-- 两只眼睛 -->
+    <path
+        android:fillColor="#151515"
+        android:pathData="M44,62 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0" />
+    <path
+        android:fillColor="#151515"
+        android:pathData="M64,62 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0" />
+</vector>

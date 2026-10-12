@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  单色层：Android 13+ 的「主题图标」用（系统按壁纸取色，整层染成一个颜色）。
+
+  所以这里不能有第二种颜色 —— 眼睛要靠 **evenOdd 挖成洞**（底色透出来），
+  而不是画成深色圆点，否则染色之后眼睛就没了。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:pathData="M54,41 L54,33"
+        android:strokeColor="#000000"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round" />
+    <path
+        android:fillColor="#000000"
+        android:pathData="M54,29 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+
+    <!-- 头 + 两只眼睛（evenOdd：眼睛是洞） -->
+    <path
+        android:fillColor="#000000"
+        android:fillType="evenOdd"
+        android:pathData="M43,41 L65,41 A16,16 0 0 1 81,57 L81,70 A16,16 0 0 1 65,86 L43,86 A16,16 0 0 1 27,70 L27,57 A16,16 0 0 1 43,41 Z M44,62 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0 Z M64,62 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0 Z" />
+</vector>
