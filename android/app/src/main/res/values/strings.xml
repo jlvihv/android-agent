@@ -3,5 +3,4 @@
     <string name="app_name">agent</string>
     <string name="accessibility_summary">让 agent 读取屏幕内容并执行点击</string>
     <string name="accessibility_description">开启后，agent 可以读取当前界面的元素并代为点击、输入。数据全部留在本机，不会上传。</string>
-    <string name="notif_channel">agent 运行中</string>
 </resources>

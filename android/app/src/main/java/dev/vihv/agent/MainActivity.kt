@@ -4,7 +4,6 @@ import android.Manifest
 import android.app.Activity
 import android.content.ContentValues
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -41,7 +40,6 @@ class MainActivity : Activity() {
         private const val PREFS = "agent"
         private const val KEY_ASKED_A11Y = "asked_accessibility"
         private const val KEY_ASKED_FILES = "asked_all_files"
-        private const val REQ_NOTIF = 1
         private const val REQ_STORAGE = 2
         /** 页面 `<input type=file>` 选文件 */
         private const val REQ_FILE = 3
@@ -50,7 +48,6 @@ class MainActivity : Activity() {
     }
 
     private var web: WebView? = null
-    private var fgsStarted = false
     /** 已注册的系统返回回调（API 33+；类型用 Any 存，低版本设备不会碰到这个类） */
     private var backCallback: Any? = null
     /** 页面等着回调的文件选择请求（WebView 的 onShowFileChooser） */
@@ -71,25 +68,12 @@ class MainActivity : Activity() {
             setContentView(buildWebView(port))
         }
 
-        askNotificationPermission()
         // 两个设置页只能一个一个来：先存储（沙箱干活的地方），下次启动再无障碍
         if (!maybeAskAllFilesAccess()) maybeOpenAccessibilitySettings()
     }
 
-    /**
-     * 前台服务在这里起，不在 Application.onCreate。
-     *
-     * Android 12+ 禁止从后台起前台服务；Activity 走到 onResume 才算
-     * 真的进了前台。放这里就不会抛
-     * `ForegroundServiceStartNotAllowedException`（实测踩过，
-     * 而且那次直接崩了整个 App）。
-     */
     override fun onResume() {
         super.onResume()
-        if (!fgsStarted) {
-            fgsStarted = true
-            AgentForegroundService.start(this)
-        }
         // 从设置页回来时权限可能刚打开：重挂沙箱的 /sdcard 和 /workspace
         AgentApp.syncSharedStorage(this)
     }
@@ -512,16 +496,6 @@ class MainActivity : Activity() {
 
     private fun isDebuggable(): Boolean =
         (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-
-    private fun askNotificationPermission() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            return
-        }
-        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
-    }
 
     /**
      * 首次启动时要「所有文件访问权限」。

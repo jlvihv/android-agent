@@ -2,7 +2,6 @@ package dev.vihv.agent
 
 import android.app.Application
 import android.content.Context
-import android.content.Intent
 import android.net.ConnectivityManager
 import android.os.Build
 import android.util.Log
@@ -241,67 +240,4 @@ class AgentApp : Application() {
      */
     private fun tzOffsetMinutes(): Int =
         TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000
-}
-
-/** 前台服务：让进程别被系统回收 */
-class AgentForegroundService : android.app.Service() {
-
-    companion object {
-        private const val CHANNEL_ID = "agent-runtime"
-        private const val NOTIF_ID = 1001
-
-        /**
-         * 起前台服务。**必须从 Activity 可见时调用** ——
-         * Android 12+ 从后台（含 Application.onCreate）起会抛
-         * `ForegroundServiceStartNotAllowedException`。
-         *
-         * 这里再包一层 try/catch：起不来只意味着可能被系统回收，
-         * 不该让调用方崩掉。
-         */
-        fun start(ctx: Context) {
-            runCatching {
-                val i = Intent(ctx, AgentForegroundService::class.java)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    ctx.startForegroundService(i)
-                } else {
-                    ctx.startService(i)
-                }
-            }.onFailure { Log.w("AgentFgs", "前台服务起不来（不影响主流程）: ${it.message}") }
-        }
-    }
-
-    override fun onBind(intent: Intent?) = null
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val nm = getSystemService(android.app.NotificationManager::class.java)
-        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-            nm.createNotificationChannel(
-                android.app.NotificationChannel(
-                    CHANNEL_ID,
-                    getString(R.string.notif_channel),
-                    android.app.NotificationManager.IMPORTANCE_LOW,
-                ).apply { setShowBadge(false) },
-            )
-        }
-
-        val notif = android.app.Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText("正在运行 · 127.0.0.1:${AgentApp.port}")
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setOngoing(true)
-            .build()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIF_ID,
-                notif,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            )
-        } else {
-            startForeground(NOTIF_ID, notif)
-        }
-
-        // START_STICKY：被系统杀掉后自动重启（agent 需要常驻）
-        return START_STICKY
-    }
 }
