@@ -19,25 +19,30 @@
 //!
 //! 这也和项目既有的取舍一致：LLM 协议自己写（不用 SDK），CDP 也自己写。
 //!
-//! ## 谁起 Chrome
+//! ## Chrome 由**核心自己起**
 //!
-//! 我们**不**替用户起进程（端口、profile、退出清理都是麻烦，而且用户可能想让
-//! agent 用他自己那个浏览器）。连的是 `AGENT_CDP`（默认
-//! `http://127.0.0.1:9222`）—— `just chrome` 会起一个无头 Chrome 并开这个端口；
-//! 用户自己的 Chrome 加 `--remote-debugging-port=9222` 也一样能用（还能看着它动）。
-//! 连不上时报的错里会写清楚怎么办，模型照着做就行。
+//! 用的人不该先另开一个终端去起浏览器。第一次用到它的时候，核心拉起一个无头
+//! Chrome：当场挑一个空闲端口（不是写死 9222 —— 同一台机器上跑两个核心不会互相
+//! 抢）、独立的 profile、日志落在 `<profile>/chrome.log`。生命周期跟着核心：
+//! 正常退出时 `Drop` 杀掉它，被 SIGKILL 的话下次启动时 `sweep_orphan_chromes`
+//! 收掉上次留下的。
 //!
-//! ## 和 Kotlin 那份的关系
+//! 要**用你自己那个浏览器**（能看着它动）或者接到别的机器上：
+//! `AGENT_CDP=http://127.0.0.1:9222`（自己起一个带 `--remote-debugging-port` 的）；
+//! `AGENT_CDP=off` 是不要浏览器；找不到 Chrome 时用 `AGENT_CHROME` 指可执行文件。
+//! 连不上时报的错里会写清楚这两条路。
 //!
-//! 动作表、返回形状（`{ok, text, url, title, image}`）、以及注入的 JS 都是从
-//! `BrowserController.kt` 移植过来的，语义要一致。**两份 JS 现在确实是两份**
-//! （Kotlin 那份只能在真机上验，这轮没动它），所以改 JS 的时候两边都得改 ——
-//! 这是已知的债，见 docs/08 的「两份实现」。
-//! 动作**名字**这一层是能自动对齐的：`ACTIONS` 和沙箱里 `agent browser` 的
-//! case 表有测试盯着（`agent_cli_and_cdp_agree_on_the_action_list`）。
+//! ## 注入的 JS 只有一份
+//!
+//! 页面里那段逻辑（骨架 / 正文 / 点击 / 输入 / 按键 / 滚动 / 找元素 / DOM 指纹 /
+//! 页面信息 / `target=_blank` 修正）在 `crate::browser_js`，手机上的 WebView
+//! 也是从那儿取（uniffi 的 `AgentCore.browserJs`）—— 见 docs/08 第 15 节。
+//! 动作**名字**这一层也有测试盯着：`ACTIONS` 和沙箱里 `agent browser` 的 case 表
+//! （`agent_cli_and_cdp_agree_on_the_action_list`）。
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -55,6 +60,9 @@ const JS_TIMEOUT: Duration = Duration::from_secs(15);
 /// 一般 CDP 命令（attach / 建标签 / 截图）的预算。
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 等自己起的 Chrome 把调试端口听上：冷启动一般 < 1s，慢机器给足
+const CHROME_BOOT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// navigate 等 `Page.loadEventFired` 的上限。等不到**不算失败**（SPA 常常不触发）
 const NAV_TIMEOUT: Duration = Duration::from_secs(25);
 
@@ -64,7 +72,6 @@ const SETTLE_BUDGET: Duration = Duration::from_secs(4);
 
 /// 骨架树给模型的文本上限（它会进历史，按钱算）
 const BACKBONE_MAX_CHARS: usize = 12_000;
-const BACKBONE_MAX_NODES: usize = 220;
 
 /// 正文 / JS 返回值上限
 const TEXT_MAX_CHARS: usize = 12_000;
@@ -130,8 +137,18 @@ impl Profile {
 }
 
 /// 无头 Chrome 上的一个浏览器。
+///
+/// 两种来源：
+/// - **自己起**（默认）：第一次要动作时拉起一个无头 Chrome（挑一个空闲端口、
+///   独立 profile），进程跟着核心一起死。**这才是常规路径** —— 用的人不该先
+///   去另开一个终端起浏览器。
+/// - **连别人的**：`AGENT_CDP=http://127.0.0.1:9222` 指到已经在跑的那个上
+///   （比如你自己那个带 `--remote-debugging-port` 的可见 Chrome，能看着它动）。
 pub struct CdpBrowser {
+    /// `AGENT_CDP` 指的地址；自己起的时候是空的（端口起来才知道）
     endpoint: String,
+    /// 自己起 Chrome 吗
+    managed: bool,
     /// 截图落哪（宿主目录 + 历史里存的前缀）
     shots: ShotDir,
     /// 用户按了停止：正在跑的动作在下一个检查点退出
@@ -139,10 +156,31 @@ pub struct CdpBrowser {
     inner: Mutex<Inner>,
 }
 
+/// 自己起的那个 Chrome 进程。`Drop` 就杀掉它 —— 核心退出 / 浏览器被换掉时
+/// 不留孤儿进程。
+struct Chrome {
+    child: std::process::Child,
+    /// 用的哪个 profile（日志里报出来，排查「登录态怎么没了」时要用）
+    profile: PathBuf,
+    /// Chrome 自己的 stdout/stderr 落在这儿（起不来时它是唯一线索）
+    log: PathBuf,
+}
+
+impl Drop for Chrome {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// 连接 + 标签页。整个 `execute` 期间被 Mutex 串住：两个动作交叉执行会让
 /// `navigate A → click` 点到别的页面上（和 Kotlin 那个 `lock` 同一个理由）。
 struct Inner {
     conn: Option<Conn>,
+    /// 自己起的 Chrome（连别人的时候是 None）
+    chrome: Option<Chrome>,
+    /// 实际连的地址（自己起的话 = 起来之后才知道的那个端口）
+    endpoint: String,
     tabs: Vec<Tab>,
     current: usize,
     next_id: i32,
@@ -159,13 +197,36 @@ struct Tab {
 }
 
 impl CdpBrowser {
-    pub fn new(endpoint: String, shots: ShotDir) -> Self {
+    /// 连一个**已经在跑**的 Chrome（`AGENT_CDP` 指的那个）
+    pub fn connect_to(endpoint: String, shots: ShotDir) -> Self {
         Self {
+            inner: Mutex::new(Inner {
+                conn: None,
+                chrome: None,
+                endpoint: endpoint.clone(),
+                tabs: Vec::new(),
+                current: 0,
+                next_id: 1,
+                profile: Profile::Desktop,
+            }),
             endpoint,
+            managed: false,
+            shots,
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    /// 自己起一个无头 Chrome（端口起来之后才知道，所以先空着）
+    pub fn managed(shots: ShotDir) -> Self {
+        Self {
+            endpoint: String::new(),
+            managed: true,
             shots,
             cancelled: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 conn: None,
+                chrome: None,
+                endpoint: String::new(),
                 tabs: Vec::new(),
                 current: 0,
                 next_id: 1,
@@ -174,23 +235,34 @@ impl CdpBrowser {
         }
     }
 
-    /// 连的是哪个调试端口（启动日志 / 体检用）
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+    /// 连的是哪个地址（启动日志 / 体检用）。自己起的时候要等它起来才有值。
+    pub fn endpoint(&self) -> String {
+        if self.managed {
+            self.inner
+                .lock()
+                .ok()
+                .map(|g| g.endpoint.clone())
+                .unwrap_or_default()
+        } else {
+            self.endpoint.clone()
+        }
     }
 
-    /// 从环境变量构造（桌面用）。`AGENT_CDP` 指 Chrome 的调试端口；
-    /// 设成 `off` / `0` 就是不要浏览器。
+    /// 从环境变量构造（桌面用）。
+    ///
+    /// - 没设 `AGENT_CDP`：**自己起**一个无头 Chrome（常规路径）
+    /// - `AGENT_CDP=http://…`：连那个已经在跑的（自己的可见 Chrome 也行）
+    /// - `AGENT_CDP=off` / `0` / `no`：不要浏览器
     pub fn from_env(shots: ShotDir) -> Option<Self> {
         let ep = std::env::var("AGENT_CDP")
             .ok()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "http://127.0.0.1:9222".to_string());
-        if matches!(ep.as_str(), "off" | "0" | "no") {
-            return None;
+            .filter(|s| !s.is_empty());
+        match ep.as_deref() {
+            Some("off") | Some("0") | Some("no") => None,
+            Some(url) => Some(Self::connect_to(url.to_string(), shots)),
+            None => Some(Self::managed(shots)),
         }
-        Some(Self::new(ep, shots))
     }
 
     fn dispatch(&self, g: &mut Inner, name: &str, a: &Value) -> Result<Value, String> {
@@ -213,11 +285,12 @@ impl CdpBrowser {
                     normalize_url(url).ok_or_else(|| format!("只支持 http/https：{url}"))?;
                 let idx = g.current;
                 let session = g.tabs[idx].session.clone();
-                let conn = g.conn(&self.endpoint)?;
+                let conn = self.ensure_conn(g)?;
                 conn.drain_events();
                 conn.call(Some(&session), "Page.navigate", json!({ "url": target }))?;
                 let loaded = conn.wait_event(&session, "Page.loadEventFired", NAV_TIMEOUT)?;
                 self.await_dom_stable(conn, &session, SETTLE_BUDGET)?;
+                install_target_fix(conn, &session);
                 let info = page_info(conn, &session)?;
                 let real = info
                     .get("url")
@@ -246,9 +319,9 @@ impl CdpBrowser {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(5)
                     .clamp(1, 10);
-                let js = backbone_js(depth as usize);
+                let js = page_js("backbone", json!({ "max_depth": depth }))?;
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
+                let conn = self.ensure_conn(g)?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
@@ -273,17 +346,17 @@ impl CdpBrowser {
             "click" => {
                 let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
                 let js = if !sel.is_empty() {
-                    click_sel_js(sel)
+                    page_js("click_sel", json!({ "selector": sel }))?
                 } else if let (Some(x), Some(y)) = (
                     a.get("x").and_then(|v| v.as_i64()),
                     a.get("y").and_then(|v| v.as_i64()),
                 ) {
-                    click_xy_js(x, y)
+                    page_js("click_xy", json!({ "x": x, "y": y }))?
                 } else {
                     return Err("click 需要 selector，或者 x + y".into());
                 };
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
+                let conn = self.ensure_conn(g)?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
@@ -310,8 +383,9 @@ impl CdpBrowser {
                 }
                 let text = a.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
-                let out = eval_json(conn, &session, &type_js(sel, text), JS_TIMEOUT)?;
+                let conn = self.ensure_conn(g)?;
+                let js = page_js("type", json!({ "selector": sel, "text": text }))?;
+                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
                 }
@@ -332,8 +406,9 @@ impl CdpBrowser {
             "get_text" => {
                 let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
-                let out = eval_json(conn, &session, &get_text_js(sel), JS_TIMEOUT)?;
+                let conn = self.ensure_conn(g)?;
+                let js = page_js("get_text", json!({ "selector": sel }))?;
+                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
                 }
@@ -355,8 +430,9 @@ impl CdpBrowser {
             }
             "get_readable" => {
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
-                let out = eval_json(conn, &session, READABLE_JS, JS_TIMEOUT)?;
+                let conn = self.ensure_conn(g)?;
+                let js = page_js("readable", json!({}))?;
+                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
                 }
@@ -383,10 +459,11 @@ impl CdpBrowser {
                     .unwrap_or(10)
                     .max(1);
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
-                let before = eval_str(conn, &session, DOM_SIG_JS)?;
+                let conn = self.ensure_conn(g)?;
+                let sig_js = page_js("dom_sig", json!({}))?;
+                let before = eval_str(conn, &session, &sig_js)?;
                 self.await_dom_stable(conn, &session, Duration::from_secs(secs as u64))?;
-                let after = eval_str(conn, &session, DOM_SIG_JS)?;
+                let after = eval_str(conn, &session, &sig_js)?;
                 let moved = before != after;
                 Ok(ok(
                     if moved {
@@ -406,8 +483,12 @@ impl CdpBrowser {
                 let amount = a.get("amount").and_then(|v| v.as_i64()).unwrap_or(600);
                 let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
-                let out = eval_json(conn, &session, &scroll_js(dir, amount, sel), JS_TIMEOUT)?;
+                let conn = self.ensure_conn(g)?;
+                let js = page_js(
+                    "scroll",
+                    json!({ "direction": dir, "amount": amount, "selector": sel }),
+                )?;
+                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
                 }
@@ -439,7 +520,7 @@ impl CdpBrowser {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
+                let conn = self.ensure_conn(g)?;
                 let r = conn.call(
                     Some(&session),
                     "Page.captureScreenshot",
@@ -476,7 +557,7 @@ impl CdpBrowser {
             }
             "back" => {
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
+                let conn = self.ensure_conn(g)?;
                 let h = conn.call(Some(&session), "Page.getNavigationHistory", json!({}))?;
                 let idx = h.get("currentIndex").and_then(|v| v.as_i64()).unwrap_or(0);
                 let entries = h
@@ -500,6 +581,7 @@ impl CdpBrowser {
                 )?;
                 conn.wait_event(&session, "Page.loadEventFired", NAV_TIMEOUT)?;
                 self.await_dom_stable(conn, &session, SETTLE_BUDGET)?;
+                install_target_fix(conn, &session);
                 let info = page_info(conn, &session)?;
                 let url = info
                     .get("url")
@@ -515,8 +597,9 @@ impl CdpBrowser {
             "press" => {
                 let key = a.get("key").and_then(|v| v.as_str()).unwrap_or("");
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
-                let out = eval_json(conn, &session, &press_js(key), JS_TIMEOUT)?;
+                let conn = self.ensure_conn(g)?;
+                let js = page_js("press", json!({ "key": key }))?;
+                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
                 }
@@ -541,8 +624,9 @@ impl CdpBrowser {
                     return Err("缺少参数 selector".into());
                 }
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
-                let out = eval_json(conn, &session, &find_elements_js(sel), JS_TIMEOUT)?;
+                let conn = self.ensure_conn(g)?;
+                let js = page_js("find_elements", json!({ "selector": sel }))?;
+                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
                 }
@@ -585,7 +669,7 @@ impl CdpBrowser {
                 g.profile = want;
                 let sessions: Vec<String> = g.tabs.iter().map(|t| t.session.clone()).collect();
                 let current = g.current;
-                let conn = g.conn(&self.endpoint)?;
+                let conn = self.ensure_conn(g)?;
                 for s in &sessions {
                     apply_profile(conn, s, want)?;
                 }
@@ -595,6 +679,7 @@ impl CdpBrowser {
                     conn.call(Some(s), "Page.reload", json!({}))?;
                     conn.wait_event(s, "Page.loadEventFired", NAV_TIMEOUT)?;
                     self.await_dom_stable(conn, s, SETTLE_BUDGET)?;
+                    install_target_fix(conn, s);
                 }
                 Ok(ok(
                     &format!(
@@ -615,7 +700,7 @@ impl CdpBrowser {
                     return Err("缺少参数 script".into());
                 }
                 let session = self.session(g)?;
-                let conn = g.conn(&self.endpoint)?;
+                let conn = self.ensure_conn(g)?;
                 // 包一层 async IIFE：`await fetch(...)` 是这个动作最值钱的用法。
                 // CDP 的 `awaitPromise` 会等它，不用像 Kotlin 那边 kick + 轮询。
                 let expr = format!("(async function() {{\n{script}\n}})()");
@@ -726,7 +811,7 @@ impl CdpBrowser {
                 };
                 let target = g.tabs[i].target.clone();
                 let id = g.tabs[i].id;
-                let conn = g.conn(&self.endpoint)?;
+                let conn = self.ensure_conn(g)?;
                 conn.call(None, "Target.closeTarget", json!({ "targetId": target }))?;
                 g.tabs.remove(i);
                 g.current = g.current.min(g.tabs.len().saturating_sub(1));
@@ -764,7 +849,7 @@ impl CdpBrowser {
         let profile = g.profile;
         let id = g.next_id;
         g.next_id += 1;
-        let conn = g.conn(&self.endpoint)?;
+        let conn = self.ensure_conn(g)?;
         let r = conn.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
         let target = r
             .get("targetId")
@@ -797,6 +882,7 @@ impl CdpBrowser {
                 )?;
                 conn.wait_event(&session, "Page.loadEventFired", NAV_TIMEOUT)?;
                 self.await_dom_stable(conn, &session, SETTLE_BUDGET)?;
+                install_target_fix(conn, &session);
                 let info = page_info(conn, &session)?;
                 Some((
                     info.get("url")
@@ -838,10 +924,11 @@ impl CdpBrowser {
         budget: Duration,
     ) -> Result<(), String> {
         let deadline = Instant::now() + budget;
+        let dom_sig = page_js("dom_sig", json!({}))?;
         let mut last = String::new();
         let mut stable_since = Instant::now();
         loop {
-            let sig = eval_str(conn, session, DOM_SIG_JS)?;
+            let sig = eval_str(conn, session, &dom_sig)?;
             if sig != last {
                 last = sig;
                 stable_since = Instant::now();
@@ -858,7 +945,16 @@ impl CdpBrowser {
 
 impl BrowserApi for CdpBrowser {
     fn describe(&self) -> String {
-        format!("CDP {}", self.endpoint)
+        let ep = self.endpoint();
+        if self.managed {
+            if ep.is_empty() {
+                "CDP（自己起的无头 Chrome，还没起 —— 第一次动作用到它时拉起来）".to_string()
+            } else {
+                format!("CDP（自己起的无头 Chrome）{ep}")
+            }
+        } else {
+            format!("CDP（连别人起的）{ep}")
+        }
     }
 
     fn execute(&self, action_json: &str) -> Result<String, String> {
@@ -905,8 +1001,9 @@ impl Conn {
         let version = http_get_json(endpoint, "/json/version").map_err(|e| {
             format!(
                 "连不上 Chrome（{endpoint}）：{e}。\
-                 先跑 `just chrome` 起一个无头 Chrome，或者自己起一个带 \
-                 `--remote-debugging-port=9222` 的（AGENT_CDP 可以换地址）"
+                 没设 AGENT_CDP 时是我们自己起的那个没起来（看日志里那条 \
+                 「自己起了无头 Chrome」，或者 `AGENT_CHROME` 指对可执行文件）；\
+                 设了 AGENT_CDP 时是那个地址不对 / 那个 Chrome 没开调试端口"
             )
         })?;
         let ws_url = version
@@ -1063,19 +1160,290 @@ impl Conn {
     }
 }
 
-impl Inner {
-    /// 懒连接：第一次要动作的时候才连（Chrome 可能还没起来）
-    fn conn(&mut self, endpoint: &str) -> Result<&mut Conn, String> {
-        if self.conn.is_none() {
-            self.conn = Some(Conn::connect(endpoint)?);
+impl CdpBrowser {
+    /// 懒连接：第一次要动作的时候才连 —— 自己起 Chrome 的话，**也是这时候才拉起
+    /// 它**（启动核心不该等一个浏览器）。
+    fn ensure_conn<'a>(&self, g: &'a mut Inner) -> Result<&'a mut Conn, String> {
+        if g.conn.is_none() {
+            if self.managed && g.chrome.is_none() {
+                let (chrome, endpoint) = launch_chrome()?;
+                tracing::info!(
+                    "自己起了无头 Chrome：{}（profile {}，日志 {}）",
+                    endpoint,
+                    chrome.profile.display(),
+                    chrome.log.display()
+                );
+                g.endpoint = endpoint;
+                g.chrome = Some(chrome);
+            }
+            let ep = if self.managed {
+                g.endpoint.clone()
+            } else {
+                self.endpoint.clone()
+            };
+            g.conn = Some(Conn::connect(&ep)?);
         }
-        Ok(self.conn.as_mut().expect("刚设过"))
+        Ok(g.conn.as_mut().expect("刚设过"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 自己起 Chrome
+// ---------------------------------------------------------------------------
+
+/// 找得到的 Chrome 可执行文件（`AGENT_CHROME` 优先）。
+const CHROME_NAMES: &[&str] = &[
+    "google-chrome-stable",
+    "google-chrome",
+    "chromium",
+    "chromium-browser",
+    "chrome",
+];
+
+/// 起一个无头 Chrome，等它把调试端口听上，返回 `(进程, 地址)`。
+///
+/// **为什么在核心里做**：用的人不该先另开一个终端去起浏览器 —— 那是实现细节。
+/// 要「用我自己那个浏览器」的人有 `AGENT_CDP` 那条路（见 `from_env`）。
+///
+/// 端口是**当场挑一个空闲的**（不是写死 9222）：同一台机器上跑两个核心
+/// （比如 `just dev` + `just dev-host`）不会互相抢。profile 是持久的
+/// （`$XDG_DATA_HOME/android-agent/chrome`）—— 登录态能留到下次；万一那个
+/// profile 被另一个 Chrome 占着（SingletonLock），退一步用临时的。
+fn launch_chrome() -> Result<(Chrome, String), String> {
+    sweep_orphan_chromes();
+    let bin = chrome_bin()?;
+    let mut last: Option<String> = None;
+    for (i, profile) in chrome_profiles().into_iter().enumerate() {
+        match try_launch(&bin, &profile) {
+            Ok((child, port, log)) => {
+                return Ok((
+                    Chrome {
+                        child,
+                        profile,
+                        log,
+                    },
+                    format!("http://127.0.0.1:{port}"),
+                ))
+            }
+            Err(e) => {
+                if i == 0 {
+                    tracing::debug!("用持久 profile 起 Chrome 失败（{e}），换个临时的再试");
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| "起 Chrome 失败".to_string()))
+}
+
+/// 上一次核心被 SIGKILL（或 panic 崩掉）时留下的无头 Chrome：收掉它们。
+///
+/// 为什么要这一步：`Drop` 只在**正常退出**时跑（Ctrl-C / SIGTERM），
+/// 被 `kill -9` / OOM 干掉时那个 Chrome 会变成孤儿，一直占着内存和一个
+/// profile（几十 MB）。判据卡两道，避免误杀别人的浏览器：
+///
+/// - 命令行里有 `--user-data-dir=<我们的目录>`（持久那个，或者 `/tmp/android-agent-chrome-*`）
+/// - **父进程已经是 init**（ppid == 1）—— 还活着的兄弟核心起的那个不算孤儿，
+///   它有自己的爹
+fn sweep_orphan_chromes() {
+    let ours = |cmd: &str| {
+        cmd.contains("--remote-debugging-port=")
+            && (cmd.contains(&format!("--user-data-dir={}", chrome_profile_dir().display()))
+                || cmd.contains("--user-data-dir=/tmp/android-agent-chrome-"))
+            // 只认主进程：`--type=zygote` / `--type=renderer` 那些是它的孩子，
+            // 跟着它一起死，不用单独杀
+            && !cmd.contains("--type=")
+    };
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut killed = 0;
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid <= 1 {
+            continue;
+        }
+        let raw = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
+        let cmd = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if !ours(&cmd) || !is_orphan(pid) {
+            continue;
+        }
+        // SAFETY: kill(2) 只读参数
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        killed += 1;
+    }
+    if killed > 0 {
+        tracing::info!("收掉了 {killed} 个上次留下的无头 Chrome");
+    }
+}
+
+/// 父进程已经是 init 了吗（`/proc/<pid>/stat` 的第 4 个字段）
+fn is_orphan(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `comm` 里可能有空格和括号，所以从最后一个 `)` 之后切
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+        return false;
+    };
+    let mut it = rest.split_whitespace();
+    let _state = it.next();
+    it.next().and_then(|p| p.parse::<i32>().ok()) == Some(1)
+}
+
+/// profile 目录：先是持久的那个，失败就退回一次性的（并发的第二个核心）
+fn chrome_profiles() -> Vec<PathBuf> {
+    vec![
+        chrome_profile_dir(),
+        std::env::temp_dir().join(format!("android-agent-chrome-{}", std::process::id())),
+    ]
+}
+
+/// 持久的那个 profile（登录态能留到下次）
+fn chrome_profile_dir() -> PathBuf {
+    crate::linux::host_data_dir().join("chrome")
+}
+
+fn chrome_bin() -> Result<PathBuf, String> {
+    if let Ok(p) = std::env::var("AGENT_CHROME") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Ok(p);
+        }
+        return Err(format!("AGENT_CHROME={} 不是一个文件", p.display()));
+    }
+    for name in CHROME_NAMES {
+        if let Some(path) = which(name) {
+            return Ok(path);
+        }
+    }
+    // 常见安装位置（有些发行版不在 PATH 里）
+    for p in [
+        "/opt/google/chrome/chrome",
+        "/usr/lib/chromium/chromium",
+        "/snap/bin/chromium",
+    ] {
+        if Path::new(p).is_file() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    Err(format!(
+        "找不到 Chrome / Chromium（试过 {}）—— 装一个，或者设 AGENT_CHROME 指到它的可执行文件",
+        CHROME_NAMES.join(" / ")
+    ))
+}
+
+/// PATH 里找可执行文件（不引 `which` crate）
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// 真的 spawn 一次，并等端口应答。失败返回原因（含 Chrome 自己的日志尾巴）。
+fn try_launch(bin: &Path, profile: &Path) -> Result<(std::process::Child, u16, PathBuf), String> {
+    std::fs::create_dir_all(profile).map_err(|e| format!("建 profile 目录失败: {e}"))?;
+    let log = profile.join("chrome.log");
+    let port = free_port()?;
+    let out = std::fs::File::create(&log).map_err(|e| format!("建日志失败: {e}"))?;
+    let err = out
+        .try_clone()
+        .map_err(|e| format!("克隆日志句柄失败: {e}"))?;
+
+    let child = std::process::Command::new(bin)
+        .arg("--headless=new")
+        .arg(format!("--remote-debugging-port={port}"))
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-gpu")
+        .arg("--hide-scrollbars")
+        // 容器 / 内存小的机器上 `/dev/shm` 常常只有 64MB，不给这个 flag 会崩
+        .arg("--disable-dev-shm-usage")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err))
+        .spawn()
+        .map_err(|e| format!("起不了 {}: {e}", bin.display()))?;
+
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + CHROME_BOOT_TIMEOUT;
+    let mut child = child;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("Chrome 起来就退了（{status}）：{}", tail_of(&log)));
+        }
+        if http_get_json(&endpoint, "/json/version").is_ok() {
+            return Ok((child, port, log));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Chrome {}s 还没把调试端口听上：{}",
+                CHROME_BOOT_TIMEOUT.as_secs(),
+                tail_of(&log)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+}
+
+/// 挑一个空闲端口（bind 0 拿一个，然后放掉）
+fn free_port() -> Result<u16, String> {
+    let l =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("挑空闲端口失败: {e}"))?;
+    l.local_addr()
+        .map(|a| a.port())
+        .map_err(|e| format!("读端口失败: {e}"))
+}
+
+/// 日志尾巴（出错时给模型 / 人看的线索）
+fn tail_of(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(400)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if tail.trim().is_empty() {
+        "（Chrome 没写日志）".to_string()
+    } else {
+        tail.trim().to_string()
     }
 }
 
 // ---------------------------------------------------------------------------
 // 小工具
 // ---------------------------------------------------------------------------
+
+/// 取一段要注进页面的 JS。**只有一份**（`crate::browser_js`）——
+/// 手机上的 WebView 也从那儿取，两边不许各写一份。
+fn page_js(kind: &str, params: Value) -> Result<String, String> {
+    crate::browser_js::build(kind, &params.to_string())
+}
+
+/// 把 `target=_blank` 掰成 `_self`（见 `browser_js` 里那段 JS 的说明）。
+///
+/// 手机那边是在 `onPageStarted` 里注的，这边在加载完成后注 —— 效果一样，
+/// 而且那段 JS 自带幂等哨兵（`window.__agentTargetFix`），重复注不会叠加监听器。
+/// 注失败不算错（顶多是点 `_blank` 链接时开出一只我们管不住的标签）。
+fn install_target_fix(conn: &mut Conn, session: &str) {
+    if let Ok(js) = page_js("target_fix", json!({})) {
+        let _ = conn.eval(session, &js, JS_TIMEOUT);
+    }
+}
 
 /// `http://127.0.0.1:9222` → `("127.0.0.1", 9222)`
 fn split_endpoint(endpoint: &str) -> Result<(String, u16), String> {
@@ -1198,25 +1566,6 @@ fn normalize_url(raw: &str) -> Option<String> {
     Some(format!("https://{url}"))
 }
 
-/// 把一段字符串安全地塞进 JS 的单引号字面量里。
-fn js_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// 按**字符**截断（多字节边界上 `truncate` 会 panic）
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -1251,7 +1600,8 @@ fn err_of(v: &Value) -> Option<String> {
 /// （漏了这一步的表现很隐蔽：url/title 静默为空，看着像「页面没标题」）。
 /// 解析不了不算错，返回 Null（页面信息是锦上添花，不该让动作失败）。
 fn page_info(conn: &mut Conn, session: &str) -> Result<Value, String> {
-    let v = conn.eval(session, PAGE_INFO_JS, JS_TIMEOUT)?;
+    let js = page_js("page_info", json!({}))?;
+    let v = conn.eval(session, &js, JS_TIMEOUT)?;
     Ok(match v {
         Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
         other => other,
@@ -1306,573 +1656,6 @@ fn apply_profile(conn: &mut Conn, session: &str, p: Profile) -> Result<(), Strin
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// 注入的 JS（从 BrowserController.kt 移植）
-// ---------------------------------------------------------------------------
-
-/// DOM 指纹：元素个数 + 可见文字长度 + 滚动高度。变了就说明还没稳。
-const DOM_SIG_JS: &str = "(function(){var b=document.body;if(!b)return 'null';\
-     return document.querySelectorAll('*').length+':'+(b.innerText||'').length+':'+\
-     (document.documentElement.scrollHeight||0);})()";
-
-const PAGE_INFO_JS: &str = r##"
-(function() {
-  return JSON.stringify({
-    url: location.href,
-    title: document.title,
-    ready: document.readyState,
-    scrollY: Math.round(window.scrollY),
-    scrollHeight: document.documentElement.scrollHeight,
-    innerWidth: window.innerWidth,
-    innerHeight: window.innerHeight,
-    elements: document.querySelectorAll('*').length
-  });
-})()
-"##;
-
-/// 点一个元素的**完整鼠标事件序列**。
-///
-/// 只调 `el.click()` 不够：很多站点在 `mousedown`/`mouseup` 上做状态
-/// （下拉菜单、拖拽、自定义控件），合成 click 到不了它们。
-const CLICK_EVENTS: &str = r##"
-  var mk = function(type, bubbles) {
-    return new MouseEvent(type, {bubbles: bubbles, cancelable: true, view: window});
-  };
-  el.dispatchEvent(mk('mouseover', true));
-  el.dispatchEvent(mk('mouseenter', false));
-  el.dispatchEvent(mk('mousemove', true));
-  el.dispatchEvent(mk('mousedown', true));
-  el.dispatchEvent(mk('mouseup', true));
-  el.click();
-  el.dispatchEvent(mk('mouseleave', false));
-  el.dispatchEvent(mk('mouseout', true));
-"##;
-
-fn click_sel_js(selector: &str) -> String {
-    let q = js_quote(selector);
-    format!(
-        r##"
-(function() {{
-  var list = document.querySelectorAll('{q}');
-  if (!list.length) return JSON.stringify({{error: '没找到元素: {q}'}});
-  var el = list[0];
-  if (el.disabled) return JSON.stringify({{error: '元素是 disabled 的'}});
-  el.scrollIntoView({{block: 'center'}});
-  {CLICK_EVENTS}
-  return JSON.stringify({{clicked: true, matched: list.length, tag: el.tagName, text: (el.innerText || el.value || '').substring(0, 100)}});
-}})()
-"##
-    )
-}
-
-fn click_xy_js(x: i64, y: i64) -> String {
-    format!(
-        r##"
-(function() {{
-  var el = document.elementFromPoint({x}, {y});
-  if (!el) return JSON.stringify({{error: '坐标 ({x}, {y}) 上没有元素'}});
-  {CLICK_EVENTS}
-  return JSON.stringify({{clicked: true, tag: el.tagName, text: (el.innerText || el.value || '').substring(0, 100)}});
-}})()
-"##
-    )
-}
-
-/// 输入文本。三件事必须都做，少一件就有站点点不动：
-/// 1. **native setter** —— React/Vue 在 `input.value` 上装了自己的 setter，
-///    直接赋值它看不见（框里有字、state 是空的）；
-/// 2. **逐字符 keydown/input/keyup** —— 靠监听按键的搜索框只认事件；
-/// 3. **框架同步** —— Angular 认 `$apply`，Vue 认 `$forceUpdate`。
-fn type_js(selector: &str, text: &str) -> String {
-    let q = js_quote(selector);
-    let val = js_quote(text);
-    format!(
-        r##"
-(function() {{
-  var list = document.querySelectorAll('{q}');
-  if (!list.length) return JSON.stringify({{error: '没找到元素: {q}'}});
-  var el = list[0];
-  var val = '{val}';
-  el.focus();
-  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
-    var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    var setter = Object.getOwnPropertyDescriptor(proto, 'value');
-    if (setter && setter.set) setter.set.call(el, val); else el.value = val;
-  }} else if (el.isContentEditable) {{
-    el.innerText = val;
-  }}
-  for (var i = 0; i < val.length; i++) {{
-    var c = val[i];
-    el.dispatchEvent(new KeyboardEvent('keydown', {{key: c, bubbles: true}}));
-    el.dispatchEvent(new KeyboardEvent('keypress', {{key: c, bubbles: true}}));
-    el.dispatchEvent(new InputEvent('input', {{data: c, inputType: 'insertText', bubbles: true}}));
-    el.dispatchEvent(new KeyboardEvent('keyup', {{key: c, bubbles: true}}));
-  }}
-  el.dispatchEvent(new Event('input', {{bubbles: true}}));
-  el.dispatchEvent(new Event('change', {{bubbles: true}}));
-  try {{
-    if (window.angular) {{
-      var ng = window.angular.element(el);
-      var sc = (ng.scope && ng.scope()) || (ng.injector && ng.injector().get('$rootScope'));
-      if (sc && !sc.$$phase) sc.$apply();
-    }}
-  }} catch (e) {{}}
-  try {{ if (el.__vue__) el.__vue__.$forceUpdate(); }} catch (e) {{}}
-  el.dispatchEvent(new FocusEvent('blur', {{bubbles: true, relatedTarget: null}}));
-  el.blur();
-  return JSON.stringify({{typed: true, matched: list.length, length: val.length}});
-}})()
-"##
-    )
-}
-
-fn get_text_js(selector: &str) -> String {
-    if selector.is_empty() {
-        return r##"
-(function() {
-  var t = (document.body.innerText || '').trim();
-  return JSON.stringify({text: t.substring(0, 40000), length: t.length, url: location.href, title: document.title});
-})()
-"##
-        .to_string();
-    }
-    let q = js_quote(selector);
-    format!(
-        r##"
-(function() {{
-  var el = document.querySelector('{q}');
-  if (!el) return JSON.stringify({{error: '没找到元素: {q}'}});
-  var t = (el.innerText || el.textContent || '').trim();
-  return JSON.stringify({{text: t.substring(0, 40000), length: t.length}});
-}})()
-"##
-    )
-}
-
-/// 滚动。先试 window；页面没动说明滚动在某个内层容器里（现在满大街都是），
-/// 就找「overflow 是 auto/scroll 且内容比容器高」里面**面积最大**的那个 ——
-/// 面积最大基本就是主内容区，不是侧边的小列表。
-fn scroll_js(direction: &str, amount: i64, selector: &str) -> String {
-    let px = if direction == "up" { -amount } else { amount };
-    let sel = if selector.is_empty() {
-        "null".to_string()
-    } else {
-        format!("'{}'", js_quote(selector))
-    };
-    format!(
-        r##"
-(function() {{
-  var sel = {sel};
-  var px = {px};
-  if (sel) {{
-    var el = document.querySelector(sel);
-    if (!el) return JSON.stringify({{error: '没找到元素: ' + sel}});
-    el.scrollBy(0, px);
-    return JSON.stringify({{scrolled: true, element: sel, scrollY: Math.round(el.scrollTop), scrollHeight: el.scrollHeight}});
-  }}
-  var before = window.scrollY;
-  window.scrollBy(0, px);
-  if (window.scrollY !== before || document.documentElement.scrollHeight <= window.innerHeight + 2) {{
-    return JSON.stringify({{scrolled: true, element: 'window', scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight}});
-  }}
-  var best = null, bestArea = 0;
-  var all = document.body.querySelectorAll('*');
-  for (var i = 0; i < all.length; i++) {{
-    var e = all[i];
-    var st = getComputedStyle(e);
-    if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && e.scrollHeight > e.clientHeight + 5) {{
-      var area = e.clientWidth * e.clientHeight;
-      if (area > bestArea) {{ best = e; bestArea = area; }}
-    }}
-  }}
-  if (best) {{
-    best.scrollBy(0, px);
-    return JSON.stringify({{scrolled: true, element: best.tagName.toLowerCase(), scrollY: Math.round(best.scrollTop), scrollHeight: best.scrollHeight}});
-  }}
-  return JSON.stringify({{scrolled: false, scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight}});
-}})()
-"##
-    )
-}
-
-/// 按键。合成事件不会引发「隐式提交」和「Tab 移焦」，这两件事自己补。
-fn press_js(key: &str) -> String {
-    let name = js_quote(key);
-    format!(
-        r##"
-(function() {{
-  var name = '{name}';
-  var CODES = {{
-    Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, ' ': 32,
-    ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
-    PageUp: 33, PageDown: 34, Home: 36, End: 35
-  }};
-  var code = CODES[name];
-  if (code === undefined) return JSON.stringify({{error: '不支持的按键: ' + name + '（支持 Enter Tab Escape Backspace Delete Space Arrow* PageUp PageDown Home End）'}});
-  var el = document.activeElement || document.body;
-  function mk(type) {{
-    var e = new KeyboardEvent(type, {{
-      key: name, code: name, keyCode: code, which: code,
-      bubbles: true, cancelable: true, view: window
-    }});
-    try {{
-      Object.defineProperty(e, 'keyCode', {{get: function() {{ return code; }}}});
-      Object.defineProperty(e, 'which', {{get: function() {{ return code; }}}});
-    }} catch (err) {{}}
-    return e;
-  }}
-  var target = (el === document.body) ? document : el;
-  target.dispatchEvent(mk('keydown'));
-  target.dispatchEvent(mk('keypress'));
-  target.dispatchEvent(mk('keyup'));
-
-  var acted = '';
-  if (name === 'Enter') {{
-    var form = el.form || (el.closest && el.closest('form'));
-    if (form) {{
-      try {{
-        if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); acted = '已提交表单'; }}
-        else {{
-          var b = form.querySelector('button[type=submit], input[type=submit]');
-          if (b) {{ b.click(); acted = '已点提交键'; }}
-        }}
-      }} catch (err) {{ acted = '提交表单失败: ' + err.message; }}
-    }}
-  }}
-  if (name === 'Tab') {{
-    var all = document.querySelectorAll('a[href], button, input, select, textarea, [tabindex]');
-    var list = [];
-    for (var i = 0; i < all.length; i++) {{
-      var e2 = all[i];
-      if (e2.disabled || e2.tabIndex < 0) continue;
-      var st = getComputedStyle(e2);
-      if (st.display === 'none' || st.visibility === 'hidden') continue;
-      list.push(e2);
-    }}
-    var at = list.indexOf(el);
-    if (list.length) {{
-      var next = list[(at + 1 + list.length) % list.length];
-      try {{ next.focus(); acted = '焦点移到 <' + next.tagName + '>'; }} catch (err) {{}}
-    }}
-  }}
-  if (name === 'Escape' && document.activeElement && document.activeElement.blur) {{
-    try {{ document.activeElement.blur(); acted = '已取消焦点'; }} catch (err) {{}}
-  }}
-  return JSON.stringify({{pressed: name, tag: el.tagName, acted: acted}});
-}})()
-"##
-    )
-}
-
-/// 列出一个 selector 匹配到的元素。坐标是**视口坐标**（`click` 的 x/y 要的
-/// 正是它），另给 pageY 让模型知道要滚多远。
-fn find_elements_js(selector: &str) -> String {
-    let q = js_quote(selector);
-    format!(
-        r##"
-(function() {{
-  var all = document.querySelectorAll('{q}');
-  var sx = window.scrollX || 0, sy = window.scrollY || 0;
-  var items = [];
-  var limit = Math.min(all.length, 20);
-  for (var i = 0; i < limit; i++) {{
-    var el = all[i];
-    var r = el.getBoundingClientRect();
-    var st = getComputedStyle(el);
-    items.push({{
-      i: i,
-      tag: el.tagName,
-      text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().substring(0, 80),
-      href: (el.href || '').substring(0, 200),
-      x: Math.round(r.x + r.width / 2),
-      y: Math.round(r.y + r.height / 2),
-      w: Math.round(r.width), h: Math.round(r.height),
-      pageY: Math.round(r.top + sy),
-      visible: r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight &&
-               st.display !== 'none' && st.visibility !== 'hidden'
-    }});
-  }}
-  return JSON.stringify({{count: all.length, shown: limit, items: items, scrollY: Math.round(sy)}});
-}})()
-"##
-    )
-}
-
-/// 页面骨架：不把 HTML 丢给模型（太大且全是噪音），而是抽一棵**可见元素树**。
-///
-/// 1. 挑候选：可见、够大、且「有内容」（语义元素，或自己带文字且没有可见子元素）；
-/// 2. **合并同位置的包装层**（±8px）—— 现代页面上百个无意义 div 靠这步消失；
-/// 3. 每个节点算一个**唯一的短 selector**（这是模型能"点"的前提）；
-/// 4. 内外层文字一样时只留内层；
-/// 5. 按面积建树、剪掉空壳、按 max_depth 截断；
-/// 6. 直接拼成缩进文本（模型读的就是它），带上 rect。
-fn backbone_js(max_depth: usize) -> String {
-    BACKBONE_JS
-        .replace("__MAX_DEPTH__", &max_depth.to_string())
-        .replace("__LIMIT__", &BACKBONE_MAX_NODES.to_string())
-}
-
-const BACKBONE_JS: &str = r##"
-(function() {
-  var MAX_DEPTH = __MAX_DEPTH__;
-  var MERGE = 8;
-  var MIN = 6;
-  var LIMIT = __LIMIT__;
-
-  function vis(el) {
-    var st = getComputedStyle(el);
-    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
-    var r = el.getBoundingClientRect();
-    return r.width >= MIN && r.height >= MIN;
-  }
-  var SEM = {IMG:1, SVG:1, VIDEO:1, CANVAS:1, INPUT:1, TEXTAREA:1, SELECT:1, BUTTON:1, A:1, IFRAME:1, AUDIO:1};
-  var CLICK = {A:1, BUTTON:1, INPUT:1, TEXTAREA:1, SELECT:1, SUMMARY:1};
-  var SKIP = {SCRIPT:1, STYLE:1, NOSCRIPT:1, BR:1, HR:1, META:1, LINK:1, TEMPLATE:1, HEAD:1};
-  function text(el) { return ((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()); }
-  function isLeaf(el) {
-    if (SKIP[el.tagName]) return false;
-    if (SEM[el.tagName]) return true;
-    var kids = el.children;
-    for (var i = 0; i < kids.length; i++) {
-      if (!SKIP[kids[i].tagName] && vis(kids[i])) return false;
-    }
-    return true;
-  }
-  function near(a, b) {
-    return Math.abs(a.left - b.left) <= MERGE && Math.abs(a.top - b.top) <= MERGE &&
-           Math.abs(a.right - b.right) <= MERGE && Math.abs(a.bottom - b.bottom) <= MERGE;
-  }
-  // selector **必须唯一** —— 模型拿它去点，指到十几个元素上就点不动了。
-  function uniq(s) { try { return document.querySelectorAll(s).length === 1; } catch (e) { return false; } }
-  // 数字开头的 id **不能**写成 `#50051583`（CSS 里非法，querySelector 直接抛）
-  function idSel(id) {
-    if (/^[A-Za-z_-][A-Za-z0-9_-]*$/.test(id)) return '#' + id;
-    return '[id="' + String(id).replace(/"/g, '\\"') + '"]';
-  }
-  function sel(el) {
-    if (el.id) { var byId = idSel(el.id); if (uniq(byId)) return byId; }
-    var parts = [], cur = el, guard = 0;
-    while (cur && cur !== document.body && cur !== document.documentElement && guard++ < 8) {
-      if (cur.id) { parts.unshift(idSel(cur.id)); break; }
-      var seg = cur.tagName.toLowerCase();
-      var p = cur.parentElement;
-      if (p) {
-        var same = 0, idx = 0;
-        for (var i = 0; i < p.children.length; i++) {
-          if (p.children[i].tagName === cur.tagName) { same++; if (p.children[i] === cur) idx = same; }
-        }
-        if (same > 1) seg += ':nth-of-type(' + idx + ')';
-      }
-      parts.unshift(seg);
-      cur = p;
-      if (parts.length >= 2 && uniq(parts.join(' > '))) return parts.join(' > ');
-    }
-    return parts.join(' > ');
-  }
-
-  var all = document.body.querySelectorAll('*');
-  var nodes = [];
-  for (var i = 0; i < all.length; i++) {
-    var el = all[i];
-    if (!vis(el) || !isLeaf(el)) continue;
-    var r = el.getBoundingClientRect();
-    var t = text(el);
-    var interesting = t.length > 1 || SEM[el.tagName] || (el.tagName === 'A' && el.href);
-    if (!interesting) continue;
-    // 合并同位置的包装层：一路提升到最外层的"外壳"。
-    // **碰见可点的语义元素就停** —— 继续往上合并的话 selector 会指到一个
-    // div/td/span 上，而点 wrapper 是点不出反应的。
-    var rep = el, rr = r;
-    var up = el.parentElement;
-    while (!CLICK[rep.tagName] && up && up !== document.body && up !== document.documentElement &&
-           vis(up) && near(rr, up.getBoundingClientRect())) {
-      rep = up; rr = up.getBoundingClientRect();
-      up = up.parentElement;
-    }
-    var dup = false;
-    for (var k = 0; k < nodes.length; k++) { if (nodes[k].el === rep) { dup = true; break; } }
-    if (dup) continue;
-    nodes.push({el: rep, rect: rr, area: rr.width * rr.height, text: t.substring(0, 200)});
-  }
-
-  // 外层和内层文字一模一样时只留内层（三层包装一份标题 = 三倍噪音，
-  // 而且**能点的通常是内层那个 a**）
-  var kept = [];
-  for (var i = 0; i < nodes.length; i++) {
-    var n = nodes[i], dupText = false;
-    if (n.text) {
-      for (var j = 0; j < nodes.length; j++) {
-        if (j !== i && nodes[j].el !== n.el && n.el.contains(nodes[j].el) && nodes[j].text === n.text) { dupText = true; break; }
-      }
-    }
-    if (!dupText) kept.push(n);
-  }
-  nodes = kept;
-
-  nodes.sort(function(a, b) { return b.area - a.area; });
-  function contains(a, b) { return a.el !== b.el && a.el.contains(b.el); }
-  var roots = [];
-  for (var i = 0; i < nodes.length; i++) {
-    var n = nodes[i], parent = null, best = Infinity;
-    for (var j = 0; j < i; j++) {
-      if (contains(nodes[j], n) && nodes[j].area < best) { parent = nodes[j]; best = nodes[j].area; }
-    }
-    if (parent) { (parent.kids = parent.kids || []).push(n); } else { roots.push(n); }
-  }
-  function prune(n) {
-    (n.kids || []).forEach(prune);
-    if ((!n.kids || n.kids.length === 1) && !n.text) {
-      var c = n.kids && n.kids[0];
-      if (c) { n.el = c.el; n.rect = c.rect; n.text = c.text; n.kids = c.kids; }
-    }
-    if (n.kids) n.kids = n.kids.filter(function(k) { return (k.kids && k.kids.length) || k.text || SEM[k.el.tagName]; });
-  }
-  function textOf(n) { return (n.text || '').substring(0, 120); }
-  roots.forEach(prune);
-  roots = roots.filter(function(r) { return textOf(r) || SEM[r.el.tagName] || (r.kids && r.kids.length); });
-
-  var lines = [], count = 0, depth = 0;
-  function emit(n, d, pad) {
-    if (count >= LIMIT) return;
-    count++; if (d > depth) depth = d;
-    var el = n.el, r = n.rect;
-    var head = pad + '<' + el.tagName.toLowerCase() + '>';
-    if (el.id) head += ' #' + el.id;
-    var cls = (typeof el.className === 'string' ? el.className : '').trim().split(/\s+/).filter(Boolean).slice(0, 2);
-    if (cls.length) head += ' .' + cls.join('.');
-    head += ' | ' + sel(el);
-    head += ' | ' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height);
-    lines.push(head);
-    var t = textOf(n);
-    if (t) lines.push(pad + '  "' + t + '"');
-    if (el.tagName === 'A' && el.href) {
-      try {
-        var u = new URL(el.href);
-        var host = (u.host === location.host) ? '' : (u.host + ' ');
-        lines.push(pad + '  -> ' + host + u.pathname + (u.search || ''));
-      }
-      catch (e) { lines.push(pad + '  -> ' + el.href.substring(0, 100)); }
-    }
-    if (el.tagName === 'IMG') lines.push(pad + '  img ' + (el.naturalWidth || 0) + 'x' + (el.naturalHeight || 0) + ' ' + (el.currentSrc || el.src || '').substring(0, 100));
-    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
-      var tp = el.type || el.tagName.toLowerCase();
-      var v = el.type === 'password' ? '[redacted]' : (el.value || '');
-      lines.push(pad + '  input ' + tp + (v ? ' value="' + String(v).substring(0, 60) + '"' : '') + (el.placeholder ? ' placeholder="' + el.placeholder.substring(0, 60) + '"' : ''));
-    }
-    if (d >= MAX_DEPTH) return;
-    (n.kids || []).forEach(function(k) { emit(k, d + 1, pad + '  '); });
-  }
-  roots.forEach(function(r) { emit(r, 1, ''); });
-  if (!lines.length) lines.push('（这一屏没有可读的可见元素）');
-  return JSON.stringify({text: lines.join('\n'), nodes: count, depth: depth});
-})()
-"##;
-
-/// 抽正文（Readability 的简化版，只留真管用的那几条）。
-const READABLE_JS: &str = r##"
-(function() {
-  var SKIP_TAGS = {NAV:1, FOOTER:1, ASIDE:1, HEADER:1, FORM:1, SCRIPT:1, STYLE:1, NOSCRIPT:1, IFRAME:1, BUTTON:1, SELECT:1};
-  var JUNK = /(^|[\s_-])(nav|menu|sidebar|footer|header|comment|share|sharing|social|promo|ads?|advert|breadcrumb|cookie|consent|privacy|legal|terms|gdpr|ccpa|disclaimer|banner|subscribe|newsletter|signup|login|paywall|related|recommend|popup|modal|toolbar|masthead)([\s_-]|$)/i;
-  var POS = /(^|[\s_-])(article|body|content|entry|main|page|post|story|text|blog|read)([\s_-]|$)/i;
-  var NEG = /(^|[\s_-])(nav|menu|sidebar|footer|comment|promo|related|recommend|popular|banner|cookie|consent|privacy|legal|terms|gdpr|subscribe|newsletter|signup|login|paywall|popup|modal|advert|ads?|social|share|widget|tool|tags)([\s_-]|$)/i;
-  function t(el) { return (el.innerText || el.textContent || '').trim(); }
-  function names(el) {
-    return (typeof el.className === 'string' ? el.className : '') + ' ' +
-           (el.id || '') + ' ' + (el.getAttribute ? (el.getAttribute('role') || '') : '');
-  }
-  function inChrome(el) {
-    try { return !!el.closest('nav, footer, aside, header, form, [aria-hidden="true"]'); } catch (e) { return false; }
-  }
-  // 自己或**上面 6 层**里任何一层像周边，就当周边。只查自己不够 ——
-  // 实测 CNBC 的 cookie 声明是一堆正常 <p>，包在一个 `#...CookieNotice` 壳里。
-  function junk(el) {
-    var cur = el, depth = 0;
-    while (cur && cur !== document.body && depth++ < 6) {
-      if (JUNK.test(names(cur))) return true;
-      cur = cur.parentElement;
-    }
-    return false;
-  }
-  function hidden(el) {
-    var st = getComputedStyle(el);
-    return st.display === 'none' || st.visibility === 'hidden';
-  }
-  function bad(el) { return SKIP_TAGS[el.tagName] || inChrome(el) || hidden(el) || junk(el); }
-  function weight(el) {
-    var s = names(el);
-    if (NEG.test(s)) return 0.15;
-    if (POS.test(s)) return 2;
-    return 1;
-  }
-
-  var h1 = null;
-  var hs = document.querySelectorAll('h1');
-  for (var i = 0; i < hs.length; i++) {
-    if (!bad(hs[i]) && t(hs[i]).length > 3) { h1 = hs[i]; break; }
-  }
-
-  var cands = document.querySelectorAll('article, main, [role=main], div, section, td');
-  var best = null, bestScore = 0;
-  for (var i = 0; i < cands.length; i++) {
-    var c = cands[i];
-    if (bad(c)) continue;
-    var ps = c.querySelectorAll('p');
-    if (!ps.length) continue;
-    var s = 0;
-    for (var j = 0; j < ps.length; j++) {
-      var p = ps[j];
-      if (bad(p)) continue;
-      var pt = t(p);
-      if (pt.length < 25) continue;
-      s += 1 + Math.min(pt.length / 100, 3);
-    }
-    if (s <= 0) continue;
-    s *= weight(c);
-    if (h1 && c.contains(h1)) s += 20;
-    var all = t(c);
-    var linkLen = 0;
-    var as = c.querySelectorAll('a');
-    for (var k = 0; k < as.length; k++) linkLen += t(as[k]).length;
-    if (all.length > 0 && linkLen / all.length > 0.5) s *= 0.3;
-    s += Math.min(all.length / 1000, 5);
-    if (s > bestScore) { bestScore = s; best = c; }
-  }
-
-  var host = best, source = 'best-block';
-  if (!host || bestScore < 6) { host = document.body; source = 'body(fallback)'; }
-
-  var chunks = [];
-  var nodes = host.querySelectorAll('h1, h2, h3, p, li, blockquote, pre, figcaption');
-  for (var i = 0; i < nodes.length; i++) {
-    var n = nodes[i];
-    if (bad(n)) continue;
-    if (n.tagName === 'LI' && n.querySelector('p')) continue;
-    var txt = t(n);
-    if (!txt || txt.length < 2) continue;
-    if (n.tagName === 'PRE') { chunks.push('```\n' + (n.innerText || '') + '\n```'); continue; }
-    if (n.tagName === 'H1' || n.tagName === 'H2' || n.tagName === 'H3') { chunks.push('## ' + txt); continue; }
-    if (chunks.length > 400) break;
-    var links = n.querySelectorAll('a[href]');
-    if (links.length === 1 && t(links[0]).length > txt.length * 0.6) {
-      try {
-        var u = new URL(links[0].href);
-        var where = (u.host === location.host) ? (u.pathname + (u.search || '')) : (u.host + u.pathname);
-        chunks.push(txt + '  [' + where + ']');
-        continue;
-      } catch (e) {}
-    }
-    chunks.push(txt);
-  }
-  var out = [];
-  for (var i = 0; i < chunks.length; i++) {
-    if (i > 0 && chunks[i] === chunks[i - 1]) continue;
-    out.push(chunks[i]);
-  }
-  var body = out.join('\n\n');
-  return JSON.stringify({text: body.substring(0, 40000), length: body.length, source: source, title: document.title, url: location.href});
-})()
-"##;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1916,42 +1699,15 @@ mod tests {
         assert_eq!(normalize_url("   "), None);
     }
 
-    /// 选择器 / 文本里的引号和换行不能把注入的 JS 拼坏（引号逃逸）
-    #[test]
-    fn js_quote_escapes_what_would_break_out() {
-        assert_eq!(js_quote("a'b"), "a\\'b");
-        assert_eq!(js_quote("a\\b"), "a\\\\b");
-        assert_eq!(js_quote("a\nb"), "a\\nb");
-        assert_eq!(js_quote("a\u{2028}b"), "a\\u2028b");
-        // 拼进 JS 之后，那个字面量里不该出现裸的引号
-        let js = click_sel_js("div[data-x='y']");
-        assert!(
-            js.contains(r#"querySelectorAll('div[data-x=\'y\']')"#),
-            "{js}"
-        );
-    }
-
-    /// 骨架 JS 的两个占位符都得被替换掉（留着的话页面里是语法错误）
-    #[test]
-    fn backbone_js_has_no_placeholders_left() {
-        let js = backbone_js(3);
-        assert!(
-            !js.contains("__MAX_DEPTH__") && !js.contains("__LIMIT__"),
-            "{js}"
-        );
-        assert!(js.contains("var MAX_DEPTH = 3;"));
-        assert!(js.contains(&format!("var LIMIT = {BACKBONE_MAX_NODES};")));
-        // 深度要夹在 1..10（调用方保证；这里钉住 clamp 那行没被改掉）
-        let clamped = backbone_js(10);
-        assert!(clamped.contains("var MAX_DEPTH = 10;"));
-    }
-
     /// 每个动作名都得能进 dispatch（不然 CLI 发得出去、后端回「未知动作」）
     #[test]
     fn every_action_is_reachable() {
-        let b = CdpBrowser::new("http://127.0.0.1:1".into(), shots_for_test());
+        // 连一个**连不上**的地址：这些动作在碰网络之前就该报「参数」类的错
+        let b = CdpBrowser::connect_to("http://127.0.0.1:1".into(), shots_for_test());
         let mut g = Inner {
             conn: None,
+            chrome: None,
+            endpoint: "http://127.0.0.1:1".into(),
             tabs: Vec::new(),
             current: 0,
             next_id: 1,
@@ -1971,28 +1727,29 @@ mod tests {
 
     /// 连不上 Chrome 时的错要**能照着做**（这是模型唯一能看到的线索）
     #[test]
-    fn the_offline_error_tells_you_how_to_start_chrome() {
+    fn the_offline_error_points_at_the_two_ways_to_get_a_browser() {
         let e = match Conn::connect("http://127.0.0.1:1") {
             Ok(_) => panic!("127.0.0.1:1 上不该有东西在听"),
             Err(e) => e,
         };
-        assert!(e.contains("just chrome"), "{e}");
-        assert!(e.contains("--remote-debugging-port"), "{e}");
+        assert!(e.contains("AGENT_CDP"), "{e}");
+        assert!(e.contains("AGENT_CHROME"), "{e}");
     }
 
-    /// **真 Chrome 的端到端**：起一个本地的假页面，把动作过一遍。
+    /// **真 Chrome 的端到端**：自己起一个无头 Chrome，起一个本地的假页面，
+    /// 把动作过一遍。
     ///
-    /// 默认跳过（CI / 别人机器上不一定有 Chrome，也不一定有调试端口）：
-    ///     just chrome                        # 另开一个终端
+    /// 默认跳过（CI / 别人机器上不一定装了 Chrome）：
     ///     AGENT_CDP_TEST=1 cargo test cdp::
     #[test]
     fn end_to_end_against_a_real_chrome() {
         if std::env::var("AGENT_CDP_TEST").as_deref() != Ok("1") {
-            eprintln!("跳过（设 AGENT_CDP_TEST=1 且先 `just chrome` 才跑）");
+            eprintln!("跳过（设 AGENT_CDP_TEST=1 才跑；会自己起 Chrome）");
             return;
         }
         let (base, _srv) = serve_test_page();
-        let b = CdpBrowser::new("http://127.0.0.1:9222".into(), shots_for_test());
+        // **自己起** Chrome（和核心走同一条路）：不用先另开一个终端起浏览器
+        let b = CdpBrowser::managed(shots_for_test());
         let act = |json: Value| -> Value {
             let out = b.execute(&json.to_string()).expect("execute 不该 Err");
             serde_json::from_str(&out).expect("回包要是 JSON")

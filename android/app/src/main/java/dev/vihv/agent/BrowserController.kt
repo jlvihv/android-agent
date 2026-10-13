@@ -241,7 +241,7 @@ class BrowserController(private val app: Application) : BrowserHost {
         var last = ""
         var same = 0
         while (System.currentTimeMillis() < deadline) {
-            val sig = runCatching { eval(DOM_SIG_JS) }.getOrNull()
+            val sig = runCatching { eval(domSigJs()) }.getOrNull()
             if (sig == null) return // 页面可能正在换文档（导航），当作“还在动”
             if (sig == last && sig != "null") {
                 same++
@@ -698,7 +698,7 @@ class BrowserController(private val app: Application) : BrowserHost {
             /** 每页开始加载时把 target=_blank 掰成 _self（见 installTargetFix） */
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 tab.started.incrementAndGet()
-                view?.evaluateJavascript(TARGET_FIX_JS, null)
+                view?.evaluateJavascript(targetFixJs(), null)
             }
         }
 
@@ -815,24 +815,7 @@ class BrowserController(private val app: Application) : BrowserHost {
     }
 
     private fun pageInfo(): JSONObject? = runCatching {
-        JSONObject(
-            eval(
-                """
-                (function() {
-                  return JSON.stringify({
-                    url: location.href,
-                    title: document.title,
-                    ready: document.readyState,
-                    scrollY: Math.round(window.scrollY),
-                    scrollHeight: document.documentElement.scrollHeight,
-                    innerWidth: window.innerWidth,
-                    innerHeight: window.innerHeight,
-                    elements: document.querySelectorAll('*').length
-                  });
-                })()
-                """.trimIndent(),
-            ),
-        )
+        JSONObject(eval(pageInfoJs()))
     }.getOrNull()
 
     private fun getBackbone(maxDepth: Int): JSONObject {
@@ -914,7 +897,7 @@ class BrowserController(private val app: Application) : BrowserHost {
      */
     private fun getReadable(): JSONObject {
         ensureWeb()
-        val out = evalToJson(READABLE_JS) ?: return errObj("抽正文失败")
+        val out = evalToJson(readableJs()) ?: return errObj("抽正文失败")
         out.optString("error").takeIf { it.isNotEmpty() }?.let { return errObj(it) }
 
         val title = out.optString("title")
@@ -1239,6 +1222,9 @@ class BrowserController(private val app: Application) : BrowserHost {
         // 直接画的话内容会往下偏一个 scrollY（顶部空白、底部被裁）。
         // 注意滚动位置在**合成器**里，不挂窗口时 `webView.scrollY` 恒为 0，
         // 所以只能问页面要。
+        //
+        // 这一小段（还有下面整页高度的那个）是**截图这套**的私事，不在共享的那份
+        // JS 里：桌面走 CDP 的 `Page.captureScreenshot`，压根不需要它。
         val scroll = runCatching {
             val a = JSONArray(eval("[Math.round(window.scrollX),Math.round(window.scrollY)]"))
             a.getInt(0) to a.getInt(1)
@@ -1438,612 +1424,46 @@ class BrowserController(private val app: Application) : BrowserHost {
     private fun err(msg: String): String = errObj(msg).toString()
 
     // -----------------------------------------------------------------------
-    // JS 源码
+    // JS：**不在这个文件里**
     //
-    // 每个动作是一段自包含的 IIFE，最后 `JSON.stringify(...)` 回结果。
-    // 几个坑都写在代码里了（React 的受控输入、框架的变更通知、事件序列）。
+    // 动作级的页面逻辑（骨架、正文、点击、输入、按键、滚动、找元素、DOM 指纹、
+    // 页面信息、`target=_blank` 修正）只有**一份**，在核心里
+    // （`core/src/browser_js.rs`）—— 桌面那个 CDP 后端用的是同一个 `build`。
+    // 各写一份就会漂：动作表漂过一次（`new_tab` 把 URL 吃掉），而 JS 漂了更隐蔽
+    // （点不动、抽不出正文），只有真机上才看得出来。
+    //
+    // 这边只剩**宿主逻辑**：往哪只 WebView 里注、什么时候注、超时怎么办。
     // -----------------------------------------------------------------------
 
-    private fun jsQuote(s: String): String = buildString {
-        for (ch in s) {
-            when (ch) {
-                '\\' -> append("\\\\")
-                '\'' -> append("\\'")
-                '"' -> append("\\\"")
-                '\n' -> append("\\n")
-                '\r' -> append("\\r")
-                '\t' -> append("\\t")
-                '\u2028' -> append("\\u2028")
-                '\u2029' -> append("\\u2029")
-                '$' -> append("\\$")
-                else -> append(ch)
+    /** 向核心要一段页面 JS（kind 见 `browser_js::KINDS`，params 是 JSON 对象）*/
+    private fun js(kind: String, params: String = "{}"): String =
+        runCatching { AgentApp.core.browserJs(kind, params) }
+            .getOrElse { e ->
+                // 拿不到就把原因说清楚：这个动作做不了，而不是静默注入一段空脚本
+                Log.e(TAG, "取 JS 失败 kind=$kind", e)
+                "throw new Error('取页面脚本失败: ${e.message}')"
             }
-        }
-    }
 
-    private fun clickSelJs(selector: String): String = """
-        (function() {
-          var list = document.querySelectorAll('${jsQuote(selector)}');
-          if (!list.length) return JSON.stringify({error: '没找到元素: ${jsQuote(selector)}'});
-          var el = list[0];
-          if (el.disabled) return JSON.stringify({error: '元素是 disabled 的'});
-          el.scrollIntoView({block: 'center'});
-          ${CLICK_EVENTS}
-          return JSON.stringify({clicked: true, matched: list.length, tag: el.tagName, text: (el.innerText || el.value || '').substring(0, 100)});
-        })()
-    """.trimIndent()
+    private fun clickSelJs(selector: String) =
+        js("click_sel", """{"selector":${JSONObject.quote(selector)}}""")
+    private fun clickXyJs(x: Int, y: Int) = js("click_xy", """{"x":$x,"y":$y}""")
+    private fun typeJs(selector: String, text: String) =
+        js("type", """{"selector":${JSONObject.quote(selector)},"text":${JSONObject.quote(text)}}""")
+    private fun getTextJs(selector: String?) =
+        js("get_text", """{"selector":${JSONObject.quote(selector ?: "")}}""")
+    private fun scrollJs(direction: String, amount: Int, selector: String?) =
+        js("scroll", """{"direction":${JSONObject.quote(direction)},"amount":$amount,"selector":${JSONObject.quote(selector ?: "")}}""")
+    private fun pressJs(key: String) = js("press", """{"key":${JSONObject.quote(key)}}""")
+    private fun findElementsJs(selector: String) = js("find_elements", """{"selector":${JSONObject.quote(selector)}}""")
+    private fun backboneJs(maxDepth: Int) = js("backbone", """{"max_depth":$maxDepth}""")
+    private fun readableJs() = js("readable")
+    private fun targetFixJs() = js("target_fix")
+    private fun domSigJs() = js("dom_sig")
+    private fun pageInfoJs() = js("page_info")
 
-    private fun clickXyJs(x: Int, y: Int): String = """
-        (function() {
-          var el = document.elementFromPoint($x, $y);
-          if (!el) return JSON.stringify({error: '坐标 ($x, $y) 上没有元素'});
-          ${CLICK_EVENTS}
-          return JSON.stringify({clicked: true, tag: el.tagName, text: (el.innerText || el.value || '').substring(0, 100)});
-        })()
-    """.trimIndent()
-
-    /**
-     * 输入文本。
-     *
-     * 三件事必须都做，少一件就有站点点不动：
-     * 1. **native setter** —— React/Vue 会在 `input.value` 上装自己的 setter
-     *    记录"上一次的值"，直接赋值它看不见，于是框里有字、state 是空的。
-     * 2. **逐字符 keydown/input/keyup** —— 靠监听按键的搜索框（防抖、逐字
-     *    请求）只认事件。
-     * 3. **框架同步** —— Angular 认 `$apply`，Vue 认 `$forceUpdate`。
-     */
-    private fun typeJs(selector: String, text: String): String = """
-        (function() {
-          var list = document.querySelectorAll('${jsQuote(selector)}');
-          if (!list.length) return JSON.stringify({error: '没找到元素: ${jsQuote(selector)}'});
-          var el = list[0];
-          var val = '${jsQuote(text)}';
-          el.focus();
-          if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-            var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            var setter = Object.getOwnPropertyDescriptor(proto, 'value');
-            if (setter && setter.set) setter.set.call(el, val); else el.value = val;
-          } else if (el.isContentEditable) {
-            el.innerText = val;
-          }
-          for (var i = 0; i < val.length; i++) {
-            var c = val[i];
-            el.dispatchEvent(new KeyboardEvent('keydown', {key: c, bubbles: true}));
-            el.dispatchEvent(new KeyboardEvent('keypress', {key: c, bubbles: true}));
-            el.dispatchEvent(new InputEvent('input', {data: c, inputType: 'insertText', bubbles: true}));
-            el.dispatchEvent(new KeyboardEvent('keyup', {key: c, bubbles: true}));
-          }
-          el.dispatchEvent(new Event('input', {bubbles: true}));
-          el.dispatchEvent(new Event('change', {bubbles: true}));
-          try {
-            if (window.angular) {
-              var ng = window.angular.element(el);
-              var sc = (ng.scope && ng.scope()) || (ng.injector && ng.injector().get('${'$'}rootScope'));
-              if (sc && !sc.${'$'}${'$'}phase) sc.${'$'}apply();
-            }
-          } catch (e) {}
-          try { if (el.__vue__) el.__vue__.${'$'}forceUpdate(); } catch (e) {}
-          // 丢掉焦点：很多表单/搜索框是 onblur 才提交或校验的
-          el.dispatchEvent(new FocusEvent('blur', {bubbles: true, relatedTarget: null}));
-          el.blur();
-          return JSON.stringify({typed: true, matched: list.length, length: val.length});
-        })()
-    """.trimIndent()
-
-    private fun getTextJs(selector: String?): String {
-        if (selector.isNullOrEmpty()) {
-            return """
-                (function() {
-                  var t = (document.body.innerText || '').trim();
-                  return JSON.stringify({text: t.substring(0, 40000), length: t.length, url: location.href, title: document.title});
-                })()
-            """.trimIndent()
-        }
-        return """
-            (function() {
-              var el = document.querySelector('${jsQuote(selector)}');
-              if (!el) return JSON.stringify({error: '没找到元素: ${jsQuote(selector)}'});
-              var t = (el.innerText || el.textContent || '').trim();
-              return JSON.stringify({text: t.substring(0, 40000), length: t.length});
-            })()
-        """.trimIndent()
-    }
-
-    /**
-     * 滚动。先试 window；页面没动说明滚动在某个内层容器里（现在满大街都是），
-     * 就遍历 DOM 找"overflow 是 auto/scroll 且内容比容器高"里面**面积最大**的
-     * 那个 —— 面积最大基本就是主内容区，不是侧边的小列表。
-     */
-    private fun scrollJs(direction: String, amount: Int, selector: String?): String {
-        val px = if (direction == "up") -amount else amount
-        val sel = if (selector.isNullOrEmpty()) "null" else "'${jsQuote(selector)}'"
-        return """
-            (function() {
-              var sel = $sel;
-              var px = $px;
-              if (sel) {
-                var el = document.querySelector(sel);
-                if (!el) return JSON.stringify({error: '没找到元素: ' + sel});
-                el.scrollBy(0, px);
-                return JSON.stringify({scrolled: true, element: sel, scrollY: Math.round(el.scrollTop), scrollHeight: el.scrollHeight});
-              }
-              var before = window.scrollY;
-              window.scrollBy(0, px);
-              if (window.scrollY !== before || document.documentElement.scrollHeight <= window.innerHeight + 2) {
-                return JSON.stringify({scrolled: true, element: 'window', scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight});
-              }
-              var best = null, bestArea = 0;
-              var all = document.body.querySelectorAll('*');
-              for (var i = 0; i < all.length; i++) {
-                var e = all[i];
-                var st = getComputedStyle(e);
-                if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && e.scrollHeight > e.clientHeight + 5) {
-                  var area = e.clientWidth * e.clientHeight;
-                  if (area > bestArea) { best = e; bestArea = area; }
-                }
-              }
-              if (best) {
-                best.scrollBy(0, px);
-                return JSON.stringify({scrolled: true, element: best.tagName.toLowerCase(), scrollY: Math.round(best.scrollTop), scrollHeight: best.scrollHeight});
-              }
-              return JSON.stringify({scrolled: false, scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight});
-            })()
-        """.trimIndent()
-    }
-
-    /**
-     * 按键。合成事件不会引发“隐式提交”和“Tab 移焦”，这两件事自己补（见 [press]）。
-     */
-    private fun pressJs(key: String): String = """
-        (function() {
-          var name = '${jsQuote(key)}';
-          var CODES = {
-            Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, ' ': 32,
-            ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
-            PageUp: 33, PageDown: 34, Home: 36, End: 35
-          };
-          var code = CODES[name];
-          if (code === undefined) return JSON.stringify({error: '不支持的按键: ' + name + '（支持 Enter Tab Escape Backspace Delete Space Arrow* PageUp PageDown Home End）'});
-          var el = document.activeElement || document.body;
-          function mk(type) {
-            var e = new KeyboardEvent(type, {
-              key: name, code: name, keyCode: code, which: code,
-              bubbles: true, cancelable: true, view: window
-            });
-            // 很多只想跑在页面里的旧代码读 keyCode/which，而构造函数里给的值
-            // 在部分 Chromium 版本上不会真的落到属性上 —— 手动盖一层。
-            try {
-              Object.defineProperty(e, 'keyCode', {get: function() { return code; }});
-              Object.defineProperty(e, 'which', {get: function() { return code; }});
-            } catch (err) {}
-            return e;
-          }
-          var target = (el === document.body) ? document : el;
-          target.dispatchEvent(mk('keydown'));
-          target.dispatchEvent(mk('keypress'));
-          target.dispatchEvent(mk('keyup'));
-
-          var acted = '';
-          if (name === 'Enter') {
-            // 合成 keydown 不会触发表单的隐式提交，得显式来一下：
-            // 有的站是自己在 keydown 里处理的（上面那三个事件已经够了），
-            // 有的是真表单提交 —— 两条路都盖住。
-            var form = el.form || (el.closest && el.closest('form'));
-            if (form) {
-              try {
-                if (typeof form.requestSubmit === 'function') { form.requestSubmit(); acted = '已提交表单'; }
-                else {
-                  var b = form.querySelector('button[type=submit], input[type=submit]');
-                  if (b) { b.click(); acted = '已点提交键'; }
-                }
-              } catch (err) { acted = '提交表单失败: ' + err.message; }
-            }
-          }
-          if (name === 'Tab') {
-            var all = document.querySelectorAll('a[href], button, input, select, textarea, [tabindex]');
-            var list = [];
-            for (var i = 0; i < all.length; i++) {
-              var e2 = all[i];
-              if (e2.disabled || e2.tabIndex < 0) continue;
-              var st = getComputedStyle(e2);
-              if (st.display === 'none' || st.visibility === 'hidden') continue;
-              list.push(e2);
-            }
-            var at = list.indexOf(el);
-            if (list.length) {
-              var next = list[(at + 1 + list.length) % list.length];
-              try { next.focus(); acted = '焦点移到 <' + next.tagName + '>'; } catch (err) {}
-            }
-          }
-          if (name === 'Escape' && document.activeElement && document.activeElement.blur) {
-            try { document.activeElement.blur(); acted = '已取消焦点'; } catch (err) {}
-          }
-          return JSON.stringify({pressed: name, tag: el.tagName, acted: acted});
-        })()
-    """.trimIndent()
-
-    /**
-     * 列出一个 selector 匹配到的元素。
-     *
-     * 坐标给的是**视口坐标**（`click` 的 x/y 要的正是它）；同时给 pageY，
-     * 让模型知道要滚多远。
-     */
-    private fun findElementsJs(selector: String): String = """
-        (function() {
-          var all = document.querySelectorAll('${jsQuote(selector)}');
-          var sx = window.scrollX || 0, sy = window.scrollY || 0;
-          var items = [];
-          var limit = Math.min(all.length, 20);
-          for (var i = 0; i < limit; i++) {
-            var el = all[i];
-            var r = el.getBoundingClientRect();
-            var st = getComputedStyle(el);
-            items.push({
-              i: i,
-              tag: el.tagName,
-              text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().substring(0, 80),
-              href: (el.href || '').substring(0, 200),
-              x: Math.round(r.x + r.width / 2),
-              y: Math.round(r.y + r.height / 2),
-              w: Math.round(r.width), h: Math.round(r.height),
-              pageY: Math.round(r.top + sy),
-              visible: r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight &&
-                       st.display !== 'none' && st.visibility !== 'hidden'
-            });
-          }
-          return JSON.stringify({count: all.length, shown: limit, items: items, scrollY: Math.round(sy)});
-        })()
-    """.trimIndent()
-
-    /**
-     * 页面骨架（模型“看”页面的主要方式）。
-     *
-     * 思路：不把 HTML 丢给模型（太大且全是噪音），而是抽一棵**可见元素树**：
-     *
-     * 1. 挑候选：可见、够大，而且是"有内容"的 —— 语义元素（a/button/input/img/…）
-     *    或者自己直接带文字、且没有可见的元素子节点。
-     * 2. **合并同位置的包装层**：如果某祖先的矩形和它几乎重合（±8px），
-     *    代表提升到那个祖先。现代页面上百个无意义 div 靠这一步消失。
-     * 3. 给每个节点算一个**唯一的短 selector**（有 id 用 id，否则从元素往上拼、
-     *    拼到唯一为止），这是模型能"点"的前提。
-     * 4. 内层和外层文字一样时只留内层（三层包装一份标题 = 三倍噪音）。
-     * 5. 按面积建树、剪掉只有一个孩子的空壳、按 max_depth 截断。
-     * 6. 直接在这里拼成缩进文本（模型读的就是它），并带上 rect。
-     */
-    private fun backboneJs(maxDepth: Int): String = """
-        (function() {
-          var MAX_DEPTH = $maxDepth;
-          var MERGE = 8;
-          var MIN = 6;
-          var LIMIT = $BACKBONE_MAX_NODES;
-
-          function vis(el) {
-            var st = getComputedStyle(el);
-            if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
-            var r = el.getBoundingClientRect();
-            return r.width >= MIN && r.height >= MIN;
-          }
-          var SEM = {IMG:1, SVG:1, VIDEO:1, CANVAS:1, INPUT:1, TEXTAREA:1, SELECT:1, BUTTON:1, A:1, IFRAME:1, AUDIO:1};
-          // 点它能出事儿的元素（合并时不许越过它们，见下面的 while）
-          var CLICK = {A:1, BUTTON:1, INPUT:1, TEXTAREA:1, SELECT:1, SUMMARY:1};
-          var SKIP = {SCRIPT:1, STYLE:1, NOSCRIPT:1, BR:1, HR:1, META:1, LINK:1, TEMPLATE:1, HEAD:1};
-          function text(el) { return ((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()); }
-          function isLeaf(el) {
-            if (SKIP[el.tagName]) return false;
-            if (SEM[el.tagName]) return true;
-            var kids = el.children;
-            for (var i = 0; i < kids.length; i++) {
-              if (!SKIP[kids[i].tagName] && vis(kids[i])) return false;
-            }
-            return true;
-          }
-          function near(a, b) {
-            return Math.abs(a.left - b.left) <= MERGE && Math.abs(a.top - b.top) <= MERGE &&
-                   Math.abs(a.right - b.right) <= MERGE && Math.abs(a.bottom - b.bottom) <= MERGE;
-          }
-          // selector **必须唯一** —— 模型拿它去点，指到十几个元素上就点不动了。
-          // 所以从元素往上拼，每加一段就问一次“现在唯一了吗”，唯一就停。
-          // 代价是导航站那种“几百行一样结构”的表格会得到
-          // `tr:nth-of-type(7) > td:nth-of-type(3) > a` 这种长 selector ——
-          // 丑，但能点。（早先版本硬截成 3 段，于是每个链接的 selector
-          // 全都一样，白忙一场。）
-          function uniq(s) { try { return document.querySelectorAll(s).length === 1; } catch (e) { return false; } }
-          // 数字开头的 id  **不能**写成 `#50051583`（CSS 里那是非法选择器，
-          // querySelector 直接抛 SyntaxError）。导航站的行 id 全是这种，
-          // 所以一律先验证，不行就用 [id="…"]。
-          function idSel(id) {
-            if (/^[A-Za-z_-][A-Za-z0-9_-]*$/.test(id)) return '#' + id;
-            return '[id="' + String(id).replace(/"/g, '\\"') + '"]';
-          }
-          function sel(el) {
-            if (el.id) { var byId = idSel(el.id); if (uniq(byId)) return byId; }
-            var parts = [], cur = el, guard = 0;
-            while (cur && cur !== document.body && cur !== document.documentElement && guard++ < 8) {
-              if (cur.id) { parts.unshift(idSel(cur.id)); break; }
-              var seg = cur.tagName.toLowerCase();
-              var p = cur.parentElement;
-              if (p) {
-                var same = 0, idx = 0;
-                for (var i = 0; i < p.children.length; i++) {
-                  if (p.children[i].tagName === cur.tagName) { same++; if (p.children[i] === cur) idx = same; }
-                }
-                if (same > 1) seg += ':nth-of-type(' + idx + ')';
-              }
-              parts.unshift(seg);
-              cur = p;
-              if (parts.length >= 2 && uniq(parts.join(' > '))) return parts.join(' > ');
-            }
-            return parts.join(' > ');
-          }
-
-          var all = document.body.querySelectorAll('*');
-          var nodes = [];
-          for (var i = 0; i < all.length; i++) {
-            var el = all[i];
-            if (!vis(el) || !isLeaf(el)) continue;
-            var r = el.getBoundingClientRect();
-            var t = text(el);
-            var interesting = t.length > 1 || SEM[el.tagName] ||
-                              (el.tagName === 'A' && el.href);
-            if (!interesting) continue;
-            // 合并同位置的包装层：一路提升到最外层的"外壳"。
-            // **碰见可点的语义元素就停**（a/button/input/…）—— 继续往上合并的话
-            // selector 会指到一个 div/td/span 上，而点 wrapper 是点不出反应的
-            // （我们是对元素本身派发事件，没有冒泡到内层 a 那回事）。
-            var rep = el, rr = r;
-            var up = el.parentElement;
-            while (!CLICK[rep.tagName] && up && up !== document.body && up !== document.documentElement &&
-                   vis(up) && near(rr, up.getBoundingClientRect())) {
-              rep = up; rr = up.getBoundingClientRect();
-              up = up.parentElement;
-            }
-            // 同一个代表只收一次
-            var dup = false;
-            for (var k = 0; k < nodes.length; k++) { if (nodes[k].el === rep) { dup = true; break; } }
-            if (dup) continue;
-            nodes.push({el: rep, rect: rr, area: rr.width * rr.height, text: t.substring(0, 200)});
-          }
-
-          // 外层和内层文字一模一样时只留内层。
-          // 现代页面上一个标题常常被包三层（td > span.titleline > a），
-          // 三份一样的文字就是三倍的噪音；而且**能点的通常是内层那个 a**。
-          var kept = [];
-          for (var i = 0; i < nodes.length; i++) {
-            var n = nodes[i], dupText = false;
-            if (n.text) {
-              for (var j = 0; j < nodes.length; j++) {
-                if (j !== i && nodes[j].el !== n.el && n.el.contains(nodes[j].el) && nodes[j].text === n.text) { dupText = true; break; }
-              }
-            }
-            if (!dupText) kept.push(n);
-          }
-          nodes = kept;
-
-          nodes.sort(function(a, b) { return b.area - a.area; });
-          function contains(a, b) { return a.el !== b.el && a.el.contains(b.el); }
-          var roots = [];
-          for (var i = 0; i < nodes.length; i++) {
-            var n = nodes[i], parent = null, best = Infinity;
-            for (var j = 0; j < i; j++) {
-              if (contains(nodes[j], n) && nodes[j].area < best) { parent = nodes[j]; best = nodes[j].area; }
-            }
-            if (parent) { (parent.kids = parent.kids || []).push(n); } else { roots.push(n); }
-          }
-          // 只有一个孩子的空壳：把孩子的身份提上来
-          function prune(n) {
-            (n.kids || []).forEach(prune);
-            if ((!n.kids || n.kids.length === 1) && !n.text) {
-              var c = n.kids && n.kids[0];
-              if (c) { n.el = c.el; n.rect = c.rect; n.text = c.text; n.kids = c.kids; }
-            }
-            if (n.kids) n.kids = n.kids.filter(function(k) { return (k.kids && k.kids.length) || k.text || SEM[k.el.tagName]; });
-          }
-          function textOf(n) { return (n.text || '').substring(0, 120); }
-          roots.forEach(prune);
-          roots = roots.filter(function(r) { return textOf(r) || SEM[r.el.tagName] || (r.kids && r.kids.length); });
-
-          var lines = [], count = 0, depth = 0;
-          function emit(n, d, pad) {
-            if (count >= LIMIT) return;
-            count++; if (d > depth) depth = d;
-            var el = n.el, r = n.rect;
-            var head = pad + '<' + el.tagName.toLowerCase() + '>';
-            if (el.id) head += ' #' + el.id;
-            var cls = (typeof el.className === 'string' ? el.className : '').trim().split(/\s+/).filter(Boolean).slice(0, 2);
-            if (cls.length) head += ' .' + cls.join('.');
-            head += ' | ' + sel(el);
-            head += ' | ' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height);
-            lines.push(head);
-            var t = textOf(n);
-            if (t) lines.push(pad + '  "' + t + '"');
-            if (el.tagName === 'A' && el.href) {
-              try {
-                var u = new URL(el.href);
-                // 跨域链接要带上域名，否则模型只看到 /article/xxx 以为还在本站
-                var host = (u.host === location.host) ? '' : (u.host + ' ');
-                lines.push(pad + '  -> ' + host + u.pathname + (u.search || ''));
-              }
-              catch (e) { lines.push(pad + '  -> ' + el.href.substring(0, 100)); }
-            }
-            if (el.tagName === 'IMG') lines.push(pad + '  img ' + (el.naturalWidth || 0) + 'x' + (el.naturalHeight || 0) + ' ' + (el.currentSrc || el.src || '').substring(0, 100));
-            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
-              var tp = el.type || el.tagName.toLowerCase();
-              var v = el.type === 'password' ? '[redacted]' : (el.value || '');
-              lines.push(pad + '  input ' + tp + (v ? ' value="' + String(v).substring(0, 60) + '"' : '') + (el.placeholder ? ' placeholder="' + el.placeholder.substring(0, 60) + '"' : ''));
-            }
-            if (d >= MAX_DEPTH) return;
-            (n.kids || []).forEach(function(k) { emit(k, d + 1, pad + '  '); });
-          }
-          roots.forEach(function(r) { emit(r, 1, ''); });
-          if (!lines.length) lines.push('（这一屏没有可读的可见元素）');
-          return JSON.stringify({text: lines.join('\n'), nodes: count, depth: depth});
-        })()
-    """.trimIndent()
-
-    /**
-     * 抽正文。思路（Readability 的简化版，只留真管用的那几条）：
-     *
-     * 1. 候选容器：article / main / [role=main] / div / section / td。
-     * 2. 打分：里面的 `<p>`（≥ 25 字，不在 nav/footer/aside/header/form 里）
-     *    每个算 1 + min(字数/100, 3)；再加一点总长度的分。
-     * 3. **链接密度惩罚**：整块里链接文字占比 > 50% 的多半是导航/列表页，×0.3。
-     * 4. 输出不取整个容器的 innerText（那还会带上里面的分享按钮、相关阅读），
-     *    而是按文档顺序只取 h1-h3 / p / li / blockquote / pre / figcaption，
-     *    跳过导航块；块里只有一个链占主体时把链接地址附在后面。
-     *
-     * 分太低（< 6）就退回 body —— 那就是 `get_text` 的行为，但模型已明确
-     * 要求“正文”，总比返回空好。
-     */
-    private val READABLE_JS = """
-        (function() {
-          var SKIP_TAGS = {NAV:1, FOOTER:1, ASIDE:1, HEADER:1, FORM:1, SCRIPT:1, STYLE:1, NOSCRIPT:1, IFRAME:1, BUTTON:1, SELECT:1};
-          // 块自身的类名像“周边”的：整块不要
-          var JUNK = /(^|[\s_-])(nav|menu|sidebar|footer|header|comment|share|sharing|social|promo|ads?|advert|breadcrumb|cookie|consent|privacy|legal|terms|gdpr|ccpa|disclaimer|banner|subscribe|newsletter|signup|login|paywall|related|recommend|popup|modal|toolbar|masthead)([\s_-]|$)/i;
-          // 候选容器的正/负信号（Readability 的做法：同一份分数，类名不同差 10 倍）
-          var POS = /(^|[\s_-])(article|body|content|entry|main|page|post|story|text|blog|read)([\s_-]|$)/i;
-          var NEG = /(^|[\s_-])(nav|menu|sidebar|footer|comment|promo|related|recommend|popular|banner|cookie|consent|privacy|legal|terms|gdpr|subscribe|newsletter|signup|login|paywall|popup|modal|advert|ads?|social|share|widget|tool|tags)([\s_-]|$)/i;
-          function t(el) { return (el.innerText || el.textContent || '').trim(); }
-          function names(el) {
-            return (typeof el.className === 'string' ? el.className : '') + ' ' +
-                   (el.id || '') + ' ' + (el.getAttribute ? (el.getAttribute('role') || '') : '');
-          }
-          function inChrome(el) {
-            try { return !!el.closest('nav, footer, aside, header, form, [aria-hidden="true"]'); } catch (e) { return false; }
-          }
-          // 自己或**上面 6 层**里任何一层像周边，就当周边。
-          // 只查自己不够 —— 实测 CNBC 的 cookie 声明是一堆正常 <p>，包在一个
-          // `#...CookieNotice` 的壳里，段落自己的类名毫无异常。
-          function junk(el) {
-            var cur = el, depth = 0;
-            while (cur && cur !== document.body && depth++ < 6) {
-              if (JUNK.test(names(cur))) return true;
-              cur = cur.parentElement;
-            }
-            return false;
-          }
-          function hidden(el) {
-            var st = getComputedStyle(el);
-            return st.display === 'none' || st.visibility === 'hidden';
-          }
-          function bad(el) { return SKIP_TAGS[el.tagName] || inChrome(el) || hidden(el) || junk(el); }
-          function weight(el) {
-            var s = names(el);
-            if (NEG.test(s)) return 0.15;
-            if (POS.test(s)) return 2;
-            return 1;
-          }
-
-          var h1 = null;
-          var hs = document.querySelectorAll('h1');
-          for (var i = 0; i < hs.length; i++) {
-            if (!bad(hs[i]) && t(hs[i]).length > 3) { h1 = hs[i]; break; }
-          }
-
-          var cands = document.querySelectorAll('article, main, [role=main], div, section, td');
-          var best = null, bestScore = 0;
-          for (var i = 0; i < cands.length; i++) {
-            var c = cands[i];
-            if (bad(c)) continue;
-            var ps = c.querySelectorAll('p');
-            if (!ps.length) continue;
-            var s = 0;
-            for (var j = 0; j < ps.length; j++) {
-              var p = ps[j];
-              if (bad(p)) continue;
-              var pt = t(p);
-              if (pt.length < 25) continue;
-              s += 1 + Math.min(pt.length / 100, 3);
-            }
-            if (s <= 0) continue;
-            s *= weight(c);
-            // 页面主标题在哪个块里 —— 强信号，正文容器几乎一定包含它
-            if (h1 && c.contains(h1)) s += 20;
-            var all = t(c);
-            var linkLen = 0;
-            var as = c.querySelectorAll('a');
-            for (var k = 0; k < as.length; k++) linkLen += t(as[k]).length;
-            if (all.length > 0 && linkLen / all.length > 0.5) s *= 0.3;
-            s += Math.min(all.length / 1000, 5);
-            if (s > bestScore) { bestScore = s; best = c; }
-          }
-
-          var host = best, source = 'best-block';
-          if (!host || bestScore < 6) { host = document.body; source = 'body(fallback)'; }
-
-          var chunks = [];
-          var nodes = host.querySelectorAll('h1, h2, h3, p, li, blockquote, pre, figcaption');
-          for (var i = 0; i < nodes.length; i++) {
-            var n = nodes[i];
-            if (bad(n)) continue;
-            if (n.tagName === 'LI' && n.querySelector('p')) continue;
-            var txt = t(n);
-            if (!txt || txt.length < 2) continue;
-            if (n.tagName === 'PRE') { chunks.push('```\n' + (n.innerText || '') + '\n```'); continue; }
-            if (n.tagName === 'H1' || n.tagName === 'H2' || n.tagName === 'H3') { chunks.push('## ' + txt); continue; }
-            if (chunks.length > 400) break;
-            var links = n.querySelectorAll('a[href]');
-            if (links.length === 1 && t(links[0]).length > txt.length * 0.6) {
-              try {
-                var u = new URL(links[0].href);
-                var where = (u.host === location.host) ? (u.pathname + (u.search || '')) : (u.host + u.pathname);
-                chunks.push(txt + '  [' + where + ']');
-                continue;
-              } catch (e) {}
-            }
-            chunks.push(txt);
-          }
-          var out = [];
-          for (var i = 0; i < chunks.length; i++) {
-            if (i > 0 && chunks[i] === chunks[i - 1]) continue;
-            out.push(chunks[i]);
-          }
-          var body = out.join('\n\n');
-          var title = document.title || '';
-          if (h1) { var ht = t(h1); if (ht && title.indexOf(ht) < 0) title = ht + ' — ' + title; }
-          var md = document.querySelector('meta[name="description"]');
-          return JSON.stringify({
-            text: body.substring(0, 60000),
-            length: body.length,
-            title: title.substring(0, 200),
-            description: md ? (md.content || '').substring(0, 300) : '',
-            source: source
-          });
-        })()
-    """.trimIndent()
-
-    /**
-     * 页面里的 `target=_blank` / `window.open` 不另开窗口（我们的 WebView 没有
-     * 多窗口能力，点了会**什么都不发生** —— 模型只会看到"点了但没反应"）。
-     * 每页开始加载时把 `_blank` 掰成 `_self`，链接就在原地打开。
-     */
-    private fun targetFixJs(): String = """
-        (function() {
-          if (window.__agentTargetFix) return;
-          window.__agentTargetFix = 1;
-          document.addEventListener('click', function(e) {
-            var a = e.target && e.target.closest && e.target.closest('a[target]');
-            if (a && a.target && a.target !== '_self') a.target = '_self';
-          }, true);
-        })()
-    """.trimIndent()
-
-    private val CLICK_EVENTS = """
-          var mk = function(type, bubbles) {
-            return new MouseEvent(type, {bubbles: bubbles, cancelable: true, view: window});
-          };
-          el.dispatchEvent(mk('mouseover', true));
-          el.dispatchEvent(mk('mouseenter', false));
-          el.dispatchEvent(mk('mousemove', true));
-          el.dispatchEvent(mk('mousedown', true));
-          el.dispatchEvent(mk('mouseup', true));
-          el.click();
-          el.dispatchEvent(mk('mouseleave', false));
-          el.dispatchEvent(mk('mouseout', true));
-    """.trimIndent()
-
-    private val TARGET_FIX_JS = targetFixJs()
-
-    /** 读 [runJs] 踢出去的那一脚的结果。`pending:1` = 还没结束 */
+    /** [runJs] 踢出去的那一脚的结果。`pending:1` = 还没结束 —— 这个**是宿主逻辑**
+     *  （`evaluateJavascript` 不会等 Promise，所以只能踢一脚再轮询），不属于共享
+     *  的那份 JS。桌面那边用 CDP 的 `awaitPromise`，根本不需要它。 */
     private val POLL_JS = """
         (function() {
           var v = window.__agentJs;
@@ -2052,10 +1472,4 @@ class BrowserController(private val app: Application) : BrowserHost {
           return JSON.stringify({pending: 0, ok: (typeof v.ok === 'string' ? v.ok : JSON.stringify(v.ok))});
         })()
     """.trimIndent()
-
-    /** DOM 指纹：元素个数 + 可见文字长度 + 滚动高度。变了就说明还没稳 */
-    private val DOM_SIG_JS =
-        "(function(){var b=document.body;if(!b)return 'null';" +
-            "return document.querySelectorAll('*').length+':'+(b.innerText||'').length+':'+" +
-            "(document.documentElement.scrollHeight||0);})()"
 }

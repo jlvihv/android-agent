@@ -179,6 +179,18 @@ impl AgentCore {
         crate::VERSION.to_string()
     }
 
+    /// 页面里注入的 JS（`kind` 见 `browser_js::KINDS`，`params` 是 JSON 对象）。
+    ///
+    /// **手机上那份 JS 不在 Kotlin 里**：动作级的页面逻辑（骨架、正文、点击、
+    /// 输入、按键、滚动、找元素、DOM 指纹、页面信息、`target=_blank` 修正）只有
+    /// 核心这一份，桌面（CDP）用的是同一个 `build`。各写一份就会漂 ——
+    /// 漂了的表现是「点不动 / 抽不出正文」，只有真机上才看得出来。
+    pub fn browser_js(&self, kind: String, params: String) -> Result<String, CoreError> {
+        crate::browser_js::build(&kind, &params).map_err(|e| CoreError::Failed {
+            message: e.to_string(),
+        })
+    }
+
     /// 注入设备实现。无障碍服务连上之后调用。
     pub fn set_device(&self, host: Box<dyn DeviceHost>) {
         self.core.set_device(Arc::new(HostAdapter(host)));

@@ -18,7 +18,7 @@
 | `agent ps` | 列常驻进程（靠 proot 的 `TracerPid` 归因） | 只回一句「用真的 `ps` / `pgrep`」 |
 | `agent kill <pid>` | ✅ | ✅ |
 | `agent command`（设备） | mock | mock（手机上才是真的） |
-| `agent browser` | ✅（无头 Chrome + CDP，见 [docs/08](08-browser.md) 第 15 节） | ✅ 同一个后端 |
+| `agent browser` | ✅ 核心自己起的无头 Chrome + CDP（[docs/08](08-browser.md) 第 15 节） | ✅ 同一个后端 |
 | `agent search` | ✅ | ✅ |
 
 ## 怎么做到的：只加了「一种沙箱形态」，没加第二条路
@@ -107,6 +107,6 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
 - `sandbox:` 链接这时映射的是**整台机器**的文件，只看那把随机的
   `sandbox_key`（同源拆分仍然挡着「AI 写的网页读 App 凭据」那条路）。
 - 设备操作（`agent command`）在桌面上是 mock —— 手机上才有真的无障碍那条路。
-- 浏览器要**另外起一个 Chrome**（`just chrome`，或者把 `AGENT_CDP` 指到你自己
-  那个带 `--remote-debugging-port` 的 Chrome 上，那样还能看着它动）。
+- 浏览器由**核心自己起**（第一次用到时才拉起无头 Chrome，退出时收掉）——
+  不用手动开。想用你自己那个浏览器（能看着它动）就 `AGENT_CDP=…`；
   `AGENT_CDP=off` 就是不要浏览器。

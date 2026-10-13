@@ -1371,7 +1371,7 @@ fn host_mode_requested() -> bool {
 ///
 /// 故意**不用** `~/.local/bin` / `~/.local/bin` 那一类用户的目录：这是我们自己的
 /// 东西，不能往用户的 PATH 配置里塞。
-fn host_data_dir() -> PathBuf {
+pub(crate) fn host_data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
         .filter(|s| !s.trim().is_empty())

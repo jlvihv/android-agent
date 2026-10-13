@@ -391,23 +391,56 @@ just phone                       # 交互模式
 
 这也和既有取舍一致：LLM 协议自己写（不用 SDK），CDP 也自己写。
 
+### Chrome 是**核心自己起的**
+
+用的人不该先另开一个终端去起浏览器 —— 那是实现细节。第一次用到浏览器时核心
+自己拉起一个无头 Chrome：**当场挑一个空闲端口**（不是写死 9222，同一台机器上
+跑两个核心不会互相抢）、独立的 profile、日志落在 `<profile>/chrome.log`。
+
+生命周期跟着核心：
+
+- 正常退出（Ctrl-C / SIGTERM）→ `Drop` 里杀掉它；
+- 被 `kill -9` / OOM 干掉（`Drop` 没机会跑）→ 下次启动时
+  `sweep_orphan_chromes()` 收掉上次留下的（判据：命令行里有我们的 profile
+  且**父进程已经是 init**，所以不会误杀还活着的兄弟核心起的那个）；
+- profile 是持久的（`$XDG_DATA_HOME/android-agent/chrome`）—— 登录态留到下次；
+  万一被另一个 Chrome 占着（SingletonLock），自动退一步用临时的。
+
+要**用你自己那个浏览器**（能看着它动）或者接到别的机器上，就设
+`AGENT_CDP=http://127.0.0.1:9222`（自己起一个带 `--remote-debugging-port` 的）；
+`AGENT_CDP=off` 是不要浏览器。找不到 Chrome 时用 `AGENT_CHROME` 指可执行文件。
+
 ```sh
-just chrome                      # 起无头 Chrome（独立 profile，调试端口 9222）
 just dev-host                    # 或者 just dev —— 沙箱/宿主模式都能用它
 agent browser navigate https://example.com
 ```
 
-核心**不替用户起 Chrome**（端口 / profile / 退出清理都是麻烦，而且用户可能想让
-agent 用他自己那个浏览器）：它只连 `AGENT_CDP`（默认 `127.0.0.1:9222`），
-连不上时报的错里写着怎么办。`AGENT_CDP=off` 就是不要浏览器。
+### 注入的 JS 只有**一份**
 
-### 和手机那份的差异（都是**有意**的）
+动作级的页面逻辑（骨架、正文、点击、输入、按键、滚动、找元素、DOM 指纹、
+页面信息、`target=_blank` 修正）全在 `core/src/browser_js.rs`：
+
+- 桌面：`cdp.rs` 直接调 `browser_js::build(kind, params)`
+- 手机：Kotlin 通过 uniffi 的 `AgentCore.browserJs(kind, params)` 取
+  （`BrowserController.kt` 里只剩「往哪只 WebView 里注、什么时候注、超时怎么办」
+  这层宿主逻辑，~590 行 JS 从那边的文件里删掉了）
+
+为什么不各写一份：动作表漂过一次（`new_tab` 把 URL 吃掉、模型对着白屏截了三张图），
+而 JS 漂了更隐蔽 —— 点不动、抽不出正文，只有真机上才看得出来。
+
+`kind` 一共 12 个（`browser_js::KINDS`），参数从 JSON 里取（两边都不用记顺序）。
+动作**名字**那一层也有测试盯着：`cdp::ACTIONS` 和沙箱 CLI 的 case 表
+（`agent_cli_and_cdp_agree_on_the_action_list`）。
+
+**还留在 Kotlin 的**是宿主私事，不是共享逻辑：`js` 那个动作的「踢一脚 + 轮询」
+（`evaluateJavascript` 不会等 Promise，而 CDP 有 `awaitPromise`）、以及截图那套
+（`View.draw` / 虚拟显示，见第 5 节）里问页面要滚动位置的两小段。
+
+### 和手机那份的其它差异
 
 - **截图一条路**：`Page.captureScreenshot` 直接给 JPEG，不需要「GPU 合成 +
-  软件绘制」那两条（见第 5 节）—— 那是 Android 无窗口 WebView 的坑。
-- **`js` 不用 kick + 轮询**：CDP 的 `awaitPromise` 会等 Promise，
-  所以直接 `(async function(){ … })()` 就行（第 4 节那个两段式是
-  `evaluateJavascript` 的限制）。
+  软件绘制」那两条（第 5 节）—— 那是 Android 无窗口 WebView 的坑。
+- **`js` 不用 kick + 轮询**：CDP 的 `awaitPromise` 会等 Promise。
 - **截图落哪**：手机上是 `<rootfs>/root/.browser/`；宿主模式下 `/root` 是**用户的
   根目录**（写不进去也不该写），换成 `$XDG_DATA_HOME/android-agent/browser/`
   —— 前缀就是宿主路径本身，`read` 直接解得开。两边都由 `gc` 清扫
@@ -416,20 +449,8 @@ agent 用他自己那个浏览器）：它只连 `AGENT_CDP`（默认 `127.0.0.1
   也挡掉（手机那份是「没有 `://` 就当主机名」，于是 `javascript:alert(1)` 会被
   拼成 `https://javascript:alert(1)`）；`host:8080/…` 靠「冒号后面是不是数字」放行。
 
-### 已知的债：注入的 JS 现在是两份
-
-动作表、返回形状（`{ok, text, url, title, image}`）、以及那些 JS
-（backbone / readable / click / type / press / scroll / find_elements）都是从
-`BrowserController.kt` **移植**过来的 —— 语义要一致，但**两份文件各有一份**。
-改 JS 的时候两边都得改。
-
-能自动对齐的那一层已经钉住了：`cdp::ACTIONS` 和沙箱 CLI 的 case 表有测试
-（`agent_cli_and_cdp_agree_on_the_action_list`）—— 漂了就是「CLI 发得出去、
-后端回未知动作」，正是 `new_tab` 把 URL 吃掉那个类别。
-
-真 Chrome 的端到端测试（默认跳过，CI 上没有 Chrome）：
+真 Chrome 的端到端测试（自己起 Chrome，默认跳过 —— CI 上不一定装了）：
 
 ```sh
-just chrome
 AGENT_CDP_TEST=1 cargo test cdp::          # 18 个动作全过一遍
 ```

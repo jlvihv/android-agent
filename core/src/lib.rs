@@ -15,6 +15,9 @@
 
 pub mod agent;
 pub mod assets;
+/// 页面里注入的 JS：**只有一份**，手机（Kotlin 的 WebView）和桌面（CDP）都从
+/// 这儿取（见 `browser_js` 的模块说明）。
+pub mod browser_js;
 /// 桌面（Linux）上的浏览器：无头 Chrome + CDP。安卓那边是壳里的 WebView
 /// （`BrowserController.kt`），用不到这个模块 —— 别把它编进 .so。
 #[cfg(not(target_os = "android"))]

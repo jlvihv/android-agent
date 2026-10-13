@@ -34,6 +34,14 @@ async fn main() -> anyhow::Result<()> {
     println!("  （mock 设备已启用；Ctrl-C 退出）");
     println!();
 
-    tokio::signal::ctrl_c().await?;
+    // Ctrl-C **和 SIGTERM** 都要走正常退出路径：`Drop` 才会把自己起的那个
+    // 无头 Chrome 收掉（`kill <pid>` 默认发 SIGTERM，不处理的话浏览器会变成
+    // 孤儿进程）。真被 SIGKILL 就没这个机会了 —— 那种情况靠下次启动时的
+    // `cdp::sweep_orphan_chromes` 收。
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
     Ok(())
 }

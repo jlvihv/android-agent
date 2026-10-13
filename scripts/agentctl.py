@@ -690,7 +690,7 @@ def cmd_doctor(deep: bool = False) -> int:
     # 浏览器后端：手机上=壳里的 WebView；桌面上=CDP + 调试端口
     browser = h.get("browser")
     row("浏览器", bool(browser),
-        str(browser) if browser else "没接（桌面上先 `just chrome`；AGENT_CDP=off 就是关掉）")
+        str(browser) if browser else "没接（桌面上是 AGENT_CDP=off，或者自己起的 Chrome 起不来）")
 
     # 真跑一句。只读、无副作用 —— 但它是唯一能证明命令通道**真的能跑**的检查
     t0 = time.time()
