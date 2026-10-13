@@ -145,19 +145,14 @@ pub struct CreatedFile {
     pub bytes: usize,
 }
 
+/// proot 沙箱的配置（安卓；桌面上的 `just dev` 也是它）。宿主模式不用它 ——
+/// 见 `Mode`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// proot 可执行文件。Android 上是 `<nativeLibraryDir>/libproot.so`
     pub proot: PathBuf,
     /// rootfs 根目录
     pub rootfs: PathBuf,
-    /// **宿主模式**：不套 proot，直接在宿主机上跑（桌面原生用，见 `LinuxSandbox::host`）。
-    ///
-    /// 打开后：`rootfs` 是 `/`（沙箱内的绝对路径就是本机路径），`proot` 不参与；
-    /// 命令由 `/bin/bash -c` 直接跑，cwd 是挂到 `/workspace` 的那个宿主目录。
-    /// `/sdcard`、loader、DNS 这些安卓专属项都不参与。
-    #[serde(default)]
-    pub host: bool,
     /// 额外的绑定挂载，`(宿主路径, 沙箱内路径)`
     #[serde(default)]
     pub binds: Vec<(String, String)>,
@@ -885,8 +880,34 @@ fn fmt_age(secs: u64) -> String {
     }
 }
 
+/// 命令跑在哪。
+///
+/// 两种形态共用同一套进程模型（runner + 状态文件 + 命令自己的进程组，见
+/// `run_live` / `CommandGuard`）和同一套路径解析（`resolve_path`）；不同的只有
+/// 「怎么起进程、东西放哪、要准备什么」—— 这些地方都 `match` 它，编译器替我们
+/// 盯着两边都处理到。以前是 `SandboxConfig` 里一个 `host: bool`：宿主模式也得
+/// 带着 proot / loader / dns 这些对它毫无意义的字段，分岔全靠 `if`。
+enum Mode {
+    /// 安卓（以及桌面 `just dev`）：proot + Alpine rootfs
+    Proot(Box<SandboxConfig>),
+    /// 宿主模式（桌面原生）：直接跑在这台电脑上。`workspace` 是命令的 cwd，
+    /// 也是 `/workspace` 这个别名的落点；rootfs 就是 `/`。
+    Host { workspace: PathBuf },
+}
+
+/// 我们自己的副产物落在哪。每项都是 `(宿主路径, 命令行 / 模型看到的写法)`：
+/// 沙箱里两者不同源（`<rootfs>/tmp` ↔ `/tmp`），宿主模式下是同一个路径。
+struct Layout {
+    /// 状态文件目录（`runner_script` 的 `$2` 落在这里）
+    exit: (PathBuf, String),
+    /// 浏览器截图
+    shots: crate::gc::ShotDir,
+    /// bash 输出被截断时溢出的完整输出
+    spills: (PathBuf, String),
+}
+
 pub struct LinuxSandbox {
-    cfg: SandboxConfig,
+    mode: Mode,
     /// 核心 HTTP 服务的端口。`agent` 命令靠它找到「自己」（见 `AGENT_CLI`）。
     /// 0 = 还不知道（核心还没 bind），这时不注入环境变量。
     agent_port: AtomicU16,
@@ -1435,8 +1456,12 @@ fn host_has_setsid(ours: &Path) -> bool {
 
 impl LinuxSandbox {
     pub fn new(cfg: SandboxConfig) -> Self {
+        Self::with_mode(Mode::Proot(Box::new(cfg)))
+    }
+
+    fn with_mode(mode: Mode) -> Self {
         Self {
-            cfg,
+            mode,
             agent_port: AtomicU16::new(0),
             agent_token: std::sync::RwLock::new(None),
             runs: Mutex::new(RunRegistry::default()),
@@ -1477,13 +1502,13 @@ impl LinuxSandbox {
         // 宿主模式没有 proot，那套归因（`TracerPid == 我们的 proot`）无从谈起，
         // 而**不能**就这么扫一遍 /proc：那会把这台机器上所有 ppid==1 的进程
         // （用户桌面、系统服务）都列进「可以 kill」里。直接用系统自带的 ps。
-        if self.cfg.host {
-            return ProcsReport {
+        match self.mode {
+            Mode::Host { .. } => ProcsReport {
                 host: true,
                 ..ProcsReport::default()
-            };
+            },
+            Mode::Proot(_) => self.procs_with(scan_procs(), self_pgid),
         }
-        self.procs_with(scan_procs(), self_pgid)
     }
 
     /// `procs()` 的实现（扫描结果从外面给，好测）。
@@ -1546,9 +1571,8 @@ impl LinuxSandbox {
         //    ppid 还指着 guest 里的父进程）。
         let known: std::collections::BTreeSet<i32> = runs.runs.keys().copied().collect();
         let proot_name = self
-            .cfg
-            .proot
-            .file_name()
+            .proot_config()
+            .and_then(|cfg| cfg.proot.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "proot".to_string());
         let orphan_proots: std::collections::BTreeSet<i32> = all
@@ -1593,31 +1617,18 @@ impl LinuxSandbox {
         }
     }
 
-    /// 宿主模式：核心直接在这台 Linux 上跑，没有沙箱。
+    /// 宿主模式：核心直接在这台电脑（Linux / macOS）上跑，没有沙箱。
     ///
     /// `workspace` 是命令的 cwd，同时也以 `/workspace` 这个名字出现在
     /// 路径解析里（`resolve_path` 的挂载表）。`rootfs` 给 `/` —— 沙箱里的
     /// 绝对路径于是就是本机路径，`read` / `edit` 一路不用改。
     pub fn host(workspace: PathBuf) -> Self {
-        Self::new(SandboxConfig {
-            proot: PathBuf::new(),
-            rootfs: PathBuf::from("/"),
-            host: true,
-            binds: Vec::new(),
-            tmp: None,
-            loader: None,
-            loader32: None,
-            dns: Vec::new(),
-            tz_offset_minutes: None,
-            env: BTreeMap::new(),
-            workspace: Some(workspace),
-            shared: None,
-        })
+        Self::with_mode(Mode::Host { workspace })
     }
 
     /// 是不是宿主模式（桌面原生）。系统提示词、预装工具都看它。
     pub fn is_host(&self) -> bool {
-        self.cfg.host
+        matches!(self.mode, Mode::Host { .. })
     }
 
     /// 核心 bind 成功后告诉沙箱自己的端口 —— 沙箱里的 `agent` 命令要靠它。
@@ -1634,10 +1645,10 @@ impl LinuxSandbox {
 
     /// rootfs 齐了吗（安卓上解压是后台做的，之前只是个空壳）。
     pub fn is_ready(&self) -> bool {
-        if self.cfg.host {
-            return true;
+        match &self.mode {
+            Mode::Proot(cfg) => is_alpine_rootfs(&cfg.rootfs),
+            Mode::Host { .. } => true,
         }
-        is_alpine_rootfs(&self.cfg.rootfs)
     }
 
     /// 常用工具装过了吗。
@@ -1645,13 +1656,13 @@ impl LinuxSandbox {
     /// 标记文件里存的是**清单版本**（工具数）。只判文件在不在的话，以后往
     /// `TOOLSET` 里加工具，老设备永远装不上 —— 它会一直以为自己装过了。
     pub fn is_provisioned(&self) -> bool {
-        // 宿主模式：工具就是这台机器上本来就有的那些，没有 `apk add` 这一步
-        if self.cfg.host {
-            return true;
+        match &self.mode {
+            Mode::Proot(cfg) => std::fs::read_to_string(cfg.rootfs.join("etc/agent-tools"))
+                .map(|s| s.trim() == TOOLSET.len().to_string())
+                .unwrap_or(false),
+            // 宿主模式：工具就是这台机器上本来就有的那些，没有 `apk add` 这一步
+            Mode::Host { .. } => true,
         }
-        std::fs::read_to_string(self.cfg.rootfs.join("etc/agent-tools"))
-            .map(|s| s.trim() == TOOLSET.len().to_string())
-            .unwrap_or(false)
     }
 
     /// 把常用工具装上（`agent-setup`）。幂等，装过就秒退。
@@ -1679,10 +1690,9 @@ impl LinuxSandbox {
                 .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from("/"));
             let sb = Self::host(ws);
-            tracing::info!(
-                "宿主模式：直接在 {} 上跑（没有沙箱）",
-                sb.host_cwd().display()
-            );
+            if let Some(ws) = sb.workspace() {
+                tracing::info!("宿主模式：直接在 {} 上跑（没有沙箱）", ws.display());
+            }
             if let Err(e) = sb.prepare_rootfs() {
                 tracing::warn!("宿主模式准备失败: {e:#}");
             }
@@ -1711,7 +1721,6 @@ impl LinuxSandbox {
         let sb = Self::new(SandboxConfig {
             proot,
             rootfs,
-            host: false,
             binds: Vec::new(),
             tmp: None,
             loader: None,
@@ -1728,12 +1737,21 @@ impl LinuxSandbox {
         Some(sb)
     }
 
-    pub fn config(&self) -> &SandboxConfig {
-        &self.cfg
+    /// proot 沙箱的配置（宿主模式没有）。重配挂载时要从它出发（`ffi::set_shared_storage`）。
+    pub fn proot_config(&self) -> Option<&SandboxConfig> {
+        match &self.mode {
+            Mode::Proot(cfg) => Some(cfg),
+            Mode::Host { .. } => None,
+        }
+        .map(|b| &**b)
     }
 
+    /// 沙箱里的 `/` 在宿主上是哪儿（宿主模式就是 `/`）。
     pub fn rootfs(&self) -> &Path {
-        &self.cfg.rootfs
+        match &self.mode {
+            Mode::Proot(cfg) => &cfg.rootfs,
+            Mode::Host { .. } => Path::new("/"),
+        }
     }
 
     /// 启动前把 rootfs 里缺的基础文件补上。幂等。
@@ -1745,10 +1763,14 @@ impl LinuxSandbox {
     ///
     /// 宿主模式另走一条（见 `prepare_host`）：**绝不往 `/` 里写东西**。
     pub fn prepare_rootfs(&self) -> anyhow::Result<()> {
-        if self.cfg.host {
-            return self.prepare_host();
+        match &self.mode {
+            Mode::Proot(cfg) => Self::prepare_proot(cfg),
+            Mode::Host { workspace } => Self::prepare_host(workspace),
         }
-        let rootfs = &self.cfg.rootfs;
+    }
+
+    fn prepare_proot(cfg: &SandboxConfig) -> anyhow::Result<()> {
+        let rootfs = &cfg.rootfs;
 
         for d in ["root", "tmp", "var/tmp", "workspace", "sdcard"] {
             std::fs::create_dir_all(rootfs.join(d))?;
@@ -1780,7 +1802,7 @@ impl LinuxSandbox {
         )?;
 
         let resolv = rootfs.join("etc/resolv.conf");
-        let servers = self.resolved_dns();
+        let servers = resolved_dns(cfg);
         if !servers.is_empty() {
             let body: String = servers
                 .iter()
@@ -1809,12 +1831,11 @@ impl LinuxSandbox {
     /// 只在我们这个进程发出去的命令的 PATH 前缀里（见 `host_env`）。
     /// 宿主模式下**不装** `agent-open` / `xdg-open` 那套壳：桌面上的
     /// `xdg-open` 本来就该开用户自己的浏览器，不能把它抢到手机那条路上。
-    fn prepare_host(&self) -> anyhow::Result<()> {
+    fn prepare_host(ws: &Path) -> anyhow::Result<()> {
         // cwd 得真的在：`AGENT_HOST_WORKSPACE` 指到一个还不存在的目录时，
         // 每条命令都会在 spawn 那一步失败（模型看到的只是一句 ENOENT）
-        let ws = self.host_cwd();
         if !ws.is_dir() {
-            std::fs::create_dir_all(&ws)?;
+            std::fs::create_dir_all(ws)?;
             tracing::info!("宿主模式：建了工作目录 {}", ws.display());
         }
         let dir = host_cli_dir();
@@ -1834,60 +1855,55 @@ impl LinuxSandbox {
 
     /// 挂到 `/workspace` 的那个宿主目录（配了才有；宿主模式下就是命令的 cwd）。
     pub fn workspace(&self) -> Option<&Path> {
-        self.cfg.workspace.as_deref()
-    }
-
-    /// 宿主模式下的 cwd：挂到 `/workspace` 的那个宿主目录。
-    fn host_cwd(&self) -> PathBuf {
-        self.cfg
-            .workspace
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/"))
-    }
-
-    /// 状态文件（`runner_script` 的 `$2`）放哪：返回 `(宿主目录, 命令行里的写法)`。
-    ///
-    /// 沙箱里是 rootfs 的 `<EXIT_DIR>`（guest 路径就是 `/<EXIT_DIR>`）；
-    /// 宿主模式放我们自己的数据目录 —— **绝不往 `/` 里写**（那是用户的根目录）。
-    fn exit_dir(&self) -> (PathBuf, String) {
-        if self.cfg.host {
-            let dir = crate::desktop::data_root().join("exit");
-            let guest = dir.display().to_string();
-            (dir, guest)
-        } else {
-            (self.cfg.rootfs.join(EXIT_DIR), format!("/{EXIT_DIR}"))
+        match &self.mode {
+            Mode::Proot(cfg) => cfg.workspace.as_deref(),
+            Mode::Host { workspace } => Some(workspace),
         }
     }
 
-    /// 浏览器截图落哪儿（宿主目录 + 历史里存的那个路径前缀）。
+    /// 我们自己的副产物落在哪（见 `Layout`）。
     ///
-    /// 沙箱里和 `BrowserController.SHOT_GUEST_DIR` 一致（`/root/.browser`）；
-    /// 宿主模式下 `/root` 是**用户的根目录**（写不进去，也不该写），
-    /// 换成我们自己的数据目录 —— 前缀就是宿主路径本身，`read` 直接解得开。
-    pub fn shot_dir(&self) -> crate::gc::ShotDir {
-        if self.cfg.host {
-            let host = crate::desktop::data_root().join("browser");
-            let guest = host.display().to_string();
-            crate::gc::ShotDir { host, guest }
-        } else {
-            crate::gc::ShotDir {
-                host: self.cfg.rootfs.join(crate::gc::SHOT_DIR),
-                guest: format!("/{}", crate::gc::SHOT_DIR),
+    /// 沙箱里都在 rootfs 里；宿主模式下 rootfs 是 `/`，`/root` / `/tmp` 是**用户的**
+    /// 目录（`/root` 写不进去也不该写），所以换成我们自己的数据目录和系统临时
+    /// 目录（跟着 TMPDIR 走）—— 写法就是宿主路径本身，`read` 直接解得开。
+    fn layout(&self) -> Layout {
+        match &self.mode {
+            Mode::Proot(cfg) => Layout {
+                exit: (cfg.rootfs.join(EXIT_DIR), format!("/{EXIT_DIR}")),
+                // 和 `BrowserController.SHOT_GUEST_DIR` 一致（`/root/.browser`）
+                shots: crate::gc::ShotDir {
+                    host: cfg.rootfs.join(crate::gc::SHOT_DIR),
+                    guest: format!("/{}", crate::gc::SHOT_DIR),
+                },
+                spills: (cfg.rootfs.join("tmp"), "/tmp".into()),
+            },
+            Mode::Host { .. } => {
+                let same = |p: PathBuf| {
+                    let g = p.display().to_string();
+                    (p, g)
+                };
+                let root = crate::desktop::data_root();
+                let (host, guest) = same(root.join("browser"));
+                Layout {
+                    exit: same(root.join("exit")),
+                    shots: crate::gc::ShotDir { host, guest },
+                    spills: same(std::env::temp_dir()),
+                }
             }
         }
     }
 
+    /// 浏览器截图落哪儿（宿主目录 + 历史里存的那个路径前缀）。
+    pub fn shot_dir(&self) -> crate::gc::ShotDir {
+        self.layout().shots
+    }
+
     /// 我们自己的副产物落在哪（清扫用，见 `gc::SideDirs`）。
     pub fn side_dirs(&self) -> crate::gc::SideDirs {
-        let spills = if self.cfg.host {
-            // 和 `spill_captured` 一致：跟着 TMPDIR 走
-            std::env::temp_dir()
-        } else {
-            self.cfg.rootfs.join("tmp")
-        };
+        let l = self.layout();
         crate::gc::SideDirs {
-            shots: Some(self.shot_dir()),
-            spills: Some(spills),
+            shots: Some(l.shots),
+            spills: Some(l.spills.0),
         }
     }
 
@@ -1923,44 +1939,47 @@ impl LinuxSandbox {
 
         env.into_iter().collect()
     }
+}
 
-    fn resolved_dns(&self) -> Vec<String> {
-        if !self.cfg.dns.is_empty() {
-            return self.cfg.dns.clone();
-        }
-        // 环境变量覆盖
-        if let Ok(v) = std::env::var("AGENT_LINUX_DNS") {
-            let list: Vec<String> = v
-                .split([',', ' '])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !list.is_empty() {
-                return list;
-            }
-        }
-        // 桌面兜底：抄宿主机的
-        if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
-            let list: Vec<String> = text
-                .lines()
-                .filter_map(|l| l.trim().strip_prefix("nameserver "))
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && !s.starts_with("127."))
-                .take(3)
-                .collect();
-            if !list.is_empty() {
-                return list;
-            }
-        }
-        vec!["1.1.1.1".into(), "8.8.8.8".into()]
+/// 沙箱里用哪些 DNS：配置里给了就用；否则 `AGENT_LINUX_DNS`；再否则抄宿主的。
+fn resolved_dns(cfg: &SandboxConfig) -> Vec<String> {
+    if !cfg.dns.is_empty() {
+        return cfg.dns.clone();
     }
+    // 环境变量覆盖
+    if let Ok(v) = std::env::var("AGENT_LINUX_DNS") {
+        let list: Vec<String> = v
+            .split([',', ' '])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !list.is_empty() {
+            return list;
+        }
+    }
+    // 桌面兜底：抄宿主机的
+    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
+        let list: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("nameserver "))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.starts_with("127."))
+            .take(3)
+            .collect();
+        if !list.is_empty() {
+            return list;
+        }
+    }
+    vec!["1.1.1.1".into(), "8.8.8.8".into()]
+}
 
+impl LinuxSandbox {
     /// 沙箱里有没有真 bash（没装就只能退回 ash，见 `command_line`）。
     pub fn has_bash(&self) -> bool {
-        if self.cfg.host {
-            return host_bash().is_some();
+        match &self.mode {
+            Mode::Proot(cfg) => cfg.rootfs.join("bin/bash").is_file(),
+            Mode::Host { .. } => host_bash().is_some(),
         }
-        self.cfg.rootfs.join("bin/bash").is_file()
     }
 
     /// 沙箱里 `setsid` 的路径（rootfs 里没有就 None）。
@@ -1975,9 +1994,9 @@ impl LinuxSandbox {
     /// 没有 setsid，超时那一杀就落到 proot 自己的组上（`process_group(0)` 那个
     /// 兜底不能当主路径用），proot 被 SIGKILL，它 trace 的常驻进程全成了没翻译
     /// 的孤儿。`is_alpine_rootfs()` 上有同样的教训。
-    fn setsid_guest(&self) -> Option<&'static str> {
+    fn setsid_guest(cfg: &SandboxConfig) -> Option<&'static str> {
         SETSID_PATHS.into_iter().find(|p| {
-            std::fs::symlink_metadata(self.cfg.rootfs.join(p.trim_start_matches('/'))).is_ok()
+            std::fs::symlink_metadata(cfg.rootfs.join(p.trim_start_matches('/'))).is_ok()
         })
     }
 
@@ -1990,33 +2009,43 @@ impl LinuxSandbox {
     /// ```
     /// `status` 是沙箱内的状态文件路径（宿主侧在 `<rootfs>/<EXIT_DIR>/`）。
     pub fn command_line(&self, script: &str, status: &str) -> Vec<String> {
-        // 宿主模式：命令行里没有 proot，**但进程模型是同一套** —— 照样跑
-        // runner、照样写状态文件、照样把「命令自己的进程组」当靶子
-        // （见 `CommandGuard`）。差异只有：状态文件落在我们自己的数据目录里。
-        if self.cfg.host {
+        let cfg = match &self.mode {
+            Mode::Proot(cfg) => cfg,
+            // 宿主模式：命令行里没有 proot，**但进程模型是同一套** —— 照样跑
+            // runner、照样写状态文件、照样把「命令自己的进程组」当靶子
+            // （见 `CommandGuard`）。差异只有：状态文件落在我们自己的数据目录里。
+            Mode::Host { .. } => return Self::host_command_line(script, status),
+        };
+        self.proot_command_line(cfg, script, status)
+    }
+
+    fn host_command_line(script: &str, status: &str) -> Vec<String> {
+        {
             let shell = host_bash()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "/bin/sh".to_string());
             // 宿主模式不需要 guest 的 setsid：spawn 时那个 `process_group(0)`
             // 已经把 runner 变成组长，所以 `$$` 就是组号（`report_pgid = true`）。
             let runner = runner_script(&shell, true);
-            return vec![
+            vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 runner,
                 "sh".to_string(),
                 script.to_string(),
                 status.to_string(),
-            ];
+            ]
         }
+    }
 
+    fn proot_command_line(&self, cfg: &SandboxConfig, script: &str, status: &str) -> Vec<String> {
         let mut cmd: Vec<String> = Vec::with_capacity(24);
 
         macro_rules! arg {
             ($($x:expr),+ $(,)?) => {{ $( cmd.push($x.to_string()); )+ }};
         }
 
-        arg!(self.cfg.proot.display().to_string());
+        arg!(cfg.proot.display().to_string());
 
         // 假装 uid 0。Alpine 的 apk 装包会因为不是 root 而失败。
         arg!("-0");
@@ -2027,19 +2056,19 @@ impl LinuxSandbox {
         // 桌面上无害，所以两边用同一套参数，避免行为分叉。
         arg!("--link2symlink");
 
-        arg!("-r", self.cfg.rootfs.display().to_string());
+        arg!("-r", cfg.rootfs.display().to_string());
 
         for fs in ["/dev", "/proc", "/sys"] {
             arg!("-b", fs);
         }
 
-        for (host, guest) in &self.cfg.binds {
+        for (host, guest) in &cfg.binds {
             arg!("-b", format!("{host}:{guest}"));
         }
-        if let Some(h) = &self.cfg.shared {
+        if let Some(h) = &cfg.shared {
             arg!("-b", format!("{}:{SHARED}", h.display()));
         }
-        if let Some(h) = &self.cfg.workspace {
+        if let Some(h) = &cfg.workspace {
             arg!("-b", format!("{}:{WORKSPACE}", h.display()));
         }
 
@@ -2049,7 +2078,7 @@ impl LinuxSandbox {
         // 进程替换、`<<<`），拿 ash 跑会报 "syntax error"。首次预装之前
         // （或者手动清了 rootfs）没有 bash，退回 /bin/sh（这时结果里会
         // 提醒模型去装，见 `ExecResult::to_text`）。
-        let shell = if self.has_bash() {
+        let shell = if cfg.rootfs.join("bin/bash").is_file() {
             "/bin/bash"
         } else {
             "/bin/sh"
@@ -2057,7 +2086,7 @@ impl LinuxSandbox {
 
         // 没有 setsid 就退回「不分组」：那时 pid 文件不能信（`$$` 不是组号），
         // 超时 / 停止只能拿 proot 自己的组当靶子（见 `CommandGuard::target`）。
-        let setsid = self.setsid_guest();
+        let setsid = Self::setsid_guest(cfg);
         let runner = runner_script(shell, setsid.is_some());
         if let Some(s) = setsid {
             arg!(s);
@@ -2073,7 +2102,7 @@ impl LinuxSandbox {
     ///
     /// 注意这里**不用 `putIfAbsent` 式的"继承宿主环境"** —— 宿主环境
     /// 带进来反而有害（PATH 就是典型）。显式给一份干净的白名单。
-    fn guest_env(&self) -> Vec<(String, String)> {
+    fn guest_env(&self, cfg: &SandboxConfig) -> Vec<(String, String)> {
         let mut env: BTreeMap<String, String> = BTreeMap::new();
 
         env.insert("PATH".into(), GUEST_PATH.into());
@@ -2101,7 +2130,7 @@ impl LinuxSandbox {
         env.insert("UV_LINK_MODE".into(), "symlink".into());
         // TZ 必须是 POSIX 格式（符号与 UTC 偏移相反）：musl 的 TZ 解析器
         // 认不出 "GMT+8" 这种带 +/- 的缩写
-        env.insert("TZ".into(), posix_tz(self.cfg.tz_offset_minutes));
+        env.insert("TZ".into(), posix_tz(cfg.tz_offset_minutes));
 
         // 沙箱里的 `agent` 命令靠它找到核心（App 在 bind 成功后注入）
         let port = self.agent_port.load(Ordering::Relaxed);
@@ -2114,20 +2143,20 @@ impl LinuxSandbox {
         }
 
         // 给 guest 程序用的临时目录
-        if let Some(tmp) = &self.cfg.tmp {
+        if let Some(tmp) = &cfg.tmp {
             env.insert("TMPDIR".into(), tmp.display().to_string());
             // proot 自己用的（宿主路径）—— 名字和 TMPDIR 不一样，别搞混
             env.insert("PROOT_TMP_DIR".into(), tmp.display().to_string());
         }
         // 安卓必需：指向 nativeLibraryDir 里的 loader。
         // 不设的话 proot 会走内嵌 loader 解压路径，撞上 W^X。
-        if let Some(l) = &self.cfg.loader {
+        if let Some(l) = &cfg.loader {
             env.insert("PROOT_LOADER".into(), l.display().to_string());
         }
-        if let Some(l) = &self.cfg.loader32 {
+        if let Some(l) = &cfg.loader32 {
             env.insert("PROOT_LOADER_32".into(), l.display().to_string());
         }
-        for (k, v) in &self.cfg.env {
+        for (k, v) in &cfg.env {
             env.insert(k.clone(), v.clone());
         }
 
@@ -2148,7 +2177,7 @@ impl LinuxSandbox {
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     ) -> anyhow::Result<ExecResult> {
         let started = Instant::now();
-        let (exit_dir, exit_guest) = self.exit_dir();
+        let (exit_dir, exit_guest) = self.layout().exit;
         let status = StatusFile::new(&exit_dir, &exit_guest);
         let argv = self.command_line(script, &status.guest);
         let using_bash = self.has_bash();
@@ -2156,16 +2185,18 @@ impl LinuxSandbox {
 
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(args);
-        if self.cfg.host {
-            // cwd 是 workspace，环境是**宿主的**（见 `host_env`）
-            cmd.current_dir(self.host_cwd());
-            for (k, v) in self.host_env() {
-                cmd.env(k, v);
+        match &self.mode {
+            Mode::Host { workspace } => {
+                // cwd 是 workspace，环境是**宿主的**（见 `host_env`）
+                cmd.current_dir(workspace);
+                cmd.envs(self.host_env());
             }
-        } else {
-            cmd.env_clear();
-            for (k, v) in self.guest_env() {
-                cmd.env(k, v);
+            Mode::Proot(cfg) => {
+                cmd.env_clear();
+                cmd.envs(self.guest_env(cfg));
+                if let Some(tmp) = &cfg.tmp {
+                    let _ = std::fs::create_dir_all(tmp);
+                }
             }
         }
         cmd.stdin(std::process::Stdio::null());
@@ -2180,19 +2211,14 @@ impl LinuxSandbox {
         // 宿主进程，会变成孤儿（见 `CommandGuard`）。
         cmd.process_group(0);
 
-        if let Some(tmp) = &self.cfg.tmp {
-            let _ = std::fs::create_dir_all(tmp);
-        }
-
         let mut child = cmd.spawn()?;
         let child_pgid = child.id().map(|p| p as i32);
         // 登记：`agent ps` 把 /proc 里的进程认到命令上，就靠这条记录。
         // **宿主模式不登记** —— 那套归因靠 `TracerPid == 这条命令的 proot`，
         // 而宿主模式根本没有 proot（`procs()` 也因此直接回一句「用 ps/pgrep」）。
-        if let Some(pid) = child_pgid {
-            if !self.cfg.host {
-                self.register_run(pid, script, status.pid_host.clone());
-            }
+        let proot = matches!(self.mode, Mode::Proot(_));
+        if let (Some(pid), true) = (child_pgid, proot) {
+            self.register_run(pid, script, status.pid_host.clone());
         }
 
         // 退出状态 + 收尸走后台任务：proot 可能在给一条常驻进程当 tracer，活
@@ -2286,10 +2312,8 @@ impl LinuxSandbox {
             }
         };
         guard.disarm();
-        if let Some(pid) = child_pgid {
-            if !self.cfg.host {
-                self.finish_run(pid);
-            }
+        if let (Some(pid), true) = (child_pgid, proot) {
+            self.finish_run(pid);
         }
 
         let code = if timed_out {
@@ -2339,18 +2363,10 @@ impl LinuxSandbox {
     /// grep 的时候以为前后是连着的。
     fn spill_captured(&self, stdout: &Capture, stderr: &Capture) -> Option<String> {
         let name = format!("agent-out-{}.log", uuid::Uuid::now_v7());
-        // 宿主模式：写系统临时目录（跟着 TMPDIR 走），回报的也就是本机路径
-        // （`read` 那边 rootfs 是 `/`，直接解得开）；沙箱里是 rootfs 的 /tmp。
-        let (host, guest) = if self.cfg.host {
-            let p = std::env::temp_dir().join(&name);
-            let g = p.display().to_string();
-            (p, g)
-        } else {
-            (
-                self.cfg.rootfs.join("tmp").join(&name),
-                format!("/tmp/{name}"),
-            )
-        };
+        // 落点见 `Layout::spills`（沙箱里 rootfs 的 /tmp，宿主模式下系统临时目录）
+        let (dir, guest_dir) = self.layout().spills;
+        let host = dir.join(&name);
+        let guest = Path::new(&guest_dir).join(&name).display().to_string();
         std::fs::create_dir_all(host.parent()?).ok()?;
 
         let mut body = Vec::new();
@@ -2369,7 +2385,7 @@ impl LinuxSandbox {
 
     /// 是否挂了手机存储
     pub fn has_shared_storage(&self) -> bool {
-        self.cfg.shared.is_some()
+        matches!(&self.mode, Mode::Proot(cfg) if cfg.shared.is_some())
     }
 
     /// 沙箱内路径 → 宿主机路径。
@@ -2412,7 +2428,11 @@ impl LinuxSandbox {
             }
         };
 
-        let mounts = [(SHARED, &self.cfg.shared), (WORKSPACE, &self.cfg.workspace)];
+        let shared = match &self.mode {
+            Mode::Proot(cfg) => cfg.shared.as_deref(),
+            Mode::Host { .. } => None,
+        };
+        let mounts = [(SHARED, shared), (WORKSPACE, self.workspace())];
         for (at, host) in mounts {
             let Some(host) = host else { continue };
             if let Ok(rest) = g.strip_prefix(at) {
@@ -2421,7 +2441,7 @@ impl LinuxSandbox {
             }
         }
 
-        let root = lexical_normalize(&self.cfg.rootfs);
+        let root = lexical_normalize(self.rootfs());
         let rel = g.strip_prefix("/").unwrap_or(&g);
         check(&root, root.join(rel))
     }
@@ -3089,7 +3109,6 @@ mod tests {
         LinuxSandbox::new(SandboxConfig {
             proot: PathBuf::from("/native/libproot.so"),
             rootfs: PathBuf::from("/data/files/alpine-rootfs"),
-            host: false,
             binds: vec![("/host/share".into(), "/mnt/share".into())],
             tmp: Some(PathBuf::from("/data/cache/tmp")),
             dns: vec!["10.0.0.1".into()],
@@ -3719,7 +3738,7 @@ mod tests {
 
         // 状态文件不能落在 `/`（那是用户的根目录）——宿主模式下它的「guest 路径」
         // 就是宿主路径本身
-        let (exit_dir, exit_guest) = sb.exit_dir();
+        let (exit_dir, exit_guest) = sb.layout().exit;
         assert_eq!(exit_dir.display().to_string(), exit_guest);
         assert!(!exit_dir.starts_with("/.agent-exit"), "别往 `/` 里写");
 
@@ -3947,7 +3966,8 @@ mod tests {
 
     #[test]
     fn path_is_explicit_because_the_host_path_is_wrong_inside_the_sandbox() {
-        let env = sandbox().guest_env();
+        let sb = sandbox();
+        let env = sb.guest_env(sb.proot_config().unwrap());
         let path = env.iter().find(|(k, _)| k == "PATH").unwrap();
         assert_eq!(path.1, GUEST_PATH);
         assert!(path.1.contains("/bin"));
@@ -3963,7 +3983,6 @@ mod tests {
         let sb = LinuxSandbox::new(SandboxConfig {
             proot: PathBuf::from("/native/libproot.so"),
             rootfs: PathBuf::from("/files/rootfs"),
-            host: false,
             binds: vec![],
             tmp: Some(PathBuf::from("/cache/proot-tmp")),
             loader: Some(PathBuf::from("/native/libproot-loader.so")),
@@ -3974,7 +3993,7 @@ mod tests {
             workspace: None,
             shared: None,
         });
-        let env: BTreeMap<_, _> = sb.guest_env().into_iter().collect();
+        let env: BTreeMap<_, _> = sb.guest_env(sb.proot_config().unwrap()).into_iter().collect();
 
         assert_eq!(
             env.get("PROOT_LOADER").map(String::as_str),
@@ -4147,8 +4166,7 @@ mod tests {
             LinuxSandbox::new(SandboxConfig {
                 proot: PathBuf::from("proot"),
                 rootfs: self.dir.clone(),
-                host: false,
-                binds: vec![],
+                    binds: vec![],
                 tmp: None,
                 dns: vec!["1.1.1.1".into()],
                 tz_offset_minutes: None,
@@ -4219,7 +4237,8 @@ mod tests {
 
         let cfg = t
             .sandbox()
-            .config()
+            .proot_config()
+            .unwrap()
             .clone()
             .with_shared_storage(Some(&phone));
         assert!(phone.join("Agent").is_dir(), "应该在手机存储里建好 Agent/");
@@ -4256,7 +4275,7 @@ mod tests {
         assert!(joined.contains(&format!("-b {}:/workspace", ws.display())));
 
         // 断开（权限被收回）：回到 rootfs 里的 /workspace
-        let off = LinuxSandbox::new(sb.config().clone().with_shared_storage(None));
+        let off = LinuxSandbox::new(sb.proot_config().unwrap().clone().with_shared_storage(None));
         assert!(!off.has_shared_storage());
         assert_eq!(
             off.resolve_path("b.html").unwrap(),
@@ -4488,7 +4507,6 @@ mod tests {
         let sb = LinuxSandbox::new(SandboxConfig {
             proot: PathBuf::from("proot"),
             rootfs: dir.clone(),
-            host: false,
             binds: vec![],
             tmp: None,
             dns: vec!["9.9.9.9".into(), "1.1.1.1".into()],
@@ -4752,11 +4770,11 @@ mod tests {
         let t = TempRoot::new("agentport");
         let sb = t.sandbox();
 
-        let has = |k: &str| sb.guest_env().iter().any(|(n, _)| n == k);
+        let has = |k: &str| sb.guest_env(sb.proot_config().unwrap()).iter().any(|(n, _)| n == k);
         assert!(!has("AGENT_PORT"), "还没 bind 就不该有端口");
 
         sb.set_agent_port(41234);
-        let env: BTreeMap<String, String> = sb.guest_env().into_iter().collect();
+        let env: BTreeMap<String, String> = sb.guest_env(sb.proot_config().unwrap()).into_iter().collect();
         assert_eq!(env.get("AGENT_PORT").map(String::as_str), Some("41234"));
         assert_eq!(
             env.get("AGENT_BASE").map(String::as_str),

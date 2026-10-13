@@ -24,27 +24,35 @@
 ## 怎么做到的：只加了「一种沙箱形态」，没加第二条路
 
 三个工具全都走 `LinuxSandbox`（`core/src/linux.rs`）同一个入口，所以宿主模式
-就是给这个类型加了一种配置，**没有第二套执行器**：
+是这个类型的**另一种形态**，**没有第二套执行器**：
 
 ```rust
-SandboxConfig { host: true, rootfs: "/", workspace: Some(<cwd>), .. }
+enum Mode {
+    Proot(Box<SandboxConfig>),       // 安卓（以及 `just dev`）
+    Host { workspace: PathBuf },     // 宿主模式：cwd = workspace，rootfs = `/`
+}
 ```
 
-打开之后各处的差别只有五处：
+进程模型（runner + 状态文件 + 命令自己的进程组）和路径解析是共用的；随形态
+变的地方都 `match` 它，编译器替我们盯着两边都处理到：
 
-1. `command_line()`：不给 proot，直接 `[/bin/sh, -c, <runner>, sh, <script>, <status>]`。
+1. `command_line()`：宿主模式不给 proot，直接 `[/bin/sh, -c, <runner>, sh, <script>, <status>]`。
 2. `run_live()`：cwd 换成 workspace，**继承宿主环境**（`guest_env` 那套干净
-   白名单正好相反：在家里电脑上，PATH / 代理 / `CARGO_HOME` 都得是用户自己的），
-   并开一个独立进程组。
-3. `resolve_path()`：`rootfs` 是 `/`，于是沙箱内的绝对路径就是本机路径 ——
+   白名单正好相反：在家里电脑上，PATH / 代理 / `CARGO_HOME` 都得是用户自己的）。
+   宿主模式不登记命令（`agent ps` 那套靠 proot 归因）。
+3. `resolve_path()`：`rootfs()` 是 `/`，于是沙箱内的绝对路径就是本机路径 ——
    `read` / `edit` / `sandbox:` 链接那条路**一行都没改**；
    `/workspace` 仍是 workspace 目录的别名。
-4. `prepare_rootfs()` / `is_ready()` / `is_provisioned()`：不往 `/` 里写东西，
-   不跑 `apk`。`is_provisioned()` 直接返回 true —— 否则启动时会去装那套工具。
-5. `exit_dir()`：状态文件落在 `$XDG_DATA_HOME/android-agent/exit`，
-   而不是 rootfs 的 `/.agent-exit`（那是用户的根目录）。
+4. `prepare_rootfs()` / `is_ready()` / `is_provisioned()` / `has_bash()`：不往 `/`
+   里写东西，不跑 `apk`；bash 用 PATH 里的。
+5. `layout()`：我们自己的副产物落哪（状态文件、截图、溢出输出）。宿主模式下是
+   `~/.local/share/android-agent/{exit,browser}` 和系统临时目录，而不是 rootfs 的
+   `/.agent-exit`、`/root/.browser`、`/tmp`（那些是用户的目录）。
 
-`SandboxConfig` 里那些安卓专属项（`loader`、`dns`、`shared`）在宿主模式下不参与。
+以前是 `SandboxConfig` 里一个 `host: bool`：宿主模式也得带着 `proot` / `loader` /
+`dns` / `shared` 这些对它毫无意义的字段，十几处分岔全靠 `if`。现在 proot 专属的
+方法（`guest_env`、`proot_command_line`、`prepare_proot`、`resolved_dns`）直接拿
+`&SandboxConfig` 当参数 —— 类型上就不可能在宿主模式下被调到。
 
 ### 进程模型是**共用**的，不是另写一套
 

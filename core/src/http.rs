@@ -2186,7 +2186,6 @@ mod tests {
             crate::linux::SandboxConfig {
                 proot: "/nonexistent/proot".into(),
                 rootfs: root.clone(),
-                host: false,
                 binds: vec![],
                 tmp: None,
                 dns: vec![],

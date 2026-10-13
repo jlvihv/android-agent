@@ -230,7 +230,6 @@ impl AgentCore {
         let cfg = SandboxConfig {
             proot: native.join("libproot.so"),
             rootfs,
-            host: false,
             binds: Vec::new(),
             tmp: Some(std::path::Path::new(&env.cache_dir).join("proot-tmp")),
             // ⚠️ 安卓上这两个必须指到 nativeLibraryDir。
@@ -257,8 +256,11 @@ impl AgentCore {
         let Some(sb) = self.core.state.linux() else {
             return;
         };
-        let cfg = sb
-            .config()
+        // 宿主模式（桌面）没有手机存储可挂
+        let Some(cfg) = sb.proot_config() else {
+            return;
+        };
+        let cfg = cfg
             .clone()
             .with_shared_storage(path.as_deref().map(std::path::Path::new));
         if cfg.shared.is_some() == sb.has_shared_storage() {
