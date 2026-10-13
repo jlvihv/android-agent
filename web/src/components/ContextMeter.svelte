@@ -181,11 +181,6 @@
           </span>
         </div>
       </div>
-
-      <p class="px-1 text-meta leading-relaxed text-muted">
-        上下文 = 最近一次请求发出去的 token（整段历史 + 系统提示词 + 工具）。缓存命中率是
-        命中的前缀占比 —— 命中部分便宜得多，它掉了说明前缀变了。
-      </p>
     </div>
   </Sheet>
 {/if}
