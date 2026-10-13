@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8787);
 
-    let core = agent_core::Core::with_mock();
+    let core = agent_core::Core::desktop();
     // 桌面上默认不设防（只有自己在用）；设了 AGENT_TOKEN 就和手机上一样要凭据
     let token = std::env::var("AGENT_TOKEN").ok().filter(|t| !t.is_empty());
     core.state.set_token(token.clone());
@@ -31,7 +31,8 @@ async fn main() -> anyhow::Result<()> {
         Some(t) => println!("  → http://127.0.0.1:{actual}/auth?t={t}"),
         None => println!("  → http://127.0.0.1:{actual}"),
     }
-    println!("  （mock 设备已启用；Ctrl-C 退出）");
+    let device = core.state.device().map(|d| d.name()).unwrap_or_default();
+    println!("  （设备：{device}；Ctrl-C 退出）");
     println!();
 
     // Ctrl-C **和 SIGTERM** 都要走正常退出路径：`Drop` 才会把自己起的那个

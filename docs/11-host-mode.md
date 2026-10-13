@@ -17,7 +17,7 @@
 | 进程模型 | runner + 状态文件 + `CommandGuard` | **同一套**（只是不套 proot） |
 | `agent ps` | 列常驻进程（靠 proot 的 `TracerPid` 归因） | 只回一句「用真的 `ps` / `pgrep`」 |
 | `agent kill <pid>` | ✅ | ✅ |
-| `agent command`（设备） | mock | mock（手机上才是真的） |
+| 设备（`agent open` / `agent command`） | mock | **这台电脑**（`desktop::HostDevice`）：`open` 用默认程序打开，macOS 上 `launch` = `open -a`；点 / 滑 / 按键明说没有 |
 | `agent browser` | ✅ 核心自己起的无头 Chrome + CDP（[docs/08](08-browser.md) 第 15 节） | ✅ 同一个后端 |
 | `agent search` | ✅ | ✅ |
 
@@ -91,9 +91,12 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 
 两个平台共用的顺手修复：
 
-- **`agent open` 在桌面上原来是假的**：设备通道是 mock，它回 `ok`，CLI 就打出
-  「已让手机打开」，其实什么都没开。现在宿主模式（`host_env` 里的 `AGENT_HOST=1`）
-  直接交给本机的 `open` / `xdg-open`。
+- **设备通道在桌面上原来是 mock，对什么都回成功**：`agent open` 打出「已让手机
+  打开」其实什么都没开，`agent command` 的点击回一句假的 `mock: tapped`。现在宿主
+  模式的设备就是这台电脑（`core/src/desktop.rs` 的 `HostDevice`）：`open` 交给
+  `open` / `xdg-open`，做不到的（点、滑、按键）明说做不到。`agent` 脚本里不需要
+  任何宿主模式的特判 —— 走的还是同一条 `/api/command`。mock 只留给 `just dev`
+  和测试。
 - **宿主提示词原来说「没有 `agent browser`」**，而桌面上早就有核心自己起的无头
   Chrome —— 模型会白白放弃浏览器。改成如实写。
 
@@ -163,7 +166,7 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
   要试大改动就用 `just dev`，那里坏了删 rootfs 就行。
 - `sandbox:` 链接这时映射的是**整台机器**的文件，只看那把随机的
   `sandbox_key`（同源拆分仍然挡着「AI 写的网页读 App 凭据」那条路）。
-- 设备操作（`agent command`）在桌面上是 mock —— 手机上才有真的无障碍那条路。
+- 点击 / 滑动 / 按键只有手机上有（无障碍那条路）；电脑上的设备只会打开东西、起应用。
 - 浏览器由**核心自己起**（第一次用到时才拉起无头 Chrome，退出时收掉）——
   不用手动开。想用你自己那个浏览器（能看着它动）就 `AGENT_CDP=…`；
   `AGENT_CDP=off` 就是不要浏览器。

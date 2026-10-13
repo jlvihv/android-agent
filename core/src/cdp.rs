@@ -1365,7 +1365,7 @@ fn chrome_profiles() -> Vec<PathBuf> {
 
 /// 持久的那个 profile（登录态能留到下次）
 fn chrome_profile_dir() -> PathBuf {
-    crate::linux::host_data_dir().join("chrome")
+    crate::desktop::data_root().join("chrome")
 }
 
 fn chrome_bin() -> Result<PathBuf, String> {

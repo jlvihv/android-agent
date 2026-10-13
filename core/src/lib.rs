@@ -24,6 +24,7 @@ pub mod browser_js;
 pub mod cdp;
 pub mod db;
 pub mod demo;
+pub mod desktop;
 pub mod editor;
 pub mod ffi;
 pub mod gc;
@@ -158,12 +159,12 @@ async fn write_attachment(
 }
 
 /// 桌面上的数据目录：`AGENT_DATA_DIR` 优先；宿主模式默认
-/// `<host_data_dir>/data`（`~/.local/share/android-agent/data`）；否则不落盘。
+/// `<desktop::data_root>/data`（`~/.local/share/android-agent/data`）；否则不落盘。
 fn desktop_data_dir(host: bool) -> Option<std::path::PathBuf> {
     if let Some(d) = std::env::var_os("AGENT_DATA_DIR").filter(|d| !d.is_empty()) {
         return Some(d.into());
     }
-    host.then(|| linux::host_data_dir().join("data"))
+    host.then(|| desktop::data_root().join("data"))
 }
 
 impl Core {
@@ -173,21 +174,28 @@ impl Core {
         }
     }
 
-    /// 带上 mock 设备 —— 桌面开发和无设备调试用。
-    pub fn with_mock() -> Self {
+    /// 桌面上的核心（`agent-dev`）：沙箱、设备、浏览器、数据库都按环境接好。
+    ///
+    /// - 宿主模式（`AGENT_LINUX_HOST=1`）：设备 = 这台电脑（`desktop::HostDevice`），
+    ///   会话和配置落盘；
+    /// - 否则（`just dev`，在电脑上复现手机）：设备是 mock，只放内存。
+    pub fn desktop() -> Self {
         let core = Self::new();
-        core.state.mock.store(true, Ordering::Relaxed);
-        let dev = mock::MockDevice::new();
-        core.state.set_device(dev);
-
         // 桌面：宿主模式 / 或者 proot + rootfs 的沙箱
         let sandbox = linux::LinuxSandbox::from_env();
+        let host = sandbox.as_ref().is_some_and(|s| s.is_host());
+        if host {
+            core.state.set_device(Arc::new(desktop::HostDevice));
+        } else {
+            core.state.mock.store(true, Ordering::Relaxed);
+            core.state.set_device(mock::MockDevice::new());
+        }
 
         // 持久化：会话、模型配置、附件落盘。宿主模式是拿来**日常用**的，
         // 只放内存的话关一次核心，会话和你在界面上配的模型就全没了。
         // `just dev`（proot 沙箱，在电脑上复现手机）照旧只在内存里，除非显式
         // 给了 `AGENT_DATA_DIR`。
-        if let Some(dir) = desktop_data_dir(sandbox.as_ref().is_some_and(|s| s.is_host())) {
+        if let Some(dir) = desktop_data_dir(host) {
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => {
                     tracing::info!("数据目录: {}", dir.display());
@@ -886,14 +894,14 @@ mod tests {
 
     #[test]
     fn sse_and_state_wire_up() {
-        let core = Core::with_mock();
+        let core = Core::desktop();
         assert_eq!(core.port(), 0);
         assert!(core.state.device().is_some());
     }
 
     #[test]
     fn mock_device_takes_commands_and_reports_garbage() {
-        let core = Core::with_mock();
+        let core = Core::desktop();
         let dev = core.state.device().unwrap();
         assert!(dev
             .execute(r#"{"type":"key","name":"back"}"#)

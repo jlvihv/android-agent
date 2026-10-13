@@ -1070,18 +1070,10 @@ EOT
       echo "agent open: 参数里没有 URI，跳过: $*" >&2
       exit 0
     fi
-    # 宿主模式（桌面）：设备通道是 mock，发过去只会拿回一句假的「已打开」——
-    # 直接交给这台电脑自己的打开器（macOS `open`，Linux `xdg-open`）
-    if [ "${AGENT_HOST:-}" = 1 ]; then
-      if command -v open >/dev/null 2>&1 && [ "$(uname)" = Darwin ]; then exec open "$uri"; fi
-      if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$uri"; fi
-      echo "agent open: 这台电脑上没有 open / xdg-open：$uri" >&2
-      exit 1
-    fi
     out=$(post /api/command "{\"cmd\":{\"type\":\"open\",\"url\":\"$(esc "$uri")\"}}")
     case "$out" in
       *'"ok":true'*)
-        echo "已让手机打开: $uri"
+        echo "已打开: $uri"
         ;;
       *)
         detail=$(printf '%s' "$out" | sed -n 's/.*"detail":"\([^"]*\)".*/\1/p')
@@ -1380,31 +1372,13 @@ fn host_mode_requested() -> bool {
     }
 }
 
-/// 宿主模式下我们自己的数据目录（`agent` 命令、状态文件都在这儿）。
-///
-/// 故意**不用** `~/.local/bin` / `~/.local/bin` 那一类用户的目录：这是我们自己的
-/// 东西，不能往用户的 PATH 配置里塞。
-pub(crate) fn host_data_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/share"))
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join("android-agent"));
-    base.join("android-agent")
-}
-
 /// 宿主模式下 `agent` 命令装在哪。
 ///
 /// 落点是 `$XDG_DATA_HOME/android-agent/bin`（默认
 /// `~/.local/share/android-agent/bin`）—— 只有我们自己发出去的命令的 PATH
 /// 前缀里有它，不动用户的 shell 配置。
 fn host_cli_dir() -> PathBuf {
-    host_data_dir().join("bin")
+    crate::desktop::data_root().join("bin")
 }
 
 /// 宿主模式用哪个 bash：**PATH 里的第一个**，没有再退回 `/bin/bash`。
@@ -1877,7 +1851,7 @@ impl LinuxSandbox {
     /// 宿主模式放我们自己的数据目录 —— **绝不往 `/` 里写**（那是用户的根目录）。
     fn exit_dir(&self) -> (PathBuf, String) {
         if self.cfg.host {
-            let dir = host_data_dir().join("exit");
+            let dir = crate::desktop::data_root().join("exit");
             let guest = dir.display().to_string();
             (dir, guest)
         } else {
@@ -1892,7 +1866,7 @@ impl LinuxSandbox {
     /// 换成我们自己的数据目录 —— 前缀就是宿主路径本身，`read` 直接解得开。
     pub fn shot_dir(&self) -> crate::gc::ShotDir {
         if self.cfg.host {
-            let host = host_data_dir().join("browser");
+            let host = crate::desktop::data_root().join("browser");
             let guest = host.display().to_string();
             crate::gc::ShotDir { host, guest }
         } else {
@@ -1937,9 +1911,6 @@ impl LinuxSandbox {
             let old = env.get("PATH").cloned().unwrap_or_default();
             env.insert("PATH".into(), format!("{}:{old}", cli.display()));
         }
-
-        // `agent` 命令据此分岔（比如 `agent open` 交给本机的打开器）
-        env.insert("AGENT_HOST".into(), "1".into());
 
         let port = self.agent_port.load(Ordering::Relaxed);
         if port != 0 {

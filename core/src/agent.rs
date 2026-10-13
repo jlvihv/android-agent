@@ -686,7 +686,8 @@ const ANDROID: Phrasing = Phrasing {
 const HOST: Phrasing = Phrasing {
     who: "",
     files: "cwd 是启动核心时的那个目录（`pwd` 就是它）。`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或者真实路径。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。",
-    link_extra: "",
+    // 实测：模型以为只能链 /workspace 里的，先把截图拷进来再给链接，白跑一步
+    link_extra: "（`sandbox:` 后面任何绝对路径都行，截图不用先拷进来）",
     cli_intro: "`agent` 命令（已在 PATH 里）可查看/操作自己",
     cli_device: "`agent open <uri>`（用这台电脑的默认程序打开网页/文件）",
     browser: "核心自己起的无头 Chrome",
