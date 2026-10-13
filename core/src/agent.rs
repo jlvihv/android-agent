@@ -72,9 +72,9 @@ fn build_tools() -> Vec<ToolSpec> {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "要执行的 shell 命令" },
-                        "timeout": { "type": "number", "description": "超时秒数。先估算这条命令要跑多久，上限 86400（24h）。" }
+                        "timeout": { "type": "number", "description": "超时秒数（可选，默认 60）。下载 / apk add / 编译 / git clone 这类长任务要显式给足，上限 86400（24h）；命令一结束就返回，估大不亏。" }
                     },
-                    "required": ["command", "timeout"]
+                    "required": ["command"]
                 })
             },
         },
@@ -2208,15 +2208,38 @@ fn parse_offset(args: &Value) -> usize {
         .unwrap_or(1)
 }
 
-/// `bash` 的 timeout（秒）：**必填**。缺失、非数、非正数都返回 `None`，由调用方
-/// 回一条「先估算一下」的错误给模型。超过 `MAX_TIMEOUT` 就夹到上限。
-fn parse_timeout(args: &Value) -> Option<std::time::Duration> {
-    let secs = args.get("timeout")?.as_f64()?;
-    if !secs.is_finite() || secs <= 0.0 {
-        return None;
-    }
+/// `bash` 不给 timeout 时的超时。
+///
+/// 绝大多数命令几秒就完；长任务（下载 / `apk add` / 编译）模型要自己显式给 ——
+/// 工具描述里写了，超时被杀时结果里也会再提醒一次（见 `timeout_hint`）。
+const BASH_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `bash` 的 timeout（秒）：可选。没给（或 null）= 默认 60s；给了但不是正数 →
+/// `Err`（模型写错了就告诉它，不偷偷换成默认值）。超过 `MAX_TIMEOUT` 夹到上限。
+fn parse_timeout(args: &Value) -> Result<std::time::Duration, &'static str> {
+    let v = match args.get("timeout") {
+        None | Some(Value::Null) => return Ok(BASH_DEFAULT_TIMEOUT),
+        Some(v) => v,
+    };
+    let secs = v
+        .as_f64()
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .ok_or("timeout 必须是正数（秒）；不给就是默认 60 秒")?;
     let capped = secs.min(linux::MAX_TIMEOUT.as_secs_f64());
-    Some(std::time::Duration::from_secs_f64(capped))
+    Ok(std::time::Duration::from_secs_f64(capped))
+}
+
+/// 超时被杀时追加在输出后面的提醒：用了多少秒、要更久怎么办。
+fn timeout_hint(timeout: std::time::Duration, explicit: bool) -> String {
+    let secs = timeout.as_secs_f64();
+    if explicit {
+        format!("[{secs:.0}s 超时被终止。确实需要更久就重跑并给更大的 timeout（上限 86400）]")
+    } else {
+        format!(
+            "[{secs:.0}s 超时被终止（没给 timeout，用的是默认值）。长任务重跑时显式给 timeout（秒，上限 86400）；\
+             要一直跑的服务用 `nohup … > /tmp/x.log 2>&1 &` 放后台]"
+        )
+    }
 }
 
 /// `read` 的 limit：缺失或 null = None，负数/非整数报错。
@@ -2301,16 +2324,11 @@ async fn execute_tool(
         if script.trim().is_empty() {
             return ToolOutcome::json(json!({ "error": "缺少参数 command" }));
         }
-        // timeout **必填**：不让模型靠一个偏短的默认值蒙混，逼它先想「这条
-        // 命令要跑多久」。估小了的代价是命令被 SIGKILL、前面的活儿白干，
-        // 所以宁可估大。
-        let Some(timeout) = parse_timeout(&args) else {
-            return ToolOutcome::json(json!({
-                "error": "缺少参数 timeout（或不是正数）。调用 bash 之前必须先估算这条命令\
-                          要跑多久，把秒数显式传进来：下载 / `apk add` / 编译 / `git clone`\
-                          可能要几十分钟到几小时。**宁可估大** —— 估小了命令会被中途杀掉，\
-                          之前的进度全白费；多估不会真的等（命令一结束就返回）。上限 24 小时。"
-            }));
+        // timeout 可选，默认 60s（见 `BASH_DEFAULT_TIMEOUT`）
+        let explicit = !matches!(args.get("timeout"), None | Some(Value::Null));
+        let timeout = match parse_timeout(&args) {
+            Ok(t) => t,
+            Err(why) => return ToolOutcome::json(json!({ "error": why })),
         };
 
         let res = match live {
@@ -2326,7 +2344,11 @@ async fn execute_tool(
         };
         return match res {
             Ok(r) => {
-                let text = r.to_text();
+                let mut text = r.to_text();
+                if r.timed_out {
+                    text.push('\n');
+                    text.push_str(&timeout_hint(timeout, explicit));
+                }
                 let urls = crate::urls::extract(&text);
                 let mut out = json!({
                     "output": text,
@@ -3271,13 +3293,18 @@ mod tests {
     }
 
     #[test]
-    fn bash_timeout_is_required_and_capped() {
-        // 缺失 / 非法都不能偷偷用一个短默认值
-        assert!(parse_timeout(&json!({})).is_none());
-        assert!(parse_timeout(&json!({ "timeout": null })).is_none());
-        assert!(parse_timeout(&json!({ "timeout": 0 })).is_none());
-        assert!(parse_timeout(&json!({ "timeout": -5 })).is_none());
-        assert!(parse_timeout(&json!({ "timeout": "600" })).is_none());
+    fn bash_timeout_defaults_to_a_minute_and_is_capped() {
+        // 不给 / null → 默认 60s
+        assert_eq!(parse_timeout(&json!({})).unwrap(), BASH_DEFAULT_TIMEOUT);
+        assert_eq!(
+            parse_timeout(&json!({ "timeout": null })).unwrap(),
+            BASH_DEFAULT_TIMEOUT
+        );
+        assert_eq!(BASH_DEFAULT_TIMEOUT.as_secs(), 60);
+        // 给了但写错了：报错，不偷偷换成默认值
+        assert!(parse_timeout(&json!({ "timeout": 0 })).is_err());
+        assert!(parse_timeout(&json!({ "timeout": -5 })).is_err());
+        assert!(parse_timeout(&json!({ "timeout": "600" })).is_err());
 
         // 普通值原样，长时间任务（比如 3 小时下载）完全允许
         assert_eq!(
@@ -3296,6 +3323,14 @@ mod tests {
             linux::MAX_TIMEOUT
         );
         assert!(linux::MAX_TIMEOUT >= std::time::Duration::from_secs(6 * 3600));
+
+        // 超时被杀时的提醒要说清用了多少秒；默认值那条还要教它怎么给
+        let h = timeout_hint(BASH_DEFAULT_TIMEOUT, false);
+        assert!(
+            h.contains("60s") && h.contains("默认") && h.contains("timeout"),
+            "{h}"
+        );
+        assert!(!timeout_hint(std::time::Duration::from_secs(600), true).contains("默认"));
     }
 
     #[test]
