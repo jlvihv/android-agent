@@ -788,9 +788,15 @@ impl ProcsReport {
     /// （`search.rs` 的 `format_hits` 就是这么搬过来的）。
     pub fn to_text(&self) -> String {
         if self.host {
-            return "宿主模式：没有 proot 登记表，认不出「刻意脱离的常驻进程」。\
-                    直接用这台机器上的 `ps` / `pgrep -af` / `ss -ltnp` 看，`kill <pid>` 停。"
-                .into();
+            return if cfg!(target_os = "macos") {
+                "宿主模式：没有 proot 登记表，认不出「刻意脱离的常驻进程」。\
+                 直接用这台机器上的 `ps` / `pgrep -fl` / `lsof -nP -iTCP -sTCP:LISTEN` 看，\
+                 `kill <pid>` 停。"
+            } else {
+                "宿主模式：没有 proot 登记表，认不出「刻意脱离的常驻进程」。\
+                 直接用这台机器上的 `ps` / `pgrep -af` / `ss -ltnp` 看，`kill <pid>` 停。"
+            }
+            .into();
         }
         if self.visible == 0 {
             return "看不见任何进程：这台机器的 /proc 被限制了（hidepid），沙箱里的 `ps` \
@@ -1064,6 +1070,14 @@ EOT
       # 而它们常被链在脚本里（set -e 下报错会把调用方炸掉）
       echo "agent open: 参数里没有 URI，跳过: $*" >&2
       exit 0
+    fi
+    # 宿主模式（桌面）：设备通道是 mock，发过去只会拿回一句假的「已打开」——
+    # 直接交给这台电脑自己的打开器（macOS `open`，Linux `xdg-open`）
+    if [ "${AGENT_HOST:-}" = 1 ]; then
+      if command -v open >/dev/null 2>&1 && [ "$(uname)" = Darwin ]; then exec open "$uri"; fi
+      if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$uri"; fi
+      echo "agent open: 这台电脑上没有 open / xdg-open：$uri" >&2
+      exit 1
     fi
     out=$(post /api/command "{\"cmd\":{\"type\":\"open\",\"url\":\"$(esc "$uri")\"}}")
     case "$out" in
@@ -1392,6 +1406,58 @@ pub(crate) fn host_data_dir() -> PathBuf {
 /// 前缀里有它，不动用户的 shell 配置。
 fn host_cli_dir() -> PathBuf {
     host_data_dir().join("bin")
+}
+
+/// 宿主模式用哪个 bash：**PATH 里的第一个**，没有再退回 `/bin/bash`。
+///
+/// 不能写死 `/bin/bash`：macOS 上那是 2007 年的 bash 3.2（GPLv3 之前的最后
+/// 一版，苹果就停在那儿了）—— 没有关联数组、`${x,,}`、`mapfile`、`|&`，
+/// 模型写的现代 bash 会报一串莫名其妙的错。装了 Homebrew bash 的人 PATH 里
+/// `/opt/homebrew/bin` 排在 `/bin` 前面，按 PATH 找正好拿到新的；Linux 上
+/// PATH 里的 bash 一般就是 `/usr/bin/bash`（= `/bin/bash`），行为不变。
+fn host_bash() -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .filter(|d| d.is_absolute())
+                .map(|d| d.join("bash"))
+                .find(|p| p.is_file())
+        })
+        .or_else(|| Some(PathBuf::from("/bin/bash")).filter(|p| p.is_file()))
+}
+
+/// macOS 没有 `setsid(1)`（那是 util-linux 的），而提示词和工具描述里「放一个
+/// 能活过这次调用的后台服务」的写法就是 `setsid <命令> &` —— 少了它模型只能
+/// 退到 `nohup … &`，可 nohup **不换进程组**，超时 / 停止时会被连组一起杀
+/// （见 `CommandGuard`），跟「刻意脱离」的语义对不上。
+///
+/// 所以宿主模式在我们自己的 bin 目录里垫一个：系统自带的 perl 调
+/// `POSIX::setsid()`。跟 util-linux 一样，调用方自己是组长时先 fork 一次
+/// （组长调 setsid 会 EPERM），父进程直接返回。只在 PATH 里**没有**真
+/// setsid 的机器上写（`prepare_host`），Linux 上一行都不碰。
+const SETSID_SHIM: &str = r##"#!/bin/sh
+# setsid —— macOS 没有 util-linux 的 setsid(1)，这是 android-agent 垫的一个。
+# 用法同 util-linux：setsid <命令> [参数…]（让命令跑在一个新会话 / 进程组里）
+[ $# -gt 0 ] || { echo "用法：setsid <命令> [参数…]" >&2; exit 2; }
+exec /usr/bin/perl -MPOSIX -e '
+  if (getpgrp() == $$) { my $p = fork(); die "setsid: fork: $!
+" unless defined $p; exit 0 if $p; }
+  POSIX::setsid() or die "setsid: $!
+";
+  exec { $ARGV[0] } @ARGV or die "setsid: $ARGV[0]: $!
+";
+' -- "$@"
+"##;
+
+/// PATH 里（我们自己的 bin 目录以外）有没有真的 `setsid`。
+fn host_has_setsid(ours: &Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|d| d != ours)
+                .any(|d| d.join("setsid").is_file())
+        })
+        .unwrap_or(false)
 }
 
 impl LinuxSandbox {
@@ -1780,6 +1846,15 @@ impl LinuxSandbox {
         }
         let dir = host_cli_dir();
         write_if_changed(&dir.join("agent"), AGENT_CLI, true)?;
+        // 没有真 setsid 的机器（macOS）垫一个；有的话把以前垫的拿掉，别挡着真的
+        let shim = dir.join("setsid");
+        if host_has_setsid(&dir) {
+            let _ = std::fs::remove_file(&shim);
+        } else if Path::new("/usr/bin/perl").is_file() {
+            write_if_changed(&shim, SETSID_SHIM, true)?;
+        } else {
+            tracing::warn!("这台机器没有 setsid 也没有 /usr/bin/perl：`setsid … &` 会是 not found");
+        }
         tracing::debug!("宿主模式 agent 命令: {}", dir.join("agent").display());
         Ok(())
     }
@@ -1859,6 +1934,9 @@ impl LinuxSandbox {
             env.insert("PATH".into(), format!("{}:{old}", cli.display()));
         }
 
+        // `agent` 命令据此分岔（比如 `agent open` 交给本机的打开器）
+        env.insert("AGENT_HOST".into(), "1".into());
+
         let port = self.agent_port.load(Ordering::Relaxed);
         if port != 0 {
             env.insert("AGENT_PORT".into(), port.to_string());
@@ -1905,7 +1983,7 @@ impl LinuxSandbox {
     /// 沙箱里有没有真 bash（没装就只能退回 ash，见 `command_line`）。
     pub fn has_bash(&self) -> bool {
         if self.cfg.host {
-            return Path::new("/bin/bash").is_file();
+            return host_bash().is_some();
         }
         self.cfg.rootfs.join("bin/bash").is_file()
     }
@@ -1941,14 +2019,12 @@ impl LinuxSandbox {
         // runner、照样写状态文件、照样把「命令自己的进程组」当靶子
         // （见 `CommandGuard`）。差异只有：状态文件落在我们自己的数据目录里。
         if self.cfg.host {
-            let shell = if self.has_bash() {
-                "/bin/bash"
-            } else {
-                "/bin/sh"
-            };
+            let shell = host_bash()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "/bin/sh".to_string());
             // 宿主模式不需要 guest 的 setsid：spawn 时那个 `process_group(0)`
             // 已经把 runner 变成组长，所以 `$$` 就是组号（`report_pgid = true`）。
-            let runner = runner_script(shell, true);
+            let runner = runner_script(&shell, true);
             return vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),

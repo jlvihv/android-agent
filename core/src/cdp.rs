@@ -1,4 +1,4 @@
-//! 桌面（Linux）上的浏览器：**无头 Chrome + CDP**。
+//! 桌面（Linux / macOS）上的浏览器：**无头 Chrome + CDP**。
 //!
 //! 手机那边的浏览器是壳里的一只无头 `WebView`（`BrowserController.kt`）。
 //! 桌面上没有壳，但 `BrowserApi` 本来就是个 trait —— 这是它的第三个实现
@@ -1200,6 +1200,25 @@ const CHROME_NAMES: &[&str] = &[
     "chrome",
 ];
 
+/// 不在 PATH 里的常见安装位置。
+#[cfg(not(target_os = "macos"))]
+const CHROME_PATHS: &[&str] = &[
+    "/opt/google/chrome/chrome",
+    "/usr/lib/chromium/chromium",
+    "/snap/bin/chromium",
+];
+
+/// macOS：`.app` 包里的可执行文件。按「和安卓 WebView 同为 Chromium、越接近
+/// 正式版越好」排；Edge / Brave 也是 Chromium，CDP 一样能用。
+#[cfg(target_os = "macos")]
+const CHROME_PATHS: &[&str] = &[
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+];
+
 /// 起一个无头 Chrome，等它把调试端口听上，返回 `(进程, 地址)`。
 ///
 /// **为什么在核心里做**：用的人不该先另开一个终端去起浏览器 —— 那是实现细节。
@@ -1242,35 +1261,30 @@ fn launch_chrome() -> Result<(Chrome, String), String> {
 /// 被 `kill -9` / OOM 干掉时那个 Chrome 会变成孤儿，一直占着内存和一个
 /// profile（几十 MB）。判据卡两道，避免误杀别人的浏览器：
 ///
-/// - 命令行里有 `--user-data-dir=<我们的目录>`（持久那个，或者 `/tmp/android-agent-chrome-*`）
+/// - 命令行里有 `--user-data-dir=<我们的目录>`（持久那个，或者
+///   `<临时目录>/android-agent-chrome-*`）
 /// - **父进程已经是 init**（ppid == 1）—— 还活着的兄弟核心起的那个不算孤儿，
 ///   它有自己的爹
+///
+/// 进程表从哪来：Linux 读 `/proc`；macOS 没有 `/proc`，问 `ps`。
 fn sweep_orphan_chromes() {
+    let persistent = format!("--user-data-dir={}", chrome_profile_dir().display());
+    // 临时 profile 跟着 `temp_dir()` 走（`chrome_profiles`）：Linux 一般是 /tmp，
+    // macOS 是 /var/folders/… —— 不能写死 /tmp
+    let temp = format!(
+        "--user-data-dir={}",
+        std::env::temp_dir().join("android-agent-chrome-").display()
+    );
     let ours = |cmd: &str| {
         cmd.contains("--remote-debugging-port=")
-            && (cmd.contains(&format!("--user-data-dir={}", chrome_profile_dir().display()))
-                || cmd.contains("--user-data-dir=/tmp/android-agent-chrome-"))
+            && (cmd.contains(&persistent) || cmd.contains(&temp))
             // 只认主进程：`--type=zygote` / `--type=renderer` 那些是它的孩子，
             // 跟着它一起死，不用单独杀
             && !cmd.contains("--type=")
     };
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return;
-    };
     let mut killed = 0;
-    for e in dir.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
-            continue;
-        };
-        if pid <= 1 {
-            continue;
-        }
-        let raw = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
-        if raw.is_empty() {
-            continue;
-        }
-        let cmd = String::from_utf8_lossy(&raw).replace('\0', " ");
-        if !ours(&cmd) || !is_orphan(pid) {
+    for (pid, ppid, cmd) in process_table() {
+        if pid <= 1 || ppid != 1 || !ours(&cmd) {
             continue;
         }
         // SAFETY: kill(2) 只读参数
@@ -1284,18 +1298,61 @@ fn sweep_orphan_chromes() {
     }
 }
 
-/// 父进程已经是 init 了吗（`/proc/<pid>/stat` 的第 4 个字段）
-fn is_orphan(pid: i32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
+/// 这台机器上的进程：`(pid, ppid, 命令行)`。拿不到就是空的（不收就是了）。
+#[cfg(target_os = "linux")]
+fn process_table() -> Vec<(i32, i32, String)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
     };
-    // `comm` 里可能有空格和括号，所以从最后一个 `)` 之后切
-    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
-        return false;
+    let mut out = Vec::new();
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let raw = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
+            continue;
+        };
+        // `comm` 里可能有空格和括号，所以从最后一个 `)` 之后切：`state ppid …`
+        let ppid = stat
+            .rfind(')')
+            .and_then(|i| stat[i + 1..].split_whitespace().nth(1))
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(0);
+        out.push((pid, ppid, String::from_utf8_lossy(&raw).replace('\0', " ")));
+    }
+    out
+}
+
+/// macOS（以及别的没有 `/proc` 的 unix）：`ps -axww -o pid=,ppid=,command=`。
+/// `ww` 不截断命令行 —— `--user-data-dir=` 往往在很后面。
+#[cfg(not(target_os = "linux"))]
+fn process_table() -> Vec<(i32, i32, String)> {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-axww", "-o", "pid=,ppid=,command="])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
     };
-    let mut it = rest.split_whitespace();
-    let _state = it.next();
-    it.next().and_then(|p| p.parse::<i32>().ok()) == Some(1)
+    parse_ps(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `ps -o pid=,ppid=,command=` 的输出：前两列是数字，其余整段是命令行。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn parse_ps(text: &str) -> Vec<(i32, i32, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            let (pid, rest) = l.split_once(char::is_whitespace)?;
+            let rest = rest.trim_start();
+            let (ppid, cmd) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            Some((pid.parse().ok()?, ppid.parse().ok()?, cmd.trim().to_string()))
+        })
+        .collect()
 }
 
 /// profile 目录：先是持久的那个，失败就退回一次性的（并发的第二个核心）
@@ -1324,14 +1381,21 @@ fn chrome_bin() -> Result<PathBuf, String> {
             return Ok(path);
         }
     }
-    // 常见安装位置（有些发行版不在 PATH 里）
-    for p in [
-        "/opt/google/chrome/chrome",
-        "/usr/lib/chromium/chromium",
-        "/snap/bin/chromium",
-    ] {
+    // 常见安装位置（有些发行版不在 PATH 里；macOS 上 Chrome 是个 .app，
+    // 从来不在 PATH 里）
+    for p in CHROME_PATHS {
         if Path::new(p).is_file() {
             return Ok(PathBuf::from(p));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        // 没有管理员权限的人会把 .app 拖进 ~/Applications
+        for p in CHROME_PATHS.iter().filter_map(|p| p.strip_prefix('/')) {
+            let p = Path::new(&home).join(p);
+            if p.is_file() {
+                return Ok(p);
+            }
         }
     }
     Err(format!(
@@ -1358,8 +1422,8 @@ fn try_launch(bin: &Path, profile: &Path) -> Result<(std::process::Child, u16, P
         .try_clone()
         .map_err(|e| format!("克隆日志句柄失败: {e}"))?;
 
-    let child = std::process::Command::new(bin)
-        .arg("--headless=new")
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--headless=new")
         .arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg("--no-first-run")
@@ -1367,7 +1431,12 @@ fn try_launch(bin: &Path, profile: &Path) -> Result<(std::process::Child, u16, P
         .arg("--disable-gpu")
         .arg("--hide-scrollbars")
         // 容器 / 内存小的机器上 `/dev/shm` 常常只有 64MB，不给这个 flag 会崩
-        .arg("--disable-dev-shm-usage")
+        .arg("--disable-dev-shm-usage");
+    // macOS：新 profile 第一次存 cookie 时 Chrome 会去钥匙串要「Chrome Safe
+    // Storage」—— 弹一个系统授权框，无头那边就一直等着。用假钥匙串绕开。
+    #[cfg(target_os = "macos")]
+    cmd.arg("--use-mock-keychain");
+    let child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err))
@@ -1659,6 +1728,20 @@ fn apply_profile(conn: &mut Conn, session: &str, p: Profile) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ps_output_keeps_the_whole_command_line() {
+        // macOS 的孤儿回收靠它：命令行里有空格（.app 路径），参数在很后面
+        let text = "    1     0 /sbin/launchd\n\
+                    \x20 4242     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless=new --remote-debugging-port=5555 --user-data-dir=/x\n\
+                    garbage line\n";
+        let rows = parse_ps(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, 4242);
+        assert_eq!(rows[1].1, 1);
+        assert!(rows[1].2.starts_with("/Applications/Google Chrome.app/"));
+        assert!(rows[1].2.ends_with("--user-data-dir=/x"));
+    }
 
     #[test]
     fn endpoint_parsing() {

@@ -3,7 +3,7 @@
 > 落地日期：2026-10-13
 
 一句话：`just dev-host` 起核心，浏览器开 <http://127.0.0.1:8787>，
-`bash` / `read` / `edit` 三个工具作用在**这台 Linux 本身** —— 没有 proot、
+`bash` / `read` / `edit` 三个工具作用在**这台 Linux / Mac 本身** —— 没有 proot、
 没有 Alpine rootfs、没有 `/workspace` 那层映射。
 
 | | `just dev`（沙箱） | `just dev-host`（宿主） |
@@ -68,12 +68,42 @@ http.server &` 就得等到超时（默认 60s）才回来。所以宿主模式�
 - **`agent` 命令的取数**：那个脚本原来只认 busybox 的 `wget`，桌面上一般只有
   `curl`，所以 `get` / `post` 现在两条都留（装完 curl 的沙箱也会走 curl）。
 
+## macOS
+
+> 落地日期：2026-10-13
+
+macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要沙箱）：
+`just dev-host`，其它都一样。核心本来就只用 POSIX 那一套（进程组、`kill(-pgid)`、
+状态文件），能直接编过、测试全绿；真正要补的是「Linux 才成立」的几处假设：
+
+| 地方 | Linux 上的做法 | macOS 上不成立的原因 | 现在 |
+|---|---|---|---|
+| `setsid` | util-linux 自带 | macOS 没有 `setsid(1)`；退到 `nohup` 不换进程组，超时会被连组杀掉 | 宿主 bin 目录里垫一个（`SETSID_SHIM`：系统 perl 调 `POSIX::setsid()`，组长先 fork，跟 util-linux 一致）。PATH 里有真的就不垫 |
+| bash | `/bin/bash` | `/bin/bash` 是 3.2（没有关联数组 / `${x,,}` / `mapfile`） | 用 **PATH 里第一个** bash（装了 Homebrew bash 就是它），找不到才退回 `/bin/bash` |
+| 系统提示词 | `ss -ltnp` / `pgrep -af` / `xdg-open` | 这三样 macOS 上都不对 | 按编译目标选 `SYSTEM_PROMPT_HOST_MACOS`：`lsof -nP -iTCP -sTCP:LISTEN` / `pgrep -fl` / `open`，并点名 BSD 用户态（`sed -i ''` 等） |
+| Chrome 在哪 | PATH / `/opt/google/chrome` | `.app` 包从不在 PATH 里 | 查 `/Applications`（和 `~/Applications`）下的 Chrome / Chromium / Canary / Edge / Brave |
+| Chrome 钥匙串 | — | 新 profile 存 cookie 时会弹「Chrome Safe Storage」授权框，无头那边一直等 | 加 `--use-mock-keychain` |
+| 孤儿 Chrome 回收 | 扫 `/proc` | 没有 `/proc`（原来静默跳过）；临时 profile 也不在 `/tmp` 而在 `/var/folders/…` | 问 `ps -axww -o pid=,ppid=,command=`；临时 profile 前缀跟着 `temp_dir()` 走 |
+
+数据目录仍是 `~/.local/share/android-agent`（`$XDG_DATA_HOME` 优先），**故意没用**
+`~/Library/Application Support`：截图路径会原样出现在 `read` / `![](sandbox:…)`
+里，路径带空格的话 Markdown 链接直接断。
+
+两个平台共用的顺手修复：
+
+- **`agent open` 在桌面上原来是假的**：设备通道是 mock，它回 `ok`，CLI 就打出
+  「已让手机打开」，其实什么都没开。现在宿主模式（`host_env` 里的 `AGENT_HOST=1`）
+  直接交给本机的 `open` / `xdg-open`。
+- **宿主提示词原来说「没有 `agent browser`」**，而桌面上早就有核心自己起的无头
+  Chrome —— 模型会白白放弃浏览器。改成如实写。
+
 ## 系统提示词：两份常量，不是插值
 
 `SYSTEM_PROMPT` 必须是常量（缓存按前缀命中，见 [docs/03](03-prompt-cache.md)），
 所以宿主模式**不是**在提示词里插「你现在在 `/home/xxx`」，而是另有一份常量
 `SYSTEM_PROMPT_HOST`（`core/src/agent.rs`），启动时按沙箱形态选一份
-（`AppState::builtin_prompt`）。
+（`AppState::builtin_prompt`）。`SYSTEM_PROMPT_HOST` 本身又按**编译目标**在
+`_LINUX` / `_MACOS` 两份里选（`cfg!`）—— 一个二进制只跑在一种系统上，仍是常量。
 
 两份只在「在哪跑、有哪些门」上不同，工具表和其余规则一字不差 ——
 不然两边干活的方式会慢慢漂。宿主那份还必须点名一件事：**工具表里仍然写着

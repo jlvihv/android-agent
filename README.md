@@ -15,7 +15,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | `android/` 壳 | ✅ **真机验证通过** |
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
 | Linux 沙箱 | ✅ **Alpine 3.21 aarch64 在真机上跑起来**，`apk add` 可用 |
-| 桌面宿主模式 | ✅ `just dev-host`：不套沙箱，`bash`/`read`/`edit` 直接作用在这台机器上（[docs/11](docs/11-host-mode.md)） |
+| 桌面宿主模式 | ✅ `just dev-host`：不套沙箱，`bash`/`read`/`edit` 直接作用在这台机器上；**Linux 和 macOS** 都行（[docs/11](docs/11-host-mode.md)） |
 | 桌面浏览器 | ✅ 核心**自己起**无头 Chrome（CDP），`agent browser` 在桌面上也能用（[docs/08](docs/08-browser.md) 第 15 节） |
 | 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI（读 UI 树那套已删，见下） |
 | Prompt cache | ✅ 实测命中 73–87% |
@@ -45,7 +45,7 @@ chmod 600 .env.local
 # 3. 构建前端 + 起核心
 just web-build
 just dev        # 沙箱里跑：bash 在 Alpine rootfs 里，改不到你的机器
-# just dev-host  # 宿主模式：没有沙箱，bash / read / edit 直接作用在这台机器上
+# just dev-host  # 宿主模式：没有沙箱，bash / read / edit 直接作用在这台机器上（macOS 只有这个）
 
 # 4. 另开一个终端，让 agent 干活
 python3 scripts/agentctl.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"

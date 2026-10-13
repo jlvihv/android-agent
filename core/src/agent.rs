@@ -645,13 +645,41 @@ pub const SYSTEM_PROMPT: &str = "\
 /// 选哪份看当前沙箱是不是宿主模式（`AppState::system_prompt`）。两份的差别
 /// 只在「在哪跑、有哪些门」那几句 —— 工具表和其余规则必须一字不差，
 /// 否则两边干活的方式会慢慢漂。
-pub const SYSTEM_PROMPT_HOST: &str = "\
+pub const SYSTEM_PROMPT_HOST: &str = if cfg!(target_os = "macos") {
+    SYSTEM_PROMPT_HOST_MACOS
+} else {
+    SYSTEM_PROMPT_HOST_LINUX
+};
+
+/// 宿主模式 · Linux。
+///
+/// 按**编译目标**选、不按运行时探测：一个二进制只会跑在一种系统上，常量也就
+/// 还是常量（缓存前缀不变）。两份只在「这是什么系统、用什么命令看进程」上不同。
+pub const SYSTEM_PROMPT_HOST_LINUX: &str = "\
 你是运行在一台 Linux 电脑上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。\n\
 \n\
 - cwd 是启动核心时的那个目录（`pwd` 就是它）。`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或者真实路径。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。\n\
-- 工具表里提到「Alpine Linux 沙箱」「已预装 …」「apk add」的那几句是**手机版**的写法，宿主模式不适用：用这台机器上已经有的工具，装东西用它的包管理器（pacman/apt/dnf/brew…）或 venv。后台常驻服务同样用 `setsid <命令> > 日志 2>&1 &` 放（能活过这次调用），收场用 `ps` / `pgrep -af` / `ss -ltnp` 看、`kill <pid>` 停 —— 宿主模式没有 proot 那套登记表，`agent ps` 只会让你去用这些。\n\
+- 工具表里提到「Alpine Linux 沙箱」「已预装 …」「apk add」的那几句是**手机版**的写法，宿主模式不适用：用这台机器上已经有的工具，装东西用它的包管理器（pacman/apt/dnf…）或 venv。后台常驻服务同样用 `setsid <命令> > 日志 2>&1 &` 放（能活过这次调用），收场用 `ps` / `pgrep -af` / `ss -ltnp` 看、`kill <pid>` 停 —— 宿主模式没有 proot 那套登记表，`agent ps` 只会让你去用这些。\n\
 - 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-- `agent` 命令（已在 PATH 里）能查看自己：`agent state|request|tools|session`、`agent search`（联网搜索）、`agent kill <pid>`（停掉一个后台进程）、`agent get|post`（直接调自己的接口），`agent help` 看全部。宿主模式没有 `agent command`（那是手机上的设备操作）和 `agent browser`（要手机上的 WebView）。\n\
+- `agent` 命令（已在 PATH 里）能查看自己：`agent state|request|tools|session`、`agent browser`（核心自己起的无头 Chrome：navigate / get_backbone / click / type / screenshot，一条命令能连做多步；截图路径在返回里，用 read 看）、`agent search`（联网搜索）、`agent kill <pid>`（停掉一个后台进程）、`agent get|post`（直接调自己的接口），`agent help` 看全部。宿主模式没有 `agent command` / `agent open`（那是手机上的设备操作）；要给用户开网页就用 `xdg-open`。\n\
+\n\
+回答要言简意赅。";
+
+/// 宿主模式 · macOS。跟 Linux 那份逐句对齐，只换掉 macOS 上不成立的：
+///
+/// - `ss` 不存在 → `lsof -nP -iTCP -sTCP:LISTEN`；`pgrep -af` 的 `-a` 是
+///   procps 的，BSD pgrep 用 `-fl`。
+/// - `setsid` 不是系统自带的 —— 是我们垫在 PATH 里的（`linux::SETSID_SHIM`），
+///   所以写法不用变。
+/// - BSD 用户态：`sed -i ''`、`date` / `stat` / `readlink -f` 的参数跟 GNU 不同，
+///   不点一句的话模型几乎一定按 GNU 写，白白报错一轮。
+pub const SYSTEM_PROMPT_HOST_MACOS: &str = "\
+你是运行在一台 Mac（macOS）上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。\n\
+\n\
+- cwd 是启动核心时的那个目录（`pwd` 就是它）。`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或者真实路径。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。\n\
+- 工具表里提到「Alpine Linux 沙箱」「已预装 …」「apk add」的那几句是**手机版**的写法，宿主模式不适用：用这台机器上已经有的工具，装东西用 brew 或 venv。这是 BSD 用户态：`sed -i ''`、`date`、`stat`、`readlink -f`、`xargs` 的参数跟 GNU 不一样，拿不准先看 `man` 或用 python3。后台常驻服务同样用 `setsid <命令> > 日志 2>&1 &` 放（能活过这次调用；`setsid` 已在 PATH 里），收场用 `ps` / `pgrep -fl` / `lsof -nP -iTCP -sTCP:LISTEN` 看、`kill <pid>` 停 —— 宿主模式没有 proot 那套登记表，`agent ps` 只会让你去用这些。\n\
+- 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
+- `agent` 命令（已在 PATH 里）能查看自己：`agent state|request|tools|session`、`agent browser`（核心自己起的无头 Chrome：navigate / get_backbone / click / type / screenshot，一条命令能连做多步；截图路径在返回里，用 read 看）、`agent search`（联网搜索）、`agent kill <pid>`（停掉一个后台进程）、`agent get|post`（直接调自己的接口），`agent help` 看全部。宿主模式没有 `agent command` / `agent open`（那是手机上的设备操作）；要给用户开网页或文件就用 `open`。\n\
 \n\
 回答要言简意赅。";
 
@@ -3066,29 +3094,47 @@ mod tests {
     /// 并且必须把「这台机器上没有沙箱」说清楚 —— 不然模型会照工具表去 `apk add`。
     #[test]
     fn the_host_prompt_is_also_frozen_and_warns_about_the_tool_table() {
-        assert!(!SYSTEM_PROMPT_HOST.contains('{'), "被插值了");
-        for dynamic in ["/home/", "/tmp/", "rootfs", "Arch", "Ubuntu"] {
+        for (os, p) in [
+            ("linux", SYSTEM_PROMPT_HOST_LINUX),
+            ("macos", SYSTEM_PROMPT_HOST_MACOS),
+        ] {
+            assert!(!p.contains('{'), "{os}: 被插值了");
+            for dynamic in ["/home/", "/Users/", "/tmp/", "rootfs", "Arch", "Ubuntu"] {
+                assert!(
+                    !p.contains(dynamic),
+                    "{os}: 宿主提示词里不该出现这台机器的具体信息: {dynamic}"
+                );
+            }
             assert!(
-                !SYSTEM_PROMPT_HOST.contains(dynamic),
-                "宿主提示词里不该出现这台机器的具体信息: {dynamic}"
+                p.contains("Alpine") && p.contains("apk add"),
+                "{os}: 工具表还在说 Alpine 沙箱，宿主提示词必须把那句话挑明"
+            );
+            assert!(
+                p.contains("pgrep"),
+                "{os}: 宿主模式 `agent ps` 是空的，得让模型去用真的 ps"
+            );
+            assert!(
+                p.contains("setsid"),
+                "{os}: 后台常驻服务那条路（工具表里写了）在宿主模式同样适用，要说清"
+            );
+            assert!(p.contains("agent search"), "{os}: 联网搜索要靠它");
+            assert!(
+                p.contains("agent browser"),
+                "{os}: 桌面上浏览器是有的（核心自己起无头 Chrome），别让模型以为没有"
             );
         }
-        assert!(
-            SYSTEM_PROMPT_HOST.contains("Alpine") && SYSTEM_PROMPT_HOST.contains("apk add"),
-            "工具表还在说 Alpine 沙箱，宿主提示词必须把那句话挑明"
-        );
-        assert!(
-            SYSTEM_PROMPT_HOST.contains("pgrep"),
-            "宿主模式 `agent ps` 是空的，得让模型去用真的 ps"
-        );
-        assert!(
-            SYSTEM_PROMPT_HOST.contains("setsid"),
-            "后台常驻服务那条路（工具表里写了）在宿主模式同样适用，要说清"
-        );
-        assert!(
-            SYSTEM_PROMPT_HOST.contains("agent search"),
-            "联网搜索要靠它"
-        );
+        // 各自系统上不存在的命令不能出现
+        assert!(!SYSTEM_PROMPT_HOST_MACOS.contains("ss -ltnp"), "macOS 没有 ss");
+        assert!(!SYSTEM_PROMPT_HOST_MACOS.contains("pgrep -af"), "BSD pgrep 没有 -a");
+        assert!(!SYSTEM_PROMPT_HOST_MACOS.contains("xdg-open"));
+        assert!(!SYSTEM_PROMPT_HOST_LINUX.contains("brew"));
+        // 编译目标选对了那份
+        let expected = if cfg!(target_os = "macos") {
+            SYSTEM_PROMPT_HOST_MACOS
+        } else {
+            SYSTEM_PROMPT_HOST_LINUX
+        };
+        assert_eq!(SYSTEM_PROMPT_HOST, expected);
     }
 
     #[test]

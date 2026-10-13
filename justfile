@@ -66,7 +66,8 @@ dev:
 #   AGENT_HOST_WORKSPACE="$PWD" just dev-host     # 你当前那个目录
 #   AGENT_HOST_WORKSPACE=~/work just dev-host      # 或直接给绝对路径
 #
-# 模型的改动是**真的**，没有回收站；要原地验证大改动就用 `just dev`（沙箱）。
+# 模型的改动是**真的**，没有回收站；要原地验证大改动就用 `just dev`（沙箱，仅 Linux）。
+# macOS 上只有这一种（docs/11 的「macOS」一节）。
 dev-host:
     #!/usr/bin/env bash
     set -a; [ -f .env.local ] && . ./.env.local; set +a
