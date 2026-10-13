@@ -415,18 +415,20 @@ class BrowserController(private val app: Application) : BrowserHost {
     /**
      * 面板上点了某个标签。**必须主线程调**（点它的地方就是主线程）。
      *
-     * agent 正在跑动作时忽略这次点击（tryLock 拿不到就返回）—— 那时的页面
-     * 是它在操作，半路把当前标签换掉会让它的下一步落在错的页上。
+     * agent 正在跑动作时忽略这次点击（tryLock 拿不到就返回 false，面板据此
+     * 提示一句）—— 那时的页面是它在操作，半路把当前标签换掉会让它的下一步
+     * 落在错的页上。
      */
-    fun selectTabFromUi(idx: Int) {
+    fun selectTabFromUi(idx: Int): Boolean {
         onMainThread()
-        if (!lock.tryLock()) return
+        if (!lock.tryLock()) return false
         try {
             setCurrent(idx)
             refreshAttached()
         } finally {
             lock.unlock()
         }
+        return true
     }
 
     /** 面板正挂着的容器（没有就是 null）。**主线程独占**。 */

@@ -236,8 +236,21 @@ agent 有一只自己的无头 WebView（第 2 节），而**同一个实例**�
 
 **为什么是原生 View 而不是页面里的一块 HTML**：要显示的是另一只真 WebView，
 而 WebView 不能嵌在网页里。所以这一层盖在 UI WebView 上面（`FrameLayout`
-兄弟，平时 `GONE`，常态零开销）。头部是原生 TextView：标题 / URL / 状态
-（`空闲` 或 `agent 正在操作…`，半秒刷一次）+ 关闭按钮。
+兄弟，平时 `GONE`，常态零开销）。实现在 `BrowserPanel.kt`。
+
+**长相和手感照抄页面里的查看器**（`Viewer.svelte`）—— 同一个 App 里看沙箱网页
+和看 agent 的浏览器是同一类事。以前它是另一套样子（从底下升上来、右上角「关闭」、
+两行小字头），和外层一眼就不像一家的。现在：顶栏 36dp + 状态栏（`--hdr`）、
+左边返回箭头（`Icon` 的 `back` 路径）+ 16sp 中粗标题（页面标题，没有就用 URL）、
+agent 在动作时右边一行小字「agent 操作中」；内容区上沿一条分隔线；从右滑入
+300ms quintOut，退场从当前位置接着滑；按住顶栏往右拖关闭（`lib/drag.ts`
+同一套松手判定，拖了一半松手按 `RELEASE` 弹回）。和页面一样没有点按反馈。
+这些数都是从 web 那边抄的，改那边就要改这边。
+
+**标签条**：药丸样式（`rounded-full bg-control`），多了能横着滑。点了之后标签条
+和标题**立刻**更新、只改高亮不重建 —— 以前要等下一拍 500ms 轮询才重建整排，
+页面已经切过去了标签条还停在原处，看着就是卡。agent 正在动作时点击会被拒绝
+（换掉当前标签它的下一步就落错页），现在会提示一句，不再静默无反应。
 
 两个入口：
 
@@ -261,7 +274,9 @@ agent 有一只自己的无头 WebView（第 2 节），而**同一个实例**�
 细节：
 
 - **返回键**：面板开着时先关面板（页面的返回回调用 `PRIORITY_DEFAULT`，
-  面板用 `PRIORITY_OVERLAY`，优先级天然更高）。API 33 以下走 `onBackPressed`。
+  面板用 `PRIORITY_OVERLAY`，优先级天然更高）。**Android 14+ 跟手**
+  （`OnBackAnimationCallback`）：手势进度直接当位移，和页面覆盖层一样；撤回
+  弹回原位。API 33 只有松手关；33 以下走 `onBackPressed`。
 - **安全区**：头让开状态栏、底部让开手势条。insets 三个来源依次回退
   （监听器 → 面板自己的 → Activity 的），因为面板 `GONE` 时 `rootWindowInsets`
   可能是 null。
