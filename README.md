@@ -15,6 +15,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | `android/` 壳 | ✅ **真机验证通过** |
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
 | Linux 沙箱 | ✅ **Alpine 3.21 aarch64 在真机上跑起来**，`apk add` 可用 |
+| 桌面宿主模式 | ✅ `just dev-host`：不套沙箱，`bash`/`read`/`edit` 直接作用在这台机器上（[docs/11](docs/11-host-mode.md)） |
 | 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI（读 UI 树那套已删，见下） |
 | Prompt cache | ✅ 实测命中 73–87% |
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
@@ -42,13 +43,19 @@ chmod 600 .env.local
 
 # 3. 构建前端 + 起核心
 just web-build
-just dev
+just dev        # 沙箱里跑：bash 在 Alpine rootfs 里，改不到你的机器
+# just dev-host  # 宿主模式：没有沙箱，bash / read / edit 直接作用在这台机器上
 
 # 4. 另开一个终端，让 agent 干活
 python3 scripts/agentctl.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"
 ```
 
 打开 <http://127.0.0.1:8787> 就是完整 App —— 和手机上 WebView 看到的是同一份东西。
+
+**想直接用这台机器**（不套沙箱）：`just dev-host` —— `bash` / `read` / `edit`
+改的就是本机真文件；cwd（`/workspace` 的落点）默认是这个仓库，
+`AGENT_HOST_WORKSPACE="$PWD" just dev-host` 可以换成现在这个目录。
+差别、代价和实现见 [docs/11-host-mode.md](docs/11-host-mode.md)。
 
 对**手机上**跑着的那个（不用重装 APK、也不用手点手机屏幕）：
 
@@ -152,12 +159,14 @@ App 随时被杀都没关系。
 | [docs/08-browser.md](docs/08-browser.md) | agent 的浏览器：无头 WebView、看板、截图 |
 | [docs/09-search.md](docs/09-search.md) | 联网搜索：Exa 的两条路、为什么不要钱 |
 | [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md) | **工具表为什么只有三个**：判据、实测、加能力的步骤 |
+| [docs/11-host-mode.md](docs/11-host-mode.md) | **宿主模式**：桌面上不套沙箱，直接用这台机器（怎么做的、代价） |
 
 ## 脚本
 
 | 命令 | 作用 |
 |---|---|
 | `just dev` | 起核心（桌面，mock 设备 + 本地 rootfs） |
+| `just dev-host` | 起核心（桌面**宿主模式**：没有沙箱，直接跑在这台机器上） |
 | `just web-dev` | 起 Vite（`/api` 代理到核心） |
 | `just test` | Rust 测试 |
 | `just smoke` | 端到端：一句话 → 工具执行 → 复述 |

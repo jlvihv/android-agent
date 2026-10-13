@@ -639,6 +639,22 @@ pub const SYSTEM_PROMPT: &str = "\
 \n\
 回答要言简意赅。";
 
+/// 宿主模式（桌面原生，见 `linux::LinuxSandbox::host`）的系统提示词。
+///
+/// 和 `SYSTEM_PROMPT` 一样是**静态常量**（理由见上），两个部署各用一份；
+/// 选哪份看当前沙箱是不是宿主模式（`AppState::system_prompt`）。两份的差别
+/// 只在「在哪跑、有哪些门」那几句 —— 工具表和其余规则必须一字不差，
+/// 否则两边干活的方式会慢慢漂。
+pub const SYSTEM_PROMPT_HOST: &str = "\
+你是运行在一台 Linux 电脑上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。\n\
+\n\
+- cwd 是启动核心时的那个目录，同一个目录也以 /workspace 出现（相对路径按它算）。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。\n\
+- 工具表里提到「Alpine Linux 沙箱」「已预装 …」「apk add」的那几句是**手机版**的写法，宿主模式不适用：用这台机器上已经有的工具，装东西用它的包管理器（pacman/apt/dnf/brew…）或 venv。后台常驻服务同样用 `setsid <命令> > 日志 2>&1 &` 放（能活过这次调用），收场用 `ps` / `pgrep -af` / `ss -ltnp` 看、`kill <pid>` 停 —— 宿主模式没有 proot 那套登记表，`agent ps` 只会让你去用这些。\n\
+- 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
+- `agent` 命令（已在 PATH 里）能查看自己：`agent state|request|tools|session`、`agent search`（联网搜索）、`agent kill <pid>`（停掉一个后台进程）、`agent get|post`（直接调自己的接口），`agent help` 看全部。宿主模式没有 `agent command`（那是手机上的设备操作）和 `agent browser`（要手机上的 WebView）。\n\
+\n\
+回答要言简意赅。";
+
 /// 回合被打断时留下的工具调用结果。
 ///
 /// 正常情况下停止会把没跑完的调用补上结果（见 `drive`），这里是兜底：
@@ -3042,6 +3058,35 @@ mod tests {
                 "system prompt 里不该出现运行时才知道的内容: {dynamic}"
             );
         }
+    }
+
+    /// 宿主模式那份也是冻结常量（同一个理由：提示词是要缓存的**前缀**），
+    /// 并且必须把「这台机器上没有沙箱」说清楚 —— 不然模型会照工具表去 `apk add`。
+    #[test]
+    fn the_host_prompt_is_also_frozen_and_warns_about_the_tool_table() {
+        assert!(!SYSTEM_PROMPT_HOST.contains('{'), "被插值了");
+        for dynamic in ["/home/", "/tmp/", "rootfs", "Arch", "Ubuntu"] {
+            assert!(
+                !SYSTEM_PROMPT_HOST.contains(dynamic),
+                "宿主提示词里不该出现这台机器的具体信息: {dynamic}"
+            );
+        }
+        assert!(
+            SYSTEM_PROMPT_HOST.contains("Alpine") && SYSTEM_PROMPT_HOST.contains("apk add"),
+            "工具表还在说 Alpine 沙箱，宿主提示词必须把那句话挑明"
+        );
+        assert!(
+            SYSTEM_PROMPT_HOST.contains("pgrep"),
+            "宿主模式 `agent ps` 是空的，得让模型去用真的 ps"
+        );
+        assert!(
+            SYSTEM_PROMPT_HOST.contains("setsid"),
+            "后台常驻服务那条路（工具表里写了）在宿主模式同样适用，要说清"
+        );
+        assert!(
+            SYSTEM_PROMPT_HOST.contains("agent search"),
+            "联网搜索要靠它"
+        );
     }
 
     #[test]

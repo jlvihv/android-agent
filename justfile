@@ -55,6 +55,29 @@ dev:
     export AGENT_LINUX_PROOT="${AGENT_LINUX_PROOT:-$(command -v proot || echo proot)}"
     cargo run --manifest-path {{core}}/Cargo.toml --bin agent-dev
 
+# 起核心：**宿主模式**（桌面原生，没有沙箱）
+#
+# 和 `just dev` 同一份东西，区别只在 `bash` 跑在哪：这里是**这台机器本身**——
+# `read` / `edit` 改的是真文件，`bash` 用的是你的 PATH / 你的工具。
+#
+# cwd（＝ /workspace 的落点）默认是 justfile 所在的目录（`just` 会把 cwd
+# 设到这里），也就是这个仓库。换成别处：
+#
+#   AGENT_HOST_WORKSPACE="$PWD" just dev-host     # 你当前那个目录
+#   AGENT_HOST_WORKSPACE=~/work just dev-host      # 或直接给绝对路径
+#
+# 模型的改动是**真的**，没有回收站；要原地验证大改动就用 `just dev`（沙箱）。
+dev-host:
+    #!/usr/bin/env bash
+    set -a; [ -f .env.local ] && . ./.env.local; set +a
+    export AGENT_LLM_API_KEY="${AGENT_LLM_API_KEY:-${OPENCODE_API_KEY:-}}"
+    export AGENT_LLM_BASE_URL="${AGENT_LLM_BASE_URL:-${OPENCODE_BASE_URL:-}}"
+    export AGENT_LLM_MODEL="${AGENT_LLM_MODEL:-${OPENCODE_MODEL:-}}"
+    export AGENT_LLM_NAME="${AGENT_LLM_NAME:-opencode-go}"
+    export AGENT_LINUX_HOST=1
+    export AGENT_HOST_WORKSPACE="${AGENT_HOST_WORKSPACE:-$PWD}"
+    cargo run --manifest-path {{core}}/Cargo.toml --bin agent-dev
+
 # --- Web -------------------------------------------------------------------
 
 web-install:

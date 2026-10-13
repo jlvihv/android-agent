@@ -294,10 +294,17 @@ impl Core {
     ///    （[`CancelBrowserOnDrop`]）：光丢 future 的话，那个阻塞线程还攥着
     ///    Kotlin 侧的动作锁继续跑，下一个动作得排在它后面。
     pub async fn browser(&self, action_json: &str) -> anyhow::Result<serde_json::Value> {
-        let host = self
-            .state
-            .browser()
-            .ok_or_else(|| anyhow::anyhow!("浏览器不可用（壳没接上）"))?;
+        let host = self.state.browser().ok_or_else(|| {
+            // 桌面宿主模式：不是「壳没接上」，是还没写这个后端
+            let host_mode = self.state.linux().map(|s| s.is_host()).unwrap_or(false);
+            if host_mode {
+                anyhow::anyhow!(
+                    "浏览器不可用：宿主模式还没接浏览器后端（要取网页就用 bash 里的 curl，或自己起个无头浏览器）"
+                )
+            } else {
+                anyhow::anyhow!("浏览器不可用（壳没接上）")
+            }
+        })?;
         let mut cancel = CancelBrowserOnDrop(Some(host.clone()));
         // 沙箱里的文件（`sandbox:/…`、绝对路径）→ `sandbox.localhost` 上的 URL：
         // AI 写完网页能自己开来看。回来的结果再改写回 `sandbox:`

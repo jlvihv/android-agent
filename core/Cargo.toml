@@ -73,6 +73,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 # 杀命令的**进程组**（`kill(-pgid, …)`）。tokio 的 `Child` 只能杀 proot 自己，
 # 而 guest 进程是独立的宿主进程 —— 见 linux.rs 的 `CommandGuard`。
+# （宿主模式也走它：那边没有 proot，但「命令自己的进程组」是同一个形状。）
 libc = "0.2"
 # 决策 D2：正向绑定 + 反向 callback，不手写 JNI
 uniffi = { version = "0.32", features = ["tokio"] }

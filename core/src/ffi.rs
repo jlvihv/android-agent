@@ -218,6 +218,7 @@ impl AgentCore {
         let cfg = SandboxConfig {
             proot: native.join("libproot.so"),
             rootfs,
+            host: false,
             binds: Vec::new(),
             tmp: Some(std::path::Path::new(&env.cache_dir).join("proot-tmp")),
             // ⚠️ 安卓上这两个必须指到 nativeLibraryDir。

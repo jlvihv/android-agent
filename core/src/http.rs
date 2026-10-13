@@ -230,6 +230,7 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "device": dev.map(|d| d.name()),
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
+            "host": s.is_host(),
         })),
         // 只报“配没配”，不泄 key
         "llm": provider.map(|p| json!({
@@ -1333,6 +1334,7 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "sessions": sessions,
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
+            "host": s.is_host(),
             "sharedStorage": s.has_shared_storage(),
         })),
         // 持久化目录（安卓上是 <filesDir>）。调试时要 adb pull 会话库 /
@@ -2164,6 +2166,7 @@ mod tests {
             crate::linux::SandboxConfig {
                 proot: "/nonexistent/proot".into(),
                 rootfs: root.clone(),
+                host: false,
                 binds: vec![],
                 tmp: None,
                 dns: vec![],

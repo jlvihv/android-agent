@@ -827,15 +827,34 @@ impl AppState {
 
     /// 当前生效的系统提示词。
     ///
-    /// 默认是编译进去的 `SYSTEM_PROMPT`；被 `/api/debug/system-prompt` 覆盖过
-    /// 就返回那一份。`Cow` 是为了没覆盖时**不拷贝**那个常量。
+    /// 默认是编译进去的那份；被 `/api/debug/system-prompt` 覆盖过就返回那一份。
+    /// `Cow` 是为了没覆盖时**不拷贝**那个常量。
+    ///
+    /// 编译进去的有两份，靠沙箱是不是宿主模式选（桌面原生 vs 安卓手机，
+    /// 见 `agent::SYSTEM_PROMPT_HOST`）。同一个实例上不会中途换 ——
+    /// 前缀缓存的一个字节都不能变。
     pub fn system_prompt(&self) -> Cow<'static, str> {
         match self.system_prompt.read() {
             Ok(g) => match &*g {
                 Some(s) => Cow::Owned(s.clone()),
-                None => Cow::Borrowed(crate::agent::SYSTEM_PROMPT),
+                None => Cow::Borrowed(self.builtin_prompt()),
             },
-            Err(_) => Cow::Borrowed(crate::agent::SYSTEM_PROMPT),
+            Err(_) => Cow::Borrowed(self.builtin_prompt()),
+        }
+    }
+
+    /// 编译进去的那份提示词（没被运行时覆盖时用）。
+    fn builtin_prompt(&self) -> &'static str {
+        let host = self
+            .linux
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.is_host()))
+            .unwrap_or(false);
+        if host {
+            crate::agent::SYSTEM_PROMPT_HOST
+        } else {
+            crate::agent::SYSTEM_PROMPT
         }
     }
 
@@ -1209,6 +1228,27 @@ mod tests {
         let d = std::env::temp_dir().join(format!("agent-state-{tag}-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// 编译进去的系统提示词跟着沙箱形态走：安卓/沙箱一份，桌面宿主模式一份。
+    ///
+    /// 两份都是常量，所以同一个实例上**不会**中途换（前缀缓存一个字节都不能变）；
+    /// 这里只是把「哪份对应哪种形态」钉住。
+    #[test]
+    fn the_builtin_prompt_follows_the_sandbox_flavour() {
+        let st = AppState::new();
+        assert_eq!(
+            st.system_prompt(),
+            crate::agent::SYSTEM_PROMPT,
+            "还没有沙箱时（安卓 boot 阶段 / 纯 Rust 环境）用手机那份"
+        );
+
+        st.set_linux(Arc::new(LinuxSandbox::host(std::env::temp_dir())));
+        assert_eq!(st.system_prompt(), crate::agent::SYSTEM_PROMPT_HOST);
+
+        // 运行时覆盖照旧最高优先（`/api/debug/system-prompt` 调提示词那条路）
+        st.set_system_prompt(Some("改过的".into()));
+        assert_eq!(st.system_prompt(), "改过的");
     }
 
     /// 老版本把 provider（含明文 key）存在 llm.json：搬进库，然后删掉文件。

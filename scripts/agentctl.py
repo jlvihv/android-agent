@@ -680,10 +680,14 @@ def cmd_doctor(deep: bool = False) -> int:
     dev = h.get("device")
     row("设备", bool(dev), str(dev) if dev else "没有设备实现（真机上＝无障碍服务没连）")
 
-    rootfs = (h.get("linux") or {}).get("rootfs")
-    row("沙箱", bool(rootfs), str(rootfs) if rootfs else "没配（真机上要等 rootfs 解压完）")
+    linux = h.get("linux") or {}
+    rootfs = linux.get("rootfs")
+    if linux.get("host"):
+        row("沙箱", True, f"宿主模式（无沙箱）：bash 直接跑在 {rootfs or '/'} 这台机器上")
+    else:
+        row("沙箱", bool(rootfs), str(rootfs) if rootfs else "没配（真机上要等 rootfs 解压完）")
 
-    # 真跑一句。只读、无副作用 —— 但它是唯一能证明沙箱**真的能跑**的检查
+    # 真跑一句。只读、无副作用 —— 但它是唯一能证明命令通道**真的能跑**的检查
     t0 = time.time()
     code, d = call("POST", "/api/linux", {"command": "echo ok"}, timeout=180)
     dt = (time.time() - t0) * 1000
