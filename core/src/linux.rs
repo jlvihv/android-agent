@@ -437,7 +437,8 @@ impl OutputTap {
 
     /// 读端每收到一块数据就记一笔。
     fn note(&self) {
-        self.last_read_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+        self.last_read_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -568,11 +569,7 @@ fn scan_procs_in(proc_dir: &Path) -> Vec<RawProc> {
     };
     let mut out = Vec::new();
     for e in entries.flatten() {
-        let Some(pid) = e
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<i32>().ok())
-        else {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
             continue;
         };
         let dir = e.path();
@@ -842,7 +839,10 @@ impl ProcsReport {
                 s.push_str(&fmt_proc_line(e));
             }
             if self.orphans.len() > MAX_ORPHANS {
-                s.push_str(&format!("  … 还有 {} 个没列\n", self.orphans.len() - MAX_ORPHANS));
+                s.push_str(&format!(
+                    "  … 还有 {} 个没列\n",
+                    self.orphans.len() - MAX_ORPHANS
+                ));
             }
         }
         s.push_str("\n（pid / pgid 都是宿主 pid，跟沙箱里 `ps` 看到的一致）");
@@ -2164,7 +2164,11 @@ impl LinuxSandbox {
 
         // 管道可能还被沙箱里某条**刻意脱离**的进程占着（`setsid … &`）—— 别为
         // 它无限等，但也**别把已经读到的丢了**（见 `drain`）。
-        let grace = if timed_out { DRAIN_AFTER_KILL } else { Duration::ZERO };
+        let grace = if timed_out {
+            DRAIN_AFTER_KILL
+        } else {
+            Duration::ZERO
+        };
         let stdout = drain(out_task, &out_cap, grace).await;
         let stderr = drain(err_task, &err_cap, grace).await;
         let (stdout_text, t1) = stdout.render();
@@ -3042,10 +3046,21 @@ mod tests {
         let t = TempRoot::new("setsid");
         std::fs::write(t.dir.join("bin/setsid"), b"").unwrap();
         let argv = t.sandbox().command_line("echo hi", "/.agent-exit/x");
-        let setsid_at = argv.iter().position(|a| a == "/bin/setsid").expect("setsid 在里面");
+        let setsid_at = argv
+            .iter()
+            .position(|a| a == "/bin/setsid")
+            .expect("setsid 在里面");
         assert_eq!(
             &argv[setsid_at..],
-            &["/bin/setsid", "/bin/sh", "-c", argv[setsid_at + 3].as_str(), "sh", "echo hi", "/.agent-exit/x"],
+            &[
+                "/bin/setsid",
+                "/bin/sh",
+                "-c",
+                argv[setsid_at + 3].as_str(),
+                "sh",
+                "echo hi",
+                "/.agent-exit/x"
+            ],
             "setsid 得直接排在 runner 的 /bin/sh 前面: {argv:?}"
         );
         let runner = &argv[setsid_at + 3];
@@ -3204,7 +3219,10 @@ mod tests {
             &err_task,
         )
         .await;
-        assert!(matches!(done, Done::Status(0)), "得靠状态文件收工，不能等管道");
+        assert!(
+            matches!(done, Done::Status(0)),
+            "得靠状态文件收工，不能等管道"
+        );
         assert!(
             !out_task.is_finished(),
             "这会儿后台进程还拿着写端（形状才对）"
@@ -3315,7 +3333,10 @@ mod tests {
         );
         assert_eq!(parse_stat("garbage"), None);
         assert_eq!(parse_stat("1 (sh) Z 2 3"), Some(('Z', 2, 3)));
-        assert_eq!(parse_tracer("Name:\tsleep\nTracerPid:\t21707\nPPid:\t1\n"), Some(21707));
+        assert_eq!(
+            parse_tracer("Name:\tsleep\nTracerPid:\t21707\nPPid:\t1\n"),
+            Some(21707)
+        );
         assert_eq!(parse_tracer("TracerPid:\t0\n"), Some(0));
         assert_eq!(parse_tracer("Name:\tsleep\n"), None);
         // cmdline 是 NUL 分隔的 argv；超长按字符切（不能撞多字节边界）
@@ -3324,14 +3345,28 @@ mod tests {
         let long = format!("echo {}", "汉".repeat(200));
         let clipped = render_cmdline(long.as_bytes());
         assert!(clipped.ends_with('…'), "{clipped}");
-        assert!(clipped.chars().count() <= 121, "{}", clipped.chars().count());
+        assert!(
+            clipped.chars().count() <= 121,
+            "{}",
+            clipped.chars().count()
+        );
 
         // 一个假 /proc：两条看得见、一条 stat 缺失（进程刚退的样子）
         let t = TempRoot::new("procscan");
         let p = t.dir.join("proc");
         for (pid, stat, tracer, cmdline) in [
-            ("4211", "4211 (sh) S 1 4211 4211 0 -1", "21707", "sh\0-c\0sleep 1\0"),
-            ("4212", "4212 (sleep) S 4211 4211 4211 0 -1", "21707", "sleep\x001\x00"),
+            (
+                "4211",
+                "4211 (sh) S 1 4211 4211 0 -1",
+                "21707",
+                "sh\0-c\0sleep 1\0",
+            ),
+            (
+                "4212",
+                "4212 (sleep) S 4211 4211 4211 0 -1",
+                "21707",
+                "sleep\x001\x00",
+            ),
             ("4213", "4213 (gone) Z 1 4213 4213 0 -1", "0", ""),
         ] {
             let d = p.join(pid);
@@ -3369,13 +3404,41 @@ mod tests {
         sb.register_run(proot, "setsid sh -c 'while :; do date; done'", pid_file);
 
         let fake = vec![
-            RawProc { pid: 9001, ppid: 1, pgid: 9001, state: 'S', tracer: proot, cmdline: "sh -c while :; do date; done".into() },
+            RawProc {
+                pid: 9001,
+                ppid: 1,
+                pgid: 9001,
+                state: 'S',
+                tracer: proot,
+                cmdline: "sh -c while :; do date; done".into(),
+            },
             // 上个 App 生命留下的孤儿 proot（名字对得上）＋它名下的 tracee
-            RawProc { pid: 4242, ppid: 1, pgid: 4242, state: 'S', tracer: 0, cmdline: "proot -0 -r /files/rootfs /bin/sh -c sleep 9".into() },
-            RawProc { pid: 9002, ppid: 1, pgid: 9002, state: 'S', tracer: 4242, cmdline: "别人的".into() },
+            RawProc {
+                pid: 4242,
+                ppid: 1,
+                pgid: 4242,
+                state: 'S',
+                tracer: 0,
+                cmdline: "proot -0 -r /files/rootfs /bin/sh -c sleep 9".into(),
+            },
+            RawProc {
+                pid: 9002,
+                ppid: 1,
+                pgid: 9002,
+                state: 'S',
+                tracer: 4242,
+                cmdline: "别人的".into(),
+            },
             // **不是** proot 的 ppid==1 进程（桌面上那是 systemd 的服务）：
             // 列进「可以 kill」比漏掉糟得多 —— 这条就是那个坑的回归测试
-            RawProc { pid: 9100, ppid: 1, pgid: 9100, state: 'S', tracer: 0, cmdline: "/usr/lib/systemd/systemd-journald".into() },
+            RawProc {
+                pid: 9100,
+                ppid: 1,
+                pgid: 9100,
+                state: 'S',
+                tracer: 0,
+                cmdline: "/usr/lib/systemd/systemd-journald".into(),
+            },
         ];
         // 命令还在跑：进 running，不逐个列进程
         let r = sb.procs_with(fake.clone(), None);
@@ -3384,7 +3447,11 @@ mod tests {
         assert_eq!(r.running.len(), 1);
         assert_eq!(r.running[0].procs, 1);
         assert_eq!(r.running[0].pgid, proot);
-        assert!(r.running[0].command.contains("while :; do date"), "{:?}", r.running[0]);
+        assert!(
+            r.running[0].command.contains("while :; do date"),
+            "{:?}",
+            r.running[0]
+        );
         let text = r.to_text();
         assert!(text.contains("正在跑的命令"), "{text}");
         // 那条 tracer 不认识、父进程也没了的：进孤儿，不进「正在跑」
@@ -3397,7 +3464,11 @@ mod tests {
 
         // 调用方报上自己的进程组：不该在「正在跑」里看到自己
         let me = sb.procs_with(fake.clone(), Some(proot));
-        assert!(me.running.is_empty(), "自己那条命令得滤掉：{:?}", me.running);
+        assert!(
+            me.running.is_empty(),
+            "自己那条命令得滤掉：{:?}",
+            me.running
+        );
 
         // 命令结束了，它还活着 = 刻意脱离的常驻进程：能拿到 pid 就能杀
         sb.finish_run(proot);
@@ -3467,7 +3538,11 @@ mod tests {
             visible: 3,
             ..Default::default()
         };
-        assert!(empty.to_text().contains("没有别的东西在跑"), "{}", empty.to_text());
+        assert!(
+            empty.to_text().contains("没有别的东西在跑"),
+            "{}",
+            empty.to_text()
+        );
     }
 
     /// /proc 看不见任何东西时得**明说**，不能假装「什么都没有」。
@@ -3490,7 +3565,10 @@ mod tests {
             (s.host.clone(), s.pid_host.clone())
         }; // 出了作用域 = 取消（future 被丢掉）也会走同一条路
         assert!(!paths.0.exists(), "状态文件得清掉");
-        assert!(!paths.1.exists(), "pid 文件也得清掉，不然 .agent-exit 会越积越多");
+        assert!(
+            !paths.1.exists(),
+            "pid 文件也得清掉，不然 .agent-exit 会越积越多"
+        );
     }
 
     /// `pgid <= 1` 一个都不许发：`0` 是「我自己这个组」，`1` 是 init。
@@ -3508,7 +3586,11 @@ mod tests {
         let f = t.dir.join("s");
         assert_eq!(read_status_code(&f), None, "文件不在就得是 None");
         std::fs::write(&f, b"").unwrap();
-        assert_eq!(read_status_code(&f), None, "写了一半（空）也是 None，下一拍再读");
+        assert_eq!(
+            read_status_code(&f),
+            None,
+            "写了一半（空）也是 None，下一拍再读"
+        );
         std::fs::write(&f, b"boom").unwrap();
         assert_eq!(read_status_code(&f), None);
         std::fs::write(&f, b"0\n").unwrap();
@@ -3534,7 +3616,10 @@ mod tests {
         tap.note();
         assert!(!tap.quiet_for(Duration::from_millis(150)), "刚写过不算安静");
         std::thread::sleep(Duration::from_millis(180));
-        assert!(tap.quiet_for(Duration::from_millis(150)), "180ms 没动静就安静了");
+        assert!(
+            tap.quiet_for(Duration::from_millis(150)),
+            "180ms 没动静就安静了"
+        );
     }
 
     // --- 宿主模式（桌面原生，不套 proot）-----------------------------------
@@ -4364,12 +4449,21 @@ mod tests {
         // 浏览器现在是**唯一的门**（`browser` 工具删了），多标签那几个子命令
         // 得在 —— 它们曾经只加在工具那边，CLI 没跟上，于是 `new_tab URL`
         // 走进兜底分支把 URL 静默吃掉。
-        for sub in ["navigate", "new_tab", "list_tabs", "switch_tab", "close_tab"] {
+        for sub in [
+            "navigate",
+            "new_tab",
+            "list_tabs",
+            "switch_tab",
+            "close_tab",
+        ] {
             assert!(body.contains(sub), "浏览器子命令 {sub} 掉了");
         }
         // `agent ps` / `agent kill`：常驻服务能活过工具调用，就得能看/停它们
         assert!(body.contains("/api/procs"), "`agent ps` 的后端接口掉了");
-        assert!(body.contains("agent ps") && body.contains("agent kill"), "help 里得列出来");
+        assert!(
+            body.contains("agent ps") && body.contains("agent kill"),
+            "help 里得列出来"
+        );
         assert!(
             body.contains("kill -TERM") && body.contains("kill -KILL"),
             "`agent kill` 要先 TERM 再 KILL（给对 TERM 有反应的进程一个收尾机会）"

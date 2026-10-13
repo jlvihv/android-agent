@@ -330,17 +330,17 @@ struct ProcsQuery {
     self_pgid: Option<i32>,
 }
 
-async fn list_procs(
-    State(st): State<Arc<AppState>>,
-    Query(q): Query<ProcsQuery>,
-) -> Response {
+async fn list_procs(State(st): State<Arc<AppState>>, Query(q): Query<ProcsQuery>) -> Response {
     let Some(sb) = st.linux() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "Linux 沙箱未初始化").into_response();
     };
     let report = sb.procs(q.self_pgid);
     if q.format.as_deref() == Some("text") {
         return (
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             report.to_text(),
         )
             .into_response();
@@ -396,7 +396,10 @@ async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) ->
     let as_text = body.get("format").and_then(|v| v.as_str()) == Some("text");
     let text = |s: String| {
         (
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             s,
         )
             .into_response()

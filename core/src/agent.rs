@@ -3439,10 +3439,8 @@ mod tests {
             );
         }
         // 只属于它们的参数不能再出现在工具表里（工具表是可缓存前缀的一部分）
-        let dump = serde_json::to_string(
-            &tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>(),
-        )
-        .unwrap();
+        let dump = serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
+            .unwrap();
         for k in [
             "full_page",
             "max_depth",
