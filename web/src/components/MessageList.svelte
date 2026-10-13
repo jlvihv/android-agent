@@ -255,6 +255,22 @@
     return () => ro.disconnect();
   });
 
+  // —— 为什么不给消息加 `content-visibility: auto` ——
+  //
+  // 这里原来给「已经说完的」消息加 `content-visibility: auto` + `contain-
+  // intrinsic-size: auto 6rem`，省离屏消息的布局/绘制。问题是**加上类的那一帧**
+  // 会先把元素按 6rem 量一遍：回复很长时（它露在视口里的只是一小截），浏览器
+  // 判定这条「对用户不重要」，整条被跳过、塌成 96px，滚动容器的 scrollHeight
+  // 跟着缩，scrollTop 被夹到新上限 —— 视口就跳回这条消息的**开头**。
+  // 高度下一帧会恢复，**夹掉的 scrollTop 不会**。实测：
+  //
+  //   加类前 scrollTop=12371 scrollHeight=12956
+  //   加类后 scrollTop=1238  scrollHeight=1838   ← 跳回消息开头
+  //
+  // 而「说完话」正好就是 `msg.done` 翻 true、这条消息拿到类的那一刻，所以
+  // 每次回复结束都跳一次。省下的那点绘制不值这个 bug —— DOM 本来就只挂
+  // 最后 40 条（见下面的窗口化），封顶靠它，不靠 content-visibility。
+
   // 自己发了消息 / 切了会话 → 无论在哪都回到底部
   $effect(() => {
     void messages.length;
@@ -288,13 +304,13 @@
         <!-- 常见情况：只有正文，一层 <p> 就够。不为了「可能会有的附件」
              恒常多套一层 div（对齐 + 收缩 + 上限 84%）。 -->
         <p
-          class="msg self-end max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
+          class="self-end max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
         >
           {text}
         </p>
       {:else}
         <!-- 有附件：缩略图/药丸在上，正文气泡在下 -->
-        <div class="msg flex max-w-[84%] flex-col items-end gap-2 self-end">
+        <div class="flex max-w-[84%] flex-col items-end gap-2 self-end">
           <div class="flex flex-wrap justify-end gap-2">
             {#each atts as a (a.id)}
               {#if a.type === 'image'}
@@ -323,7 +339,7 @@
         </div>
       {/if}
     {:else}
-      <div class="flex flex-col gap-2.5 text-base leading-relaxed {msg.done ? 'msg' : ''}">
+      <div class="flex flex-col gap-2.5 text-base leading-relaxed">
         {#each msg.parts as part, i (i)}
           {#if part.type === 'text'}
             <Markdown text={part.text} />
@@ -370,16 +386,6 @@
   {/each}
 </div>
 </div>
-
-<style>
-  /* 屏幕外的消息跳过布局和绘制。长对话里这是划动掉帧的大头。
-     auto 让浏览器记住渲染过的真实高度，翻回来不会跳。
-     正在流式的那条不加 —— 它一直在变。 */
-  .msg {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 6rem;
-  }
-</style>
 
 {#snippet fields(title: string, list: { key: string; text: string; block: boolean }[])}
   <div class="flex flex-col gap-1.5">
