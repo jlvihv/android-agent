@@ -8,7 +8,18 @@
    */
   import { untrack } from 'svelte';
   import { store } from './lib/store.svelte.ts';
-  import { consume, streamFrom, type Message, type Part, type Upload } from './lib/sse';
+  import {
+    consume,
+    streamFrom,
+    onUsage,
+    cachedTokens,
+    type Message,
+    type Part,
+    type Upload,
+    type Usage,
+    type UsageTotals,
+    type SessionUsage,
+  } from './lib/sse';
   import { uid } from './lib/uid';
   import Icon from './components/Icon.svelte';
   import Composer from './components/Composer.svelte';
@@ -50,6 +61,40 @@
   let queue = $state<Queued[]>([]);
   /** 正在把队列里的一条发出去（挡住重入：effect / 流结束回调会重复触发） */
   let flushing = false;
+
+  /**
+   * 本会话的 token 用量（输入框里那个上下文圆环）。
+   *
+   * 两个来源：流里的 `data-usage`（每步结束一条，实时）+ `/api/session` 的
+   * `usage`（刷新 / 切会话回来时的基线）。累计值以服务端为准 —— 流里那些
+   * 增量只是两次拉取之间的临时账，下一次响应整份换掉（两边数的是同一批
+   * 步骤，对得上）。
+   */
+  let usage = $state<SessionUsage | null>(null);
+
+  // 圆环的分母：模型窗口。清单是启动时就拉好的（见下面的 models.load）
+  let ctxWindow = $derived(models.contextWindow(store.llm?.model));
+
+  /**
+   * 流里每跑完一步就报一次用量 —— 圆环实时跟着涨（一轮多步时也能看出来
+   * 上下文在长）。累计值在这里往上加；下一次 `/api/session` 回来整份换成
+   * 服务端的（两边数的是同一批步骤，对得上）。
+   */
+  $effect(() => {
+    onUsage((u) => {
+      const t = usage?.total ?? { input: 0, output: 0, cached: 0, calls: 0 };
+      usage = {
+        last: u,
+        total: {
+          input: t.input + u.prompt_tokens,
+          output: t.output + u.completion_tokens,
+          cached: t.cached + (cachedTokens(u) ?? 0),
+          calls: t.calls + 1,
+        },
+      };
+    });
+    return () => onUsage(null);
+  });
 
   /**
    * 本地正连着的那条流。**只属于当前看着的会话**。
@@ -167,10 +212,25 @@
          * 不再把整个回合重发一遍（见 core 的 `session_patch`）。
          */
         keepParts?: number | null;
+        /** token 用量（输入框那个圆环）。服务端那份是权威 */
+        usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
       };
       serverBusy = !!d.busy;
       // 服务端说没变：连 JSON 里都不带 messages，什么都不用做
       if (d.unchanged) return;
+      // 用量整份换成服务端的：它数的是这个会话的**全部**调用，而我们手上
+      // 那份只从页面加载后开始算。`last` 没有 = 这个会话还没跑过
+      usage = d.usage?.last
+        ? {
+            last: d.usage.last,
+            total: {
+              input: d.usage.input ?? 0,
+              output: d.usage.output ?? 0,
+              cached: d.usage.cached ?? 0,
+              calls: d.usage.calls ?? 0,
+            },
+          }
+        : null;
       rev = d.rev ?? '';
       // rev 的格式是 `会话id:消息数:更新时间`。会话 id 变了（切会话 / 重置）
       // 就不能按 id 复用旧消息 —— `u1` 这种 id 每条会话都会有。
@@ -260,6 +320,8 @@
     rev = '';
     sessionId = '';
     messages = [];
+    // 新会话还没跑过，用量也从零开始
+    usage = null;
     // 新会话在服务端**还不存在**，所以它一定没在跑 —— 不清的话会留着上一条
     // 会话的「服务端还在跑」，输入框要等一个轮询周期才解冻（而且队列会以为
     // 自己该排队）。
@@ -652,6 +714,8 @@
       <Composer
         bind:value={input}
         busy={busy || serverBusy}
+        {usage}
+        {ctxWindow}
         onsend={send}
         onstop={stop}
         onmodel={() => (sheet = true)}

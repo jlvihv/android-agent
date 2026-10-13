@@ -1247,6 +1247,10 @@ async fn get_session(
         return Json(json!({ "unchanged": true, "rev": rev, "busy": busy }));
     }
 
+    // token 用量（输入框那个上下文圆环）。它只在有 LLM 调用时才变，
+    // 而那种时候 rev 也一定变了 —— 所以 `unchanged` 那条路不用带它。
+    let usage = st.usage_of(&id);
+
     // 增量：客户端上次的 rev 里有 (会话 id, 已存消息数)。同一个会话、且它手上的
     // 消息数没超过当前（没被重置）→ 只补差的那段，见 `session_patch`。
     if let Some((cid, client_len)) = parse_rev(&q.rev) {
@@ -1260,6 +1264,7 @@ async fn get_session(
                 "append": true,
                 "replaceFrom": p.replace_from,
                 "keepParts": p.keep_parts,
+                "usage": usage,
             }));
         }
     }
@@ -1269,7 +1274,7 @@ async fn get_session(
 
     // busy 让前端知道「服务端还在跑」—— App 切到后台时 agent 不会停，
     // 切回来要能看出还在进行中，而不是以为卡住了。
-    Json(json!({ "messages": msgs, "rev": rev, "busy": busy }))
+    Json(json!({ "messages": msgs, "rev": rev, "busy": busy, "usage": usage }))
 }
 
 /// 从 rev 里解出 (会话 id, 已存消息数)。格式见 `session_rev`。

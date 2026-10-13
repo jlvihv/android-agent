@@ -275,6 +275,11 @@ pub struct AppState {
     /// 不靠这个 map 了。
     /// 值里带上传时刻：放太久没发的会被清掉（`add_pending_attachment`）。
     pub pending_attachments: Mutex<HashMap<String, (std::time::Instant, crate::agent::Attachment)>>,
+    /// 每个会话的 token 用量（输入框上那个上下文圆环）。**只在内存里**。
+    ///
+    /// 不落盘：它是「现在这个上下文用了多少」的仪表盘，重启后从下一次
+    /// LLM 调用重新数就行 —— 为它去动会话的存储格式不值当。
+    pub usage: Mutex<HashMap<String, UsageStats>>,
 }
 
 impl AppState {
@@ -305,6 +310,7 @@ impl AppState {
             vision: RwLock::new(None),
             files: RwLock::new(None),
             pending_attachments: Mutex::new(HashMap::new()),
+            usage: Mutex::new(HashMap::new()),
         })
     }
 
@@ -531,6 +537,7 @@ impl AppState {
     /// 结果写进一个已经不存在的会话里。
     pub async fn delete_session(&self, id: &str) {
         self.request_abort(id);
+        self.forget_usage(id);
         let gone = self.chat.write().await.delete(id);
         self.mark_sessions_dirty();
         if let Some(s) = gone {
@@ -560,6 +567,8 @@ impl AppState {
             old
         };
         self.mark_sessions_dirty();
+        // 历史清空了，用量里那个「当前上下文」也就不成立了
+        self.forget_usage(&id);
         let mut gone = crate::agent::ChatSession::new();
         gone.messages = old;
         self.forget_files(gone).await;
@@ -830,6 +839,25 @@ impl AppState {
                 true
             }
             None => false,
+        }
+    }
+
+    /// 记一次 LLM 调用的用量（`agent.rs` 每步结束时调）。
+    pub fn record_usage(&self, sid: &str, u: &crate::openai::Usage) {
+        if let Ok(mut g) = self.usage.lock() {
+            g.entry(sid.to_string()).or_default().add(u);
+        }
+    }
+
+    /// 这个会话的用量（没跑过就是 `None`）。
+    pub fn usage_of(&self, sid: &str) -> Option<UsageStats> {
+        self.usage.lock().ok().and_then(|g| g.get(sid).cloned())
+    }
+
+    /// 会话没了 / 被清空：它的用量也就不成立了。
+    pub fn forget_usage(&self, sid: &str) {
+        if let Ok(mut g) = self.usage.lock() {
+            g.remove(sid);
         }
     }
 
@@ -1182,6 +1210,35 @@ pub struct Auth {
     pub sandbox_key: String,
 }
 
+/// 一个会话的 token 用量 —— 输入框上那个上下文圆环和它点开的面板。
+///
+/// `last` 是「**现在这个上下文有多大**」：一次请求发出去的 `prompt_tokens`
+/// 就是当时整段历史 + 系统提示词 + 工具定义的大小，所以它比累计值更能说明
+/// 「还剩多少余量」。
+///
+/// 缓存字段有**两套写法**（OpenAI 系 / DeepSeek 系），归一在
+/// `Usage::cached_tokens()` 里。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UsageStats {
+    /// 最近一次 LLM 调用
+    pub last: Option<crate::openai::Usage>,
+    /// 本会话累计
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
+    pub calls: u64,
+}
+
+impl UsageStats {
+    fn add(&mut self, u: &crate::openai::Usage) {
+        self.last = Some(u.clone());
+        self.input += u.prompt_tokens as u64;
+        self.output += u.completion_tokens as u64;
+        self.cached += u.cached_tokens().unwrap_or(0) as u64;
+        self.calls += 1;
+    }
+}
+
 /// 一个正在跑的回合的停止开关。
 ///
 /// agent loop **没有轮数上限**，所以必须有一个真的能停下来、而不只是
@@ -1305,6 +1362,46 @@ mod tests {
         assert_eq!(st.auth().sandbox_key, key);
         assert!(token.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_is_per_session_and_accumulates() {
+        use crate::openai::{PromptTokensDetails, Usage};
+        let st = AppState::new();
+        assert!(st.usage_of("a").is_none(), "没跑过就是 None");
+
+        let u1 = Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            total_tokens: 1050,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(800),
+            }),
+            ..Default::default()
+        };
+        st.record_usage("a", &u1);
+        let s = st.usage_of("a").unwrap();
+        assert_eq!((s.input, s.output, s.cached, s.calls), (1000, 50, 800, 1));
+        assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1000);
+
+        // 第二步：last 换成新的，累计往上加
+        let u2 = Usage {
+            prompt_tokens: 1500,
+            completion_tokens: 20,
+            // DeepSeek 系那套写法，两套都要认
+            prompt_cache_hit_tokens: Some(1400),
+            ..Default::default()
+        };
+        st.record_usage("a", &u2);
+        let s = st.usage_of("a").unwrap();
+        assert_eq!((s.input, s.output, s.cached, s.calls), (2500, 70, 2200, 2));
+        assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1500);
+
+        assert!(st.usage_of("b").is_none(), "另外那个会话不受影响");
+
+        // 会话删了 / 被清空 → 它的用量不该留着
+        st.forget_usage("a");
+        assert!(st.usage_of("a").is_none());
     }
 
     #[test]

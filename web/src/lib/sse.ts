@@ -143,6 +143,73 @@ export async function* streamFrom(
 // Reducer：chunk 流 → 可渲染的消息
 // ---------------------------------------------------------------------------
 
+/**
+ * 一次 LLM 调用的 token 用量（核心 `data-usage` part 的形状，
+ * 见 `core/src/openai.rs` 的 `Usage`）。
+ *
+ * `prompt_tokens` = 这一次请求发出去的整段上下文，所以它同时就是
+ * 「现在上下文有多大」；`completion_tokens` 是这一步的输出。
+ */
+export type Usage = {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  /** 缓存命中：OpenAI 系、DeepSeek 系各一套写法 */
+  prompt_tokens_details?: { cached_tokens?: number | null } | null;
+  completion_tokens_details?: { reasoning_tokens?: number | null } | null;
+  prompt_cache_hit_tokens?: number | null;
+  prompt_cache_miss_tokens?: number | null;
+};
+
+/** 本会话累计的用量。 */
+export type UsageTotals = { input: number; output: number; cached: number; calls: number };
+
+/**
+ * 一个会话的用量：最近一次调用 + 累计。输入框上那个圆环读它，
+ * 形状和 `/api/session` 的 `usage` 字段一致（那边 `last` 可能缺）。
+ */
+export type SessionUsage = { last: Usage; total: UsageTotals };
+
+/**
+ * 命中的缓存 token 数。两套字段都接，同时出现取**大**的那个 ——
+ * 和核心 `Usage::cached_tokens()` 同一条规则（有些网关冷启动会先报
+ * `cached_tokens: 0` 而不是省略，用 `.or()` 会把真值吞掉）。
+ *
+ * provider 不报就返回 `null`（别把「不知道」说成 0）。
+ */
+export function cachedTokens(u: Usage): number | null {
+  const openai = u.prompt_tokens_details?.cached_tokens;
+  const deepseek = u.prompt_cache_hit_tokens;
+  if (openai != null && deepseek != null) return Math.max(openai, deepseek);
+  return openai ?? deepseek ?? null;
+}
+
+/** 推理 token（DeepSeek 系按 output 计费，所以它直接影响成本）。 */
+export function reasoningTokens(u: Usage): number | null {
+  return u.completion_tokens_details?.reasoning_tokens ?? null;
+}
+
+/** 缓存命中率 0..1；provider 不报就是 `null`。夹到 [0,1] —— `prompt_tokens`
+ *  含不含缓存部分各家定义不同，直接相除会出现 >100%。 */
+export function cacheHitRatio(u: Usage): number | null {
+  const hit = cachedTokens(u);
+  if (hit == null || !u.prompt_tokens) return null;
+  return Math.min(1, Math.max(0, hit / u.prompt_tokens));
+}
+
+/**
+ * 用量来了就喊一声。
+ *
+ * 输入框上那个上下文圆环靠它实时更新。为什么不让 UI 自己去扫 parts：
+ * `onUpdate` 是每个 delta 都调一次的，而 parts 里可能有几十条工具输出 ——
+ * 每来一个字都扫一遍太贵（这一块踩过坑，见 `summarize` 的注释）。
+ * 由 `applyChunk` 直接报一声是 O(1) 的。
+ */
+let usageSink: ((u: Usage) => void) | null = null;
+export function onUsage(fn: ((u: Usage) => void) | null): void {
+  usageSink = fn;
+}
+
 export type ToolPart = {
   type: 'tool';
   toolCallId: string;
@@ -309,6 +376,8 @@ export function applyChunk(msg: Message, c: UiChunk): void {
           name: c.type.slice(5),
           data: (c as { data: unknown }).data,
         });
+        // 用量单独报一声（圆环要实时的，不想让 UI 去扫 parts）
+        if (c.type === 'data-usage') usageSink?.(c.data as Usage);
       }
       break;
     }

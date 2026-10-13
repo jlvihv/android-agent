@@ -1925,6 +1925,8 @@ async fn stream_one(
                 ),
             }
             send(tx, sse::data_part("usage", serde_json::to_value(u)?)).await;
+            // 顺手记到这个会话上 —— 输入框那个上下文圆环读的是它
+            core.state.record_usage(sid, u);
         }
 
         let mut calls: Vec<RecordedToolCall> = acc

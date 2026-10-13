@@ -16,7 +16,7 @@
  * 和缓存上记的对不上就强制重拉 —— 这是唯一需要「真的再拉一次」的场合。
  */
 
-export type Model = { id: string; name: string };
+export type Model = { id: string; name: string; context_window?: number | null };
 /** 一家服务商的模型（`GET /api/models` 的 `groups`） */
 export type Group = { id: string; name: string; models: Model[]; error?: string };
 
@@ -61,6 +61,22 @@ class ModelCache {
    *  （清单是「各家有哪些模型」，跟选谁无关）。 */
   setProvider(id: string | null): void {
     this.provider = id;
+  }
+
+  /**
+   * 这个模型的上下文上限（输入框那圆环的分母）。`GET /api/models` 里
+   * models.dev 给了就有，没收录的模型就是 `null` —— 那时圆环只显示用量，
+   * 不编一个假上限出来。
+   *
+   * 先在当前那家找，再退到全场找：`provider` 可能是 null（老接口/未配置）。
+   */
+  contextWindow(modelId: string | undefined): number | null {
+    if (!modelId) return null;
+    const here = this.groups.find((g) => g.id === this.provider);
+    const found =
+      here?.models.find((m) => m.id === modelId) ??
+      this.groups.flatMap((g) => g.models).find((m) => m.id === modelId);
+    return found?.context_window ?? null;
   }
 
   async #fetch(rev: number): Promise<void> {

@@ -1,19 +1,26 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import AttachSheet from './AttachSheet.svelte';
+  import ContextMeter from './ContextMeter.svelte';
   import { store } from '../lib/store.svelte.ts';
   import { effortLabel } from '../lib/effort';
-  import type { Upload } from '../lib/sse';
+  import type { Upload, SessionUsage } from '../lib/sse';
 
   let {
     value = $bindable(''),
     busy = false,
+    usage = null,
+    ctxWindow = null,
     onsend,
     onstop,
     onmodel,
   }: {
     value: string;
     busy: boolean;
+    /** 本会话的 token 用量（输入框里的上下文圆环）。`null` = 还没跑过 */
+    usage?: SessionUsage | null;
+    /** 模型上下文上限（token）；不知道就是 null */
+    ctxWindow?: number | null;
     /** 发送时把这次要带的附件一起交出去（本组件随即清空胶囊） */
     onsend: (attachments: Upload[]) => void;
     onstop: () => void;
@@ -229,7 +236,7 @@
     <button
       onclick={onmodel}
       title="模型 / 思考强度"
-      class="flex h-9 max-w-[68%] shrink-0 items-center rounded-full bg-control px-4 text-sm
+      class="flex h-9 max-w-[52%] shrink-0 items-center rounded-full bg-control px-4 text-sm
              text-fg"
     >
       <span class="min-w-0 truncate">{store.llm?.model ?? '未配置模型'}</span>
@@ -237,6 +244,9 @@
         <span class="ml-1.5 shrink-0 text-muted">· {effortLabel(store.llm.reasoningEffort)}</span>
       {/if}
     </button>
+
+    <!-- 上下文用量：一个环，点开看明细（见 ContextMeter） -->
+    <ContextMeter {usage} {ctxWindow} />
 
     <!-- 右边一组：还在跑 → 停止键（左边）；有字/附件或空闲 → 发送键（可以两个同时在）。
          空闲时发送键也**一定在**（暗着）—— 不能让它一会出现一会消失。 -->
