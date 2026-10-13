@@ -29,6 +29,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/command", post(post_command))
         .route("/api/linux", post(bash_run))
         .route("/api/procs", get(list_procs))
+        .route("/api/pair", post(pair))
         .route("/api/alpine", get(alpine_status))
         .route("/api/alpine/upgrade", post(alpine_upgrade))
         .route("/api/browser", post(browser_action))
@@ -166,7 +167,8 @@ async fn require_auth(
     next: axum::middleware::Next,
 ) -> Response {
     // 沙箱文件在 handler 里核对路径上的钥匙；静态资源和 /auth 本身不设防
-    if !req.uri().path().starts_with("/api/") {
+    // `/api/pair` 是**换**凭据的那一步（拿配对码换 token），它自己核对配对码
+    if !req.uri().path().starts_with("/api/") || req.uri().path() == "/api/pair" {
         return next.run(req).await;
     }
     let Some(token) = st.auth().token else {
@@ -324,6 +326,37 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
 /// 靠 `ps` 自己认不出来），也才能在 /proc 被 hidepid 限制的机器上诚实地说
 /// 「看不见」。见 `linux::LinuxSandbox::procs`。
 ///
+#[derive(Deserialize)]
+struct PairBody {
+    code: String,
+}
+
+/// `POST /api/pair` `{code}` → `{token, id, name}`：手机第一次连这台电脑时拿配对码
+/// 换访问凭据（见 `desktop::Pairing`）。只有 `just dev-lan` 才开着（别的时候 404）。
+async fn pair(State(st): State<Arc<AppState>>, Json(b): Json<PairBody>) -> Response {
+    let Some(p) = st.pairing.read().ok().and_then(|g| g.clone()) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "这台电脑没开配对（just dev-lan 才有）",
+        )
+            .into_response();
+    };
+    if let Err(e) = p.check(&b.code) {
+        st.log("warn", format!("配对失败：{e}"));
+        return (StatusCode::FORBIDDEN, e).into_response();
+    }
+    let Some(token) = st.auth().token else {
+        return (StatusCode::CONFLICT, "核心没设凭据").into_response();
+    };
+    st.log("info", "一台设备配对成功");
+    Json(json!({
+        "token": token,
+        "id": st.instance_id(),
+        "name": crate::desktop::computer_name(),
+    }))
+    .into_response()
+}
+
 #[derive(Deserialize)]
 struct AlpineQuery {
     /// 顺手问一次官方最新版（要联网；不给就只回缓存的）

@@ -63,7 +63,25 @@ async fn run() -> anyhow::Result<()> {
         Some(t) => println!("  → http://127.0.0.1:{actual}/auth?t={t}"),
         None => println!("  → http://127.0.0.1:{actual}"),
     }
+    // 局域网：广播自己 + 配对码（手机 App 的「连接电脑」自动发现、第一次连时输码）。
+    // `_advert` 活到 main 结束：Drop 就停广播
+    let mut _advert = None;
     if lan {
+        let pairing = std::sync::Arc::new(agent_core::desktop::Pairing::new());
+        if let Ok(mut g) = core.state.pairing.write() {
+            *g = Some(pairing.clone());
+        }
+        let name = agent_core::desktop::computer_name();
+        _advert = agent_core::desktop::advertise(&name, actual, &core.state.instance_id());
+        println!(
+            "  → 手机 App：设置 → 连接电脑，点「{name}」，配对码 {}{}",
+            pairing.code(),
+            if _advert.is_some() {
+                ""
+            } else {
+                "（广播没起来，只能用下面的地址）"
+            }
+        );
         let ips: Vec<std::net::IpAddr> = if bind.is_unspecified() {
             lan_ips().into_iter().map(Into::into).collect()
         } else {

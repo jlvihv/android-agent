@@ -54,7 +54,42 @@ type BackHost = {
   connectRemote?: (url: string) => void;
   /** 回到手机自己的核心 */
   useLocal?: () => void;
+  /** 开始 / 停止在局域网里找电脑（找到的推给 `window.__coresFound`） */
+  startDiscovery?: () => void;
+  stopDiscovery?: () => void;
+  /** 点了找到的某台电脑（壳只认找到过的 id；配对 / 确认都是原生对话框） */
+  connectDiscovered?: (id: string) => void;
 };
+
+/** 壳推过来的一台电脑（见 MainActivity.pushCoresFound） */
+export type FoundCore = {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  /** 手机记着它的钥匙（点了直接连，不用再输配对码） */
+  paired: boolean;
+  /** 现在连着的就是它 */
+  current: boolean;
+};
+
+/**
+ * 在局域网里找电脑：`onFound` 每次拿到完整的列表。返回停止函数 ——
+ * 「连接电脑」那一栏挂上时开始找、卸掉时停，不常驻。
+ */
+export function discoverCores(onFound: (cores: FoundCore[]) => void): () => void {
+  const w = globalThis as { __coresFound?: (c: FoundCore[]) => void };
+  w.__coresFound = onFound;
+  host()?.startDiscovery?.();
+  return () => {
+    host()?.stopDiscovery?.();
+    if (w.__coresFound === onFound) delete w.__coresFound;
+  };
+}
+
+export function connectDiscoveredCore(id: string): void {
+  host()?.connectDiscovered?.(id);
+}
 const host = (): BackHost | undefined =>
   (globalThis as { AgentHost?: BackHost }).AgentHost;
 

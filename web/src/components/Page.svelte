@@ -58,6 +58,13 @@
     };
   }
 
+  /** 输入框拿到焦点：等键盘弹完（`--kb` 更新、底部留白撑开）再滚到中间 */
+  function revealFocused(e: FocusEvent) {
+    const t = e.target as HTMLElement | null;
+    if (!t || !t.matches('input, textarea')) return;
+    setTimeout(() => t.scrollIntoView({ block: 'center', behavior: 'smooth' }), 350);
+  }
+
   /** 从当前拖到的位置接着滑出去，不跳回原位再走 */
   function slideOut(_: Element) {
     const from = off;
@@ -87,8 +94,12 @@
     <span class="min-w-0 truncate text-base font-medium">{title}</span>
   </header>
 
+  <!-- 键盘：页面不跟着缩（见 main.ts，键盘浮在上面、高度在 `--kb`），所以底部
+       留出键盘那么高，再把聚焦的输入框滚到中间 —— 不然靠下的输入框（「连接电脑」
+       的地址、服务商的 Key）连同它的按钮都被键盘盖住（真机上踩到）。 -->
   <div
-    class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-2 pb-[max(1.5rem,env(safe-area-inset-bottom))]"
+    class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-2 pb-[max(1.5rem,env(safe-area-inset-bottom),calc(var(--kb,0px)+1.5rem))]"
+    onfocusin={revealFocused}
   >
     {@render children()}
   </div>

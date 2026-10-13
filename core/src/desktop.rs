@@ -38,6 +38,144 @@ pub fn data_root() -> PathBuf {
     base.join("android-agent")
 }
 
+// ---------------------------------------------------------------------------
+// 局域网：广播自己 + 配对（手机 App 的「连接电脑」用）
+// ---------------------------------------------------------------------------
+
+/// mDNS 服务类型。手机那边（`MainActivity` 的 NsdManager）找的就是它。
+pub const SERVICE: &str = "_agent-core._tcp";
+
+/// 输错几次就不再接受配对（直到核心重启）。6 位数字 = 一百万种，5 次猜中的概率
+/// 是二十万分之一。
+const PAIR_MAX_FAILS: u32 = 5;
+
+/// 一次性的配对码：手机第一次连这台电脑时输入它，换回访问凭据。
+///
+/// 为什么要这一步：自动发现只给得出「地址」，给不出 token —— 把 token 放进
+/// mDNS 的 TXT 记录等于广播给局域网里的所有人。参照安卓「无线调试」的配对：
+/// 电脑上显示一个码，人在手机上输一次，之后手机记住 token，再也不用输。
+pub struct Pairing {
+    code: String,
+    fails: std::sync::atomic::AtomicU32,
+}
+
+impl Default for Pairing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pairing {
+    pub fn new() -> Self {
+        let n = u32::from_le_bytes(
+            uuid::Uuid::new_v4().as_bytes()[..4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
+        Self {
+            code: format!("{:06}", n % 1_000_000),
+            fails: Default::default(),
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    /// 核对配对码。输错 `PAIR_MAX_FAILS` 次之后一律拒绝（防猜）。
+    pub fn check(&self, code: &str) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.fails.load(Ordering::Relaxed) >= PAIR_MAX_FAILS {
+            return Err("配对码输错太多次，已停用 —— 重启电脑上的核心会换一个新码".into());
+        }
+        let code = code.trim();
+        // 耗时和内容无关的比较（别让快慢泄露前几位）
+        let same = code.len() == self.code.len()
+            && code
+                .bytes()
+                .zip(self.code.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if same {
+            return Ok(());
+        }
+        let n = self.fails.fetch_add(1, Ordering::Relaxed) + 1;
+        Err(format!(
+            "配对码不对（还能试 {} 次）",
+            PAIR_MAX_FAILS.saturating_sub(n)
+        ))
+    }
+}
+
+/// 这台电脑给人看的名字（macOS 的「电脑名称」；Linux 用主机名）。
+pub fn computer_name() -> String {
+    if cfg!(target_os = "macos") {
+        if let Ok(o) = Proc::new("scutil").args(["--get", "ComputerName"]).output() {
+            let n = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if o.status.success() && !n.is_empty() {
+                return n;
+            }
+        }
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname 最多写 buf.len() 个字节
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0 {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let n = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+        if !n.is_empty() {
+            return n;
+        }
+    }
+    "电脑".into()
+}
+
+/// 正在广播的 mDNS 服务。`Drop` 就停（核心退出时不留一条指向死端口的广播）。
+pub struct Advert(std::process::Child);
+
+impl Drop for Advert {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// 在局域网里广播「这里有个核心」（mDNS / DNS-SD）。
+///
+/// 用系统自带的工具，不引 Rust 的 mDNS 库：macOS 是 `dns-sd`（mDNSResponder），
+/// Linux 是 `avahi-publish-service`。除了零依赖，更要紧的是**它们按网卡回答地址**
+/// —— 自己实现的话，开着 Clash TUN 的机器会把 198.18.x.x 那张虚拟网卡的地址也
+/// 广播出去，手机解析到它就连不上（打印地址时已经踩过一次同样的坑）。
+///
+/// TXT 里只有实例 id 和版本 —— **没有凭据**（见 `Pairing`）。
+/// 工具不在就返回 None（手动输入地址那条路照样能用）。
+pub fn advertise(name: &str, port: u16, id: &str) -> Option<Advert> {
+    let port = port.to_string();
+    let txt = [format!("id={id}"), format!("v={}", crate::VERSION)];
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Proc::new("dns-sd");
+        c.args(["-R", name, SERVICE, "local", &port]);
+        c
+    } else {
+        let mut c = Proc::new("avahi-publish-service");
+        c.args([name, SERVICE, &port]);
+        c
+    };
+    cmd.args(&txt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(child) => Some(Advert(child)),
+        Err(e) => {
+            tracing::warn!(
+                "没法在局域网里广播（{:?}: {e}）—— 手机上搜不到这台电脑，只能手动输地址",
+                cmd.get_program()
+            );
+            None
+        }
+    }
+}
+
 /// 这台电脑当设备用。
 pub struct HostDevice;
 
@@ -98,6 +236,29 @@ fn run(cmd: &mut Proc) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_codes_are_six_digits_and_lock_after_five_misses() {
+        let p = Pairing::new();
+        assert_eq!(p.code().len(), 6);
+        assert!(p.code().bytes().all(|b| b.is_ascii_digit()));
+        assert!(
+            p.check(&format!(" {} ", p.code())).is_ok(),
+            "首尾空格不算错"
+        );
+        let wrong = if p.code() == "000000" {
+            "111111"
+        } else {
+            "000000"
+        };
+        for _ in 0..PAIR_MAX_FAILS {
+            assert!(p.check(wrong).is_err());
+        }
+        assert!(
+            p.check(p.code()).unwrap_err().contains("停用"),
+            "输错太多次后对的也不行"
+        );
+    }
 
     #[test]
     fn it_refuses_phone_gestures_instead_of_pretending() {

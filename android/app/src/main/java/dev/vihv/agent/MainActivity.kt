@@ -49,6 +49,10 @@ class MainActivity : Activity() {
         private const val KEY_ASKED_NOTIF = "asked_notifications"
         /** 连着的电脑核心的地址（`http://192.168.x.x:8787/auth?t=…`）；没有 = 用手机自己的 */
         private const val KEY_REMOTE = "remote_core"
+        /** 连着的那台电脑的实例 id（自动发现连上的才有） */
+        private const val KEY_REMOTE_ID = "remote_core_id"
+        /** 配对过的电脑：`paired_<实例 id>` = 它的 token */
+        private const val PAIRED_PREFIX = "paired_"
         private const val REQ_STORAGE = 2
         /** 页面 `<input type=file>` 选文件 */
         private const val REQ_FILE = 3
@@ -87,6 +91,13 @@ class MainActivity : Activity() {
     /** 下一次页面加载完就清掉历史：切换核心之后，返回键不该退回另一台的页面 */
     private var clearHistoryOnLoad = false
 
+    /** 局域网里找电脑（「连接电脑」那一栏开着时才找，见 CoreDiscovery） */
+    private val discovery by lazy {
+        CoreDiscovery(this) { runOnUiThread { pushCoresFound() } }
+    }
+    /** 页面想让我们找（栏开着）。App 切后台时停、回来时按它接着找 */
+    private var discoveryWanted = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         edgeToEdge()
@@ -121,6 +132,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         current = this
+        if (discoveryWanted) discovery.start()
         // 从设置页回来时权限可能刚打开：重挂沙箱的 /sdcard 和 /workspace
         AgentApp.syncSharedStorage(this)
     }
@@ -141,6 +153,7 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         if (current === this) current = null
+        discovery.stop()
         super.onPause()
     }
 
@@ -302,6 +315,21 @@ class MainActivity : Activity() {
                 pushBrowserAvailable()
             }
 
+            /**
+             * 电脑不认手机记着的 token 了（电脑上换过库 / 换了 AGENT_TOKEN）：`/auth`
+             * 回 403。忘掉这把钥匙，提示重新配对 —— 不然每次启动都撞在同一面墙上。
+             */
+            override fun onReceivedHttpError(
+                view: WebView?,
+                request: android.webkit.WebResourceRequest?,
+                response: android.webkit.WebResourceResponse?,
+            ) {
+                val remote = remoteUrl() ?: return
+                if (request?.isForMainFrame != true || response?.statusCode != 403) return
+                remoteId()?.let { forgetPaired(it) }
+                setContentView(remoteErrorView(remote, "这台电脑不认手机记着的钥匙了（电脑上换过库？）—— 回到手机，在 设置 → 连接电脑 里点它重新配对。"))
+            }
+
             override fun onReceivedError(
                 view: WebView?,
                 request: android.webkit.WebResourceRequest?,
@@ -449,8 +477,114 @@ class MainActivity : Activity() {
         pushBrowserAvailable()
     }
 
+    private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
+
+    private fun remoteId(): String? = prefs().getString(KEY_REMOTE_ID, null)
+
+    private fun pairedToken(id: String): String? = prefs().getString(PAIRED_PREFIX + id, null)
+
+    private fun forgetPaired(id: String) {
+        prefs().edit().remove(PAIRED_PREFIX + id).apply()
+    }
+
+    /** 记下「现在连的是哪台」并切过去 */
+    private fun connectTo(url: String, id: String?) {
+        val e = prefs().edit().putString(KEY_REMOTE, url)
+        if (id != null) e.putString(KEY_REMOTE_ID, id) else e.remove(KEY_REMOTE_ID)
+        e.apply()
+        Log.i(TAG, "连接电脑上的核心：${Uri.parse(url).host}")
+        switchTo(url)
+    }
+
+    /** 把找到的电脑推给页面（`window.__coresFound`）：带上「配对过没有」「是不是正连着的」 */
+    private fun pushCoresFound() {
+        val arr = org.json.JSONArray()
+        val cur = remoteId()
+        for (f in discovery.current()) {
+            arr.put(
+                org.json.JSONObject()
+                    .put("id", f.id)
+                    .put("name", f.name)
+                    .put("host", f.host)
+                    .put("port", f.port)
+                    .put("paired", pairedToken(f.id) != null)
+                    .put("current", f.id == cur && remoteUrl() != null),
+            )
+        }
+        web?.evaluateJavascript("window.__coresFound && window.__coresFound($arr)", null)
+    }
+
+    /**
+     * 点了列表里的某台电脑。只认**真的找到过**的（按 id 查 discovery 的结果）——
+     * 页面给不了任意地址。配对过的：原生确认一下就连；没配对的：原生对话框里输
+     * 电脑终端上显示的 6 位配对码，换回 token 再连。两样都是原生的，理由见
+     * [confirmConnect]。
+     */
+    private fun pickDiscovered(id: String) {
+        val f = discovery.current().firstOrNull { it.id == id } ?: return
+        val base = "http://${f.host}:${f.port}"
+        val token = pairedToken(id)
+        if (token != null) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("连接到「${f.name}」？")
+                .setMessage("${f.host}:${f.port}\n\n之后界面、命令、文件都在那台电脑上。随时可以在 设置 → 连接电脑 里回到手机。")
+                .setPositiveButton("连接") { _, _ -> connectTo("$base/auth?t=$token", id) }
+                .setNegativeButton("取消", null)
+                .show()
+            return
+        }
+        val input = android.widget.EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            hint = "6 位配对码"
+            filters = arrayOf(android.text.InputFilter.LengthFilter(6))
+        }
+        val box = FrameLayout(this).apply {
+            setPadding(64, 16, 64, 0)
+            addView(input)
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("和「${f.name}」配对")
+            .setMessage("输入电脑终端上 just dev-lan 显示的配对码（只要输这一次）。")
+            .setView(box)
+            .setPositiveButton("配对") { _, _ -> pair(f, base, input.text.toString()) }
+            .setNegativeButton("取消", null)
+            .show()
+        input.requestFocus()
+    }
+
+    /** `POST /api/pair` 拿配对码换 token（网络不能上主线程） */
+    private fun pair(f: CoreDiscovery.Found, base: String, code: String) {
+        Thread {
+            val result = runCatching {
+                val c = java.net.URL("$base/api/pair").openConnection() as java.net.HttpURLConnection
+                c.requestMethod = "POST"
+                c.connectTimeout = 5000
+                c.readTimeout = 10000
+                c.doOutput = true
+                c.setRequestProperty("content-type", "application/json")
+                c.outputStream.use { it.write(org.json.JSONObject().put("code", code.trim()).toString().toByteArray()) }
+                val ok = c.responseCode == 200
+                val body = (if (ok) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+                if (!ok) error(body.ifBlank { "HTTP ${c.responseCode}" })
+                org.json.JSONObject(body)
+            }
+            runOnUiThread {
+                result
+                    .onSuccess { j ->
+                        val id = j.optString("id", f.id)
+                        val token = j.getString("token")
+                        prefs().edit().putString(PAIRED_PREFIX + id, token).apply()
+                        connectTo("$base/auth?t=$token", id)
+                    }
+                    .onFailure {
+                        android.widget.Toast.makeText(this, "配对失败：${it.message}", android.widget.Toast.LENGTH_LONG).show()
+                    }
+            }
+        }.start()
+    }
+
     private fun useLocalCore() {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_REMOTE).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_REMOTE).remove(KEY_REMOTE_ID).apply()
         Log.i(TAG, "回到手机自己的核心")
         switchTo(localUrl())
     }
@@ -476,11 +610,7 @@ class MainActivity : Activity() {
                 "$where\n\n之后界面、命令、文件都在那台电脑上（明文 HTTP，只在自己信得过的 Wi-Fi 里用）。" +
                     "随时可以在 设置 → 连接电脑 里回到手机。",
             )
-            .setPositiveButton("连接") { _, _ ->
-                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_REMOTE, uri.toString()).apply()
-                Log.i(TAG, "连接电脑上的核心：$where")
-                switchTo(uri.toString())
-            }
+            .setPositiveButton("连接") { _, _ -> connectTo(uri.toString(), null) }
             .setNegativeButton("取消", null)
             .show()
     }
@@ -749,6 +879,36 @@ class MainActivity : Activity() {
             runOnUiThread { confirmConnect(url) }
         }
 
+        /** 「连接电脑」那一栏打开了：开始在局域网里找（找到的推给 `window.__coresFound`） */
+        @JavascriptInterface
+        fun startDiscovery() {
+            runOnUiThread {
+                discoveryWanted = true
+                discovery.start()
+                pushCoresFound()
+            }
+        }
+
+        /** 那一栏关了：不找了 */
+        @JavascriptInterface
+        fun stopDiscovery() {
+            runOnUiThread {
+                discoveryWanted = false
+                discovery.stop()
+            }
+        }
+
+        /**
+         * 点了列表里的某台（只认找到过的 id，见 [pickDiscovered]）。
+         *
+         * 外面那个方法**不能也叫 connectDiscovered**：这是内部类，同名的话 lambda 里
+         * 解析到的是它自己 —— 无限递归、栈溢出闪退（真机上点「连接」就是这么崩的）。
+         */
+        @JavascriptInterface
+        fun connectDiscovered(id: String) {
+            runOnUiThread { pickDiscovered(id) }
+        }
+
         /** 设置 → 连接电脑 → 回到手机。没有风险，不用确认 */
         @JavascriptInterface
         fun useLocal() {
@@ -806,6 +966,7 @@ class MainActivity : Activity() {
         fileCallback?.onReceiveValue(null)
         fileCallback = null
         unregisterBackCallback()
+        discovery.stop()
         // 看板：把 agent 那只 WebView 摘下来，别让它挂在一个马上要销毁的容器上。
         // **不销毁它** —— 它属于应用进程，回合可能还在跑（见 BrowserController）。
         panel?.destroy()

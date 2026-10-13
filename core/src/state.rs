@@ -234,6 +234,8 @@ pub struct AppState {
     pub data_dir: RwLock<Option<std::path::PathBuf>>,
     /// 沙箱的 Alpine 升级（设置页里点的那个，见 `alpine`）
     pub alpine: crate::alpine::Upgrader,
+    /// 局域网配对码（只有桌面 `just dev-lan` 才有，见 `desktop::Pairing`）
+    pub pairing: RwLock<Option<Arc<crate::desktop::Pairing>>>,
     /// 会话库。`set_data_dir` 时打开。
     pub db: RwLock<Option<Arc<Db>>>,
     /// 会话已经从库里读进内存了。
@@ -301,6 +303,7 @@ impl AppState {
             model_lists: Mutex::new(HashMap::new()),
             data_dir: RwLock::new(None),
             alpine: Default::default(),
+            pairing: RwLock::new(None),
             sessions_loaded: AtomicBool::new(false),
             turns: Mutex::new(HashMap::new()),
             auth: RwLock::new(Auth {
@@ -770,6 +773,25 @@ impl AppState {
         if let Ok(mut g) = self.auth.write() {
             *g = auth;
         }
+    }
+
+    /// 这个核心实例的 id（存在库里，重启不变）。手机按它记住配对过的电脑 ——
+    /// IP 会变（DHCP），id 不变。没库的话每次启动现编一个。
+    pub fn instance_id(&self) -> String {
+        if let Some(db) = self.db() {
+            if let Ok(Some(v)) = db.get_meta("instance_id") {
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+            let v = random_secret();
+            if let Err(e) = db.set_meta("instance_id", &v) {
+                tracing::warn!("保存 instance_id 失败: {e:#}");
+            }
+            return v;
+        }
+        static EPHEMERAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        EPHEMERAL.get_or_init(random_secret).clone()
     }
 
     pub fn auth(&self) -> Auth {
