@@ -61,7 +61,13 @@ webpki-roots = "1"
 # `read` 工具读图片：解码 → 按 EXIF 转正 → 缩到 2000×2000 → 重编码。
 # 移植 OpenMinis 的 ImageReader.kt（那边用 Android BitmapFactory，这边纯 Rust）。
 # default-features = false：不要 rayon，也别把 avif/exr/tiff 那些拖进 Android 包。
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+#
+# 解码只留 png / jpeg / webp（2026-10-13 去掉 gif / bmp）：
+#   - 手机相册和截图实测就这三种（相机 jpeg、屏幕 png、Google 相册存的 webp）
+#   - gif / bmp 两个解码器在 .text 里占 ~90KB（cargo bloat）
+#   - 收到这两种格式不是“静默不支持”：`imaging` 会带着一句人话 400（见
+#     `upload_attachment` 的 Err 分支），界面把原因原样显示出来
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # 图片以 data URL 发出，直接 base64
 base64 = "0.22"
 
