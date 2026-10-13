@@ -19,6 +19,16 @@ class AgentApp : Application() {
     companion object {
         private const val TAG = "AgentApp"
 
+        /**
+         * 优先用的端口。占用了才退回系统分配。
+         *
+         * 为什么要固定：浏览器的源（origin）带端口。沙箱里的网页在
+         * `http://sandbox.localhost:<端口>` 这个源上跑（见 core 的 `http.rs`），
+         * 它的 localStorage / IndexedDB 是挂在源上的 —— 端口每次启动都换的话，
+         * 网页存的东西重启 App 就没了。App 自己（`127.0.0.1:<端口>`）也一样。
+         */
+        private const val PREFERRED_PORT = 47817
+
         @Volatile
         private var instance: AgentApp? = null
 
@@ -195,7 +205,14 @@ class AgentApp : Application() {
             Log.i(TAG, "agent token: $t")
         }
 
-        runCatching { port = core.start(0u.toUShort()).toInt() }
+        runCatching {
+            port = runCatching { core.start(PREFERRED_PORT.toUShort()).toInt() }
+                .getOrElse {
+                    // 被别的 App 占了：随便要一个（这次启动里网页的存储会换一份）
+                    Log.w(TAG, "端口 $PREFERRED_PORT 不可用（${it.message}），改用系统分配的")
+                    core.start(0u.toUShort()).toInt()
+                }
+        }
             .onSuccess {
                 Log.i(TAG, "WebView 应指向 http://127.0.0.1:$port")
                 // 把端口落到 files/port。调试时 `adb shell run-as <pkg> cat

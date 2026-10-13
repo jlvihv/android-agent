@@ -311,6 +311,23 @@ export function sandboxPath(guestPath: string): string {
 }
 
 /**
+ * 沙箱网页要在**另一个源**上打开：`sandbox.localhost:<同一个端口>`。
+ *
+ * 和 App（`127.0.0.1`）同源的话，页面里的脚本能带着 App 的凭据调 `/api`；
+ * 所以同源那份被服务端关进 opaque origin，localStorage 之类全不能用。换个源
+ * 就两头都好：页面有自己正常的源（存储能用），又碰不到 App 的凭据。见 core
+ * `http.rs` 的 `SANDBOX_HOST`。
+ *
+ * 只给**网页**用（查看器的 iframe）。图片 / 音视频 / 文本是 App 自己取的，
+ * 留在同源（拉文本要读响应，跨源还得配 CORS）。
+ */
+export function sandboxPageUrl(url: string): string {
+  if (!url.startsWith('/sandbox/')) return url;
+  const port = location.port ? `:${location.port}` : '';
+  return `${location.protocol}//sandbox.localhost${port}${url}`;
+}
+
+/**
  * `sandbox:` → 服务端的 `/sandbox/<钥匙>/…` 路径。不是 sandbox 链接返回 null。
  *
  * 宽松接受几种写法：`sandbox:/root/a.html`、`sandbox:///root/a.html`、

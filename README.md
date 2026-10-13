@@ -10,7 +10,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 
 | 部分 | 状态 |
 |---|---|
-| `core/` Rust | ✅ 216 个测试全过，clippy 干净 |
+| `core/` Rust | ✅ 219 个测试全过，clippy 干净 |
 | `web/` Svelte | ✅ 构建通过（57 KB JS / 21 KB gzip） |
 | `android/` 壳 | ✅ **真机验证通过** |
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |

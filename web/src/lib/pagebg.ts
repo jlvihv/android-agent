@@ -9,9 +9,9 @@
  * 以前写死白色：深色网页会「先白 → 后黑」闪一下，在深色 App 里很扎眼
  * （用户实测反馈）。现在开之前先把底色探出来，上屏就是对的颜色。
  *
- * 怎么探：这份文档在 opaque origin 里（sandbox 不带 allow-same-origin），
- * 读不到 `contentDocument`，所以只能自己取一份源码、从文本里找。
- * 反正同源、走 loopback，还能顺手把 iframe 要用的那份填进 HTTP 缓存。
+ * 怎么探：这份文档在另一个源上（`sandbox.localhost`，见 `sandboxPageUrl`），
+ * 读不到 `contentDocument`，所以只能自己取一份源码、从文本里找。取的是
+ * 同源（127.0.0.1）那份地址 —— 内容一样，走 loopback，不用配 CORS。
  *
  * 取值顺序（后面的覆盖前面的）：
  *   1. `<style>` 里 html / body / :root 规则上的 `background(-color)`

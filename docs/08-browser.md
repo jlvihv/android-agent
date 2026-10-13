@@ -283,7 +283,42 @@ agent 有一只自己的无头 WebView（第 2 节），而**同一个实例**�
 所以动作仍尽量幂等，进度靠会话历史恢复。
 - **吞掉的弹窗**只报"页面弹窗已自动关闭"，不做交互。
 
-## 13. 怎么调
+## 13. 打开沙箱里的网页（以及它们的存储）
+
+AI 写了个静态网页，自己想看一眼：`browser` 的 `url` 直接给沙箱路径 ——
+`sandbox:/workspace/site/index.html`（和回复里给用户的链接同一个写法），也认
+`sandbox:相对路径`、`file:///…` 和绝对路径 `/workspace/…`。`Core::browser` 把它换成
+`http://sandbox.localhost:<端口>/sandbox/<钥匙>/workspace/site/index.html` 交给
+WebView，结果里出现的这种 URL 再换回 `sandbox:/…`（端口每次启动可能不同、钥匙
+不该进历史，模型记住稳定的写法）。`agent browser navigate sandbox:/…` 同样能用。
+
+### 为什么是 `sandbox.localhost`，而不是和 App 同一个 `127.0.0.1`
+
+沙箱文件以前和 App 同源，于是必须关进 opaque origin（CSP `sandbox`、iframe 不给
+`allow-same-origin`）—— 否则页面里的任何脚本都能带着 App 的凭据 cookie 调
+`/api/linux`（沙箱挂着整个内部存储）。代价是 **localStorage / sessionStorage /
+IndexedDB 一碰就抛 SecurityError**，生成的网页一存东西就坏。
+
+现在网页在**另一个源**上：
+
+- `*.localhost` 由 Chromium 直接解析到 loopback（不走 DNS），而它和 `127.0.0.1`
+  是不同的站点：App 的凭据 cookie（种在 `127.0.0.1`、`SameSite=Strict`）这个源上
+  的页面读不到、请求也带不上。所以不再需要 CSP sandbox，存储全能用。
+- 这个源上**只有沙箱文件**（`split_origins` 中间件）：`/api`、`/auth`、App 页面
+  一律 404。WebSocket 的 Origin 检查也不放行它。
+- 同一个文件从 `127.0.0.1` 取照旧是 opaque origin —— 图片 / 音视频 / 文本这些 App
+  自己取的还走同源（拉文本要读响应，跨源还得配 CORS）。
+- 查看器的 iframe 指向 `sandbox.localhost` 并带 `allow-same-origin`（跨源才给；
+  同源再给，页面就能拆掉自己的 sandbox）。聊天 WebView 打开了第三方 cookie ——
+  对它来说这个 iframe 是第三方，关着的话 Chromium 连存储一起拦。
+- **端口固定**（`AgentApp.PREFERRED_PORT`，被占才退回系统分配）：源带端口，端口每次
+  启动都换的话，网页存的东西重启就没了。
+- Android 的明文流量白名单对 `localhost` 开了 `includeSubdomains`。
+
+已知差别：Chromium 按顶层站点给 iframe 的存储分区 —— 查看器里（顶层是 App）和
+agent 浏览器里（顶层就是它自己）是两份存储，互不相通。各自都能持久。
+
+## 14. 怎么调
 
 不用花 token，也不用装 APK 之外的东西：
 

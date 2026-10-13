@@ -13,6 +13,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -238,6 +239,12 @@ class MainActivity : Activity() {
      */
     private fun buildBrowserPanel(): FrameLayout {
         val panel = FrameLayout(this).apply {
+        // 查看器里的沙箱网页在另一个源（`sandbox.localhost`）的 iframe 里 ——
+        // 对这个 WebView 来说是**第三方**。第三方 cookie 关着的话（WebView 默认），
+        // Chromium 连带把它的 localStorage / IndexedDB 也拦掉，生成的网页一存东西
+        // 就报错。打开没有风险：那个源只能给自己种 cookie，碰不到 127.0.0.1 的。
+        runCatching { CookieManager.getInstance().setAcceptThirdPartyCookies(w, true) }
+
             setBackgroundColor(getColor(R.color.ink))
             visibility = View.GONE
         }

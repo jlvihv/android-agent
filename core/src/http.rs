@@ -71,7 +71,48 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             require_auth,
         ))
+        .layer(axum::middleware::from_fn(split_origins))
         .with_state(state)
+}
+
+/// 沙箱网页用的主机名（独立的源）。见下面「沙箱文件」那段的说明。
+///
+/// `*.localhost` 由 Chromium 直接解析到 loopback（不走 DNS），而它和
+/// `127.0.0.1` 是**不同的站点**：App 的凭据 cookie 种在 `127.0.0.1` 上，
+/// 这个源上的页面拿不到、也发不出带它的请求（SameSite=Strict）。
+pub const SANDBOX_HOST: &str = "sandbox.localhost";
+
+/// 沙箱网页的源（浏览器里打开沙箱文件用）。端口跟 App 同一个。
+pub fn sandbox_origin(port: u16) -> String {
+    format!("http://{SANDBOX_HOST}:{port}")
+}
+
+/// 这个请求是不是打到沙箱那个源上的（看 `Host` 头）。
+fn is_sandbox_host(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let name = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    name.eq_ignore_ascii_case(SANDBOX_HOST)
+}
+
+/// 两个源分开：`sandbox.localhost` 上**只有沙箱文件**。
+///
+/// - 别的路径（`/api`、`/auth`、App 自己的页面）一律 404 —— 沙箱网页和
+///   App 不同源，靠的就是这一条；哪天有人在这个源上种了凭据也开不了 `/api`。
+/// - 沙箱文件在这里**不加** CSP sandbox（见 `sandbox_headers`）：页面有自己
+///   正常的源，localStorage / IndexedDB / cookie 都能用。打到 `127.0.0.1`
+///   上的沙箱文件（和 App 同源）照旧是 opaque origin。
+async fn split_origins(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !is_sandbox_host(req.headers()) {
+        return next.run(req).await;
+    }
+    if !req.uri().path().starts_with("/sandbox/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut res = next.run(req).await;
+    res.headers_mut().remove("content-security-policy");
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +612,77 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// agent 的浏览器要打开的地址：沙箱里的文件 → `sandbox.localhost` 上的 URL。
+///
+/// 认这几种写法（模型最可能写的）：`sandbox:/workspace/a.html`（和回复里给
+/// 用户的链接同一个写法）、`sandbox:a.html`（相对 /workspace）、
+/// `file:///workspace/a.html`、直接写绝对路径 `/workspace/a.html`。
+/// 别的（网址）返回 `None`，原样交给浏览器。
+pub fn sandbox_page_url(raw: &str, port: u16, key: &str) -> Option<String> {
+    let raw = raw.trim();
+    let lower = raw.to_ascii_lowercase();
+    let rest = if lower.starts_with("sandbox:") {
+        let r = raw["sandbox:".len()..].trim_start_matches('/');
+        if raw["sandbox:".len()..].starts_with('/') {
+            format!("/{r}")
+        } else {
+            format!("/workspace/{r}")
+        }
+    } else if lower.starts_with("file://") {
+        format!("/{}", raw["file://".len()..].trim_start_matches('/'))
+    } else if raw.starts_with('/') && !raw.starts_with("//") {
+        raw.to_string()
+    } else {
+        return None;
+    };
+    let (path, tail) = match rest.find(['?', '#']) {
+        Some(i) => rest.split_at(i),
+        None => (rest.as_str(), ""),
+    };
+    // 路径里可能有中文 / 空格：逐字节编码（已经编码过的 % 不再编一次）
+    let mut enc = String::with_capacity(path.len());
+    for b in percent_decode(path).bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:@".contains(&b) {
+            enc.push(b as char);
+        } else {
+            enc.push_str(&format!("%{b:02X}"));
+        }
+    }
+    Some(format!("{}/sandbox/{key}{enc}{tail}", sandbox_origin(port)))
+}
+
+/// 反过来：结果里出现的 `http://sandbox.localhost:<端口>/sandbox/<钥匙>/…`
+/// 改写回 `sandbox:/…`（解码过的路径）。
+///
+/// 端口每次启动可能不同、钥匙也不该进历史 —— 模型记住的应该是 `sandbox:`
+/// 这个稳定的写法，下次照样能打开，也能原样写进回复给用户点。
+pub fn sandbox_url_to_guest(text: &str, port: u16, key: &str) -> String {
+    let prefix = format!("{}/sandbox/{key}", sandbox_origin(port));
+    if !text.contains(&prefix) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(&prefix) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + prefix.len()..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')'))
+            .unwrap_or(after.len());
+        let path = &after[..end];
+        let path = if path.is_empty() || path == "/" {
+            "/workspace/".to_string()
+        } else {
+            percent_decode(path)
+        };
+        out.push_str("sandbox:");
+        out.push_str(&path);
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn hex(c: u8) -> Option<u8> {
@@ -1492,10 +1604,19 @@ fn is_loopback_origin(origin: &str) -> bool {
 // 打到这里。按 URL 路径直接映射，所以 HTML 里的相对路径（css/js/图片）
 // 天然能用。
 //
-// 安全：这些文件是 AI 写的（内容可能来自网上），却和 App 同源。所以
-// 一律加 `Content-Security-Policy: sandbox` —— 页面变成 opaque origin，
-// 读不到 /api/*、连不上 WebSocket（见 ws_upgrade 的 Origin 检查），
-// 只能看。路径越界和符号链接逃逸由 LinuxSandbox::resolve_path 挡。
+// 安全：这些文件是 AI 写的（内容和脚本可能来自网上）。它们要是和 App 同源，
+// 页面里的任何脚本都能带着 App 的凭据 cookie 调 `/api/linux` —— 在挂着整个
+// 内部存储的沙箱里跑命令。两条路：
+//
+// - **`sandbox.localhost:<端口>`（网页就该在这里开）**：独立的源（见
+//   `SANDBOX_HOST` / `split_origins`），碰不到 App 的凭据，所以不加 CSP
+//   sandbox —— localStorage / IndexedDB 这些正常能用。查看器的 iframe 和
+//   agent 的浏览器都开这个。
+// - `127.0.0.1:<端口>`（和 App 同源）：图片 / 音视频 / 文本这些 App 自己取的
+//   还走这里。一律加 `Content-Security-Policy: sandbox` —— 页面是 opaque
+//   origin，读不到 /api/*、连不上 WebSocket（见 ws_upgrade 的 Origin 检查）。
+//
+// 路径越界和符号链接逃逸由 LinuxSandbox::resolve_path 挡。
 
 /// 路径上的沙箱钥匙对不对（见 `state::Auth`）。不对一律 404，不说为什么。
 fn sandbox_key_ok(st: &AppState, key: &str) -> bool {
@@ -1943,6 +2064,151 @@ fn cmd_name(c: &Command) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{coalesce, is_loopback_origin, parse_range, parse_rev, session_rev};
+    use super::{sandbox_page_url, sandbox_url_to_guest};
+
+    /// 一个开着凭据、带一个真 rootfs 目录的核心：rootfs/workspace/site/index.html。
+    async fn sandbox_core(
+        tag: &str,
+    ) -> (std::sync::Arc<crate::state::AppState>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("agent-http-{tag}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(root.join("workspace/site")).unwrap();
+        std::fs::write(root.join("workspace/site/index.html"), "<h1>hi</h1>").unwrap();
+        let st = crate::state::AppState::new();
+        st.set_token(Some("s3cret".into()));
+        st.set_linux(std::sync::Arc::new(crate::linux::LinuxSandbox::new(
+            crate::linux::SandboxConfig {
+                proot: "/nonexistent/proot".into(),
+                rootfs: root.clone(),
+                binds: vec![],
+                tmp: None,
+                dns: vec![],
+                tz_offset_minutes: None,
+                loader: None,
+                loader32: None,
+                env: Default::default(),
+                workspace: None,
+                shared: None,
+            },
+        )));
+        (st, root)
+    }
+
+    /// 两个源分开：`sandbox.localhost` 上只有沙箱文件，而且不关进 opaque origin
+    /// （存储能用）；同一个文件从 `127.0.0.1` 取照旧带 CSP sandbox；
+    /// 带着正确凭据也别想在沙箱那个源上开 `/api`、`/auth`、App 页面。
+    #[tokio::test]
+    async fn the_sandbox_origin_serves_only_sandbox_files_and_unsandboxed() {
+        let (st, root) = sandbox_core("origin").await;
+        let key = st.auth().sandbox_key;
+        let (base, c) = serve(st.clone()).await;
+        let port = base.rsplit(':').next().unwrap().to_string();
+        let sandbox_host = format!("sandbox.localhost:{port}");
+        let file = format!("{base}/sandbox/{key}/workspace/site/index.html");
+
+        let r = c
+            .get(&file)
+            .header("host", &sandbox_host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert!(
+            r.headers().get("content-security-policy").is_none(),
+            "独立的源上不该再关进 opaque origin"
+        );
+        assert_eq!(r.text().await.unwrap(), "<h1>hi</h1>");
+
+        let r = c.get(&file).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let csp = r.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            csp.starts_with("sandbox") && !csp.contains("allow-same-origin"),
+            "{csp}"
+        );
+
+        for path in ["/api/health", "/auth?t=s3cret", "/"] {
+            let r = c
+                .get(format!("{base}{path}"))
+                .header("host", &sandbox_host)
+                .header("x-agent-token", "s3cret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 404, "{path}");
+        }
+        // App 那边照常
+        let r = c
+            .get(format!("{base}/api/health"))
+            .header("x-agent-token", "s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 浏览器要打开的地址：沙箱文件的几种写法都映射到独立的源上；网址不动。
+    #[test]
+    fn sandbox_paths_map_to_the_sandbox_origin_and_back() {
+        let base = "http://sandbox.localhost:4000/sandbox/k";
+        let map = |s: &str| sandbox_page_url(s, 4000, "k");
+        assert_eq!(
+            map("sandbox:/workspace/a.html").unwrap(),
+            format!("{base}/workspace/a.html")
+        );
+        assert_eq!(
+            map("sandbox:///workspace/a.html").unwrap(),
+            format!("{base}/workspace/a.html")
+        );
+        assert_eq!(
+            map("sandbox:site/a.html").unwrap(),
+            format!("{base}/workspace/site/a.html")
+        );
+        assert_eq!(
+            map("file:///root/x.html").unwrap(),
+            format!("{base}/root/x.html")
+        );
+        assert_eq!(
+            map("/workspace/a.html?q=1#top").unwrap(),
+            format!("{base}/workspace/a.html?q=1#top")
+        );
+        assert_eq!(
+            map("sandbox:/workspace/报告 1/index.html").unwrap(),
+            format!("{base}/workspace/%E6%8A%A5%E5%91%8A%201/index.html")
+        );
+        assert_eq!(
+            map("sandbox:/workspace/%E6%8A%A5.html").unwrap(),
+            format!("{base}/workspace/%E6%8A%A5.html"),
+            "已经编码过的不再编一次"
+        );
+        for web in [
+            "https://example.com",
+            "example.com/a",
+            "//cdn.x/y.js",
+            "http://127.0.0.1:1/",
+        ] {
+            assert!(map(web).is_none(), "{web}");
+        }
+
+        // 回来的结果改写回 `sandbox:`（端口和钥匙不进历史）
+        let back = |s: &str| sandbox_url_to_guest(s, 4000, "k");
+        assert_eq!(
+            back(&format!(
+                "已打开 {base}/workspace/%E6%8A%A5%E5%91%8A%201/index.html\n标题：x"
+            )),
+            "已打开 sandbox:/workspace/报告 1/index.html\n标题：x"
+        );
+        assert_eq!(back(&format!("{base}/")), "sandbox:/workspace/");
+        assert_eq!(back("https://example.com/"), "https://example.com/");
+        assert_eq!(
+            back(&format!("{base}/workspace/a.html")),
+            back(&back(&format!("{base}/workspace/a.html"))),
+            "幂等"
+        );
+    }
 
     /// 积压的一批里，被后来者盖掉的阶段性输出扔掉；别的 chunk（正文、
     /// 最终输出、别的工具的快照）一个不少、顺序不变。
@@ -2318,6 +2584,10 @@ mod tests {
         ] {
             assert!(!is_loopback_origin(bad), "{bad}");
         }
+        assert!(
+            !is_loopback_origin("http://sandbox.localhost:4000"),
+            "沙箱网页的源不能连 WebSocket"
+        );
     }
 
     /// 设备通道的 `open` 指令：沙箱里的 `agent-open` / `$BROWSER` / `xdg-open`

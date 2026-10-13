@@ -300,7 +300,23 @@ impl Core {
             .browser()
             .ok_or_else(|| anyhow::anyhow!("浏览器不可用（壳没接上）"))?;
         let mut cancel = CancelBrowserOnDrop(Some(host.clone()));
-        let action = action_json.to_string();
+        // 沙箱里的文件（`sandbox:/…`、绝对路径）→ `sandbox.localhost` 上的 URL：
+        // AI 写完网页能自己开来看。回来的结果再改写回 `sandbox:`
+        let port = self.port();
+        let key = self.state.auth().sandbox_key;
+        let action = match serde_json::from_str::<serde_json::Value>(action_json) {
+            Ok(mut v) => {
+                let mapped = v
+                    .get("url")
+                    .and_then(|u| u.as_str())
+                    .and_then(|u| http::sandbox_page_url(u, port, &key));
+                if let Some(url) = mapped {
+                    v["url"] = serde_json::Value::String(url);
+                }
+                v.to_string()
+            }
+            Err(_) => action_json.to_string(),
+        };
         let joined = tokio::time::timeout(
             std::time::Duration::from_secs(75),
             tokio::task::spawn_blocking(move || host.execute(&action)),
@@ -317,7 +333,10 @@ impl Core {
                 anyhow::bail!("浏览器动作超时（75s 没回来）—— 页面可能卡住了；重试或者换个做法")
             }
         };
-        Ok(serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "text": raw })))
+        let mut v: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "text": raw }));
+        rewrite_strings(&mut v, &|s| http::sandbox_url_to_guest(s, port, &key));
+        Ok(v)
     }
 
     /// 联网搜索。key 有就直连 Exa API，没有就走他们那个免 key 的公开 MCP
@@ -606,6 +625,16 @@ impl Core {
     }
 }
 
+/// 把一个 JSON 里所有字符串都过一遍 `f`。
+fn rewrite_strings(v: &mut serde_json::Value, f: &dyn Fn(&str) -> String) {
+    match v {
+        serde_json::Value::String(s) => *s = f(s),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| rewrite_strings(x, f)),
+        serde_json::Value::Object(o) => o.values_mut().for_each(|x| rewrite_strings(x, f)),
+        _ => {}
+    }
+}
+
 /// 浏览器动作没等到结果就被放弃时，叫 Kotlin 那边也别跑了。
 ///
 /// `__cancel` 在 Kotlin 侧不排队、只改一个计数（见 `BrowserController.execute`），
@@ -701,6 +730,48 @@ async fn provision_tools(st: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// agent 的浏览器打开沙箱文件：`sandbox:` 进去换成独立源上的 URL，
+    /// 结果里的 URL 再换回 `sandbox:`（端口和钥匙不进历史）。网址原样。
+    #[tokio::test]
+    async fn the_browser_opens_sandbox_files_by_their_sandbox_path() {
+        struct Echo(std::sync::Mutex<Vec<String>>);
+        impl state::BrowserApi for Echo {
+            fn execute(&self, action_json: &str) -> Result<String, String> {
+                let v: serde_json::Value = serde_json::from_str(action_json).unwrap();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(v["url"].as_str().unwrap_or("").to_string());
+                let url = v["url"].as_str().unwrap_or("");
+                Ok(
+                    serde_json::json!({ "ok": true, "url": url, "text": format!("已打开 {url}") })
+                        .to_string(),
+                )
+            }
+        }
+        let core = Core::new();
+        core.state.port.store(4321, Ordering::Relaxed);
+        let key = core.state.auth().sandbox_key;
+        let host = Arc::new(Echo(Default::default()));
+        core.state.set_browser(host.clone());
+
+        let v = core
+            .browser(r#"{"action":"navigate","url":"sandbox:/workspace/site/index.html"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.0.lock().unwrap()[0],
+            format!("http://sandbox.localhost:4321/sandbox/{key}/workspace/site/index.html")
+        );
+        assert_eq!(v["url"], "sandbox:/workspace/site/index.html");
+        assert_eq!(v["text"], "已打开 sandbox:/workspace/site/index.html");
+
+        core.browser(r#"{"action":"navigate","url":"example.com"}"#)
+            .await
+            .unwrap();
+        assert_eq!(host.0.lock().unwrap()[1], "example.com");
+    }
 
     /// 动作卡在 Kotlin 侧时，丢掉 `Core::browser` 的 future（= 用户按停止）
     /// 要补发一个 `__cancel`；正常跑完的不发。

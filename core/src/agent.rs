@@ -116,7 +116,7 @@ fn build_tools() -> Vec<ToolSpec> {
                             "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；get_readable=抽正文（文章页用它，比 get_text 干净得多）；get_text=读整页/某元素的文本；click=点 selector 或坐标；type=往 selector 里输入；press=按键（Enter 会提交表单、 Tab 移焦）；find_elements=列出 selector 匹配到的元素（几个、各自坐标）；scroll=滚动；screenshot=截图（full_page=true 截整页）；set_user_agent=切桌面/移动版；back=后退；wait_for_dom_stable=等动态内容安定下来；js=在页面里执行一段 JS（返回值 JSON 化后给你）；new_tab=开新标签（可带 url）；list_tabs=列出所有标签；switch_tab / close_tab=切到 / 关掉某只标签",
                             "enum": ["navigate", "get_backbone", "get_readable", "get_text", "click", "type", "press", "find_elements", "scroll", "screenshot", "set_user_agent", "back", "wait_for_dom_stable", "js", "new_tab", "list_tabs", "switch_tab", "close_tab"]
                         },
-                        "url": { "type": "string", "description": "navigate 的目标。没写协议头就按 https 补" },
+                        "url": { "type": "string", "description": "navigate / new_tab 的目标。没写协议头就按 https 补。沙箱里的文件（比如自己写的网页）用 sandbox:/workspace/…/index.html 打开" },
                         "selector": { "type": "string", "description": "CSS selector。get_backbone 给出的 sel 可以直接用" },
                         "text": { "type": "string", "description": "type 要输入的文本" },
                         "key": { "type": "string", "description": "press 要按的键", "enum": ["Enter", "Tab", "Escape", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"] },

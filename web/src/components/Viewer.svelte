@@ -10,9 +10,11 @@
    * 能显示；但白底无样式、整段复制也难，所以还是自己渲染（见 TextView.svelte）。
    * 关闭：左上角返回箭头、返回键、按住标题栏往右拖。
    *
-   * iframe 加了 sandbox 属性（不含 allow-same-origin），服务端也给
-   * /sandbox/* 加了 CSP sandbox —— 页面是 opaque origin，碰不到 App 的
-   * /api 和 WebSocket。
+   * 网页在**另一个源**（`sandbox.localhost`，见 `sandboxPageUrl`）的 iframe 里：
+   * 和 App 不同源，所以可以带 `allow-same-origin` —— 页面有自己正常的源，
+   * localStorage / IndexedDB 能用，又碰不到 App 的凭据和 /api。万一拿到的是
+   * 同源地址（不是 /sandbox 开头的），就不给 allow-same-origin：同源再给它，
+   * 页面就能拆掉自己的 sandbox。
    */
   import { quintOut } from 'svelte/easing';
   import Icon from './Icon.svelte';
@@ -20,7 +22,7 @@
   import { dismissable, RELEASE } from '../lib/drag';
   import { viewer, closeViewer } from '../lib/viewer.svelte.ts';
   import { probeBackground } from '../lib/pagebg';
-  import { mediaKind } from '../lib/markdown';
+  import { mediaKind, sandboxPageUrl } from '../lib/markdown';
   import TextView from './TextView.svelte';
 
   const IMAGE = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i;
@@ -36,6 +38,20 @@
   // 反过来，有扩展名的（.sh/.py/.json/…）才走文本视图。
   const isWebPage = $derived(HTMLISH.test(path) || path.endsWith('/') || !HAS_EXT.test(path));
   const media = $derived(mediaKind(viewer.url ?? ''));
+
+  /** iframe 实际加载的地址（沙箱网页换到独立的源上） */
+  const frameSrc = $derived(viewer.url ? sandboxPageUrl(viewer.url) : '');
+  /** 和 App 不同源才能放开 allow-same-origin（见文件头） */
+  const isolated = $derived.by(() => {
+    try {
+      return new URL(frameSrc, location.href).origin !== location.origin;
+    } catch {
+      return false;
+    }
+  });
+  const frameSandbox = $derived(
+    `allow-scripts allow-forms allow-modals allow-popups allow-downloads${isolated ? ' allow-same-origin' : ''}`,
+  );
 
   $effect(() => onBack(closeViewer, drag));
 
@@ -144,9 +160,9 @@
            内层文档 canvas 透明，所以这个背景就是它在页面画出来之前
            先上屏的颜色。探测结果没回来之前不写背景（透明）→ 露 App 底色 -->
       <iframe
-        src={viewer.url}
+        src={frameSrc}
         title={viewer.title}
-        sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
+        sandbox={frameSandbox}
         style:background={frameBg}
         class="absolute inset-0 size-full"
       ></iframe>
