@@ -68,7 +68,8 @@ curl -sS -H "x-agent-token: <token>" -H 'content-type: application/json' \
 
 搜索结果进历史 = 进提示词缓存前缀 = **按钱算**。所以每条片段截 400 字、
 整段封顶 4000 字（`core/src/search.rs` 的 `format_hits` —— 搜索不是工具了，
-格式化就发生在核心这一层，`/api/websearch` 把它放在响应的 `output` 字段里）。
+格式化就发生在核心这一层，`/api/websearch` 把它放在响应的 `output` 字段里；
+为什么要这样拆，见 [docs/10](10-tools-vs-sandbox.md)）。
 
 要读全文是**另一件事**，让模型自己挑：
 
@@ -89,7 +90,8 @@ just phone
 ```
 
 `/api/websearch` 是它的后端（`{query, num_results?}`）。**它也是联网搜索的唯一入口**
-（`search` 工具已删）—— 响应里的 `output` 就是给模型看的那段文字，另外带
-`provider`（`exa-mcp` / `exa-api`）和 `count`，一眼能看出走的是哪条路。
+（`search` 工具已删，理由见 [docs/10](10-tools-vs-sandbox.md)）—— 响应里的 `output`
+就是给模型看的那段文字，另外带 `provider`（`exa-mcp` / `exa-api`）和 `count`，
+一眼能看出走的是哪条路。
 
 日志：失败会带原始响应片段；成功的搜索结果不进日志（那是模型上下文的事）。

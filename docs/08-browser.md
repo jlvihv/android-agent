@@ -45,18 +45,10 @@ POST /api/browser ───────────────────┤  
   find_elements / scroll / screenshot / set_user_agent / back / wait_for_dom_stable /
   js / new_tab / list_tabs / switch_tab / close_tab`。
 
-  这里**曾经还有一个 `browser` 工具**（action 枚举 + 参数 schema），已经删了。
-  删的理由是实测，不是审美：真机上 23 个会话 377 次工具调用里，模型调
-  `agent browser` 56 次 vs `browser` 工具 26 次；在一个长会话里是 **45 : 3** ——
-  它跑过一次 `agent help` 发现有沙箱命令之后就再没回过头。差别在**轮次**：
-  一条 bash 能连做 2~6 个动作（`navigate && get_backbone 3 && click '#x'`），
-  工具那条一次只做一个，多步页面操作就是多轮完整 LLM 请求。
-
-  留着两条路的代价：前缀里多 2400 字（`browser` 一条占工具表 4495 字的 54%），
-  而且两处动作表会各自演化 —— 多标签那次提交（`0ab915e`）只改了工具和 Kotlin，
-  CLI 的 `case` 没跟上，于是 `agent browser new_tab "file:///…"` 走进兜底分支、
-  **把 URL 静默吃掉**，开出一只空白标签，模型以为页面开了、对着白屏截了三张图。
-  现在 CLI 每个动作的**参数个数上下限都校验**（少给 / 多给都报错）。
+  这里**曾经还有一个 `browser` 工具**，已经删了 —— 为什么删、以及删完的代价
+  （截图不再自动进上下文）怎么补的，见
+  [docs/10](10-tools-vs-sandbox.md)；CLI 对每个动作的参数个数上下限都校验
+  （少给 / 多给都报错）也是那次一起修的。
 
   截图是删掉工具后唯一退化的点：以前 `browser` 工具会把图直接挂到工具结果上，
   现在图落在 `/root/.browser/`，模型得自己 `read` —— 所以 `Core::browser()`
