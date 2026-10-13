@@ -66,7 +66,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。已预装 bash/curl/git/gh/jq/rg/fd/tree/unzip/python3/diff/patch。Python 包优先 `apk add py3-*`；后台服务要重定向 stdout/stderr。",
+            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。已预装 bash/curl/git/gh/jq/rg/fd/tree/unzip/python3/diff/patch。Python 包优先 `apk add py3-*`。后台常驻服务用 `setsid <命令> > /tmp/x.log 2>&1 &`（能活过这次调用；裸 `&` 起的会在超时/停止时被一起杀掉），之后 `agent ps` 看还剩什么、`agent kill <pid>` 停掉。",
             schema: || {
                 json!({
                     "type": "object",
@@ -635,7 +635,7 @@ pub const SYSTEM_PROMPT: &str = "\
 \n\
 - cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。成品放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。\n\
 - 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`，也支持外部网页或 App 深链，用户点击时能用对应 App 打开；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、`agent command`（按键/点击/滑动/启动应用/打开 URI）、`agent browser`（真 WebView：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；截图落 /root/.browser/，用 read 看）、`agent search`（联网搜索），`agent help` 看全部。\n\
+- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、`agent command`（按键/点击/滑动/启动应用/打开 URI）、`agent browser`（真 WebView：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；截图落 /root/.browser/，用 read 看）、`agent search`（联网搜索）、`agent ps` / `agent kill <pid>`（看/停沙箱里还在跑的进程 —— 包括你自己用 `setsid` 放后台的常驻服务），`agent help` 看全部。\n\
 \n\
 回答要言简意赅。";
 
@@ -2314,7 +2314,7 @@ fn timeout_hint(timeout: std::time::Duration, explicit: bool) -> String {
     } else {
         format!(
             "[{secs:.0}s 超时被终止（没给 timeout，用的是默认值）。长任务重跑时显式给 timeout（秒，上限 86400）；\
-             要一直跑的服务用 `nohup … > /tmp/x.log 2>&1 &` 放后台]"
+             要一直跑的服务用 `setsid … > /tmp/x.log 2>&1 &` 放后台——注意刚被杀的那条连同它起的东西一起死了，要在改过的写法下重新起]"
         )
     }
 }

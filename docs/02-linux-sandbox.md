@@ -2,6 +2,9 @@
 
 > 参考实现：`/home/vihv/Code/lib/OpenMinis`（GPL-3.0，公开仓库 OpenMinis/OpenMinis）
 > 调研时间：2026-10-10
+>
+> 2026-10-13 复读了 v1.14 快照（`b4c0661`）：他们现在**一条命令一个 proot、
+> 不用 `--kill-on-exit`**，超时杀的是命令自己的进程组 —— 见下面「进程模型」。
 
 ---
 
@@ -296,7 +299,7 @@ Rust core                     ▼
   "name": "bash",
   "description": "在设备上的 Alpine Linux 沙箱里执行 shell 命令。可以装包(apk add)、跑 python/node、读写文件。",
   // timeout 可选，默认 60s；长任务模型显式给（上限 24h）。超时被杀时结果里
-  // 会提醒它下次给足（见 agent.rs 的 timeout_hint）。
+  // 会提醒它下次给足（见 agent.rs 的 timeout_hint）。超时 exit_code = 124。
   "schema": { "command": "string", "timeout": "number (seconds, optional, default 60)" }
 }
 ```
@@ -306,8 +309,76 @@ Rust core                     ▼
 
 沙箱里还预置了一个 `agent` 命令（`prepare_rootfs` 写进 `/usr/local/bin/agent`）：
 它是核心自己那个 HTTP 服务的薄包装，让模型能查看自己（`agent state` /
-`agent request` / `agent tools`）和操作这台手机（`agent command`）。
+`agent request` / `agent tools`）、操作这台手机（`agent command`）、看/停沙箱里
+还在跑的进程（`agent ps` / `agent kill <pid>`，见上面「进程模型」）。
 见 [docs/07-debugging.md](07-debugging.md) §8。
+
+### 进程模型：一条命令一个 proot、一个进程组
+
+**一条命令一个 proot**（`run_live()`），不用长命 shell 复用。OpenMinis 量过
+这件事并把数字写在了 `ShellExecutionStrategy.kt` 里：他们的 guest 里
+`sh -c "echo hi"` 冷启动 4.2 ms（`setsid` 版 8.5 ms），而每次工具调用的宿主
+开销是 65–90 ms —— 复用 shell 省下的那点钱，换来的是整套带内完成标记的坑
+（标记被 `read()` 切两半、修它的 hold-back 缓冲把所有短输出吞了、超时命令
+继续污染下一条命令的 stdout，五个月炸三次）。我们要的只是进程退出码。
+
+**没有 `--kill-on-exit`**（曾经有，已删）。它让 proot 在命令退出的瞬间对整棵
+树发 SIGKILL（proot 的 `terminate_tracee` → `kill_all_tracees`），于是
+`nohup` / `setsid` 起的常驻服务**一条也活不过这次调用** —— 而「起一个后台
+服务」是这个工具该有的能力。删掉它之后 proot 会一直等到所有 tracee 退出
+（它得给每条 tracee 做路径翻译），所以：
+
+- **完成信号变成状态文件。** 命令跑在一层 runner 里（`runner_script()`，命令行
+  的最后一个参数）：
+  `setsid /bin/sh -c '<runner>' sh <script> <status>`。runner 在命令退出后把
+  **命令的**退出码写进 `<rootfs>/.agent-exit/<uuid>`，宿主以它为准（读不到才
+  退回 proot 的退出码）。不这样的话，一条 `setsid … &` 起的常驻进程会让 proot
+  继续活着 —— 它就是那根 stdout 管道的写端，宿主永远等不到 EOF。
+- **杀的是命令的进程组，不是 proot**。`setsid` 让 runner 当组长，runner 把
+  `$$` 写进 `<status>.pid`；超时 / 用户按停止时 `kill(-pgid, SIGTERM→SIGKILL)`
+  （`CommandGuard`）。**不能杀 proot**：它可能正在给上一条命令留下的常驻进程
+  当 tracer，proot 一死那些进程就失去 rootfs 翻译（看到的路径全变成宿主机的），
+  比直接杀掉更糟。宿主侧 `process_group(0)` 是兜底目标（rootfs 里没有 `setsid`，
+  或者 runner 还没写下 pid 就被杀）。
+- **不再有孤儿。** 原来超时 / 停止走 `child.start_kill()` / `kill_on_drop`，
+  都是 SIGKILL **proot 本身**；而 proot 的 `--kill-on-exit` 是 userspace 的
+  `atexit` 钩子，SIGKILL 不跑它 —— 被 trace 的整棵 guest 树就留在那里继续吃
+  CPU。现在 future 被丢掉时 `CommandGuard::drop` 杀的是进程组。
+- **超时 `exit_code = 124`**（跟 `timeout(1)` 一致），命令被信号打死时按 shell
+  的 128+N 约定给出 `signal`（于是「被 OOM 杀了」这类提示还能给）。
+
+> **判 `setsid` 在不在不能用 `is_file()`。** Alpine 里 `/usr/bin/setsid` 是指向
+> `/bin/busybox` 的**绝对**符号链接，在宿主上解析会指向宿主机的 `/bin/busybox`
+> （不存在）。真机上就这么漏过一次：命令行里没有 setsid，runner 落在 proot 自己
+> 的进程组里，超时那一杀打到 proot 头上（它忽略 SIGTERM，然后吃 SIGKILL），
+> 它 trace 的常驻进程全部变成没翻译的孤儿 —— 看起来“命令被杀干净了”，实际是
+> 把整个沙箱的翻译层一起打掉了。改用 `symlink_metadata` 判存在，
+> `is_alpine_rootfs()` 上早写过同样的教训。
+
+用户视角的规则（工具描述里就是这么写的）：
+
+| 写法 | 这次调用正常结束后 | 这次调用超时 / 被停止时 |
+|---|---|---|
+| `cmd &`（裸的） | 活着 | 连它一起杀 |
+| `setsid cmd &` / `nohup cmd &` | 活着 | 活着（刻意脱离，不动它） |
+| `cmd`（前台） | 跟着命令结束 | 杀掉 |
+
+判据在内核（进程组），不是对命令文本找 `&` —— `&` 在 `curl 'a?x=1&y=2'`、
+`grep 'a & b'`、heredoc 里都是普通文本，正则判不出来（`ForegroundCommandGroup.kt`
+里那段论证很到位，我们是拿同样的道理直接用了进程组）。
+
+**事后怎么收场**：`agent ps` 列出「命令结束后还活着的常驻进程」（带 pid / pgid /
+属于哪条命令），`agent kill <pid>` 停掉（先 SIGTERM，几秒不走再 SIGKILL）。
+归因靠 `TracerPid` —— guest 进程的 tracer 就是那条命令的 proot，而**只有核心
+记得**哪个 proot 是哪条命令起的（刻意脱离的进程父进程早就是 init 了，光靠 `ps`
+认不出它们是谁、什么时候起的）。实现在 `linux.rs` 的 `LinuxSandbox::procs`
+（`RunRegistry` + `/proc` 扫描）；`/proc` 被 hidepid 限制的机器上它会**明说**
+「看不见」，而不是假装「什么都没有」。对应的接口是 `GET /api/procs`。
+
+> 代价得说清楚：**App 进程被系统杀掉时 proot 一起死**，它 trace 的常驻进程
+> 虽然还在跑但已经失去 rootfs 翻译（等于坏了）；App 被冻住时（见
+> [docs/06](06-persistence-and-background.md)）整棵树也跟着停。所以「常驻」只
+> 承诺活过工具调用，不承诺活过 App。真要「以后再做」，得靠调度而不是后台进程。
 
 ### 预装的工具（`agent-setup`）
 
@@ -376,7 +447,8 @@ context 豁免「后台不许起 Activity」，App 自己的不豁免 —— 所
 
 需要用户在**别的** App 里完成的事（典型是 `gh auth login --web`）：页面 `agent-open`
 会自己开，但**一次性码得 agent 在回复里告诉用户**；这种命令还要等用户操作，所以
-要后台跑（`> /tmp/x.log 2>&1 &`），之后再查日志收尾 —— 前台等会死锁（用户在码出现
+得放后台（`setsid gh auth login --web > /tmp/x.log 2>&1 &`，见上面「进程模型」——
+`setsid` 起的能活过这次调用），之后再查日志收尾 —— 前台等会死锁（用户在码出现
 在聊天里之前根本看不到它）。
 
 另外输出里有网址时，bash 结果里会带一个 `urls: [...]`（没有就不带这个字段）（`urls` 模块扫输出里的 http(s) 网址）：
@@ -402,6 +474,7 @@ gh 的设备码页是它自己 print 出来的（不是所有 CLI 都会去调�
 | **D16** | 谁执行 proot | A Rust<br>B Kotlin | **A**，可桌面测试 |
 | **D17** | 要不要 `--native-offload` 那种机制 | A 要（把沙箱内的命令名路由回宿主能力）<br>B 不要 | 先不要。我们的设备能力已经走 `DeviceApi` 了，不需要第二条路 |
 | **D18** | `--fake-netlink` | A 开<br>B 不开 | **不开**。它是对 guest 撒谎，会让失败点后移 |
+| **D19** | 进程模型 | A 保留 `--kill-on-exit`：命令一退整棵树 SIGKILL（简单，但后台常驻服务全死，而且我们杀 proot 时它根本不跑 → 漏孤儿）<br>B 命令跑在自己的进程组里 + 状态文件当完成信号（后台常驻可用；超时/停止按组杀，proot 留着） | **B**（已实现）。见上面「进程模型」。代价是 completion 不再等于 proot 退出，多一个 runner + 状态文件 |
 
 ### 前置依赖
 

@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -71,6 +71,46 @@ pub const HEAD_LINES: usize = 100;
 pub const TAIL_LINES: usize = 100;
 /// 截断时分给首/尾各一侧的字节预算（给 `[省略 N 行]` 和换行留点余量）
 const SIDE_BYTES: usize = (MAX_OUTPUT_BYTES - 256) / 2;
+
+// ---------------------------------------------------------------------------
+// 一条命令的进程模型（实现在 `run_live`，理由见 docs/02 的「进程模型」）
+// ---------------------------------------------------------------------------
+
+/// 每条命令的状态文件放在 rootfs 里哪个目录下（沙箱内就是 `/.agent-exit/`）。
+///
+/// rootfs 对 guest 就是 `/`，所以两边看的是同一个文件，不用额外挂载。
+const EXIT_DIR: &str = ".agent-exit";
+
+/// Alpine 里 `setsid` 的两个可能位置（3.21 是 usrmerge 之后的 `/usr/bin`）。
+const SETSID_PATHS: [&str; 2] = ["/usr/bin/setsid", "/bin/setsid"];
+
+/// 状态文件的轮询间隔。
+const STATUS_POLL: Duration = Duration::from_millis(25);
+
+/// 命令退出后，输出安静这么久就算读完了（见 `wait_for_quiet`）。
+const OUTPUT_QUIET: Duration = Duration::from_millis(150);
+/// 上面那条的硬上限：裸 `&` 起的子孙没脱离，可以一直往同一根管道写。
+const OUTPUT_DRAIN_CAP: Duration = Duration::from_millis(2_000);
+
+/// 超时后先 SIGTERM，等这么久还不走再 SIGKILL。
+const KILL_GRACE: Duration = Duration::from_millis(1_000);
+const KILL_POLL: Duration = Duration::from_millis(50);
+
+/// 兜底等 proot 退出码的时间（它可能在给常驻进程当 tracer，不能无限等）。
+const REAP_GRACE: Duration = Duration::from_millis(2_000);
+
+/// 被我们杀掉之后，给读端收尾的时间。
+const DRAIN_AFTER_KILL: Duration = Duration::from_millis(200);
+
+/// 超过这么久的状态文件算上次崩溃留下的，清掉。
+///
+/// 必须 ≥ `MAX_TIMEOUT`：否则一条还在跑的长命令，它的 pid 文件会被**另一条**
+/// 命令的清理删掉，那条命令超时时就只能拿 proot 的组当靶子（proot 一死，它
+/// 起的常驻服务就失去 rootfs 翻译）。这些文件每个几十字节，多留一天没成本。
+const STALE_STATUS_SECS: u64 = MAX_TIMEOUT.as_secs() + 3_600;
+
+/// 超时时 `ExecResult::code` 报多少：跟 `timeout(1)` 一致，模型认得。
+const TIMEOUT_EXIT: i32 = 124;
 
 /// Alpine 的 PATH。
 ///
@@ -248,6 +288,569 @@ fn signal_hint(sig: i32) -> &'static str {
     }
 }
 
+/// 这次调用用的状态文件：宿主侧路径 + 沙箱内路径。
+///
+/// runner 在命令退出后把**命令的**退出码写进来（见 `runner_script`）。为什么不
+/// 看 proot 的退出码：`--kill-on-exit` 去掉之后，只要还有一条常驻进程是 proot
+/// 的 tracee，proot 就得活着，它那根 stdout 管道也就一直不 EOF ——「命令跑完了」
+/// 这件事只能由命令自己报出来。
+struct StatusFile {
+    /// 沙箱内的路径（runner 的 `$2`）
+    guest: String,
+    /// 宿主侧对应文件
+    host: PathBuf,
+    /// 宿主侧 `<host>.pid`：runner 把自己的 pid（= 进程组号）写在这里
+    pid_host: PathBuf,
+}
+
+impl StatusFile {
+    fn new(rootfs: &Path) -> Self {
+        let dir = rootfs.join(EXIT_DIR);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            // 建不出来不致命：拿不到状态文件时会退回 proot 的退出码
+            tracing::warn!("建不了 {}: {e}", dir.display());
+        }
+        prune_stale_status(&dir);
+        let name = uuid::Uuid::now_v7().to_string();
+        Self {
+            pid_host: dir.join(format!("{name}.pid")),
+            host: dir.join(&name),
+            guest: format!("/{EXIT_DIR}/{name}"),
+        }
+    }
+
+    fn clean_up(&self) {
+        let _ = std::fs::remove_file(&self.host);
+        let _ = std::fs::remove_file(&self.pid_host);
+    }
+}
+
+impl Drop for StatusFile {
+    /// 正常结束和**被取消**（用户按停止，future 被丢掉）都得清。只靠 `run_live`
+    /// 末尾调一次的话，取消那条路会把 `<uuid>.pid` 留在 `.agent-exit/` 里
+    /// （`spawn` 失败、提前 `?` 返回同理）—— 真机上实测就是这么攒起来的，
+    /// 而 `prune_stale_status` 要等一天才收。
+    fn drop(&mut self) {
+        self.clean_up();
+    }
+}
+
+/// runner 写下的退出码。文件还不存在（命令没跑完）或者正好落在两次 write
+/// 之间（`printf` 不是原子的）都返回 None —— 调用方下一拍再读。
+fn read_status_code(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// runner 写下的进程组号。`<= 1` 一律当没拿到：`0` 是「我自己这个组」，
+/// `1` 是 init —— 信号发错地方是灾难。
+fn read_pgid(path: &Path) -> Option<i32> {
+    let v: i32 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    (v > 1).then_some(v)
+}
+
+/// 清掉上次崩溃 / 被杀留下的状态文件。它们很小，但无界。
+fn prune_stale_status(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() > STALE_STATUS_SECS);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 给**整个进程组**发信号。
+///
+/// 组里包括命令自己、它的子孙、以及它没有刻意脱离的后台作业；用 `setsid` /
+/// `nohup` 刻意脱离的不在里面，所以杀不杀得到由内核决定，不是对命令文本做
+/// 正则判断（`&` 在 `curl 'a?x=1&y=2'`、`grep 'a & b'`、heredoc 里都是普通文本）。
+fn kill_group(pgid: i32, sig: i32) {
+    if pgid <= 1 {
+        return;
+    }
+    // SAFETY: kill(2) 只读参数；失败返回 -1（ESRCH / EPERM），没有内存安全影响
+    unsafe { libc::kill(-pgid, sig) };
+}
+
+/// 组里还有活着的进程吗。`kill(-pgid, 0)` 是存在性检查，`EPERM` 也算存在。
+fn group_alive(pgid: i32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    let r = unsafe { libc::kill(-pgid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// 沙箱里真正执行命令的那层壳（命令行里的**一个 argv**，不是拼出来的字符串）。
+///
+/// 为什么不干脆 `sh -c "<script>"`：`--kill-on-exit` 去掉之后，「命令结束」和
+/// 「proot 退出」不再是同一件事（proot 可能在给一条常驻进程当 tracer）。所以
+/// runner 在命令退出后把**命令的**退出码写进状态文件，宿主以它为准；顺手把
+/// 自己的 pid 写下来（`setsid` 让它同时是进程组号），超时 / 停止时宿主按这个
+/// 组杀。
+///
+/// `$1` 是模型给的脚本、`$2` 是沙箱内的状态文件路径 —— 两个都是独立 argv，
+/// 谁都不会被 shell 再解析一次。
+fn runner_script(shell: &str, report_pgid: bool) -> String {
+    // `$$` 在双引号里展开成 pid；printf 的格式串用单引号，别让外层先展开
+    let pid_part = if report_pgid {
+        "printf '%s' \"$$\" > \"$2.pid\"; "
+    } else {
+        ""
+    };
+    // 内层 `<shell> -c "$1"` 让脚本里的 `exit N` 只结束脚本本身，状态照样写得下；
+    // 被信号打死时 `$?` 是 128+N，跟 shell 的约定一致
+    format!("{pid_part}{shell} -c \"$1\"; rc=$?; printf '%s' \"$rc\" > \"$2\"; exit $rc")
+}
+
+/// 输出「最后一次读到数据」是多久以前 —— 命令退出之后靠它判断输出安静了。
+#[derive(Debug)]
+struct OutputTap {
+    started: Instant,
+    last_read_ms: AtomicU64,
+}
+
+impl OutputTap {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            last_read_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// 读端每收到一块数据就记一笔。
+    fn note(&self) {
+        self.last_read_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn quiet_for(&self, quiet: Duration) -> bool {
+        self.elapsed_ms()
+            .saturating_sub(self.last_read_ms.load(Ordering::Relaxed))
+            >= quiet.as_millis() as u64
+    }
+}
+
+/// 这次调用是怎么结束的。
+enum Done {
+    /// runner 报出了命令的退出码 —— 权威值
+    Status(i32),
+    /// 两根管道都 EOF：没有任何人还拿着写端（proot 也退了）
+    PipesClosed,
+    /// 用完 timeout
+    TimedOut,
+}
+
+/// 一条命令的收尾责任。
+///
+/// 正常跑完会 `disarm()`；future 被丢掉（用户按停止 / 回合取消）时由 `Drop`
+/// 杀命令组。为什么不靠 `Command::kill_on_drop`：它只 SIGKILL proot 本身，而
+/// 被 proot trace 的 guest 进程是**独立的**宿主进程 —— proot 的
+/// `--kill-on-exit` 是 userspace 的 `atexit` 钩子，SIGKILL 根本不跑它。原来那条
+/// 路会留下一整棵孤儿树继续吃 CPU 和电。
+struct CommandGuard {
+    pid_file: PathBuf,
+    /// 拿不到命令组号时的兜底：proot 自己的组（spawn 时 `process_group(0)` 建的）
+    proot_pgid: Option<i32>,
+    armed: bool,
+}
+
+impl CommandGuard {
+    fn new(pid_file: PathBuf, proot_pgid: Option<i32>) -> Self {
+        Self {
+            pid_file,
+            proot_pgid,
+            armed: true,
+        }
+    }
+
+    /// 杀谁：优先命令自己的组 —— proot 留着，它可能还在给别的常驻进程当
+    /// tracer，杀了那些进程就失去 rootfs 翻译、变成坏的。
+    fn target(&self) -> Option<i32> {
+        read_pgid(&self.pid_file).or(self.proot_pgid)
+    }
+
+    /// 超时：先 SIGTERM（`apk add` / 编译器至少有机会收尾，留个 SIGKILL 打断的
+    /// 半成品更麻烦），限时还不走就 SIGKILL。
+    async fn terminate(&self) {
+        let Some(pgid) = self.target() else { return };
+        kill_group(pgid, libc::SIGTERM);
+        let steps = KILL_GRACE.as_millis() / KILL_POLL.as_millis().max(1);
+        for _ in 0..steps {
+            tokio::time::sleep(KILL_POLL).await;
+            if !group_alive(pgid) {
+                return;
+            }
+        }
+        kill_group(pgid, libc::SIGKILL);
+    }
+
+    /// 停止：直接 SIGKILL —— 用户在按停止，不等（而且 `Drop` 里也不该睡）。
+    fn kill_now(&self) {
+        if let Some(pgid) = self.target() {
+            kill_group(pgid, libc::SIGKILL);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.kill_now();
+        }
+    }
+}
+
+/// 退出码 ≥128 按 shell 的约定解出信号号（`sh -c` 里被信号打死的命令 `$?` 就是
+/// 128+N）。有这个才能给出「被 OOM 杀了」这类提示 —— 代价是 `exit 137` 这种
+/// 写法会被当成 SIGKILL，本来就分不出来。
+fn signal_of_exit(code: i32) -> Option<i32> {
+    let sig = code - 128;
+    (1..=31).contains(&sig).then_some(sig)
+}
+
+// ---------------------------------------------------------------------------
+// `agent ps` / `agent kill`：沙箱里现在还有什么在跑
+// ---------------------------------------------------------------------------
+//
+// 为什么需要：刻意脱离（`setsid` / `nohup`）的常驻进程**能活过工具调用**，
+// 但它们的父进程早就变成 init 了 —— 模型事后只能靠 `ps` 找 pid，而安卓上
+// /proc 按 uid 过滤、有些版本干脆看不见自己的后代（实测机型能看到，但这个
+// 不能假设）。能可靠知道的只有核心：它记得每次运行起的是哪个 proot，而
+// guest 进程的 `TracerPid` 就是那个 proot（见 `procs()`）。
+
+/// `/proc/<pid>` 里我们要的那几个字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawProc {
+    pid: i32,
+    ppid: i32,
+    /// 进程组号（`stat` 第 5 个字段）
+    pgid: i32,
+    /// `R` / `S` / `D` / `T` / `Z` …
+    state: char,
+    /// 谁在 ptrace 它（0 = 没人）。guest 进程的 tracer 就是 proot。
+    tracer: i32,
+    /// 截断过的命令行
+    cmdline: String,
+}
+
+/// 扫一个 /proc（测试里喂假的）。
+///
+/// **只看得见自己 uid 的进程** —— 安卓的 /proc 按 uid 过滤，所以拿到的天然
+/// 就是 App 自己起的那些。单条读失败就跳过（进程随时可能退）。
+fn scan_procs_in(proc_dir: &Path) -> Vec<RawProc> {
+    let Ok(entries) = std::fs::read_dir(proc_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let Some(pid) = e
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let dir = e.path();
+        let Ok(stat) = std::fs::read_to_string(dir.join("stat")) else {
+            continue;
+        };
+        let Some((state, ppid, pgid)) = parse_stat(&stat) else {
+            continue;
+        };
+        let tracer = std::fs::read_to_string(dir.join("status"))
+            .ok()
+            .and_then(|s| parse_tracer(&s))
+            .unwrap_or(0);
+        let cmdline = std::fs::read(dir.join("cmdline"))
+            .map(|b| render_cmdline(&b))
+            .unwrap_or_default();
+        out.push(RawProc {
+            pid,
+            ppid,
+            pgid,
+            state,
+            tracer,
+            cmdline,
+        });
+    }
+    out
+}
+
+fn scan_procs() -> Vec<RawProc> {
+    scan_procs_in(Path::new("/proc"))
+}
+
+/// `/proc/<pid>/stat` 的形状：`pid (comm) state ppid pgrp session …`。
+///
+/// `comm` 里可能有空格和括号（`(WebView 子进程)`），所以**从最后一个 `)` 之后**
+/// 再切 —— 逐 token 切第一个 `)` 会在这种名字上错位。
+fn parse_stat(stat: &str) -> Option<(char, i32, i32)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut it = rest.split_whitespace();
+    let state = it.next()?.chars().next()?;
+    let ppid = it.next()?.parse().ok()?;
+    let pgid = it.next()?.parse().ok()?;
+    Some((state, ppid, pgid))
+}
+
+/// `/proc/<pid>/status` 里的 `TracerPid:`（没有就 0）。
+fn parse_tracer(status: &str) -> Option<i32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("TracerPid:"))
+        .map(|v| v.trim().parse().unwrap_or(0))
+}
+
+/// `/proc/<pid>/cmdline` 是 NUL 分隔的 argv。截到 ~120 字（安全地按字符切）。
+fn render_cmdline(raw: &[u8]) -> String {
+    let joined = raw
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    clip_chars(&joined, 120)
+}
+
+/// 按**字符**截断（`String::truncate` 撞上多字节边界会 panic）。
+fn clip_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// 多行命令压成一行（登记表里只留一条给模型认领的线索）。
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 进程还活着吗。僵尸也算「活着」（它占着 pid），调用方按需滤掉。
+fn pid_alive(pid: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 我们起过的一条命令 —— `procs()` 靠它把 /proc 里的进程认到命令上。
+#[derive(Debug, Clone)]
+struct RunInfo {
+    /// 命令原文（截断过）
+    command: String,
+    /// 起于（epoch 毫秒）
+    started_ms: u64,
+    /// proot 自己的 pid：**它名下的 tracee 就是这条命令的进程**
+    proot_pid: i32,
+    /// runner 写 pid 的宿主路径（读出来是这条命令的进程组）
+    pid_file: PathBuf,
+    /// 命令结束了吗。结束了还有活着的进程 = 刻意脱离的常驻进程。
+    finished: bool,
+}
+
+/// 命令登记表。
+#[derive(Default)]
+struct RunRegistry {
+    runs: BTreeMap<i32, RunInfo>,
+}
+
+impl RunRegistry {
+    /// 最多留这么多条。一个长命 App 里命令是无限的，而这个表只在 `procs()`
+    /// 被调到的时候才清。
+    const KEEP: usize = 64;
+
+    fn add(&mut self, run: RunInfo) {
+        self.runs.insert(run.proot_pid, run);
+        while self.runs.len() > Self::KEEP {
+            // 先扔「已结束且 proot 已经不在了」的；实在没有就扔最老的
+            let victim = self
+                .runs
+                .iter()
+                .find(|(_, r)| r.finished && !pid_alive(r.proot_pid))
+                .map(|(p, _)| *p)
+                .or_else(|| self.runs.keys().next().copied());
+            match victim {
+                Some(p) => {
+                    self.runs.remove(&p);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 命令结束（不代表它名下的进程都死了 —— 刻意脱离的还在）。
+    fn finish(&mut self, proot_pid: i32) {
+        if let Some(r) = self.runs.get_mut(&proot_pid) {
+            r.finished = true;
+        }
+    }
+
+    /// 清掉 proot 已经没了的登记 —— proot 退出就说明它名下不可能还有进程。
+    ///
+    /// 这也顺手挡住了 pid 复用：proot 死后的登记不会再被拿去归因。
+    fn prune(&mut self) {
+        self.runs.retain(|pid, _| pid_alive(*pid));
+    }
+}
+
+/// `agent ps` 里的一条**进程**（命令结束后还活着的那些，就是可以 kill 的）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcEntry {
+    pub pid: i32,
+    pub pgid: i32,
+    pub state: String,
+    pub age_secs: u64,
+    /// 命令已经结束、它还活着 —— 也就是刻意脱离的常驻进程
+    pub leftover: bool,
+    /// 它属于哪条命令（原文截断）
+    pub command: String,
+    /// 该进程自己的命令行
+    pub cmdline: String,
+}
+
+/// `agent ps` 里的一条**正在跑的命令**（按命令聚合，不逐个列进程）。
+#[derive(Debug, Clone, Serialize)]
+pub struct RunningRun {
+    /// 这条命令的进程组（拿不到就是 proot 的 pid）
+    pub pgid: i32,
+    pub age_secs: u64,
+    /// 它名下现在有几个进程
+    pub procs: usize,
+    pub command: String,
+}
+
+/// `agent ps` 的全貌。
+#[derive(Debug, Default, Serialize)]
+pub struct ProcsReport {
+    /// /proc 里看得见多少个进程：用来区分「没有」和「看不见」
+    pub visible: usize,
+    pub leftovers: Vec<ProcEntry>,
+    pub running: Vec<RunningRun>,
+    /// 看得见、但不属于任何我们登记过的运行。典型是**上一次 App 进程被杀**
+    /// （不是 force-stop，那个会把整个 uid 都清掉）时留下的 proot 树：新进程的
+    /// 登记表里当然没有它们，而没有列出来就等于永远没人能收。
+    pub orphans: Vec<ProcEntry>,
+}
+
+/// 孤儿列表最多列这么多（模型看的是一段文字，不是日志）。
+const MAX_ORPHANS: usize = 20;
+
+impl ProcsReport {
+    /// 给模型看的排版。**在核心侧排好**，CLI 直接打 —— 免得两处各写一份
+    /// （`search.rs` 的 `format_hits` 就是这么搬过来的）。
+    pub fn to_text(&self) -> String {
+        if self.visible == 0 {
+            return "看不见任何进程：这台机器的 /proc 被限制了（hidepid），沙箱里的 `ps` \
+                    也一样看不到。这种机器上只能让命令自己把 pid 记下来\
+                    （`setsid … & echo $!`，或写进一个 pid 文件）。"
+                .into();
+        }
+        if self.leftovers.is_empty() && self.running.is_empty() && self.orphans.is_empty() {
+            return "沙箱里现在没有别的东西在跑。".into();
+        }
+        let mut s = String::new();
+        if !self.leftovers.is_empty() {
+            s.push_str(&format!(
+                "命令结束后还活着的常驻进程（{} 个）—— `agent kill <pid>` 停掉：\n",
+                self.leftovers.len()
+            ));
+            for e in &self.leftovers {
+                s.push_str(&fmt_proc_line(e));
+            }
+        }
+        if !self.running.is_empty() {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&format!("正在跑的命令（{} 条）：\n", self.running.len()));
+            for r in &self.running {
+                s.push_str(&format!(
+                    "  pgid {}  {}个进程  {}前\n      ← {}\n",
+                    r.pgid,
+                    r.procs,
+                    fmt_age(r.age_secs),
+                    r.command
+                ));
+            }
+        }
+        if !self.orphans.is_empty() {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&format!(
+                "不属于任何已知命令的进程（{} 个）—— 通常是**上一次 App 进程被杀**时\
+                 留下的（那次的登记表已经不在了），`agent kill <pid>` 可以停掉：\n",
+                self.orphans.len()
+            ));
+            for e in self.orphans.iter().take(MAX_ORPHANS) {
+                s.push_str(&fmt_proc_line(e));
+            }
+            if self.orphans.len() > MAX_ORPHANS {
+                s.push_str(&format!("  … 还有 {} 个没列\n", self.orphans.len() - MAX_ORPHANS));
+            }
+        }
+        s.push_str("\n（pid / pgid 都是宿主 pid，跟沙箱里 `ps` 看到的一致）");
+        s
+    }
+}
+
+/// 一条进程在文字里的样子（`leftovers` / `orphans` 共用）。
+fn fmt_proc_line(e: &ProcEntry) -> String {
+    let age = if e.age_secs > 0 {
+        format!("  {}前", fmt_age(e.age_secs))
+    } else {
+        String::new()
+    };
+    let cmd = if e.cmdline.is_empty() {
+        "（读不到命令行）"
+    } else {
+        &e.cmdline
+    };
+    let from = if e.command.is_empty() {
+        String::new()
+    } else {
+        format!("      ← 来自：{}\n", e.command)
+    };
+    format!(
+        "  pid {}  pgid {}  {}{}\n      {}\n{from}",
+        e.pid, e.pgid, e.state, age, cmd
+    )
+}
+
+fn fmt_age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs} 秒"),
+        60..=3599 => format!("{} 分钟", secs / 60),
+        _ => format!("{} 小时", secs / 3600),
+    }
+}
+
 pub struct LinuxSandbox {
     cfg: SandboxConfig,
     /// 核心 HTTP 服务的端口。`agent` 命令靠它找到「自己」（见 `AGENT_CLI`）。
@@ -255,6 +858,8 @@ pub struct LinuxSandbox {
     agent_port: AtomicU16,
     /// 核心接口的凭据（`AGENT_TOKEN`）。见 `state::Auth`。
     agent_token: std::sync::RwLock<Option<String>>,
+    /// 起过的命令（`agent ps` 用，见 `RunRegistry`）。
+    runs: Mutex<RunRegistry>,
 }
 
 /// 沙箱里的 `agent` 命令。
@@ -297,6 +902,8 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #   agent search <检索意图> [条数]   联网搜索（Exa），拿标题 + 链接 + 片段
 #     输出是**排好版的文字**（不是 JSON）：抬头一行「N 条 · exa-mcp」，
 #     下面每条三行（标题 / 网址 / 片段）。
+#   agent ps                 沙箱里还有什么在跑（包括**命令结束后仍活着的常驻进程**）
+#   agent kill <pid>         停掉一个（pid 从 agent ps 来）
 #   agent get <path>         直接 GET 自己的接口（逃生口）
 #   agent post <path> <json> 直接 POST
 #
@@ -346,6 +953,35 @@ case "$cmd" in
   tools)    get /api/debug/tools | tr ',' '\n' | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p' ;;
   sessions) get /api/sessions | fmt ;;
   session)  get /api/session | fmt ;;
+  # 什么在跑：核心那边记着每条命令是哪个 proot，而 guest 进程的 TracerPid
+  # 就是它 —— 于是连刻意 setsid / nohup 脱离的常驻进程也能认出来（它们的
+  # 父进程早就是 init 了，靠 ps 自己认不出来）。
+  # `self` 参数把自己的进程组报上去，免得每次都在「正在跑」里看到自己。
+  ps|procs)
+    self_pgid=$(awk '{print $5}' /proc/self/stat 2>/dev/null || echo 0)
+    get "/api/procs?format=text&self=$self_pgid"
+    ;;
+  kill)
+    shift || true
+    case "${1:-}" in
+      ''|*[!0-9]*)
+        echo "用法：agent kill <pid>（pid 从 `agent ps` 来）" >&2
+        exit 2
+        ;;
+    esac
+    # 先好声好气（让它收尾），几秒不走再来硬的
+    kill -TERM "$1" 2>/dev/null || true
+    for _ in 1 2 3; do
+      kill -0 "$1" 2>/dev/null || { echo "已停止 $1"; exit 0; }
+      sleep 1
+    done
+    kill -KILL "$1" 2>/dev/null || true
+    if kill -0 "$1" 2>/dev/null; then
+      echo "停不掉 $1（不是这个 uid 的进程？）" >&2
+      exit 1
+    fi
+    echo "已强杀 $1"
+    ;;
   doctor)
     get /api/health | fmt
     echo '--- 在沙箱里跑一句 ---'
@@ -680,6 +1316,133 @@ impl LinuxSandbox {
             cfg,
             agent_port: AtomicU16::new(0),
             agent_token: std::sync::RwLock::new(None),
+            runs: Mutex::new(RunRegistry::default()),
+        }
+    }
+
+    /// 登记一条刚起的命令（`agent ps` 靠它把进程认到命令上）。
+    fn register_run(&self, proot_pid: i32, script: &str, pid_file: PathBuf) {
+        if let Ok(mut r) = self.runs.lock() {
+            r.add(RunInfo {
+                command: clip_chars(&one_line(script), 160),
+                started_ms: now_ms(),
+                proot_pid,
+                pid_file,
+                finished: false,
+            });
+        }
+    }
+
+    /// 命令跑完了。**不代表它名下没进程了** —— 刻意脱离的还在（见 `procs`）。
+    fn finish_run(&self, proot_pid: i32) {
+        if let Ok(mut r) = self.runs.lock() {
+            r.finish(proot_pid);
+        }
+    }
+
+    /// 沙箱里现在还有什么在跑（`agent ps`）。
+    ///
+    /// 归因靠 `TracerPid`：guest 进程的 tracer 就是那条命令的 proot，所以
+    /// 「tracer == 某个我们起的 proot」= 这个进程是我们的。这是**唯一**能认出
+    /// 刻意脱离的常驻进程的办法 —— 它们早就被 reparent 到 init 了，按父子关系
+    /// 无论如何找不回来。
+    ///
+    /// `self_pgid` = 调用方自己所在的进程组（`agent ps` 从 `/proc/self/stat`
+    /// 取的），用来把它自己那条命令从「正在跑」里去掉 —— 否则每次 `agent ps`
+    /// 都会看到自己。
+    pub fn procs(&self, self_pgid: Option<i32>) -> ProcsReport {
+        self.procs_with(scan_procs(), self_pgid)
+    }
+
+    /// `procs()` 的实现（扫描结果从外面给，好测）。
+    fn procs_with(&self, all: Vec<RawProc>, self_pgid: Option<i32>) -> ProcsReport {
+        let Ok(mut runs) = self.runs.lock() else {
+            return ProcsReport::default();
+        };
+        runs.prune();
+        let now = now_ms();
+        let mut leftovers = Vec::new();
+        let mut running = Vec::new();
+        for run in runs.runs.values() {
+            // 命令自己那棵树的进程（正在跑的）
+            let mine: Vec<&RawProc> = all
+                .iter()
+                .filter(|p| p.tracer == run.proot_pid && p.state != 'Z')
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            // 进程组：runner 写下的那个（拿不到就退回 proot 的 pid）
+            let pgid = read_pgid(&run.pid_file).unwrap_or(run.proot_pid);
+            let age = now.saturating_sub(run.started_ms) / 1000;
+            if run.finished {
+                for p in mine {
+                    leftovers.push(ProcEntry {
+                        pid: p.pid,
+                        pgid: p.pgid,
+                        state: p.state.to_string(),
+                        age_secs: age,
+                        leftover: true,
+                        command: run.command.clone(),
+                        cmdline: p.cmdline.clone(),
+                    });
+                }
+            } else if Some(pgid) != self_pgid {
+                running.push(RunningRun {
+                    pgid,
+                    age_secs: age,
+                    procs: mine.len(),
+                    command: run.command.clone(),
+                });
+            }
+        }
+        leftovers.sort_by_key(|e| e.pid);
+        running.sort_by_key(|r| std::cmp::Reverse(r.age_secs));
+
+        // 看得见、但我们不认识的那些。
+        //
+        // 判据要卡紧一点：**只把「父进程已经没了」（ppid == 1）的算孤儿** ——
+        // 那正是「App 进程被杀、它的孩子被 reparent 到 init」的样子。不卡这一条
+        // 的话，任何同一个 uid、不归我们管的进程都会被列进来（单元测试里
+        // cargo / rustc 就是），而列一个「其实跟我们无关」的进程让模型去杀，
+        // 比漏掉更糟。孤儿 proot 名下的 tracee 也要收（它们自己的 ppid 还指着
+        // guest 里的父进程）。
+        let known: std::collections::BTreeSet<i32> = runs.runs.keys().copied().collect();
+        let orphan_proots: std::collections::BTreeSet<i32> = all
+            .iter()
+            .filter(|p| p.ppid == 1 && p.tracer == 0 && !known.contains(&p.pid))
+            .map(|p| p.pid)
+            .collect();
+        let me = std::process::id() as i32;
+        let mut orphans = Vec::new();
+        for p in all.iter() {
+            // 僵尸不列；核心/App 自己那个进程无论如何不能出现在「可以 kill」的列表里
+            if p.state == 'Z' || p.pid == me {
+                continue;
+            }
+            if known.contains(&p.pid) || known.contains(&p.tracer) {
+                continue;
+            }
+            if p.ppid != 1 && !orphan_proots.contains(&p.tracer) {
+                continue;
+            }
+            orphans.push(ProcEntry {
+                pid: p.pid,
+                pgid: p.pgid,
+                state: p.state.to_string(),
+                age_secs: 0,
+                // 不是「刚才那条命令留下的」——它是「上一次 App 生命」留下的
+                leftover: false,
+                command: String::new(),
+                cmdline: p.cmdline.clone(),
+            });
+        }
+        orphans.sort_by_key(|e| e.pid);
+        ProcsReport {
+            visible: all.len(),
+            leftovers,
+            running,
+            orphans,
         }
     }
 
@@ -865,15 +1628,40 @@ impl LinuxSandbox {
         self.cfg.rootfs.join("bin/bash").is_file()
     }
 
+    /// 沙箱里 `setsid` 的路径（rootfs 里没有就 None）。
+    ///
+    /// 它给每条命令开一个**自己的进程组** —— 超时 / 停止时只杀这个组，proot
+    /// 留着（见 `CommandGuard`）。Alpine 3.21 是 usrmerge 之后的
+    /// `/usr/bin/setsid`，老一点的在 `/bin`。
+    ///
+    /// **判存在不能用 `is_file()`。** Alpine 里 `/usr/bin/setsid` 是指向
+    /// `/bin/busybox` 的**绝对**符号链接，在宿主机上解析会指向宿主机的
+    /// `/bin/busybox`（不存在）—— `is_file()` 永远是 false。真机上踩过：命令行里
+    /// 没有 setsid，超时那一杀就落到 proot 自己的组上（`process_group(0)` 那个
+    /// 兜底不能当主路径用），proot 被 SIGKILL，它 trace 的常驻进程全成了没翻译
+    /// 的孤儿。`is_alpine_rootfs()` 上有同样的教训。
+    fn setsid_guest(&self) -> Option<&'static str> {
+        SETSID_PATHS.into_iter().find(|p| {
+            std::fs::symlink_metadata(self.cfg.rootfs.join(p.trim_start_matches('/'))).is_ok()
+        })
+    }
+
     /// 构造完整命令行。抽出来单独测试，不需要真的跑 proot。
     ///
-    /// 对应 OpenMinis `PRootKernel.buildProotCommand()`：
     /// ```text
-    /// <proot> -0 -l -r <rootfs> -b /dev -b /proc -b /sys -w /workspace
-    ///         [-b <host>:<linux> ...] [/bin/bash | /bin/sh] -c "<script>"
+    /// <proot> -0 --link2symlink -r <rootfs> -b /dev -b /proc -b /sys
+    ///         [-b <host>:<linux> ...] -w /workspace
+    ///         [/usr/bin/setsid] /bin/sh -c <runner> sh <script> <status>
     /// ```
-    pub fn command_line(&self, script: &str) -> Vec<String> {
-        let mut cmd: Vec<String> = Vec::with_capacity(20);
+    ///
+    /// **没有 `--kill-on-exit`**（曾经有，见 docs/02 的「进程模型」）：它让
+    /// proot 在命令退出的瞬间对整棵树发 SIGKILL，于是 `nohup` / `setsid` 起的
+    /// 常驻服务一条也活不过这次调用。代价是完成信号换了地方 —— 从「proot 退出」
+    /// 变成 runner 写下的状态文件（见 `runner_script`）。
+    ///
+    /// `status` 是沙箱内的状态文件路径（宿主侧在 `<rootfs>/<EXIT_DIR>/`）。
+    pub fn command_line(&self, script: &str, status: &str) -> Vec<String> {
+        let mut cmd: Vec<String> = Vec::with_capacity(24);
 
         macro_rules! arg {
             ($($x:expr),+ $(,)?) => {{ $( cmd.push($x.to_string()); )+ }};
@@ -906,9 +1694,6 @@ impl LinuxSandbox {
             arg!("-b", format!("{}:{WORKSPACE}", h.display()));
         }
 
-        // 子进程随 proot 一起死，避免留下孤儿
-        arg!("--kill-on-exit");
-
         arg!("-w", WORKSPACE);
 
         // 装过 bash 就用 bash：模型写的命令常带 bash 语法（`[[ ]]`、数组、
@@ -920,7 +1705,17 @@ impl LinuxSandbox {
         } else {
             "/bin/sh"
         };
-        arg!(shell, "-c", script);
+
+        // 没有 setsid 就退回「不分组」：那时 pid 文件不能信（`$$` 不是组号），
+        // 超时 / 停止只能拿 proot 自己的组当靶子（见 `CommandGuard::target`）。
+        let setsid = self.setsid_guest();
+        let runner = runner_script(shell, setsid.is_some());
+        if let Some(s) = setsid {
+            arg!(s);
+        }
+        // runner 本身跑在 /bin/sh 里（busybox 一定在，`$$` / printf / `$?` 都是
+        // POSIX）；模型那段脚本由 runner 交给上面选出的 shell 执行。
+        arg!("/bin/sh", "-c", runner, "sh", script, status);
 
         cmd
     }
@@ -1003,7 +1798,9 @@ impl LinuxSandbox {
         timeout: Duration,
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     ) -> anyhow::Result<ExecResult> {
-        let argv = self.command_line(script);
+        let started = Instant::now();
+        let status = StatusFile::new(&self.cfg.rootfs);
+        let argv = self.command_line(script, &status.guest);
         let using_bash = self.has_bash();
         let (bin, args) = argv.split_first().expect("command_line 至少有一个元素");
 
@@ -1016,16 +1813,35 @@ impl LinuxSandbox {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        // 超时 / 按停止（future 被丢掉）时杀掉 proot；沙箱里的子孙进程靠
-        // `--kill-on-exit` 跟着一起死（见 `command_line`）
-        cmd.kill_on_drop(true);
+        // 自己的进程组：
+        //  - 沙箱里的进程不再落在核心自己的组里（给核心发组信号不会顺手打进沙箱）；
+        //  - 拿不到命令组号时（rootfs 里没有 setsid、runner 还没写下 pid 就被杀），
+        //    `-<proot_pid>` 是个安全的兜底杀法。
+        // 这里**不能**用 `kill_on_drop`：它只杀 proot，而 guest 进程是独立的
+        // 宿主进程，会变成孤儿（见 `CommandGuard`）。
+        cmd.process_group(0);
 
         if let Some(tmp) = &self.cfg.tmp {
             let _ = std::fs::create_dir_all(tmp);
         }
 
-        let started = Instant::now();
         let mut child = cmd.spawn()?;
+        let proot_pgid = child.id().map(|p| p as i32);
+        // 登记：`agent ps` 把 /proc 里的进程认到命令上，就靠这条记录
+        if let Some(pid) = proot_pgid {
+            self.register_run(pid, script, status.pid_host.clone());
+        }
+
+        // 退出状态 + 收尸走后台任务：proot 可能在给一条常驻进程当 tracer，活
+        // 多久不知道，**不能在这里等它**（原来的 `child.wait()` 就是完成信号，
+        // 现在不是了）。但也不能把 `Child` 丢了不管 —— 它是我们的子进程，
+        // 没人 `wait` 就会变僵尸。
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = exit_tx.send(child.wait().await);
+        });
 
         // 边跑边读，内存里只留**首尾两端**（见 `Capture`）。
         //
@@ -1033,31 +1849,42 @@ impl LinuxSandbox {
         // `cat /dev/urandom | base64` 这类命令 60 秒能吐出几个 GB，
         // 手机上直接 OOM 带走整个 App。
         // 边跑边读；结果塞进共享的 `Capture`（为什么要共享见 `drain`）。
+        let tap = Arc::new(OutputTap::new(started));
         let out_cap = Arc::new(Mutex::new(Capture::default()));
         let err_cap = Arc::new(Mutex::new(Capture::default()));
         let out_task = tokio::spawn(Capture::read_into(
-            child.stdout.take(),
+            stdout_pipe,
             live.clone(),
             out_cap.clone(),
+            Some(tap.clone()),
         ));
         let err_task = tokio::spawn(Capture::read_into(
-            child.stderr.take(),
+            stderr_pipe,
             live,
             err_cap.clone(),
+            Some(tap.clone()),
         ));
 
-        let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(r) => (Some(r?), false),
-            Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                (None, true)
-            }
-        };
+        // future 被丢掉（用户按停止 / 回合取消）时靠它收场
+        let mut guard = CommandGuard::new(status.pid_host.clone(), proot_pgid);
 
-        // 管道可能被沙箱里的孙进程继承着不关（`nohup … &`）—— 别为它无限
-        // 等，但也**别把已经读到的丢了**（见 `drain`）。
-        let grace = Duration::from_secs(2);
+        // 等这次调用结束。两条独立的路，先到先算：
+        //  - runner 写下的状态文件 = 命令真的退出了（proot 可能还在）
+        //  - 两根管道都 EOF = 没人再拿着写端（proot 也退了）
+        // 都没有就等 timeout。
+        let done = wait_for_done(started, timeout, &status.host, &out_task, &err_task).await;
+
+        let timed_out = matches!(done, Done::TimedOut);
+        if timed_out {
+            guard.terminate().await;
+        } else if matches!(done, Done::Status(_)) {
+            // 命令已经退出，但管道里可能还有没读完的字节（裸 `&` 起的子孙还在写）
+            wait_for_quiet(&tap, &out_task, &err_task).await;
+        }
+
+        // 管道可能还被沙箱里某条**刻意脱离**的进程占着（`setsid … &`）—— 别为
+        // 它无限等，但也**别把已经读到的丢了**（见 `drain`）。
+        let grace = if timed_out { DRAIN_AFTER_KILL } else { Duration::ZERO };
         let stdout = drain(out_task, &out_cap, grace).await;
         let stderr = drain(err_task, &err_cap, grace).await;
         let (stdout_text, t1) = stdout.render();
@@ -1065,7 +1892,44 @@ impl LinuxSandbox {
         // 中间被扔掉（输出超过内存上限）也算截断
         let dropped = stdout.dropped_bytes + stderr.dropped_bytes;
         let truncated = t1 || t2 || dropped > 0;
-        let status = status.unwrap_or_default();
+
+        // 退出码以 runner 写下的为准（那是**命令**的退出码）。管道先 EOF 的
+        // 那条路上可能还差一拍没看到文件，再读一次。
+        let status_code = match done {
+            Done::Status(c) => Some(c),
+            _ => read_status_code(&status.host),
+        };
+        // 拿不到状态文件（runner 没起来、被我们杀了）才退回 proot 的退出码；
+        // 这时它多半马上就退，但也可能还在当 tracer，所以是有界的等。
+        //
+        // 超时不在此列：code / signal 都是我们自己定的，用不着 proot 的退出码 ——
+        // 而它那会儿很可能正给一条刻意脱离的常驻进程当 tracer，白等 REAP_GRACE
+        // （真机上实测：3 秒的超时变成 5.5 秒返回）。
+        let proot_exit = if timed_out || status_code.is_some() {
+            None
+        } else {
+            let early = exit_rx.try_recv().ok().and_then(|r| r.ok());
+            match early {
+                Some(st) => Some(st),
+                None => tokio::time::timeout(REAP_GRACE, exit_rx)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .and_then(|r| r.ok()),
+            }
+        };
+        guard.disarm();
+        if let Some(pid) = proot_pgid {
+            self.finish_run(pid);
+        }
+
+        let code = if timed_out {
+            TIMEOUT_EXIT
+        } else {
+            status_code
+                .or_else(|| proot_exit.and_then(|s| s.code()))
+                .unwrap_or(-1)
+        };
 
         // 截断了就把捕获到的输出落进沙箱的 /tmp，并告诉模型路径 ——
         // 它可以再用 grep/sed 去翻，不用把几十 MB 塞回上下文
@@ -1075,16 +1939,18 @@ impl LinuxSandbox {
             None
         };
 
-        // 信号：超时那次是我们自己 SIGKILL 的，报了反而混淆
+        // 信号：超时那次是我们自己杀的，报了反而混淆。其余情况下优先按 shell
+        // 的 128+N 约定解（状态文件里就是那个值），实在没有才看 proot 自己
+        // 是怎么死的。
         use std::os::unix::process::ExitStatusExt;
-        let signal = if timed_out { None } else { status.signal() };
+        let signal = if timed_out {
+            None
+        } else {
+            signal_of_exit(code).or_else(|| proot_exit.and_then(|s| s.signal()))
+        };
 
         Ok(ExecResult {
-            code: if timed_out {
-                -1
-            } else {
-                status.code().unwrap_or(-1)
-            },
+            code,
             signal,
             stdout: stdout_text,
             stderr: stderr_text,
@@ -1433,15 +2299,17 @@ const CAPTURE_HEAD: usize = 2 << 20;
 const CAPTURE_TAIL: usize = 2 << 20;
 
 impl Capture {
-    /// 边读边往里塞；`live` 是给前端的实时副本。
+    /// 边读边往里塞；`live` 是给前端的实时副本，`tap` 记「最后读到数据」的时刻
+    /// （命令退出后判断输出安静下来用的，见 `wait_for_quiet`）。
     ///
     /// 结果放在共享的 `Arc<Mutex<Capture>>` 里、而不是当返回值：管道可能被
-    /// 孙进程继承着不关（`nohup … &`），读任务会一直卡在 `read()` 上 —— 父
-    /// 进程等不到它，但**已经读到的输出必须拿得走**（见 `drain`）。
+    /// 刻意脱离的进程占着不关（`setsid … &`），读任务会一直卡在 `read()` 上 ——
+    /// 父任务等不到它，但**已经读到的输出必须拿得走**（见 `drain`）。
     async fn read_into<R: tokio::io::AsyncRead + Unpin>(
         src: Option<R>,
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
         cap: Arc<Mutex<Capture>>,
+        tap: Option<Arc<OutputTap>>,
     ) {
         use tokio::io::AsyncReadExt;
         let Some(mut src) = src else { return };
@@ -1450,6 +2318,9 @@ impl Capture {
             match src.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    if let Some(t) = &tap {
+                        t.note();
+                    }
                     if let Some(tx) = &live {
                         let _ = tx.send(chunk[..n].to_vec());
                     }
@@ -1604,14 +2475,67 @@ fn lock(cap: &Mutex<Capture>) -> MutexGuard<'_, Capture> {
     cap.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 等这次调用结束：状态文件 / 两根管道 EOF / 超时，三条路先到先算。
+async fn wait_for_done(
+    started: Instant,
+    timeout: Duration,
+    status_host: &Path,
+    out: &tokio::task::JoinHandle<()>,
+    err: &tokio::task::JoinHandle<()>,
+) -> Done {
+    loop {
+        if let Some(code) = read_status_code(status_host) {
+            break Done::Status(code);
+        }
+        if out.is_finished() && err.is_finished() {
+            break Done::PipesClosed;
+        }
+        if started.elapsed() >= timeout {
+            break Done::TimedOut;
+        }
+        tokio::time::sleep(STATUS_POLL).await;
+    }
+}
+
+/// 命令已经退出（状态文件出现）之后，把管道里最后那点输出读完。
+///
+/// 不能一见状态文件就关读端：字节可能还在管道缓冲区里，而且**裸 `&` 起的子孙
+/// 没有脱离**，还在往同一根管道写。等到「一段时间没有新数据」为止 —— 但有个
+/// 硬上限（真有进程一直在写，不能陪它到天荒地老）。
+///
+/// 两根管道都 EOF 就没什么可等的了，直接收。
+async fn wait_for_quiet(
+    tap: &OutputTap,
+    out: &tokio::task::JoinHandle<()>,
+    err: &tokio::task::JoinHandle<()>,
+) {
+    let seen = Instant::now();
+    loop {
+        if out.is_finished() && err.is_finished() {
+            return;
+        }
+        let since = seen.elapsed();
+        if since >= OUTPUT_DRAIN_CAP {
+            return;
+        }
+        if since >= OUTPUT_QUIET && tap.quiet_for(OUTPUT_QUIET) {
+            return;
+        }
+        tokio::time::sleep(STATUS_POLL).await;
+    }
+}
+
 /// 等读任务收尾，把捕获到的输出取走。
 ///
-/// 正常情况下管道会 EOF、任务自己结束。被孙进程占着的话最多等 `grace`，
-/// 超时就 abort 掉任务 —— 要的是**已读到的输出**，不是干净的收尾。
+/// 正常情况下管道会 EOF、任务自己结束。还被某条刻意脱离的进程占着的话最多
+/// 等 `grace`，超时就 abort 掉任务 —— 要的是**已读到的输出**，不是干净的收尾。
 ///
 /// 原来这里是「等 2 秒，超时就用 `unwrap_or_default()`」：那个默认值是**空的
-/// `Capture`**，等于把 2 秒内已经读到的输出全扔了。一条 `nohup x &` 就能让
-/// 模型看到空输出，而且看不出来为什么。
+/// `Capture`**，等于把 2 秒内已经读到的输出全扔了。一条后台进程就能让模型
+/// 看到空输出，而且看不出来为什么。
+///
+/// 现在的调用方只有在**刚杀完命令组**时才给 grace（`DRAIN_AFTER_KILL`）；
+/// 知道命令已经退出、输出也安静了的那条路给 0。
 async fn drain(
     mut task: tokio::task::JoinHandle<()>,
     cap: &Mutex<Capture>,
@@ -1755,7 +2679,7 @@ mod tests {
     /// 测试用：正常读完一份内存里的字节（不关心管道被占着的情形）。
     async fn read_all(data: &[u8]) -> Capture {
         let cap = Arc::new(Mutex::new(Capture::default()));
-        Capture::read_into(Some(data), None, cap.clone()).await;
+        Capture::read_into(Some(data), None, cap.clone(), None).await;
         let out = std::mem::take(&mut *lock(&cap));
         out
     }
@@ -1799,25 +2723,64 @@ mod tests {
 
     #[test]
     fn command_line_matches_the_documented_shape() {
-        let argv = sandbox().command_line("echo hi");
+        // 这个假 rootfs 里没有 setsid，所以走的是「不分组」的退化形态
+        let argv = sandbox().command_line("echo hi", "/.agent-exit/x");
         assert_eq!(argv[0], "/native/libproot.so");
         assert_eq!(argv[1], "-0");
         assert_eq!(argv[2], "--link2symlink");
         assert_eq!(&argv[3..5], &["-r", "/data/files/alpine-rootfs"]);
         assert_eq!(&argv[5..11], &["-b", "/dev", "-b", "/proc", "-b", "/sys"]);
         assert_eq!(&argv[11..13], &["-b", "/host/share:/mnt/share"]);
-        assert_eq!(argv[13], "--kill-on-exit");
-        assert_eq!(&argv[14..16], &["-w", "/workspace"]);
-        assert_eq!(&argv[16..], &["/bin/sh", "-c", "echo hi"]);
+        assert_eq!(&argv[13..15], &["-w", "/workspace"]);
+        assert_eq!(&argv[15..18], &["/bin/sh", "-c", argv[17].as_str()]);
+        assert_eq!(&argv[18..], &["sh", "echo hi", "/.agent-exit/x"]);
+        // 这个参数一加回来，`nohup` / `setsid` 起的服务就活不过这次调用
+        assert!(
+            !argv.iter().any(|a| a == "--kill-on-exit"),
+            "不能再用 --kill-on-exit: {argv:?}"
+        );
+    }
+
+    /// 有 setsid 就一定要用它：命令得跑在**自己的进程组**里，超时 / 停止时
+    /// 才能只杀它（proot 要留着给常驻进程当 tracer）。
+    #[test]
+    fn command_line_runs_the_command_in_its_own_process_group() {
+        let t = TempRoot::new("setsid");
+        std::fs::write(t.dir.join("bin/setsid"), b"").unwrap();
+        let argv = t.sandbox().command_line("echo hi", "/.agent-exit/x");
+        let setsid_at = argv.iter().position(|a| a == "/bin/setsid").expect("setsid 在里面");
+        assert_eq!(
+            &argv[setsid_at..],
+            &["/bin/setsid", "/bin/sh", "-c", argv[setsid_at + 3].as_str(), "sh", "echo hi", "/.agent-exit/x"],
+            "setsid 得直接排在 runner 的 /bin/sh 前面: {argv:?}"
+        );
+        let runner = &argv[setsid_at + 3];
+        assert!(
+            runner.contains("$2.pid"),
+            "有 setsid 时 runner 必须报进程组号: {runner}"
+        );
+    }
+
+    /// 没有 setsid 时 runner 不能报 pid —— 那个 `$$` 不是组号，按它杀会杀错组。
+    #[test]
+    fn command_line_degrades_without_setsid() {
+        let t = TempRoot::new("nosetsid");
+        let argv = t.sandbox().command_line("true", "/.agent-exit/x");
+        assert!(!argv.iter().any(|a| a.ends_with("setsid")), "{argv:?}");
+        let runner = argv.iter().find(|a| a.contains("rc=$?")).unwrap();
+        assert!(
+            !runner.contains("$2.pid"),
+            "没有 setsid 时不能报组号: {runner}"
+        );
     }
 
     #[test]
     fn script_is_passed_as_one_argv_element_not_shell_escaped() {
         // 关键：脚本原样作为单个参数传，不做任何转义 —— 因为我们是
-        // 直接 execve，没有中间 shell 会二次解析它
+        // 直接 execve，没有中间 shell 会二次解析它（runner 拿它当 `$1`）
         let nasty = "echo \"a b\"; ls | grep x; echo '$(whoami)'";
-        let argv = sandbox().command_line(nasty);
-        assert_eq!(argv.last().unwrap(), nasty);
+        let argv = sandbox().command_line(nasty, "/.agent-exit/x");
+        assert_eq!(argv[argv.len() - 2], nasty);
     }
 
     /// 没 bash 退回 ash、装了就用 bash —— 两条路都要盯住。
@@ -1825,21 +2788,432 @@ mod tests {
     fn command_line_uses_bash_once_it_is_installed() {
         let t = TempRoot::new("shellbash");
         let sb = t.sandbox();
-        let shell_of = |argv: Vec<String>| {
+        // 真正执行脚本的 shell 写在 runner 里，runner 是 `-c` 的下一个参数
+        let runner_of = |argv: Vec<String>| {
             let i = argv.iter().position(|a| a == "-c").expect("-c 一定在");
-            argv[i - 1].clone()
+            argv[i + 1].clone()
         };
-        assert_eq!(
-            shell_of(sb.command_line("true")),
-            "/bin/sh",
+        assert!(
+            runner_of(sb.command_line("true", "/.agent-exit/x")).starts_with("/bin/sh -c"),
             "没装就退回 ash"
         );
         std::fs::write(t.dir.join("bin/bash"), b"").unwrap();
-        assert_eq!(
-            shell_of(sb.command_line("true")),
-            "/bin/bash",
+        assert!(
+            runner_of(sb.command_line("true", "/.agent-exit/x")).starts_with("/bin/bash -c"),
             "装了就该用 bash，不然模型写的 bash 语法白写"
         );
+    }
+
+    /// runner 是纯 POSIX sh，所以拿**宿主的** /bin/sh 就能把它验到底：
+    /// 退出码和组号真的写下来了，脚本也没被多解析一层。
+    #[test]
+    fn runner_writes_the_exit_code_and_the_group_id() {
+        let t = TempRoot::new("runner");
+        let status = t.dir.join("status");
+        let path = status.display().to_string();
+        let script = "echo \"a b\"; echo '$(whoami)'; exit 7";
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &runner_script("/bin/sh", true), "sh", script, &path])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(7), "runner 要把命令的退出码传出来");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "a b\n$(whoami)\n",
+            "脚本原样交给内层 sh，没被多解析一层"
+        );
+        assert_eq!(std::fs::read_to_string(&status).unwrap(), "7");
+        let pid = read_pgid(&PathBuf::from(format!("{path}.pid"))).expect("pid 文件要能读");
+        assert!(pid > 1, "pid 得是个真 pid: {pid}");
+    }
+
+    /// `kill_group` 得真的打到组里的**每个**进程，不只是组长。
+    /// 这就是超时 / 停止时不再漏孤儿的那一步。
+    #[tokio::test]
+    async fn kill_group_takes_down_the_whole_group() {
+        use std::os::unix::process::CommandExt;
+        // 组里两条 sleep：组长（sh）和它自己起的子进程
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 & sleep 30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(group_alive(pgid), "组该起来了");
+
+        kill_group(pgid, libc::SIGKILL);
+        let _ = child.wait(); // 给组长收尸，免得僵尸顶着组号
+        let mut gone = false;
+        for _ in 0..40 {
+            if !group_alive(pgid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !gone {
+            // 别把 30 秒的 sleep 留给下一次测试
+            kill_group(pgid, libc::SIGKILL);
+        }
+        assert!(gone, "组里还有活着的进程（孤儿漏出来了）");
+    }
+
+    /// 真机上「命令退出、但它起的进程还拿着 stdout」这条形状，在 macOS 上拿
+    /// 宿主的 /bin/sh 就能复现（测的是**我们的**监控 / 收尾逻辑，不是 proot）：
+    ///
+    /// - 有状态文件就立刻收工，不陪那根永不 EOF 的管道；
+    /// - 输出安静之后的 `drain(0)` 照样把已经读到的输出完整交出来；
+    /// - 组杀真的能打到拿着管道的那条（读端因此等到 EOF）。
+    #[tokio::test]
+    async fn a_status_file_ends_the_call_without_waiting_for_the_pipe() {
+        let t = TempRoot::new("heldpipe");
+        let status = t.dir.join("status");
+        let pid_file = t.dir.join("status.pid");
+        let started = Instant::now();
+
+        // 后台 sleep 继承 stdout（就是「常驻进程」那根写端），然后命令自己退出、
+        // 写下状态文件 —— runner 干的就是这件事。
+        //
+        // 路径用双引号包住：测试的临时目录名里带 `ThreadId(128)` 这种括号，
+        // 裸词里的 `(` 会被 sh 当语法错误（runner 那边是 `> "$2"`，本来就带引号）。
+        let script = format!(
+            "sleep 30 & echo hi; printf 0 > \"{}\"; exit 0",
+            status.display()
+        );
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id().unwrap() as i32;
+        std::fs::write(&pid_file, pgid.to_string()).unwrap();
+
+        let tap = Arc::new(OutputTap::new(started));
+        let cap = Arc::new(Mutex::new(Capture::default()));
+        let out_task = tokio::spawn(Capture::read_into(
+            child.stdout.take(),
+            None,
+            cap.clone(),
+            Some(tap.clone()),
+        ));
+        let err_task = tokio::spawn(async {});
+
+        let done = wait_for_done(
+            started,
+            Duration::from_secs(5),
+            &status,
+            &out_task,
+            &err_task,
+        )
+        .await;
+        assert!(matches!(done, Done::Status(0)), "得靠状态文件收工，不能等管道");
+        assert!(
+            !out_task.is_finished(),
+            "这会儿后台进程还拿着写端（形状才对）"
+        );
+
+        let before = Instant::now();
+        wait_for_quiet(&tap, &out_task, &err_task).await;
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "安静了就该立刻走，实际 {:?}",
+            before.elapsed()
+        );
+
+        let got = drain(out_task, &cap, Duration::ZERO).await;
+        assert_eq!(
+            String::from_utf8_lossy(&got.head),
+            "hi\n",
+            "已经读到的输出不能丢"
+        );
+
+        // 收尾：把那条 sleep 干掉（平时这是 CommandGuard 的事）
+        kill_group(pgid, libc::SIGKILL);
+        let _ = child.wait().await;
+    }
+
+    /// 超时又没有状态文件时：组杀要真的打到拿着管道的那条，读端才会 EOF。
+    /// 这就是「不再漏孤儿」那一步的可测形式。
+    #[tokio::test]
+    async fn a_timed_out_command_group_is_killed_and_releases_the_pipe() {
+        let t = TempRoot::new("timeoutkill");
+        let pid_file = t.dir.join("status.pid");
+
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id().unwrap() as i32;
+        std::fs::write(&pid_file, pgid.to_string()).unwrap();
+        let guard = CommandGuard::new(pid_file, Some(pgid));
+
+        let cap = Arc::new(Mutex::new(Capture::default()));
+        let out_task = tokio::spawn(Capture::read_into(
+            child.stdout.take(),
+            None,
+            cap.clone(),
+            None,
+        ));
+        let err_task = tokio::spawn(async {});
+
+        let started = Instant::now();
+        let done = wait_for_done(
+            started,
+            Duration::from_millis(200),
+            &t.dir.join("never-written"),
+            &out_task,
+            &err_task,
+        )
+        .await;
+        assert!(matches!(done, Done::TimedOut));
+
+        guard.terminate().await;
+        let mut released = false;
+        for _ in 0..40 {
+            if out_task.is_finished() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(released, "杀了组，管道还没 EOF —— 孤儿还在拿着它");
+        // 先收尸再判组：被杀死的组长在 `wait` 之前是僵尸，而僵尸也占着组号
+        let _ = child.wait().await;
+        assert!(!group_alive(pgid), "组里还有活着的进程");
+        let _ = drain(out_task, &cap, Duration::ZERO).await;
+    }
+
+    /// Alpine 里 `/usr/bin/setsid` 是指向 `/bin/busybox` 的**绝对**符号链接，
+    /// 在宿主机上解析必然失败 —— 判存在不能 `is_file()`。
+    ///
+    /// 漏了这一步的后果（真机上实测）：命令行里没有 setsid，runner 就落在
+    /// proot 自己的进程组里，超时那一杀打到 proot 头上（它忽略 SIGTERM，然后
+    /// 吃 SIGKILL），被 trace 的常驻进程全部失去翻译。
+    #[test]
+    fn setsid_is_found_when_it_is_a_dangling_absolute_symlink() {
+        let t = TempRoot::new("setsidlink");
+        std::fs::create_dir_all(t.dir.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink("/bin/busybox", t.dir.join("usr/bin/setsid")).unwrap();
+
+        let argv = t.sandbox().command_line("true", "/.agent-exit/x");
+        assert!(
+            argv.iter().any(|a| a == "/usr/bin/setsid"),
+            "绝对符号链接也算在：{argv:?}"
+        );
+        let runner = argv.iter().find(|a| a.contains("rc=$?")).unwrap();
+        assert!(runner.contains("$2.pid"), "有 setsid 就该报组号: {runner}");
+    }
+
+    /// `agent ps`：扫 /proc 的解析。假 /proc 直接造，不靠真实进程。
+    #[test]
+    fn proc_scan_parses_stat_status_and_cmdline() {
+        // comm 里有空格和括号：必须从**最后一个** ')' 之后切
+        assert_eq!(
+            parse_stat("4211 (WebView 子进程) S 1 4211 4211 0 -1 4194560 1 0 0 0 0"),
+            Some(('S', 1, 4211))
+        );
+        assert_eq!(parse_stat("garbage"), None);
+        assert_eq!(parse_stat("1 (sh) Z 2 3"), Some(('Z', 2, 3)));
+        assert_eq!(parse_tracer("Name:\tsleep\nTracerPid:\t21707\nPPid:\t1\n"), Some(21707));
+        assert_eq!(parse_tracer("TracerPid:\t0\n"), Some(0));
+        assert_eq!(parse_tracer("Name:\tsleep\n"), None);
+        // cmdline 是 NUL 分隔的 argv；超长按字符切（不能撞多字节边界）
+        assert_eq!(render_cmdline(b"sh\0-c\0echo hi\0"), "sh -c echo hi");
+        assert_eq!(render_cmdline(b""), "");
+        let long = format!("echo {}", "汉".repeat(200));
+        let clipped = render_cmdline(long.as_bytes());
+        assert!(clipped.ends_with('…'), "{clipped}");
+        assert!(clipped.chars().count() <= 121, "{}", clipped.chars().count());
+
+        // 一个假 /proc：两条看得见、一条 stat 缺失（进程刚退的样子）
+        let t = TempRoot::new("procscan");
+        let p = t.dir.join("proc");
+        for (pid, stat, tracer, cmdline) in [
+            ("4211", "4211 (sh) S 1 4211 4211 0 -1", "21707", "sh\0-c\0sleep 1\0"),
+            ("4212", "4212 (sleep) S 4211 4211 4211 0 -1", "21707", "sleep\x001\x00"),
+            ("4213", "4213 (gone) Z 1 4213 4213 0 -1", "0", ""),
+        ] {
+            let d = p.join(pid);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("stat"), stat).unwrap();
+            std::fs::write(d.join("status"), format!("TracerPid:\t{tracer}\n")).unwrap();
+            std::fs::write(d.join("cmdline"), cmdline).unwrap();
+        }
+        // 一个非数字目录 + 一个缺 stat 的目录
+        std::fs::create_dir_all(p.join("net")).unwrap();
+        std::fs::create_dir_all(p.join("4214")).unwrap();
+        let mut got = scan_procs_in(&p);
+        got.sort_by_key(|r| r.pid);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0].pid, 4211);
+        assert_eq!(got[0].cmdline, "sh -c sleep 1");
+        assert_eq!(got[0].tracer, 21707);
+        assert_eq!(got[1].ppid, 4211);
+        assert_eq!(got[2].state, 'Z');
+    }
+
+    /// 归因：`TracerPid` 指向我们起的 proot 的进程才算我们的；命令结束后还活着
+    /// 的那些进 `leftovers`（这才是可以 `agent kill` 的）。
+    #[test]
+    fn procs_attributes_survivors_to_the_command_that_left_them() {
+        let t = TempRoot::new("procsattr");
+        let sb = t.sandbox();
+        // 拿一个真活着的进程当 "proot"（归因只要求 pid 活着）
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .unwrap();
+        let proot = child.id() as i32;
+        let pid_file = t.dir.join("nope.pid"); // 没有 pid 文件 = 退回 proot 自己的 pid
+        sb.register_run(proot, "setsid sh -c 'while :; do date; done'", pid_file);
+
+        let fake = vec![
+            RawProc { pid: 9001, ppid: 1, pgid: 9001, state: 'S', tracer: proot, cmdline: "sh -c while :; do date; done".into() },
+            RawProc { pid: 9002, ppid: 1, pgid: 9002, state: 'S', tracer: 4242, cmdline: "别人的".into() },
+        ];
+        // 命令还在跑：进 running，不逐个列进程
+        let r = sb.procs_with(fake.clone(), None);
+        assert_eq!(r.visible, 2);
+        assert!(r.leftovers.is_empty());
+        assert_eq!(r.running.len(), 1);
+        assert_eq!(r.running[0].procs, 1);
+        assert_eq!(r.running[0].pgid, proot);
+        assert!(r.running[0].command.contains("while :; do date"), "{:?}", r.running[0]);
+        let text = r.to_text();
+        assert!(text.contains("正在跑的命令"), "{text}");
+        // 那条 tracer 不认识、父进程也没了的：进孤儿，不进「正在跑」
+        assert_eq!(r.orphans.len(), 1, "{:?}", r.orphans);
+
+        // 调用方报上自己的进程组：不该在「正在跑」里看到自己
+        let me = sb.procs_with(fake.clone(), Some(proot));
+        assert!(me.running.is_empty(), "自己那条命令得滤掉：{:?}", me.running);
+
+        // 命令结束了，它还活着 = 刻意脱离的常驻进程：能拿到 pid 就能杀
+        sb.finish_run(proot);
+        let r = sb.procs_with(fake, None);
+        assert!(r.running.is_empty());
+        assert_eq!(r.leftovers.len(), 1);
+        assert_eq!(r.leftovers[0].pid, 9001);
+        assert!(r.leftovers[0].leftover);
+        let text = r.to_text();
+        assert!(text.contains("还活着的常驻进程"), "{text}");
+        assert!(text.contains("agent kill <pid>"), "{text}");
+        assert!(text.contains("pid 9001"), "{text}");
+        // 那条 tracer=4242 的：看得见、不认识，而且**父进程已经没了** ——
+        // 正是「上个 App 生命留下的」那种，要列出来（否则没人能收）
+        assert_eq!(r.orphans.len(), 1, "不认识又没爹的就是孤儿：{:?}", r.orphans);
+        assert!(r.orphans[0].cmdline.contains("别人的"), "{:?}", r.orphans[0]);
+        assert!(
+            text.contains("不属于任何已知命令的进程"),
+            "孤儿也得说清楚是什么：{text}"
+        );
+        assert!(!text.contains("← 来自：\n"), "孤儿没有「来自」：{text}");
+
+        // proot 没了 → 登记被清掉，不再误导模型
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let other = RawProc {
+            pid: 9500,
+            ppid: 1,
+            pgid: 9500,
+            state: 'S',
+            tracer: 0,
+            cmdline: "init 留下来的".into(),
+        };
+        // 父进程还在、又不归我们的 → 不是孤儿（单元测试里 cargo 自己就是这种）
+        let alive_parent = RawProc {
+            pid: 9501,
+            ppid: 4242,
+            pgid: 4242,
+            state: 'S',
+            tracer: 0,
+            cmdline: "别人的孩子".into(),
+        };
+        let r = sb.procs_with(vec![other, alive_parent], None);
+        assert!(r.leftovers.is_empty() && r.running.is_empty());
+        assert_eq!(r.orphans.len(), 1, "只列真孤儿：{:?}", r.orphans);
+        assert_eq!(r.orphans[0].pid, 9500);
+        assert!(r.to_text().contains("不属于任何已知命令的进程"));
+        // 什么都没有时（看得见 /proc，但没我们的进程）
+        let empty = ProcsReport {
+            visible: 3,
+            ..Default::default()
+        };
+        assert!(empty.to_text().contains("没有别的东西在跑"), "{}", empty.to_text());
+    }
+
+    /// /proc 看不见任何东西时得**明说**，不能假装「什么都没有」。
+    #[test]
+    fn procs_says_so_when_proc_is_hidden() {
+        let t = TempRoot::new("procshidden");
+        let r = t.sandbox().procs_with(vec![], None);
+        assert_eq!(r.visible, 0);
+        assert!(r.to_text().contains("hidepid"), "{}", r.to_text());
+    }
+
+    #[test]
+    fn status_files_are_removed_when_the_run_ends_or_is_cancelled() {
+        let t = TempRoot::new("statusclean");
+        let paths = {
+            let s = StatusFile::new(&t.dir);
+            std::fs::write(&s.host, b"0").unwrap();
+            std::fs::write(&s.pid_host, b"4242").unwrap();
+            assert!(s.host.exists() && s.pid_host.exists());
+            (s.host.clone(), s.pid_host.clone())
+        }; // 出了作用域 = 取消（future 被丢掉）也会走同一条路
+        assert!(!paths.0.exists(), "状态文件得清掉");
+        assert!(!paths.1.exists(), "pid 文件也得清掉，不然 .agent-exit 会越积越多");
+    }
+
+    /// `pgid <= 1` 一个都不许发：`0` 是「我自己这个组」，`1` 是 init。
+    /// 这道闸真的生效的话，这个测试进程能活到最后一行。
+    #[test]
+    fn kill_group_refuses_unsafe_targets() {
+        assert!(!group_alive(0) && !group_alive(1) && !group_alive(-1));
+        kill_group(0, libc::SIGKILL);
+        kill_group(1, libc::SIGKILL);
+    }
+
+    #[test]
+    fn status_and_pgid_files_are_read_only_when_they_parse() {
+        let t = TempRoot::new("statusread");
+        let f = t.dir.join("s");
+        assert_eq!(read_status_code(&f), None, "文件不在就得是 None");
+        std::fs::write(&f, b"").unwrap();
+        assert_eq!(read_status_code(&f), None, "写了一半（空）也是 None，下一拍再读");
+        std::fs::write(&f, b"boom").unwrap();
+        assert_eq!(read_status_code(&f), None);
+        std::fs::write(&f, b"0\n").unwrap();
+        assert_eq!(read_status_code(&f), Some(0));
+        std::fs::write(&f, b" 7 ").unwrap();
+        assert_eq!(read_status_code(&f), Some(7));
+
+        assert_eq!(read_pgid(&f), Some(7));
+        for bad in ["0", "1", "-3", ""] {
+            std::fs::write(&f, bad.as_bytes()).unwrap();
+            assert_eq!(read_pgid(&f), None, "{bad:?} 不能当组号");
+        }
+        std::fs::write(&f, b"4242").unwrap();
+        assert_eq!(read_pgid(&f), Some(4242));
+    }
+
+    /// 「输出安静了」得真的按时间算，不然命令刚退出就把最后一块输出丢了。
+    #[test]
+    fn output_tap_reports_silence() {
+        let tap = OutputTap::new(Instant::now());
+        assert!(!tap.quiet_for(Duration::from_millis(150)), "刚起步不算安静");
+        std::thread::sleep(Duration::from_millis(30));
+        tap.note();
+        assert!(!tap.quiet_for(Duration::from_millis(150)), "刚写过不算安静");
+        std::thread::sleep(Duration::from_millis(180));
+        assert!(tap.quiet_for(Duration::from_millis(150)), "180ms 没动静就安静了");
     }
 
     /// 管道正常关闭（常见情形）：drain 不能多 await 一次 —— 那条路上
@@ -1847,7 +3221,12 @@ mod tests {
     #[tokio::test]
     async fn drain_handles_a_task_that_finishes_in_time() {
         let cap = Arc::new(Mutex::new(Capture::default()));
-        let task = tokio::spawn(Capture::read_into(Some(&b"hello\n"[..]), None, cap.clone()));
+        let task = tokio::spawn(Capture::read_into(
+            Some(&b"hello\n"[..]),
+            None,
+            cap.clone(),
+            None,
+        ));
         let got = drain(task, &cap, Duration::from_secs(5)).await;
         assert_eq!(got.head, b"hello\n");
         assert_eq!(got.dropped_bytes, 0);
@@ -1862,7 +3241,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (mut w, r) = tokio::io::duplex(4096);
         let cap = Arc::new(Mutex::new(Capture::default()));
-        let task = tokio::spawn(Capture::read_into(Some(r), None, cap.clone()));
+        let task = tokio::spawn(Capture::read_into(Some(r), None, cap.clone(), None));
         w.write_all(b"partial output\n").await.unwrap();
         // 写端不关（就像还在跑的后台进程），读任务永远等不到 EOF
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2233,7 +3612,7 @@ mod tests {
             t.dir.join("x")
         );
 
-        let argv = sb.command_line("true");
+        let argv = sb.command_line("true", "/.agent-exit/x");
         let joined = argv.join(" ");
         assert!(joined.contains(&format!("-b {}:/sdcard", phone.display())));
         assert!(joined.contains(&format!("-b {}:/workspace", ws.display())));
@@ -2517,6 +3896,13 @@ mod tests {
         for sub in ["navigate", "new_tab", "list_tabs", "switch_tab", "close_tab"] {
             assert!(body.contains(sub), "浏览器子命令 {sub} 掉了");
         }
+        // `agent ps` / `agent kill`：常驻服务能活过工具调用，就得能看/停它们
+        assert!(body.contains("/api/procs"), "`agent ps` 的后端接口掉了");
+        assert!(body.contains("agent ps") && body.contains("agent kill"), "help 里得列出来");
+        assert!(
+            body.contains("kill -TERM") && body.contains("kill -KILL"),
+            "`agent kill` 要先 TERM 再 KILL（给对 TERM 有反应的进程一个收尾机会）"
+        );
 
         #[cfg(unix)]
         {

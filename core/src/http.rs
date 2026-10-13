@@ -28,6 +28,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health))
         .route("/api/command", post(post_command))
         .route("/api/linux", post(bash_run))
+        .route("/api/procs", get(list_procs))
         .route("/api/browser", post(browser_action))
         .route("/api/websearch", post(web_search))
         .route("/api/websearch/config", post(set_search_config))
@@ -306,6 +307,51 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
         .into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
     }
+}
+
+/// `GET /api/procs` → 沙箱里现在还有什么在跑（`agent ps` 的后端）。
+///
+/// 为什么看进程这件事得在核心侧做：只有核心记得每次运行起的是哪个 proot，
+/// 而 guest 进程的 `TracerPid` 就是它 —— 凭这个才能认出**命令结束后仍活着**的
+/// 常驻进程（`setsid` / `nohup` 刻意脱离的那些，父进程早就是 init 了，
+/// 靠 `ps` 自己认不出来），也才能在 /proc 被 hidepid 限制的机器上诚实地说
+/// 「看不见」。见 `linux::LinuxSandbox::procs`。
+///
+/// `?format=text` 直接回排好版的文字（沙箱里的 `agent ps` 就走这条，
+/// 跟 `/api/websearch` 一个路数），否则回 JSON。
+#[derive(Deserialize)]
+struct ProcsQuery {
+    #[serde(default)]
+    format: Option<String>,
+    /// 调用方自己所在的进程组（`agent ps` 从 `/proc/self/stat` 取）——
+    /// 用来把它自己那条命令从「正在跑」里去掉。
+    #[serde(default, rename = "self")]
+    self_pgid: Option<i32>,
+}
+
+async fn list_procs(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ProcsQuery>,
+) -> Response {
+    let Some(sb) = st.linux() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Linux 沙箱未初始化").into_response();
+    };
+    let report = sb.procs(q.self_pgid);
+    if q.format.as_deref() == Some("text") {
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            report.to_text(),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "visible": report.visible,
+        "output": report.to_text(),
+        "leftovers": report.leftovers,
+        "running": report.running,
+    }))
+    .into_response()
 }
 
 /// `POST /api/browser` → 直接跑一个浏览器动作（对应 `browser` 工具）。
@@ -2130,6 +2176,46 @@ mod tests {
             },
         )));
         (st, root)
+    }
+
+    /// `agent ps` 的后端：`/api/procs` 跟别的 `/api` 一样要凭据，`?format=text`
+    /// 回人话（沙箱里的 `agent ps` 直接打它）。
+    #[tokio::test]
+    async fn procs_endpoint_needs_auth_and_speaks_plain_text() {
+        let (st, _root) = sandbox_core("procs").await;
+        let (base, c) = serve(st.clone()).await;
+
+        let unauth = c.get(format!("{base}/api/procs")).send().await.unwrap();
+        assert_eq!(unauth.status(), 401);
+
+        let r = c
+            .get(format!("{base}/api/procs?format=text"))
+            .header("x-agent-token", "s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let ctype = r.headers()["content-type"].to_str().unwrap().to_string();
+        assert!(ctype.starts_with("text/plain"), "{ctype}");
+        let body = r.text().await.unwrap();
+        // 新建的空沙箱没登记过任何运行：要么「没有别的东西在跑」，要么 /proc 看不见
+        assert!(
+            body.contains("没有别的东西在跑") || body.contains("看不见任何进程"),
+            "{body}"
+        );
+
+        let v: serde_json::Value = c
+            .get(format!("{base}/api/procs"))
+            .header("x-agent-token", "s3cret")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v["leftovers"].as_array().unwrap().is_empty());
+        assert!(v["running"].as_array().unwrap().is_empty());
     }
 
     /// 两个源分开：`sandbox.localhost` 上只有沙箱文件，而且不关进 opaque origin

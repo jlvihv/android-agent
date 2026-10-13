@@ -18,6 +18,7 @@ dependencies = [
  "base64 0.22.1",
  "http",
  "image",
+ "libc",
  "log",
  "mime_guess",
  "reqwest",

@@ -362,6 +362,8 @@ agent sessions / session # 会话列表 / 当前这条会话的消息
 agent doctor             # 各部件体检
 agent setup [--force|--list|包…]   # 装/看常用工具
 agent command '{"type":"key","name":"back"}'   # 操作这台手机
+agent ps                 # 沙箱里还有什么在跑（含命令结束后刻意留下的常驻进程）
+agent kill <pid>         # 停掉一个（pid 从 agent ps 来）
 agent get /api/…         # 直接 GET 自己的任意接口（逃生口）
 agent post /api/… '{…}'
 ```
