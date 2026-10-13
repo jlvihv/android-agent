@@ -79,6 +79,13 @@
   let fresh = $state(false);
 
   let drawer = $state(false);
+  /**
+   * 宽屏下侧边栏要不要展开（窄屏不看它 —— 那里侧边栏是抽屉，看 `drawer`）。
+   *
+   * 默认**收起**：刷新之后永远是同一个样子（不会有“从关闭弹到打开”那一下），
+   * 要用再点左上的菜单。不持久化 —— 这个 App 什么都不往 localStorage 里存。
+   */
+  let sidebar = $state(false);
   let sheet = $state(false);
   /** 设置页。可以从抽屉的齿轮进，也可以从模型面板「模型提供商」页的「管理模型提供商」进 ——
    *  后者是叠在模型面板上面的，关掉之后回到模型面板。每层各自在
@@ -370,13 +377,19 @@
     ),
   );
 
-  // 打开抽屉时**显式**刷新列表。
+  // 左上角那个菜单按钮：窄屏是开抽屉；宽屏是**收 / 展**侧边栏
+  // （宽屏侧边栏一直在，只是可以收起来把地方让给对话）。
   //
-  // 不能只靠 `$effect(() => { if (drawer) ... })`：抽屉一直开着的时候
-  // drawer 状态没变化，effect 不会重跑 —— 实测踩过（在别处新建了会话，
-  // 抽屉里还是"还没有对话"）。
-  function openDrawer() {
-    drawer = true;
+  // 展开时**显式**刷新列表。不能只靠 `$effect(() => { if (drawer) ... })`：
+  // 开着的时候状态没变化，effect 不会重跑 —— 实测踩过（在别处新建了会话，
+  // 抽屉里还是“还没有对话”）。
+  function toggleSidebar() {
+    if (wide.on) {
+      sidebar = !sidebar;
+      if (!sidebar) return;
+    } else {
+      drawer = true;
+    }
     void loadSessions();
     void loadMessages();
   }
@@ -560,7 +573,7 @@
 <div class="flex h-full overflow-hidden bg-ink">
   <!-- 宽屏：侧边栏**并排**在左边（不是抽屉），一直是开着的。
        窄屏：它还是盖在对话上的抽屉，由头部的菜单按钮控制（见下面）。 -->
-  {#if wide.on}
+  {#if wide.on && sidebar}
     <Drawer
       {sessions}
       onclose={close}
@@ -601,11 +614,12 @@
       class="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-center justify-between
              px-4 pb-1 pt-[calc(0.25rem+env(safe-area-inset-top))]"
     >
-      <!-- 窄屏才需要它（宽屏侧边栏一直在，见上） -->
+      <!-- 窄屏：开抽屉；宽屏：收 / 展侧边栏（两个宽度下都在） -->
       <button
-        onclick={openDrawer}
+        onclick={toggleSidebar}
         aria-label="菜单"
-        class="pointer-events-auto p-1 text-fg {wide.on ? 'hidden' : ''}"
+        title={wide.on ? '收起 / 展开侧边栏' : '菜单'}
+        class="pointer-events-auto p-1 text-fg"
       >
         <Icon name="menu" size={20} />
       </button>

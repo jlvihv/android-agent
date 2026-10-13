@@ -24,7 +24,7 @@
    * 往左拖可以跟手关掉。遮罩也在这里，跟面板一起淡入淡出。
    * 没有关闭按钮：往左拖、点遮罩、按返回键都能关。
    */
-  import { fade } from 'svelte/transition';
+  import { fade, slide } from 'svelte/transition';
   import { quintOut } from 'svelte/easing';
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
@@ -345,8 +345,11 @@
 
 {#if pinned}
   <!-- 宽屏：并排的一栏。没有遮罩、不能往左拖、也不接返回键 ——
-       它本来就不是「盖在上面」的东西，宽度写死，跟对话平分剩下的地方。 -->
+       它本来就不是「盖在上面」的东西，宽度写死。
+       收 / 展是头部那个菜单按钮（`in`/`out` 这里负责动画：宽度收到 0）。 -->
   <aside
+    in:slide|global={{ axis: 'x', duration: 180 }}
+    out:slide|global={{ axis: 'x', duration: 180 }}
     class="flex h-full w-72 shrink-0 flex-col border-r border-hairline bg-drawer
            pt-[env(safe-area-inset-top)]"
   >
