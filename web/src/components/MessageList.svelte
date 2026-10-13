@@ -153,6 +153,15 @@
   const argsOf = (t: ToolPart) => (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
 
   /**
+   * 「离底部多近算贴着底」（px）。两处用同一个数：列表的贴底判定（`onscroll`）
+   * 和工具输出里的跟尾（`followTail`）—— 同一个含义别写两个值。
+   *
+   * 不能太小：流式时内容刚长高一截、滚动事件还没派发，一算就超过阈值，会把
+   * 「程序刚滚到底」误判成「用户往上翻了」，之后再也不会跟（踩过）。
+   */
+  const NEAR_BOTTOM = 48;
+
+  /**
    * 输出在长的时候跟到最底下，像终端一样。
    *
    * 只在"本来就在底部"时跟：用户往上翻着看前面的输出，就别把他拽回去。
@@ -161,8 +170,8 @@
     const sc = node.closest('.overflow-y-auto') as HTMLElement | null;
     if (!sc) return;
     const gap = () => sc.scrollHeight - sc.scrollTop - sc.clientHeight;
-    let atBottom = gap() < 40;
-    const onScroll = () => (atBottom = gap() < 40);
+    let atBottom = gap() < NEAR_BOTTOM;
+    const onScroll = () => (atBottom = gap() < NEAR_BOTTOM);
     const mo = new MutationObserver(() => {
       if (atBottom) sc.scrollTop = sc.scrollHeight;
     });
@@ -218,6 +227,8 @@
   // 工具、正文都是同一条助手消息里的 parts。所以 40 条 ≈ 20 个回合，
   // 每个回合里几十个工具调用都算在这一条里。
   const WINDOW_STEP = 40;
+  /** 滚到这个位置（px）就再补一窗更早的 */
+  const LOAD_EARLIER_AT = 200;
   let limit = $state(WINDOW_STEP);
   let loadingEarlier = false;
 
@@ -256,11 +267,11 @@
   function onscroll() {
     const el = scroller!;
     const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (gap < 48) pinned = true;
+    if (gap < NEAR_BOTTOM) pinned = true;
     else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
     // 快到顶了 → 再补一窗更早的（窗口化）
-    if (el.scrollTop < 200) void loadEarlier();
+    if (el.scrollTop < LOAD_EARLIER_AT) void loadEarlier();
   }
 
   $effect(() => {

@@ -14,8 +14,9 @@
    *
    * 没有关闭按钮：往下拉、点遮罩、按返回键都能关。
    *
-   * 高度：最少 45%（Claude 固定 422/923 ≈ 46%），内容短也不会缩成一条；
-   * 最多 75%，再长就在面板内滚。
+   * 高度：最少 45%、最多 75%（`--sheet-min-h` / `--sheet-max-h`，写在一处），
+   * 内容短也不会缩成一条；再长就在面板内滚。
+   * “就几行字”的面板（附件 / 用量 / 模型）传 `hug`，贴合内容。
    */
   import type { Snippet } from 'svelte';
   import { fly } from 'svelte/transition';
@@ -23,13 +24,23 @@
   import { onBack, type Peek } from '../lib/overlay';
   import { dismissable, RELEASE, PAGE_MS } from '../lib/drag';
 
+  /** 滑出 / 淡出遮罩的时长。面板的 transform 和遮罩的 opacity 必须同步，
+   *  `close()` 那个 setTimeout 也用它（等动画跑完再卸载）。 */
+  const CLOSE_MS = 280;
+  /** 换页时标题飞入 / 飞出的横向位移（px） */
+  const PAGE_SHIFT = 28;
+  /** 面板还没量出高度时的兜底（只在首帧就跟手时可能用到） */
+  const FALLBACK_H = 400;
+
   let {
     title,
     onclose,
     onback,
     peek,
     slide = 1,
-    minClass = 'min-h-[45dvh]',
+    /** 贴合内容（`min-h-0`）：就几行数字的面板别摚到 45% 屏高。
+     *  不传就是默认下限（正文类的思考/工具输出用）。 */
+    hug = false,
     padClass = 'px-3',
     children,
   }: {
@@ -46,7 +57,8 @@
     /** 标题从哪边飞进来：1 = 从右（内容往左推，进第二页），-1 = 从左（退回）。
      *  只在面板内部换页时有意义。 */
     slide?: number;
-    minClass?: string;
+    /** 高度贴合内容（不摚到 `--sheet-min-h`） */
+    hug?: boolean;
     /** 内容区的左右内边距，默认 `px-3`。
      *
      * 横向翻页的面板（「选择模型」）要传 `px-0`：它的内容是一整条 `w-[200%]`
@@ -99,7 +111,7 @@
     closing = true;
     dragging = false;
     p = 1;
-    setTimeout(onclose, 280);
+    setTimeout(onclose, CLOSE_MS);
   }
 
   /**
@@ -152,7 +164,7 @@
   const drag = {
     axis: 'y' as const,
     dir: 1 as const,
-    size: () => panel?.offsetHeight ?? 400,
+    size: () => panel?.offsetHeight ?? FALLBACK_H,
     // 正文（或里面单独滚的清单）没滚到顶时往下拉是在滚它，不接管
     canStart: (t: EventTarget | null) => !closing && !scrolled(t),
     onStart: () => (dragging = true),
@@ -170,7 +182,7 @@
   use:portal
   class="fixed inset-0 z-40 bg-scrim"
   style:opacity={1 - p}
-  style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
+  style:transition={dragging ? 'none' : `opacity ${CLOSE_MS}ms ease-out`}
   aria-label="关闭"
   onclick={close}
 ></button>
@@ -185,7 +197,9 @@
   tabindex="-1"
   style:transform="translateY({p * 100}%)"
   style:transition={dragging ? 'none' : RELEASE}
-  class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[75dvh] {minClass} flex-col
+  class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[var(--sheet-max-h)] {hug
+         ? 'min-h-0'
+         : 'min-h-[var(--sheet-min-h)]'} flex-col
          rounded-t-4xl bg-ink pt-1 will-change-transform"
 >
   <div class="shrink-0">
@@ -196,8 +210,8 @@
       <div class="relative h-full overflow-hidden">
         {#key title}
           <h2
-            in:fly={{ x: 28 * slide, duration: PAGE_MS, easing: cubicOut }}
-            out:fly={{ x: -28 * slide, duration: PAGE_MS, easing: cubicOut }}
+            in:fly={{ x: PAGE_SHIFT * slide, duration: PAGE_MS, easing: cubicOut }}
+            out:fly={{ x: -PAGE_SHIFT * slide, duration: PAGE_MS, easing: cubicOut }}
             class="absolute inset-0 flex items-center justify-center truncate px-12 text-[17px]
                    font-semibold"
           >

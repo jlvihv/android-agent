@@ -27,6 +27,21 @@
 
   let open = $state(false);
 
+  /**
+   * 两个环的几何（`size` 外框 / `r` 半径 / `sw` 线宽 / `fs` 数字），单位都是 px。
+   * 小的那个外框 36 = 输入卡片里其他圆钮（「+」、发送）的直径，同一行才对称；
+   * 线宽 3 和 Icon.svelte 的描边比例（20 画布 / 1.8）对齐。大的给面板用。
+   */
+  const RING = { size: 36, r: 15.4, sw: 3, fs: 12 };
+  const RING_BIG = { size: 56, r: 22, sw: 5.2, fs: 18 };
+  /** 环里那个数低于这个百分比就写 `<1`（0 看着像坏了） */
+  const TINY_PCT = 0.5;
+  /** 百分比低于这个（0.01 = 1%）时给一位小数 */
+  const ONE_DECIMAL_BELOW = 0.01;
+  /** `fmt` 的进位门槛 */
+  const KILO = 1_000;
+  const MEGA = 1_000_000;
+
   const used = $derived(usage?.last.prompt_tokens ?? 0);
   /** 0..1；没有窗口就是 null */
   const ratio = $derived(ctxWindow ? Math.min(1, used / ctxWindow) : null);
@@ -35,16 +50,21 @@
    * 1M 窗口的头几轮就是这样（实测第一句 prompt 才 1468），写个 0 看着像坏了。
    */
   const ringText = $derived(
-    ratio == null ? null : ratio > 0 && ratio * 100 < 0.5 ? '<1' : String(Math.round(ratio * 100)),
+    ratio == null
+      ? null
+      : ratio > 0 && ratio * 100 < TINY_PCT
+        ? '<1'
+        : String(Math.round(ratio * 100)),
   );
   /** 面板和 tooltip 用的百分比：不到 1% 时给一位小数（0.1% 比 0% 诚实） */
   const pctLabel = $derived(
     ratio == null
       ? null
-      : ratio >= 0.01
+      : ratio >= ONE_DECIMAL_BELOW
         ? `${Math.round(ratio * 100)}%`
         : `${(ratio * 100).toFixed(1)}%`,
   );
+
 
 
   // —— 数字排版 ——
@@ -52,8 +72,9 @@
   // token 数只保留三位有效：`1.2M` / `36.2k` / `940`。面板是给人瞟一眼的，
   // 精确到个位只是噪声（真实值在 /api/session 里，随时能看）。
   function fmt(n: number): string {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
-    if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+    // 过万就不给小数位了：`12.3k` 三位有效数字够看，`12345` 精确到个位只是噪声
+    if (n >= MEGA) return `${(n / MEGA).toFixed(n >= MEGA * 10 ? 0 : 1)}M`;
+    if (n >= KILO) return `${(n / KILO).toFixed(n >= KILO * 10 ? 0 : 1)}k`;
     return String(n);
   }
   const fmtPct = (r: number) => `${(r * 100).toFixed(1)}%`;
@@ -115,7 +136,7 @@
       : `上下文 ${pctLabel}（${fmt(used)} / ${fmt(ctxWindow ?? 0)}）`}
     class="grid size-9 shrink-0 place-items-center"
   >
-    {@render ring(36, 15.4, 3, 12)}
+    {@render ring(RING.size, RING.r, RING.sw, RING.fs)}
   </button>
 {/if}
 
@@ -125,10 +146,10 @@
   {@const hr = cacheHitRatio(u)}
   {@const reason = reasoningTokens(u)}
   <!-- 高度贴合内容：这里就几行数字，别撑到半屏 -->
-  <Sheet title="上下文用量" minClass="min-h-0" onclose={() => (open = false)}>
+  <Sheet title="上下文用量" hug onclose={() => (open = false)}>
     <div class="flex flex-col gap-3 pb-2">
       <div class="flex items-center gap-4 rounded-2xl bg-surface px-4 py-4">
-        {@render ring(56, 22, 5.2, 18)}
+        {@render ring(RING_BIG.size, RING_BIG.r, RING_BIG.sw, RING_BIG.fs)}
         <div class="flex min-w-0 flex-col">
           <span class="text-[17px]">
             {fmt(used)}{#if ctxWindow}<span class="text-muted"> / {fmt(ctxWindow)}</span>{/if}

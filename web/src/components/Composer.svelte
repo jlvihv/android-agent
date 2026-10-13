@@ -60,7 +60,8 @@
     (value.trim().length > 0 || ready.length > 0) && !uploading,
   );
 
-  // 按内容长高，最多 5 行，再多就在框里滚。
+  // 按内容长高，最多 5 行（再高就在框里滚）：5 × 行高 1.5rem + 上下内边距
+  // 0.25×2 = 8rem。这个数是算出来的，不是量的。
   $effect(() => {
     void value;
     if (!ta) return;
@@ -206,9 +207,8 @@
     placeholder="与 agent 对话…"
     onkeydown={onkeydown}
     spellcheck="false"
-    class="resize-none bg-transparent px-1 py-1 text-base leading-6 text-fg
-           placeholder:text-muted outline-none"
-    style="max-height: 8.5rem; overflow-y: auto"
+    class="max-h-[8rem] resize-none overflow-y-auto bg-transparent px-1 py-1 text-base leading-6
+           text-fg placeholder:text-muted outline-none"
   ></textarea>
 
   {#if failed.length > 0}

@@ -20,6 +20,15 @@ export type LogItem = { id: number; ts: number; level: string; msg: string };
 
 let logSeq = 0;
 
+/** WebSocket 退避重连：起始间隔（ms），每次翻倍，封顶 `RETRY_MAX_MS` */
+const RETRY_BASE_MS = 500;
+const RETRY_MAX_MS = 8000;
+/** 解析不了的事件，日志里只留前这么多字符 */
+const LOG_SNIPPET = 120;
+/** 日志 / 指令回执各自最多留多少条（进抽屉的面板看的，不是审计） */
+const MAX_LOGS = 300;
+const MAX_ACKS = 50;
+
 class AgentStore {
   connected = $state(false);
   hello = $state<Hello | null>(null);
@@ -85,7 +94,7 @@ class AgentStore {
       this.connected = false;
       if (this.#closed) return;
       // 退避重连：手机上 WebView 被切到后台时连接会断，必须能自愈
-      const delay = Math.min(500 * 2 ** this.#retry++, 8000);
+      const delay = Math.min(RETRY_BASE_MS * 2 ** this.#retry++, RETRY_MAX_MS);
       this.#timer = setTimeout(() => this.#open(), delay);
     };
 
@@ -96,7 +105,7 @@ class AgentStore {
       try {
         ev = JSON.parse(e.data as string) as AgentEvent;
       } catch {
-        this.pushLog('warn', `无法解析的事件: ${String(e.data).slice(0, 120)}`);
+        this.pushLog('warn', `无法解析的事件: ${String(e.data).slice(0, LOG_SNIPPET)}`);
         return;
       }
       this.#dispatch(ev);
@@ -150,13 +159,13 @@ class AgentStore {
         this.acks = [
           { id: ev.id, ok: ev.ok, detail: ev.detail, ts: Date.now() },
           ...this.acks,
-        ].slice(0, 50);
+        ].slice(0, MAX_ACKS);
         break;
     }
   }
 
   pushLog(level: string, msg: string): void {
-    this.logs = [{ id: ++logSeq, ts: Date.now(), level, msg }, ...this.logs].slice(0, 300);
+    this.logs = [{ id: ++logSeq, ts: Date.now(), level, msg }, ...this.logs].slice(0, MAX_LOGS);
   }
 
   send(msg: ClientMsg): void {

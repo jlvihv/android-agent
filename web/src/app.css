@@ -85,6 +85,15 @@ body,
     calc(0.5rem + env(safe-area-inset-bottom)),
     calc(var(--kb) + 0.5rem)
   );
+  /* 底部面板（Sheet）的高度区间。**两个数只写这里** —— 面板自己的类、以及
+     调用方要换掉最小值时都引它，免得同一个高度散在好几处。
+     下限 45%：Claude 实测固定 422/923 ≈ 46%，内容少也不缩成一条；
+     上限 75%：再高就快盖满整屏了，超出的在面板内滚。 */
+  --sheet-min-h: 45dvh;
+  --sheet-max-h: 75dvh;
+  /* 抽屉宽度。`Drawer.svelte` 里 aside 的宽度，和长按菜单「往右不许超出抽屉」
+     的夹取用的是同一个数 —— 改宽度只改这里。 */
+  --drawer-w: 92%;
 }
 
 body {

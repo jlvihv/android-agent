@@ -49,8 +49,11 @@
       ta.remove();
     }
     copied = v;
-    setTimeout(() => copied === v && (copied = null), 1500);
+    setTimeout(() => copied === v && (copied = null), COPIED_MS);
   }
+  /** 「已复制」这个提示挂多久（ms）——够看清，又不至于一直杵在那儿 */
+  const COPIED_MS = 1500;
+
 </script>
 
 {#snippet spans(list: Span[])}

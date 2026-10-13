@@ -24,7 +24,7 @@
   } = $props();
 </script>
 
-<Sheet title="添加到会话" {onclose} minClass="min-h-0">
+<Sheet title="添加到会话" {onclose} hug>
   <div class="flex gap-3">
     <button
       onclick={() => onpick('camera')}

@@ -203,7 +203,7 @@
   onback={page === 'sub' ? back : undefined}
   {peek}
   slide={page === 'sub' ? 1 : -1}
-  minClass="min-h-0"
+  hug
   padClass="px-0"
   {onclose}
 >

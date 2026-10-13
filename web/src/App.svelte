@@ -399,9 +399,13 @@
   // 比"重连 SSE"简单得多，而且跨 WebView 挂起也可靠。
   // 服务端每个步骤完成都会把 assistant 消息写进会话，所以轮询能
   // 看到逐步骤推进。
+  /** 轮询间隔（ms）。服务端的粒度是「一步」，1.5 秒完全够用；再密就是白转发。 */
+  const POLL_MS = 1500;
+  /** 按下停止之后过多久拉一次（给服务端一点时间把「已停止」的工具结果补上） */
+  const AFTER_STOP_MS = 300;
   $effect(() => {
     if (!serverBusy) return;
-    const t = setInterval(() => void loadMessages(), 1500);
+    const t = setInterval(() => void loadMessages(), POLL_MS);
     return () => clearInterval(t);
   });
 
@@ -628,7 +632,7 @@
     r?.controller.abort();
     // 本地流断了，服务端收尾（补上「已停止」的工具结果）的那几条要拉回来；
     // 没连着流时按的停止也一样：马上拉一次，「运行中」尽快消失
-    setTimeout(() => void loadMessages(), 300);
+    setTimeout(() => void loadMessages(), AFTER_STOP_MS);
   };
 </script>
 

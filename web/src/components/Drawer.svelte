@@ -64,10 +64,31 @@
     pinned?: boolean;
   } = $props();
 
+  /** 搜索防抖（ms）：输入停顿这么久再打后端。一边打字一边发请求纯属浪费；
+   *  effect 的清理函数会把上一个计时器干掉，所以快速输入不会堆积请求。 */
+  const SEARCH_DEBOUNCE_MS = 180;
+  /** 长按多久算长按（ms）。太短会和滚动/点击打架，太长会让人觉得没反应 */
+  const LONG_PRESS_MS = 420;
+  /** 长按触发的轻震（ms） */
+  const HAPTIC_MS = 12;
+  /** 宽屏下侧边栏收 / 展的宽度动画时长（ms） */
+  const PIN_MS = 180;
+  /** 抽屉滑进 / 滑出的时长（ms）。出场是「先快后慢」：从当前位置继续往左收，
+   *  剩下的距离越短越快收完，所以是 `SLIDE_OUT_MS * 剩余比例 + SLIDE_OUT_MIN_MS`
+   *  —— 拖到一半松手时手指本来就在动，减速收尾才接得住。 */
+  const SLIDE_IN_MS = 320;
+  const SLIDE_OUT_MS = 240;
+  const SLIDE_OUT_MIN_MS = 80;
+  /** 遮罩淡入 / 淡出的时长（ms） */
+  const SCRIM_FADE_MS = 220;
+  /** 长按菜单的尺寸（rem）：`w-40` = 10 宽；两行 `py-3.5` + 留白 ≈ 8 高。
+   *  弹出时要把它夹在抽屉（`--drawer-w`）和屏幕里，所以这两个数得跟着菜单改。 */
+  const MENU_W = 10;
+  const MENU_H = 8;
+  /** 菜单离抽屉 / 屏幕边留的空隙（rem） */
+  const MENU_GAP = 0.5;
+
   // —— 搜索 ——
-  //
-  // 输入停顿 180ms 再打后端：一边打字一边发请求纯属浪费。
-  // effect 的清理函数会把上一个计时器干掉，所以快速输入不会堆积请求。
   let q = $state('');
   let hits = $state<Hit[]>([]);
   let searching = $state(false);
@@ -126,7 +147,7 @@
       return;
     }
     searching = true;
-    const t = setTimeout(() => void search(needle), 180);
+    const t = setTimeout(() => void search(needle), SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(t);
   });
 
@@ -180,18 +201,17 @@
   /** 进场：从左边整个滑进来 */
   function slideIn(_: Element) {
     return {
-      duration: 320,
+      duration: SLIDE_IN_MS,
       easing: quintOut,
       css: (_t: number, u: number) => `transform: translateX(${-u * 100}%)`,
     };
   }
 
-  /** 出场：从当前位置（可能被拖到一半）继续往左收。
-   *  先快后慢 —— 拖完松手时手指本来就在动，减速收尾才接得住。 */
+  /** 出场：从当前位置（可能被拖到一半）继续往左收（时间怎么算见上面常量） */
   function slideOut(_: Element) {
     const from = off;
     return {
-      duration: 240 * (1 - from) + 80,
+      duration: SLIDE_OUT_MS * (1 - from) + SLIDE_OUT_MIN_MS,
       easing: quintOut,
       css: (_t: number, u: number) => `transform: translateX(${-(from + (1 - from) * u) * 100}%)`,
     };
@@ -213,8 +233,8 @@
     pressTimer = setTimeout(() => {
       longPressed = true;
       menu = { id, x, y };
-      navigator.vibrate?.(12);
-    }, 420);
+      navigator.vibrate?.(HAPTIC_MS);
+    }, LONG_PRESS_MS);
   }
   const pressEnd = () => clearTimeout(pressTimer);
 
@@ -341,8 +361,8 @@
        它本来就不是「盖在上面」的东西，宽度写死。
        收 / 展是头部那个菜单按钮（`in`/`out` 这里负责动画：宽度收到 0）。 -->
   <aside
-    in:slide|global={{ axis: 'x', duration: 180 }}
-    out:slide|global={{ axis: 'x', duration: 180 }}
+    in:slide|global={{ axis: 'x', duration: PIN_MS }}
+    out:slide|global={{ axis: 'x', duration: PIN_MS }}
     class="flex h-full w-72 shrink-0 flex-col border-r border-hairline bg-drawer
            pt-[env(safe-area-inset-top)]"
   >
@@ -355,7 +375,7 @@
     style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
     aria-label="关闭"
     onclick={onclose}
-    transition:fade|global={{ duration: 220 }}
+    transition:fade|global={{ duration: SCRIM_FADE_MS }}
   ></button>
 
   <aside
@@ -363,8 +383,8 @@
     use:dismissable={drag}
     style:transform={off ? `translateX(${-off * 100}%)` : null}
     style:transition={dragging ? 'none' : RELEASE}
-    class="fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[92%] flex-col bg-drawer
-           pt-[env(safe-area-inset-top)] will-change-transform"
+    class="fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[var(--drawer-w)] flex-col
+           bg-drawer pt-[env(safe-area-inset-top)] will-change-transform"
     in:slideIn|global
     out:slideOut|global
   >
@@ -378,7 +398,8 @@
   <button class="fixed inset-0 z-[60]" aria-label="关闭菜单" onclick={() => (menu = null)}></button>
   <div
     class="fixed z-[61] w-40 overflow-hidden rounded-2xl bg-bubble shadow-2xl shadow-black/60"
-    style="left: min({m.x}px, calc(92vw - 10.5rem)); top: min({m.y}px, calc(100dvh - 8.5rem))"
+    style="left: min({m.x}px, calc(var(--drawer-w) - {MENU_W + MENU_GAP}rem));
+           top: min({m.y}px, calc(100dvh - {MENU_H + MENU_GAP}rem))"
   >
     <button
       onclick={() => pick(m.id)}
