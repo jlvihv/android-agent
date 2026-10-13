@@ -143,6 +143,20 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
 `~/.local/share/android-agent/bin`），只在我们发出去的命令的 PATH 前缀里 ——
 不动用户的 shell 配置，也不抢他的 `xdg-open`。
 
+## 会话和模型配置落盘
+
+宿主模式是拿来**日常用**的，所以会话、模型配置、附件都落盘：默认
+`~/.local/share/android-agent/data/sessions.db`（`$XDG_DATA_HOME` 优先），
+`AGENT_DATA_DIR` 可以换。以前桌面上一律只放内存 —— 关一次核心，你在界面上
+配的模型和所有会话就没了（在 macOS 上实测时撞到的）。
+
+- `just dev`（proot 沙箱，在电脑上复现手机）**照旧只在内存里**，除非显式给了
+  `AGENT_DATA_DIR`。
+- `.env.local` / `AGENT_LLM_*` 里的模型只在**库里还没有模型配置**时采用（会存下来，
+  跟在界面上配一次一样），不会每次启动都把界面上配好的覆盖掉。
+- 访问凭据照旧：桌面上默认不设防，设了 `AGENT_TOKEN` 才要（库里那把随机 token
+  在桌面上不生效）。
+
 ## 该知道的代价（是真的）
 
 - **没有审批环节**（铁律 7）：模型的所有命令直接执行，等于把这台机器交出去。

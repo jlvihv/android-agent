@@ -157,6 +157,15 @@ async fn write_attachment(
     Ok(())
 }
 
+/// 桌面上的数据目录：`AGENT_DATA_DIR` 优先；宿主模式默认
+/// `<host_data_dir>/data`（`~/.local/share/android-agent/data`）；否则不落盘。
+fn desktop_data_dir(host: bool) -> Option<std::path::PathBuf> {
+    if let Some(d) = std::env::var_os("AGENT_DATA_DIR").filter(|d| !d.is_empty()) {
+        return Some(d.into());
+    }
+    host.then(|| linux::host_data_dir().join("data"))
+}
+
 impl Core {
     pub fn new() -> Self {
         Self {
@@ -171,14 +180,33 @@ impl Core {
         let dev = mock::MockDevice::new();
         core.state.set_device(dev);
 
-        // 桌面：环境变量里配了 LLM 就当成一个已配置的服务商（没有库，只在内存里）
-        if let Some(p) = crate::llm::Provider::from_env() {
-            core.state.adopt_provider(&p);
-            core.state.set_llm(p);
+        // 桌面：宿主模式 / 或者 proot + rootfs 的沙箱
+        let sandbox = linux::LinuxSandbox::from_env();
+
+        // 持久化：会话、模型配置、附件落盘。宿主模式是拿来**日常用**的，
+        // 只放内存的话关一次核心，会话和你在界面上配的模型就全没了。
+        // `just dev`（proot 沙箱，在电脑上复现手机）照旧只在内存里，除非显式
+        // 给了 `AGENT_DATA_DIR`。
+        if let Some(dir) = desktop_data_dir(sandbox.as_ref().is_some_and(|s| s.is_host())) {
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    tracing::info!("数据目录: {}", dir.display());
+                    core.set_data_dir(dir);
+                }
+                Err(e) => tracing::warn!("建数据目录 {} 失败（只放内存）: {e}", dir.display()),
+            }
         }
 
-        // 桌面：如果环境里能找到 proot + rootfs，就把 Linux 沙箱也接上
-        if let Some(sb) = linux::LinuxSandbox::from_env() {
+        // 环境变量里配了 LLM：库里还没有模型配置时才用它（会存下来，跟在界面上
+        // 配一次一样）。**不覆盖**界面上配好的 —— 不然每次启动都被打回环境变量那份。
+        if core.state.llm().is_none() {
+            if let Some(p) = crate::llm::Provider::from_env() {
+                core.state.adopt_provider(&p);
+                core.state.set_llm(p);
+            }
+        }
+
+        if let Some(sb) = sandbox {
             core.state.set_linux(Arc::new(sb));
         }
 
