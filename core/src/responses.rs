@@ -46,6 +46,11 @@ pub struct ResponsesRequest {
     pub stream: bool,
     /// 不落服务端状态：我们靠完整回放历史（也才可控 prompt 前缀）。
     pub store: bool,
+    /// 要服务端在思考条目里带上加密的思考内容（`reasoning.encrypted_content`）。
+    ///
+    /// `store: false` 时服务端不留东西，回传思考条目只能靠它 —— 光有 id 的话
+    /// OpenAI 会去找那个 id、找不到就 400。见 `agent::build_responses_input`。
+    pub include: &'static [&'static str],
     /// 思考强度。Responses 里它是嵌套对象（Chat Completions 是顶层字符串）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
@@ -66,6 +71,8 @@ pub enum InputItem {
     AssistantMessage(AssistantItem),
     FunctionCall(FunctionCallItem),
     FunctionCallOutput(FunctionCallOutputItem),
+    /// 服务端给过的输出项，原样回传（目前只有思考条目，见 `StreamChunk::reasoning_item`）
+    Raw(Value),
 }
 
 /// user / system / developer 消息。
@@ -263,6 +270,16 @@ impl Mapper {
     /// 一条 SSE 的 `data:` 载荷 →（可选的）`StreamChunk`。
     /// 返回 `Err` 会把错误透传给前端；返回 `Ok(None)` 表示这条事件忽略。
     pub fn map(&mut self, data: &str) -> anyhow::Result<Option<StreamChunk>> {
+        // 思考条目要**原样**留着（下一次请求放回 input），所以单独按 Value 解一遍。
+        // 先用子串筛：绝大多数事件是正文增量，不值得每条都多解析一次。
+        if data.contains("response.output_item.done") && data.contains("\"reasoning\"") {
+            if let Some(item) = reasoning_item(data) {
+                return Ok(Some(StreamChunk {
+                    reasoning_item: Some(item),
+                    ..StreamChunk::default()
+                }));
+            }
+        }
         let event: Event = match serde_json::from_str(data) {
             Ok(e) => e,
             // 未知/不认识的形状：跳过比整条流崩掉好
@@ -280,6 +297,7 @@ impl Mapper {
                 }],
                 usage: None,
                 error: None,
+                reasoning_item: None,
             })
         };
 
@@ -351,6 +369,7 @@ impl Mapper {
                         .error
                         .unwrap_or_else(|| Value::String("response.failed".into())),
                 ),
+                reasoning_item: None,
             }),
             Event::Error { message, code } => Some(StreamChunk {
                 choices: vec![],
@@ -359,12 +378,54 @@ impl Mapper {
                     Some(c) => Value::String(format!("{c}: {message}")),
                     None => Value::String(message),
                 }),
+                reasoning_item: None,
             }),
             Event::Other => None,
             // 带 guard 的 ItemAdded/ItemDone 没匹配上（不是 function_call）
             _ => None,
         })
     }
+}
+
+/// `response.output_item.done` 里的思考条目（原样）。不是就 `None`。
+fn reasoning_item(data: &str) -> Option<Value> {
+    let mut v: Value = serde_json::from_str(data).ok()?;
+    if v["type"] != "response.output_item.done" || v["item"]["type"] != "reasoning" {
+        return None;
+    }
+    let item = v.get_mut("item")?.take();
+    log_reasoning_shape(&item);
+    Some(item)
+}
+
+/// 第一次收到思考条目时，把它的**形状**记进日志（字段名 + 长度，不记内容）：
+/// 不同网关转换出来的样子不一样（有没有 id、正文在 summary 还是 content、
+/// 带不带加密内容），回传出问题时靠它查。
+fn log_reasoning_shape(item: &Value) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if ONCE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    fn shape(v: &Value) -> String {
+        match v {
+            Value::Object(o) => {
+                let fields: Vec<String> = o
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {}", shape(v)))
+                    .collect();
+                format!("{{{}}}", fields.join(", "))
+            }
+            Value::Array(a) => match a.first() {
+                Some(x) => format!("[{} 项, 如 {}]", a.len(), shape(x)),
+                None => "[]".into(),
+            },
+            Value::String(s) if s.chars().count() <= 16 => format!("{s:?}"),
+            Value::String(s) => format!("<{} 字符>", s.chars().count()),
+            other => other.to_string(),
+        }
+    }
+    tracing::info!("Responses 思考条目的形状: {}", shape(item));
 }
 
 fn tool_delta(
@@ -396,6 +457,7 @@ fn finish_chunk(response: ResponsePayload, finish_reason: Option<String>) -> Opt
         }],
         usage,
         error: None,
+        reasoning_item: None,
     })
 }
 
@@ -432,6 +494,35 @@ mod tests {
 
     fn req_json(r: &ResponsesRequest) -> Value {
         serde_json::to_value(r).unwrap()
+    }
+
+    /// 思考条目（`output_item.done` 里 `type: "reasoning"` 的那个）要**原样**
+    /// 拿到，下一次请求原样回传；别的输出项照旧走原来那条路。
+    #[test]
+    fn reasoning_items_are_captured_verbatim() {
+        let mut m = Mapper::default();
+        let item = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{ "type": "summary_text", "text": "先看看目录" }],
+            "encrypted_content": "gAAA…",
+        });
+        let ev = json!({ "type": "response.output_item.done", "output_index": 0, "item": item });
+        let c = m
+            .map(&ev.to_string())
+            .unwrap()
+            .expect("思考条目要出一个 chunk");
+        assert_eq!(c.reasoning_item.as_ref(), Some(&item));
+        assert!(c.choices.is_empty());
+
+        // 正文里恰好出现 "reasoning" 的普通增量不受影响
+        let ev = json!({ "type": "response.output_text.delta", "delta": "\"reasoning\" 是个词" });
+        let c = m.map(&ev.to_string()).unwrap().unwrap();
+        assert!(c.reasoning_item.is_none());
+        assert_eq!(
+            c.choices[0].delta.content.as_deref(),
+            Some("\"reasoning\" 是个词")
+        );
     }
 
     /// 把一串事件喂给 Mapper，拼出每个工具调用最终的参数文本。
@@ -509,6 +600,7 @@ mod tests {
             tools: vec![].into(),
             stream: true,
             store: false,
+            include: &[],
             reasoning: None,
         };
         let v = req_json(&r);
@@ -559,6 +651,7 @@ mod tests {
             .into(),
             stream: true,
             store: false,
+            include: &[],
             reasoning: None,
         };
         let v = req_json(&r);

@@ -512,6 +512,7 @@ mod tests {
             content: "{\"User\":假的".into(),
             reasoning: String::new(),
             tool_calls: vec![],
+            reasoning_items: vec![],
         });
         let active = st.sessions[1].id.clone();
         st.activate(&active);
@@ -743,6 +744,7 @@ mod tests {
                     name: "bash".into(),
                     arguments: r#"{"command":"ls"}"#.into(),
                 }],
+                reasoning_items: vec![serde_json::json!({ "type": "reasoning", "id": "rs_1" })],
             },
             ChatMessage::Tool {
                 tool_call_id: "c1".into(),
@@ -760,9 +762,11 @@ mod tests {
                 content,
                 reasoning,
                 tool_calls,
+                reasoning_items,
             } => {
                 assert_eq!(content, "回答");
                 assert_eq!(reasoning, "思考");
+                assert_eq!(reasoning_items[0]["id"], "rs_1", "思考条目原样落盘");
                 assert_eq!(tool_calls[0].name, "bash");
             }
             _ => panic!("assistant 类型丢了"),

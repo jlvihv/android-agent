@@ -228,3 +228,29 @@ req["stream_options"] = json!({ "include_usage": true });
 - 环境（沙箱可不可用、手机存储挂没挂）**不进 prompt**：它在 `SYSTEM_PROMPT` 里只有
   一句“不确定就先 `ls /sdcard`”。早先版本每轮追加一个 `<环境>` 消息，再往前还塞过
   当前界面的 UI 树 —— 都是几百行文本每轮重发，纯烧 token，全删了。
+
+---
+
+## 7. 思考内容要回传
+
+带工具的多步回合里，**每一步都要把之前各步的思考内容原样放回请求**，否则模型每一步
+都看不到自己上一步想了什么 —— 不报错，只是更容易前后不连贯、每步重想一遍（更慢、
+思考 token 更多）。DeepSeek 官方 API 在思考模式 + 工具调用时**强制**要求，不传直接
+400；有的网关不强制，于是这件事可以悄无声息地坏很久（我们就是）。
+
+两条协议各传各的：
+
+- **Responses API**（OpenCode Go 的 `deepseek-flash` 实际走的就是它）：输出里的
+  思考条目（`type: "reasoning"` 的输出项）**原样**存进历史
+  （`ChatMessage::Assistant::reasoning_items`），下一次请求原样放回 input，排在那一步
+  的正文和工具调用前面。请求带 `include: ["reasoning.encrypted_content"]`；只回传带
+  `encrypted_content` 的条目 —— 我们发的是 `store: false`，光有 id 的条目 OpenAI 会去找、
+  找不到就 400。
+- **Chat Completions**：assistant 消息带上 `reasoning_content`（DeepSeek 系的字段）。
+  不返回思考内容的模型历史里本来就是空的，字段自然不出现。
+
+实测（2026-10-13，OpenCode Go / `deepseek-flash`）：网关给的思考条目形状是
+`{type, id, status, summary: [], content: [{type: "reasoning_text", text}], encrypted_content}`；
+原样回传 + `include` 都被接受。验证方法：让模型**只在思考里**随机想一个 6 位数，调一次
+工具，再问它那个数 —— 回传之后它能原样答出来，第二步的输入 token 也多出了思考那一段。
+回传会让老会话的前缀变一次（多了思考条目），之后照常命中缓存（实测 98%+）。

@@ -69,6 +69,15 @@ pub enum Message {
         /// 只有工具调用、没有正文时省略（`null` 有些端点会 400）
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// 这一步的思考内容，**原样回传**（DeepSeek 系的非标准字段）。
+        ///
+        /// DeepSeek 的思考模式：请求带了 `tools`，之后每一次请求都要把所有
+        /// assistant 消息的 `reasoning_content` 完整传回（没调工具的那步也算），
+        /// 不传就 400；而且不传的话模型每一步都看不到自己上一步想了什么。
+        /// 不返回思考内容的模型（OpenAI 的 Chat Completions 就不给）历史里本来
+        /// 就是空的，这个字段自然不出现。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
     },
@@ -152,7 +161,7 @@ pub struct FunctionDef {
 // role，没有 `reasoning_content`（DeepSeek 系）也没有 `reasoning`（GLM）的
 // 位置，思考过程会被静默丢掉。
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct StreamChunk {
     #[serde(default)]
     pub choices: Vec<StreamChoice>,
@@ -163,6 +172,13 @@ pub struct StreamChunk {
     /// 不接的话会被当成一个空 chunk 忽略，前端看着像「卡住不回复」。
     #[serde(default)]
     pub error: Option<Value>,
+    /// Responses API 的一个思考条目（`type: "reasoning"` 的输出项），**原样**。
+    ///
+    /// 下一次请求要原样放回 input（见 `agent::build_responses_input`）：不放的话
+    /// 模型每一步都看不到自己上一步想了什么。Chat Completions 没有这个东西
+    /// （那边的思考内容走 `reasoning_content`）。
+    #[serde(skip)]
+    pub reasoning_item: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,6 +528,7 @@ mod tests {
     fn assistant_with_only_tool_calls_omits_content() {
         let m = Message::Assistant {
             content: None,
+            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
                 kind: "function".into(),

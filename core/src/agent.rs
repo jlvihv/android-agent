@@ -174,6 +174,14 @@ pub enum ChatMessage {
         content: String,
         reasoning: String,
         tool_calls: Vec<RecordedToolCall>,
+        /// Responses API 给的思考条目，**原样**（见 `StreamChunk::reasoning_item`）。
+        ///
+        /// 下一次请求要原样放回 input —— 不放的话模型每一步都看不到自己上一步
+        /// 想了什么（不报错，只是更容易前后不连贯、每步重想一遍）。`reasoning`
+        /// 是给人看的文字，这个是给服务端的；Chat Completions 那边没有它。
+        /// `#[serde(default)]`：老会话照样能读。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasoning_items: Vec<Value>,
     },
     Tool {
         tool_call_id: String,
@@ -268,10 +276,13 @@ impl ChatMessage {
             }
             ChatMessage::Assistant {
                 content,
+                reasoning,
                 tool_calls,
                 ..
             } => Message::Assistant {
                 content: (!content.is_empty()).then(|| content.clone()),
+                // 思考内容原样回传（见 `openai::Message::Assistant`）
+                reasoning_content: (!reasoning.is_empty()).then(|| reasoning.clone()),
                 tool_calls: tool_calls
                     .iter()
                     .map(|tc| ToolCall {
@@ -1052,6 +1063,7 @@ pub fn session_view_count_before(sess: &ChatSession, upto: usize) -> usize {
                 content,
                 reasoning,
                 tool_calls,
+                ..
             } => {
                 if content.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
                     continue;
@@ -1118,6 +1130,7 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
                 content,
                 reasoning,
                 tool_calls,
+                ..
             } => {
                 let mut parts: Vec<Value> = Vec::new();
                 if !reasoning.is_empty() {
@@ -1179,6 +1192,7 @@ fn view_parts_len(m: &ChatMessage) -> usize {
             content,
             reasoning,
             tool_calls,
+            ..
         } => {
             usize::from(!reasoning.is_empty()) + usize::from(!content.is_empty()) + tool_calls.len()
         }
@@ -1345,6 +1359,8 @@ impl Drop for TurnGuard {
 struct StepOutput {
     content: String,
     reasoning: String,
+    /// Responses API 的思考条目（原样，下一次请求回传）
+    reasoning_items: Vec<Value>,
     calls: Vec<RecordedToolCall>,
     /// 流到一半用户按了停止。已经流出来的正文/思考照样进历史，工具调用作废。
     aborted: bool,
@@ -1356,6 +1372,7 @@ impl StepOutput {
         Self {
             content: String::new(),
             reasoning: String::new(),
+            reasoning_items: Vec::new(),
             calls: Vec::new(),
             aborted: true,
         }
@@ -1396,7 +1413,11 @@ async fn drive(
         let step = step_out;
 
         // 不管有没有工具调用，这一轮的 assistant 输出都要进历史
-        if !step.content.is_empty() || !step.reasoning.is_empty() || !step.calls.is_empty() {
+        if !step.content.is_empty()
+            || !step.reasoning.is_empty()
+            || !step.calls.is_empty()
+            || !step.reasoning_items.is_empty()
+        {
             append(
                 core,
                 sid,
@@ -1404,6 +1425,7 @@ async fn drive(
                     content: step.content.clone(),
                     reasoning: step.reasoning.clone(),
                     tool_calls: step.calls.clone(),
+                    reasoning_items: step.reasoning_items.clone(),
                 },
             )
             .await;
@@ -1533,6 +1555,7 @@ pub fn build_responses_request(
         tools: tool_definitions_responses(),
         stream: true,
         store: false,
+        include: &["reasoning.encrypted_content"],
         reasoning: effort.map(|e| Reasoning {
             effort: e.to_string(),
         }),
@@ -1559,9 +1582,18 @@ fn build_responses_input(
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                reasoning_items,
                 ..
             } => {
-                // Responses 的 output 顺序：先正文，再每个 function_call。
+                // Responses 的 output 顺序：思考条目在最前（原样回传，见
+                // `ChatMessage::Assistant::reasoning_items`），再正文，再每个 function_call。
+                //
+                // 只回传带 `encrypted_content` 的：`store: false` 时服务端不留东西，
+                // 光有 id 的条目 OpenAI 会去找、找不到就 400。不带的（比如老会话、
+                // 不给加密内容的服务端）跳过 —— 那就和以前一样，只是少了这一步的思考。
+                for item in reasoning_items.iter().filter(|i| replayable(i)) {
+                    out.push(InputItem::Raw(item.clone()));
+                }
                 if !content.is_empty() {
                     out.push(InputItem::AssistantMessage(AssistantItem {
                         kind: "message",
@@ -1592,6 +1624,13 @@ fn build_responses_input(
         }
     }
     out
+}
+
+/// 这个思考条目能不能原样回传（见 `build_responses_input`）
+fn replayable(item: &Value) -> bool {
+    item.get("encrypted_content")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
 }
 
 fn message_item(role: &str, content: MessageContent) -> InputItem {
@@ -1787,6 +1826,7 @@ async fn stream_one(
         let mut reason_acc = String::new();
         let mut finish: Option<String> = None;
         let mut usage: Option<Usage> = None;
+        let mut reasoning_items: Vec<Value> = Vec::new();
         // 往前端流出过内容没有（决定流断了还能不能重来）
         let mut emitted = false;
 
@@ -1828,6 +1868,9 @@ async fn stream_one(
             }
             if chunk.usage.is_some() {
                 usage = chunk.usage.clone();
+            }
+            if let Some(item) = chunk.reasoning_item {
+                reasoning_items.push(item);
             }
             for choice in chunk.choices {
                 if let Some(r) = choice.delta.reasoning_text() {
@@ -1947,6 +1990,7 @@ async fn stream_one(
             return Ok(StepOutput {
                 content: text_acc,
                 reasoning: reason_acc,
+                reasoning_items,
                 calls: Vec::new(),
                 aborted: true,
             });
@@ -1981,6 +2025,7 @@ async fn stream_one(
         return Ok(StepOutput {
             content: text_acc,
             reasoning: reason_acc,
+            reasoning_items,
             calls,
             aborted: false,
         });
@@ -2909,6 +2954,100 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// Responses API：上一步的思考条目原样放回 input，排在那一步的正文和
+    /// 工具调用前面（和服务端给出时的顺序一致）。
+    #[test]
+    fn responses_requests_replay_reasoning_items_before_the_step() {
+        let item =
+            json!({ "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "e" });
+        let bare = json!({ "type": "reasoning", "id": "rs_0", "summary": [] });
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::User("U".into()),
+            ChatMessage::Assistant {
+                content: "我去看看".into(),
+                reasoning: "先看看目录".into(),
+                tool_calls: vec![call("c1")],
+                // 光有 id、没有加密内容的回传不了（store: false 时 OpenAI 会 400），跳过
+                reasoning_items: vec![bare, item.clone()],
+            },
+            tool("c1"),
+        ];
+        let req = build_responses_request(&sess, "m", false, false, None).unwrap();
+        let input = serde_json::to_value(&req).unwrap()["input"].clone();
+        let kinds: Vec<&str> = input
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message",
+                "reasoning",
+                "message",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+        assert_eq!(input[1], item, "原样，一个字段都不改");
+        assert_eq!(
+            serde_json::to_value(&req).unwrap()["include"],
+            json!(["reasoning.encrypted_content"]),
+            "要服务端带上加密的思考内容，不然回传不了"
+        );
+    }
+
+    /// DeepSeek 思考模式：带工具的请求里，历史上**每一条** assistant 消息的
+    /// 思考内容都要原样传回（不传就 400，模型也看不到自己上一步想了什么）；
+    /// 没有思考内容的那条不带这个字段。
+    #[test]
+    fn chat_requests_pass_reasoning_back_on_every_assistant_message() {
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("U".into()),
+            ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: "先看看目录".into(),
+                tool_calls: vec![call("c1")],
+                reasoning_items: Vec::new(),
+            },
+            tool("c1"),
+            ChatMessage::Assistant {
+                content: "好了".into(),
+                reasoning: "目录里有两个文件".into(),
+                tool_calls: vec![],
+                reasoning_items: Vec::new(),
+            },
+            ChatMessage::User("再来".into()),
+            ChatMessage::Assistant {
+                content: "嗯".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_items: Vec::new(),
+            },
+        ];
+        let req = build_request(&sess, "m", false, false, None).unwrap();
+        let v = serde_json::to_value(&req).unwrap();
+        let assistants: Vec<&Value> = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .collect();
+        assert_eq!(assistants[0]["reasoning_content"], "先看看目录");
+        assert_eq!(
+            assistants[1]["reasoning_content"], "目录里有两个文件",
+            "没调工具的那步也要传"
+        );
+        assert!(
+            assistants[2].get("reasoning_content").is_none(),
+            "没有思考内容就不带字段"
+        );
+    }
+
     fn call(id: &str) -> RecordedToolCall {
         RecordedToolCall {
             id: id.into(),
@@ -2936,6 +3075,7 @@ mod tests {
             content: String::new(),
             reasoning: String::new(),
             tool_calls: vec![call("c1"), call("c2"), call("c3")],
+            reasoning_items: Vec::new(),
         });
         sess.messages.push(tool("c1"));
         // c2、c3 没有结果；后面已经又来了一句（老会话的形状）
@@ -2974,6 +3114,7 @@ mod tests {
             content: String::new(),
             reasoning: String::new(),
             tool_calls: vec![call("c1"), call("c2")],
+            reasoning_items: Vec::new(),
         });
         sess.messages.push(tool("c1"));
         close_dangling_tail(&mut sess);
@@ -3018,6 +3159,7 @@ mod tests {
                 name: "bash".into(),
                 arguments: r#"{"command":"ls"}"#.into(),
             }],
+            reasoning_items: Vec::new(),
         });
         sess.messages.push(ChatMessage::Tool {
             tool_call_id: "c1".into(),
@@ -3050,6 +3192,7 @@ mod tests {
             content: "答".into(),
             reasoning: String::new(),
             tool_calls: vec![],
+            reasoning_items: Vec::new(),
         });
         let before = wire(&sess);
 
@@ -3100,6 +3243,7 @@ mod tests {
             content: "答".into(),
             reasoning: String::new(),
             tool_calls: vec![],
+            reasoning_items: Vec::new(),
         });
         sess.messages.push(ChatMessage::User("再问".into()));
 
@@ -3135,6 +3279,7 @@ mod tests {
                 name: "bash".into(),
                 arguments: r#"{"command":"ls"}"#.into(),
             }],
+            reasoning_items: Vec::new(),
         });
         sess.messages.push(ChatMessage::Tool {
             tool_call_id: "c1".into(),
@@ -3211,6 +3356,7 @@ mod tests {
                 content: String::new(),
                 reasoning: String::new(),
                 tool_calls: vec![call("c1"), call("c2")],
+                reasoning_items: Vec::new(),
             },
             ChatMessage::Tool {
                 tool_call_id: "c1".into(),
@@ -3349,6 +3495,7 @@ mod tests {
                 content: "答1".into(),
                 reasoning: String::new(),
                 tool_calls: vec![],
+                reasoning_items: Vec::new(),
             },
             ChatMessage::UserFiles {
                 text: "U2".into(),
@@ -3364,6 +3511,7 @@ mod tests {
                 content: "答2".into(),
                 reasoning: String::new(),
                 tool_calls: vec![],
+                reasoning_items: Vec::new(),
             },
         ];
         let full = session_view(&sess);
@@ -3557,6 +3705,7 @@ mod tests {
                 content: "先看看".into(),
                 reasoning: "想1".into(),
                 tool_calls: vec![call("c1")],
+                reasoning_items: Vec::new(),
             },
             ChatMessage::Tool {
                 tool_call_id: "c1".into(),
@@ -3567,12 +3716,14 @@ mod tests {
                 content: "答".into(),
                 reasoning: "想2".into(),
                 tool_calls: vec![],
+                reasoning_items: Vec::new(),
             },
             ChatMessage::User("再问".into()),
             ChatMessage::Assistant {
                 content: "再答".into(),
                 reasoning: String::new(),
                 tool_calls: vec![],
+                reasoning_items: Vec::new(),
             },
         ];
         let v = session_view(&sess);
@@ -3632,6 +3783,7 @@ mod tests {
                 content: "先看看".into(),
                 reasoning: "想".into(),
                 tool_calls: vec![call("c1")],
+                reasoning_items: Vec::new(),
             },
             ChatMessage::Tool {
                 tool_call_id: "c1".into(),
@@ -3642,12 +3794,14 @@ mod tests {
                 content: "答1".into(),
                 reasoning: String::new(),
                 tool_calls: vec![],
+                reasoning_items: Vec::new(),
             },
             ChatMessage::User("U2".into()),
             ChatMessage::Assistant {
                 content: "答2".into(),
                 reasoning: String::new(),
                 tool_calls: vec![],
+                reasoning_items: Vec::new(),
             },
         ];
         let full = session_view(&sess);
@@ -3684,6 +3838,7 @@ mod tests {
                 content: content.into(),
                 reasoning: reasoning.into(),
                 tool_calls: calls,
+                reasoning_items: Vec::new(),
             };
         let mut sess = ChatSession::new();
         sess.messages = vec![
@@ -3807,6 +3962,7 @@ mod tests {
                 content: "Alpine 3.21\n第二行".into(),
                 reasoning: String::new(),
                 tool_calls: vec![],
+                reasoning_items: Vec::new(),
             },
             ChatMessage::Tool {
                 tool_call_id: "c1".into(),
