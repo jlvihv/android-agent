@@ -57,8 +57,7 @@ fn shout(msg: &str) {
 /// 初始化日志。安卓上同时输出到 logcat，桌面上输出到 stdout。
 pub fn init_tracing() {
     // rustls 的 crypto provider 必须在**建任何 reqwest client 之前**装好，
-    // 否则 async-openai 的 `Client::with_config()` 里那句
-    // `reqwest::Client::new()` 直接 panic，整个回合静默死掉。
+    // 否则建 client 时直接 panic（见 `llm::shared_http`）。
     // 放在这里是因为桌面 / 安卓两条启动路径都会先调它。
     crate::llm::install_crypto_provider();
 

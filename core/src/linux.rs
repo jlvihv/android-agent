@@ -1131,7 +1131,7 @@ impl LinuxSandbox {
             .map_err(|e| anyhow::anyhow!("读取失败 {guest_path}: {e}（只能编辑 UTF-8 文本）"))?;
 
         let outcome = editor::apply(&raw, edits, guest_path)?;
-        std::fs::write(&host, &outcome.content)
+        atomic_write(&host, outcome.content.as_bytes())
             .map_err(|e| anyhow::anyhow!("写入失败 {guest_path}: {e}"))?;
 
         Ok(outcome)
@@ -1152,7 +1152,7 @@ impl LinuxSandbox {
             std::fs::create_dir_all(dir)
                 .map_err(|e| anyhow::anyhow!("建目录失败 {}: {e}", dir.display()))?;
         }
-        std::fs::write(&host, content)
+        atomic_write(&host, content.as_bytes())
             .map_err(|e| anyhow::anyhow!("写入失败 {guest_path}: {e}"))?;
 
         Ok(CreatedFile {
@@ -1254,6 +1254,47 @@ fn confine_new(root: &Path, path: &Path, guest: &str) -> anyhow::Result<PathBuf>
         }
     }
     Ok(norm)
+}
+
+/// 整份写入一个文件，**要么全是新的、要么还是旧的**。
+///
+/// `std::fs::write` 是先清空再写：写到一半进程被杀（系统回收、用户划掉 App），
+/// 文件就只剩半截甚至是空的 —— 而 `/workspace` 是用户内部存储里的文件夹，坏了
+/// 就是真坏了。所以先写同目录下的临时文件、刷盘，再 rename 盖过去（同一个文件
+/// 系统里 rename 是原子的）。
+///
+/// - 目标是**符号链接**：写到它指向的那个文件，不要把链接本身换成普通文件
+///   （原来 `fs::write` 也是跟着链接走的）。越界检查调用方已经做过（`confine`）。
+/// - 改已有文件时保留原来的权限位（不然可执行脚本改一下就不能执行了）。
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = match std::fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(_) => path.to_path_buf(), // 新文件
+    };
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let tmp = dir.join(format!(
+        ".{name}.agent-{}.tmp",
+        uuid::Uuid::now_v7().simple()
+    ));
+    let res = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        if let Ok(meta) = std::fs::metadata(&target) {
+            // 共享存储（FUSE）上改权限可能不被支持：失败不算错
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, &target)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// 读成 UTF-8 文本。二进制给一条能操作的错误，而不是一句 "invalid utf-8"。
@@ -2183,6 +2224,34 @@ mod tests {
         assert_eq!(out.first_changed_line, 1);
         assert!(out.patch.contains("-host=old"));
         assert!(out.patch.contains("+host=new"));
+    }
+
+    /// 写文件是「临时文件 + rename」：改完不留临时文件、保留可执行位；
+    /// 改一个符号链接时改的是它指向的文件，链接本身还是链接。
+    #[test]
+    fn edit_writes_atomically_keeping_mode_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempRoot::new("atomic");
+        let sb = t.sandbox();
+        let script = t.dir.join("root/run.sh");
+        std::fs::write(&script, "echo old\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("run.sh", t.dir.join("root/link.sh")).unwrap();
+
+        sb.edit_file("/root/link.sh", &[Edit::new("old", "new")])
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), "echo new\n");
+        let link = std::fs::symlink_metadata(t.dir.join("root/link.sh")).unwrap();
+        assert!(link.file_type().is_symlink(), "链接不能被换成普通文件");
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "可执行位要保住");
+        let leftovers: Vec<_> = std::fs::read_dir(t.dir.join("root"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件要么被 rename 掉，要么清掉");
     }
 
     #[test]

@@ -334,9 +334,8 @@ impl Provider {
 /// No rustls crypto provider is configured...
 /// ```
 ///
-/// **必须在建任何 HTTP client 之前调** —— 不只是我们自己的 `shared_http`，
-/// async-openai 的 `Client::with_config()` 内部也会先建一个默认 reqwest
-/// client。所以放在 `init_tracing()` 里（桌面 / 安卓两条启动路径都经过它）。
+/// **必须在建任何 HTTP client 之前调**（搜索、模型目录也各自用 `shared_http`）。
+/// 所以放在 `init_tracing()` 里（桌面 / 安卓两条启动路径都经过它）。
 /// 幂等：重复调只生效一次。
 pub fn install_crypto_provider() {
     static ONCE: OnceLock<()> = OnceLock::new();
@@ -363,13 +362,8 @@ pub(crate) fn shared_http() -> anyhow::Result<reqwest::Client> {
         //   `rustls-no-provider` feature you must install a crypto provider
         //   before building a Client.
         //
-        // 这是个 panic，而且发生在 `stream_one` 里 —— agent 任务直接 unwind，
-        // 前端只看到 start / start-step / [DONE]，模型永远不回复。
-        // 装 ring：跟 Cargo.toml 里 `rustls` 的 `ring` feature 一致（没有 ring
-        // 就只有 aws-lc 那个大 C 库）。已经装过时返回 Err，忽略即可。
-        // rustls 0.23 **不会**自动装进程级 CryptoProvider；而 reqwest 开了
-        // `rustls-no-provider` 后不但不装，构建 Client 时还硬要求它已经存在。
-        // 正常启动路径已在 `init_tracing()` 里装过，这里再保险一下（幂等）。
+        // 那是个 panic（release 里就是崩）。正常启动路径已在 `init_tracing()`
+        // 里装过，这里再保险一下（幂等）。
         install_crypto_provider();
 
         let tls = Provider::tls_config().map_err(|e| format!("{e:#}"))?;
@@ -407,16 +401,53 @@ pub enum StreamError {
 
 impl StreamError {
     /// 是不是「端点不支持这个 API」。
+    ///
+    /// 400 只在报错**说的是路由/端点本身**时才算 —— 以前只要带 "unknown" 就算，
+    /// 于是「unknown parameter」「unknown model」这种跟协议无关的 400 也会让这次
+    /// 运行剩下的时间全切到 Chat Completions。
     pub fn is_unsupported_endpoint(&self) -> bool {
         match self {
             StreamError::Http { status, body } => {
-                matches!(*status, 404 | 405 | 501)
-                    || (*status == 400
-                        && ["not found", "unsupported", "unknown", "does not exist"]
-                            .iter()
-                            .any(|k| body.to_ascii_lowercase().contains(k)))
+                if matches!(*status, 404 | 405 | 501) {
+                    return true;
+                }
+                if *status != 400 {
+                    return false;
+                }
+                let b = body.to_ascii_lowercase();
+                let negative = [
+                    "not found",
+                    "unsupported",
+                    "not supported",
+                    "unknown",
+                    "does not exist",
+                ]
+                .iter()
+                .any(|k| b.contains(k));
+                let about_route = ["endpoint", "route", "path", "url"]
+                    .iter()
+                    .any(|k| b.contains(k));
+                let about_other = ["parameter", "model", "field", "argument"]
+                    .iter()
+                    .any(|k| b.contains(k));
+                negative && about_route && !about_other
             }
             StreamError::Other(_) => false,
+        }
+    }
+
+    /// 值得重试的临时故障：限流、网关 / 服务端临时出错、连不上 / 读超时。
+    ///
+    /// 手机网络上一次抖动不该让一个跑了半天的回合直接报错结束（agent 不限
+    /// 步数，长任务中途碰到一次的概率很高）。鉴权失败、请求本身有问题（400）
+    /// 这类重试也没用，不算。
+    pub fn is_transient(&self) -> bool {
+        match self {
+            StreamError::Http { status, .. } => {
+                matches!(*status, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+            }
+            // 只认网络层的错误（发请求时 reqwest 报的）；别的（建 client 失败之类）不重试
+            StreamError::Other(e) => e.downcast_ref::<reqwest::Error>().is_some(),
         }
     }
 }
@@ -440,9 +471,29 @@ pub fn responses_known_unsupported(p: &Provider) -> bool {
         .unwrap_or(false)
 }
 
-pub fn mark_responses_unsupported(p: &Provider) {
+/// 记下「这个端点不支持 Responses」。返回 `true` = 这是新记下的（调用方据此
+/// 落盘，见 `AppState::remember_responses_unsupported`）。
+pub fn mark_responses_unsupported(p: &Provider) -> bool {
+    responses_unsupported()
+        .lock()
+        .map(|mut s| s.insert(responses_key(p)))
+        .unwrap_or(false)
+}
+
+/// 全部已知不支持的（落盘用）。
+pub fn responses_unsupported_list() -> Vec<String> {
+    let mut v: Vec<String> = responses_unsupported()
+        .lock()
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// 启动时把落过盘的读回来：不然每次重启后的第一个请求都要白白失败一次。
+pub fn load_responses_unsupported(keys: impl IntoIterator<Item = String>) {
     if let Ok(mut s) = responses_unsupported().lock() {
-        s.insert(responses_key(p));
+        s.extend(keys);
     }
 }
 
@@ -517,15 +568,43 @@ mod tests {
 
     #[test]
     fn unsupported_endpoint_is_recognized() {
-        let e = StreamError::Http {
-            status: 404,
-            body: "not found".into(),
+        let http = |status: u16, body: &str| StreamError::Http {
+            status,
+            body: body.into(),
         };
-        assert!(e.is_unsupported_endpoint());
-        let e = StreamError::Http {
-            status: 401,
-            body: "bad key".into(),
+        assert!(http(404, "not found").is_unsupported_endpoint());
+        assert!(http(405, "").is_unsupported_endpoint());
+        assert!(http(400, "Unsupported endpoint: /v1/responses").is_unsupported_endpoint());
+        assert!(!http(401, "bad key").is_unsupported_endpoint());
+        // 跟协议无关的 400 不能让整个运行切到 Chat Completions
+        assert!(!http(400, "Unknown parameter: 'reasoning.effort'").is_unsupported_endpoint());
+        assert!(!http(400, "unknown model: gpt-9").is_unsupported_endpoint());
+        assert!(!http(400, "context length exceeded").is_unsupported_endpoint());
+    }
+
+    #[test]
+    fn only_temporary_failures_are_retried() {
+        let http = |status: u16| StreamError::Http {
+            status,
+            body: String::new(),
         };
-        assert!(!e.is_unsupported_endpoint());
+        for s in [429, 500, 502, 503, 504, 529, 408] {
+            assert!(http(s).is_transient(), "{s}");
+        }
+        for s in [400, 401, 403, 404, 422] {
+            assert!(!http(s).is_transient(), "{s}");
+        }
+        assert!(!StreamError::Other(anyhow::anyhow!("建 HTTP client 失败")).is_transient());
+    }
+
+    #[test]
+    fn responses_unsupported_round_trips_for_persistence() {
+        let p = Provider::compatible("x", "https://persist.test/v1", "m2", "k");
+        assert!(mark_responses_unsupported(&p), "第一次是新记下的");
+        assert!(!mark_responses_unsupported(&p), "再记一次不算新的");
+        assert!(responses_unsupported_list().contains(&"https://persist.test/v1|m2".to_string()));
+        load_responses_unsupported(["https://loaded.test/v1|m".to_string()]);
+        let q = Provider::compatible("y", "https://loaded.test/v1/", "m", "k");
+        assert_eq!(q.transport(), Transport::Chat, "读回来的直接生效");
     }
 }

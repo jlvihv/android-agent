@@ -34,8 +34,13 @@
    * 一行截断描述，而不是把 JSON 摊在正文里。
    */
   function summarize(t: ToolPart): string {
-    // 参数还在流式（JSON 没写完）时从半截文本里抠字段，边写边显示
-    const a = (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
+    // 参数还在流式（JSON 没写完）时从半截文本里抠字段，边写边显示。
+    //
+    // 只看开头那一段：这一行只要命令 / 路径 / 网址这种排在前面的短字段。
+    // 每来一小段参数这里就重算一次，原来是对**整段** inputText 跑正则 + 试
+    // JSON.parse —— 模型用 edit 写一个 30KB 的文件，就是几千次 × 30KB 的反复
+    // 扫描，手机上肉眼可见地卡。
+    const a = (t.input ?? partialArgs(t.inputText.slice(0, SUMMARY_SCAN))) as Record<string, unknown>;
     const s = (v: unknown) => (typeof v === 'string' ? v : '');
     // 只取第一行，长度交给 CSS 截断 —— 屏幕多宽就显示多少
     const firstLine = (v: string) => v.split('\n')[0].trim();
@@ -55,6 +60,9 @@
         return t.toolName || '工具调用';
     }
   }
+
+  /** 折叠行的摘要从流式参数里最多看这么多字符（见 summarize） */
+  const SUMMARY_SCAN = 2048;
 
   /**
    * 浏览器那一行：动作 + 目标。

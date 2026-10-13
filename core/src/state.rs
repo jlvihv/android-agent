@@ -384,6 +384,10 @@ impl AppState {
                 self.load_llm(&db, dir);
                 self.load_providers(&db);
                 self.load_auth(&db);
+                if let Ok(Some(raw)) = db.get_meta(RESPONSES_UNSUPPORTED) {
+                    let keys: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+                    crate::llm::load_responses_unsupported(keys);
+                }
                 if let Ok(mut g) = self.db.write() {
                     *g = Some(db);
                 }
@@ -595,6 +599,24 @@ impl AppState {
             pending.insert(a.id.clone(), (std::time::Instant::now(), a));
         }
         crate::gc::remove_all(&stale);
+    }
+
+    /// 记下「这个端点不支持 Responses API」并落盘。
+    ///
+    /// 只放内存的话，每次重启后的第一个请求都要先白白失败一次再退回 Chat
+    /// Completions。是新记下的才写库（一个端点一辈子写一次）。
+    pub async fn remember_responses_unsupported(&self, p: &Provider) {
+        if !crate::llm::mark_responses_unsupported(p) {
+            return;
+        }
+        let Some(db) = self.db() else { return };
+        let body = serde_json::to_string(&crate::llm::responses_unsupported_list())
+            .unwrap_or_else(|_| "[]".into());
+        let res =
+            tokio::task::spawn_blocking(move || db.set_meta(RESPONSES_UNSUPPORTED, &body)).await;
+        if !matches!(res, Ok(Ok(()))) {
+            tracing::warn!("记录「不支持 Responses」失败（下次启动会再探测一次）");
+        }
     }
 
     /// 各家的 Key。老版本只有一个 provider（`llm`）：库里还没有 `providers`
@@ -1101,6 +1123,9 @@ fn migrate_llm_json(db: &Db, dir: &std::path::Path) -> Option<String> {
         }
     }
 }
+
+/// `meta` 表里那一行：已知不支持 Responses API 的 `base_url|model`（JSON 数组）
+const RESPONSES_UNSUPPORTED: &str = "responses_unsupported";
 
 /// 随机凭据：122 位随机数的十六进制（UUID v4 去掉版本位之外全是随机的）。
 fn random_secret() -> String {

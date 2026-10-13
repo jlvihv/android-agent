@@ -76,6 +76,9 @@ class BrowserController(private val app: Application) : BrowserHost {
         /** 截图压缩质量。截图进的是模型上下文，不是相册 */
         private const val SHOT_QUALITY = 80
 
+        /** 截图长边上限，和核心 `imaging::MAX_DIM` 一致（超过的那边会再缩一遍） */
+        private const val SHOT_MAX_DIM = 2000
+
         /** 整页截图的高度上限（物理像素）。1080×8000 的 ARGB 位图 ≈ 34MB */
         private const val FULL_PAGE_MAX_PX = 8_000
 
@@ -1292,16 +1295,34 @@ class BrowserController(private val app: Application) : BrowserHost {
             runCatching { eval("window.scrollTo(${scroll.first}, ${scroll.second})") }
         }
 
+        // 长边先缩到 SHOT_MAX_DIM 以内再压：核心发给模型前也会缩到这个尺寸，
+        // 这里不缩的话那边就得把 JPEG 整个解码、缩放、再编码一遍（手机上几百毫秒）。
+        // 缩好了它直接原样放行。
+        val scale = SHOT_MAX_DIM.toFloat() / maxOf(bmp.width, bmp.height)
+        val out = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                bmp,
+                (bmp.width * scale).toInt().coerceAtLeast(1),
+                (bmp.height * scale).toInt().coerceAtLeast(1),
+                true,
+            )
+        } else {
+            bmp
+        }
+        // 下面 finally 里会 recycle，尺寸先记下来
+        val outW = out.width
+        val outH = out.height
         val saved: File? = try {
             val dir = File(RootfsInstaller.rootfsDir(app), "root/.browser")
             if (!dir.exists() && !dir.mkdirs()) error("建不了目录 $dir")
             val f = File(dir, "shot-${System.currentTimeMillis()}.jpg")
-            f.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, SHOT_QUALITY, it) }
+            f.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, SHOT_QUALITY, it) }
             f
         } catch (t: Throwable) {
             Log.w(TAG, "截图落盘失败", t)
             null
         } finally {
+            if (out !== bmp) out.recycle()
             bmp.recycle()
         }
         if (saved == null) return errObj("截图存不下来（沙箱目录写不进？）")
@@ -1311,8 +1332,9 @@ class BrowserController(private val app: Application) : BrowserHost {
         val kind = if (fullPage) "整页" else "视口"
         val cut = if (clipped) "（页面更长，截到 ${FULL_PAGE_MAX_PX}px 为止）" else ""
         val how = if (gpu != null) "GPU 合成" else "软件绘制"
+        val size = if (scale < 1f) "${pxW}×${pxH}px → ${outW}×${outH}" else "${pxW}×${pxH}px"
         return ok(
-            "已截图 ${saved.length() / 1024}KB（$kind ${pxW}×${pxH}px，$how$cut）",
+            "已截图 ${saved.length() / 1024}KB（$kind $size，$how$cut）",
             info?.optString("url").orEmpty(),
             info?.optString("title").orEmpty(),
         ).put("image", guest)

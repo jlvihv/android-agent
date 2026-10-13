@@ -1350,6 +1350,18 @@ struct StepOutput {
     aborted: bool,
 }
 
+impl StepOutput {
+    /// 还没拿到任何东西就停了
+    fn aborted() -> Self {
+        Self {
+            content: String::new(),
+            reasoning: String::new(),
+            calls: Vec::new(),
+            aborted: true,
+        }
+    }
+}
+
 /// 真正的 loop：模型 → 工具 → 模型 …
 async fn drive(
     core: &Core,
@@ -1740,282 +1752,352 @@ async fn stream_one(
         let _ = tokio::task::spawn_blocking(move || crate::imaging::prewarm(&files)).await;
     }
 
-    let open = async {
-        let rx = match provider.transport() {
-            Transport::Responses => {
-                let (req, session_id) = {
-                    let store = core.state.chat.read().await;
-                    let sess = store
-                        .get(sid)
-                        .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-                    (
-                        build_responses_request(
-                            sess,
-                            &provider.model,
-                            supports_images,
-                            supports_files,
-                            provider.reasoning_effort.as_deref(),
-                        )?,
-                        sess.provider_session.clone(),
-                    )
-                };
-                match provider.stream_responses(&req, &session_id).await {
-                    Ok(rx) => rx,
-                    Err(e) if e.is_unsupported_endpoint() => {
-                        crate::llm::mark_responses_unsupported(provider);
-                        tracing::info!(
-                            "{} 不支持 Responses API，退回 Chat Completions",
-                            provider.base_url
-                        );
-                        let (req, session_id) = {
-                            let store = core.state.chat.read().await;
-                            let sess = store
-                                .get(sid)
-                                .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-                            (
-                                build_request(
-                                    sess,
-                                    &provider.model,
-                                    supports_images,
-                                    supports_files,
-                                    provider.reasoning_effort.as_deref(),
-                                )?,
-                                sess.provider_session.clone(),
-                            )
-                        };
-                        provider.stream_chat(&req, &session_id).await?
+    // 打开流 + 收流，外面套一层重试：限流 / 网关临时出错 / 断网这类临时故障
+    // 退避后重来（见 `RETRY_DELAYS`）。只在**还没往前端流出任何内容**时重试 ——
+    // 已经流出正文 / 工具调用的话，重来一遍界面上就是两份。
+    let mut attempt = 0usize;
+    'attempt: loop {
+        // 等首包也可能很久（长上下文的预填充），这段也要能停
+        let opened = tokio::select! {
+            r = open_stream(core, provider, sid, supports_images, supports_files) => r,
+            _ = turn.aborted() => return Ok(StepOutput::aborted()),
+        };
+        let mut rx = match opened {
+            Ok(rx) => rx,
+            Err(e) if e.is_transient() && attempt < RETRY_DELAYS.len() => {
+                if !backoff(tx, turn, attempt, &format!("{e:#}")).await {
+                    return Ok(StepOutput::aborted());
+                }
+                attempt += 1;
+                continue 'attempt;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // 工具调用是分片到达的：按 index 累积
+        let mut acc: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
+                                                                 // 每个工具调用是否已经告诉前端"开始了"。
+                                                                 //
+                                                                 // 之前要等这一步整个流完、才一次性发 tool-input-available —— 模型写
+                                                                 // 一条长命令（或一大段 edit）的那几秒里，界面上什么都没有。现在 id 和
+                                                                 // 名字一到就发 start，参数边到边发 delta，前端能边写边显示。
+        let mut started: Vec<bool> = Vec::new();
+        let mut blocks = BlockStream::default();
+        let mut text_acc = String::new();
+        let mut reason_acc = String::new();
+        let mut finish: Option<String> = None;
+        let mut usage: Option<Usage> = None;
+        // 往前端流出过内容没有（决定流断了还能不能重来）
+        let mut emitted = false;
+
+        let mut aborted = false;
+        loop {
+            let item = tokio::select! {
+                item = rx.recv() => match item {
+                    Some(item) => item,
+                    None => break,
+                },
+                // 流到一半按停止：已经流出来的留着，剩下的不要了
+                _ = turn.aborted() => {
+                    aborted = true;
+                    break;
+                }
+            };
+            let chunk = match item {
+                Ok(c) => c,
+                // 流在出任何内容之前就断了（连上之后网络掉了、网关掐了连接）：
+                // 跟连不上一样，重来
+                Err(e) if !emitted && attempt < RETRY_DELAYS.len() => {
+                    if !backoff(tx, turn, attempt, &format!("{e:#}")).await {
+                        return Ok(StepOutput::aborted());
                     }
-                    Err(e) => return Err(e.into()),
+                    attempt += 1;
+                    continue 'attempt;
+                }
+                Err(e) => return Err(e),
+            };
+            // 网关在流里直接报错（限流、上下文超限、response.failed）。不接的话
+            // 这一步就是个空回复，回合「正常结束」，用户只看到没反应。
+            if let Some(e) = &chunk.error {
+                let msg = e
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| e.to_string());
+                anyhow::bail!("provider 报错：{msg}");
+            }
+            if chunk.usage.is_some() {
+                usage = chunk.usage.clone();
+            }
+            for choice in chunk.choices {
+                if let Some(r) = choice.delta.reasoning_text() {
+                    emitted = true;
+                    reason_acc.push_str(r);
+                    for c in blocks.push(BlockKind::Reasoning, r) {
+                        send(tx, c).await;
+                    }
+                }
+                if let Some(c) = choice.delta.content.as_deref() {
+                    if !c.is_empty() {
+                        emitted = true;
+                        text_acc.push_str(c);
+                        for c in blocks.push(BlockKind::Text, c) {
+                            send(tx, c).await;
+                        }
+                    }
+                }
+                if let Some(fr) = choice.finish_reason.as_deref() {
+                    if fr == "length" {
+                        finish = Some("length".to_string());
+                    }
+                }
+                if let Some(tcs) = choice.delta.tool_calls {
+                    for tc in tcs {
+                        let i = tc.index as usize;
+                        while acc.len() <= i {
+                            acc.push((String::new(), String::new(), String::new()));
+                            started.push(false);
+                        }
+                        if let Some(id) = tc.id {
+                            acc[i].0 = id;
+                        }
+                        let mut piece = String::new();
+                        if let Some(f) = tc.function {
+                            if let Some(n) = f.name {
+                                acc[i].1.push_str(&n);
+                            }
+                            if let Some(a) = f.arguments {
+                                acc[i].2.push_str(&a);
+                                piece = a;
+                            }
+                        }
+
+                        let (id, name, args) = &acc[i];
+                        if !started[i] && !id.is_empty() && !name.is_empty() {
+                            started[i] = true;
+                            emitted = true;
+                            // 先收尾正在流的思考/正文，工具行才排在它们后面
+                            if let Some(c) = blocks.close() {
+                                send(tx, c).await;
+                            }
+                            send(tx, sse::tool_input_start(id, name)).await;
+                            // id/名字到之前就来了的参数一并补上
+                            if !args.is_empty() {
+                                send(tx, sse::tool_input_delta(id, args)).await;
+                            }
+                        } else if started[i] && !piece.is_empty() {
+                            send(tx, sse::tool_input_delta(id, &piece)).await;
+                        }
+                    }
                 }
             }
-            Transport::Chat => {
-                let (req, session_id) = {
-                    let store = core.state.chat.read().await;
-                    let sess = store
-                        .get(sid)
-                        .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
-                    (
-                        build_request(
-                            sess,
-                            &provider.model,
-                            supports_images,
-                            supports_files,
-                            provider.reasoning_effort.as_deref(),
-                        )?,
-                        sess.provider_session.clone(),
-                    )
-                };
-                provider.stream_chat(&req, &session_id).await?
+        }
+
+        // 收尾最后一个块，之后才是工具调用 —— 前端按收到的顺序排 part
+        if let Some(c) = blocks.close() {
+            send(tx, c).await;
+        }
+
+        // 把缓存命中情况摆出来 —— 这是验证 prompt cache 的唯一硬证据
+        if let Some(u) = &usage {
+            match u.cache_hit_ratio() {
+                Some(ratio) => tracing::info!(
+                    "prompt cache 命中 {:.1}%（cached={} prompt={} completion={} reasoning={}）",
+                    ratio * 100.0,
+                    u.cached_tokens().unwrap_or(0),
+                    u.prompt_tokens,
+                    u.completion_tokens,
+                    u.reasoning_tokens().unwrap_or(0),
+                ),
+                None => tracing::info!(
+                    "prompt={} completion={}（provider 未报缓存字段）",
+                    u.prompt_tokens,
+                    u.completion_tokens
+                ),
             }
-        };
-        Ok::<_, anyhow::Error>(rx)
-    };
-    // 等首包也可能很久（长上下文的预填充），这段也要能停
-    let mut rx = tokio::select! {
-        r = open => r?,
-        _ = turn.aborted() => {
+            send(tx, sse::data_part("usage", serde_json::to_value(u)?)).await;
+        }
+
+        let mut calls: Vec<RecordedToolCall> = acc
+            .into_iter()
+            .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
+            .map(|(id, name, arguments)| RecordedToolCall {
+                id,
+                name,
+                arguments,
+            })
+            .collect();
+
+        // 被输出长度上限截断时要告诉用户，否则看起来就像模型话说到一半。
+        //
+        // 而且这一轮的**工具调用全部作废**：截断意味着参数 JSON 很可能是半个
+        // 对象，而 `execute_tool` 遇到坏 JSON 会退化成 `{}` 再报「缺少参数」——
+        // 拿着坏参数去点手机，比直接说清楚要危险得多。
+        // 停在半路：工具调用的参数多半是半截 JSON，一个都不能执行。
+        // 已经在界面上露头的那几个，告诉前端作废了，别一直转圈。
+        if aborted {
+            // `calls` 里只剩有 id 和名字的，正是发过 tool-input-start 的那些
+            for c in &calls {
+                send(
+                    tx,
+                    sse::tool_output_available(&c.id, json!({ "error": "已停止" })),
+                )
+                .await;
+            }
             return Ok(StepOutput {
-                content: String::new(),
-                reasoning: String::new(),
+                content: text_acc,
+                reasoning: reason_acc,
                 calls: Vec::new(),
                 aborted: true,
             });
         }
-    };
 
-    // 工具调用是分片到达的：按 index 累积
-    let mut acc: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
-                                                             // 每个工具调用是否已经告诉前端"开始了"。
-                                                             //
-                                                             // 之前要等这一步整个流完、才一次性发 tool-input-available —— 模型写
-                                                             // 一条长命令（或一大段 edit）的那几秒里，界面上什么都没有。现在 id 和
-                                                             // 名字一到就发 start，参数边到边发 delta，前端能边写边显示。
-    let mut started: Vec<bool> = Vec::new();
-    let mut blocks = BlockStream::default();
-    let mut text_acc = String::new();
-    let mut reason_acc = String::new();
-    let mut finish: Option<String> = None;
-    let mut usage: Option<Usage> = None;
-
-    let mut aborted = false;
-    loop {
-        let item = tokio::select! {
-            item = rx.recv() => match item {
-                Some(item) => item,
-                None => break,
-            },
-            // 流到一半按停止：已经流出来的留着，剩下的不要了
-            _ = turn.aborted() => {
-                aborted = true;
-                break;
+        if finish.as_deref() == Some("length") {
+            let dropped = calls.len();
+            let message = if dropped > 0 {
+                format!("输出达到长度上限被截断，{dropped} 个不完整的工具调用已作废，请重试")
+            } else {
+                "输出达到长度上限被截断（provider 的 max_tokens）".to_string()
+            };
+            send(tx, sse::data_part("warning", json!({ "message": message }))).await;
+            for c in &calls {
+                send(
+                    tx,
+                    sse::tool_output_available(
+                        &c.id,
+                        json!({ "error": "输出被截断，本次工具调用已作废，请重试" }),
+                    ),
+                )
+                .await;
             }
-        };
-        let chunk = item?;
-        // 网关在流里直接报错（限流、上下文超限、response.failed）。不接的话
-        // 这一步就是个空回复，回合「正常结束」，用户只看到没反应。
-        if let Some(e) = &chunk.error {
-            let msg = e
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| e.to_string());
-            anyhow::bail!("provider 报错：{msg}");
+            calls.clear();
         }
-        if chunk.usage.is_some() {
-            usage = chunk.usage.clone();
-        }
-        for choice in chunk.choices {
-            if let Some(r) = choice.delta.reasoning_text() {
-                reason_acc.push_str(r);
-                for c in blocks.push(BlockKind::Reasoning, r) {
-                    send(tx, c).await;
-                }
-            }
-            if let Some(c) = choice.delta.content.as_deref() {
-                if !c.is_empty() {
-                    text_acc.push_str(c);
-                    for c in blocks.push(BlockKind::Text, c) {
-                        send(tx, c).await;
-                    }
-                }
-            }
-            if let Some(fr) = choice.finish_reason.as_deref() {
-                if fr == "length" {
-                    finish = Some("length".to_string());
-                }
-            }
-            if let Some(tcs) = choice.delta.tool_calls {
-                for tc in tcs {
-                    let i = tc.index as usize;
-                    while acc.len() <= i {
-                        acc.push((String::new(), String::new(), String::new()));
-                        started.push(false);
-                    }
-                    if let Some(id) = tc.id {
-                        acc[i].0 = id;
-                    }
-                    let mut piece = String::new();
-                    if let Some(f) = tc.function {
-                        if let Some(n) = f.name {
-                            acc[i].1.push_str(&n);
-                        }
-                        if let Some(a) = f.arguments {
-                            acc[i].2.push_str(&a);
-                            piece = a;
-                        }
-                    }
 
-                    let (id, name, args) = &acc[i];
-                    if !started[i] && !id.is_empty() && !name.is_empty() {
-                        started[i] = true;
-                        // 先收尾正在流的思考/正文，工具行才排在它们后面
-                        if let Some(c) = blocks.close() {
-                            send(tx, c).await;
-                        }
-                        send(tx, sse::tool_input_start(id, name)).await;
-                        // id/名字到之前就来了的参数一并补上
-                        if !args.is_empty() {
-                            send(tx, sse::tool_input_delta(id, args)).await;
-                        }
-                    } else if started[i] && !piece.is_empty() {
-                        send(tx, sse::tool_input_delta(id, &piece)).await;
-                    }
-                }
-            }
-        }
-    }
-
-    // 收尾最后一个块，之后才是工具调用 —— 前端按收到的顺序排 part
-    if let Some(c) = blocks.close() {
-        send(tx, c).await;
-    }
-
-    // 把缓存命中情况摆出来 —— 这是验证 prompt cache 的唯一硬证据
-    if let Some(u) = &usage {
-        match u.cache_hit_ratio() {
-            Some(ratio) => tracing::info!(
-                "prompt cache 命中 {:.1}%（cached={} prompt={} completion={} reasoning={}）",
-                ratio * 100.0,
-                u.cached_tokens().unwrap_or(0),
-                u.prompt_tokens,
-                u.completion_tokens,
-                u.reasoning_tokens().unwrap_or(0),
-            ),
-            None => tracing::info!(
-                "prompt={} completion={}（provider 未报缓存字段）",
-                u.prompt_tokens,
-                u.completion_tokens
-            ),
-        }
-        send(tx, sse::data_part("usage", serde_json::to_value(u)?)).await;
-    }
-
-    let mut calls: Vec<RecordedToolCall> = acc
-        .into_iter()
-        .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
-        .map(|(id, name, arguments)| RecordedToolCall {
-            id,
-            name,
-            arguments,
-        })
-        .collect();
-
-    // 被输出长度上限截断时要告诉用户，否则看起来就像模型话说到一半。
-    //
-    // 而且这一轮的**工具调用全部作废**：截断意味着参数 JSON 很可能是半个
-    // 对象，而 `execute_tool` 遇到坏 JSON 会退化成 `{}` 再报「缺少参数」——
-    // 拿着坏参数去点手机，比直接说清楚要危险得多。
-    // 停在半路：工具调用的参数多半是半截 JSON，一个都不能执行。
-    // 已经在界面上露头的那几个，告诉前端作废了，别一直转圈。
-    if aborted {
-        // `calls` 里只剩有 id 和名字的，正是发过 tool-input-start 的那些
         for c in &calls {
-            send(
-                tx,
-                sse::tool_output_available(&c.id, json!({ "error": "已停止" })),
-            )
-            .await;
+            let input: Value = serde_json::from_str(&c.arguments).unwrap_or(json!({}));
+            send(tx, sse::tool_input_available(&c.id, &c.name, input)).await;
         }
+
         return Ok(StepOutput {
             content: text_acc,
             reasoning: reason_acc,
-            calls: Vec::new(),
-            aborted: true,
+            calls,
+            aborted: false,
         });
     }
+}
 
-    if finish.as_deref() == Some("length") {
-        let dropped = calls.len();
-        let message = if dropped > 0 {
-            format!("输出达到长度上限被截断，{dropped} 个不完整的工具调用已作废，请重试")
-        } else {
-            "输出达到长度上限被截断（provider 的 max_tokens）".to_string()
-        };
-        send(tx, sse::data_part("warning", json!({ "message": message }))).await;
-        for c in &calls {
-            send(
-                tx,
-                sse::tool_output_available(
-                    &c.id,
-                    json!({ "error": "输出被截断，本次工具调用已作废，请重试" }),
-                ),
+/// LLM 请求遇到临时故障时，第 n 次重试前等多少毫秒。三次都不行就报错。
+/// （测试里缩成几毫秒，不然一个用例要等十几秒。）
+const RETRY_DELAYS: [u64; 3] = if cfg!(test) {
+    [5, 5, 5]
+} else {
+    [2_000, 5_000, 10_000]
+};
+
+/// 重试前：告诉前端在等什么（不然界面就是一段莫名其妙的停顿），然后退避。
+/// 等的时候按停止要立刻生效。返回 `false` = 用户停了。
+async fn backoff(
+    tx: &mpsc::UnboundedSender<Value>,
+    turn: &crate::state::Turn,
+    attempt: usize,
+    why: &str,
+) -> bool {
+    let ms = RETRY_DELAYS[attempt];
+    let secs = ms / 1000;
+    let short: String = why.chars().take(160).collect();
+    tracing::warn!(
+        "LLM 请求失败（{short}），{secs}s 后第 {} 次重试",
+        attempt + 1
+    );
+    send(
+        tx,
+        sse::data_part(
+            "warning",
+            json!({
+                "message": format!(
+                    "请求出错（{short}），{secs} 秒后重试（第 {}/{} 次）",
+                    attempt + 1,
+                    RETRY_DELAYS.len()
+                )
+            }),
+        ),
+    )
+    .await;
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => true,
+        _ = turn.aborted() => false,
+    }
+}
+
+/// 打开一条 LLM 流（组请求 + 发出去，等到响应头）。
+///
+/// 优先 Responses API（见 `ApiStyle`）：端点不支持（404/405）就退回 Chat
+/// Completions，并记住这个 base_url|model（落盘），后面不再白试。
+/// 组请求出的错（会话被删了之类）包成 `StreamError::Other`，不会被当成临时
+/// 故障重试（见 `StreamError::is_transient`）。
+async fn open_stream(
+    core: &Core,
+    provider: &Provider,
+    sid: &str,
+    supports_images: bool,
+    supports_files: bool,
+) -> Result<
+    mpsc::UnboundedReceiver<anyhow::Result<crate::openai::StreamChunk>>,
+    crate::llm::StreamError,
+> {
+    let chat = || async {
+        let (req, session_id) = {
+            let store = core.state.chat.read().await;
+            let sess = store
+                .get(sid)
+                .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+            (
+                build_request(
+                    sess,
+                    &provider.model,
+                    supports_images,
+                    supports_files,
+                    provider.reasoning_effort.as_deref(),
+                )?,
+                sess.provider_session.clone(),
             )
-            .await;
+        };
+        provider.stream_chat(&req, &session_id).await
+    };
+
+    match provider.transport() {
+        Transport::Chat => chat().await,
+        Transport::Responses => {
+            let (req, session_id) = {
+                let store = core.state.chat.read().await;
+                let sess = store
+                    .get(sid)
+                    .ok_or_else(|| anyhow::anyhow!("会话已被删除，回合停止"))?;
+                (
+                    build_responses_request(
+                        sess,
+                        &provider.model,
+                        supports_images,
+                        supports_files,
+                        provider.reasoning_effort.as_deref(),
+                    )?,
+                    sess.provider_session.clone(),
+                )
+            };
+            match provider.stream_responses(&req, &session_id).await {
+                Err(e) if e.is_unsupported_endpoint() => {
+                    core.state.remember_responses_unsupported(provider).await;
+                    tracing::info!(
+                        "{} 不支持 Responses API，退回 Chat Completions",
+                        provider.base_url
+                    );
+                    chat().await
+                }
+                other => other,
+            }
         }
-        calls.clear();
     }
-
-    for c in &calls {
-        let input: Value = serde_json::from_str(&c.arguments).unwrap_or(json!({}));
-        send(tx, sse::tool_input_available(&c.id, &c.name, input)).await;
-    }
-
-    Ok(StepOutput {
-        content: text_acc,
-        reasoning: reason_acc,
-        calls,
-        aborted: false,
-    })
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -2710,6 +2792,121 @@ mod tests {
             !core.state.is_busy(&sid),
             "回合结束要把会话从「进行中」里拿掉"
         );
+    }
+
+    /// 按顺序回话的假 Chat Completions 端点。`script[n]` 是第 n 次请求的回法：
+    /// `Err(状态码)` = 直接报错；`Ok(帧)` = 200 + 这些 SSE 帧（不带 `[DONE]`
+    /// 就是「连接在回复结束前断了」）。返回 (base_url, 已收到的请求数)。
+    async fn scripted_provider(
+        script: Vec<Result<Vec<&'static str>, u16>>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let script = std::sync::Arc::new(script);
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || {
+                let (h, script) = (h.clone(), script.clone());
+                async move {
+                    let n = h.fetch_add(1, Ordering::SeqCst);
+                    match script.get(n).cloned().unwrap_or(Err(500)) {
+                        Err(code) => (axum::http::StatusCode::from_u16(code).unwrap(), "boom")
+                            .into_response(),
+                        Ok(frames) => {
+                            let body: String =
+                                frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+                            ([("content-type", "text/event-stream")], body).into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// 跑一个回合直到结束，返回 (结果, 推给前端的全部 chunk, 会话里最后一条)。
+    async fn run_scripted(base: &str) -> (anyhow::Result<()>, Vec<Value>, Option<ChatMessage>) {
+        crate::llm::install_crypto_provider();
+        let mut p = Provider::compatible("fake", base, "m", "k");
+        p.api_style = crate::llm::ApiStyle::Chat;
+        let core = Core::new();
+        let sid = core.state.chat.write().await.create();
+        let t = core.state.begin_turn(&sid).unwrap();
+        *core.state.vision.write().unwrap() = Some((format!("{base}|m"), false));
+        *core.state.files.write().unwrap() = Some((format!("{base}|m"), false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_turn(&core, &p, "你好", vec![], &sid, t, tx),
+        )
+        .await
+        .expect("回合卡住了");
+        let mut chunks = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            chunks.push(c);
+        }
+        let last = core
+            .state
+            .chat
+            .read()
+            .await
+            .get(&sid)
+            .unwrap()
+            .messages
+            .last()
+            .cloned();
+        (r, chunks, last)
+    }
+
+    const OK_REPLY: [&str; 2] = [
+        r#"{"choices":[{"delta":{"content":"好了"},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ];
+
+    /// 临时故障退避重试：503、以及连上之后一个字没出就断了，都重来；
+    /// 第三次正常回话，回合照常完成，前端看得到在重试。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transient_llm_failures_are_retried_before_anything_streamed() {
+        let (base, hits) =
+            scripted_provider(vec![Err(503), Ok(vec![]), Ok(OK_REPLY.to_vec())]).await;
+        let (r, chunks, last) = run_scripted(&base).await;
+        r.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            matches!(last, Some(ChatMessage::Assistant { ref content, .. }) if content == "好了"),
+            "{last:?}"
+        );
+        let warnings = chunks
+            .iter()
+            .filter(|c| c["type"] == "data-warning")
+            .count();
+        assert_eq!(warnings, 2, "每次重试都要让前端知道在等什么");
+        assert!(!chunks.iter().any(|c| c["type"] == "error"));
+    }
+
+    /// 不该重试的：鉴权失败（重来也没用）；以及已经流出了内容才断的
+    /// （重来的话界面上就是两份）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn permanent_failures_and_half_streamed_replies_are_not_retried() {
+        let (base, hits) = scripted_provider(vec![Err(401), Ok(OK_REPLY.to_vec())]).await;
+        let (r, _, _) = run_scripted(&base).await;
+        assert!(r.is_err());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "401 不重试"
+        );
+
+        let half = vec![r#"{"choices":[{"delta":{"content":"说到一半"}}]}"#];
+        let (base, hits) = scripted_provider(vec![Ok(half), Ok(OK_REPLY.to_vec())]).await;
+        let (r, _, _) = run_scripted(&base).await;
+        assert!(r.is_err(), "流出过内容就断了：报错，不重来");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn call(id: &str) -> RecordedToolCall {

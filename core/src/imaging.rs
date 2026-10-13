@@ -292,8 +292,12 @@ fn encode(source: &[u8], source_mime: &str) -> anyhow::Result<Encoded> {
         small
     };
 
+    // 先试 PNG 只对**无损**的源图有意义（截图式的界面图、图表、带透明的）。
+    // 照片、JPEG 截图拿去无损压缩：2000px 的图手机上要几百毫秒，出来好几 MB，
+    // 还常常塞得进上限 —— 于是发出去一张大 PNG。这类直接出 JPEG。
+    let lossless = matches!(source_mime, "image/png" | "image/gif" | "image/bmp");
     loop {
-        if let Some(bytes) = try_png(&cur) {
+        if let Some(bytes) = lossless.then(|| try_png(&cur)).flatten() {
             if fits_inline(bytes.len()) {
                 return Ok(Encoded {
                     bytes,
@@ -474,6 +478,24 @@ mod tests {
         let e = load_if_image_bytes(&rotated).unwrap().unwrap();
         assert_ne!(e.bytes, rotated, "带旋转标记的不能原样发");
         assert_eq!((e.width, e.height), (20, 40), "转正之后宽高互换");
+    }
+
+    /// 照片 / JPEG 截图缩完直接出 JPEG，不先去试（慢又大的）PNG；
+    /// 无损的源图（PNG）还是先试 PNG。
+    #[test]
+    fn lossy_sources_skip_the_png_attempt() {
+        let big = DynamicImage::new_rgb8(2600, 1300);
+        let mut jpeg = Vec::new();
+        big.write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+        let e = load_if_image_bytes(&jpeg).unwrap().unwrap();
+        assert_eq!(e.mime, "image/jpeg");
+        assert_eq!((e.width, e.height), (2000, 1000));
+
+        let e = load_if_image_bytes(&png_bytes(2600, 1300))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.mime, "image/png", "无损的源图缩完还是先试 PNG");
     }
 
     #[test]
