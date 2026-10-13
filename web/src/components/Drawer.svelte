@@ -5,10 +5,13 @@
    *   [ 搜索对话… ]                  ← 顶上就一个搜索框，输入即搜（跨会话搜正文）
    *   💬 新对话                     ← 没搜 = 最近对话；搜了 = 命中（标题 + 摘要）
    *   💬 帮我看看屏幕上是什么界面
-   *   (⚙)              [+ 新建会话]
+   *   (⚙)
    *
    * 去掉了：agent 标题栏 + 版本号、事件入口、分割线、「最近对话」标题。
    * 搜索框替掉标题栏：边栏本来就是用来找对话的，搜索比版本号有用。
+   *
+   * 底栏那个白底的「新建会话」也去掉了 —— 它是这一屏最亮的东西，比对话本身还
+   * 抢眼；开新对话本来就有头部右上角那个图标，不需要再来一个。
    *
    * **长按**对话行 → 重命名 / 删除。跟 Claude 一样，列表里不放常驻按钮。
    *
@@ -44,7 +47,6 @@
   let {
     sessions,
     onclose,
-    onnew,
     onswitch,
     ondelete,
     onrename,
@@ -54,7 +56,6 @@
   }: {
     sessions: Session[];
     onclose: () => void;
-    onnew: () => void;
     onswitch: (id: string) => void;
     ondelete: (id: string) => void;
     onrename: (id: string, title: string) => void;
@@ -331,14 +332,6 @@
       class="grid size-11 shrink-0 place-items-center rounded-full bg-hairline text-muted"
     >
       <Icon name="gear" size={20} />
-    </button>
-
-    <button
-      onclick={onnew}
-      class="ml-auto flex h-11 items-center gap-1.5 rounded-full bg-fg px-5 text-sm font-medium text-ink"
-    >
-      <Icon name="plus" size={16} />
-      新建会话
     </button>
   </div>
 {/snippet}

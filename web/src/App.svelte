@@ -571,13 +571,12 @@
 </script>
 
 <div class="flex h-full overflow-hidden bg-ink">
-  <!-- 宽屏：侧边栏**并排**在左边（不是抽屉），一直是开着的。
-       窄屏：它还是盖在对话上的抽屉，由头部的菜单按钮控制（见下面）。 -->
+  <!-- 宽屏：侧边栏**并排**在左边（不是抽屉），默认收着，点左上角的菜单展开。
+       窄屏：它还是盖在对话上的抽屉，同样是那个菜单按钮控制（见下面）。 -->
   {#if wide.on && sidebar}
     <Drawer
       {sessions}
       onclose={close}
-      onnew={newSession}
       onswitch={switchSession}
       ondelete={deleteSession}
       onrename={renameSession}
@@ -665,7 +664,6 @@
     <Drawer
       {sessions}
       onclose={close}
-      onnew={newSession}
       onswitch={switchSession}
       ondelete={deleteSession}
       onrename={renameSession}
