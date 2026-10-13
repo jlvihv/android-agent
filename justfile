@@ -78,6 +78,39 @@ dev-host:
     export AGENT_HOST_WORKSPACE="${AGENT_HOST_WORKSPACE:-$PWD}"
     cargo run --manifest-path {{core}}/Cargo.toml --bin agent-dev
 
+# 起一个**无头 Chrome**，开 CDP 调试端口 —— 桌面上 agent 的浏览器就是它。
+#
+# 为什么不由核心自己起：端口、profile、退出清理都是麻烦，而且你可能想让 agent
+# 用**你自己**那个浏览器（`google-chrome --remote-debugging-port=9222`，还能看着
+# 它动）。核心只负责连 `AGENT_CDP`（默认 127.0.0.1:9222），连不上时报的错里
+# 会写怎么办。
+#
+#   just chrome                       # 无头，独立 profile（.dev/chrome）
+#   AGENT_CDP=http://127.0.0.1:9223 just chrome
+#   just chrome --window-size=1440,900
+#
+# 然后（另开一个终端）：agent browser navigate https://example.com
+chrome *ARGS:
+    #!/usr/bin/env bash
+    set -eu
+    port="${AGENT_CDP_PORT:-9222}"
+    bin=""
+    for c in google-chrome-stable google-chrome chromium chromium-browser; do
+      if command -v "$c" >/dev/null 2>&1; then bin=$(command -v "$c"); break; fi
+    done
+    if [ -z "$bin" ]; then
+      echo "找不到 Chrome / Chromium（google-chrome-stable / chromium 都不在 PATH 里）" >&2
+      exit 1
+    fi
+    profile="$PWD/.dev/chrome"
+    mkdir -p "$profile"
+    echo "无头 Chrome：$bin"
+    echo "  profile=$profile  调试端口=$port"
+    echo "  核心连的就是它（AGENT_CDP=http://127.0.0.1:$port）；Ctrl-C 退出"
+    exec "$bin" --headless=new --remote-debugging-port="$port" \
+      --user-data-dir="$profile" --no-first-run --no-default-browser-check \
+      --disable-gpu --hide-scrollbars "$@"
+
 # --- Web -------------------------------------------------------------------
 
 web-install:

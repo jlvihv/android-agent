@@ -15,6 +15,10 @@
 
 pub mod agent;
 pub mod assets;
+/// 桌面（Linux）上的浏览器：无头 Chrome + CDP。安卓那边是壳里的 WebView
+/// （`BrowserController.kt`），用不到这个模块 —— 别把它编进 .so。
+#[cfg(not(target_os = "android"))]
+pub mod cdp;
 pub mod db;
 pub mod demo;
 pub mod editor;
@@ -173,6 +177,28 @@ impl Core {
         if let Some(sb) = linux::LinuxSandbox::from_env() {
             core.state.set_linux(Arc::new(sb));
         }
+
+        // 桌面：浏览器 = 无头 Chrome + CDP（`AGENT_CDP`，默认 127.0.0.1:9222）。
+        // 这里是**懒连接**：Chrome 没起来也能启动核心，第一次动作用到它时报错
+        // 并告诉人怎么办（见 `cdp::Conn::connect`）。
+        #[cfg(not(target_os = "android"))]
+        {
+            let shots =
+                core.state
+                    .linux()
+                    .map(|l| l.shot_dir())
+                    .unwrap_or_else(|| crate::gc::ShotDir {
+                        host: std::env::temp_dir().join("android-agent-shots"),
+                        guest: std::env::temp_dir()
+                            .join("android-agent-shots")
+                            .display()
+                            .to_string(),
+                    });
+            if let Some(b) = cdp::CdpBrowser::from_env(shots) {
+                tracing::info!("浏览器后端: CDP（{}）", b.endpoint());
+                core.state.set_browser(Arc::new(b));
+            }
+        }
         core
     }
 
@@ -295,11 +321,10 @@ impl Core {
     ///    Kotlin 侧的动作锁继续跑，下一个动作得排在它后面。
     pub async fn browser(&self, action_json: &str) -> anyhow::Result<serde_json::Value> {
         let host = self.state.browser().ok_or_else(|| {
-            // 桌面宿主模式：不是「壳没接上」，是还没写这个后端
-            let host_mode = self.state.linux().map(|s| s.is_host()).unwrap_or(false);
-            if host_mode {
+            // 桌面上被 `AGENT_CDP=off` 关掉时走这里；手机上则是壳还没注入
+            if self.state.linux().map(|s| s.is_host()).unwrap_or(false) {
                 anyhow::anyhow!(
-                    "浏览器不可用：宿主模式还没接浏览器后端（要取网页就用 bash 里的 curl，或自己起个无头浏览器）"
+                    "浏览器不可用（桌面这个后端被 AGENT_CDP=off 关了）。要取网页就用 bash 里的 curl"
                 )
             } else {
                 anyhow::anyhow!("浏览器不可用（壳没接上）")

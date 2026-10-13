@@ -87,6 +87,11 @@ log = "0.4"
 # 编进安卓的 .so（实测 ~0.2MB）。
 [target.'cfg(not(target_os = "android"))'.dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 桌面浏览器后端（`cdp.rs`）：CDP 就是 WebSocket + JSON，自己写客户端。
+# 用**同步**那个（tokio-tungstenite 依赖的），因为 `BrowserApi::execute` 本来就
+# 是阻塞接口、跑在 spawn_blocking 上。**不引新代码** —— 同一个版本早就在依赖树里
+# 了（axum 带进来的），这里只是把它变成直接依赖。
+tungstenite = { version = "0.29", default-features = false, features = ["handshake", "url"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # default-features = false：它的默认 feature 是 "regex"（env_filter，给

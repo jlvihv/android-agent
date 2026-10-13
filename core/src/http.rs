@@ -232,6 +232,8 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "rootfs": s.rootfs().display().to_string(),
             "host": s.is_host(),
         })),
+        // 浏览器后端是谁（手机上=壳里的 WebView，桌面上=CDP + 调试端口）
+        "browser": st.browser().map(|b| b.describe()),
         // 只报“配没配”，不泄 key
         "llm": provider.map(|p| json!({
             "name": p.name,
@@ -1340,6 +1342,7 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "host": s.is_host(),
             "sharedStorage": s.has_shared_storage(),
         })),
+        "browser": st.browser().map(|b| b.describe()),
         // 持久化目录（安卓上是 <filesDir>）。调试时要 adb pull 会话库 /
         // 看 llm.json 就用它，不用猜路径。
         "dataDir": st

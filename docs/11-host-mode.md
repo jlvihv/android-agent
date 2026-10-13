@@ -9,7 +9,7 @@
 | | `just dev`（沙箱） | `just dev-host`（宿主） |
 |---|---|---|
 | `bash` 跑在哪 | proot 里的 Alpine | 本机（`/bin/sh -c <runner>` → 宿主的 bash） |
-| cwd | rootfs 的 `/workspace` | 启动核心时的目录（也以 `/workspace` 可见） |
+| cwd | rootfs 的 `/workspace` | 启动核心时的目录（`/workspace` 只是工具路径里的别名，shell 里没有） |
 | `read` / `edit` 的路径 | rootfs 里的路径 | 本机路径（rootfs＝`/`） |
 | 工具 | Alpine 那套（要 `apk add`） | 你的 PATH（node/cargo/python…都在） |
 | 装东西 | `apk add` / `agent-setup` | 系统包管理器 / venv |
@@ -18,7 +18,7 @@
 | `agent ps` | 列常驻进程（靠 proot 的 `TracerPid` 归因） | 只回一句「用真的 `ps` / `pgrep`」 |
 | `agent kill <pid>` | ✅ | ✅ |
 | `agent command`（设备） | mock | mock（手机上才是真的） |
-| `agent browser` | ❌（要手机上的 WebView） | ❌（还没接桌面后端） |
+| `agent browser` | ✅（无头 Chrome + CDP，见 [docs/08](08-browser.md) 第 15 节） | ✅ 同一个后端 |
 | `agent search` | ✅ | ✅ |
 
 ## 怎么做到的：只加了「一种沙箱形态」，没加第二条路
@@ -106,6 +106,7 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
   要试大改动就用 `just dev`，那里坏了删 rootfs 就行。
 - `sandbox:` 链接这时映射的是**整台机器**的文件，只看那把随机的
   `sandbox_key`（同源拆分仍然挡着「AI 写的网页读 App 凭据」那条路）。
-- `agent browser` / 设备操作在桌面上还没有实现，模型只能 `curl` 取网页。
-  （要的是「agent 用我自己那个浏览器」的话，得在核心侧接一个 CDP 后端 ——
-  就是 `state::BrowserApi` 的第三个实现，和 Kotlin 的 WebView 那个并列。）
+- 设备操作（`agent command`）在桌面上是 mock —— 手机上才有真的无障碍那条路。
+- 浏览器要**另外起一个 Chrome**（`just chrome`，或者把 `AGENT_CDP` 指到你自己
+  那个带 `--remote-debugging-port` 的 Chrome 上，那样还能看着它动）。
+  `AGENT_CDP=off` 就是不要浏览器。

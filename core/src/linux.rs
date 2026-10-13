@@ -1806,6 +1806,38 @@ impl LinuxSandbox {
         }
     }
 
+    /// 浏览器截图落哪儿（宿主目录 + 历史里存的那个路径前缀）。
+    ///
+    /// 沙箱里和 `BrowserController.SHOT_GUEST_DIR` 一致（`/root/.browser`）；
+    /// 宿主模式下 `/root` 是**用户的根目录**（写不进去，也不该写），
+    /// 换成我们自己的数据目录 —— 前缀就是宿主路径本身，`read` 直接解得开。
+    pub fn shot_dir(&self) -> crate::gc::ShotDir {
+        if self.cfg.host {
+            let host = host_data_dir().join("browser");
+            let guest = host.display().to_string();
+            crate::gc::ShotDir { host, guest }
+        } else {
+            crate::gc::ShotDir {
+                host: self.cfg.rootfs.join(crate::gc::SHOT_DIR),
+                guest: format!("/{}", crate::gc::SHOT_DIR),
+            }
+        }
+    }
+
+    /// 我们自己的副产物落在哪（清扫用，见 `gc::SideDirs`）。
+    pub fn side_dirs(&self) -> crate::gc::SideDirs {
+        let spills = if self.cfg.host {
+            // 和 `spill_captured` 一致：跟着 TMPDIR 走
+            std::env::temp_dir()
+        } else {
+            self.cfg.rootfs.join("tmp")
+        };
+        crate::gc::SideDirs {
+            shots: Some(self.shot_dir()),
+            spills: Some(spills),
+        }
+    }
+
     /// 宿主模式的环境变量：**继承宿主环境**（PATH 就是用户自己那一份），
     /// 只覆盖几个会碍事的，再加上 `agent` 命令要的那两三个。
     ///
@@ -4491,6 +4523,33 @@ mod tests {
 
         // 幂等：再跑一次不炸
         sb.prepare_rootfs().unwrap();
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    /// 沙箱 CLI 的浏览器 case 表和后端（`cdp::ACTIONS`）**必须对得上**。
+    ///
+    /// 漂了就是「CLI 发得出去、后端回未知动作」的静默失败 —— `new_tab` 那次
+    /// 把 URL 吃掉就是这个类别（见 docs/08）。CLI 允许短别名
+    /// （`user_agent` 就是 `set_user_agent`），所以别名要在这儿列出来。
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn agent_cli_and_cdp_agree_on_the_action_list() {
+        let t = TempRoot::new("cdpactions");
+        t.sandbox().prepare_rootfs().unwrap();
+        let cli = std::fs::read_to_string(t.dir.join("usr/local/bin/agent")).unwrap();
+
+        for action in crate::cdp::ACTIONS {
+            // CLI 允许短别名（`user_agent` 就是 `set_user_agent`）
+            let name = if *action == "set_user_agent" {
+                "user_agent"
+            } else {
+                action
+            };
+            assert!(
+                cli.contains(&format!("{name})")) || cli.contains(&format!("{name}|")),
+                "CLI 的 case 表里没有 {action}（找的是 `{name})`）—— 两边漂了"
+            );
+        }
         let _ = std::fs::remove_dir_all(&t.dir);
     }
 

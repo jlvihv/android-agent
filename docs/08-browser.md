@@ -372,3 +372,64 @@ just phone                       # 交互模式
 或者 `adb pull /sdcard/Agent/xxx.jpg`。
 
 日志：`adb logcat -s AgentBrowser`（每个动作一行 `action=…`，包含参数）。
+
+---
+
+## 15. 桌面（Linux）：同一个 `BrowserApi`，换一个后端 = 无头 Chrome + CDP
+
+手机上这个后端是壳里的 WebView（`BrowserController.kt`）。桌面上没有壳，
+但 `BrowserApi` 本来就是 trait —— `core/src/cdp.rs` 是它的第三个实现
+（前两个：Kotlin 的 WebView、测试里的 Echo/RecordingBrowser）。
+
+**为什么是 CDP**（而不是嵌一个 WebView）：
+
+| 方案 | 为什么不 |
+|---|---|
+| WebKitGTK | 要把 GTK/glib 链进 `.so` + GLib 主循环；而且它是 **WebKit**，安卓那边是 **Chromium** —— 注入的 JS 不保证同一种行为 |
+| CEF / Electron / QtWebEngine | 几十上百 MB 的运行时 / 构建链，桌面开发不值 |
+| **无头 Chrome + CDP** | 引擎和安卓同为 Chromium；`tungstenite` 早就因为 axum 在依赖树里了（**零新依赖**）；`scripts/dom-audit.ts` 已经在用 CDP 干真事 |
+
+这也和既有取舍一致：LLM 协议自己写（不用 SDK），CDP 也自己写。
+
+```sh
+just chrome                      # 起无头 Chrome（独立 profile，调试端口 9222）
+just dev-host                    # 或者 just dev —— 沙箱/宿主模式都能用它
+agent browser navigate https://example.com
+```
+
+核心**不替用户起 Chrome**（端口 / profile / 退出清理都是麻烦，而且用户可能想让
+agent 用他自己那个浏览器）：它只连 `AGENT_CDP`（默认 `127.0.0.1:9222`），
+连不上时报的错里写着怎么办。`AGENT_CDP=off` 就是不要浏览器。
+
+### 和手机那份的差异（都是**有意**的）
+
+- **截图一条路**：`Page.captureScreenshot` 直接给 JPEG，不需要「GPU 合成 +
+  软件绘制」那两条（见第 5 节）—— 那是 Android 无窗口 WebView 的坑。
+- **`js` 不用 kick + 轮询**：CDP 的 `awaitPromise` 会等 Promise，
+  所以直接 `(async function(){ … })()` 就行（第 4 节那个两段式是
+  `evaluateJavascript` 的限制）。
+- **截图落哪**：手机上是 `<rootfs>/root/.browser/`；宿主模式下 `/root` 是**用户的
+  根目录**（写不进去也不该写），换成 `$XDG_DATA_HOME/android-agent/browser/`
+  —— 前缀就是宿主路径本身，`read` 直接解得开。两边都由 `gc` 清扫
+  （`gc::SideDirs`）。
+- **URL 校验严一点**：`javascript:` / `data:` / `file:` 这些没有 `://` 的 scheme
+  也挡掉（手机那份是「没有 `://` 就当主机名」，于是 `javascript:alert(1)` 会被
+  拼成 `https://javascript:alert(1)`）；`host:8080/…` 靠「冒号后面是不是数字」放行。
+
+### 已知的债：注入的 JS 现在是两份
+
+动作表、返回形状（`{ok, text, url, title, image}`）、以及那些 JS
+（backbone / readable / click / type / press / scroll / find_elements）都是从
+`BrowserController.kt` **移植**过来的 —— 语义要一致，但**两份文件各有一份**。
+改 JS 的时候两边都得改。
+
+能自动对齐的那一层已经钉住了：`cdp::ACTIONS` 和沙箱 CLI 的 case 表有测试
+（`agent_cli_and_cdp_agree_on_the_action_list`）—— 漂了就是「CLI 发得出去、
+后端回未知动作」，正是 `new_tab` 把 URL 吃掉那个类别。
+
+真 Chrome 的端到端测试（默认跳过，CI 上没有 Chrome）：
+
+```sh
+just chrome
+AGENT_CDP_TEST=1 cargo test cdp::          # 18 个动作全过一遍
+```

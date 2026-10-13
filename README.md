@@ -16,6 +16,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
 | Linux 沙箱 | ✅ **Alpine 3.21 aarch64 在真机上跑起来**，`apk add` 可用 |
 | 桌面宿主模式 | ✅ `just dev-host`：不套沙箱，`bash`/`read`/`edit` 直接作用在这台机器上（[docs/11](docs/11-host-mode.md)） |
+| 桌面浏览器 | ✅ `just chrome` + 无头 Chrome/CDP：`agent browser` 在桌面上也能用（[docs/08](docs/08-browser.md) 第 15 节） |
 | 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI（读 UI 树那套已删，见下） |
 | Prompt cache | ✅ 实测命中 73–87% |
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
@@ -167,6 +168,7 @@ App 随时被杀都没关系。
 |---|---|
 | `just dev` | 起核心（桌面，mock 设备 + 本地 rootfs） |
 | `just dev-host` | 起核心（桌面**宿主模式**：没有沙箱，直接跑在这台机器上） |
+| `just chrome` | 起无头 Chrome（CDP 调试端口 9222）—— 桌面 agent 的浏览器 |
 | `just web-dev` | 起 Vite（`/api` 代理到核心） |
 | `just test` | Rust 测试 |
 | `just smoke` | 端到端：一句话 → 工具执行 → 复述 |

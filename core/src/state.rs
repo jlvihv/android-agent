@@ -125,6 +125,14 @@ pub trait BrowserApi: Send + Sync + 'static {
     /// 约定的返回形状（Kotlin 侧负责填）：
     /// `{"ok":bool, "text":…, "url":…, "title":…, "image":"<沙箱路径>", "error":…}`
     fn execute(&self, action_json: &str) -> Result<String, String>;
+
+    /// 一句话说明自己是哪个后端（`/api/health`、体检用）。
+    ///
+    /// 手机上就是壳里那只 WebView，没什么可说的；桌面这边要说清连的是哪个
+    /// Chrome 的调试端口 —— 连不上时那是唯一能查的线索。
+    fn describe(&self) -> String {
+        "WebView（壳）".to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,15 +446,13 @@ impl AppState {
     /// 启动清扫：删掉没有任何会话引用的图片副本 / 附件 / 截图 / 溢出输出。
     async fn sweep_files(&self, db: Arc<Db>, before: std::time::SystemTime) {
         let data = self.data_dir.read().ok().and_then(|g| g.clone());
-        let rootfs = self.linux().map(|l| l.rootfs().to_path_buf());
+        let dirs = self.side_dirs();
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let msgs = db.messages_with_files()?;
-            let referenced = crate::gc::owned_files(&msgs, rootfs.as_deref())
-                .into_iter()
-                .collect();
+            let referenced = crate::gc::owned_files(&msgs, &dirs).into_iter().collect();
             Ok(crate::gc::sweep(
                 data.as_deref(),
-                rootfs.as_deref(),
+                &dirs,
                 &referenced,
                 before,
             ))
@@ -560,10 +566,16 @@ impl AppState {
         Ok(())
     }
 
+    /// 我们自己的副产物落在哪（截图 / 溢出输出）。沙箱那边按形态给（见
+    /// `LinuxSandbox::side_dirs`）；没有沙箱就是空的（没地方写这些东西）。
+    pub fn side_dirs(&self) -> crate::gc::SideDirs {
+        self.linux().map(|l| l.side_dirs()).unwrap_or_default()
+    }
+
     /// 清掉一个（已经从 store 里拿出来的）会话引用的文件。消息不在内存里的
     /// 从库里读（赶在落盘把那些行删掉之前；没赶上就留给启动清扫）。
     async fn forget_files(&self, s: crate::agent::ChatSession) {
-        let rootfs = self.linux().map(|l| l.rootfs().to_path_buf());
+        let dirs = self.side_dirs();
         let db = self.db();
         let _ = tokio::task::spawn_blocking(move || {
             let msgs = if s.resident() {
@@ -572,7 +584,7 @@ impl AppState {
                 db.and_then(|d| d.load_messages(&s.id).ok())
                     .unwrap_or_default()
             };
-            let files = crate::gc::owned_files(&msgs, rootfs.as_deref());
+            let files = crate::gc::owned_files(&msgs, &dirs);
             let n = crate::gc::remove_all(&files);
             if n > 0 {
                 tracing::debug!("会话 {} 的 {n} 个文件已清掉", s.id);
