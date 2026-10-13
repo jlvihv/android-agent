@@ -1925,6 +1925,8 @@ impl LinuxSandbox {
         env.insert("PAGER".into(), "cat".into());
         env.insert("GIT_PAGER".into(), "cat".into());
         env.insert("NO_COLOR".into(), "1".into());
+        // 实时输出（见 `guest_env` 里同一行的说明）
+        env.insert("PYTHONUNBUFFERED".into(), "1".into());
 
         // 我们自己的 `agent` 命令排在最前面
         let cli = host_cli_dir();
@@ -2129,6 +2131,11 @@ impl LinuxSandbox {
         env.insert("GIT_PAGER".into(), "cat".into());
         env.insert("NO_COLOR".into(), "1".into());
         env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+        // 实时输出：命令的 stdout 是管道不是终端，Python 就从「按行刷」变成「攒满
+        // 几 KB / 进程退出才写」—— 每秒 print 一行的脚本，界面上要等它跑完才一次
+        // 出来（实测：核心每 120ms 推一次，echo 是实时的，python 全在退出那一刻到）。
+        // C 的 printf / perl / ruby 同理，但没有通用的开关；Python 是模型最常跑的。
+        env.insert("PYTHONUNBUFFERED".into(), "1".into());
         env.insert("GOMAXPROCS".into(), "2".into()); // 手机上限
                                                      // proot 的 link2symlink 会留 .l2s.* 哨兵文件，uv 默认 hardlink
                                                      // 模式会二次 link 它们并拿到 EPERM

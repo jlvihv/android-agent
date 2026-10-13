@@ -972,7 +972,16 @@ impl BrowserApi for CdpBrowser {
             .inner
             .lock()
             .map_err(|_| "浏览器状态被锁坏了（上一个动作 panic 过？）".to_string())?;
-        let out = match self.dispatch(&mut g, name, &a) {
+        let mut res = self.dispatch(&mut g, name, &a);
+        // 连接断了：重连（标签页重新挂上）再试一次。只试一次 —— 再断就是真有问题
+        if g.conn.as_ref().is_some_and(|c| c.dead) {
+            tracing::info!("和 Chrome 的连接断了，重连");
+            res = match self.reconnect(&mut g) {
+                Ok(()) => self.dispatch(&mut g, name, &a),
+                Err(e) => Err(format!("和浏览器的连接断了，重连也失败：{e}")),
+            };
+        }
+        let out = match res {
             Ok(v) => v,
             Err(e) => json!({ "ok": false, "text": e }),
         };
@@ -994,6 +1003,10 @@ struct Conn {
     next_id: i64,
     /// 不是回包的消息（事件）先放这儿，`wait_event` 来取。
     events: Vec<Value>,
+    /// 连接已经断了（收发碰到真的 IO 错误 / 对面 Close）。`execute` 看到它就
+    /// 重连一次（见 `reconnect`）—— 不然之后每个动作都报同一句 Broken pipe，
+    /// 只能重启核心。实测：Mac 上空闲半小时后就这么断过一次，Chrome 本身还活着。
+    dead: bool,
 }
 
 impl Conn {
@@ -1021,6 +1034,7 @@ impl Conn {
             ws,
             next_id: 1,
             events: Vec::new(),
+            dead: false,
         })
     }
 
@@ -1031,9 +1045,10 @@ impl Conn {
         if let Some(s) = session {
             msg["sessionId"] = json!(s);
         }
-        self.ws
-            .send(Message::Text(msg.to_string().into()))
-            .map_err(|e| format!("往 CDP 发 {method} 失败: {e}"))?;
+        if let Err(e) = self.ws.send(Message::Text(msg.to_string().into())) {
+            self.dead = true;
+            return Err(format!("往 CDP 发 {method} 失败: {e}"));
+        }
         Ok(id)
     }
 
@@ -1046,7 +1061,10 @@ impl Conn {
             Ok(Message::Binary(b)) => serde_json::from_slice(&b)
                 .map(Some)
                 .map_err(|e| format!("CDP 回了非 JSON（binary）: {e}")),
-            Ok(Message::Close(_)) => Err("CDP 连接被关掉了（Chrome 退出了？）".into()),
+            Ok(Message::Close(_)) => {
+                self.dead = true;
+                Err("CDP 连接被关掉了（Chrome 退出了？）".into())
+            }
             Ok(_) => Ok(None), // Ping / Pong / Frame
             Err(tungstenite::Error::Io(e))
                 if matches!(
@@ -1056,7 +1074,10 @@ impl Conn {
             {
                 Ok(None)
             }
-            Err(e) => Err(format!("读 CDP 失败: {e}")),
+            Err(e) => {
+                self.dead = true;
+                Err(format!("读 CDP 失败: {e}"))
+            }
         }
     }
 
@@ -1163,6 +1184,51 @@ impl Conn {
 impl CdpBrowser {
     /// 懒连接：第一次要动作的时候才连 —— 自己起 Chrome 的话，**也是这时候才拉起
     /// 它**（启动核心不该等一个浏览器）。
+    /// 连接断了之后：重新连上，把原来的标签页重新挂上（CDP 的 session 跟着连接
+    /// 走，旧的全作废；而标签页在 Chrome 里还在，`targetId` 不变）。自己起的
+    /// Chrome 要是已经退出了，就重新起一个 —— 那时标签页确实没了。
+    fn reconnect(&self, g: &mut Inner) -> Result<(), String> {
+        g.conn = None;
+        if let Some(c) = g.chrome.as_mut() {
+            if !matches!(c.child.try_wait(), Ok(None)) {
+                tracing::info!("自己起的 Chrome 已经退出了，重新起");
+                g.chrome = None;
+                g.tabs.clear();
+            }
+        }
+        let profile = g.profile;
+        let old = std::mem::take(&mut g.tabs);
+        let current = old.get(g.current).map(|t| t.id);
+        let conn = self.ensure_conn(g)?;
+        let mut kept = Vec::new();
+        for mut t in old {
+            let attached = conn
+                .call(
+                    None,
+                    "Target.attachToTarget",
+                    json!({ "targetId": t.target, "flatten": true }),
+                )
+                .ok()
+                .and_then(|r| r.get("sessionId").and_then(|v| v.as_str()).map(String::from));
+            let Some(session) = attached else {
+                continue; // 那只标签已经没了
+            };
+            if conn.call(Some(&session), "Page.enable", json!({})).is_err()
+                || apply_profile(conn, &session, profile).is_err()
+            {
+                continue;
+            }
+            t.session = session;
+            kept.push(t);
+        }
+        g.current = kept
+            .iter()
+            .position(|t| Some(t.id) == current)
+            .unwrap_or(kept.len().saturating_sub(1));
+        g.tabs = kept;
+        Ok(())
+    }
+
     fn ensure_conn<'a>(&self, g: &'a mut Inner) -> Result<&'a mut Conn, String> {
         if g.conn.is_none() {
             if self.managed && g.chrome.is_none() {
