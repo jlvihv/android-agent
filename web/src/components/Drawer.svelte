@@ -274,7 +274,9 @@
            text-fg placeholder:text-faint outline-none"
   />
 
-  <div class="min-h-0 flex-1 overflow-y-auto px-3 pt-1 pb-1">
+  <!-- 列表的左右边距跟搜索框和底栏对齐（`px-4`）—— 都是顶层表面，内部要一个值。
+       行自己的 `px-3` 是药丸内的内边距，不是这里说的边距。 -->
+  <div class="min-h-0 flex-1 overflow-y-auto px-4 pt-1 pb-1">
     {#if q.trim()}
       {#if hits.length === 0}
         <p class="px-3 py-3 text-sm text-faint">
