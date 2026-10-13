@@ -104,18 +104,25 @@ just phone                                   # 交互模式，/help 看命令
 
 ## Agent 工具
 
-给模型五个工具：
+给模型四个工具：
 
 | 工具 | 作用 |
 |---|---|
 | `read` | 读文件：文本带 `offset` / `limit` / `numbered`（`numbered=true` 加 `cat -n` 同款行号；截断到 2000 行或 50KB），结果里附 `totalLines` / `totalBytes`（整个文件多大）；**图片缩放后直接发给模型看** |
 | `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`），cwd 是 `/workspace` |
 | `edit` | 改文件：按原文精确替换，返回 unified diff；新建文件：只给 `content` |
-| `browser` | 操作 agent 自己的那只真 WebView：打开 / 读结构 / 点 / 输入 / 截图 / 多标签（见 [docs/08-browser.md](docs/08-browser.md)） |
 | `search` | 联网搜索（Exa），回标题 + 链接 + 片段 |
 
 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不作为工具**暴露给模型。
 以后收进沙箱里的一个命令、由 `bash` 调用 —— 这样模型只需要理解 shell。
+
+浏览器**曾经也是工具**，已经删掉了，唯一入口是沙箱里的 `agent browser`
+（见 [docs/08-browser.md](docs/08-browser.md)）。理由不是「哪个好用」，是实测出来的：
+同一个会话里模型 45 : 3 选沙箱那条 —— 一条 bash 能连做多个动作
+（`agent browser navigate … && agent browser get_backbone 3 && agent browser click '#x'`），
+省的是**整轮 LLM 请求**，而工具调用一次只做一个动作。留着两条路的代价很具体：
+前缀里多 2400 字（工具表的 54%），以及两份动作表各自演化 ——
+`agent browser new_tab URL` 把 URL 静默吃掉（开出一只空白标签）就是这么来的。
 
 agent loop **没有轮数上限**：任务要多少轮就跑多少轮，唯一的出口是模型自己不再调工具，
 或者用户按停止（`POST /api/stop`）。停止是真的停服务端循环 —— 前端断流循环是看不到的。
@@ -168,7 +175,8 @@ App 随时被杀都没关系。
 |---|---|
 | `just wifi-pair <ip:port> <码>` | 首次配对（手机上开发者选项 → 无线调试） |
 | `just wifi` / `just wifi-tcpip` | 之后每次连上（后者：USB 插一次，以后自动） |
-| `just forward` | 把手机上核心的端口转发到本机 |
+| `just forward` | 把手机上核心的端口转发到本机（App 不在前台就顺手叫到前台） |
+| `just wake [on\|off]` | 手机那头会不会被系统冻住：看状态 / 加 doze 白名单 + 叫到前台 |
 | `just doctor [--deep]` | 各部件体检：核心/模型/沙箱/设备/会话库 |
 | `just phone "…"` | 和手机上的 agent 说话 |
 | `just open` | 把手机上的界面开到桌面浏览器（真 DevTools） |

@@ -37,4 +37,15 @@ export ANDROID_SERIAL="$dev"
 port=$(scripts/phone-port.sh)
 "$ADB" -s "$dev" forward "tcp:$HOST_PORT" "tcp:$port" >/dev/null
 
+# 开工前确认手机那头不会被冻住。
+#
+# App 一旦失去焦点，Android 的 cached app freezer 会在 60~75 秒后把它的**整个
+# 进程**冻住（cgroup v2 freezer）—— Rust 核心、沙箱、WebView 全停，远程发过去的
+# 请求就原地挂住，不报错也不超时；用户一碰手机瞬间全通。实测和两个机制见
+# scripts/phone-wake.sh 顶部那张表。
+#
+# `auto` 只在**真需要时**才动手机（已经在前台就什么都不做），提示走 stderr ——
+# 上面那行 URL 必须是最后一行（调用方普遍用 `tail -1` 取它）。
+[ "${AGENT_NO_WAKE:-}" = "1" ] || scripts/phone-wake.sh auto >&2 || true
+
 echo "http://127.0.0.1:$HOST_PORT"

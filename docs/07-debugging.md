@@ -46,6 +46,24 @@ just wifi-tcpip
 配对过一次就不用再管了：`forward` / `phone` / `doctor` / `open` 都只依赖 adb，
 **不关心底下是 USB 还是无线**。
 
+### 手机闲置一会儿之后，远程回合会「原地挂住」
+
+如果看到 `just phone` 发出去就**没有反应**（不报错、不超时，就卡在那里），而你把
+手机上的 App 切到前台它**瞬间**就通了 —— 那不是 WebView 的事，是 Android 把整个进程
+冻住了（cached app freezer）：
+
+```sh
+just wake          # 看现在什么情况：焦点 Activity / doze 白名单 / 进程冻没冻
+just wake on       # 两招一起上：白名单 + 叫到前台（开工前跑一次）
+```
+
+`just phone` / `just doctor` / `just open` 走 `phone-forward.sh`，它会自己跑
+`just wake` 的 `auto` 版 —— **已经在前台就什么都不做**，不在才把它叫到前台并在
+stderr 说一句。不想让它动手机：`AGENT_NO_WAKE=1 just phone "…"`。
+
+细节（两个冻结机制、实测数据表、为什么关电池优化治不好）见
+[docs/06](06-persistence-and-background.md) 的「深度后台：整个进程会被冻住」。
+
 两个实测到的坑：
 
 - **发行版自带的 adb 可能没有 `adb mdns`**。这台机器上 `/usr/bin/adb`

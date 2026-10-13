@@ -126,8 +126,26 @@ restart:
     dev_restart && dev_a11y_on
 
 # 把手机上核心的端口转发到本机（固定 18787；设备侧端口每次都变）
+#
+# 顺手做一件事：App 不在前台就把它叫到前台（**这是防冻的唯一办法**，见下）。
+# 不想让它动手机：`AGENT_NO_WAKE=1 just forward`。
 forward:
     scripts/phone-forward.sh
+
+# 手机那头会不会被系统冻住 —— 远程回合挂死十有八九是它（不是 WebView）。
+#
+# App 一旦失去焦点，Android 的 cached app freezer 会在 60~75 秒后把它的**整个
+# 进程**冻住：Rust 核心收不到请求、沙箱跑不了、WebView 也不动，而症状是
+# 「不报错、不超时，就是挂住」，一碰手机瞬间全通。
+#
+#   just wake          # 看现在什么情况（焦点 / doze 白名单 / 冻没冻）
+#   just wake on       # doze 白名单 + 叫到前台（开工前跑一次）
+#   just wake off      # 摘掉 doze 白名单
+#
+# `just phone` / `just doctor` 走 phone-forward.sh，会自己跑 `wake auto`
+# （已经在前台就什么都不做）。实测与两个机制的细节见 scripts/phone-wake.sh。
+wake *ARGS:
+    scripts/phone-wake.sh {{ARGS}}
 
 # 手机上各个部件还活着吗（核心 / 模型 / 沙箱 / 设备 / 会话库）
 #

@@ -163,9 +163,64 @@ Rust 侧的 `begin_turn`/`end_turn` 在会话数变化时调一次（幂等，�
 - **浏览器回合**：切后台后 `browser navigate` + `get_text` 照常完成 —— 无头 WebView
   不需要可见，这正是它和「共用用户的 WebView」的分水岭。
 
+> ⚠️ 上面这两条只在**切后台之后的头一分钟**成立。再往下看：系统会把整个进程冻住。
+
 > 顺带一个 Android 17（API 37）的坑：**通知那一行显示的是「启动器图标」，不再是
 > `setSmallIcon` 的小图标**（小图标只在状态栏出现）。所以改小图标在通知行上看不到
 > 变化 —— 不是没生效。想强制用回小图标要加 `EXTRA_PREFER_SMALL_ICON`。
+
+### 深度后台：整个进程会被冻住（2026-10-13）
+
+**症状**：手机撂下一会儿之后，从电脑发过去的请求**原地挂住** —— 不报错、不超时，
+`curl` 就一直等；用户一碰手机（App 到前台），**瞬间**全通了。
+
+第一反应都会猜「WebView 在后台不能操作」。不是。冻住的是**整个进程**：
+`/api/health` 这种纯本地、根本不碰 WebView 的请求一样挂 —— 连沙箱里 `echo` 都跑不了。
+
+**真因**：Android 的 cached app freezer（cgroup v2 freezer）。读这个文件就知道答案：
+
+```sh
+pid=$(adb shell pidof dev.vihv.agent)
+cg=$(adb shell "cat /proc/$pid/cgroup" | sed -n 's|^0::/apps/\(.*\)$|\1|p')
+adb shell cat /sys/fs/cgroup/apps/$cg/cgroup.freeze     # 1 = 冻着
+```
+
+实测（Pixel 10 / Android 17）：
+
+| 状态 | `cgroup.freeze` | `/api/health` |
+|---|---|---|
+| App 是焦点 Activity（屏幕亮 / 熄屏 Dozing 都好） | 0 | 25ms |
+| 焦点被别的 App 抢走（或按 HOME 回桌面）后 60~75 秒 | **1** | 挂死 |
+| 上一条 + **加到 doze 白名单** | **1** | 挂死 |
+| 熄屏很久 → 强制深度 doze（`dumpsys deviceidle force-idle`，无白名单） | **1** | 挂死 |
+| 同上，但**有**白名单 | 0 | 24ms |
+| 冻住之后再叫到前台（`am start`） | 0 | 24ms |
+
+**是两个机制，要两招分别治**（这也解释了为什么「关掉电池优化」治不好这件事）：
+
+1. **失去焦点 → 60~75 秒后被冻**（「前一个 App」也是 cached 进程）。白名单**治不了**。
+   治法是让它保持焦点：`am start` 把我们的 Activity 提到前面 —— 锁屏挡着也算，
+   熄屏 Dozing 下也稳（只要焦点还在我们身上，oom adj 就是 0，freezer 不碰）。
+2. **深度 doze（熄屏 30 分钟以上）→ 冻 + 掐网**。这个白名单能治
+   （= 设置里「电池 → 不受限」，`dumpsys deviceidle whitelist +dev.vihv.agent`）。
+
+**为什么专坑「从电脑驱动手机」**：回合是脚本起的 → 前台服务起不来
+（Android 12+ 不许从后台起，见上一节）→ 进程就是个 cached 进程 → 用户不碰手机，
+它就一直 cached → 被冻。人在界面上发起回合时反而没事（前台服务挂着）。
+
+**落到工具上**：`scripts/phone-wake.sh` 把两招都做了（`just wake on`），
+`phone-forward.sh` 会在每次远程驱动前跑它的 `auto` 版 —— **已经在前台就什么都不做**，
+不在才叫到前台并在 stderr 说一句（`AGENT_NO_WAKE=1` 关掉）。实测：
+
+```
+冻着（cgroup.freeze=1, adj=900）→ just phone "用 bash 跑 date +%T"
+  ⚠️  手机上那个 App 不在前台 …… 已把它叫到前台
+  🔧 bash {"command": "date +%T"}   exit=0 0.59s → 12:49:30
+```
+
+还剩一个洞：**用户在手机上用别的 App 的时候**（焦点真被抢走），远程回合仍会被冻。
+那个只能靠常驻前台服务（Termux 那种「一直挂个通知」）—— 目前的取舍是不要常驻通知，
+所以没做；真要长期无人值守地远程驱动，就把它加回来。
 
 ### 缺的部分：前端回来时的同步
 
