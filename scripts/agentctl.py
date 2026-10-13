@@ -558,7 +558,7 @@ def print_prompt() -> None:
         print(f"系统提示词：{sp.get('chars')} 字符（{c(WARN, '运行时覆盖中')}，重启失效）")
     else:
         print(f"系统提示词：{sp.get('chars')} 字符（编译进去的那版）")
-    print(c(DIM, "看正文：core/src/agent.rs 的 SYSTEM_PROMPT，或 `cargo run -q --example dump_prompt`"))
+    print(c(DIM, "看正文：core/src/agent.rs 的 compose_prompt，或 `cargo run -q --example dump_prompt [linux|macos]`"))
 
 
 def set_prompt(text: str | None) -> None:
@@ -683,7 +683,8 @@ def cmd_doctor(deep: bool = False) -> int:
     linux = h.get("linux") or {}
     rootfs = linux.get("rootfs")
     if linux.get("host"):
-        row("沙箱", True, f"宿主模式（无沙箱）：bash 直接跑在 {rootfs or '/'} 这台机器上")
+        ws = linux.get("workspace")
+        row("沙箱", True, f"宿主模式（无沙箱）：bash 直接跑在这台机器上，cwd = {ws or '（没报）'}")
     else:
         row("沙箱", bool(rootfs), str(rootfs) if rootfs else "没配（真机上要等 rootfs 解压完）")
 

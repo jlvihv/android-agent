@@ -231,6 +231,8 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
             "host": s.is_host(),
+            // 宿主模式下 rootfs 是 `/`，有信息量的是命令的 cwd
+            "workspace": s.workspace().map(|w| w.display().to_string()),
         })),
         // 浏览器后端是谁（手机上=壳里的 WebView，桌面上=CDP + 调试端口）
         "browser": st.browser().map(|b| b.describe()),
@@ -338,12 +340,17 @@ async fn list_procs(State(st): State<Arc<AppState>>, Query(q): Query<ProcsQuery>
     };
     let report = sb.procs(q.self_pgid);
     if q.format.as_deref() == Some("text") {
+        // CLI 直接 `cat` 这段：没有结尾换行的话，下一条命令的输出会接在同一行上
+        let mut text = report.to_text();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
         return (
             [(
                 axum::http::header::CONTENT_TYPE,
                 "text/plain; charset=utf-8",
             )],
-            report.to_text(),
+            text,
         )
             .into_response();
     }
@@ -1403,6 +1410,7 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
     let body = match p.transport() {
         crate::llm::Transport::Responses => crate::agent::build_responses_request(
             &sess,
+            st.platform(),
             &p.model,
             images,
             files,
@@ -1411,6 +1419,7 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
         .and_then(|r| Ok(serde_json::to_value(&r)?)),
         crate::llm::Transport::Chat => crate::agent::build_request(
             &sess,
+            st.platform(),
             &p.model,
             images,
             files,
@@ -1428,8 +1437,8 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
 ///
 /// 存在的意义：沙箱里的 `agent tools` 靠它回答「我自己有哪些工具」，
 /// 不用去翻整份请求体。给的是 Chat Completions 的形态（嵌套 `function`）。
-async fn debug_tools() -> Response {
-    match serde_json::to_value(crate::agent::tool_definitions()) {
+async fn debug_tools(State(st): State<Arc<AppState>>) -> Response {
+    match serde_json::to_value(crate::agent::tool_definitions(st.platform())) {
         Ok(v) => Json(json!({ "tools": v })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -1445,7 +1454,7 @@ struct SystemPromptBody {
 
 /// `POST /api/debug/system-prompt` → 运行时换一份系统提示词。
 ///
-/// 不重装 APK 就能调提示词，只改内存（重启回到 `SYSTEM_PROMPT`）。
+/// 不重装 APK 就能调提示词，只改内存（重启回到编译进去的那份，`agent::system_prompt`）。
 ///
 /// 换提示词**不会动老会话的前缀**：`ensure_system_prompt` 会把新的作为一条
 /// system 消息追加在历史末尾，老前缀原样保留、缓存照命中

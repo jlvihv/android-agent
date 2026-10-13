@@ -73,8 +73,11 @@ async fn stream_one(...) {
 
 三条规则：
 
-1. **`SYSTEM_PROMPT` 是 `const &str`，不含任何 `{}` 插值。**
+1. **系统提示词每个平台一份、冻结，不含任何运行期数据。**
    不能有日期、时间、设备名、屏幕内容、当前目录 —— 任何运行期才知道的东西。
+   它由 `'static` 片段按平台（安卓 / Linux / macOS）拼一次、存进 `OnceLock`
+   （`agent::system_prompt`，见 [docs/11](11-host-mode.md)「按平台拼」）——
+   同一个部署里字节不变，这才是缓存要的。工具表同理（`agent::tools(平台)`）。
 2. **历史只追加，不注入任何“每轮重发”的东西。**
    需要环境信息（手机存储挂没挂、现在屏幕是什么）就让模型自己查：
    一次 `ls` 的开销远小于每轮重发一段动态文本。
@@ -83,10 +86,10 @@ async fn stream_one(...) {
 对应代码（`core/src/agent.rs`）：
 
 ```rust
-pub const SYSTEM_PROMPT: &str = "你是运行在安卓手机上的 Agent。……";  // 纯常量
+pub fn system_prompt(p: Platform) -> &'static str   // 每个平台拼一次，之后不变
 
 // run_turn：补上当前提示词（没出现过才追加），再追加用户输入
-ensure_system_prompt(sess, SYSTEM_PROMPT);
+ensure_system_prompt(sess, &st.system_prompt());   // = system_prompt(st.platform())
 sess.messages.push(ChatMessage::User(user_text.into()));
 
 // build_messages：历史原样；唯一的例外是图片 carrier，排在连续 tool 消息之后

@@ -788,15 +788,13 @@ impl ProcsReport {
     /// （`search.rs` 的 `format_hits` 就是这么搬过来的）。
     pub fn to_text(&self) -> String {
         if self.host {
-            return if cfg!(target_os = "macos") {
+            let p = crate::platform::Platform::host();
+            return format!(
                 "宿主模式：没有 proot 登记表，认不出「刻意脱离的常驻进程」。\
-                 直接用这台机器上的 `ps` / `pgrep -fl` / `lsof -nP -iTCP -sTCP:LISTEN` 看，\
-                 `kill <pid>` 停。"
-            } else {
-                "宿主模式：没有 proot 登记表，认不出「刻意脱离的常驻进程」。\
-                 直接用这台机器上的 `ps` / `pgrep -af` / `ss -ltnp` 看，`kill <pid>` 停。"
-            }
-            .into();
+                 直接用这台机器上的 {} 看，{} 停。",
+                p.proc_tools(),
+                p.kill_tool()
+            );
         }
         if self.visible == 0 {
             return "看不见任何进程：这台机器的 /proc 被限制了（hidepid），沙箱里的 `ps` \
@@ -923,11 +921,12 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #   agent session            当前这条会话的消息（不会切走你正在看的那条）
 #   agent doctor             各部件体检
 #   agent setup [--force|--list|包…]   装/看常用工具（rg fd jq git python3…）
-#   agent command <json>     操作这台手机，例如 '{"type":"key","name":"back"}'
-#   agent open <uri>         让手机打开它：http(s) / App 深链（weixin://、
-#                            androidamap://）/ intent:// / tel: …
-#                            （$BROWSER / xdg-open 最后也是走到它）
-#   agent browser <动作> [参数…]  驱动内置浏览器（真 WebView）：
+#   agent command <json>     操作这台手机（只有手机上有），例如 '{"type":"key","name":"back"}'
+#   agent open <uri>         打开它。手机上：http(s) / App 深链（weixin://、
+#                            androidamap://）/ intent:// / tel: …（沙箱里的
+#                            $BROWSER / xdg-open 最后也走到它）；电脑上交给本机
+#                            的 open / xdg-open
+#   agent browser <动作> [参数…]  驱动浏览器（手机上是 WebView，电脑上是无头 Chrome）：
 #       navigate <url> | get_backbone [深度] | click <选择器> | type <选择器> <文本>
 #       get_text [选择器] | get_readable | scroll [up|down] [像素]
 #       screenshot [true=整页] | press Enter | find_elements <选择器> | user_agent mobile|desktop
@@ -935,12 +934,12 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #       new_tab [url] | list_tabs | switch_tab <编号> | close_tab [编号]
 #     输出是核心给的原始 JSON。一条命令里可以连做多步（这是它比工具调用强的地方）：
 #       agent browser navigate <url> && agent browser get_backbone 3 && agent browser click '#x'
-#     截图落在 /root/.browser/，要 read 它才看得见（screenshot 的返回里会提醒）。
+#     截图路径在 screenshot 的返回里，要 read 它才看得见。
 #     其他参数直接给 JSON：agent browser '{"action":"click","x":100,"y":200}'
 #   agent search <检索意图> [条数]   联网搜索（Exa），拿标题 + 链接 + 片段
 #     输出是**排好版的文字**（不是 JSON）：抬头一行「N 条 · exa-mcp」，
 #     下面每条三行（标题 / 网址 / 片段）。
-#   agent ps                 沙箱里还有什么在跑（包括**命令结束后仍活着的常驻进程**）
+#   agent ps                 沙箱里还有什么在跑（包括**命令结束后仍活着的常驻进程**；电脑上用系统的 ps）
 #   agent kill <pid>         停掉一个（pid 从 agent ps 来）
 #   agent get <path>         直接 GET 自己的接口（逃生口）
 #   agent post <path> <json> 直接 POST
@@ -1031,7 +1030,7 @@ case "$cmd" in
     ;;
   doctor)
     get /api/health | fmt
-    echo '--- 在沙箱里跑一句 ---'
+    echo '--- 跑一句 shell ---'
     post /api/linux '{"command":"echo ok"}'
     ;;
   setup)
@@ -1105,7 +1104,7 @@ EOT
   get_text [选择器]                 读整页/某元素的文本（带导航页脚；文章用 get_readable）
   get_readable                     抽正文（文章页用这个）
   scroll [up|down] [像素]           滚动
-  screenshot [true]                截图（true = 整页）；存 /root/.browser/，用 read 看
+  screenshot [true]                截图（true = 整页）；路径在返回里，用 read 看
   press <键名>                      按键：Enter（会提交表单）/Tab/Escape/方向键…
   find_elements <选择器>            列出匹配到的元素（个数 + 坐标，坐标可直接给 click）
   new_tab [url]                    开一只新标签（不给 url 就是空白页）
@@ -1857,6 +1856,11 @@ impl LinuxSandbox {
         }
         tracing::debug!("宿主模式 agent 命令: {}", dir.join("agent").display());
         Ok(())
+    }
+
+    /// 挂到 `/workspace` 的那个宿主目录（配了才有；宿主模式下就是命令的 cwd）。
+    pub fn workspace(&self) -> Option<&Path> {
+        self.cfg.workspace.as_deref()
     }
 
     /// 宿主模式下的 cwd：挂到 `/workspace` 的那个宿主目录。

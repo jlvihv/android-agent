@@ -257,7 +257,7 @@ pub struct AppState {
     pub sessions_dirty: AtomicBool,
     /// 运行时覆盖的系统提示词（`POST /api/debug/system-prompt`）。
     ///
-    /// `None` = 用编译进二进制的 `SYSTEM_PROMPT`。存在的理由就一个：
+    /// `None` = 用编译进二进制的那份（`agent::system_prompt`）。存在的理由就一个：
     /// **不重装 APK 就能对着真机调提示词** —— 改 Rust 常量要重编 .so、
     /// 重新打包安装，而提示词是迭代最频繁的东西。只改内存，重启即失效。
     pub system_prompt: RwLock<Option<String>>,
@@ -870,9 +870,8 @@ impl AppState {
     /// 默认是编译进去的那份；被 `/api/debug/system-prompt` 覆盖过就返回那一份。
     /// `Cow` 是为了没覆盖时**不拷贝**那个常量。
     ///
-    /// 编译进去的有两份，靠沙箱是不是宿主模式选（桌面原生 vs 安卓手机，
-    /// 见 `agent::SYSTEM_PROMPT_HOST`）。同一个实例上不会中途换 ——
-    /// 前缀缓存的一个字节都不能变。
+    /// 编译进去的按平台各一份（`platform()`，见 `agent::system_prompt`）。
+    /// 同一个实例上不会中途换 —— 前缀缓存的一个字节都不能变。
     pub fn system_prompt(&self) -> Cow<'static, str> {
         match self.system_prompt.read() {
             Ok(g) => match &*g {
@@ -885,6 +884,15 @@ impl AppState {
 
     /// 编译进去的那份提示词（没被运行时覆盖时用）。
     fn builtin_prompt(&self) -> &'static str {
+        crate::agent::system_prompt(self.platform())
+    }
+
+    /// 模型跑在哪种机器上 —— 提示词和工具表按它选。
+    ///
+    /// 看沙箱的形态：宿主模式就是这个二进制的桌面系统；proot 沙箱、或者
+    /// 还没有沙箱（安卓 boot 阶段 / 纯 Rust 环境）都按手机算。同一个实例上
+    /// 不会中途变（沙箱只在启动时设一次），前缀缓存的一个字节都不会动。
+    pub fn platform(&self) -> crate::platform::Platform {
         let host = self
             .linux
             .read()
@@ -892,9 +900,9 @@ impl AppState {
             .and_then(|g| g.as_ref().map(|s| s.is_host()))
             .unwrap_or(false);
         if host {
-            crate::agent::SYSTEM_PROMPT_HOST
+            crate::platform::Platform::host()
         } else {
-            crate::agent::SYSTEM_PROMPT
+            crate::platform::Platform::Android
         }
     }
 
@@ -1308,12 +1316,15 @@ mod tests {
         let st = AppState::new();
         assert_eq!(
             st.system_prompt(),
-            crate::agent::SYSTEM_PROMPT,
+            crate::agent::system_prompt(crate::platform::Platform::Android),
             "还没有沙箱时（安卓 boot 阶段 / 纯 Rust 环境）用手机那份"
         );
 
         st.set_linux(Arc::new(LinuxSandbox::host(std::env::temp_dir())));
-        assert_eq!(st.system_prompt(), crate::agent::SYSTEM_PROMPT_HOST);
+        assert_eq!(
+            st.system_prompt(),
+            crate::agent::system_prompt(crate::platform::Platform::host())
+        );
 
         // 运行时覆盖照旧最高优先（`/api/debug/system-prompt` 调提示词那条路）
         st.set_system_prompt(Some("改过的".into()));

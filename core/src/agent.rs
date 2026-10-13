@@ -24,6 +24,7 @@ use crate::responses::{
     AssistantItem, FunctionCallItem, FunctionCallOutputItem, InputItem, InputPart, MessageContent,
     MessageItem, OutputPart, Reasoning, ResponsesRequest, ToolOutput,
 };
+use crate::platform::Platform;
 use crate::{linux, sse, Core};
 
 // ---------------------------------------------------------------------------
@@ -32,25 +33,25 @@ use crate::{linux, sse, Core};
 
 pub struct ToolSpec {
     pub name: &'static str,
-    pub description: &'static str,
+    /// 按平台拼出来的（`bash` 那条「在哪跑、有什么」随平台变），拼一次就冻结
+    pub description: String,
     pub schema: fn() -> Value,
 }
 
-/// 工具表只建一次。
+/// 工具表每个平台只建一次。
 ///
 /// 每个 step 都要把整张表序列化进请求（含那段很长的 `bash` 描述），
 /// 工具表是**可缓存前缀的一部分**，只建一次也让「字节确定」更保险。
-static TOOLS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
-
-pub fn tools() -> &'static [ToolSpec] {
-    TOOLS.get_or_init(build_tools)
+pub fn tools(p: Platform) -> &'static [ToolSpec] {
+    static TOOLS: [OnceLock<Vec<ToolSpec>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    TOOLS[p as usize].get_or_init(|| build_tools(p))
 }
 
-fn build_tools() -> Vec<ToolSpec> {
+fn build_tools(p: Platform) -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read",
-            description: "读取文本或图片。读取文本时，输出截断到 2000 行或 50KB，被截断时末尾会写明用哪个 offset 续读；结果里的 totalLines / totalBytes 是整个文本文件的行数和字节数，据此决定继续读还是改用 bash 的 rg/sed 局部读。读取图片时（png/jpg/gif/webp/bmp）可能会缩放（offset/limit 对图片无效），结果里的 totalBytes 是原图片文件大小。",
+            description: "读取文本或图片。读取文本时，输出截断到 2000 行或 50KB，被截断时末尾会写明用哪个 offset 续读；结果里的 totalLines / totalBytes 是整个文本文件的行数和字节数，据此决定继续读还是改用 bash 的 rg/sed 局部读。读取图片时（png/jpg/gif/webp/bmp）可能会缩放（offset/limit 对图片无效），结果里的 totalBytes 是原图片文件大小。".into(),
             schema: || {
                 json!({
                     "type": "object",
@@ -66,7 +67,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash",
-            description: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。已预装 bash/curl/git/gh/jq/rg/fd/tree/unzip/python3/diff/patch。Python 包优先 `apk add py3-*`。后台常驻服务用 `setsid <命令> > /tmp/x.log 2>&1 &`（能活过这次调用；裸 `&` 起的会在超时/停止时被一起杀掉），之后 `agent ps` 看还剩什么、`agent kill <pid>` 停掉。",
+            description: bash_description(p),
             schema: || {
                 json!({
                     "type": "object",
@@ -80,7 +81,7 @@ fn build_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit",
-            description: "改文件：edits 做精确替换（一个或多个；相邻改动合并成一条，不要为了够到远处的改动而在 oldText 里塞大段没变的内容）。新建文件：只给 content（全文），文件已存在会报错。edits 与 content 互斥。",
+            description: "改文件：edits 做精确替换（一个或多个；相邻改动合并成一条，不要为了够到远处的改动而在 oldText 里塞大段没变的内容）。新建文件：只给 content（全文），文件已存在会报错。edits 与 content 互斥。".into(),
             schema: || {
                 json!({
                     "type": "object",
@@ -604,7 +605,9 @@ impl SessionStore {
 // 提示词：缓存友好性
 // ---------------------------------------------------------------------------
 //
-// ⚠️ **SYSTEM_PROMPT 必须是常量，任何时候都不能变。**
+// ⚠️ **系统提示词（`system_prompt(平台)`）必须是常量，任何时候都不能变。**
+// 它按平台由 `'static` 片段拼一次就冻结（见下面 `system_prompt`）——「常量」说的是
+// 同一个部署里字节不变，不是「源码里只能是一个字面量」。
 //
 // 原因：它是消息数组的第一个元素，而 prompt cache 是**按前缀**命中的。
 // 只要第一个字节变了，整个对话的缓存全部失效。
@@ -613,7 +616,7 @@ impl SessionStore {
 // 意味着屏幕每次一变就重算整个上下文。
 //
 // 所以：
-//   - 系统提示词：静态常量，零插值
+//   - 系统提示词：每个平台一份冻结的字符串，零运行时数据
 //   - 动态内容（界面快照、设备信息）：作为一个**独立消息**插在
 //     用户输入前面，只生成一次然后冻结进历史
 //   - 工具表：顺序固定，序列化字节完全确定
@@ -621,7 +624,7 @@ impl SessionStore {
 //
 // 最终消息形状（前缀单调增长，每轮都能命中上一轮的前缀）：
 //
-//   [system: SYSTEM_PROMPT]          ← 永远不变
+//   [system: 系统提示词]              ← 永远不变
 //   [system: 上下文#1]                ← 第一轮生成后冻结
 //   [user:   U1]
 //   [assistant: ...]
@@ -630,58 +633,126 @@ impl SessionStore {
 //   [user:   U2]
 //   ...
 
-pub const SYSTEM_PROMPT: &str = "\
-你是运行在安卓手机上的 Agent。\n\
-\n\
-- cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。成品放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。\n\
-- 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`，也支持外部网页或 App 深链，用户点击时能用对应 App 打开；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、`agent command`（按键/点击/滑动/启动应用/打开 URI）、`agent browser`（真 WebView：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；截图落 /root/.browser/，用 read 看）、`agent search`（联网搜索）、`agent ps` / `agent kill <pid>`（看/停沙箱里还在跑的进程 —— 包括你自己用 `setsid` 放后台的常驻服务），`agent help` 看全部。\n\
-\n\
-回答要言简意赅。";
-
-/// 宿主模式（桌面原生，见 `linux::LinuxSandbox::host`）的系统提示词。
+/// 这个平台的系统提示词（每个平台拼一次，之后一直是同一个 `&'static str`）。
 ///
-/// 和 `SYSTEM_PROMPT` 一样是**静态常量**（理由见上），两个部署各用一份；
-/// 选哪份看当前沙箱是不是宿主模式（`AppState::system_prompt`）。两份的差别
-/// 只在「在哪跑、有哪些门」那几句 —— 工具表和其余规则必须一字不差，
-/// 否则两边干活的方式会慢慢漂。
-pub const SYSTEM_PROMPT_HOST: &str = if cfg!(target_os = "macos") {
-    SYSTEM_PROMPT_HOST_MACOS
-} else {
-    SYSTEM_PROMPT_HOST_LINUX
+/// 为什么拼而不是写三个字面量：三份里绝大多数句子一字不差，只有「在哪跑、
+/// 有哪些门」那几处不同 —— 抄三遍的话，改一句共用规则得记着改三处，漏一处
+/// 几个平台干活的方式就开始漂。拼的输入全是 `'static` 片段，**没有运行时
+/// 数据**，所以同一个平台每次拼出来都是同一串字节，缓存前缀不受影响。
+pub fn system_prompt(p: Platform) -> &'static str {
+    static PROMPTS: [OnceLock<String>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    PROMPTS[p as usize].get_or_init(|| compose_prompt(Phrasing::of(p)))
+}
+
+/// 提示词和工具描述里**随平台变**的那几句。共用的句子只在 `compose_prompt` /
+/// `bash_description` 里写一份。
+struct Phrasing {
+    /// 第一句：你是谁、跑在哪
+    who: &'static str,
+    /// cwd / 文件放哪 / 能动用户的什么
+    files: &'static str,
+    /// `sandbox:` 链接那句的补充（手机上点外链能跳 App）
+    link_extra: &'static str,
+    /// `agent` 命令从哪来
+    cli_intro: &'static str,
+    /// 设备那一门：手机上是 `agent command`，电脑上是 `agent open`
+    cli_device: &'static str,
+    /// `agent browser` 背后是什么
+    browser: &'static str,
+    /// 截图去哪找
+    shots: &'static str,
+    /// 进程那一门（宿主模式写在 bash 描述里，这里空）
+    cli_procs: &'static str,
+    /// bash 工具描述的开头：在哪跑
+    bash_where: &'static str,
+    /// bash 工具描述：这台机器上有什么、怎么装东西
+    bash_env: &'static str,
+}
+
+const ANDROID: Phrasing = Phrasing {
+    who: "你是运行在安卓手机上的 Agent。",
+    files: "cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。成品放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。",
+    link_extra: "，也支持外部网页或 App 深链，用户点击时能用对应 App 打开",
+    cli_intro: "沙箱里的 `agent` 命令可查看/操作自己",
+    cli_device: "`agent command`（按键/点击/滑动/启动应用/打开 URI）",
+    browser: "真 WebView",
+    shots: "截图落 /root/.browser/，用 read 看",
+    cli_procs: "、`agent ps` / `agent kill <pid>`（看/停沙箱里还在跑的进程 —— 包括你自己用 `setsid` 放后台的常驻服务）",
+    bash_where: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。",
+    bash_env: "已预装 bash/curl/git/gh/jq/rg/fd/tree/unzip/python3/diff/patch。Python 包优先 `apk add py3-*`。",
 };
 
-/// 宿主模式 · Linux。
-///
-/// 按**编译目标**选、不按运行时探测：一个二进制只会跑在一种系统上，常量也就
-/// 还是常量（缓存前缀不变）。两份只在「这是什么系统、用什么命令看进程」上不同。
-pub const SYSTEM_PROMPT_HOST_LINUX: &str = "\
-你是运行在一台 Linux 电脑上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。\n\
-\n\
-- cwd 是启动核心时的那个目录（`pwd` 就是它）。`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或者真实路径。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。\n\
-- 工具表里提到「Alpine Linux 沙箱」「已预装 …」「apk add」的那几句是**手机版**的写法，宿主模式不适用：用这台机器上已经有的工具，装东西用它的包管理器（pacman/apt/dnf…）或 venv。后台常驻服务同样用 `setsid <命令> > 日志 2>&1 &` 放（能活过这次调用），收场用 `ps` / `pgrep -af` / `ss -ltnp` 看、`kill <pid>` 停 —— 宿主模式没有 proot 那套登记表，`agent ps` 只会让你去用这些。\n\
-- 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-- `agent` 命令（已在 PATH 里）能查看自己：`agent state|request|tools|session`、`agent browser`（核心自己起的无头 Chrome：navigate / get_backbone / click / type / screenshot，一条命令能连做多步；截图路径在返回里，用 read 看）、`agent search`（联网搜索）、`agent kill <pid>`（停掉一个后台进程）、`agent get|post`（直接调自己的接口），`agent help` 看全部。宿主模式没有 `agent command` / `agent open`（那是手机上的设备操作）；要给用户开网页就用 `xdg-open`。\n\
-\n\
-回答要言简意赅。";
+/// Linux / macOS 宿主模式共用的部分（各自再盖掉不同的那几句）。
+const HOST: Phrasing = Phrasing {
+    who: "",
+    files: "cwd 是启动核心时的那个目录（`pwd` 就是它）。`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或者真实路径。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。",
+    link_extra: "",
+    cli_intro: "`agent` 命令（已在 PATH 里）可查看/操作自己",
+    cli_device: "`agent open <uri>`（用这台电脑的默认程序打开网页/文件）",
+    browser: "核心自己起的无头 Chrome",
+    shots: "截图路径在返回里，用 read 看",
+    cli_procs: "",
+    bash_where: "直接在这台电脑上跑 bash 命令（没有沙箱；cwd=启动核心时的目录；每次新进程，shell 状态不持久）。",
+    bash_env: "",
+};
 
-/// 宿主模式 · macOS。跟 Linux 那份逐句对齐，只换掉 macOS 上不成立的：
-///
-/// - `ss` 不存在 → `lsof -nP -iTCP -sTCP:LISTEN`；`pgrep -af` 的 `-a` 是
-///   procps 的，BSD pgrep 用 `-fl`。
-/// - `setsid` 不是系统自带的 —— 是我们垫在 PATH 里的（`linux::SETSID_SHIM`），
-///   所以写法不用变。
-/// - BSD 用户态：`sed -i ''`、`date` / `stat` / `readlink -f` 的参数跟 GNU 不同，
-///   不点一句的话模型几乎一定按 GNU 写，白白报错一轮。
-pub const SYSTEM_PROMPT_HOST_MACOS: &str = "\
-你是运行在一台 Mac（macOS）上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。\n\
-\n\
-- cwd 是启动核心时的那个目录（`pwd` 就是它）。`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或者真实路径。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。\n\
-- 工具表里提到「Alpine Linux 沙箱」「已预装 …」「apk add」的那几句是**手机版**的写法，宿主模式不适用：用这台机器上已经有的工具，装东西用 brew 或 venv。这是 BSD 用户态：`sed -i ''`、`date`、`stat`、`readlink -f`、`xargs` 的参数跟 GNU 不一样，拿不准先看 `man` 或用 python3。后台常驻服务同样用 `setsid <命令> > 日志 2>&1 &` 放（能活过这次调用；`setsid` 已在 PATH 里），收场用 `ps` / `pgrep -fl` / `lsof -nP -iTCP -sTCP:LISTEN` 看、`kill <pid>` 停 —— 宿主模式没有 proot 那套登记表，`agent ps` 只会让你去用这些。\n\
-- 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-- `agent` 命令（已在 PATH 里）能查看自己：`agent state|request|tools|session`、`agent browser`（核心自己起的无头 Chrome：navigate / get_backbone / click / type / screenshot，一条命令能连做多步；截图路径在返回里，用 read 看）、`agent search`（联网搜索）、`agent kill <pid>`（停掉一个后台进程）、`agent get|post`（直接调自己的接口），`agent help` 看全部。宿主模式没有 `agent command` / `agent open`（那是手机上的设备操作）；要给用户开网页或文件就用 `open`。\n\
-\n\
-回答要言简意赅。";
+const LINUX: Phrasing = Phrasing {
+    who: "你是运行在一台 Linux 电脑上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。",
+    bash_env: "用这台机器上已有的工具，装东西用它的包管理器（pacman/apt/dnf…）或 venv。",
+    ..HOST
+};
+
+/// `setsid` 在 macOS 上不是系统自带的 —— 是宿主模式垫在 PATH 里的
+/// （`linux::SETSID_SHIM`），所以后台服务的写法跟别处一样，不用另说。
+const MACOS: Phrasing = Phrasing {
+    who: "你是运行在一台 Mac（macOS）上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。",
+    // 不点这一句的话，模型几乎一定按 GNU 写，白白报错一轮
+    bash_env: "这是 BSD 用户态：`sed -i ''`、`date`、`stat`、`readlink -f`、`xargs` 的参数跟 GNU 不一样，拿不准先看 `man` 或用 python3；装东西用 brew 或 venv。",
+    ..HOST
+};
+
+impl Phrasing {
+    const fn of(p: Platform) -> &'static Phrasing {
+        match p {
+            Platform::Android => &ANDROID,
+            Platform::Linux => &LINUX,
+            Platform::Macos => &MACOS,
+        }
+    }
+}
+
+fn compose_prompt(t: &Phrasing) -> String {
+    format!(
+        "{who}\n\
+         \n\
+         - {files}\n\
+         - 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`{link_extra}；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
+         - {cli_intro}：`agent state|request|tools`、{cli_device}、`agent browser`（{browser}：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；{shots}）、`agent search`（联网搜索）{cli_procs}，`agent help` 看全部。\n\
+         \n\
+         回答要言简意赅。",
+        who = t.who,
+        files = t.files,
+        link_extra = t.link_extra,
+        cli_intro = t.cli_intro,
+        cli_device = t.cli_device,
+        browser = t.browser,
+        shots = t.shots,
+        cli_procs = t.cli_procs,
+    )
+}
+
+/// `bash` 工具的描述：在哪跑 + 共用的输出规则 + 这台机器上有什么 +
+/// 后台服务怎么放、怎么收。
+fn bash_description(p: Platform) -> String {
+    let t = Phrasing::of(p);
+    format!(
+        "{where_}输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。{env}后台常驻服务用 `setsid <命令> > /tmp/x.log 2>&1 &`（能活过这次调用；裸 `&` 起的会在超时/停止时被一起杀掉），之后 {procs} 看还剩什么、{kill} 停掉。",
+        where_ = t.bash_where,
+        env = t.bash_env,
+        procs = p.proc_tools(),
+        kill = p.kill_tool(),
+    )
+}
 
 /// 回合被打断时留下的工具调用结果。
 ///
@@ -951,16 +1022,17 @@ fn user_message(
 ///
 /// 只建一次、之后共享（`Arc`）：每一步的请求都要带整张表，没必要每步重新
 /// 跑一遍 `json!` 拼 schema（也让「工具表字节确定」更没悬念）。
-pub fn tool_definitions() -> std::sync::Arc<[Tool]> {
-    static DEFS: OnceLock<std::sync::Arc<[Tool]>> = OnceLock::new();
-    DEFS.get_or_init(|| {
-        tools()
+pub fn tool_definitions(p: Platform) -> std::sync::Arc<[Tool]> {
+    static DEFS: [OnceLock<std::sync::Arc<[Tool]>>; 3] =
+        [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    DEFS[p as usize].get_or_init(|| {
+        tools(p)
             .iter()
             .map(|t| Tool {
                 kind: "function".into(),
                 function: FunctionDef {
                     name: t.name.to_string(),
-                    description: t.description.to_string(),
+                    description: t.description.clone(),
                     parameters: (t.schema)(),
                 },
             })
@@ -970,15 +1042,16 @@ pub fn tool_definitions() -> std::sync::Arc<[Tool]> {
 }
 
 /// Responses API 的工具表：**扁平**的 `{"type":"function","name":…}`。
-fn tool_definitions_responses() -> std::sync::Arc<[crate::responses::Tool]> {
-    static DEFS: OnceLock<std::sync::Arc<[crate::responses::Tool]>> = OnceLock::new();
-    DEFS.get_or_init(|| {
-        tools()
+fn tool_definitions_responses(p: Platform) -> std::sync::Arc<[crate::responses::Tool]> {
+    static DEFS: [OnceLock<std::sync::Arc<[crate::responses::Tool]>>; 3] =
+        [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    DEFS[p as usize].get_or_init(|| {
+        tools(p)
             .iter()
             .map(|t| crate::responses::Tool {
                 kind: "function",
                 name: t.name.to_string(),
-                description: t.description.to_string(),
+                description: t.description.clone(),
                 parameters: (t.schema)(),
             })
             .collect()
@@ -1514,6 +1587,7 @@ async fn stop_with_pending(
 /// `pub` 是给 `/api/debug/request` 用的（把模型将看到的东西原样吐出来）。
 pub fn build_request(
     sess: &ChatSession,
+    platform: Platform,
     model: &str,
     supports_images: bool,
     supports_files: bool,
@@ -1523,7 +1597,7 @@ pub fn build_request(
     Ok(ChatRequest {
         model: model.to_string(),
         messages,
-        tools: tool_definitions(),
+        tools: tool_definitions(platform),
         stream: true,
         // 要 provider 在流末尾回报 token 用量 —— 这是验证 prompt cache
         // 命中的唯一硬证据。
@@ -1538,6 +1612,7 @@ pub fn build_request(
 /// 构造一次完整的 **Responses API** 请求体。
 pub fn build_responses_request(
     sess: &ChatSession,
+    platform: Platform,
     model: &str,
     supports_images: bool,
     supports_files: bool,
@@ -1546,7 +1621,7 @@ pub fn build_responses_request(
     Ok(ResponsesRequest {
         model: model.to_string(),
         input: build_responses_input(sess, supports_images, supports_files),
-        tools: tool_definitions_responses(),
+        tools: tool_definitions_responses(platform),
         stream: true,
         store: false,
         include: &["reasoning.encrypted_content"],
@@ -1767,7 +1842,7 @@ async fn stream_one(
     let supports_images = core.state.supports_images_for(provider).await;
     let supports_files = core.state.supports_files_for(provider).await;
 
-    // SYSTEM_PROMPT 是静态常量，**这里不做任何插值** —— 见它上面的说明。
+    // 系统提示词是按平台冻结的常量，**这里不做任何插值** —— 见 `system_prompt`。
     // 动态的界面/环境信息在 run_turn 里作为独立消息进历史，保证前缀可缓存。
     //
     // 优先 Responses API（见 `ApiStyle`）：端点不支持（404/405）就退回
@@ -2096,6 +2171,7 @@ async fn open_stream(
             (
                 build_request(
                     sess,
+                    core.state.platform(),
                     &provider.model,
                     supports_images,
                     supports_files,
@@ -2118,6 +2194,7 @@ async fn open_stream(
                 (
                     build_responses_request(
                         sess,
+                        core.state.platform(),
                         &provider.model,
                         supports_images,
                         supports_files,
@@ -2832,7 +2909,7 @@ mod tests {
             },
             tool("c1"),
         ];
-        let req = build_responses_request(&sess, "m", false, false, None).unwrap();
+        let req = build_responses_request(&sess, Platform::Android, "m", false, false, None).unwrap();
         let input = serde_json::to_value(&req).unwrap()["input"].clone();
         let kinds: Vec<&str> = input
             .as_array()
@@ -2888,7 +2965,7 @@ mod tests {
                 reasoning_items: Vec::new(),
             },
         ];
-        let req = build_request(&sess, "m", false, false, None).unwrap();
+        let req = build_request(&sess, Platform::Android, "m", false, false, None).unwrap();
         let v = serde_json::to_value(&req).unwrap();
         let assistants: Vec<&Value> = v["messages"]
             .as_array()
@@ -2928,7 +3005,7 @@ mod tests {
     #[test]
     fn every_tool_call_has_a_result_even_after_an_interrupted_turn() {
         let mut sess = ChatSession::default();
-        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
         sess.messages.push(ChatMessage::User("跑三个".into()));
         sess.messages.push(ChatMessage::Assistant {
             content: String::new(),
@@ -2954,7 +3031,7 @@ mod tests {
         );
 
         let r =
-            serde_json::to_value(build_responses_request(&sess, "m", true, true, None).unwrap())
+            serde_json::to_value(build_responses_request(&sess, Platform::Android, "m", true, true, None).unwrap())
                 .unwrap();
         let outs = r["input"]
             .as_array()
@@ -3005,7 +3082,7 @@ mod tests {
         let mut sess = ChatSession::default();
 
         // 第 1 轮：run_turn 干的事
-        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
         sess.messages.push(ChatMessage::User("第一问".into()));
         let turn1 = wire(&sess);
 
@@ -3025,7 +3102,7 @@ mod tests {
             content: "ok".into(),
             images: vec![],
         });
-        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
         sess.messages.push(ChatMessage::User("第二问".into()));
         let turn2 = wire(&sess);
 
@@ -3079,62 +3156,55 @@ mod tests {
     #[test]
     fn system_prompt_is_a_frozen_constant_with_no_interpolation() {
         assert!(
-            !SYSTEM_PROMPT.contains('{'),
+            !system_prompt(Platform::Android).contains('{'),
             "system prompt 里出现格式占位符，说明被插值了"
         );
         for dynamic in ["rootfs", "/data/", "Android", "Activity", "1080"] {
             assert!(
-                !SYSTEM_PROMPT.contains(dynamic),
+                !system_prompt(Platform::Android).contains(dynamic),
                 "system prompt 里不该出现运行时才知道的内容: {dynamic}"
             );
         }
     }
 
-    /// 宿主模式那份也是冻结常量（同一个理由：提示词是要缓存的**前缀**），
-    /// 并且必须把「这台机器上没有沙箱」说清楚 —— 不然模型会照工具表去 `apk add`。
+    /// 每个平台的提示词 + 工具表：拼出来但**冻结**（同一个平台两次拿到同一串
+    /// 字节、没有运行时数据），而且不能叫模型去用它那台机器上没有的东西。
     #[test]
-    fn the_host_prompt_is_also_frozen_and_warns_about_the_tool_table() {
-        for (os, p) in [
-            ("linux", SYSTEM_PROMPT_HOST_LINUX),
-            ("macos", SYSTEM_PROMPT_HOST_MACOS),
-        ] {
-            assert!(!p.contains('{'), "{os}: 被插值了");
-            for dynamic in ["/home/", "/Users/", "/tmp/", "rootfs", "Arch", "Ubuntu"] {
+    fn every_platform_gets_a_frozen_prompt_that_matches_its_machine() {
+        for p in Platform::ALL {
+            let prompt = system_prompt(p);
+            let bash = &tools(p).iter().find(|t| t.name == "bash").unwrap().description;
+            assert!(std::ptr::eq(prompt, system_prompt(p)), "{p:?}: 每次都该是同一份");
+            for dynamic in ["/home/", "/Users/", "/data/", "rootfs", "Arch", "Ubuntu", "1080"] {
                 assert!(
-                    !p.contains(dynamic),
-                    "{os}: 宿主提示词里不该出现这台机器的具体信息: {dynamic}"
+                    !prompt.contains(dynamic) && !bash.contains(dynamic),
+                    "{p:?}: 不该出现这台机器的具体信息: {dynamic}"
                 );
             }
-            assert!(
-                p.contains("Alpine") && p.contains("apk add"),
-                "{os}: 工具表还在说 Alpine 沙箱，宿主提示词必须把那句话挑明"
-            );
-            assert!(
-                p.contains("pgrep"),
-                "{os}: 宿主模式 `agent ps` 是空的，得让模型去用真的 ps"
-            );
-            assert!(
-                p.contains("setsid"),
-                "{os}: 后台常驻服务那条路（工具表里写了）在宿主模式同样适用，要说清"
-            );
-            assert!(p.contains("agent search"), "{os}: 联网搜索要靠它");
-            assert!(
-                p.contains("agent browser"),
-                "{os}: 桌面上浏览器是有的（核心自己起无头 Chrome），别让模型以为没有"
-            );
+            for door in ["agent browser", "agent search", "agent help"] {
+                assert!(prompt.contains(door), "{p:?}: 提示词得告诉模型 {door} 在哪");
+            }
+            assert!(bash.contains("setsid"), "{p:?}: 后台常驻服务怎么放");
+            assert!(bash.contains(p.proc_tools()), "{p:?}: 之后怎么看还剩什么");
+
+            if p.is_host() {
+                // 以前宿主提示词得整句反驳工具表（「那几句是手机版写法」）——
+                // 现在工具表本身就是这台机器的，Alpine / apk 一个字都不该有
+                for phone in ["Alpine", "apk add", "agent ps", "agent command", "/root/", "/sdcard"] {
+                    assert!(
+                        !prompt.contains(phone) && !bash.contains(phone),
+                        "{p:?}: 宿主模式里还在说手机上的 {phone}"
+                    );
+                }
+                assert!(prompt.contains("agent open"), "{p:?}: 电脑上开网页走 agent open");
+            } else {
+                assert!(bash.contains("Alpine") && bash.contains("apk add"));
+                assert!(prompt.contains("agent command"));
+            }
         }
-        // 各自系统上不存在的命令不能出现
-        assert!(!SYSTEM_PROMPT_HOST_MACOS.contains("ss -ltnp"), "macOS 没有 ss");
-        assert!(!SYSTEM_PROMPT_HOST_MACOS.contains("pgrep -af"), "BSD pgrep 没有 -a");
-        assert!(!SYSTEM_PROMPT_HOST_MACOS.contains("xdg-open"));
-        assert!(!SYSTEM_PROMPT_HOST_LINUX.contains("brew"));
-        // 编译目标选对了那份
-        let expected = if cfg!(target_os = "macos") {
-            SYSTEM_PROMPT_HOST_MACOS
-        } else {
-            SYSTEM_PROMPT_HOST_LINUX
-        };
-        assert_eq!(SYSTEM_PROMPT_HOST, expected);
+        let mac = &tools(Platform::Macos)[1].description;
+        assert!(mac.contains("brew") && mac.contains("BSD"), "macOS 要点名 BSD 用户态");
+        assert!(!tools(Platform::Linux)[1].description.contains("brew"));
     }
 
     #[test]
@@ -3143,7 +3213,7 @@ mod tests {
         // 系统提示词是历史里的一条（`ensure_system_prompt` 注的），
         // 所以 请求体长度 == 历史长度，一条不多一条不少。
         let mut sess = ChatSession::default();
-        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
         sess.messages.push(ChatMessage::User("问".into()));
         sess.messages.push(ChatMessage::Assistant {
             content: "答".into(),
@@ -3156,7 +3226,7 @@ mod tests {
         let w = wire(&sess);
         assert_eq!(w.len(), sess.messages.len(), "请求体里多出了别的东西");
         assert_eq!(w[0]["role"], "system");
-        assert_eq!(w[0]["content"], SYSTEM_PROMPT);
+        assert_eq!(w[0]["content"], system_prompt(Platform::Android));
         assert_eq!(
             w.iter().filter(|m| m["role"] == "system").count(),
             1,
@@ -3169,11 +3239,11 @@ mod tests {
     #[test]
     fn full_request_body_is_prefix_stable_across_turns() {
         let mut sess = ChatSession::default();
-        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
         sess.messages.push(ChatMessage::User("第一问".into()));
         // 转成 Value 是为了断言请求体本身；线上路径不经过这一步
         let req1 = serde_json::to_value(
-            build_request(&sess, "deepseek-v4.1-flash", true, true, None).unwrap(),
+            build_request(&sess, Platform::Android, "deepseek-v4.1-flash", true, true, None).unwrap(),
         )
         .unwrap();
 
@@ -3194,7 +3264,7 @@ mod tests {
         });
         sess.messages.push(ChatMessage::User("第二问".into()));
         let req2 = serde_json::to_value(
-            build_request(&sess, "deepseek-v4.1-flash", true, true, None).unwrap(),
+            build_request(&sess, Platform::Android, "deepseek-v4.1-flash", true, true, None).unwrap(),
         )
         .unwrap();
 
@@ -3216,23 +3286,23 @@ mod tests {
     #[test]
     fn reasoning_effort_is_tagged_per_protocol_and_omitted_when_unset() {
         let mut sess = ChatSession::default();
-        ensure_system_prompt(&mut sess, SYSTEM_PROMPT);
+        ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
         sess.messages.push(ChatMessage::User("嗨".into()));
 
         let chat =
-            serde_json::to_value(build_request(&sess, "m", true, true, None).unwrap()).unwrap();
+            serde_json::to_value(build_request(&sess, Platform::Android, "m", true, true, None).unwrap()).unwrap();
         assert!(chat.get("reasoning_effort").is_none(), "{chat}");
         let resp =
-            serde_json::to_value(build_responses_request(&sess, "m", true, true, None).unwrap())
+            serde_json::to_value(build_responses_request(&sess, Platform::Android, "m", true, true, None).unwrap())
                 .unwrap();
         assert!(resp.get("reasoning").is_none(), "{resp}");
 
         let chat =
-            serde_json::to_value(build_request(&sess, "m", true, true, Some("high")).unwrap())
+            serde_json::to_value(build_request(&sess, Platform::Android, "m", true, true, Some("high")).unwrap())
                 .unwrap();
         assert_eq!(chat["reasoning_effort"], "high");
         let resp = serde_json::to_value(
-            build_responses_request(&sess, "m", true, true, Some("low")).unwrap(),
+            build_responses_request(&sess, Platform::Android, "m", true, true, Some("low")).unwrap(),
         )
         .unwrap();
         assert_eq!(resp["reasoning"]["effort"], "low");
@@ -3442,10 +3512,10 @@ mod tests {
         // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）暂时**不作为工具**
         // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
         // 浏览器和搜索同理，已经删掉了（唯一入口是 `agent browser` / `agent search`）。
-        let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
+        let names: Vec<&str> = tools(Platform::Android).iter().map(|t| t.name).collect();
         assert_eq!(names, vec!["read", "bash", "edit"]);
         // 重复调用必须完全一致
-        assert_eq!(names, tools().iter().map(|t| t.name).collect::<Vec<_>>());
+        assert_eq!(names, tools(Platform::Android).iter().map(|t| t.name).collect::<Vec<_>>());
     }
 
     /// 删掉的设备工具不能在提示词里留名字。
@@ -3462,8 +3532,8 @@ mod tests {
             "device_launch",
         ];
         for g in gone {
-            assert!(!SYSTEM_PROMPT.contains(g), "提示词还在提 {g}");
-            assert!(!tools().iter().any(|t| t.name == g), "工具表里还有 {g}");
+            assert!(!system_prompt(Platform::Android).contains(g), "提示词还在提 {g}");
+            assert!(!tools(Platform::Android).iter().any(|t| t.name == g), "工具表里还有 {g}");
         }
     }
 
@@ -3478,16 +3548,16 @@ mod tests {
     fn browser_and_search_are_only_reachable_through_the_sandbox_cli() {
         for tool in ["browser", "search"] {
             assert!(
-                !tools().iter().any(|t| t.name == tool),
+                !tools(Platform::Android).iter().any(|t| t.name == tool),
                 "{tool} 工具又回来了？加回去前先看看它和沙箱命令的重复度"
             );
             assert!(
-                SYSTEM_PROMPT.contains(&format!("agent {tool}")),
+                system_prompt(Platform::Android).contains(&format!("agent {tool}")),
                 "提示词得告诉模型去哪用它（不然它得自己跑 agent help 才发现）"
             );
         }
         // 只属于它们的参数不能再出现在工具表里（工具表是可缓存前缀的一部分）
-        let dump = serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
+        let dump = serde_json::to_string(&tools(Platform::Android).iter().map(|t| (t.schema)()).collect::<Vec<_>>())
             .unwrap();
         for k in [
             "full_page",
@@ -3502,10 +3572,10 @@ mod tests {
 
     #[test]
     fn tool_schemas_serialize_byte_identically() {
-        let once = serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
+        let once = serde_json::to_string(&tools(Platform::Android).iter().map(|t| (t.schema)()).collect::<Vec<_>>())
             .unwrap();
         let twice =
-            serde_json::to_string(&tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>())
+            serde_json::to_string(&tools(Platform::Android).iter().map(|t| (t.schema)()).collect::<Vec<_>>())
                 .unwrap();
         assert_eq!(once, twice);
     }

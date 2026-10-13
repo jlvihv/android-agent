@@ -34,6 +34,7 @@ pub mod llm;
 pub mod mock;
 pub mod models;
 pub mod openai;
+pub mod platform;
 pub mod providers;
 pub mod reader;
 pub mod responses;

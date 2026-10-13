@@ -284,7 +284,7 @@ stream_options = {"include_usage": true}
 
 要点：
 
-- **只改内存**，重启 App 就回到 `core/src/agent.rs` 里的 `SYSTEM_PROMPT`；
+- **只改内存**，重启 App 就回到 `core/src/agent.rs` 里编译进去的那份（`system_prompt(平台)`）；
 - 换掉之后 `state.rs` 会 `log("warn", …)`，在 App 的日志面板里看得见 ——
   否则「为什么它的表现和代码里写的不一样」能查半天；
 - **不动老会话的前缀**：新提示词作为一条 `system` 消息**追加在历史末尾**，
@@ -315,7 +315,7 @@ stream_options = {"include_usage": true}
 cd core && cargo run -q --example dump_prompt
 ```
 
-它会打出 `SYSTEM_PROMPT` + 每个工具的 desc/schema 字符数（schema 按线上紧凑写法算）。
+它会打出系统提示词 + 每个工具的 desc/schema 字符数（schema 按线上紧凑写法算）。
 缓存读取只有输入价的 1/50，所以精简它的意义不是省钱，而是冷启动那一次、
 上下文窗口占用、以及模型注意力被无关细节稀释。
 

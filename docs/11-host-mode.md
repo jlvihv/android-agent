@@ -13,7 +13,7 @@
 | `read` / `edit` 的路径 | rootfs 里的路径 | 本机路径（rootfs＝`/`） |
 | 工具 | Alpine 那套（要 `apk add`） | 你的 PATH（node/cargo/python…都在） |
 | 装东西 | `apk add` / `agent-setup` | 系统包管理器 / venv |
-| 系统提示词 | `SYSTEM_PROMPT`（手机那份） | `SYSTEM_PROMPT_HOST` |
+| 系统提示词 / 工具表 | `Platform::Android` 那份 | `Platform::Linux` / `Platform::Macos` 那份（见下面「按平台拼」） |
 | 进程模型 | runner + 状态文件 + `CommandGuard` | **同一套**（只是不套 proot） |
 | `agent ps` | 列常驻进程（靠 proot 的 `TracerPid` 归因） | 只回一句「用真的 `ps` / `pgrep`」 |
 | `agent kill <pid>` | ✅ | ✅ |
@@ -80,7 +80,7 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 |---|---|---|---|
 | `setsid` | util-linux 自带 | macOS 没有 `setsid(1)`；退到 `nohup` 不换进程组，超时会被连组杀掉 | 宿主 bin 目录里垫一个（`SETSID_SHIM`：系统 perl 调 `POSIX::setsid()`，组长先 fork，跟 util-linux 一致）。PATH 里有真的就不垫 |
 | bash | `/bin/bash` | `/bin/bash` 是 3.2（没有关联数组 / `${x,,}` / `mapfile`） | 用 **PATH 里第一个** bash（装了 Homebrew bash 就是它），找不到才退回 `/bin/bash` |
-| 系统提示词 | `ss -ltnp` / `pgrep -af` / `xdg-open` | 这三样 macOS 上都不对 | 按编译目标选 `SYSTEM_PROMPT_HOST_MACOS`：`lsof -nP -iTCP -sTCP:LISTEN` / `pgrep -fl` / `open`，并点名 BSD 用户态（`sed -i ''` 等） |
+| 系统提示词 / 工具表 | `ss -ltnp` / `pgrep -af` / `xdg-open` | 这三样 macOS 上都不对 | `Platform::Macos`：`lsof -nP -iTCP -sTCP:LISTEN` / `pgrep -fl` / `agent open`（→ `open`），并点名 BSD 用户态（`sed -i ''` 等） |
 | Chrome 在哪 | PATH / `/opt/google/chrome` | `.app` 包从不在 PATH 里 | 查 `/Applications`（和 `~/Applications`）下的 Chrome / Chromium / Canary / Edge / Brave |
 | Chrome 钥匙串 | — | 新 profile 存 cookie 时会弹「Chrome Safe Storage」授权框，无头那边一直等 | 加 `--use-mock-keychain` |
 | 孤儿 Chrome 回收 | 扫 `/proc` | 没有 `/proc`（原来静默跳过）；临时 profile 也不在 `/tmp` 而在 `/var/folders/…` | 问 `ps -axww -o pid=,ppid=,command=`；临时 profile 前缀跟着 `temp_dir()` 走 |
@@ -97,20 +97,33 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 - **宿主提示词原来说「没有 `agent browser`」**，而桌面上早就有核心自己起的无头
   Chrome —— 模型会白白放弃浏览器。改成如实写。
 
-## 系统提示词：两份常量，不是插值
+## 系统提示词和工具表：按平台拼，不是抄几份
 
-`SYSTEM_PROMPT` 必须是常量（缓存按前缀命中，见 [docs/03](03-prompt-cache.md)），
-所以宿主模式**不是**在提示词里插「你现在在 `/home/xxx`」，而是另有一份常量
-`SYSTEM_PROMPT_HOST`（`core/src/agent.rs`），启动时按沙箱形态选一份
-（`AppState::builtin_prompt`）。`SYSTEM_PROMPT_HOST` 本身又按**编译目标**在
-`_LINUX` / `_MACOS` 两份里选（`cfg!`）—— 一个二进制只跑在一种系统上，仍是常量。
+前缀缓存要求系统提示词和工具表**在同一个部署里字节不变**（[docs/03](03-prompt-cache.md)），
+所以宿主模式**不是**在提示词里插「你现在在 `/home/xxx`」。但「不插运行时数据」
+不等于「只能写字面量」：
 
-两份只在「在哪跑、有哪些门」上不同，工具表和其余规则一字不差 ——
-不然两边干活的方式会慢慢漂。宿主那份还必须点名一件事：**工具表里仍然写着
-「Alpine Linux 沙箱」「已预装 …」「apk add」「`agent ps`」**（工具表是缓存前缀，
-没跟着分叉），所以提示词里把这几句挑明成「那是手机版的写法，宿主模式按本机
-理解；后台服务同样用 `setsid … &`，收场用 `ps` / `pgrep` / `kill`」。
-不加这句的实测后果：模型会去 `apk add`，白花一轮。
+- `Platform`（`core/src/platform.rs`）：`Android` / `Linux` / `Macos`。
+  `AppState::platform()` 看沙箱形态定：宿主模式是这个二进制的桌面系统
+  （`Platform::host()`，按编译目标），proot 沙箱或还没有沙箱都按手机算。
+- `agent::Phrasing`：提示词和 `bash` 工具描述里**随平台变**的那几句（你是谁、
+  cwd 规则、设备那一门、浏览器背后是谁、这台机器上有什么）。三份是三个
+  `const`，Linux / macOS 共用 `HOST` 再各盖几个字段。
+- `compose_prompt` / `bash_description`：共用的句子**只写一份**，按平台把片段
+  填进去；`system_prompt(p)` / `tools(p)` 每个平台拼一次就冻结在 `OnceLock` 里。
+- 「每个系统的事实」（看进程用 `pgrep -af` 还是 `pgrep -fl`、有没有 `ss`）在
+  `Platform::proc_tools()` / `kill_tool()`，提示词、工具表、`agent ps` 的回话
+  三处都从这里取。
+
+以前是三份整段字面量，工具表只有一份（写死了「Alpine 沙箱 / 已预装 / apk add /
+`agent ps`」）。宿主那两份只好**整句反驳工具表**（「那几句是手机版的写法，不适用」）——
+每轮多花 token，模型同时看着两套互相矛盾的说法。现在工具表本身就是这台机器的，
+那句反驳删掉了。
+
+安卓那份重构前后**逐字节一致**（`cargo run -q --example dump_prompt` 前后 diff 过），
+老会话的缓存不受影响；宿主那两份变了，`ensure_system_prompt` 会把新版本追加进老会话。
+测试 `every_platform_gets_a_frozen_prompt_that_matches_its_machine` 盯着：每个平台
+拿到的是同一串字节、没有机器相关的路径、宿主模式里没有一个手机上的词。
 
 ## 用起来
 
