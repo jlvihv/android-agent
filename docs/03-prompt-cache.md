@@ -83,7 +83,7 @@ async fn stream_one(...) {
 对应代码（`core/src/agent.rs`）：
 
 ```rust
-pub const SYSTEM_PROMPT: &str = "你是运行在安卓手机上的操作助手……";  // 纯常量
+pub const SYSTEM_PROMPT: &str = "你是运行在安卓手机上的 Agent。……";  // 纯常量
 
 // run_turn：补上当前提示词（没出现过才追加），再追加用户输入
 ensure_system_prompt(sess, SYSTEM_PROMPT);
@@ -201,7 +201,7 @@ req["stream_options"] = json!({ "include_usage": true });
 
 ## 5. 守住它的回归测试
 
-`core/src/agent.rs` 里有 7 条测试专门守这些不变式：
+`core/src/agent.rs` 里有 9 条测试专门守这些不变式：
 
 | 测试 | 守什么 |
 |---|---|
@@ -212,6 +212,7 @@ req["stream_options"] = json!({ "include_usage": true });
 | `the_request_is_the_history_verbatim` | 请求体长度 == 历史长度：不拼、不前置、不插上下文块 |
 | `tool_schema_order_and_names_are_fixed` | 工具表顺序钉死（想改顺序必须先改测试） |
 | `tool_schemas_serialize_byte_identically` | schema 序列化字节确定 |
+| `browser_is_only_reachable_through_the_sandbox_cli` | 浏览器只能从沙箱那个门进（工具表里不能有 `browser`，提示词里必须有 `agent browser`） |
 | `usage_understands_both_cache_field_styles` | 两套缓存字段都认，同时在时取大的那个 |
 
 `full_request_body_is_prefix_stable_across_turns` 是硬的那条：它不断言中间函数，

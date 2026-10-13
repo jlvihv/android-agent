@@ -105,37 +105,6 @@ fn build_tools() -> Vec<ToolSpec> {
             },
         },
         ToolSpec {
-            name: "browser",
-            description: "在真浏览器（WebView）里打开网页并操作它。多标签：new_tab 开一只新的（默认操作总是落在当前标签上），list_tabs 看有哪些、当前是哪只。典型顺序：navigate → get_backbone（拿到可点的 selector 和页面结构）→ click / type → 再 get_backbone 或 get_readable 确认。读文章用 get_readable，别用 get_text（后者带导航/页脚）。",
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；get_readable=抽正文；get_text=读整页/某元素的文本；click=点 selector 或坐标；type=往 selector 里输入；press=按键（Enter 会提交表单、 Tab 移焦）；find_elements=列出 selector 匹配到的元素（几个、各自坐标）；scroll=滚动；screenshot=截图（full_page=true 时截整页，不常用，最好滚动截视口）；set_user_agent=切桌面/移动版；back=后退；wait_for_dom_stable=等动态内容安定下来；js=在页面里执行一段 JS（返回值 JSON 化后给你）；new_tab=开新标签（可带 url）；list_tabs=列出所有标签；switch_tab / close_tab=切到 / 关掉某只标签",
-                            "enum": ["navigate", "get_backbone", "get_readable", "get_text", "click", "type", "press", "find_elements", "scroll", "screenshot", "set_user_agent", "back", "wait_for_dom_stable", "js", "new_tab", "list_tabs", "switch_tab", "close_tab"]
-                        },
-                        "url": { "type": "string", "description": "navigate / new_tab 的目标。没写协议头就按 https 补。沙箱里的文件（比如自己写的网页）用 sandbox:/workspace/…/index.html 打开" },
-                        "selector": { "type": "string", "description": "CSS selector。get_backbone 给出的 sel 可以直接用" },
-                        "text": { "type": "string", "description": "type 要输入的文本" },
-                        "key": { "type": "string", "description": "press 要按的键", "enum": ["Enter", "Tab", "Escape", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"] },
-                        "user_agent": { "type": "string", "description": "set_user_agent 的档（会连着视口一起换，然后重载）", "enum": ["mobile", "desktop"] },
-                        "full_page": { "type": "boolean", "description": "screenshot：true = 整页（上限 8000px），否则只截视口" },
-                        "tab": { "type": "integer", "description": "对哪只标签操作（默认当前那只）。给了就先切过去；id 从 new_tab / list_tabs 来。close_tab 不带 tab 就是关当前这只" },
-                        "x": { "type": "integer", "description": "click 的 X 坐标（和 y 一起用，代替 selector）" },
-                        "y": { "type": "integer", "description": "click 的 Y 坐标" },
-                        "script": { "type": "string", "description": "js 动作要执行的代码。可以是 async，允许 await 和顶层 return" },
-                        "direction": { "type": "string", "description": "scroll 方向", "enum": ["up", "down"] },
-                        "amount": { "type": "integer", "description": "scroll 每次滚多少像素（默认 500）" },
-                        "max_depth": { "type": "integer", "description": "get_backbone 的树深度（默认 5）" },
-                        "timeout": { "type": "integer", "description": "wait_for_dom_stable 等几秒（默认 10，上限 30）" }
-                    },
-                    "required": ["action"]
-                })
-            },
-        },
-        ToolSpec {
             name: "search",
             description: "联网搜索（Exa）：给一句自然语言描述的检索意图，拿回标题 + 链接 + 摘要片段。写检索意图而不是关键词。",
             schema: || {
@@ -680,7 +649,7 @@ pub const SYSTEM_PROMPT: &str = "\
 \n\
 - cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。成品放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。\n\
 - 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`，也支持外部网页或 App 深链，用户点击时能用对应 App 打开；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、`agent command`（按键/点击/滑动/启动应用/打开 URI），`agent help` 看全部。\n\
+- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、`agent command`（按键/点击/滑动/启动应用/打开 URI）、`agent browser`（真 WebView：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；截图落 /root/.browser/，用 read 看），`agent help` 看全部。\n\
 \n\
 回答要言简意赅。";
 
@@ -2554,70 +2523,17 @@ async fn execute_tool(
         };
     }
 
-    if name == "browser" {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        if action.is_empty() {
-            return ToolOutcome::json(json!({ "error": "缺少参数 action" }));
-        }
-        // `__` 开头的是壳和核心之间的内部动作（取消、打开 URI），不给模型
-        if action.starts_with("__") {
-            return ToolOutcome::json(json!({ "error": format!("未知动作 {action}") }));
-        }
+    // 浏览器**不再是一个工具**：唯一入口是沙箱里的 `agent browser`（见
+    // `linux.rs` 的 AGENT_CLI）。
+    //
+    // 为什么删：实测同一个会话里模型 45 : 3 选沙箱那条 —— 一条 bash 能连做多个
+    // 动作（`navigate && get_backbone && click`），省的是**整轮 LLM 请求**；
+    // 而工具那条一次只做一个动作。留着两条路的代价是实打实的：前缀里多 2400 字
+    // （工具表的 54%），以及两处动作表各自演化 —— `new_tab URL` 被 CLI 静默
+    // 吃掉（开出一只空白标签，模型对着白屏截图）就是这么来的。
+    //
+    // 和上面那段设备操作同一个道理：能在 shell 里说清的能力，就别再开一个工具。
 
-        let res = match core.browser(&args.to_string()).await {
-            Ok(v) => v,
-            Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
-        };
-
-        if res.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let why = res
-                .get("text")
-                .or_else(|| res.get("error"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("浏览器动作失败");
-            return ToolOutcome::json(json!({ "error": why }));
-        }
-
-        let mut text = res
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // 每一跳都把落地点报出来：模型下一步要发请求/点链接时靠它判断自己在哪
-        if let Some(url) = res
-            .get("url")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            text.push_str(&format!("\nURL: {url}"));
-        }
-
-        let mut out = ToolOutcome::json(json!({
-            "ok": true,
-            "output": text,
-            "truncated": false,
-        }));
-
-        // 截图（只有 screenshot 动作有）：走 `read` 同一条图片管线 ——
-        // 解码、缩到 2000、重新编码后落盘，所以历史里存的是压过的那份。
-        if let Some(p) = res.get("image").and_then(|v| v.as_str()) {
-            match browser_image(core, p).await {
-                Some(img) => {
-                    out.result["imagePath"] = json!(p);
-                    out.images.push(img);
-                }
-                None => {
-                    let t = out.result["output"].as_str().unwrap_or("").to_string();
-                    out.result["output"] = json!(format!("{t}\n[截图没能读出来，没发给模型]"));
-                }
-            }
-        }
-
-        return out;
-    }
-
-    // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）现在**不作为工具**
-    // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
     ToolOutcome::json(json!({ "error": format!("未知工具 {name}") }))
 }
 
@@ -2628,7 +2544,8 @@ async fn execute_tool(
 /// 把十篇全文（几十 KB）塞进历史才是真浪费。
 fn format_hits(found: &crate::search::Found) -> String {
     if found.hits.is_empty() {
-        return "没搜到结果。换个说法，或者用 browser 打开搜索引擎自己翻。".to_string();
+        return "没搜到结果。换个说法，或者用 `agent browser navigate` 打开搜索引擎自己翻。"
+            .to_string();
     }
     let mut out = String::new();
     let mut chars = 0usize;
@@ -2643,48 +2560,6 @@ fn format_hits(found: &crate::search::Found) -> String {
         }
     }
     out
-}
-
-/// 浏览器截图 → 挂到工具结果上。
-///
-/// Kotlin 把截图落在沙箱里的 `/root/.browser/…`，这里按**沙箱路径**读进来
-/// （`read_any` 会把它映射到 rootfs），复用 `read` 的图片管线：解码 → 缩到
-/// 2000 → 重编码 → 落盘。返回 `None` 表示这张图没拿到（调用方在文本里标明）。
-async fn browser_image(core: &Core, guest_path: &str) -> Option<ImagePart> {
-    let img = match core.read_any(guest_path, 0, None, false).await {
-        Ok(crate::linux::ReadResult::Image(img)) => img,
-        Ok(_) => {
-            tracing::warn!("浏览器截图不是图片: {guest_path}");
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!("读浏览器截图失败 {guest_path}: {e:#}");
-            return None;
-        }
-    };
-
-    let supports_images = core
-        .state
-        .llm()
-        .map(|p| core.state.cached_supports_images(&p))
-        .unwrap_or(true);
-    if !supports_images {
-        return None;
-    }
-
-    let mime = img.mime.clone();
-    match core.save_image(img.bytes, mime.clone()).await {
-        Ok(stored) => Some(ImagePart {
-            path: stored.display().to_string(),
-            mime,
-            source: guest_path.to_string(),
-            tool: "browser".to_string(),
-        }),
-        Err(e) => {
-            tracing::warn!("浏览器截图落盘失败: {e:#}");
-            None
-        }
-    }
 }
 
 /// 图片结果：缩好的字节落盘（历史回放时还要重发），回给模型一段能读的说明
@@ -3530,8 +3405,9 @@ mod tests {
         //
         // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）暂时**不作为工具**
         // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
+        // 浏览器同理，已经删掉了（唯一入口是 `agent browser`）。
         let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["read", "bash", "edit", "browser", "search"]);
+        assert_eq!(names, vec!["read", "bash", "edit", "search"]);
         // 重复调用必须完全一致
         assert_eq!(names, tools().iter().map(|t| t.name).collect::<Vec<_>>());
     }
@@ -3552,6 +3428,32 @@ mod tests {
         for g in gone {
             assert!(!SYSTEM_PROMPT.contains(g), "提示词还在提 {g}");
             assert!(!tools().iter().any(|t| t.name == g), "工具表里还有 {g}");
+        }
+    }
+
+    /// 浏览器只能从**一个门**进：沙箱里的 `agent browser`。
+    ///
+    /// 以前是两条路（`browser` 工具 + 沙箱命令），实测同一个会话里模型 45 : 3
+    /// 选沙箱那条 —— 一条 bash 能连做多个动作，省的是整轮 LLM 请求。工具那条
+    /// 留着只有两个后果：前缀里多 2400 字（工具表的 54%），以及两处动作表各自
+    /// 漂移（`agent browser new_tab URL` 把 URL 静默吃掉就是这么来的）。
+    #[test]
+    fn browser_is_only_reachable_through_the_sandbox_cli() {
+        assert!(
+            !tools().iter().any(|t| t.name == "browser"),
+            "browser 工具又回来了？加回去前先看看它和沙箱命令的重复度"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("agent browser"),
+            "提示词得告诉模型去哪开网页（不然它得自己跑 agent help 才发现）"
+        );
+        // 那几个只属于它的参数不能再出现在工具表里（工具表是可缓存前缀的一部分）
+        let dump = serde_json::to_string(
+            &tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for k in ["full_page", "max_depth", "set_user_agent", "find_elements"] {
+            assert!(!dump.contains(k), "工具表里还有 browser 的参数 {k}");
         }
     }
 

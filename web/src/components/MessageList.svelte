@@ -53,6 +53,9 @@
       case 'edit':
         return `编辑 ${s(a.path) || '文件'}`;
       case 'browser':
+        // 浏览器工具已经删了（唯一入口是沙箱里的 `agent browser`，动作输出长
+        // 在 bash 卡片里）。这里留着只为**回放老会话** —— 历史里那些 browser
+        // 工具调用得照旧显示成人话。
         return `浏览器 ${browserSummary(a)}`;
       case 'search':
         return `搜索 ${firstLine(s(a.query))}`.trim();

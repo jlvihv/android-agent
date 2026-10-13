@@ -335,6 +335,23 @@ impl Core {
         let mut v: serde_json::Value =
             serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "text": raw }));
         rewrite_strings(&mut v, &|s| http::sandbox_url_to_guest(s, port, &key));
+        // 截图：图本体在沙箱里（Kotlin 写的），**不会**自动进上下文 ——
+        // 以前靠 `browser` 工具把它挂到工具结果上，工具删了就得让模型自己 read。
+        // 把它写进 text 而不是让 CLI 另打一行：text 是 JSON 里的字段，
+        // 模型 `| jq` / `| python3 -c json.load` 的时候不会被打断。
+        if let Some(shot) = v.get("image").and_then(|i| i.as_str()) {
+            let shot = shot.to_string();
+            if !shot.is_empty() {
+                let text = v
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                v["text"] = serde_json::Value::String(format!(
+                    "{text}\n上图已存到 {shot}：用 read {shot} 看（read 会把图直接发给你）"
+                ));
+            }
+        }
         Ok(v)
     }
 

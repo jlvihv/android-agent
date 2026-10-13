@@ -371,8 +371,8 @@ action/extras，没 App 接时退到 `S.browser_fallback_url`）。`http(s)` 找
 `__open_uri`，它启动时就注册了，不依赖无障碍）。两条路的差别只在后台：无障碍服务的
 context 豁免「后台不许起 Activity」，App 自己的不豁免 —— 所以没开无障碍、App 又在
 后台时，`__open_uri` 先自己检查前台状态并**明说打不开**（系统拦的时候不抛异常，
-不查的话 agent 会以为已经开了）。`__` 开头的动作只在壳和核心之间用，`browser` 工具
-不接受。
+不查的话 agent 会以为已经开了）。`__` 开头的动作只在壳和核心之间用，模型这边
+（沙箱里的 `agent browser`）不接受。
 
 需要用户在**别的** App 里完成的事（典型是 `gh auth login --web`）：页面 `agent-open`
 会自己开，但**一次性码得 agent 在回复里告诉用户**；这种命令还要等用户操作，所以

@@ -29,21 +29,40 @@
 ## 3. 结构
 
 ```
-Rust 工具 browser ─┐
-                   ├─ Core::browser() ─ BrowserApi(uinffi) ─┐
-POST /api/browser ─┘                                        ├─ BrowserController.kt
-沙箱 `agent browser` ──(wget /api/browser)──────────────────┘   （无头 WebView）
+                                     ┌─ Core::browser() ─ BrowserApi(uinffi) ─┐
+POST /api/browser ───────────────────┤                                       ├─ BrowserController.kt
+沙箱 `agent browser` ─(wget)─────────┘                                       │   （无头 WebView）
 ```
 
 - **`BrowserHost`（uniffi callback）** 和 `DeviceHost`（无障碍）是**两条独立的路**。
   浏览器不需要无障碍权限，所以 `AgentApp.onCreate` 就注入了；设备那条要等服务连上。
-- **`POST /api/browser`** 直接跑一个动作（body 就是工具参数的形状）。
-  存在的理由：① `agent browser` 走它，于是 bash 能脚本化驱动浏览器；
+- **`POST /api/browser`** 是唯一的入口，body 就是动作（一个 `action` + 可选参数）。
+  ① `agent browser` 走它，于是 bash 能脚本化驱动浏览器；
   ② 走到一次工具调用要花一整轮 LLM，调试时不现实 —— 有个能直接打的入口，
   改一行 JS 就能立刻验。
-- **`browser` 工具**：`action` 枚举 + 可选参数。动作是
-  `navigate / get_backbone / get_readable / get_text / click / type / press / find_elements / scroll / screenshot / set_user_agent / back / wait_for_dom_stable / js`。
-  描述里写清"什么时候用它、什么时候 curl 更快"，这决定模型会不会用对。
+- **模型只有一个门：沙箱里的 `agent browser`**（`core/src/linux.rs` 的 `AGENT_CLI`）。
+  动作是 `navigate / get_backbone / get_readable / get_text / click / type / press /
+  find_elements / scroll / screenshot / set_user_agent / back / wait_for_dom_stable /
+  js / new_tab / list_tabs / switch_tab / close_tab`。
+
+  这里**曾经还有一个 `browser` 工具**（action 枚举 + 参数 schema），已经删了。
+  删的理由是实测，不是审美：真机上 23 个会话 377 次工具调用里，模型调
+  `agent browser` 56 次 vs `browser` 工具 26 次；在一个长会话里是 **45 : 3** ——
+  它跑过一次 `agent help` 发现有沙箱命令之后就再没回过头。差别在**轮次**：
+  一条 bash 能连做 2~6 个动作（`navigate && get_backbone 3 && click '#x'`），
+  工具那条一次只做一个，多步页面操作就是多轮完整 LLM 请求。
+
+  留着两条路的代价：前缀里多 2400 字（`browser` 一条占工具表 4495 字的 54%），
+  而且两处动作表会各自演化 —— 多标签那次提交（`0ab915e`）只改了工具和 Kotlin，
+  CLI 的 `case` 没跟上，于是 `agent browser new_tab "file:///…"` 走进兜底分支、
+  **把 URL 静默吃掉**，开出一只空白标签，模型以为页面开了、对着白屏截了三张图。
+  现在 CLI 每个动作的**参数个数上下限都校验**（少给 / 多给都报错）。
+
+  截图是删掉工具后唯一退化的点：以前 `browser` 工具会把图直接挂到工具结果上，
+  现在图落在 `/root/.browser/`，模型得自己 `read` —— 所以 `Core::browser()`
+  在截图返回的 `text` 里写了一句「用 read 看它」（写进 JSON 字段而不是另打一行，
+  免得 `| jq` / `| python3 -c json.load` 被打断）。实测模型本来就这么干（6 次截图
+  全是自己 read 回来的），所以这一轮不亏。
 
 ## 4. 无头 WebView 必须自己做的事
 
@@ -300,7 +319,7 @@ agent 在动作时右边一行小字「agent 操作中」；内容区上沿一�
 
 ## 13. 打开沙箱里的网页（以及它们的存储）
 
-AI 写了个静态网页，自己想看一眼：`browser` 的 `url` 直接给沙箱路径 ——
+AI 写了个静态网页，自己想看一眼：`agent browser navigate` 的 url 直接给沙箱路径 ——
 `sandbox:/workspace/site/index.html`（和回复里给用户的链接同一个写法），也认
 `sandbox:相对路径`、`file:///…` 和绝对路径 `/workspace/…`。`Core::browser` 把它换成
 `http://sandbox.localhost:<端口>/sandbox/<钥匙>/workspace/site/index.html` 交给

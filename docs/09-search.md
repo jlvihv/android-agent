@@ -72,7 +72,7 @@ curl -sS -H "x-agent-token: <token>" -H 'content-type: application/json' \
 要读全文是**另一件事**，让模型自己挑：
 
 - 静态页面 → `bash` 里的 `curl`
-- 要登录态 / JS 渲染 / 点按钮 → `browser` 打开那个链接（见 `docs/08`）
+- 要登录态 / JS 渲染 / 点按钮 → `agent browser navigate` 打开那个链接（见 `docs/08`）
 - 接口返回 JSON → `bash` 里 `curl … | jq`
 
 把十篇全文（几十 KB）塞进历史才是真浪费。

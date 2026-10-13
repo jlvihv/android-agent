@@ -289,7 +289,10 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #       get_text [选择器] | get_readable | scroll [up|down] [像素]
 #       screenshot [true=整页] | press Enter | find_elements <选择器> | user_agent mobile|desktop
 #       back | wait_for_dom_stable [秒] | js '<代码>'
-#     输出是核心给的原始 JSON；screenshot 把图存到 /root/.browser/。
+#       new_tab [url] | list_tabs | switch_tab <编号> | close_tab [编号]
+#     输出是核心给的原始 JSON。一条命令里可以连做多步（这是它比工具调用强的地方）：
+#       agent browser navigate <url> && agent browser get_backbone 3 && agent browser click '#x'
+#     截图落在 /root/.browser/，要 read 它才看得见（screenshot 的返回里会提醒）。
 #     其他参数直接给 JSON：agent browser '{"action":"click","x":100,"y":200}'
 #   agent search <检索意图> [条数]   联网搜索（Exa），拿标题 + 链接 + 片段
 #   agent get <path>         直接 GET 自己的接口（逃生口）
@@ -404,41 +407,90 @@ EOT
   get_text [选择器]                 读整页/某元素的文本（带导航页脚；文章用 get_readable）
   get_readable                     抽正文（文章页用这个）
   scroll [up|down] [像素]           滚动
-  screenshot [true]                截图（true = 整页）；存 /root/.browser/
+  screenshot [true]                截图（true = 整页）；存 /root/.browser/，用 read 看
   press <键名>                      按键：Enter（会提交表单）/Tab/Escape/方向键…
   find_elements <选择器>            列出匹配到的元素（个数 + 坐标，坐标可直接给 click）
+  new_tab [url]                    开一只新标签（不给 url 就是空白页）
+  list_tabs                        标签列表（含当前是哪一只）
+  switch_tab <编号>                 切到某只标签
+  close_tab [编号]                  关掉某只（不给编号 = 关当前这只）
   user_agent mobile|desktop        切 UA + 视口（会重载页面）
   back                             后退
   wait_for_dom_stable [秒]         等动态内容安定（默认 10）
   js '<代码>'                      在页面里跑一段 JS（可以 await）
+
+一条命令里可以连做多步（省轮次）：
+  agent browser navigate <url> && agent browser get_backbone 3 && agent browser click '#x'
+参数给不全 / 给多了都会报错，不会静默忽略 —— 少给一个 url 就等于开空白页。
 EOT
     }
+    # 纯数字参数（标签编号 / 超时秒数）：非数字直接报错，别拼出一段坏 JSON 给核心
+    int_arg() { case "${1:-}" in ''|*[!0-9]*) echo "agent browser $2：要一个数字，给的是「${1:-}」" >&2; exit 2 ;; esac; }
     case "$act" in
-      ""|help|-h|--help) usage; exit 2 ;;
+      help|-h|--help) usage; exit 0 ;;
+      "")             usage; exit 2 ;;
     esac
+
+    # 每个动作最多收几个参数，多给就报错。**静默扔掉参数**是这套 CLI 最坑人的错法
+    # （踩过：`agent browser new_tab URL` 把 URL 吃了、开出一只空白标签，模型以为
+    # 页面开了，对着白屏截了三张图 —— 见 docs/08-browser.md）。
+    max=1
+    case "$act" in
+      get_readable|back|list_tabs|tabs) max=0 ;;
+      type|scroll)                      max=2 ;;
+    esac
+    [ $# -le "$max" ] || { echo "agent browser ${act}：最多 $max 个参数，给了 $# 个" >&2; usage; exit 2; }
+
     # 参数长得复杂（要 x/y、要多个字段）就直接给 JSON：agent browser '{"action":…}'
     case "$act" in
-      navigate) body="{\"action\":\"navigate\",\"url\":\"$(esc "${1:-}")\"}" ;;
+      navigate)
+        [ -n "${1:-}" ] || { usage; exit 2; }
+        body="{\"action\":\"navigate\",\"url\":\"$(esc "$1")\"}" ;;
       get_backbone)
-        if [ -n "${1:-}" ]; then body="{\"action\":\"get_backbone\",\"max_depth\":$1}"; else body='{"action":"get_backbone"}'; fi ;;
-      click)    body="{\"action\":\"click\",\"selector\":\"$(esc "${1:-}")\"}" ;;
-      type)     body="{\"action\":\"type\",\"selector\":\"$(esc "${1:-}")\",\"text\":\"$(esc "${2:-}")\"}" ;;
+        if [ -n "${1:-}" ]; then int_arg "$1" get_backbone; body="{\"action\":\"get_backbone\",\"max_depth\":$1}"; else body='{"action":"get_backbone"}'; fi ;;
+      click)
+        [ -n "${1:-}" ] || { usage; exit 2; }
+        body="{\"action\":\"click\",\"selector\":\"$(esc "$1")\"}" ;;
+      type)
+        [ -n "${1:-}" ] && [ -n "${2:-}" ] || { usage; exit 2; }
+        body="{\"action\":\"type\",\"selector\":\"$(esc "$1")\",\"text\":\"$(esc "$2")\"}" ;;
       get_text)
         if [ -n "${1:-}" ]; then body="{\"action\":\"get_text\",\"selector\":\"$(esc "$1")\"}"; else body='{"action":"get_text"}'; fi ;;
       scroll)
-        if [ -n "${2:-}" ]; then body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\",\"amount\":$2}"; else body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\"}"; fi ;;
+        if [ -n "${2:-}" ]; then int_arg "$2" scroll; body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\",\"amount\":$2}"; else body="{\"action\":\"scroll\",\"direction\":\"${1:-down}\"}"; fi ;;
       screenshot)
-        if [ -n "${1:-}" ]; then body="{\"action\":\"screenshot\",\"full_page\":$1}"; else body='{"action":"screenshot"}'; fi ;;
-      back)       body='{"action":"back"}' ;;
+        case "${1:-}" in
+          ''|false) body='{"action":"screenshot"}' ;;
+          true)     body='{"action":"screenshot","full_page":true}' ;;
+          *)        echo "用法：agent browser screenshot [true]（true = 整页）" >&2; exit 2 ;;
+        esac ;;
+      back)         body='{"action":"back"}' ;;
       get_readable) body='{"action":"get_readable"}' ;;
-      press)      body="{\"action\":\"press\",\"key\":\"$(esc "${1:-}")\"}" ;;
-      find_elements|find) body="{\"action\":\"find_elements\",\"selector\":\"$(esc "${1:-}")\"}" ;;
-      user_agent|ua) body="{\"action\":\"set_user_agent\",\"user_agent\":\"$(esc "${1:-}")\"}" ;;
+      press)
+        [ -n "${1:-}" ] || { usage; exit 2; }
+        body="{\"action\":\"press\",\"key\":\"$(esc "$1")\"}" ;;
+      find_elements|find)
+        [ -n "${1:-}" ] || { usage; exit 2; }
+        body="{\"action\":\"find_elements\",\"selector\":\"$(esc "$1")\"}" ;;
+      user_agent|ua)
+        case "${1:-}" in mobile|desktop) ;; *) echo "用法：agent browser user_agent mobile|desktop" >&2; exit 2 ;; esac
+        body="{\"action\":\"set_user_agent\",\"user_agent\":\"$(esc "$1")\"}" ;;
       wait_for_dom_stable)
-        if [ -n "${1:-}" ]; then body="{\"action\":\"wait_for_dom_stable\",\"timeout\":$1}"; else body='{"action":"wait_for_dom_stable"}'; fi ;;
-      js)         body="{\"action\":\"js\",\"script\":\"$(esc "${1:-}")\"}" ;;
-      # 第一眼像 JSON 就原样发（复杂参数走这条）；否则当成不带参数的 action 名
-      \{*) body="$act" ;;
+        if [ -n "${1:-}" ]; then int_arg "$1" wait_for_dom_stable; body="{\"action\":\"wait_for_dom_stable\",\"timeout\":$1}"; else body='{"action":"wait_for_dom_stable"}'; fi ;;
+      js)
+        [ -n "${1:-}" ] || { usage; exit 2; }
+        body="{\"action\":\"js\",\"script\":\"$(esc "$1")\"}" ;;
+      new_tab)
+        if [ -n "${1:-}" ]; then body="{\"action\":\"new_tab\",\"url\":\"$(esc "$1")\"}"; else body='{"action":"new_tab"}'; fi ;;
+      list_tabs|tabs) body='{"action":"list_tabs"}' ;;
+      switch_tab)
+        int_arg "${1:-}" switch_tab
+        body="{\"action\":\"switch_tab\",\"tab\":$1}" ;;
+      close_tab)
+        if [ -n "${1:-}" ]; then int_arg "$1" close_tab; body="{\"action\":\"close_tab\",\"tab\":$1}"; else body='{"action":"close_tab"}'; fi ;;
+      # 第一眼像 JSON 就原样发（复杂参数走这条）
+      \{*) [ $# -eq 0 ] || { echo "JSON 形式后面不该再跟参数：$*" >&2; exit 2; }; body="$act" ;;
+      # 光杆动作名：核心自己会认（认不出它会回「未知动作」，比在这边猜好）
       *)   body="{\"action\":\"$(esc "$act")\"}" ;;
     esac
     post /api/browser "$body"
@@ -454,10 +506,15 @@ EOT
     post /api/websearch "$body"
     ;;
   help|-h|--help)
-    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,31p'
+    # 从第 2 行打到「端口从…」那行为止（那行是表头的结尾）。用哨兵行而不是
+    # 写死行号：以前是 '2,31p'，表头一改 help 就悄悄少印或多印几行。
+    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,/端口从/p'
     ;;
   *)
-    echo "不认识的子命令：$cmd（agent help）" >&2
+    # ⚠️ 变量后面紧跟中文标点时**必须**写 ${var}：沙箱里是 busybox ash，它不认
+    # UTF-8，会把全角字节当成变量名的一部分 —— 于是那个变量变成了一个不存在的
+    # 名字，set -u 下直接「unbound variable」退出 1，提示语永远打不出来。
+    echo "不认识的子命令：${cmd}（agent help）" >&2
     exit 2
     ;;
 esac
@@ -2448,6 +2505,12 @@ mod tests {
         assert!(body.contains("/api/debug/request"), "得能看自己的上下文");
         assert!(body.contains("/api/command"), "得能操作手机");
         assert!(body.contains("AGENT_PORT"), "端口从环境变量来");
+        // 浏览器现在是**唯一的门**（`browser` 工具删了），多标签那几个子命令
+        // 得在 —— 它们曾经只加在工具那边，CLI 没跟上，于是 `new_tab URL`
+        // 走进兜底分支把 URL 静默吃掉。
+        for sub in ["navigate", "new_tab", "list_tabs", "switch_tab", "close_tab"] {
+            assert!(body.contains(sub), "浏览器子命令 {sub} 掉了");
+        }
 
         #[cfg(unix)]
         {
@@ -2472,6 +2535,41 @@ mod tests {
         // 幂等：再跑一次不炸
         sb.prepare_rootfs().unwrap();
         let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    /// `$var` 后面**不能**紧跟中文标点，必须写 `${var}`。
+    ///
+    /// 沙箱里是 busybox ash，它不认 UTF-8：把它后面的全角字节当成变量名的
+    /// 一部分，于是 `$cmd（` 变成一个叫 `cmd（` 的变量、`set -u` 下
+    /// 「unbound variable」退出 1 —— 那句提示语永远打不出来（`agent frobnicate`
+    /// 就这么稢了很久，直到给 `agent browser` 加参数校验时才被碰出来）。
+    #[test]
+    fn agent_cli_braces_variables_before_multibyte() {
+        let b = AGENT_CLI.as_bytes();
+        let name = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut i = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        while i < b.len() {
+            let start_ok = b[i] == b'$'
+                && i + 1 < b.len()
+                && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_');
+            if start_ok {
+                let mut j = i + 1;
+                while j < b.len() && name(b[j]) {
+                    j += 1;
+                }
+                if j < b.len() && b[j] >= 0x80 {
+                    bad.push(String::from_utf8_lossy(&b[i..j]).into_owned());
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        assert!(
+            bad.is_empty(),
+            "这些变量后面紧跟多字节字符，沙箱的 ash 会把它当成变量名的一部分：{bad:?}"
+        );
     }
 
     /// 预装脚本也得写进去、可执行，而且**工具清单不能是空的**。
