@@ -14,6 +14,7 @@
 //! 安卓上由 Kotlin 实现，通过 UniFFI callback interface 注入（阶段 2）。
 
 pub mod agent;
+pub mod alpine;
 pub mod assets;
 /// 页面里注入的 JS：**只有一份**，手机（Kotlin 的 WebView）和桌面（CDP）都从
 /// 这儿取（见 `browser_js` 的模块说明）。
@@ -758,6 +759,7 @@ async fn refresh_capabilities(st: Arc<AppState>) {
 /// 安卓上这件事有坑：`serve()` 比 rootfs 解压**早**（解压在 Kotlin 的后台线程里），
 /// 所以这里先等沙箱就绪再动手 —— 空壳上跑 `apk` 只会失败。
 async fn provision_tools(st: Arc<AppState>) {
+    let mut recovered = false;
     for attempt in 0..90 {
         let Some(sb) = st.linux() else {
             if attempt == 0 {
@@ -765,6 +767,18 @@ async fn provision_tools(st: Arc<AppState>) {
             }
             return;
         };
+        // 上次 Alpine 升级没走完（App 中途被杀）：先换回快照，再干别的
+        if !recovered {
+            recovered = true;
+            if let Some(cfg) = sb.proot_config() {
+                let rootfs = cfg.rootfs.clone();
+                if let Ok(Some(msg)) =
+                    tokio::task::spawn_blocking(move || alpine::recover_interrupted(&rootfs)).await
+                {
+                    st.log("warn", msg);
+                }
+            }
+        }
         if !sb.is_ready() {
             // 安卓首次启动：rootfs 还在解压。等 2 秒再看（最多 3 分钟）
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;

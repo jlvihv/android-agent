@@ -232,6 +232,8 @@ pub struct AppState {
     pub model_lists: Mutex<HashMap<String, (std::time::Instant, Vec<crate::models::ModelInfo>)>>,
     /// 持久化目录（安卓上是 `<filesDir>`；桌面上为空则只存内存）
     pub data_dir: RwLock<Option<std::path::PathBuf>>,
+    /// 沙箱的 Alpine 升级（设置页里点的那个，见 `alpine`）
+    pub alpine: crate::alpine::Upgrader,
     /// 会话库。`set_data_dir` 时打开。
     pub db: RwLock<Option<Arc<Db>>>,
     /// 会话已经从库里读进内存了。
@@ -298,6 +300,7 @@ impl AppState {
             providers: RwLock::new(Default::default()),
             model_lists: Mutex::new(HashMap::new()),
             data_dir: RwLock::new(None),
+            alpine: Default::default(),
             sessions_loaded: AtomicBool::new(false),
             turns: Mutex::new(HashMap::new()),
             auth: RwLock::new(Auth {

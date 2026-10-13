@@ -19,6 +19,10 @@ abis  := env_var_or_default("AGENT_ABIS", "arm64-v8a")
 mod   := and / "app"
 jni   := mod / "src/main/jniLibs"
 assets := mod / "src/main/assets"
+# 打进 APK 的 Alpine minirootfs 版本（只影响**新装**：已经装过的手机不会重解，
+# 它们在 设置 → Linux 沙箱 里原地升级，见 core/src/alpine.rs）
+alpine := "3.24.2"
+alpine_branch := "v" + replace_regex(alpine, '\.[0-9]+$', '')
 
 # NDK：从 SDK 里挑版本号最高的那个，避免依赖环境变量
 # SDK：Linux 上习惯放 ~/Android/Sdk，macOS 上 Android Studio 默认放 ~/Library/Android/sdk
@@ -214,7 +218,7 @@ linux-setup:
     d=.dev/linux
     mkdir -p "$d"
     [ -f "$d/alpine-minirootfs.tar.gz" ] || curl -sSL -o "$d/alpine-minirootfs.tar.gz" \
-      https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz
+      https://dl-cdn.alpinelinux.org/alpine/{{alpine_branch}}/releases/x86_64/alpine-minirootfs-{{alpine}}-x86_64.tar.gz
     [ -d "$d/rootfs" ] || { mkdir -p "$d/rootfs"; tar xzf "$d/alpine-minirootfs.tar.gz" -C "$d/rootfs"; }
     echo "rootfs 就绪: $d/rootfs"
     command -v proot >/dev/null || echo "⚠️  没装 proot（Arch: sudo pacman -S proot-git）"
@@ -287,10 +291,18 @@ android-assets:
     OM="${OPENMINIS_DIR:-$HOME/Code/lib/OpenMinis}/src/android/app/src/main"
     mkdir -p "{{assets}}" "{{jni}}/arm64-v8a"
 
-    # Alpine rootfs：从官方源下载（aarch64）
-    if [ ! -f "{{assets}}/alpine-minirootfs.tar.gz" ]; then
-      curl -sSL -o "{{assets}}/alpine-minirootfs.tar.gz" \
-        https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz
+    # Alpine rootfs：从官方源下载（aarch64）。
+    #
+    # 版本戳放在 assets/ **外面**（assets/ 里的东西都会被打进 APK）：只判文件
+    # 在不在的话，改了上面的 `alpine` 也永远是旧包。顺手清掉别的名字的旧包
+    # （AAPT 解过一层的 `.tar`）—— 两份都在的话 APK 里就带了两个 rootfs。
+    stamp=.dev/alpine-asset-version
+    if [ ! -f "{{assets}}/alpine-minirootfs.tar.gz" ] || [ "$(cat "$stamp" 2>/dev/null)" != "{{alpine}}" ]; then
+      rm -f "{{assets}}"/alpine-minirootfs.tar*
+      curl -fsSL --retry 5 --retry-all-errors -o "{{assets}}/alpine-minirootfs.tar.gz" \
+        https://dl-cdn.alpinelinux.org/alpine/{{alpine_branch}}/releases/aarch64/alpine-minirootfs-{{alpine}}-aarch64.tar.gz
+      mkdir -p .dev && echo "{{alpine}}" > "$stamp"
+      echo "Alpine minirootfs {{alpine}} 已下载"
     fi
 
     # proot + ELF loader：必须住在 nativeLibraryDir（Android 10+ 的 W^X

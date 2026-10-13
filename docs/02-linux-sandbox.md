@@ -464,6 +464,41 @@ gh 的设备码页是它自己 print 出来的（不是所有 CLI 都会去调�
 > 现在它们不作为工具暴露给模型了 —— 以后收进沙箱里的一个命令、由 `linux_run`
 > （现名 `bash`）调用，这样模型只需要理解 shell，工具表也只有两个。
 
+### 升级 Alpine：设置里点一下，原地升级
+
+> 落地日期：2026-10-14。真机（Pixel 10）上从 3.21.0 手动升到 3.24.2，再用这个功能
+> 从 3.23.6 升到 3.24.2，并专门测过一次「验收不过 → 换回」。
+
+APK 里带的 minirootfs 只在**第一次安装**时解压（`RootfsInstaller` 只认格式版本号
+`FORMAT`，不认 Alpine 版本）。换成新版本的包对已经装过的手机**没有任何作用**；
+而要是为了升级去改 `FORMAT`，效果是删掉整个 rootfs 重新解压 —— `/root`（`gh` 的
+登录态、`.gitconfig`、模型建的项目）和后来 `apk add` 的包全没了。`/workspace` 是
+手机存储里的 `Agent/`，不受影响，但光它不够。
+
+所以升级走 Alpine 官方的**原地升级**：改 `/etc/apk/repositories` 里的 `/v3.xx/`，
+然后 `apk update && apk upgrade --available`。实现在 `core/src/alpine.rs`，
+界面是 设置 → Linux 沙箱（`SandboxSection.svelte`），接口是
+`GET /api/alpine[?check=1]`、`POST /api/alpine/upgrade`。
+
+| 步骤 | 做什么 | 为什么这样 |
+|---|---|---|
+| 前置 | proot 沙箱才有；没有回合在跑；剩余空间 ≥ rootfs + 600MB | 宿主模式没有 Alpine；快照要一整份空间 |
+| 快照 | 在**沙箱外面**把 rootfs 复制成 `alpine-rootfs.upgrade-bak`，复制完才写标记 | 在沙箱里 tar 不行：升级把 musl 弄坏的话沙箱里什么都跑不了，tar 也解不回来；换目录不依赖沙箱还能不能用 |
+| 改源 | 只换 `/v<数字>.<数字>/` 这一段，镜像域名、注释不动 | 一行都没换到（`edge` / 自定义源）就拒绝，交给人 |
+| 升级 | `apk update && apk upgrade --available`，输出实时进进度日志 | 实测 3.21 → 3.24：178 个包、3 分 20 秒 |
+| 验收 | `/etc/alpine-release` 到了目标分支且不比目标旧；`sh` / `apk` / `bash` 真能跑 | **不看 apk 的退出码**：proot 下 trigger 常报非零（降级那次就是 `1 error`，包都装好了） |
+| 收尾 | 过了删快照；没过：升坏的先挪开（瞬间）、快照换回去、再删 | |
+
+两个兜底：
+
+- **升级期间沙箱拒绝别的命令**（`LinuxSandbox::set_maintenance`，模型那边看到
+  「沙箱正在升级 Alpine」）。升级自己的命令走 `run_maintenance`。
+- **App 在升级中途被杀**：下次启动 `provision_tools` 先跑 `recover_interrupted` ——
+  快照还在就换回去（快照没复制完就只清掉半份，沙箱本来就没动过）。
+
+跨大版本要知道的：**Python 的小版本会跟着变**（3.21 → 3.24 是 3.12 → 3.14），
+`/root` 里用旧 Python 建的 venv 会失效，得重建；`node` 也从 22 跳到了 24。
+
 ### 决策点
 
 | # | 决策 | 选项 | 倾向 |

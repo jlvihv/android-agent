@@ -14,7 +14,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | `web/` Svelte | ✅ 构建通过（57 KB JS / 21 KB gzip） |
 | `android/` 壳 | ✅ **真机验证通过** |
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
-| Linux 沙箱 | ✅ **Alpine 3.21 aarch64 在真机上跑起来**，`apk add` 可用 |
+| Linux 沙箱 | ✅ **Alpine 3.24 aarch64 在真机上跑起来**，`apk add` 可用；设置里能一键原地升级 Alpine |
 | 桌面宿主模式 | ✅ `just dev-host`：不套沙箱，`bash`/`read`/`edit` 直接作用在这台机器上；**Linux 和 macOS** 都行（[docs/11](docs/11-host-mode.md)） |
 | 桌面浏览器 | ✅ 核心**自己起**无头 Chrome（CDP），`agent browser` 在桌面上也能用（[docs/08](docs/08-browser.md) 第 15 节） |
 | 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI（读 UI 树那套已删，见下） |
@@ -30,7 +30,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 # 1. 准备 Linux 沙箱（x86_64，用于桌面开发）
 mkdir -p .dev/linux && cd .dev/linux
 curl -sSL -o alpine-minirootfs.tar.gz \
-  https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz
+  https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.2-x86_64.tar.gz
 mkdir -p rootfs && tar xzf alpine-minirootfs.tar.gz -C rootfs
 cd ../..
 

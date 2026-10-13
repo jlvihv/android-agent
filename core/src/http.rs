@@ -29,6 +29,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/command", post(post_command))
         .route("/api/linux", post(bash_run))
         .route("/api/procs", get(list_procs))
+        .route("/api/alpine", get(alpine_status))
+        .route("/api/alpine/upgrade", post(alpine_upgrade))
         .route("/api/browser", post(browser_action))
         .route("/api/websearch", post(web_search))
         .route("/api/websearch/config", post(set_search_config))
@@ -322,6 +324,92 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
 /// 靠 `ps` 自己认不出来），也才能在 /proc 被 hidepid 限制的机器上诚实地说
 /// 「看不见」。见 `linux::LinuxSandbox::procs`。
 ///
+#[derive(Deserialize)]
+struct AlpineQuery {
+    /// 顺手问一次官方最新版（要联网；不给就只回缓存的）
+    #[serde(default)]
+    check: Option<u8>,
+}
+
+/// `GET /api/alpine` → 沙箱的 Alpine 版本、最新版、升级任务的进度（设置页用）。
+///
+/// `available: false` = 没有可升级的 Alpine（宿主模式 / 沙箱还没起来）。
+async fn alpine_status(State(st): State<Arc<AppState>>, Query(q): Query<AlpineQuery>) -> Response {
+    let job = st.alpine.job();
+    let Some(rootfs) = st
+        .linux()
+        .and_then(|sb| sb.proot_config().map(|c| c.rootfs.clone()))
+    else {
+        return Json(json!({ "available": false, "job": job })).into_response();
+    };
+    let current = crate::alpine::installed_version(&rootfs);
+    let arch = crate::alpine::arch(&rootfs);
+    let mut check_error = None;
+    let latest = if q.check == Some(1) {
+        match crate::alpine::fetch_latest(&st.alpine, &arch).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                check_error = Some(format!("{e:#}"));
+                st.alpine.cached_latest()
+            }
+        }
+    } else {
+        st.alpine.cached_latest()
+    };
+    let upgradable = match (&latest, &current) {
+        (Some(l), Some(c)) => crate::alpine::is_newer(l, c),
+        _ => false,
+    };
+    Json(json!({
+        "available": true,
+        "current": current,
+        "arch": arch,
+        "latest": latest,
+        "upgradable": upgradable,
+        "checkError": check_error,
+        "job": job,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct AlpineUpgradeBody {
+    /// 目标版本（如 `3.24.2`）；不给就升到官方最新的稳定版
+    #[serde(default)]
+    to: Option<String>,
+}
+
+/// `POST /api/alpine/upgrade` → 在后台开始升级（立刻返回；进度看 `GET /api/alpine`）。
+async fn alpine_upgrade(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<AlpineUpgradeBody>>,
+) -> Response {
+    let Some(sb) = st.linux() else {
+        return (StatusCode::CONFLICT, "沙箱还没起来").into_response();
+    };
+    let (rootfs, from) = match crate::alpine::precheck(&st, &sb) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::CONFLICT, e).into_response(),
+    };
+    let to = match body.and_then(|b| b.0.to) {
+        Some(v) => v,
+        None => match crate::alpine::fetch_latest(&st.alpine, &crate::alpine::arch(&rootfs)).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("查不到最新版本：{e:#}")).into_response()
+            }
+        },
+    };
+    if !crate::alpine::is_newer(&to, &from) {
+        return (StatusCode::CONFLICT, format!("已经是 {from}，不比 {to} 旧")).into_response();
+    }
+    if !st.alpine.try_begin(&from, &to) {
+        return (StatusCode::CONFLICT, "已经在升级了").into_response();
+    }
+    tokio::spawn(crate::alpine::run(st.clone(), sb, rootfs, from.clone(), to.clone()));
+    Json(json!({ "ok": true, "from": from, "to": to })).into_response()
+}
+
 /// `?format=text` 直接回排好版的文字（沙箱里的 `agent ps` 就走这条，
 /// 跟 `/api/websearch` 一个路数），否则回 JSON。
 #[derive(Deserialize)]

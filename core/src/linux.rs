@@ -915,6 +915,10 @@ pub struct LinuxSandbox {
     agent_token: std::sync::RwLock<Option<String>>,
     /// 起过的命令（`agent ps` 用，见 `RunRegistry`）。
     runs: Mutex<RunRegistry>,
+    /// 维护中（Alpine 升级，见 `alpine`）：别的命令一律拒，只有升级自己的
+    /// 命令走 `run_maintenance`。一边换 musl 一边跑模型的命令，两边都可能拿到
+    /// 半新半旧的库。
+    maintenance: std::sync::atomic::AtomicBool,
 }
 
 /// 沙箱里的 `agent` 命令。
@@ -1465,6 +1469,7 @@ impl LinuxSandbox {
             agent_port: AtomicU16::new(0),
             agent_token: std::sync::RwLock::new(None),
             runs: Mutex::new(RunRegistry::default()),
+            maintenance: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2171,6 +2176,34 @@ impl LinuxSandbox {
     /// 同 `run`，但把输出**边跑边**交给 `live`（stdout/stderr 按到达顺序混在一起）。
     /// 给前端实时显示用；最终结果照样完整返回。
     pub async fn run_live(
+        &self,
+        script: &str,
+        timeout: Duration,
+        live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> anyhow::Result<ExecResult> {
+        anyhow::ensure!(
+            !self.maintenance.load(Ordering::Relaxed),
+            "沙箱正在升级 Alpine（设置 → Linux 沙箱），这期间不能跑命令；几分钟后再试"
+        );
+        self.exec(script, timeout, live).await
+    }
+
+    /// 进入 / 退出维护状态（见 `maintenance` 字段）。
+    pub fn set_maintenance(&self, on: bool) {
+        self.maintenance.store(on, Ordering::Relaxed);
+    }
+
+    /// 维护期间自己的命令（`apk upgrade`、验收）：不受 `maintenance` 拦。
+    pub(crate) async fn run_maintenance(
+        &self,
+        script: &str,
+        timeout: Duration,
+        live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> anyhow::Result<ExecResult> {
+        self.exec(script, timeout, live).await
+    }
+
+    async fn exec(
         &self,
         script: &str,
         timeout: Duration,

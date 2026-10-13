@@ -19,13 +19,15 @@
   /**
    * 设置页。从抽屉左下角的齿轮、或者选择模型面板里「模型提供商」页最下面的「管理模型提供商」进来。
    *
-   * 现在只有「模型提供商」一栏：内置几家服务商，每家只填 API Key；Base URL、
+   * 两栏：「模型提供商」和「Linux 沙箱」（Alpine 版本 / 升级，见 SandboxSection；
+   * 桌面宿主模式下没有这一栏）。模型提供商：内置几家服务商，每家只填 API Key；Base URL、
    * 协议都内置好了，模型清单自动拉（见 core/src/providers.rs）。几家可以
    * 同时配好，在选择模型面板里点哪家的模型就切到哪家。
    */
   import Icon from './Icon.svelte';
   import Page from './Page.svelte';
   import ProviderPage from './ProviderPage.svelte';
+  import SandboxSection from './SandboxSection.svelte';
   import { store } from '../lib/store.svelte.ts';
 
   let { onclose }: { onclose: () => void } = $props();
@@ -86,6 +88,8 @@
     每家只要填 API Key，模型清单会自动拉。几家可以同时配好，在「选择模型」里点哪家的模型就用哪家。
     Key 只存在这台手机上，也只发给对应的服务商。
   </p>
+
+  <SandboxSection />
 </Page>
 
 {#if open}
