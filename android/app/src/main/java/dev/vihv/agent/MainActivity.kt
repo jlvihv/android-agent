@@ -31,8 +31,13 @@ import android.widget.TextView
  * - 是 secure context，`crypto.subtle` / Service Worker 都能用
  * - 开发期只要把 Vite 的地址换上去就能热更新
  *
- * 明文流量由 `res/xml/network_security_config.xml` 给 loopback 开了例外，
+ * 明文流量由 `res/xml/network_security_config.xml` 放行，
  * 否则 Android 9+ 会直接报 ERR_CLEARTEXT_NOT_PERMITTED。
+ *
+ * **也能连电脑上的核心**（设置 → 连接电脑）：电脑上 `just dev-lan`，把它打出来
+ * 的地址粘进来，这个 WebView 就改加载那台电脑 —— 界面一样，命令跑在电脑上。
+ * 选择记在 SharedPreferences 里（下次启动直接连）；连不上时给原生的错误页，
+ * 能「重试」或「回到手机」。手机自己的核心照常在后台跑着，切回来是瞬间的。
  */
 class MainActivity : Activity() {
 
@@ -42,6 +47,8 @@ class MainActivity : Activity() {
         private const val KEY_ASKED_A11Y = "asked_accessibility"
         private const val KEY_ASKED_FILES = "asked_all_files"
         private const val KEY_ASKED_NOTIF = "asked_notifications"
+        /** 连着的电脑核心的地址（`http://192.168.x.x:8787/auth?t=…`）；没有 = 用手机自己的 */
+        private const val KEY_REMOTE = "remote_core"
         private const val REQ_STORAGE = 2
         /** 页面 `<input type=file>` 选文件 */
         private const val REQ_FILE = 3
@@ -73,6 +80,13 @@ class MainActivity : Activity() {
     /** 浏览器看板（agent 那只无头 WebView 的观察窗口）。见 BrowserPanel */
     private var panel: BrowserPanel? = null
 
+    /** WebView + 看板那一层（出错时会被错误页换下去，恢复时换回来） */
+    private var root: View? = null
+    /** 手机自己的核心的端口 */
+    private var localPort = 0
+    /** 下一次页面加载完就清掉历史：切换核心之后，返回键不该退回另一台的页面 */
+    private var clearHistoryOnLoad = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         edgeToEdge()
@@ -80,10 +94,13 @@ class MainActivity : Activity() {
         WebView.setWebContentsDebuggingEnabled(isDebuggable())
 
         val port = AgentApp.port
-        if (port == 0) {
+        localPort = port
+        if (port == 0 && remoteUrl() == null) {
             setContentView(errorView("核心没起来。看 logcat 里 AgentApp 的报错。"))
         } else {
-            setContentView(buildRoot(buildWebView(port)))
+            val r = buildRoot(buildWebView(port))
+            root = r
+            setContentView(r)
         }
 
         // 头部的地球按钮只在 agent 真开着浏览器时才显示。状态在壳这边
@@ -210,7 +227,8 @@ class MainActivity : Activity() {
      * 的时候状态变了**（agent 第一次开页面 / 把标签关光）。
      */
     private fun pushBrowserAvailable() {
-        val on = AgentApp.browser?.hasPage() == true
+        // 连着电脑时 agent 的浏览器在电脑上，手机这只跟它无关
+        val on = remoteUrl() == null && AgentApp.browser?.hasPage() == true
         web?.evaluateJavascript(
             "window.__browserAvailable && window.__browserAvailable($on)",
             null,
@@ -268,12 +286,17 @@ class MainActivity : Activity() {
             ): Boolean {
                 val uri = request?.url ?: return false
                 if (uri.host == "127.0.0.1" && uri.port == port) return false
+                if (isRemoteCore(uri)) return false
                 openExternally(uri)
                 return true
             }
 
 
             override fun onPageFinished(view: WebView?, url: String?) {
+                if (clearHistoryOnLoad) {
+                    clearHistoryOnLoad = false
+                    view?.clearHistory()
+                }
                 // 页面自己挂载时也会问一次，这里防的是「状态刚好在页面加载那
                 // 一下变了」：补推一次，删掉也不会错，只是少一层保险。
                 pushBrowserAvailable()
@@ -287,6 +310,11 @@ class MainActivity : Activity() {
                 // 只关心主文档的失败，子资源失败不该盖掉页面
                 if (request?.isForMainFrame == true) {
                     Log.e(TAG, "主文档加载失败: ${error?.description}")
+                    val remote = remoteUrl()
+                    if (remote != null) {
+                        setContentView(remoteErrorView(remote, error?.description?.toString()))
+                        return
+                    }
                     setContentView(
                         errorView(
                             "加载 http://127.0.0.1:$port 失败\n${error?.description}\n\n" +
@@ -382,14 +410,105 @@ class MainActivity : Activity() {
             }
         }
 
-        // 先过 /auth：核心种上 HttpOnly cookie，再跳回首页。之后页面的
-        // fetch / WebSocket / <img> 都自动带着凭据，页面里的 JS 也读不到它。
-        val t = AgentApp.token
-        w.loadUrl(
-            if (t != null) "http://127.0.0.1:$port/auth?t=$t" else "http://127.0.0.1:$port",
-        )
         web = w
+        w.loadUrl(remoteUrl() ?: localUrl())
         return w
+    }
+
+    // -----------------------------------------------------------------------
+    // 手机自己的核心 / 电脑上的核心
+    // -----------------------------------------------------------------------
+
+    /**
+     * 手机自己的核心。先过 /auth：核心种上 HttpOnly cookie，再跳回首页。之后页面的
+     * fetch / WebSocket / <img> 都自动带着凭据，页面里的 JS 也读不到它。
+     */
+    private fun localUrl(): String {
+        val t = AgentApp.token
+        return if (t != null) "http://127.0.0.1:$localPort/auth?t=$t" else "http://127.0.0.1:$localPort"
+    }
+
+    private fun remoteUrl(): String? =
+        getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_REMOTE, null)?.takeIf { it.isNotBlank() }
+
+    /** 这个地址是不是连着的那台电脑（同 scheme / host / port 的都留在 WebView 里） */
+    private fun isRemoteCore(uri: Uri): Boolean {
+        val r = remoteUrl()?.let(Uri::parse) ?: return false
+        return uri.scheme == r.scheme && uri.host == r.host && portOf(uri) == portOf(r)
+    }
+
+    private fun portOf(u: Uri): Int = if (u.port != -1) u.port else if (u.scheme == "https") 443 else 80
+
+    /** 切到某个地址（换核心）：错误页要是在上面先换回来，历史也清掉 */
+    private fun switchTo(url: String) {
+        val w = web ?: return
+        root?.let { if (it.parent == null) setContentView(it) }
+        clearHistoryOnLoad = true
+        panel?.hide()
+        w.loadUrl(url)
+        pushBrowserAvailable()
+    }
+
+    private fun useLocalCore() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_REMOTE).apply()
+        Log.i(TAG, "回到手机自己的核心")
+        switchTo(localUrl())
+    }
+
+    /**
+     * 页面要连某台电脑：**先弹原生确认框**。
+     *
+     * 为什么必须确认：`addJavascriptInterface` 注入的对象**每个 frame 都看得见**，
+     * 包括查看器里 AI 写的网页（iframe）。不确认的话，那种网页一句
+     * `AgentHost.connectRemote("http://…")` 就能把整个 App 带到别人的服务器上。
+     * 对话框是原生的，网页画不出来、也点不了。
+     */
+    private fun confirmConnect(raw: String) {
+        val uri = runCatching { Uri.parse(raw.trim()) }.getOrNull()
+        if (uri == null || (uri.scheme != "http" && uri.scheme != "https") || uri.host.isNullOrEmpty()) {
+            android.widget.Toast.makeText(this, "地址不对：要 http://电脑IP:端口/auth?t=… 那一整行", android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+        val where = "${uri.host}:${portOf(uri)}"
+        android.app.AlertDialog.Builder(this)
+            .setTitle("连接到电脑？")
+            .setMessage(
+                "$where\n\n之后界面、命令、文件都在那台电脑上（明文 HTTP，只在自己信得过的 Wi-Fi 里用）。" +
+                    "随时可以在 设置 → 连接电脑 里回到手机。",
+            )
+            .setPositiveButton("连接") { _, _ ->
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_REMOTE, uri.toString()).apply()
+                Log.i(TAG, "连接电脑上的核心：$where")
+                switchTo(uri.toString())
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 电脑连不上：说清楚，给「重试」和「回到手机」两条路（不然只能清数据） */
+    private fun remoteErrorView(url: String, why: String?): View {
+        val host = runCatching { Uri.parse(url).let { "${it.host}:${portOf(it)}" } }.getOrDefault(url)
+        val box = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(64, 200, 64, 64)
+            setBackgroundColor(getColor(R.color.ink))
+        }
+        box.addView(
+            TextView(this).apply {
+                text = "连不上电脑 $host\n${why.orEmpty()}\n\n" +
+                    "电脑上的 `just dev-lan` 还开着吗？手机和电脑在同一个 Wi-Fi 里吗？"
+                setTextColor(Color.parseColor("#e0e0e0"))
+                textSize = 15f
+            },
+        )
+        fun button(label: String, onClick: () -> Unit) = android.widget.Button(this).apply {
+            text = label
+            isAllCaps = false
+            setOnClickListener { onClick() }
+        }
+        box.addView(button("重试") { switchTo(url) })
+        box.addView(button("回到手机") { useLocalCore() })
+        return box
     }
 
     /**
@@ -622,7 +741,19 @@ class MainActivity : Activity() {
          * 同步返回一个 boolean，不碰 UI，所以不用回主线程。
          */
         @JavascriptInterface
-        fun hasBrowser(): Boolean = AgentApp.browser?.hasPage() == true
+        fun hasBrowser(): Boolean = remoteUrl() == null && AgentApp.browser?.hasPage() == true
+
+        /** 设置 → 连接电脑 → 连接。会先弹原生确认框（见 [confirmConnect]） */
+        @JavascriptInterface
+        fun connectRemote(url: String) {
+            runOnUiThread { confirmConnect(url) }
+        }
+
+        /** 设置 → 连接电脑 → 回到手机。没有风险，不用确认 */
+        @JavascriptInterface
+        fun useLocal() {
+            runOnUiThread { useLocalCore() }
+        }
     }
 
     private fun registerBackCallback() {

@@ -50,9 +50,26 @@ type BackHost = {
   openBrowser?: () => void;
   /** agent 现在有没有开着的浏览器页面（头部的地球按钮据此显隐）。同步返回 */
   hasBrowser?: () => boolean;
+  /** 改连电脑上的核心（壳会先弹原生确认框）。见 MainActivity.confirmConnect */
+  connectRemote?: (url: string) => void;
+  /** 回到手机自己的核心 */
+  useLocal?: () => void;
 };
 const host = (): BackHost | undefined =>
   (globalThis as { AgentHost?: BackHost }).AgentHost;
+
+/** 在 App 里吗（能在手机核心 / 电脑核心之间切）。桌面浏览器、手机浏览器上都没有壳 */
+export function canSwitchCore(): boolean {
+  return typeof host()?.connectRemote === 'function';
+}
+
+export function connectRemoteCore(url: string): void {
+  host()?.connectRemote?.(url);
+}
+
+export function useLocalCore(): void {
+  host()?.useLocal?.();
+}
 
 /** 头部的地球按钮调它。桌面（没有壳）上什么都不做。 */
 export function openAgentBrowser(): void {

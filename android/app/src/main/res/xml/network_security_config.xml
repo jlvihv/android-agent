@@ -5,12 +5,16 @@
   Android 9 (API 28) 起默认禁止明文 HTTP，包括 loopback。不给例外的话
   WebView 加载会直接失败，报 ERR_CLEARTEXT_NOT_PERMITTED。
   实测确认过：这个例外是必需的，不是保险起见。
+
+  为什么是整体放开（base-config），不再只列 127.0.0.1 / localhost：
+  App 能连**电脑上的核心**（设置 → 连接电脑，电脑上 `just dev-lan`），那是
+  `http://192.168.x.x:8787` 这种局域网地址 —— 而 network-security-config 只能
+  按域名列例外，写不了「整个私有网段」。
+
+  影响面：只管 Java / WebView 这一层（Rust 核心的出站请求走自己的 rustls，
+  不受它管）。副作用是 agent 的浏览器（BrowserController）也能打开 http 网站，
+  这本来就该能。
 -->
 <network-security-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <!-- includeSubdomains：沙箱里的网页在 sandbox.localhost 上（独立的源，
-             见 core 的 http.rs），Chromium 把 *.localhost 直接解析到 loopback -->
-        <domain includeSubdomains="true">localhost</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

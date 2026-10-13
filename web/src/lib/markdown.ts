@@ -328,7 +328,7 @@ export function sandboxPath(guestPath: string): string {
  * 留在同源（拉文本要读响应，跨源还得配 CORS）。
  */
 /** 这个主机名是不是本机（App 的 WebView、电脑上的浏览器、Vite 开发服务器） */
-function isLoopbackHost(h: string): boolean {
+export function isLoopbackHost(h: string): boolean {
   return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
 }
 

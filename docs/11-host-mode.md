@@ -191,6 +191,26 @@ just dev-lan       # = dev-host + AGENT_BIND=0.0.0.0
 连时系统挑哪张网卡」那个办法：开着 Clash 之类 TUN 模式的机器上挑中的是虚拟网卡
 （198.18.x.x），手机连不到 —— 实测就是这么打出过一个错地址。
 
+### 在 App 里切（不用手机浏览器）
+
+App 的 **设置 → 连接电脑**：粘贴上面那行地址 → 连接 → **原生确认框**里点连接，
+整个 App 就改连那台电脑（`MainActivity` 的 WebView 改加载它）；同一栏里有「回到
+手机」。选择记在壳的 SharedPreferences 里，下次启动直接连；连不上时是原生错误页，
+有「重试」和「回到手机」。手机自己的核心一直在后台，回去是瞬间的。
+
+几处要知道的：
+
+- **为什么要原生确认框**：`addJavascriptInterface` 注入的 `AgentHost` 在**每个
+  frame** 里都看得见，包括查看器里 AI 写的网页（iframe）。不确认的话那种网页一句
+  `AgentHost.connectRemote("http://…")` 就能把 App 带到别人的服务器上；原生对话框
+  网页画不出来、也点不了。「回到手机」没有风险，不确认。
+- **明文 HTTP 整体放开了**（`network_security_config.xml` 的 `base-config`）：
+  局域网地址没法按域名列例外。只影响 Java / WebView 这层（Rust 核心出站走自己的
+  rustls）；顺带 agent 的浏览器也能开 http 网站了。
+- 连着电脑时头部的地球按钮（看 agent 的浏览器）不显示：那时 agent 的浏览器在电脑上，
+  手机这只跟它无关。
+- 切换后清掉 WebView 的历史，返回键不会退回另一台的页面。
+
 代价：**明文 HTTP**，`t=` 就是钥匙，Wi-Fi 上能抓包的人能拿到它（等于拿到这台电脑的
 shell）。只在自己信得过的网络里用；在外面要连回家里的电脑，走 Tailscale / WireGuard
 这类加密隧道，别把端口暴露到公网。
