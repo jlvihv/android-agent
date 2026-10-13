@@ -168,6 +168,39 @@ fn desktop_data_dir(host: bool) -> Option<std::path::PathBuf> {
     host.then(|| desktop::data_root().join("data"))
 }
 
+/// 核心的线程预算（所有设备一套参数）。
+///
+/// 为什么封顶：桌面默认按 CPU 核数开 worker（这台机器 32 核 → 33 个线程），
+/// 而核心里几乎全是**等 IO** 的活（等 LLM 吐字、等端口、等 HTTP）—— 32 个
+/// worker 一个也不会多干活，只是白占着栈和调度器。手机更没必要。
+///
+/// 账：`1`（跑 runtime 的那个线程：桌面上是 main，安卓上是 `agent-core-rt`）、
+/// `WORKERS`（worker）、`BLOCKING`（阻塞池上限）三项加起来不超过
+/// `RUNTIME_THREAD_BUDGET`，还留一个余量。阻塞池里的活是 sqlite 落盘/加载、
+/// 附件写入、图片解码、`read`、bash 工具、CDP —— 同时占满不太可能（一个回合里
+/// 工具是串行跑的、落盘 2 秒一次），真占满了就排队，不会出错。
+pub const RUNTIME_THREAD_BUDGET: usize = 10;
+const WORKERS: usize = 4;
+const BLOCKING: usize = 4;
+
+/// 账算不平就别让它编过（编译期断言，不是测试 —— 这个式子没有任何运行时输入）。
+const _: () = assert!(
+    1 + WORKERS + BLOCKING <= RUNTIME_THREAD_BUDGET,
+    "线程预算超了：1（runtime 线程）+ WORKERS + BLOCKING 必须 ≤ RUNTIME_THREAD_BUDGET"
+);
+
+/// 核心的 tokio runtime —— **桌面和安卓共用这一个构造**。
+///
+/// 别再回到 `#[tokio::main]` / 各写一份 `new_multi_thread()`：那样线程数就
+/// 跟着 CPU 核数或某个平台的写法跑了（手机 2 个、桌面 32 个）。
+pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
+        .max_blocking_threads(BLOCKING)
+        .enable_all()
+        .build()
+}
+
 impl Core {
     pub fn new() -> Self {
         Self {
@@ -333,7 +366,7 @@ impl Core {
     ///
     /// 图片（`ReadResult::Image`）已经解码/缩放好、可以直接内联；
     /// 其余是带 offset/limit/numbered/截断提示的文本。和 `edit_file` 一样是同步
-    /// 本地 I/O，包一层 `spawn_blocking` 免得占住 tokio 的 worker（只有 2 个）。
+    /// 本地 I/O，包一层 `spawn_blocking` 免得占住 tokio 的 worker（只有 `WORKERS` 个）。
     pub async fn read_any(
         &self,
         path: &str,
@@ -457,7 +490,7 @@ impl Core {
             .and_then(|g| g.clone())
             .map(|d| d.join("images"))
             .unwrap_or_else(|| std::env::temp_dir().join("android-agent-images"));
-        // 写盘是阻塞 I/O，几 MB 也会占住一个 worker（runtime 只有 2 个）
+        // 写盘是阻塞 I/O，几 MB 也会占住一个 worker（只有 `WORKERS` 个）
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("建图片目录失败: {e}"))?;
             let ext = match mime.as_str() {
@@ -574,7 +607,7 @@ impl Core {
     }
 
     /// 新建一个文件（`edit` 工具的 create 模式）。同步本地 I/O，同 `edit_file`
-    /// 包一层 `spawn_blocking`，免得占住 tokio 的 worker（只有 2 个）。
+    /// 包一层 `spawn_blocking`，免得占住 tokio 的 worker（只有 `WORKERS` 个）。
     pub async fn create_file(
         &self,
         path: &str,
@@ -650,9 +683,15 @@ impl Core {
             loop {
                 tick.tick().await;
                 if st.sessions_dirty.swap(false, Ordering::Relaxed) {
-                    // SQLite 写盘是阻塞 I/O。runtime 只有 2 个 worker，直接在
-                    // 异步任务里写会占住一个，期间 SSE/HTTP 都变慢。
-                    let res = tokio::task::block_in_place(|| st.save_sessions());
+                    // SQLite 写盘是阻塞 I/O，丢给阻塞池（不要用 `block_in_place`：
+                    // 那会把当前 worker 顶掉、调度器可能再补一个线程出来，
+                    // 线程数就不是我们写死的那个了）。
+                    let res = tokio::task::spawn_blocking({
+                        let st = st.clone();
+                        move || st.save_sessions()
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("落盘任务挂了: {e}")));
                     if let Err(e) = res {
                         // 没写成（比如会话正被占用）就留到下一轮再写
                         st.mark_sessions_dirty();
@@ -681,11 +720,7 @@ impl Core {
         std::thread::Builder::new()
             .name("agent-core-rt".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()
-                {
+                let rt = match runtime() {
                     Ok(rt) => rt,
                     Err(e) => {
                         let _ = tx.send(Err(format!("runtime: {e}")));

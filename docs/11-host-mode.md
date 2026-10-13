@@ -178,3 +178,7 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
 - 浏览器由**核心自己起**（第一次用到时才拉起无头 Chrome，退出时收掉）——
   不用手动开。想用你自己那个浏览器（能看着它动）就 `AGENT_CDP=…`；
   `AGENT_CDP=off` 就是不要浏览器。
+- **线程数封顶，不看 CPU 核数**：桌面以前走 `#[tokio::main]`，默认按核数开 worker
+  （32 核的机器就是 33 个线程），而核心里几乎全是等 IO 的活。现在桌面和安卓共用
+  `agent_core::runtime()`：4 个 worker + 阻塞池上限 4 + 1（跑 runtime 的那个线程）
+  ≤ 10（见 `core/src/lib.rs` 的 `RUNTIME_THREAD_BUDGET`，那一行是编译期断言）。

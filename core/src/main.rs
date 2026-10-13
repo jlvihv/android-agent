@@ -10,10 +10,15 @@
 
 use anyhow::Context;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// 注意：**不用 `#[tokio::main]`**。那个宏按 CPU 核数开 worker（这台机器 32 核
+/// → 33 个线程），而核心里全是等 IO 的活。runtime 由 `agent_core::runtime()`
+/// 统一构造（和安卓同一条路径、同一个线程预算）。
+fn main() -> anyhow::Result<()> {
     agent_core::init_tracing();
+    agent_core::runtime()?.block_on(run())
+}
 
+async fn run() -> anyhow::Result<()> {
     let port: u16 = std::env::var("AGENT_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
