@@ -165,16 +165,25 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
   `AGENT_DATA_DIR`。
 - `.env.local` / `AGENT_LLM_*` 里的模型只在**库里还没有模型配置**时采用（会存下来，
   跟在界面上配一次一样），不会每次启动都把界面上配好的覆盖掉。
-- 访问凭据照旧：桌面上默认不设防，设了 `AGENT_TOKEN` 才要（库里那把随机 token
-  在桌面上不生效）。
+- 访问凭据：这台电脑自己（127.0.0.1）来的不要；局域网来的要（见下一节）。
+  设了 `AGENT_TOKEN` 就是本机也要。
 
 ## 局域网：用手机上的界面操控这台电脑
 
+**宿主模式默认就对局域网开放**（听在 `0.0.0.0`）—— 不用另起一个特殊命令：
+`just dev-host` 起来，手机 App 的「连接电脑」就能找到它。只想自己用：
+
 ```sh
-just dev-lan       # = dev-host + AGENT_BIND=0.0.0.0
+AGENT_BIND=127.0.0.1 just dev-host
 ```
 
-启动时会打一行「手机上打开：`http://192.168.x.x:8787/auth?t=…`」，同一个 Wi-Fi 里的
+（`just dev` 那条沙箱模式是在电脑上复现手机，默认只听本机。）
+
+局域网来的请求都要凭据；**这台电脑自己（loopback）来的照旧免登录**
+（`AppState::trust_loopback`，只有桌面会打开 —— 手机上别的 App 也能连
+127.0.0.1，那里绝不能开）。所以电脑上自己开浏览器还是 `http://127.0.0.1:8787`。
+
+用手机浏览器也行：启动时会打一行「手机上打开：`http://192.168.x.x:8787/auth?t=…`」，同一个 Wi-Fi 里的
 手机用浏览器开它一次（种上 cookie、跳回首页），之后就是同一个界面，只是 `bash` /
 `read` / `edit` / `agent browser` 都作用在电脑上。想常用就「添加到主屏幕」。
 
@@ -183,7 +192,7 @@ just dev-lan       # = dev-host + AGENT_BIND=0.0.0.0
 | | 原来 | 现在 |
 |---|---|---|
 | 听在哪 | 写死 `127.0.0.1` | `AGENT_BIND`（`Core::serve_on`）；手机上照旧只听 loopback |
-| 凭据 | 桌面上默认不设防 | **听在非 loopback 上就必须有**：`AGENT_TOKEN`，没给就用库里那把（宿主模式有库，重启不变，收藏的地址一直能用） |
+| 凭据 | 桌面上默认不设防 | **听在非 loopback 上就必须有**：`AGENT_TOKEN`，没给就用库里那把（宿主模式有库，重启不变，收藏的地址一直能用）；本机来的免（对端地址靠 `into_make_service_with_connect_info`） |
 | WebSocket 来源 | 只放本机来源 | 另外放**同源**（`Origin` 和 `Host` 对得上）—— 从手机开时来源是 `http://192.168.x.x:8787`；`sandbox.localhost`、`null` 照样挡 |
 | AI 写的网页 | 放到 `sandbox.localhost` 这个独立的源上开 | 不是从本机访问时 `sandbox.localhost` 解析到的是**手机自己**，所以回落到同源：服务端给同源的沙箱文件加 CSP sandbox，iframe 也不给 `allow-same-origin` —— 照样碰不到凭据，只是页面用不了 localStorage |
 
@@ -195,7 +204,7 @@ just dev-lan       # = dev-host + AGENT_BIND=0.0.0.0
 
 **自动发现 + 一次性配对**（参照安卓「无线调试」）：
 
-- 电脑：`just dev-lan` 用系统自带的工具广播 mDNS 服务 `_agent-core._tcp`
+- 电脑：`just dev-host` 起来就用系统自带的工具广播 mDNS 服务 `_agent-core._tcp`
   （macOS `dns-sd`、Linux `avahi-publish-service`，`desktop::advertise`），终端里
   打一个 6 位配对码。TXT 记录里只有实例 id 和版本 —— **没有凭据**：自动发现只该
   给出「地址」，把 token 放进广播等于告诉局域网里所有人。用系统工具而不是自己

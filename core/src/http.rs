@@ -174,6 +174,17 @@ async fn require_auth(
     let Some(token) = st.auth().token else {
         return next.run(req).await; // 桌面开发没设 AGENT_TOKEN
     };
+    // 桌面：这台电脑自己（loopback）来的不要凭据 —— 宿主模式默认对局域网开放，
+    // 凭据是给局域网里的手机的；电脑上自己开浏览器还是 http://127.0.0.1:8787 直接用。
+    // **手机上绝不能开**：那里别的 App 也能连 127.0.0.1（见上面「威胁」）。
+    if st.trust_loopback.load(std::sync::atomic::Ordering::Relaxed)
+        && req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .is_some_and(|c| c.0.ip().is_loopback())
+    {
+        return next.run(req).await;
+    }
     match presented_token(req.headers()) {
         Some(t) if same_secret(t, &token) => next.run(req).await,
         _ => (StatusCode::UNAUTHORIZED, "需要凭据").into_response(),
@@ -332,12 +343,12 @@ struct PairBody {
 }
 
 /// `POST /api/pair` `{code}` → `{token, id, name}`：手机第一次连这台电脑时拿配对码
-/// 换访问凭据（见 `desktop::Pairing`）。只有 `just dev-lan` 才开着（别的时候 404）。
+/// 换访问凭据（见 `desktop::Pairing`）。只有桌面宿主模式对局域网开放时才开着（别的时候 404）。
 async fn pair(State(st): State<Arc<AppState>>, Json(b): Json<PairBody>) -> Response {
     let Some(p) = st.pairing.read().ok().and_then(|g| g.clone()) else {
         return (
             StatusCode::NOT_FOUND,
-            "这台电脑没开配对（just dev-lan 才有）",
+            "这台电脑没开配对（宿主模式对局域网开放时才有）",
         )
             .into_response();
     };

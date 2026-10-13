@@ -677,6 +677,8 @@ impl Core {
         let st = self.state.clone();
         tokio::spawn(async move {
             st.log("info", format!("http://127.0.0.1:{actual}"));
+            // 带上对端地址：桌面上「本机来的不要凭据」要靠它（`AppState::trust_loopback`）
+            let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("http server exited: {e}");
             }

@@ -234,8 +234,12 @@ pub struct AppState {
     pub data_dir: RwLock<Option<std::path::PathBuf>>,
     /// 沙箱的 Alpine 升级（设置页里点的那个，见 `alpine`）
     pub alpine: crate::alpine::Upgrader,
-    /// 局域网配对码（只有桌面 `just dev-lan` 才有，见 `desktop::Pairing`）
+    /// 局域网配对码（只有桌面宿主模式对局域网开放时才有，见 `desktop::Pairing`）
     pub pairing: RwLock<Option<Arc<crate::desktop::Pairing>>>,
+    /// 本机（loopback）来的请求不要凭据。**只有桌面**会打开（`agent-dev` 的 main）：
+    /// 对局域网开放时凭据是给手机的，电脑自己用浏览器照旧免登录。手机上永远是
+    /// false —— 那里别的 App 也能连 127.0.0.1。
+    pub trust_loopback: AtomicBool,
     /// 会话库。`set_data_dir` 时打开。
     pub db: RwLock<Option<Arc<Db>>>,
     /// 会话已经从库里读进内存了。
@@ -304,6 +308,7 @@ impl AppState {
             data_dir: RwLock::new(None),
             alpine: Default::default(),
             pairing: RwLock::new(None),
+            trust_loopback: AtomicBool::new(false),
             sessions_loaded: AtomicBool::new(false),
             turns: Mutex::new(HashMap::new()),
             auth: RwLock::new(Auth {

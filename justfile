@@ -72,6 +72,12 @@ dev:
 #
 # 模型的改动是**真的**，没有回收站；要原地验证大改动就用 `just dev`（沙箱，仅 Linux）。
 # macOS 上只有这一种（docs/11 的「macOS」一节）。
+#
+# **默认对局域网开放**：同一个 Wi-Fi 里的手机 App（设置 → 连接电脑）能自动找到
+# 这台，第一次连输终端里打出来的配对码；手机浏览器也能开打出来的那个地址。
+# 局域网来的都要凭据，这台电脑自己（127.0.0.1）照旧免登录。只想自己用：
+#
+#   AGENT_BIND=127.0.0.1 just dev-host
 dev-host:
     #!/usr/bin/env bash
     set -a; [ -f .env.local ] && . ./.env.local; set +a
@@ -81,26 +87,6 @@ dev-host:
     export AGENT_LLM_NAME="${AGENT_LLM_NAME:-opencode-go}"
     export AGENT_LINUX_HOST=1
     export AGENT_HOST_WORKSPACE="${AGENT_HOST_WORKSPACE:-$PWD}"
-    cargo run --manifest-path {{core}}/Cargo.toml --bin agent-dev
-
-# 起核心：宿主模式 + **局域网**（用手机上的界面操控这台电脑）
-#
-# 和 `just dev-host` 一样，只是听在 0.0.0.0：同一个 Wi-Fi 里的手机用浏览器打开
-# 启动时打出来的那行「手机上打开：http://192.168.x.x:8787/auth?t=…」就行
-# （打开一次种上 cookie；想常用就「添加到主屏幕」）。
-#
-# 局域网上**一定要凭据**：没给 AGENT_TOKEN 就用库里那把（重启不变）。明文 HTTP
-# —— 只在自己信得过的网络里用；出门在外请走 Tailscale / WireGuard 这类。
-dev-lan:
-    #!/usr/bin/env bash
-    set -a; [ -f .env.local ] && . ./.env.local; set +a
-    export AGENT_LLM_API_KEY="${AGENT_LLM_API_KEY:-${OPENCODE_API_KEY:-}}"
-    export AGENT_LLM_BASE_URL="${AGENT_LLM_BASE_URL:-${OPENCODE_BASE_URL:-}}"
-    export AGENT_LLM_MODEL="${AGENT_LLM_MODEL:-${OPENCODE_MODEL:-}}"
-    export AGENT_LLM_NAME="${AGENT_LLM_NAME:-opencode-go}"
-    export AGENT_LINUX_HOST=1
-    export AGENT_HOST_WORKSPACE="${AGENT_HOST_WORKSPACE:-$PWD}"
-    export AGENT_BIND="${AGENT_BIND:-0.0.0.0}"
     cargo run --manifest-path {{core}}/Cargo.toml --bin agent-dev
 
 # --- Web -------------------------------------------------------------------

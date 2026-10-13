@@ -8,7 +8,7 @@ import android.util.Log
 import java.net.Inet4Address
 
 /**
- * 在局域网里找电脑上的核心（`just dev-lan` 用 mDNS 广播 `_agent-core._tcp`，
+ * 在局域网里找电脑上的核心（宿主模式的 `just dev-host` 用 mDNS 广播 `_agent-core._tcp`，
  * 见 core 的 `desktop::advertise`）。
  *
  * **只在「连接电脑」那一栏开着的时候找**：页面挂上时 `start`、关掉时 `stop`

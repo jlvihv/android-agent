@@ -34,7 +34,7 @@ import android.widget.TextView
  * 明文流量由 `res/xml/network_security_config.xml` 放行，
  * 否则 Android 9+ 会直接报 ERR_CLEARTEXT_NOT_PERMITTED。
  *
- * **也能连电脑上的核心**（设置 → 连接电脑）：电脑上 `just dev-lan`，把它打出来
+ * **也能连电脑上的核心**（设置 → 连接电脑）：电脑上 `just dev-host`，自动找到它（或者粘它打出来
  * 的地址粘进来，这个 WebView 就改加载那台电脑 —— 界面一样，命令跑在电脑上。
  * 选择记在 SharedPreferences 里（下次启动直接连）；连不上时给原生的错误页，
  * 能「重试」或「回到手机」。手机自己的核心照常在后台跑着，切回来是瞬间的。
@@ -544,7 +544,7 @@ class MainActivity : Activity() {
         }
         android.app.AlertDialog.Builder(this)
             .setTitle("和「${f.name}」配对")
-            .setMessage("输入电脑终端上 just dev-lan 显示的配对码（只要输这一次）。")
+            .setMessage("输入电脑终端里显示的配对码（只要输这一次）。")
             .setView(box)
             .setPositiveButton("配对") { _, _ -> pair(f, base, input.text.toString()) }
             .setNegativeButton("取消", null)
@@ -626,7 +626,7 @@ class MainActivity : Activity() {
         box.addView(
             TextView(this).apply {
                 text = "连不上电脑 $host\n${why.orEmpty()}\n\n" +
-                    "电脑上的 `just dev-lan` 还开着吗？手机和电脑在同一个 Wi-Fi 里吗？"
+                    "电脑上的核心（just dev-host）还开着吗？手机和电脑在同一个 Wi-Fi 里吗？"
                 setTextColor(Color.parseColor("#e0e0e0"))
                 textSize = 15f
             },

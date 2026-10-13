@@ -24,23 +24,33 @@ async fn run() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8787);
 
-    // 听在哪：默认只听本机。`AGENT_BIND=0.0.0.0` = 局域网里的手机也能连
-    // （`just dev-lan`）—— 用手机上的界面操控这台电脑。
+    let core = agent_core::Core::desktop();
+
+    // 听在哪：**宿主模式默认对局域网开放**（0.0.0.0）—— 手机 App 的「连接电脑」
+    // 能自动找到这台、输一次配对码就能用它，不用另起一个特殊命令。只想自己用：
+    // `AGENT_BIND=127.0.0.1`。沙箱模式（`just dev`，在电脑上复现手机）默认只听本机。
+    let host_mode = core.state.linux().is_some_and(|s| s.is_host());
     let bind: std::net::IpAddr = match std::env::var("AGENT_BIND") {
         Ok(v) if !v.trim().is_empty() => v
             .trim()
             .parse()
             .with_context(|| format!("AGENT_BIND={v} 不是 IP 地址"))?,
+        _ if host_mode => std::net::Ipv4Addr::UNSPECIFIED.into(),
         _ => std::net::Ipv4Addr::LOCALHOST.into(),
     };
     let lan = !bind.is_loopback();
-
-    let core = agent_core::Core::desktop();
     // 凭据：只在本机时默认不设防（只有自己在用）；设了 AGENT_TOKEN 就和手机上
     // 一样要凭据。**听在局域网上就必须有** —— 不然同一个 Wi-Fi 里谁都能在这台
     // 电脑上跑命令（宿主模式下就是你的真机器）。没给的话用库里那把（宿主模式
     // 有库，重启不变，手机上收藏的地址一直能用），没库就现编一把。
     let env_token = std::env::var("AGENT_TOKEN").ok().filter(|t| !t.is_empty());
+    // 凭据是给局域网的；电脑自己（loopback）照旧免登录。自己给了 AGENT_TOKEN 的
+    // 意思是「本机也要」，那就不放行
+    if lan && env_token.is_none() {
+        core.state
+            .trust_loopback
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let token = match (env_token, lan) {
         (Some(t), _) => Some(t),
         (None, true) => Some(
@@ -59,9 +69,13 @@ async fn run() -> anyhow::Result<()> {
 
     println!();
     println!("  android-agent core v{}", agent_core::VERSION);
+    let trusted = core
+        .state
+        .trust_loopback
+        .load(std::sync::atomic::Ordering::Relaxed);
     match &token {
-        Some(t) => println!("  → http://127.0.0.1:{actual}/auth?t={t}"),
-        None => println!("  → http://127.0.0.1:{actual}"),
+        Some(t) if !trusted => println!("  → http://127.0.0.1:{actual}/auth?t={t}"),
+        _ => println!("  → http://127.0.0.1:{actual}"),
     }
     // 局域网：广播自己 + 配对码（手机 App 的「连接电脑」自动发现、第一次连时输码）。
     // `_advert` 活到 main 结束：Drop 就停广播
@@ -94,7 +108,8 @@ async fn run() -> anyhow::Result<()> {
         for ip in ips {
             println!("  → 手机上打开：http://{ip}:{actual}/auth?t={t}");
         }
-        println!("    （明文 HTTP：只在自己信得过的 Wi-Fi 里用；地址里的 t= 就是钥匙）");
+        println!("    （明文 HTTP：只在自己信得过的 Wi-Fi 里用；地址里的 t= 就是钥匙。");
+        println!("      只想自己用：AGENT_BIND=127.0.0.1）");
     }
     let device = core.state.device().map(|d| d.name()).unwrap_or_default();
     println!("  （设备：{device}；Ctrl-C 退出）");

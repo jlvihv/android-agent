@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * 设置页里的「连接电脑」：让这个 App 改连电脑上的核心（电脑上 `just dev-lan`）。
+   * 设置页里的「连接电脑」：让这个 App 改连电脑上的核心（电脑上 `just dev-host`）。
    *
    * 这一栏开着的时候在局域网里找电脑（mDNS，壳里的 CoreDiscovery），关掉就停 ——
    * 不常驻。点找到的那台：配对过的原生确认一下就连；第一次连要输电脑终端上显示
@@ -93,7 +93,7 @@
     {#if remote}
       现在界面、命令、文件都在电脑上；手机自己的核心还在后台，回去是瞬间的。
     {:else}
-      电脑上跑 <code class="font-mono">just dev-lan</code>，它会出现在上面；第一次连输它终端里显示的配对码。
+      电脑上跑 <code class="font-mono">just dev-host</code>，它会出现在上面；第一次连输它终端里显示的配对码。
       手机和电脑要在同一个 Wi-Fi 里；是明文 HTTP，只在自己信得过的网络里用。
     {/if}
   </p>
