@@ -37,6 +37,15 @@ if [ -n "${t:-}" ]; then
   exit 0
 fi
 
-echo "拿不到凭据：debug 包用 run-as 读 files/token；release 包重启一次 App 再试（看 logcat）。" >&2
-echo "或者手动：AGENT_TOKEN=… $0" >&2
+# 那行是被日志缓冲区冲掉的（默认才 ~256KB，手机一忙十几分钟就滚没了）。
+# 把缓冲区放大，**下次** App 启动打的那行就能留住 —— 这是设备侧设置，不影响别人。
+"$ADB" logcat -G 16M >/dev/null 2>&1 || true
+
+cat >&2 <<EOF
+拿不到凭据：logcat 里那行 “agent token: …” 已经被冲掉了（release 包读不了 files/token，
+只能靠它）。
+  · 重启一次 App 就会重新打一行：just restart（或 adb shell am force-stop + am start）
+  · 刚把 logcat 缓冲区放大到 16M，以后不容易再被冲掉
+  · 也可以手动：AGENT_TOKEN=… $0
+EOF
 exit 1
