@@ -464,7 +464,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
             .expect("pending_attachments poisoned");
         for id in &body.attachments {
             match pending.remove(id) {
-                Some(a) => attachments.push(a),
+                Some((_, a)) => attachments.push(a),
                 None => {
                     drop(pending);
                     st.end_turn(&sid);
@@ -914,9 +914,7 @@ async fn upload_attachment(
     let core = Core { state: st.clone() };
     match core.store_attachment(name, mime, body.to_vec()).await {
         Ok(a) => {
-            if let Ok(mut pending) = st.pending_attachments.lock() {
-                pending.insert(a.id.clone(), a.clone());
-            }
+            st.add_pending_attachment(a.clone());
             Json(json!({
                 "id": a.id,
                 "name": a.name,
@@ -1013,53 +1011,52 @@ async fn get_session(
     State(st): State<Arc<AppState>>,
     Query(q): Query<SessionQuery>,
 ) -> impl IntoResponse {
-    // 读锁一直持到拼完 —— rev 和它对应的那份 messages 必须来自同一个瞬间，
-    // 不然客户端会存下一个「对不上的 rev」，之后就永远以为自己是最新的。
-    let store = st.chat.read().await;
     // 不指定 = 当前活动会话（界面）；调试脚本指定自己那条调试会话
-    let sess = match q.id.as_deref() {
-        Some(id) => store.get(id),
-        None => store.active_ref(),
+    let id = {
+        let store = st.chat.read().await;
+        match q.id.as_deref() {
+            Some(id) => store.get(id).map(|s| s.id.clone()),
+            None => store.active_ref().map(|s| s.id.clone()),
+        }
     };
-    let Some(sess) = sess else {
+    let Some(id) = id else {
         return Json(json!({ "messages": [], "rev": "", "busy": false }));
     };
     // 「进行中」看的是**这个**会话：别的会话在跑不影响这里发消息
-    let busy = st.is_busy(&sess.id);
+    let busy = st.is_busy(&id);
+    // 不活跃的会话消息不在内存里，先读回来
+    if let Err(e) = st.ensure_loaded(&id).await {
+        return Json(json!({ "messages": [], "rev": "", "busy": busy, "error": format!("{e:#}") }));
+    }
+
+    // 读锁一直持到拼完 —— rev 和它对应的那份 messages 必须来自同一个瞬间，
+    // 不然客户端会存下一个「对不上的 rev」，之后就永远以为自己是最新的。
+    let store = st.chat.read().await;
+    let Some(sess) = store.get(&id) else {
+        return Json(json!({ "messages": [], "rev": "", "busy": false }));
+    };
+    if !sess.resident() {
+        // 读进来之后、拿锁之前又被放掉了（极少见）：让客户端下次再来
+        return Json(json!({ "unchanged": true, "rev": q.rev, "busy": busy }));
+    }
     let rev = session_rev(sess);
     if !q.rev.is_empty() && q.rev == rev {
         return Json(json!({ "unchanged": true, "rev": rev, "busy": busy }));
     }
 
     // 增量：客户端上次的 rev 里有 (会话 id, 已存消息数)。同一个会话、且它手上的
-    // 消息数没超过当前（没被重置）→ 只重发「当前回合」那一段。会话是只追加的，
-    // 前面都是最终的。不这样做的话，跑长任务时每步都要重传整段历史（含每个
-    // 50KB 的 bash 输出），客户端还要再 JSON.parse 一遍。
-    let len = sess.messages.len();
+    // 消息数没超过当前（没被重置）→ 只补差的那段，见 `session_patch`。
     if let Some((cid, client_len)) = parse_rev(&q.rev) {
-        if cid == sess.id && client_len <= len {
-            let mut from = client_len;
-            if client_len == len {
-                // 没有新消息（只是 updated_at 变了）：尾部不用重发
-                from = len;
-            } else if !sess.messages[client_len].is_user() {
-                // 新消息是同一回合的延续（assistant/tool）—— 回到这个回合的起点
-                // （上一条是 User，或到 0），这样开头那个 assistant 一定是新的
-                // 一条，与完整视图的合并规则一致。
-                // 若新消息本身就是一条 User（新回合），from 就留在 client_len。
-                while from > 0 && !sess.messages[from - 1].is_user() {
-                    from -= 1;
-                }
-            }
-            let replace_from = crate::agent::session_view_count_before(sess, from);
-            let msgs = crate::agent::session_view_from(sess, from);
+        if cid == sess.id && client_len <= sess.messages.len() {
+            let p = crate::agent::session_patch(sess, client_len);
             drop(store);
             return Json(json!({
-                "messages": msgs,
+                "messages": p.messages,
                 "rev": rev,
                 "busy": busy,
                 "append": true,
-                "replaceFrom": replace_from,
+                "replaceFrom": p.replace_from,
+                "keepParts": p.keep_parts,
             }));
         }
     }
@@ -1098,7 +1095,7 @@ struct SessionQuery {
 /// 带 `id`：切换会话时长度和时间戳很容易撞车，撞了客户端就会一直拿着
 /// 上一个会话的消息不动。
 fn session_rev(sess: &crate::agent::ChatSession) -> String {
-    format!("{}:{}:{}", sess.id, sess.messages.len(), sess.updated_at)
+    format!("{}:{}:{}", sess.id, sess.message_count(), sess.updated_at)
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,7 +1119,8 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "active": store.active_ref().map(|s| json!({
                 "id": s.id,
                 "title": if s.title.is_empty() { "新对话" } else { &s.title },
-                "messages": s.messages.len(),
+                "messages": s.message_count(),
+                "resident": s.resident(),
                 "rev": session_rev(s),
             })),
         })
@@ -1173,6 +1171,12 @@ async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "未配置 LLM provider").into_response();
     };
 
+    let active = st.chat.read().await.active_ref().map(|s| s.id.clone());
+    if let Some(id) = &active {
+        if let Err(e) = st.ensure_loaded(id).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+        }
+    }
     let mut sess = {
         let store = st.chat.read().await;
         match store.active_ref() {
@@ -1292,9 +1296,18 @@ async fn search_sessions(
     State(st): State<Arc<AppState>>,
     Query(SearchQuery { q }): Query<SearchQuery>,
 ) -> impl IntoResponse {
-    let store = st.chat.read().await;
-    // 每个会话最多 3 条、总共 60 条：侧边栏不是搜索页，再多也看不过来
-    let hits = store.search(&q, 3, 60);
+    // 消息不在内存里的会话要临时读库（阻塞 I/O），整个搜索放进阻塞线程跑
+    let store = st.chat.clone().read_owned().await;
+    let db = st.db();
+    let qq = q.clone();
+    let hits = tokio::task::spawn_blocking(move || {
+        // 每个会话最多 3 条、总共 60 条：侧边栏不是搜索页，再多也看不过来
+        store.search(&qq, 3, 60, |id| {
+            db.as_ref().and_then(|d| d.load_messages(id).ok())
+        })
+    })
+    .await
+    .unwrap_or_default();
     Json(json!({ "q": q, "hits": hits }))
 }
 
@@ -1354,39 +1367,46 @@ async fn delete_session(
     State(st): State<Arc<AppState>>,
     Json(body): Json<ActivateBody>,
 ) -> Response {
-    let mut store = st.chat.write().await;
-    store.delete(&body.id);
-    drop(store);
-    st.mark_sessions_dirty();
+    st.delete_session(&body.id).await;
     Json(json!({ "ok": true })).into_response()
 }
 
 /// `POST /api/reset` → 清空会话历史。
-async fn reset(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut store = st.chat.write().await;
-    store.active_mut().clear();
-    drop(store);
-    st.mark_sessions_dirty();
-    st.log("info", "会话已清空");
-    StatusCode::NO_CONTENT
+async fn reset(State(st): State<Arc<AppState>>) -> Response {
+    match st.reset_active().await {
+        Ok(()) => {
+            st.log("info", "会话已清空");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(why) => (StatusCode::CONFLICT, why).into_response(),
+    }
 }
 
 /// 把 chunk 通道包成带正确 header 的 SSE 响应，并在结束时补 `[DONE]`。
 ///
 /// 上游是无界通道（见 agent.rs 的 `send`）：前端读得慢只会让 chunk 在这里
-/// 排队，不会反压到 agent 循环。
+/// 排队，不会反压到 agent 循环。排队的大头是 bash 的实时输出（每 120ms 一份、
+/// 每份最多 64KB 的尾部快照），而这种东西只有最新的一份有用 —— 所以每次把
+/// 积压的一批取出来，被后来者盖掉的快照直接扔（`coalesce`）。客户端挂着连接
+/// 却不读（WebView 被挂起）时，积压就不会无限涨。
 fn sse_response(mut rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) -> Response {
     let (out_tx, out_rx) =
         tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
 
     tokio::spawn(async move {
-        while let Some(v) = rx.recv().await {
-            if out_tx
-                .send(Ok(SseEvent::default().data(v.to_string())))
-                .await
-                .is_err()
-            {
-                return; // 客户端断开
+        while let Some(first) = rx.recv().await {
+            let mut batch = vec![first];
+            while let Ok(v) = rx.try_recv() {
+                batch.push(v);
+            }
+            for v in coalesce(batch) {
+                if out_tx
+                    .send(Ok(SseEvent::default().data(v.to_string())))
+                    .await
+                    .is_err()
+                {
+                    return; // 客户端断开
+                }
             }
         }
         // 上游通道关闭 = 回合结束
@@ -1401,6 +1421,30 @@ fn sse_response(mut rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>)
         HeaderValue::from_static(sse::STREAM_HEADER_VALUE),
     );
     res
+}
+
+/// 扔掉一批 chunk 里被盖掉的工具阶段性输出：同一个工具调用后面还有输出
+/// （阶段性的或最终的）时，前面那份快照没有意义 —— 前端是整份替换，不是拼接。
+fn coalesce(batch: Vec<Value>) -> Vec<Value> {
+    let output_of = |v: &Value| -> Option<String> {
+        (v["type"] == "tool-output-available")
+            .then(|| v["toolCallId"].as_str().map(str::to_string))
+            .flatten()
+    };
+    let mut later: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut keep = vec![true; batch.len()];
+    for (i, v) in batch.iter().enumerate().rev() {
+        let Some(id) = output_of(v) else { continue };
+        if v["preliminary"] == true && later.contains(&id) {
+            keep[i] = false;
+        }
+        later.insert(id);
+    }
+    batch
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(v, k)| k.then_some(v))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1831,17 +1875,29 @@ async fn handle_client_msg(st: &Arc<AppState>, raw: &str) -> anyhow::Result<()> 
 /// 把指令发给设备执行。设备实现可能阻塞，所以走 `spawn_blocking`。
 pub async fn dispatch(st: &Arc<AppState>, cmd: Command) -> serde_json::Value {
     let id = uuid::Uuid::now_v7().to_string();
-    let Some(dev) = st.device() else {
-        return json!({ "id": id, "ok": false, "detail": "没有设备实现（mock 未启用或无障碍服务未连接）" });
-    };
-
-    let cmd_json = match serde_json::to_string(&cmd) {
-        Ok(s) => s,
-        Err(e) => return json!({ "id": id, "ok": false, "detail": format!("序列化失败: {e}") }),
-    };
     let kind = cmd_name(&cmd);
 
-    let res = tokio::task::spawn_blocking(move || dev.execute(&cmd_json)).await;
+    let res = match (st.device(), &cmd) {
+        (Some(dev), _) => {
+            let cmd_json = match serde_json::to_string(&cmd) {
+                Ok(s) => s,
+                Err(e) => {
+                    return json!({ "id": id, "ok": false, "detail": format!("序列化失败: {e}") })
+                }
+            };
+            tokio::task::spawn_blocking(move || dev.execute(&cmd_json)).await
+        }
+        // 打开 URI 不需要无障碍：没有设备实现时交给浏览器那条（它不依赖无障碍，
+        // 启动时就注进来了）。`agent open` / `$BROWSER` / `xdg-open` 都落在这里。
+        (None, Command::Open { url }) if st.browser().is_some() => {
+            let host = st.browser().expect("刚查过");
+            let action = json!({ "action": "__open_uri", "url": url }).to_string();
+            tokio::task::spawn_blocking(move || host.execute(&action).and_then(browser_reply)).await
+        }
+        (None, _) => {
+            return json!({ "id": id, "ok": false, "detail": "没有设备实现（mock 未启用或无障碍服务未连接）" })
+        }
+    };
 
     let (ok, detail) = match res {
         Ok(Ok(d)) => (true, d),
@@ -1862,6 +1918,18 @@ pub async fn dispatch(st: &Arc<AppState>, cmd: Command) -> serde_json::Value {
     json!({ "id": id, "ok": ok, "detail": detail })
 }
 
+/// 浏览器那边的回执（`{ok, text, error}`）→ 设备指令的 `Result` 形状。
+fn browser_reply(raw: String) -> Result<String, String> {
+    let v: Value = serde_json::from_str(&raw).map_err(|_| raw.clone())?;
+    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+        Ok(text("text"))
+    } else {
+        let why = text("text");
+        Err(if why.is_empty() { text("error") } else { why })
+    }
+}
+
 fn cmd_name(c: &Command) -> &'static str {
     match c {
         Command::TapXy { .. } => "tap_xy",
@@ -1874,7 +1942,29 @@ fn cmd_name(c: &Command) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_origin, parse_range, parse_rev, session_rev};
+    use super::{coalesce, is_loopback_origin, parse_range, parse_rev, session_rev};
+
+    /// 积压的一批里，被后来者盖掉的阶段性输出扔掉；别的 chunk（正文、
+    /// 最终输出、别的工具的快照）一个不少、顺序不变。
+    #[test]
+    fn coalesce_drops_only_superseded_live_output() {
+        use crate::sse;
+        let p = |id: &str, n: u32| sse::tool_output_preliminary(id, serde_json::json!(n));
+        let batch = vec![
+            p("a", 1),
+            sse::text_delta("t", "x"),
+            p("b", 1),
+            p("a", 2),
+            sse::tool_output_available("b", serde_json::json!("done")),
+            p("a", 3),
+        ];
+        let out = coalesce(batch.clone());
+        assert_eq!(
+            out,
+            vec![batch[1].clone(), batch[4].clone(), batch[5].clone()],
+            "a 只留最后一份；b 的快照被它的最终输出盖掉"
+        );
+    }
     use crate::agent::{ChatMessage, ChatSession};
 
     /// 起一个真的核心服务，返回 (base, 不跟随跳转的 client)。
@@ -2277,5 +2367,74 @@ mod tests {
             v["detail"].as_str().unwrap_or("").contains("没有设备"),
             "{v}"
         );
+    }
+
+    /// 记下收到的浏览器动作，按 `__open_uri` 的约定回话。
+    struct RecordingBrowser(std::sync::Mutex<Vec<String>>, bool);
+
+    impl crate::state::BrowserApi for RecordingBrowser {
+        fn execute(&self, action_json: &str) -> Result<String, String> {
+            self.0.lock().unwrap().push(action_json.to_string());
+            Ok(if self.1 {
+                r#"{"ok":true,"text":"opened x"}"#.into()
+            } else {
+                r#"{"ok":false,"text":"App 在后台"}"#.into()
+            })
+        }
+    }
+
+    /// 打开 URI 不该依赖无障碍：没有设备通道时交给浏览器那条（`__open_uri`），
+    /// 那边的失败原因原样带回来。点击之类真要无障碍的指令照旧报「没有设备」。
+    #[tokio::test]
+    async fn open_falls_back_to_the_browser_host_without_accessibility() {
+        let st = crate::state::AppState::new();
+        let b = std::sync::Arc::new(RecordingBrowser(Default::default(), true));
+        st.set_browser(b.clone());
+        let (base, c) = serve(st.clone()).await;
+        let cmd = |cmd: serde_json::Value| {
+            c.post(format!("{base}/api/command"))
+                .json(&serde_json::json!({ "cmd": cmd }))
+                .send()
+        };
+
+        let v: serde_json::Value = cmd(serde_json::json!({ "type": "open", "url": "weixin://" }))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["detail"], "opened x");
+        let sent: serde_json::Value = serde_json::from_str(&b.0.lock().unwrap()[0]).unwrap();
+        assert_eq!(sent["action"], "__open_uri");
+        assert_eq!(sent["url"], "weixin://");
+
+        let v: serde_json::Value = cmd(serde_json::json!({ "type": "tap_xy", "x": 1, "y": 2 }))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["detail"].as_str().unwrap().contains("没有设备"), "{v}");
+        assert_eq!(b.0.lock().unwrap().len(), 1, "点击不该落到浏览器上");
+
+        let st2 = crate::state::AppState::new();
+        st2.set_browser(std::sync::Arc::new(RecordingBrowser(
+            Default::default(),
+            false,
+        )));
+        let (base2, c2) = serve(st2).await;
+        let v: serde_json::Value = c2
+            .post(format!("{base2}/api/command"))
+            .json(&serde_json::json!({ "cmd": { "type": "open", "url": "https://x.example" } }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["detail"], "App 在后台");
     }
 }

@@ -218,7 +218,7 @@ class BrowserController(private val app: Application) : BrowserHost {
             val (s, f) = navCounters()
             if (s > started0) sawStart = true
             if (sawStart && f >= s) return true
-            Thread.sleep(60)
+            pause(60)
         }
         return false
     }
@@ -247,7 +247,7 @@ class BrowserController(private val app: Application) : BrowserHost {
                 same = 0
             }
             last = sig
-            Thread.sleep(250)
+            pause(250)
         }
     }
 
@@ -255,7 +255,7 @@ class BrowserController(private val app: Application) : BrowserHost {
     private fun settleAfterAction(started0: Int) {
         val navigating = waitForNavStart(started0, 1200)
         if (navigating) awaitLoad(started0, 20_000)
-        else Thread.sleep(SETTLE_MS)
+        else pause(SETTLE_MS)
         awaitDomStable(SETTLE_BUDGET_MS)
     }
 
@@ -264,13 +264,59 @@ class BrowserController(private val app: Application) : BrowserHost {
         val deadline = System.currentTimeMillis() + maxMs
         while (System.currentTimeMillis() < deadline) {
             if (navCounters().first > started0) return true
-            Thread.sleep(60)
+            pause(60)
         }
         return false
     }
 
     /** 页面弹过的 alert/confirm/prompt。它们被我们吞掉了，得让模型知道 */
     private val dialogs = ArrayDeque<String>()
+
+    // -----------------------------------------------------------------------
+    // 取消
+    // -----------------------------------------------------------------------
+    //
+    // 用户按停止时，Rust 那边丢掉的只是 future —— 这里的阻塞线程还在跑，而且
+    // 攥着 [lock]：导航 25s + 等加载 20s + 每次 eval 15s 叠起来能过一分钟，
+    // 下一个动作（甚至下一个回合）全排在它后面。所以 Rust 丢掉 future 时会发一个
+    // `__cancel`（见 `Core::browser`），这里所有等待都会看它。
+    //
+    // 用「代」而不是一个布尔：`__cancel` 取消的是**此刻已经进了 [execute]** 的
+    // 动作（包括还在排队等锁的）；在它之后才进来的不受影响。
+
+    private class Cancelled : RuntimeException("已取消（回合被停止）")
+
+    private val cancelGen = AtomicInteger()
+
+    /** 当前（持锁的）动作进门时的代。只在锁里写 */
+    @Volatile
+    private var runningGen = 0
+
+    private fun checkCancelled() {
+        if (cancelGen.get() != runningGen) throw Cancelled()
+    }
+
+    /** 可取消的 sleep：切成小段，每段之间看一眼有没有被取消 */
+    private fun pause(ms: Long) {
+        val deadline = System.currentTimeMillis() + ms
+        while (true) {
+            checkCancelled()
+            val left = deadline - System.currentTimeMillis()
+            if (left <= 0) return
+            Thread.sleep(left.coerceAtMost(50))
+        }
+    }
+
+    /** 等闩（最多 [timeout]），等的时候也看取消。返回 false = 超时 */
+    private fun awaitLatch(latch: CountDownLatch, timeout: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeout
+        while (true) {
+            checkCancelled()
+            val left = deadline - System.currentTimeMillis()
+            if (left <= 0) return false
+            if (latch.await(left.coerceAtMost(50), TimeUnit.MILLISECONDS)) return true
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 入口
@@ -290,10 +336,30 @@ class BrowserController(private val app: Application) : BrowserHost {
             return err("参数不是合法 JSON: ${t.message}")
         }
 
+        // 两个内部动作（`__` 开头，模型调不到，见 agent.rs）：不排队、不碰 WebView
+        when (action.optString("action")) {
+            "__cancel" -> {
+                cancelGen.incrementAndGet()
+                return ok("已取消").toString()
+            }
+            // 打开 URI 不需要无障碍：没开无障碍时 `agent open` 走这里（见 http.rs 的 dispatch）
+            "__open_uri" -> return try {
+                ok(UriLauncher.openFromApp(app, android.net.Uri.parse(action.optString("url")))).toString()
+            } catch (t: Throwable) {
+                err(t.message ?: t.toString())
+            }
+        }
+
+        val gen = cancelGen.get()
         lock.withLock {
+            runningGen = gen
             busy = true
             return try {
+                checkCancelled()
                 dispatch(action)
+            } catch (c: Cancelled) {
+                Log.i(TAG, "动作被取消: ${actionJson.take(200)}")
+                err(c.message ?: "已取消")
             } catch (t: Throwable) {
                 Log.w(TAG, "动作失败: $actionJson", t)
                 err(t.message ?: t.toString())
@@ -1083,7 +1149,7 @@ class BrowserController(private val app: Application) : BrowserHost {
         val out = evalToJson(scrollJs(dir, amount, a.optString("selector").ifEmpty { null }))
             ?: return errObj("滚动失败")
         out.optString("error").takeIf { it.isNotEmpty() }?.let { return errObj(it) }
-        Thread.sleep(200)
+        pause(200)
         return ok(
             "已滚动 $dir $amount（scrollY=${out.optInt("scrollY")}/" +
                 "${out.optInt("scrollHeight")}）",
@@ -1097,7 +1163,7 @@ class BrowserController(private val app: Application) : BrowserHost {
         val snap = navCounters().first
         onMain { w.goBack() }
         awaitLoad(snap, NAV_TIMEOUT_MS)
-        Thread.sleep(SETTLE_MS)
+        pause(SETTLE_MS)
         val info = pageInfo()
         return ok(
             "已后退到 ${info?.optString("url").orEmpty()}",
@@ -1141,7 +1207,7 @@ class BrowserController(private val app: Application) : BrowserHost {
                     return ok("JS 返回：\n$v")
                 }
             }
-            Thread.sleep(120)
+            pause(120)
         }
         return errObj("JS 超过 ${JS_TIMEOUT_MS / 1000}s 没返回")
     }
@@ -1195,7 +1261,7 @@ class BrowserController(private val app: Application) : BrowserHost {
                     )
                     w.layout(0, 0, pxW, pxH)
                 }
-                Thread.sleep(400) // 等重排完再画
+                pause(400) // 等重排完再画
             }
         }
 
@@ -1276,7 +1342,7 @@ class BrowserController(private val app: Application) : BrowserHost {
                 latch.countDown()
             }
         }
-        if (!latch.await(timeout, TimeUnit.MILLISECONDS)) {
+        if (!awaitLatch(latch, timeout)) {
             active?.dead = true
             throw IllegalStateException("页面 ${timeout / 1000}s 没响应（渲染进程可能卡住了）")
         }
@@ -1323,7 +1389,7 @@ class BrowserController(private val app: Application) : BrowserHost {
                 latch.countDown()
             }
         }
-        if (!latch.await(timeout, TimeUnit.MILLISECONDS)) {
+        if (!awaitLatch(latch, timeout)) {
             active?.dead = true
             Log.w(TAG, "主线程 ${timeout}ms 没响应（标记当前标签已坏）")
             throw IllegalStateException("WebView 主线程 ${timeout / 1000}s 没响应")

@@ -133,6 +133,12 @@
         append?: boolean;
         /** 增量时从哪里开始替换 */
         replaceFrom?: number;
+        /**
+         * 增量且是同一回合的延续：`messages[0]` 接在本地第 `replaceFrom` 条
+         * （assistant）的前 `keepParts` 个 part 后面 —— 服务端只重发最后一步，
+         * 不再把整个回合重发一遍（见 core 的 `session_patch`）。
+         */
+        keepParts?: number | null;
       };
       serverBusy = !!d.busy;
       // 服务端说没变：连 JSON 里都不带 messages，什么都不用做
@@ -143,9 +149,20 @@
       const sid = rev.split(':')[0];
       const same = sid === sessionId;
       if (d.append && same) {
-        // 服务端只重发了「当前回合」那段：前面的原样留着，从 replaceFrom 换掉尾部
+        // 服务端只补了差的那段：前面的原样留着，从 replaceFrom 换掉尾部
         const from = Math.min(d.replaceFrom ?? 0, messages.length);
-        messages = [...messages.slice(0, from), ...(d.messages ?? [])];
+        const fresh = d.messages ?? [];
+        const keep = d.keepParts;
+        if (keep != null) {
+          const old = messages[from];
+          if (!old || old.role !== 'assistant' || old.parts.length < keep || !fresh[0]) {
+            // 本地那条和服务端以为的对不上：老老实实要一份全量
+            rev = '';
+            return loadMessages();
+          }
+          fresh[0] = { ...fresh[0], parts: [...old.parts.slice(0, keep), ...fresh[0].parts] };
+        }
+        messages = [...messages.slice(0, from), ...fresh];
       } else {
         messages = same ? reconcile(messages, d.messages ?? []) : (d.messages ?? []);
       }

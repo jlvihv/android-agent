@@ -307,6 +307,29 @@ pub struct ChatSession {
     pub messages: Vec<ChatMessage>,
     /// 给 provider 做 prompt cache 路由用的稳定会话 ID
     pub provider_session: String,
+    /// 消息**不在内存里**时的摘要；`None` = 消息都在 `messages` 里。
+    ///
+    /// 不活跃的会话只留元数据（几十个会话、每个带一堆几十 KB 的 bash 输出，
+    /// 全放内存是几十 MB）。要用时 `AppState::ensure_loaded` 从库里读回来，
+    /// 落盘之后 `AppState::evict_idle` 再放掉。见 `db.rs`。
+    #[serde(skip)]
+    pub stub: Option<Stub>,
+    /// 消息上次从库里读进来的时刻：刚读进来的别马上又放掉。
+    #[serde(skip)]
+    pub loaded_at: Option<std::time::Instant>,
+    /// 清空过几次（`clear`）。落盘靠它认出「整段换了」—— 只看条数的话，
+    /// 清空后两秒内又长过了旧长度，库里的旧消息就留下来了。
+    #[serde(skip)]
+    pub epoch: u32,
+}
+
+/// 消息不在内存里的会话，侧边栏和落盘还要知道的那点东西。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stub {
+    /// 消息条数（= 库里的行数，也是落盘的水位线）
+    pub len: usize,
+    /// 其中用户消息几条（侧边栏的计数）
+    pub users: usize,
 }
 
 /// 新的 provider session id（作为 `x-opencode-session` 发出去）。
@@ -331,6 +354,9 @@ impl ChatSession {
             updated_at: now,
             messages: Vec::new(),
             provider_session: new_provider_session(),
+            stub: None,
+            loaded_at: None,
+            epoch: 0,
         }
     }
 
@@ -357,6 +383,8 @@ impl ChatSession {
 
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.stub = None;
+        self.epoch += 1;
         self.title.clear();
         self.updated_at = now_ms();
         // 历史清空了，前缀完全变了：继续用旧 id 就是「同 session 不同前缀」，
@@ -368,7 +396,46 @@ impl ChatSession {
     ///
     /// 「新对话」点了不发消息就不该留痕 —— 否则连点几次攒一堆空会话。
     pub fn has_content(&self) -> bool {
-        !self.messages.is_empty()
+        self.message_count() > 0
+    }
+
+    /// 消息在不在内存里。不在的话 `messages` 是空的，**别拿它当真**。
+    pub fn resident(&self) -> bool {
+        self.stub.is_none()
+    }
+
+    /// 消息条数（不管在不在内存里）。
+    pub fn message_count(&self) -> usize {
+        self.stub.map_or(self.messages.len(), |s| s.len)
+    }
+
+    /// 用户消息条数（不管在不在内存里）。
+    pub fn user_count(&self) -> usize {
+        match self.stub {
+            Some(s) => s.users,
+            None => self.messages.iter().filter(|m| m.is_user()).count(),
+        }
+    }
+
+    /// 放掉内存里的消息，只留摘要。调用方保证它们**已经落盘**。
+    pub fn evict(&mut self) {
+        if self.resident() {
+            self.stub = Some(Stub {
+                len: self.messages.len(),
+                users: self.user_count(),
+            });
+            self.messages = Vec::new();
+            self.loaded_at = None;
+        }
+    }
+
+    /// 把从库里读回来的消息装回去（已经在内存里就不动）。
+    pub fn install(&mut self, messages: Vec<ChatMessage>) {
+        if !self.resident() {
+            self.messages = messages;
+            self.stub = None;
+            self.loaded_at = Some(std::time::Instant::now());
+        }
     }
 }
 
@@ -379,16 +446,27 @@ fn hit_snippet(text: &str, needle: &str) -> Option<String> {
     const BEFORE: usize = 20;
     const AFTER: usize = 60;
 
-    let hay: Vec<char> = text.to_lowercase().chars().collect();
+    let raw: Vec<char> = text.chars().collect();
+    // 小写化可能改变字符数（`İ` → `i̇` 是两个字符）：逐字符展开，每个小写字符
+    // 记住它来自原文第几个字符，命中位置才能换算回原文。
+    let mut hay: Vec<char> = Vec::with_capacity(raw.len());
+    let mut origin: Vec<usize> = Vec::with_capacity(raw.len());
+    for (i, c) in raw.iter().enumerate() {
+        for l in c.to_lowercase() {
+            hay.push(l);
+            origin.push(i);
+        }
+    }
     let pat: Vec<char> = needle.to_lowercase().chars().collect();
     if pat.is_empty() || hay.len() < pat.len() {
         return None;
     }
-    let at = hay.windows(pat.len()).position(|w| w == pat.as_slice())?;
+    let at_low = hay.windows(pat.len()).position(|w| w == pat.as_slice())?;
+    let at = origin[at_low];
+    let last = origin[at_low + pat.len() - 1];
 
-    let raw: Vec<char> = text.chars().collect();
     let start = at.saturating_sub(BEFORE);
-    let end = (at + pat.len() + AFTER).min(raw.len());
+    let end = (last + 1 + AFTER).min(raw.len());
 
     let mut s = String::new();
     if start > 0 {
@@ -457,8 +535,10 @@ impl SessionStore {
         }
     }
 
-    pub fn delete(&mut self, id: &str) {
-        self.sessions.retain(|s| s.id != id);
+    /// 删掉并交还这个会话（调用方要清它引用的文件）。
+    pub fn delete(&mut self, id: &str) -> Option<ChatSession> {
+        let at = self.sessions.iter().position(|s| s.id == id);
+        let gone = at.map(|i| self.sessions.remove(i));
         if self.active == id {
             self.active = self
                 .sessions
@@ -466,6 +546,7 @@ impl SessionStore {
                 .map(|s| s.id.clone())
                 .unwrap_or_default();
         }
+        gone
     }
 
     /// 给侧边栏用的列表，最近更新的在前。
@@ -484,7 +565,7 @@ impl SessionStore {
                     "title": if s.title.is_empty() { "新对话" } else { &s.title },
                     "active": s.id == self.active,
                     "updatedAt": s.updated_at,
-                    "count": s.messages.iter().filter(|m| m.is_user()).count(),
+                    "count": s.user_count(),
                 })
             })
             .collect()
@@ -493,9 +574,16 @@ impl SessionStore {
     /// 全文搜：跨会话找用户／助手消息里的子串（忽略大小写），
     /// 每个会话最多回 `per_session` 条，总量封顶 `limit`。
     ///
-    /// 直接在内存里线性扫 —— 整个 store 本来就在内存里，会话量级是几十，
-    /// 用不上 SQL 的 FTS（少一张表、少一处 schema 迁移）。
-    pub fn search(&self, q: &str, per_session: usize, limit: usize) -> Vec<Value> {
+    /// 线性扫，会话量级是几十，用不上 SQL 的 FTS（少一张表、少一处 schema
+    /// 迁移）。消息不在内存里的会话由 `load` 临时从库里读（读不出来就跳过），
+    /// 扫完就扔，不装回 store。`load` 是阻塞 I/O，调用方放进 `spawn_blocking`。
+    pub fn search(
+        &self,
+        q: &str,
+        per_session: usize,
+        limit: usize,
+        mut load: impl FnMut(&str) -> Option<Vec<ChatMessage>>,
+    ) -> Vec<Value> {
         let needle = q.trim();
         if needle.is_empty() {
             return Vec::new();
@@ -505,8 +593,16 @@ impl SessionStore {
 
         let mut out = Vec::new();
         for s in sorted {
+            let fetched;
+            let messages: &[ChatMessage] = if s.resident() {
+                &s.messages
+            } else {
+                let Some(m) = load(&s.id) else { continue };
+                fetched = m;
+                &fetched
+            };
             let mut in_this = 0;
-            for m in &s.messages {
+            for m in messages {
                 let (role, text) = match m {
                     ChatMessage::User(t) => ("user", t.as_str()),
                     ChatMessage::UserFiles { text, .. } => ("user", text.as_str()),
@@ -847,31 +943,42 @@ fn user_message(
 ///
 /// 抽出来是给 `/api/debug/tools` 用的：模型（或人）想知道「我有哪些工具」，
 /// 不用去翻整份请求体。
-pub fn tool_definitions() -> Vec<Tool> {
-    tools()
-        .iter()
-        .map(|t| Tool {
-            kind: "function".into(),
-            function: FunctionDef {
-                name: t.name.to_string(),
-                description: t.description.to_string(),
-                parameters: (t.schema)(),
-            },
-        })
-        .collect()
+///
+/// 只建一次、之后共享（`Arc`）：每一步的请求都要带整张表，没必要每步重新
+/// 跑一遍 `json!` 拼 schema（也让「工具表字节确定」更没悬念）。
+pub fn tool_definitions() -> std::sync::Arc<[Tool]> {
+    static DEFS: OnceLock<std::sync::Arc<[Tool]>> = OnceLock::new();
+    DEFS.get_or_init(|| {
+        tools()
+            .iter()
+            .map(|t| Tool {
+                kind: "function".into(),
+                function: FunctionDef {
+                    name: t.name.to_string(),
+                    description: t.description.to_string(),
+                    parameters: (t.schema)(),
+                },
+            })
+            .collect()
+    })
+    .clone()
 }
 
 /// Responses API 的工具表：**扁平**的 `{"type":"function","name":…}`。
-fn tool_definitions_responses() -> Vec<crate::responses::Tool> {
-    tools()
-        .iter()
-        .map(|t| crate::responses::Tool {
-            kind: "function",
-            name: t.name.to_string(),
-            description: t.description.to_string(),
-            parameters: (t.schema)(),
-        })
-        .collect()
+fn tool_definitions_responses() -> std::sync::Arc<[crate::responses::Tool]> {
+    static DEFS: OnceLock<std::sync::Arc<[crate::responses::Tool]>> = OnceLock::new();
+    DEFS.get_or_init(|| {
+        tools()
+            .iter()
+            .map(|t| crate::responses::Tool {
+                kind: "function",
+                name: t.name.to_string(),
+                description: t.description.to_string(),
+                parameters: (t.schema)(),
+            })
+            .collect()
+    })
+    .clone()
 }
 
 /// 保证历史里有当前版本的系统提示词。
@@ -1064,6 +1171,93 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
     out
 }
 
+/// 一条历史消息在前端视图里贡献几个 part（和 `session_view_from` 的规则一致，
+/// 有测试盯着两边不跑偏）。
+fn view_parts_len(m: &ChatMessage) -> usize {
+    match m {
+        ChatMessage::Assistant {
+            content,
+            reasoning,
+            tool_calls,
+        } => {
+            usize::from(!reasoning.is_empty()) + usize::from(!content.is_empty()) + tool_calls.len()
+        }
+        _ => 0,
+    }
+}
+
+/// 会不会在视图里变成（或并进）一条 assistant 消息。
+fn is_visible_assistant(m: &ChatMessage) -> bool {
+    matches!(m, ChatMessage::Assistant { .. }) && view_parts_len(m) > 0
+}
+
+/// 增量同步：客户端手上是 `messages[..client_len]` 的视图，给它补到最新。
+///
+/// 会话是只追加的，前面的消息都是最终的；唯一会变的是**当前回合**那条
+/// assistant 消息 —— 一个回合的多步都并在它里面。以前的做法是退回回合起点、
+/// 把整个回合重发一遍：回合不限步数，100 步、每步一个 50KB 的 bash 输出，
+/// 轮询一次就是几 MB（服务端拼、客户端 parse、整条消息重新渲染），越跑越慢。
+///
+/// 现在只退回到 `client_len` 之前**最后一步**（那一步的工具结果可能是新到的），
+/// 并告诉客户端：那条 assistant 消息的前 `keep_parts` 个 part 留着，后面换成
+/// 新发的。重发量和回合长度无关。
+pub struct SessionPatch {
+    /// 客户端的消息数组从这里开始替换
+    pub replace_from: usize,
+    /// `Some(k)`：`messages[0]` 接在客户端第 `replace_from` 条（assistant）的
+    /// 前 k 个 part 后面，而不是整条替换
+    pub keep_parts: Option<usize>,
+    pub messages: Vec<Value>,
+}
+
+pub fn session_patch(sess: &ChatSession, client_len: usize) -> SessionPatch {
+    let msgs = &sess.messages;
+    let len = msgs.len();
+    let client_len = client_len.min(len);
+
+    // 没有新消息，或者新的是一条用户消息（新回合）：从 client_len 往后发
+    let continuing = client_len < len && !msgs[client_len].is_user();
+    if !continuing {
+        return SessionPatch {
+            replace_from: session_view_count_before(sess, client_len),
+            keep_parts: None,
+            messages: session_view_from(sess, client_len),
+        };
+    }
+
+    // 同一回合的延续。回合起点：上一条是 User（或到 0）
+    let mut turn_start = client_len;
+    while turn_start > 0 && !msgs[turn_start - 1].is_user() {
+        turn_start -= 1;
+    }
+    let assistants: Vec<usize> = (turn_start..client_len)
+        .filter(|&i| is_visible_assistant(&msgs[i]))
+        .collect();
+    let (Some(&first), Some(&last)) = (assistants.first(), assistants.last()) else {
+        // 这个回合在客户端那边还没有 assistant：新开的那条就是它
+        return SessionPatch {
+            replace_from: session_view_count_before(sess, client_len),
+            keep_parts: None,
+            messages: session_view_from(sess, client_len),
+        };
+    };
+
+    let keep: usize = msgs[turn_start..last].iter().map(view_parts_len).sum();
+    let prior_steps = assistants.len() - 1;
+    let mut out = session_view_from(sess, last);
+    if let Some(head) = out.first_mut() {
+        // 并进去之后它就是完整视图里那一条：id 和步数都按整条算
+        head["id"] = json!(format!("a{first}"));
+        let steps = head["steps"].as_u64().unwrap_or(1) as usize + prior_steps;
+        head["steps"] = json!(steps);
+    }
+    SessionPatch {
+        replace_from: session_view_count_before(sess, turn_start),
+        keep_parts: Some(keep),
+        messages: out,
+    }
+}
+
 /// 跑一个用户回合，把 chunk 推到 `tx`。
 ///
 /// `sid`：写进哪个会话。`turn`：这个回合的停止开关 —— 由调用方用
@@ -1082,11 +1276,15 @@ pub async fn run_turn(
     // 系统提示词可能被 /api/debug/system-prompt 覆盖过，所以不能直接用常量。
     // 在拿会话写锁之前先取出来，避免锁套锁。
     let system_prompt = core.state.system_prompt();
+    // 不活跃的会话消息不在内存里，先从库里读回来（回合进行中不会被放掉，
+    // 见 `AppState::evict_idle`）
+    core.state.ensure_loaded(sid).await?;
     {
         let mut store = core.state.chat.write().await;
         let Some(sess) = store.get_mut(sid) else {
             anyhow::bail!("没有这个会话: {sid}");
         };
+        anyhow::ensure!(sess.resident(), "会话的消息没能读进来: {sid}");
         // 上一回合被打断（进程被杀）留下的半截工具调用，先补上结果
         close_dangling_tail(sess);
         // 历史里只追加两类东西：待补的系统提示词（见 `ensure_system_prompt`）
@@ -1117,9 +1315,15 @@ pub async fn run_turn(
 /// 会话中途被删了就丢掉（下一步 stream_one 会报错停下）。
 async fn append(core: &Core, sid: &str, m: ChatMessage) {
     let mut store = core.state.chat.write().await;
-    if let Some(s) = store.get_mut(sid) {
-        s.messages.push(m);
-        s.updated_at = now_ms();
+    match store.get_mut(sid) {
+        Some(s) if s.resident() => {
+            s.messages.push(m);
+            s.updated_at = now_ms();
+        }
+        // 回合进行中的会话不会被放掉（`evict_idle` 跳过 busy 的）；真到了这里，
+        // 往空的 `messages` 里推会让落盘把库里的历史覆盖掉 —— 宁可丢这一条
+        Some(_) => tracing::error!("会话 {sid} 的消息不在内存里，丢弃一条追加"),
+        None => {}
     }
     drop(store);
     core.state.mark_sessions_dirty();
@@ -2123,10 +2327,8 @@ async fn execute_tool(
         return match res {
             Ok(r) => {
                 let text = r.to_text();
-                ToolOutcome::json(json!({
-                    // 输出里的网址（见 `urls` 模块）：要么用 agent-open 打开，
-                    // 要么在回复里给用户（他在聊天里点）
-                    "urls": crate::urls::extract(&text),
+                let urls = crate::urls::extract(&text);
+                let mut out = json!({
                     "output": text,
                     "exit_code": r.code,
                     "truncated": r.truncated,
@@ -2134,7 +2336,14 @@ async fn execute_tool(
                     "signal": r.signal,
                     "full_output_path": r.full_output_path,
                     "wall_time_seconds": (r.duration_ms as f64) / 1000.0,
-                }))
+                });
+                // 输出里的网址（见 `urls` 模块）：要么用 agent-open 打开，要么在
+                // 回复里给用户（用户在聊天里点）。没有就不带这个字段 —— 每条
+                // 结果都会留在历史里、每一步都重发，空数组也是钱
+                if !urls.is_empty() {
+                    out["urls"] = json!(urls);
+                }
+                ToolOutcome::json(out)
             }
             Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
         };
@@ -2206,6 +2415,10 @@ async fn execute_tool(
         if action.is_empty() {
             return ToolOutcome::json(json!({ "error": "缺少参数 action" }));
         }
+        // `__` 开头的是壳和核心之间的内部动作（取消、打开 URI），不给模型
+        if action.starts_with("__") {
+            return ToolOutcome::json(json!({ "error": format!("未知动作 {action}") }));
+        }
 
         let res = match core.browser(&args.to_string()).await {
             Ok(v) => v,
@@ -2274,16 +2487,13 @@ fn format_hits(found: &crate::search::Found) -> String {
         return "没搜到结果。换个说法，或者用 browser 打开搜索引擎自己翻。".to_string();
     }
     let mut out = String::new();
+    let mut chars = 0usize;
     for (i, h) in found.hits.iter().enumerate() {
         let snip: String = h.snippet.chars().take(400).collect();
-        out.push_str(&format!(
-            "{}. {}\n   {}\n   {}\n",
-            i + 1,
-            h.title,
-            h.url,
-            snip
-        ));
-        if out.chars().count() > 4000 {
+        let item = format!("{}. {}\n   {}\n   {}\n", i + 1, h.title, h.url, snip);
+        chars += item.chars().count();
+        out.push_str(&item);
+        if chars > 4000 {
             out.push_str("…（结果太长，已截断；调小 num_results 或换更准的说法）\n");
             break;
         }
@@ -3222,6 +3432,84 @@ mod tests {
         }
     }
 
+    /// 轮询补丁的不变式：客户端手上是**任意时刻**（`messages[..n]`）的视图，
+    /// 按前端的规则（`App.svelte` 的 `loadMessages`）套上 `session_patch(n)`，
+    /// 必须逐字节等于完整视图。而且回合再长，补丁也只带最后一步。
+    #[test]
+    fn session_patch_brings_any_snapshot_up_to_date() {
+        let call = |id: &str| RecordedToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let tool = |id: &str| ChatMessage::Tool {
+            tool_call_id: id.into(),
+            content: format!("{{\"output\":\"{id}\"}}"),
+            images: vec![],
+        };
+        let asst =
+            |content: &str, reasoning: &str, calls: Vec<RecordedToolCall>| ChatMessage::Assistant {
+                content: content.into(),
+                reasoning: reasoning.into(),
+                tool_calls: calls,
+            };
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("U1".into()),
+            asst("先看看", "想", vec![call("c1"), call("c2")]),
+            tool("c1"),
+            tool("c2"),
+            // 什么都没有的一步：视图里不出现，也不算步数
+            asst("", "", vec![]),
+            asst("", "再想", vec![call("c3")]),
+            tool("c3"),
+            asst("答1", "", vec![]),
+            ChatMessage::System("新提示词".into()),
+            ChatMessage::User("U2".into()),
+            asst("", "", vec![call("c4")]),
+            tool("c4"),
+            asst("答2", "", vec![]),
+        ];
+        let full = session_view(&sess);
+
+        for n in 0..=sess.messages.len() {
+            let mut then = sess.clone();
+            then.messages.truncate(n);
+            let client = session_view(&then);
+
+            let p = session_patch(&sess, n);
+            assert!(p.replace_from <= client.len(), "n={n}");
+            let mut fresh = p.messages.clone();
+            if let Some(k) = p.keep_parts {
+                let old = client[p.replace_from]["parts"].as_array().unwrap();
+                let mut parts: Vec<Value> = old[..k].to_vec();
+                parts.extend(fresh[0]["parts"].as_array().unwrap().iter().cloned());
+                fresh[0]["parts"] = json!(parts);
+            }
+            let applied: Vec<Value> = client[..p.replace_from]
+                .iter()
+                .cloned()
+                .chain(fresh)
+                .collect();
+            assert_eq!(applied, full, "n={n} 时补丁结果与完整视图不一致");
+        }
+
+        // 回合进行中（服务端刚追加了 c3 的结果，客户端停在它之前）：只重发
+        // 最后那一步，前面那步留在客户端
+        let mut now = sess.clone();
+        now.messages.truncate(8);
+        let p = session_patch(&now, 7);
+        assert_eq!(p.keep_parts, Some(4), "第一步的思考 + 正文 + 两个工具");
+        assert_eq!(p.messages.len(), 1);
+        assert_eq!(
+            p.messages[0]["parts"].as_array().unwrap().len(),
+            2,
+            "思考 + c3"
+        );
+        assert_eq!(p.messages[0]["parts"][1]["state"], "output");
+    }
+
     #[test]
     fn each_block_gets_its_own_id_in_output_order() {
         let ids = |chunks: &[Value]| -> Vec<(String, String)> {
@@ -3310,13 +3598,13 @@ mod tests {
     fn search_hits_message_text_case_insensitively() {
         let store = store_with_two_sessions();
 
-        let hits = store.search("APK", 3, 60);
+        let hits = store.search("APK", 3, 60, |_| None);
         assert_eq!(hits.len(), 1, "只搜用户/助手正文，系统提示词和工具结果不算");
         assert_eq!(hits[0]["title"], "Alpine 版本");
         assert_eq!(hits[0]["role"], "user");
         assert_eq!(hits[0]["snippet"], "看一下 apk 版本");
 
-        let hits = store.search("alpine", 3, 60);
+        let hits = store.search("alpine", 3, 60, |_| None);
         assert_eq!(hits[0]["snippet"], "Alpine 3.21 第二行", "换行要拍成空格");
     }
 
@@ -3324,7 +3612,7 @@ mod tests {
     fn search_is_ordered_by_recency_and_capped() {
         let store = store_with_two_sessions();
         // "a" 两个会话都命中；更新的那个（a，updated_at=200）排前面
-        let hits = store.search("a", 3, 60);
+        let hits = store.search("a", 3, 60, |_| None);
         assert!(hits.len() >= 2);
         assert_eq!(hits[0]["title"], "Alpine 版本");
 
@@ -3337,16 +3625,16 @@ mod tests {
             sessions: vec![many],
             active: String::new(),
         };
-        assert_eq!(store.search("命中", 3, 60).len(), 3);
-        assert_eq!(store.search("命中", 3, 1).len(), 1, "总量封顶");
+        assert_eq!(store.search("命中", 3, 60, |_| None).len(), 3);
+        assert_eq!(store.search("命中", 3, 1, |_| None).len(), 1, "总量封顶");
     }
 
     #[test]
     fn search_handles_empty_and_multibyte() {
         let store = store_with_two_sessions();
-        assert!(store.search("", 3, 60).is_empty());
-        assert!(store.search("   ", 3, 60).is_empty());
-        assert!(store.search("不存在的词", 3, 60).is_empty());
+        assert!(store.search("", 3, 60, |_| None).is_empty());
+        assert!(store.search("   ", 3, 60, |_| None).is_empty());
+        assert!(store.search("不存在的词", 3, 60, |_| None).is_empty());
 
         // 中文按字符切，不能切出半截 UTF-8
         let mut s = ChatSession::new();
@@ -3359,11 +3647,61 @@ mod tests {
             sessions: vec![s],
             active: String::new(),
         };
-        let hits = store.search("测试", 3, 60);
+        let hits = store.search("测试", 3, 60, |_| None);
         assert_eq!(hits.len(), 1);
         let snip = hits[0]["snippet"].as_str().unwrap();
         assert!(snip.starts_with('…') && snip.ends_with('…'));
         assert!(snip.chars().count() < 90);
+    }
+
+    /// 小写化会改变字符数的字符（`İ` → 两个字符）在命中位置之前时，
+    /// 摘要还得切在原文的正确位置上。
+    #[test]
+    fn snippet_survives_case_folding_that_changes_length() {
+        let text = format!("{}needle{}", "İ".repeat(30), "x".repeat(10));
+        let snip = hit_snippet(&text, "NEEDLE").unwrap();
+        assert!(snip.contains("needle"), "{snip}");
+        assert!(snip.ends_with("xxxxxxxxxx"), "{snip}");
+    }
+
+    /// 消息不在内存里的会话：搜索时临时从库里读（`load`），读不出来就跳过。
+    #[test]
+    fn search_loads_evicted_sessions_on_demand() {
+        let mut store = store_with_two_sessions();
+        let parked = store.sessions[1].messages.clone();
+        let id = store.sessions[1].id.clone();
+        store.sessions[1].evict();
+        assert!(store.sessions[1].messages.is_empty());
+
+        let mut asked = Vec::new();
+        let hits = store.search("fizzbuzz", 3, 60, |sid| {
+            asked.push(sid.to_string());
+            Some(parked.clone())
+        });
+        assert_eq!(asked, vec![id]);
+        assert_eq!(hits.len(), 1);
+        assert!(store.sessions[1].messages.is_empty(), "搜完不装回去");
+
+        assert!(store.search("fizzbuzz", 3, 60, |_| None).is_empty());
+    }
+
+    /// 放掉消息之后，侧边栏 / 落盘要的数字照旧。
+    #[test]
+    fn an_evicted_session_keeps_its_counts() {
+        let mut s = ChatSession::new();
+        s.messages = vec![
+            ChatMessage::System("p".into()),
+            ChatMessage::User("一".into()),
+            ChatMessage::User("二".into()),
+        ];
+        s.evict();
+        assert!(!s.resident());
+        assert_eq!((s.message_count(), s.user_count()), (3, 2));
+        assert!(s.has_content());
+
+        s.install(vec![ChatMessage::User("一".into())]);
+        assert!(s.resident());
+        assert_eq!(s.message_count(), 1);
     }
 
     // —— 空会话 ——

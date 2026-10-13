@@ -876,11 +876,12 @@ impl LinuxSandbox {
         env.insert("ENV".into(), "/etc/profile".into());
         env.insert("CHARSET".into(), "UTF-8".into());
         env.insert("LANG".into(), "C.UTF-8".into());
-        env.insert("TERM".into(), "dumb".into()); // 非交互，别输出 ANSI
-                                                  // 沙箱里没有浏览器，但用户手里有：把 BROWSER 指到 agent-open。它不会开
-                                                  // 任何东西，只把网址打回输出，由 agent 在回复里转告用户 ——
-                                                  // `gh auth login --web` / python webbrowser / xdg-open 都会走这里。
-                                                  // 强制覆盖（不 putIfAbsent）：用户 dotfile 里的 BROWSER= 不该抢走它。
+        // 非交互，别输出 ANSI
+        env.insert("TERM".into(), "dumb".into());
+        // 沙箱里没有浏览器，但手机上有：把 BROWSER 指到 agent-open，它让手机
+        // 去打开（`agent open` → 设备通道）。`gh auth login --web` / python
+        // webbrowser / xdg-open 都会走这里。强制覆盖（不 putIfAbsent）：用户
+        // dotfile 里的 BROWSER= 不该抢走它。
         env.insert("BROWSER".into(), "/usr/local/bin/agent-open".into());
         // 分页器会**挂住**（非交互环境没人按键），一次工具调用就废了
         env.insert("PAGER".into(), "cat".into());
@@ -952,7 +953,8 @@ impl LinuxSandbox {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        // 让 proot 自己成为进程组组长，超时好整组杀
+        // 超时 / 按停止（future 被丢掉）时杀掉 proot；沙箱里的子孙进程靠
+        // `--kill-on-exit` 跟着一起死（见 `command_line`）
         cmd.kill_on_drop(true);
 
         if let Some(tmp) = &self.cfg.tmp {

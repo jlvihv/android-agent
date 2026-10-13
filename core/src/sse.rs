@@ -14,7 +14,6 @@
 //!
 //! 这里只产出 **chunk 本身**（`serde_json::Value`），不负责传输格式：
 //! - HTTP 走 `axum::response::sse`，用 `SseEvent::default().data(v.to_string())`
-//! - WebSocket 直接把这几个 Value 塞进 `Event::Agent { chunk }`
 //! - 需要裸 SSE 文本时用 `frame()`
 
 use serde_json::{json, Value};

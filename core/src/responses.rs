@@ -41,7 +41,8 @@ use crate::openai::{
 pub struct ResponsesRequest {
     pub model: String,
     pub input: Vec<InputItem>,
-    pub tools: Vec<Tool>,
+    /// 共享的那一份，同 `openai::ChatRequest::tools`
+    pub tools: std::sync::Arc<[Tool]>,
     pub stream: bool,
     /// 不落服务端状态：我们靠完整回放历史（也才可控 prompt 前缀）。
     pub store: bool,
@@ -505,7 +506,7 @@ mod tests {
                     ]),
                 }),
             ],
-            tools: vec![],
+            tools: vec![].into(),
             stream: true,
             store: false,
             reasoning: None,
@@ -554,7 +555,8 @@ mod tests {
                 name: "bash".into(),
                 description: "跑命令".into(),
                 parameters: json!({ "type": "object" }),
-            }],
+            }]
+            .into(),
             stream: true,
             store: false,
             reasoning: None,

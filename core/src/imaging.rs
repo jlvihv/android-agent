@@ -129,7 +129,7 @@ pub fn load_if_image_bytes(source: &[u8]) -> anyhow::Result<Option<Encoded>> {
     // 源码路径（版本号就在路径里，例如 `zune-jpeg-0.5.15/src/…`），顺着找过去，
     // 然后**修 / 换 / 自己写**那个解码器，而不是把 abort 改回去。
     //
-    // 上面那两道防线保留：`dimensions()` 预检 + `Limits`（宽高/分配上限）把
+    // 上面那两道防线保留：`header()` 预检 + `Limits`（宽高/分配上限）把
     // 畸形输入变成正常的 `Err`，那是防患于未然，和「兜 panic」不是一回事。
     encode(source, source_mime).map(Some)
 }
@@ -237,14 +237,17 @@ fn fits_inline(raw: usize) -> bool {
 }
 
 fn encode(source: &[u8], source_mime: &str) -> anyhow::Result<Encoded> {
-    // --- 快路：只读尺寸，不整理解码 ---
-    if let Ok((w, h)) = dimensions(source) {
+    // --- 快路：只读头（尺寸 + EXIF 方向），不整个解码 ---
+    if let Ok((w, h, orientation)) = header(source) {
         anyhow::ensure!(
             pixels_ok(w, h),
             "图片 {w}×{h} 太大（超过 {} 万像素），先在沙箱里缩一下：\n\n    apk add imagemagick && convert in.jpg -resize 2000x2000 out.jpg\n\n然后再 read out.jpg。",
             MAX_PIXELS / 10_000
         );
-        if w <= MAX_DIM && h <= MAX_DIM && fits_inline(source.len()) {
+        // 带 EXIF 旋转标记的不能原样发：手机竖拍的小图，模型看到的会是躺着的
+        // （provider 不保证按 EXIF 转正）。走慢路解码、转正、重编码。
+        let upright = orientation == Orientation::NoTransforms;
+        if upright && w <= MAX_DIM && h <= MAX_DIM && fits_inline(source.len()) {
             return Ok(Encoded {
                 bytes: source.to_vec(),
                 mime: source_mime.to_string(),
@@ -344,9 +347,13 @@ fn fit(w: u32, h: u32) -> (u32, u32) {
     )
 }
 
-fn dimensions(bytes: &[u8]) -> anyhow::Result<(u32, u32)> {
+/// 只读图片头：尺寸和 EXIF 方向（建 decoder 只解析头，不解码像素）。
+fn header(bytes: &[u8]) -> anyhow::Result<(u32, u32, Orientation)> {
     let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
-    Ok(reader.into_dimensions()?)
+    let mut decoder = reader.into_decoder()?;
+    let (w, h) = decoder.dimensions();
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    Ok((w, h, orientation))
 }
 
 fn try_png(img: &DynamicImage) -> Option<Vec<u8>> {
@@ -444,6 +451,29 @@ mod tests {
         let p = std::env::temp_dir().join(format!("agent-image-text-{}", std::process::id()));
         std::fs::write(&p, "just text").unwrap();
         assert!(load_if_image(&p).unwrap().is_none());
+    }
+
+    /// 手机竖拍的小图：尺寸没超、字节也不大，但带 EXIF 旋转标记 ——
+    /// 不能原样发（模型看到的是躺着的），要转正后重编码。
+    #[test]
+    fn small_images_with_an_exif_rotation_are_turned_upright() {
+        let img = DynamicImage::new_rgb8(40, 20);
+        let mut jpeg = Vec::new();
+        img.write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+        // APP1/Exif：大端 TIFF，一个 IFD 条目 Orientation(0x0112) = 6（顺时针 90°）
+        let mut app1: Vec<u8> = vec![0xFF, 0xE1, 0x00, 0x22];
+        app1.extend_from_slice(b"Exif\0\0MM\0\x2a\0\0\0\x08");
+        app1.extend_from_slice(&[
+            0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let mut rotated = jpeg[..2].to_vec();
+        rotated.extend_from_slice(&app1);
+        rotated.extend_from_slice(&jpeg[2..]);
+
+        let e = load_if_image_bytes(&rotated).unwrap().unwrap();
+        assert_ne!(e.bytes, rotated, "带旋转标记的不能原样发");
+        assert_eq!((e.width, e.height), (20, 40), "转正之后宽高互换");
     }
 
     #[test]

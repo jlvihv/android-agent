@@ -37,7 +37,9 @@ use serde_json::Value;
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
-    pub tools: Vec<Tool>,
+    /// 共享的那一份（`agent::tool_definitions`）：每一步都要带上整张表，
+    /// 不必每步重新拼 schema。
+    pub tools: std::sync::Arc<[Tool]>,
     pub stream: bool,
     pub stream_options: StreamOptions,
     /// 思考强度（`minimal` / `low` / `medium` / `high`）。

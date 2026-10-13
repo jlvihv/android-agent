@@ -51,6 +51,39 @@ for (i, m) in s.messages.iter().enumerate().skip(done) { INSERT ... }
 
 有测试专门守这条：`appends_only_new_messages`。
 
+### 只把要用的会话放在内存里
+
+启动时 `Db::load()` 只读**全部会话的元数据 + 活动会话的消息**；别的会话只留摘要
+（`ChatSession::stub`：条数、用户消息数——侧边栏和水位线要的就这些）。会话多了以后
+（每条都带几十 KB 的 bash 输出），全放内存是几十 MB，而大部分再也不会打开。
+
+- 要用时 `AppState::ensure_loaded` 从库里读回来：开始回合、`/api/session`、
+  `/api/debug/request`。搜索临时读、扫完就扔，不装回去。
+- 落盘定时器每次写完盘调 `AppState::evict_idle` 放掉：不是当前会话、没有回合在跑、
+  读进来超过一分钟、**而且内存里的样子已经全部落盘**（`Db::is_synced`）。
+- `sync` 碰到消息不在内存里的会话只更新会话头，消息一条都不动 —— 空的 `messages`
+  绝不能被当成「清空过」。
+
+### 读不出来的消息：整个会话报错，不跳过
+
+`load_messages` 遇到解析不了的 payload（装回旧版本时，新版本写的变体它不认识）
+**整个报错**。以前是 `filter_map(.ok())` 静默跳过：内存比库里少一条，水位线跟着
+变小，下次落盘从那个位置 `INSERT OR REPLACE`，就把库里后面的消息覆盖了。现在这个
+会话保持「不在内存里」，库里的行原样不动，换回能读的版本还看得到。
+
+### 清空过：`epoch`
+
+`clear()` 会把 `ChatSession::epoch` 加一，`Saved` 里也记着它。只看条数的话，清空后
+两秒内又长过了旧长度就看不出清空过，库里前面那几条旧消息会留下来。
+
+### 磁盘上的副产物（`gc.rs`）
+
+图片副本（`images/`）、附件（`attachments/`）、浏览器截图（`/root/.browser/`）、
+bash 溢出的输出（`/tmp/agent-out-*.log`）以前只增不减。现在删会话 / 清空会话时
+清它引用的那些；启动时再扫一遍，删掉库里没有任何消息引用、又是这次启动之前写的
+（沙箱里那两类再多宽限一天：模型可能还在 bash 里用它们）。上传了没发的附件放
+一小时，下次上传时清掉。
+
 ### `bundled` feature
 
 Android 上没有 `libsqlite3.so` 可链，所以开 `rusqlite` 的 `bundled`

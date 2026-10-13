@@ -1,5 +1,6 @@
 package dev.vihv.agent
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -12,7 +13,9 @@ import android.util.Log
  *  - **用户**在聊天里点链接（`MainActivity` 的 `shouldOverrideUrlLoading` /
  *    `onCreateWindow`）；
  *  - **agent** 自己要求打开（沙箱里的 `agent-open` / `$BROWSER` / `xdg-open`
- *    → `POST /api/open` → `DeviceHostImpl` 的 `open` 指令）。
+ *    → `agent open` → `POST /api/command` 的 `open` 指令）。开着无障碍时走
+ *    `DeviceHostImpl`（用无障碍服务的 context，后台也能拉起页面）；没开时走
+ *    `BrowserController` 的 `__open_uri`（[openFromApp]，只在 App 在前台时行）。
  *
  * 两边都**不做 scheme 白名单**：agent 操作的是用户自己的手机，跟 `agent command`
  * 那条路一个立场 —— 调用直接执行，没有审批环节。剩下的只是"系统能不能接"。
@@ -33,6 +36,24 @@ object UriLauncher {
         if (scheme == "intent" || scheme == "android-app") return openParsedIntent(context, uri)
         startView(context, Intent(Intent.ACTION_VIEW, uri))
         return "opened $uri"
+    }
+
+    /**
+     * 没有无障碍服务时的入口：用 Application 的 context 打开。
+     *
+     * Android 10+ 不许普通 App 从后台起 Activity —— 而且被拦时**不抛异常**，
+     * 只是什么都不发生。所以先自己看一眼在不在前台，不在就明说，别让 agent
+     * 以为已经打开了。（前台服务不算：它不豁免这条限制。）
+     */
+    fun openFromApp(context: Context, uri: Uri): String {
+        val me = ActivityManager.RunningAppProcessInfo()
+        ActivityManager.getMyMemoryState(me)
+        val visible = me.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND ||
+            me.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
+        check(visible) {
+            "App 在后台、无障碍服务也没开，系统不允许从后台打开页面：开启无障碍服务，或请用户切回 App 后再试"
+        }
+        return open(context, uri)
     }
 
     private fun openParsedIntent(context: Context, uri: Uri): String {

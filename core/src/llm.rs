@@ -460,7 +460,7 @@ pub fn build_chat_request(model: &str, system: Option<&str>, user: &str) -> Chat
     ChatRequest {
         model: model.to_string(),
         messages,
-        tools: Vec::new(),
+        tools: Vec::new().into(),
         stream: true,
         stream_options: openai::StreamOptions {
             include_usage: true,

@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::agent::{ChatMessage, ChatSession, SessionStore};
+use crate::agent::{ChatMessage, ChatSession, SessionStore, Stub};
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -69,6 +69,8 @@ struct Inner {
 struct Saved {
     /// 已经落盘的消息条数（水位线）
     len: usize,
+    /// 落盘时的清空次数（`ChatSession::epoch`）。变了 = 整段换过
+    epoch: u32,
     updated_at: u64,
     title: String,
     provider_session: String,
@@ -77,7 +79,8 @@ struct Saved {
 impl Saved {
     fn of(s: &ChatSession) -> Self {
         Self {
-            len: s.messages.len(),
+            len: s.message_count(),
+            epoch: s.epoch,
             updated_at: s.updated_at,
             title: s.title.clone(),
             provider_session: s.provider_session.clone(),
@@ -118,7 +121,10 @@ impl Db {
         })
     }
 
-    /// 读出全部会话。只在启动时调一次。
+    /// 启动时读会话：**全部会话的元数据 + 活动会话的消息**。只在启动时调一次。
+    ///
+    /// 别的会话只留摘要（`ChatSession::stub`），要用时 `load_messages` 再读 ——
+    /// 全读进来的话，历史一多就是几十 MB 常驻内存，而大部分会话再也不会打开。
     pub fn load(&self) -> Result<SessionStore> {
         let mut g = self
             .inner
@@ -136,11 +142,25 @@ impl Db {
 
         let store = {
             let g = &*g;
-            let mut store = SessionStore::default();
+            let active: String = g
+                .conn
+                .query_row("SELECT v FROM meta WHERE k = 'active'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap_or_default();
+            let mut store = SessionStore {
+                active,
+                ..Default::default()
+            };
 
+            // 用户消息条数靠 payload 的开头认：`ChatMessage` 是外部标签的枚举，
+            // 用户消息序列化出来是 `{"User":…` 或 `{"UserFiles":…`（有测试盯着）。
             let mut stmt = g.conn.prepare(
-                "SELECT id, title, created_at, updated_at, provider_session
-                 FROM sessions ORDER BY updated_at DESC",
+                r#"SELECT s.id, s.title, s.created_at, s.updated_at, s.provider_session,
+                          COUNT(m.seq), COALESCE(SUM(m.payload LIKE '{"User%'), 0)
+                   FROM sessions s JOIN messages m ON m.session_id = s.id
+                   GROUP BY s.id
+                   ORDER BY s.updated_at DESC"#,
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -149,44 +169,37 @@ impl Db {
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             })?;
 
             for row in rows {
-                let (id, title, created_at, updated_at, provider_session) = row?;
-
-                let mut m = g
-                    .conn
-                    .prepare("SELECT payload FROM messages WHERE session_id = ?1 ORDER BY seq")?;
-                let messages: Vec<ChatMessage> = m
-                    .query_map([&id], |r| r.get::<_, String>(0))?
-                    .filter_map(|p| p.ok())
-                    .filter_map(|p| serde_json::from_str(&p).ok())
-                    .collect();
-
-                // 空会话不给回来（跟 sync 的过滤对称）：库里可能还留着
-                // 老版本攒下的空会话，读到内存里就只在侧边栏里占位。
-                if messages.is_empty() {
-                    continue;
-                }
-
-                store.sessions.push(ChatSession {
+                let (id, title, created_at, updated_at, provider_session, len, users) = row?;
+                let mut s = ChatSession {
                     id,
                     title,
                     created_at: created_at.max(0) as u64,
                     updated_at: updated_at.max(0) as u64,
-                    messages,
+                    messages: Vec::new(),
                     provider_session,
-                });
+                    stub: Some(Stub {
+                        len: len.max(0) as usize,
+                        users: users.max(0) as usize,
+                    }),
+                    loaded_at: None,
+                    epoch: 0,
+                };
+                // 活动会话一打开就要看，直接读进来；读不出来就让它留着摘要
+                // （库里的行原样不动，换个能读的版本还能看到）
+                if s.id == store.active {
+                    match Self::messages_of(&g.conn, &s.id) {
+                        Ok(m) => s.install(m),
+                        Err(e) => tracing::warn!("会话 {} 读不出来: {e:#}", s.id),
+                    }
+                }
+                store.sessions.push(s);
             }
-
-            store.active = g
-                .conn
-                .query_row("SELECT v FROM meta WHERE k = 'active'", [], |r| {
-                    r.get::<_, String>(0)
-                })
-                .unwrap_or_default();
-
             store
         };
 
@@ -198,6 +211,67 @@ impl Db {
         g.saved_active = Some(store.active.clone());
 
         Ok(store)
+    }
+
+    /// 读一个会话的全部消息（按需加载用）。
+    ///
+    /// **任何一条解析不了就整个报错**，不跳过：跳过的话内存里比库里少，水位线
+    /// 跟着变小，下次落盘从那个位置 `INSERT OR REPLACE`，就把库里后面的消息
+    /// 覆盖了。典型场景是装回旧版本 —— 新版本写的变体旧版本认不出来。
+    pub fn load_messages(&self, id: &str) -> Result<Vec<ChatMessage>> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        Self::messages_of(&g.conn, id)
+    }
+
+    fn messages_of(conn: &Connection, id: &str) -> Result<Vec<ChatMessage>> {
+        let mut stmt =
+            conn.prepare("SELECT seq, payload FROM messages WHERE session_id = ?1 ORDER BY seq")?;
+        let rows = stmt.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, payload) = row?;
+            let m = serde_json::from_str(&payload).with_context(|| {
+                format!("第 {seq} 条消息解析不了（可能是新版本写的，当前版本不认识）")
+            })?;
+            out.push(m);
+        }
+        Ok(out)
+    }
+
+    /// 库里所有**带文件**的消息（附件、工具返回的图片），给启动清扫算「哪些
+    /// 文件还有人引用」（见 `gc`）。
+    ///
+    /// 只挑可能带文件的那几行来解析，不把整个库读一遍：`UserFiles`，以及
+    /// `images` 非空的 `Tool`（`Tool` 的字段按 `tool_call_id, content, images`
+    /// 的顺序序列化，没图的那行一定以 `"images":[]}}` 结尾，有测试盯着）。
+    /// 任何一行解析不了就整个报错 —— 调用方据此**不清扫**，宁可留着。
+    pub fn messages_with_files(&self) -> Result<Vec<ChatMessage>> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let mut stmt = g.conn.prepare(
+            r#"SELECT payload FROM messages
+               WHERE payload LIKE '{"UserFiles"%'
+                  OR (payload LIKE '{"Tool"%' AND payload NOT LIKE '%"images":[]}}')"#,
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?).context("消息解析不了")?);
+        }
+        Ok(out)
+    }
+
+    /// 这个会话内存里的样子是不是都已经落盘了（放掉消息之前要确认这一点）。
+    pub fn is_synced(&self, s: &ChatSession) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.saved.get(&s.id) == Some(&Saved::of(s)))
+            .unwrap_or(false)
     }
 
     /// 增量落盘。每 2 秒被定时器调一次（有改动时）。
@@ -250,12 +324,19 @@ impl Db {
                 ],
             )?;
 
-            let mut done = saved.get(&s.id).map(|x| x.len).unwrap_or(0);
+            let prev = saved.get(&s.id);
+            let mut done = prev.map(|x| x.len).unwrap_or(0);
             // 会话被清空过（/api/reset）：消息变少了。不处理的话 done 还停在
             // 旧长度，新消息的 seq 从 0 开始会被 skip(done) 全部跳过不落盘，
             // 而库里的旧消息还在 —— 重启后清掉的对话又回来了。
             // 变少只可能是整个清空过，前缀也不可信，整段重写。
-            if s.messages.len() < done {
+            //
+            // 消息不在内存里的会话只可能改了会话头（改名、换 provider session），
+            // 消息一条都不能动 —— 空的 `messages` 在这里会被当成「清空过」。
+            if !s.resident() {
+                continue;
+            }
+            if s.messages.len() < done || prev.is_some_and(|x| x.epoch != s.epoch) {
                 tx.execute("DELETE FROM messages WHERE session_id = ?1", [&s.id])?;
                 done = 0;
             }
@@ -411,9 +492,163 @@ mod tests {
 
         let back = db.load().unwrap();
         assert_eq!(back.sessions.len(), 2);
-        assert_eq!(back.sessions[0].messages.len(), 3);
         assert_eq!(back.active, st.active);
-        assert_eq!(back.sessions[0].title, "会话0");
+        let s0 = back.sessions.iter().find(|s| s.title == "会话0").unwrap();
+        assert_eq!(db.load_messages(&s0.id).unwrap().len(), 3);
+    }
+
+    /// 启动只把活动会话的消息读进内存；别的只留摘要（条数、用户消息数），
+    /// 要用时 `load_messages` 读。
+    #[test]
+    fn only_the_active_session_is_loaded_eagerly() {
+        let db = Db::in_memory().unwrap();
+        let mut st = store_with(2, 3);
+        // 用户消息计数要把带附件的也算上
+        st.sessions[0].messages.push(ChatMessage::UserFiles {
+            text: "看图".into(),
+            attachments: vec![],
+        });
+        st.sessions[0].messages.push(ChatMessage::Assistant {
+            content: "{\"User\":假的".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+        });
+        let active = st.sessions[1].id.clone();
+        st.activate(&active);
+        db.sync(&st).unwrap();
+
+        let back = db.load().unwrap();
+        let a = back.get(&active).unwrap();
+        assert!(a.resident());
+        assert_eq!(a.messages.len(), 3);
+
+        let other = back.sessions.iter().find(|s| s.id != active).unwrap();
+        assert!(!other.resident());
+        assert!(other.messages.is_empty());
+        assert_eq!((other.message_count(), other.user_count()), (5, 4));
+        assert_eq!(db.load_messages(&other.id).unwrap().len(), 5);
+    }
+
+    /// 消息不在内存里的会话只能改会话头：改名要落盘，消息一条都不能动
+    /// （空的 `messages` 绝不能被当成「清空过」）。
+    #[test]
+    fn syncing_an_evicted_session_never_touches_its_messages() {
+        let db = Db::in_memory().unwrap();
+        let mut st = store_with(2, 3);
+        db.sync(&st).unwrap();
+
+        let id = st.sessions[0].id.clone();
+        st.sessions[0].evict();
+        assert!(db.is_synced(&st.sessions[0]), "放掉消息不算改动");
+        st.sessions[0].title = "改名".into();
+        st.sessions[0].rotate_provider_session();
+        assert!(!db.is_synced(&st.sessions[0]));
+        db.sync(&st).unwrap();
+
+        assert_eq!(db.load_messages(&id).unwrap().len(), 3);
+        let back = db.load().unwrap();
+        assert_eq!(back.get(&id).unwrap().title, "改名");
+    }
+
+    /// 解析不了的消息（装回旧版本时，新版本写的变体它不认识）：整个会话
+    /// 报错，而不是悄悄跳过 —— 跳过会让水位线变小，下次落盘把后面的覆盖掉。
+    #[test]
+    fn an_unreadable_message_fails_the_session_instead_of_being_skipped() {
+        let db = Db::in_memory().unwrap();
+        let st = store_with(1, 3);
+        let id = st.sessions[0].id.clone();
+        db.sync(&st).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE messages SET payload = '{\"FromTheFuture\":1}' WHERE seq = 1",
+                [],
+            )
+            .unwrap();
+
+        assert!(db.load_messages(&id).is_err());
+
+        // 活动会话读不出来：留着摘要，落盘不碰它的行
+        let back = db.load().unwrap();
+        let s = back.get(&id).unwrap();
+        assert!(!s.resident());
+        assert_eq!(s.message_count(), 3);
+        db.sync(&back).unwrap();
+        let rows: i64 = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3);
+    }
+
+    /// 清空之后两秒内又长过了旧长度：只看条数的话看不出来清空过，
+    /// 旧消息会留在库里。
+    #[test]
+    fn clearing_then_growing_past_the_old_length_drops_the_old_rows() {
+        let db = Db::in_memory().unwrap();
+        let mut st = store_with(1, 2);
+        let id = st.sessions[0].id.clone();
+        db.sync(&st).unwrap();
+
+        st.sessions[0].clear();
+        for i in 0..3 {
+            st.sessions[0].messages.push(msg_user(&format!("新{i}")));
+        }
+        db.sync(&st).unwrap();
+
+        let msgs = db.load_messages(&id).unwrap();
+        let texts: Vec<&str> = msgs.iter().filter_map(|m| m.user_text()).collect();
+        assert_eq!(texts, vec!["新0", "新1", "新2"]);
+    }
+
+    /// 启动清扫用的那条查询：只挑带文件的行，不把整个库读一遍。
+    #[test]
+    fn messages_with_files_picks_only_rows_that_carry_files() {
+        use crate::agent::{Attachment, AttachmentKind, ImagePart};
+        let db = Db::in_memory().unwrap();
+        let mut st = SessionStore::default();
+        let id = st.create();
+        let s = st.get_mut(&id).unwrap();
+        s.messages = vec![
+            msg_user("hi"),
+            ChatMessage::UserFiles {
+                text: String::new(),
+                attachments: vec![Attachment {
+                    id: "a.pdf".into(),
+                    path: "/d/attachments/a.pdf".into(),
+                    mime: "application/pdf".into(),
+                    name: "a.pdf".into(),
+                    kind: AttachmentKind::Pdf,
+                }],
+            },
+            // 正文里恰好有那串字也不该被误挑出来
+            ChatMessage::Tool {
+                tool_call_id: "c1".into(),
+                content: "\"images\":[{}]".into(),
+                images: vec![],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "c2".into(),
+                content: "{}".into(),
+                images: vec![ImagePart {
+                    path: "/d/images/1.jpg".into(),
+                    mime: "image/jpeg".into(),
+                    source: "/root/.browser/shot-1.jpg".into(),
+                    tool: "browser".into(),
+                }],
+            },
+        ];
+        db.sync(&st).unwrap();
+
+        let got = db.messages_with_files().unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0], ChatMessage::UserFiles { .. }));
+        assert!(matches!(&got[1], ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "c2"));
     }
 
     /// `provider_session` 是缓存路由的锚点，换过了就必须落盘 ——

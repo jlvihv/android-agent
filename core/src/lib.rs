@@ -19,6 +19,7 @@ pub mod db;
 pub mod demo;
 pub mod editor;
 pub mod ffi;
+pub mod gc;
 pub mod http;
 pub mod imaging;
 pub mod linux;
@@ -204,26 +205,35 @@ impl Core {
         self.state.set_linux(Arc::new(sb));
     }
 
-    /// 清空会话历史（含待审批项）
+    /// 清空当前会话的历史。有回合在跑就不清（见 `AppState::reset_active`）。
     pub fn reset_session(&self) {
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
+        match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 let st = self.state.clone();
                 h.spawn(async move {
-                    let mut store = st.chat.write().await;
-                    store.active_mut().clear();
+                    match st.reset_active().await {
+                        Ok(()) => st.log("info", "会话已清空"),
+                        Err(why) => st.log("warn", why),
+                    }
                 });
             }
             Err(_) => {
-                // 没有运行时上下文（比如刚从 Kotlin 调进来）：
-                // try_write 拿不到就算了，下次 /api/reset 会清
-                if let Ok(mut store) = self.state.chat.try_write() {
-                    store.active_mut().clear();
+                // 没有运行时上下文（比如刚从 Kotlin 调进来）：try_write 拿不到
+                // 就算了。文件留给下次启动的清扫（见 `gc`）。
+                let Ok(mut store) = self.state.chat.try_write() else {
+                    return;
+                };
+                let sid = store.active_mut().id.clone();
+                if self.state.is_busy(&sid) {
+                    self.push_log("warn", "这个会话还有回合在运行，没有清空");
+                    return;
                 }
+                store.active_mut().clear();
+                drop(store);
+                self.state.mark_sessions_dirty();
+                self.push_log("info", "会话已清空");
             }
         }
-        self.push_log("info", "会话已清空");
     }
 
     /// 在 Linux 沙箱里跑一段脚本。
@@ -281,19 +291,24 @@ impl Core {
     ///    直接在 tokio worker 上等会把（只有两个的）worker 占死。
     /// 2. 这里包一层 `timeout`：Kotlin 自己的硬超时是主要手段，但万一它没回来
     ///    （WebView 卡住/进程状态不对），agent 不能陪着一起挂。
-    /// 3. 超时只意味着**不再等**，那个阻塞线程还会跑完 —— 可以接受，因为
-    ///    Kotlin 实现里有自己的动作超时，不会无限跑下去。
+    /// 3. 不再等（超时，或者用户按停止、这个 future 被丢掉）时发一个 `__cancel`
+    ///    （[`CancelBrowserOnDrop`]）：光丢 future 的话，那个阻塞线程还攥着
+    ///    Kotlin 侧的动作锁继续跑，下一个动作得排在它后面。
     pub async fn browser(&self, action_json: &str) -> anyhow::Result<serde_json::Value> {
         let host = self
             .state
             .browser()
             .ok_or_else(|| anyhow::anyhow!("浏览器不可用（壳没接上）"))?;
+        let mut cancel = CancelBrowserOnDrop(Some(host.clone()));
         let action = action_json.to_string();
         let joined = tokio::time::timeout(
             std::time::Duration::from_secs(75),
             tokio::task::spawn_blocking(move || host.execute(&action)),
         )
         .await;
+        if joined.is_ok() {
+            cancel.0 = None;
+        }
         let raw = match joined {
             Ok(join) => join
                 .map_err(|e| anyhow::anyhow!("浏览器调用没能跑起来: {e}"))?
@@ -536,6 +551,11 @@ impl Core {
                         tracing::debug!("会话落盘推迟: {e:#}");
                     }
                 }
+                // 落过盘的、不用的会话把消息放掉（只剩摘要，要用时再读）
+                let n = st.evict_idle();
+                if n > 0 {
+                    tracing::debug!("{n} 个会话的消息已移出内存");
+                }
             }
         });
 
@@ -583,6 +603,20 @@ impl Core {
         rx.recv()
             .map_err(|e| anyhow::anyhow!("runtime thread died: {e}"))?
             .map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+/// 浏览器动作没等到结果就被放弃时，叫 Kotlin 那边也别跑了。
+///
+/// `__cancel` 在 Kotlin 侧不排队、只改一个计数（见 `BrowserController.execute`），
+/// 所以在 drop 里同步调没问题。
+struct CancelBrowserOnDrop(Option<Arc<dyn state::BrowserApi>>);
+
+impl Drop for CancelBrowserOnDrop {
+    fn drop(&mut self) {
+        if let Some(host) = self.0.take() {
+            let _ = host.execute(r#"{"action":"__cancel"}"#);
+        }
     }
 }
 
@@ -667,6 +701,37 @@ async fn provision_tools(st: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 动作卡在 Kotlin 侧时，丢掉 `Core::browser` 的 future（= 用户按停止）
+    /// 要补发一个 `__cancel`；正常跑完的不发。
+    #[tokio::test]
+    async fn dropping_a_browser_call_cancels_it_on_the_kotlin_side() {
+        struct Slow(std::sync::Mutex<Vec<String>>);
+        impl state::BrowserApi for Slow {
+            fn execute(&self, action_json: &str) -> Result<String, String> {
+                self.0.lock().unwrap().push(action_json.to_string());
+                if action_json.contains("\"slow\"") {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                Ok(r#"{"ok":true,"text":""}"#.into())
+            }
+        }
+        let core = Core::new();
+        let host = Arc::new(Slow(Default::default()));
+        core.state.set_browser(host.clone());
+
+        core.browser(r#"{"action":"fast"}"#).await.unwrap();
+        assert_eq!(host.0.lock().unwrap().len(), 1, "跑完的动作不该被取消");
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            core.browser(r#"{"action":"slow"}"#),
+        )
+        .await;
+        assert!(r.is_err());
+        let log = host.0.lock().unwrap().clone();
+        assert!(log.iter().any(|a| a.contains("__cancel")), "{log:?}");
+    }
 
     #[test]
     fn sse_and_state_wire_up() {

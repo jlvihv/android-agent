@@ -153,11 +153,6 @@ pub enum Event {
         level: String,
         msg: String,
     },
-    /// agent 事件。`chunk` 是 AI SDK UI Message Stream 的 chunk，原样透传
-    /// （见 sse.rs）。前端不需要区分来源，统一走同一个 reducer。
-    Agent {
-        chunk: serde_json::Value,
-    },
     /// 指令执行回执
     Ack {
         id: String,
@@ -270,7 +265,8 @@ pub struct AppState {
     /// 要把“已经把字节存到磁盘上”这件事先记下来。发出去时按 id 取走。
     /// 附件一旦进了会话历史，`ChatMessage` 里就带着完整的 `Attachment`，
     /// 不靠这个 map 了。
-    pub pending_attachments: Mutex<HashMap<String, crate::agent::Attachment>>,
+    /// 值里带上传时刻：放太久没发的会被清掉（`add_pending_attachment`）。
+    pub pending_attachments: Mutex<HashMap<String, (std::time::Instant, crate::agent::Attachment)>>,
 }
 
 impl AppState {
@@ -411,8 +407,11 @@ impl AppState {
             return;
         };
         let st = self.clone();
+        // 清扫只动这个时刻之前写的文件（见 `gc::sweep`）
+        let started = std::time::SystemTime::now();
         tokio::spawn(async move {
-            match tokio::task::spawn_blocking(move || db.load()).await {
+            let db2 = db.clone();
+            match tokio::task::spawn_blocking(move || db2.load()).await {
                 Ok(Ok(store)) => {
                     let n = store.sessions.len();
                     *guard = store;
@@ -421,6 +420,7 @@ impl AppState {
                     if n > 0 {
                         st.log("info", format!("从 sessions.db 恢复 {n} 个会话"));
                     }
+                    st.sweep_files(db, started).await;
                 }
                 Ok(Err(e)) => st.log(
                     "error",
@@ -429,6 +429,172 @@ impl AppState {
                 Err(e) => st.log("error", format!("读取会话的任务挂了: {e}")),
             }
         });
+    }
+
+    /// 启动清扫：删掉没有任何会话引用的图片副本 / 附件 / 截图 / 溢出输出。
+    async fn sweep_files(&self, db: Arc<Db>, before: std::time::SystemTime) {
+        let data = self.data_dir.read().ok().and_then(|g| g.clone());
+        let rootfs = self.linux().map(|l| l.rootfs().to_path_buf());
+        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let msgs = db.messages_with_files()?;
+            let referenced = crate::gc::owned_files(&msgs, rootfs.as_deref())
+                .into_iter()
+                .collect();
+            Ok(crate::gc::sweep(
+                data.as_deref(),
+                rootfs.as_deref(),
+                &referenced,
+                before,
+            ))
+        })
+        .await;
+        match res {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => tracing::info!("清掉 {n} 个没人引用的文件"),
+            Ok(Err(e)) => tracing::warn!("没法确定哪些文件还在用，这次不清扫: {e:#}"),
+            Err(e) => tracing::warn!("清扫任务挂了: {e}"),
+        }
+    }
+
+    // —— 会话的消息：按需读进来、用完放掉 ——
+
+    /// 保证这个会话的消息在内存里（不在就从库里读回来）。
+    ///
+    /// 没有这个会话不算错（调用方自己报）；库里那份读不出来才报错 —— 这时
+    /// 会话保持「不在内存里」，库里的行一条都不会被动到。
+    pub async fn ensure_loaded(&self, id: &str) -> anyhow::Result<()> {
+        {
+            let store = self.chat.read().await;
+            match store.get(id) {
+                Some(s) if !s.resident() => {}
+                _ => return Ok(()),
+            }
+        }
+        let db = self
+            .db()
+            .ok_or_else(|| anyhow::anyhow!("会话 {id} 的消息不在内存里，又没有会话库"))?;
+        let sid = id.to_string();
+        let msgs = tokio::task::spawn_blocking(move || db.load_messages(&sid))
+            .await?
+            .map_err(|e| anyhow::anyhow!("读会话 {id} 失败: {e:#}"))?;
+        // 读的这一会儿会话只可能改了会话头（消息要改得先读进来），装回去就行；
+        // 期间被清空过的话它已经在内存里了，`install` 不会动它
+        if let Some(s) = self.chat.write().await.get_mut(id) {
+            s.install(msgs);
+        }
+        Ok(())
+    }
+
+    /// 把用不着的会话的消息放掉（落盘定时器每次写完盘调一次）。
+    ///
+    /// 只放这样的：不是当前会话、没有回合在跑、刚读进来超过一分钟、而且
+    /// **内存里的样子已经全部落盘**（放掉的东西必须能读回来）。
+    pub fn evict_idle(&self) -> usize {
+        const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+        let Some(db) = self.db() else { return 0 };
+        if !self.sessions_loaded.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let busy = self.busy_sessions();
+        let Ok(mut store) = self.chat.try_write() else {
+            return 0;
+        };
+        let active = store.active.clone();
+        let mut n = 0;
+        for s in &mut store.sessions {
+            let idle = s.resident()
+                && s.has_content()
+                && s.id != active
+                && !busy.contains(&s.id)
+                && s.loaded_at.is_none_or(|t| t.elapsed() >= KEEP_FOR);
+            if idle && db.is_synced(s) {
+                s.evict();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// 删一个会话：先停它的回合，再删，再清它引用的文件。
+    ///
+    /// 不先停的话，回合还在后台跑（一条 `timeout: 3600` 的 bash 会一直跑完），
+    /// 结果写进一个已经不存在的会话里。
+    pub async fn delete_session(&self, id: &str) {
+        self.request_abort(id);
+        let gone = self.chat.write().await.delete(id);
+        self.mark_sessions_dirty();
+        if let Some(s) = gone {
+            self.forget_files(s).await;
+        }
+    }
+
+    /// 清空当前会话（`/api/reset`）。有回合在跑就拒绝：回合跑到一半把历史
+    /// 抽空，后面追加进来的工具结果就没有对应的调用了，这条会话从此每次都 400。
+    pub async fn reset_active(&self) -> Result<(), &'static str> {
+        let Some(id) = self.chat.read().await.active_ref().map(|s| s.id.clone()) else {
+            return Ok(());
+        };
+        // 读进来只是为了知道要清哪些文件；读不出来也照样清空
+        let _ = self.ensure_loaded(&id).await;
+        let old = {
+            let mut store = self.chat.write().await;
+            // 在会话锁里判断：拿着锁的这段时间，新回合碰不到这条历史
+            if self.is_busy(&id) {
+                return Err("这个会话还有回合在运行，先停止它或等它结束");
+            }
+            let Some(s) = store.get_mut(&id) else {
+                return Ok(());
+            };
+            let old = std::mem::take(&mut s.messages);
+            s.clear();
+            old
+        };
+        self.mark_sessions_dirty();
+        let mut gone = crate::agent::ChatSession::new();
+        gone.messages = old;
+        self.forget_files(gone).await;
+        Ok(())
+    }
+
+    /// 清掉一个（已经从 store 里拿出来的）会话引用的文件。消息不在内存里的
+    /// 从库里读（赶在落盘把那些行删掉之前；没赶上就留给启动清扫）。
+    async fn forget_files(&self, s: crate::agent::ChatSession) {
+        let rootfs = self.linux().map(|l| l.rootfs().to_path_buf());
+        let db = self.db();
+        let _ = tokio::task::spawn_blocking(move || {
+            let msgs = if s.resident() {
+                s.messages
+            } else {
+                db.and_then(|d| d.load_messages(&s.id).ok())
+                    .unwrap_or_default()
+            };
+            let files = crate::gc::owned_files(&msgs, rootfs.as_deref());
+            let n = crate::gc::remove_all(&files);
+            if n > 0 {
+                tracing::debug!("会话 {} 的 {n} 个文件已清掉", s.id);
+            }
+        })
+        .await;
+    }
+
+    /// 记下一个刚上传、还没随消息发出去的附件；顺手清掉放了太久的。
+    ///
+    /// 上传了不发（用户改主意、页面刷新）的附件没人会来取，不清的话 map 和
+    /// 磁盘上的文件都只增不减。一小时足够「上传 → 打字 → 发送」。
+    pub fn add_pending_attachment(&self, a: crate::agent::Attachment) {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+        let mut stale = Vec::new();
+        if let Ok(mut pending) = self.pending_attachments.lock() {
+            pending.retain(|_, (at, old)| {
+                let keep = at.elapsed() < TTL;
+                if !keep {
+                    stale.push(std::path::PathBuf::from(&old.path));
+                }
+                keep
+            });
+            pending.insert(a.id.clone(), (std::time::Instant::now(), a));
+        }
+        crate::gc::remove_all(&stale);
     }
 
     /// 各家的 Key。老版本只有一个 provider（`llm`）：库里还没有 `providers`
@@ -1111,6 +1277,146 @@ mod tests {
         assert_eq!(store.sessions.len(), 1);
         assert!(st.sessions_loaded.load(Ordering::Relaxed));
         drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一个开着库、读过会话的 AppState，外加 n 个各有一句话的会话（最后一个是活动的）。
+    async fn state_with_sessions(
+        tag: &str,
+        n: usize,
+    ) -> (Arc<AppState>, Vec<String>, std::path::PathBuf) {
+        let dir = temp_dir(tag);
+        let st = AppState::new();
+        st.open_db(&dir);
+        st.sessions_loaded.store(true, Ordering::Relaxed);
+        let mut ids = Vec::new();
+        {
+            let mut store = st.chat.write().await;
+            for i in 0..n {
+                let id = store.create();
+                store
+                    .get_mut(&id)
+                    .unwrap()
+                    .messages
+                    .push(crate::agent::ChatMessage::User(format!("第{i}个")));
+                ids.push(id);
+            }
+        }
+        st.save_sessions().unwrap();
+        (st, ids, dir)
+    }
+
+    /// 落过盘、不活跃、没在跑的会话放掉消息；要用时 `ensure_loaded` 原样读回来。
+    /// 活动的、在跑的、没落盘的都不放。
+    #[tokio::test]
+    async fn idle_sessions_are_evicted_and_read_back_on_demand() {
+        let (st, ids, dir) = state_with_sessions("evict", 3).await;
+        let (a, b, active) = (&ids[0], &ids[1], &ids[2]);
+        st.begin_turn(b).unwrap();
+        // a 有一条还没落盘的消息：不能放
+        st.chat
+            .write()
+            .await
+            .get_mut(a)
+            .unwrap()
+            .messages
+            .push(crate::agent::ChatMessage::User("没落盘".into()));
+        assert_eq!(st.evict_idle(), 0);
+
+        st.save_sessions().unwrap();
+        assert_eq!(st.evict_idle(), 1, "只有 a：b 在跑，另一个是当前会话");
+        {
+            let store = st.chat.read().await;
+            assert!(!store.get(a).unwrap().resident());
+            assert!(store.get(b).unwrap().resident());
+            assert!(store.get(active).unwrap().resident());
+        }
+
+        st.ensure_loaded(a).await.unwrap();
+        let store = st.chat.read().await;
+        let s = store.get(a).unwrap();
+        assert!(s.resident());
+        let texts: Vec<&str> = s.messages.iter().filter_map(|m| m.user_text()).collect();
+        assert_eq!(texts, vec!["第0个", "没落盘"]);
+        drop(store);
+        // 刚读回来的不马上又放掉
+        assert_eq!(st.evict_idle(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 删会话先停它的回合，再把它引用的文件（附件、图片副本）一起清掉。
+    #[tokio::test]
+    async fn deleting_a_session_stops_its_turn_and_removes_its_files() {
+        let (st, ids, dir) = state_with_sessions("delete", 1).await;
+        let id = &ids[0];
+        let att = dir.join("a.png");
+        std::fs::write(&att, b"x").unwrap();
+        st.chat.write().await.get_mut(id).unwrap().messages.push(
+            crate::agent::ChatMessage::UserFiles {
+                text: String::new(),
+                attachments: vec![crate::agent::Attachment {
+                    id: "a.png".into(),
+                    path: att.display().to_string(),
+                    mime: "image/png".into(),
+                    name: "a.png".into(),
+                    kind: crate::agent::AttachmentKind::Image,
+                }],
+            },
+        );
+        let turn = st.begin_turn(id).unwrap();
+
+        st.delete_session(id).await;
+        assert!(turn.abort_requested(), "回合要停");
+        assert!(st.chat.read().await.get(id).is_none());
+        assert!(!att.exists(), "附件要跟着删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回合跑到一半不许清空：后面追加的工具结果会没有对应的调用，会话从此 400。
+    #[tokio::test]
+    async fn resetting_a_busy_session_is_refused() {
+        let (st, ids, dir) = state_with_sessions("reset", 1).await;
+        let id = &ids[0];
+        st.begin_turn(id).unwrap();
+        assert!(st.reset_active().await.is_err());
+        assert_eq!(st.chat.read().await.get(id).unwrap().messages.len(), 1);
+
+        st.end_turn(id);
+        st.reset_active().await.unwrap();
+        assert!(st.chat.read().await.get(id).unwrap().messages.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上传了不发的附件：放过一小时，下一次上传时清掉（map 和文件都清）。
+    #[test]
+    fn stale_pending_attachments_are_dropped() {
+        let dir = temp_dir("pending");
+        let st = AppState::new();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, b"x").unwrap();
+            crate::agent::Attachment {
+                id: n.into(),
+                path: p.display().to_string(),
+                mime: "application/pdf".into(),
+                name: n.into(),
+                kind: crate::agent::AttachmentKind::Pdf,
+            }
+        };
+        st.add_pending_attachment(file("old.pdf"));
+        // 把它的时间拨回两小时前
+        st.pending_attachments
+            .lock()
+            .unwrap()
+            .get_mut("old.pdf")
+            .unwrap()
+            .0 -= std::time::Duration::from_secs(7200);
+        st.add_pending_attachment(file("new.pdf"));
+
+        let pending = st.pending_attachments.lock().unwrap();
+        assert!(!pending.contains_key("old.pdf") && pending.contains_key("new.pdf"));
+        assert!(!dir.join("old.pdf").exists() && dir.join("new.pdf").exists());
+        drop(pending);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,18 +6,16 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 
 ## 状态
 
-🟢 **核心已跑通并在桌面验证**（真机 Android 壳还没写）
-
 **已在 Pixel 10 / Android 17 真机上完整验证。**
 
 | 部分 | 状态 |
 |---|---|
-| `core/` Rust | ✅ 80 个测试全过，clippy 干净 |
+| `core/` Rust | ✅ 216 个测试全过，clippy 干净 |
 | `web/` Svelte | ✅ 构建通过（57 KB JS / 21 KB gzip） |
 | `android/` 壳 | ✅ **真机验证通过** |
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
 | Linux 沙箱 | ✅ **Alpine 3.21 aarch64 在真机上跑起来**，`apk add` 可用 |
-| 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用（读 UI 树那套已删，见下） |
+| 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI（读 UI 树那套已删，见下） |
 | Prompt cache | ✅ 实测命中 73–87% |
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
 | 多会话 | ✅ 侧边栏「最近对话」，标题自动生成 |
@@ -78,12 +76,12 @@ just phone                                   # 交互模式，/help 看命令
 │   自研 agent loop           事件流 / 工具循环               │
 │   linux.rs                  proot + Alpine 沙箱           │
 │   editor.rs                 edit 工具（精确替换 + diff）    │
-│   uniffi (待接)             正向绑定 + 反向 callback        │
+│   uniffi                    正向绑定 + 反向 callback        │
 └──────────────────────────────────────────────────────────┘
                           │ UniFFI callback
 ┌──────────────────────────────────────────────────────────┐
-│ Kotlin 薄壳（目标 < 800 行）                                │
-│   MainActivity / AgentAccessibilityService / DeviceApiImpl │
+│ Kotlin 壳（只做平台能力，不做业务逻辑）                    │
+│   MainActivity / AccessibilityService / BrowserController  │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -96,19 +94,25 @@ just phone                                   # 交互模式，/help 看命令
 2. **不手写流式协议** —— 用 AI SDK 的 UI Message Stream 规范
 3. **不手写反向 JNI** —— UniFFI callback interface
 4. **native 侧不反调 Java** —— 跨语言边界只有 JSON 字符串，Rust 里没有一行 JNI
-5. **Kotlin 壳不写业务逻辑** —— 目标 < 800 行，不随功能增长
+5. **Kotlin 壳不写业务逻辑** —— 只放非它不可的平台能力（WebView、无障碍、
+   Intent、前台服务）。最初的目标是 < 800 行；浏览器（真 WebView + 注入的 JS）
+   落地后壳已经到 ~4300 行，其中 `BrowserController.kt` 一个就 ~2000 行（一半
+   是注入的 JS）。行数不再当硬指标，但**判断该放哪边**的标准不变：能在 Rust
+   里做的不放 Kotlin
 6. **提示词前缀一个字都不能变** —— 见 [docs/03-prompt-cache.md](docs/03-prompt-cache.md)
 7. **没有审批环节** —— 工具调用一律直接执行，服务端不保存「挂起等回复」的状态
 
 ## Agent 工具
 
-只给模型三个工具：
+给模型五个工具：
 
 | 工具 | 作用 |
 |---|---|
 | `read` | 读文件：文本带 `offset` / `limit` / `numbered`（`numbered=true` 加 `cat -n` 同款行号；截断到 2000 行或 50KB），结果里附 `totalLines` / `totalBytes`（整个文件多大）；**图片缩放后直接发给模型看** |
 | `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`），cwd 是 `/workspace` |
 | `edit` | 改文件：按原文精确替换，返回 unified diff；新建文件：只给 `content` |
+| `browser` | 操作 agent 自己的那只真 WebView：打开 / 读结构 / 点 / 输入 / 截图 / 多标签（见 [docs/08-browser.md](docs/08-browser.md)） |
+| `search` | 联网搜索（Exa），回标题 + 链接 + 片段 |
 
 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不作为工具**暴露给模型。
 以后收进沙箱里的一个命令、由 `bash` 调用 —— 这样模型只需要理解 shell。
@@ -139,6 +143,7 @@ App 随时被杀都没关系。
 | [docs/05-ui.md](docs/05-ui.md) | 界面：设计令牌、edge-to-edge、对话渲染 |
 | [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）与后台运行 |
 | [docs/07-debugging.md](docs/07-debugging.md) | 无线调试 + agentctl + `/api/debug/*`：不重装 APK 也能调 |
+| [docs/08-browser.md](docs/08-browser.md) | agent 的浏览器：无头 WebView、看板、截图 |
 
 ## 脚本
 

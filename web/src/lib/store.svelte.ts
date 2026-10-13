@@ -1,8 +1,9 @@
 /**
  * 全局状态 + WebSocket 连接。
  *
- * 所有 agent 事件都从 WS 进来，走同一个分发函数；聊天流的 chunk 会进
- * `sse.ts` 的 `applyChunk`。组件只读 store，不自己管连接。
+ * WS 上来的是设备 / 日志 / 回执这些事件，走同一个分发函数；聊天流走
+ * `/api/chat` 的 SSE（chunk 进 `sse.ts` 的 `applyChunk`）。组件只读 store，
+ * 不自己管连接。
  */
 
 import type {
@@ -12,7 +13,7 @@ import type {
   DeviceInfo,
   Hello,
 } from './types';
-import { applyChunk, type Message } from './sse';
+import type { Message } from './sse';
 import { uid } from './uid';
 
 export type LogItem = { id: number; ts: number; level: string; msg: string };
@@ -151,10 +152,6 @@ class AgentStore {
           ...this.acks,
         ].slice(0, 50);
         break;
-
-      case 'agent':
-        if (this.streaming) applyChunk(this.streaming, ev.chunk as never);
-        break;
     }
   }
 
@@ -171,8 +168,6 @@ class AgentStore {
     ws.send(JSON.stringify(msg));
   }
 
-  /** 让设备重新读一次 UI 树 */
-  /** 直接下发一条指令给设备 */
   /**
    * 开始一条新的助手消息（聊天流用）。
    *
