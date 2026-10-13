@@ -30,7 +30,21 @@
   const used = $derived(usage?.last.prompt_tokens ?? 0);
   /** 0..1；没有窗口就是 null */
   const ratio = $derived(ctxWindow ? Math.min(1, used / ctxWindow) : null);
-  const pct = $derived(ratio == null ? null : Math.round(ratio * 100));
+  /**
+   * 环里那两个字。四舍五入到整数，但**明明有量却不到 0.5% 时不写 0** ——
+   * 1M 窗口的头几轮就是这样（实测第一句 prompt 才 1468），写个 0 看着像坏了。
+   */
+  const ringText = $derived(
+    ratio == null ? null : ratio > 0 && ratio * 100 < 0.5 ? '<1' : String(Math.round(ratio * 100)),
+  );
+  /** 面板和 tooltip 用的百分比：不到 1% 时给一位小数（0.1% 比 0% 诚实） */
+  const pctLabel = $derived(
+    ratio == null
+      ? null
+      : ratio >= 0.01
+        ? `${Math.round(ratio * 100)}%`
+        : `${(ratio * 100).toFixed(1)}%`,
+  );
 
 
   // —— 数字排版 ——
@@ -44,11 +58,51 @@
   }
   const fmtPct = (r: number) => `${(r * 100).toFixed(1)}%`;
 
-  // 环的几何：直径 28（和同一行的 36px 圆钮配），轨道 2.6 粗
-  const R = 11;
-  const C = 2 * Math.PI * R;
-  const dash = $derived(C * (1 - (ratio ?? 0)));
 </script>
+
+<!--
+  环。两处用同一段：输入框里那个小的、面板里那个大的 —— 只是尺寸不同，
+  几何按 size 现算，别维护两份。
+
+  `size` 是外框像素；`r`/`sw` 是环半径和线宽（同一套坐标）。输入框那个**环本身
+  就画满 36**（和「+」那个圆钮一样大），**不套一层底色圆** —— 它是读数，不是按钮
+  底色；点它的热区也是这 36。
+-->
+{#snippet ring(size: number, r: number, sw: number, fs: number)}
+  {@const c = 2 * Math.PI * r}
+  {@const half = size / 2}
+  <svg width={size} height={size} viewBox="0 0 {size} {size}" fill="none" class="text-muted">
+    <!-- 轨道 -->
+    <circle cx={half} cy={half} {r} stroke="currentColor" stroke-width={sw} class="text-muted/30" />
+    <!-- 用量。没有上限时只有轨道（不给假信息） -->
+    {#if ratio != null}
+      <circle
+        cx={half}
+        cy={half}
+        {r}
+        stroke="currentColor"
+        stroke-width={sw}
+        stroke-linecap="round"
+        stroke-dasharray={c}
+        stroke-dashoffset={c * (1 - (ratio ?? 0))}
+        transform="rotate(-90 {half} {half})"
+      />
+    {/if}
+    {#if ringText != null}
+      <text
+        x={half}
+        y={half}
+        text-anchor="middle"
+        dominant-baseline="central"
+        class="fill-current text-fg"
+        font-size={fs}
+        style="font-variant-numeric: tabular-nums"
+      >
+        {ringText}
+      </text>
+    {/if}
+  </svg>
+{/snippet}
 
 <!-- 环本身就是按钮。没有数据时**不占位** —— 输入框那一行本来就不宽，
      空着放一个灰圈只是噪声。 -->
@@ -56,41 +110,12 @@
   <button
     onclick={() => (open = true)}
     aria-label="上下文用量"
-    title={pct == null
+    title={pctLabel == null
       ? `上下文 ${fmt(used)} token`
-      : `上下文 ${pct}%（${fmt(used)} / ${fmt(ctxWindow ?? 0)}）`}
-    class="grid size-7 shrink-0 place-items-center"
+      : `上下文 ${pctLabel}（${fmt(used)} / ${fmt(ctxWindow ?? 0)}）`}
+    class="grid size-9 shrink-0 place-items-center"
   >
-    <svg width="28" height="28" viewBox="0 0 28 28" fill="none" class="text-muted">
-      <!-- 轨道 -->
-      <circle cx="14" cy="14" r={R} stroke="currentColor" stroke-width="2.6" class="text-hairline" />
-      <!-- 用量。没有上限时画一个空环（不给假信息） -->
-      {#if ratio != null}
-        <circle
-          cx="14"
-          cy="14"
-          r={R}
-          stroke="currentColor"
-          stroke-width="2.6"
-          stroke-linecap="round"
-          stroke-dasharray={C}
-          stroke-dashoffset={dash}
-          transform="rotate(-90 14 14)"
-        />
-      {/if}
-      {#if pct != null}
-        <text
-          x="14"
-          y="14"
-          text-anchor="middle"
-          dominant-baseline="central"
-          class="fill-current text-[9px]"
-          style="font-variant-numeric: tabular-nums"
-        >
-          {pct}
-        </text>
-      {/if}
-    </svg>
+    {@render ring(36, 15.4, 3, 12)}
   </button>
 {/if}
 
@@ -103,47 +128,15 @@
   <Sheet title="上下文用量" minClass="min-h-0" onclose={() => (open = false)}>
     <div class="flex flex-col gap-3 pb-2">
       <div class="flex items-center gap-4 rounded-2xl bg-surface px-4 py-4">
-        <svg width="56" height="56" viewBox="0 0 28 28" fill="none" class="text-muted">
-          <circle
-            cx="14"
-            cy="14"
-            r={R}
-            stroke="currentColor"
-            stroke-width="2.6"
-            class="text-control"
-          />
-          {#if ratio != null}
-            <circle
-              cx="14"
-              cy="14"
-              r={R}
-              stroke="currentColor"
-              stroke-width="2.6"
-              stroke-linecap="round"
-              stroke-dasharray={C}
-              stroke-dashoffset={dash}
-              transform="rotate(-90 14 14)"
-            />
-          {/if}
-          {#if pct != null}
-            <text
-              x="14"
-              y="14"
-              text-anchor="middle"
-              dominant-baseline="central"
-              class="fill-current text-[9px]"
-              style="font-variant-numeric: tabular-nums"
-            >
-              {pct}
-            </text>
-          {/if}
-        </svg>
+        {@render ring(56, 22, 5.2, 18)}
         <div class="flex min-w-0 flex-col">
           <span class="text-[17px]">
             {fmt(used)}{#if ctxWindow}<span class="text-muted"> / {fmt(ctxWindow)}</span>{/if}
           </span>
           <span class="text-meta text-muted">
-            {pct == null ? '不知道这个模型的上下文上限（models.dev 里没有）' : `用掉 ${pct}% 的上下文`}
+            {pctLabel == null
+              ? '不知道这个模型的上下文上限（models.dev 里没有）'
+              : `用掉 ${pctLabel} 的上下文`}
           </span>
         </div>
       </div>
