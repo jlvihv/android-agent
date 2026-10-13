@@ -14,6 +14,7 @@
   import { tick } from 'svelte';
   import type { Message, ToolPart } from '../lib/sse';
   import { sandboxPath } from '../lib/markdown';
+  import { BROWSER_ACTION, describeInput, describeResult, type Tone } from '../lib/toolview';
   import Icon from './Icon.svelte';
   import Markdown from './Markdown.svelte';
   import Sheet from './Sheet.svelte';
@@ -64,26 +65,7 @@
   function browserSummary(a: Record<string, unknown>): string {
     const s = (v: unknown) => (typeof v === 'string' ? v : '');
     const action = s(a.action) || '?';
-    const label: Record<string, string> = {
-      navigate: '打开',
-      get_backbone: '读结构',
-      get_readable: '抽正文',
-      get_text: '读文本',
-      click: '点击',
-      type: '输入',
-      press: '按键',
-      find_elements: '找元素',
-      scroll: '滚动',
-      screenshot: '截图',
-      set_user_agent: '切UA',
-      back: '后退',
-      wait_for_dom_stable: '等页面安定',
-      js: '执行 JS',
-      new_tab: '开新标签',
-      list_tabs: '列出标签',
-      switch_tab: '切标签',
-      close_tab: '关标签',
-    };
+    const label = BROWSER_ACTION;
     const target = s(a.url) || s(a.selector) || (a.x !== undefined ? `${a.x},${a.y}` : '');
     const one = target.split('\n')[0].trim();
     // 多标签时把"对哪只标签"带上 —— 同一行里 action 和对象要够判断
@@ -137,158 +119,8 @@
     }
   }
 
-  /** 面板正文的主体：能一眼看懂的那部分，而不是把 JSON 摊开 */
-  function primary(t: ToolPart): string {
-    const a = (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
-    const s = (v: unknown) => (typeof v === 'string' ? v : '');
-    if (t.toolName === 'read') return s(a.path);
-    if (t.toolName === 'bash') return s(a.command);
-    if (t.toolName === 'edit') return s(a.path);
-    if (t.toolName === 'browser') return browserPrimary(a);
-    if (t.toolName === 'search') return s(a.query);
-    if (t.input !== undefined) return JSON.stringify(t.input, null, 2);
-    return t.inputText ?? '';
-  }
-
-  /** 浏览器面板正文：动作 + 参数。截图那一条的图片由下面的 imagePath 分支渲染 */
-  function browserPrimary(a: Record<string, unknown>): string {
-    const s = (v: unknown) => (typeof v === 'string' ? v : '');
-    const action = s(a.action);
-    if (action === 'navigate') return s(a.url);
-    if (action === 'js') return s(a.script);
-    if (action === 'type') return `${s(a.selector)} ← ${s(a.text)}`;
-    if (action === 'click' && !s(a.selector)) return `(${a.x}, ${a.y})`;
-    if (action === 'press') return s(a.key);
-    if (action === 'new_tab') return s(a.url);
-    if (action === 'switch_tab' || action === 'close_tab') return a.tab !== undefined ? `#${a.tab}` : '';
-    if (action === 'list_tabs' || action === 'wait_for_dom_stable') return '';
-    if (action === 'set_user_agent') return s(a.user_agent);
-    if (action === 'screenshot') return a.full_page === true ? '整页' : '';
-    if (action === 'get_readable' || action === 'back') return '';
-    return s(a.selector) || JSON.stringify(a, null, 2);
-  }
-
-  const asText = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
-
-  /** 兜底：对象排成 key: value，去掉 JSON 的括号和引号噪音 */
-  function kv(v: unknown): string {
-    if (typeof v !== 'object' || v === null) return asText(v);
-    return Object.entries(v as Record<string, unknown>)
-      .map(([k, val]) => `${k}: ${typeof val === 'string' ? val : JSON.stringify(val)}`)
-      .join('\n');
-  }
-
-  /** 人类可读的字节数，跟核心 reader::fmt_size 一致 */
-  function fmtBytes(n: number): string {
-    if (!Number.isFinite(n) || n < 0) return '?';
-    for (const [unit, div] of [
-      ['GB', 1024 ** 3],
-      ['MB', 1024 ** 2],
-      ['KB', 1024],
-    ] as const) {
-      if (n >= div) return `${(n / div).toFixed(1)}${unit}`;
-    }
-    return `${Math.round(n)}B`;
-  }
-
-  type Chip = { text: string; tone: 'ok' | 'bad' | 'warn' | 'plain' };
-
-  type Result = {
-    chips: Chip[];
-    label: string;
-    failed: boolean;
-    body: string;
-    diff: boolean;
-    path: string | null;
-    /** 工具返回的图片在沙箱里的路径（read 读图才有） */
-    image: string | null;
-  };
-
-  /**
-   * 把工具结果拆成能分样式显示的部分。
-   *
-   * 之前是把整个结果 JSON 摊开 —— output 里的换行会转义成字面量 `\n`，
-   * 一屏全是反斜杠。现在每个字段有自己的样式：
-   *   exit_code / wall_time / truncated / message → 顶部小药丸
-   *   output  → 正文（非 0 退出时整块红）
-   *   diff    → 按行染色（+ 绿 / - 红）
-   *   error   → 整块红
-   *   full_output_path → 底部的路径说明
-   */
-  function result(t: ToolPart): Result | null {
-    const o = t.output;
-    if (o === undefined) return null;
-
-    const plain = (label: string, body: string, failed = false): Result => ({
-      chips: [],
-      label,
-      failed,
-      body,
-      diff: false,
-      path: null,
-      image: null,
-    });
-
-    if (typeof o === 'string') return plain('输出', o);
-    if (typeof o !== 'object' || o === null) return plain('输出', asText(o));
-
-    const r = o as Record<string, unknown>;
-
-    // 工具直接报错
-    if (typeof r.error === 'string') return plain('错误', r.error, true);
-
-    const chips: Chip[] = [];
-
-    // bash 还在跑：服务端推的阶段性输出
-    if (r.running === true) chips.push({ text: '运行中', tone: 'warn' });
-
-    // bash
-    if (typeof r.exit_code === 'number') {
-      const ok = r.exit_code === 0;
-      chips.push({ text: ok ? 'exit 0' : `exit ${r.exit_code}`, tone: ok ? 'plain' : 'bad' });
-    }
-    if (typeof r.wall_time_seconds === 'number') {
-      chips.push({ text: `${r.wall_time_seconds}s`, tone: 'plain' });
-    }
-    if (r.truncated === true) chips.push({ text: '已截断', tone: 'warn' });
-
-    // read：整个文件多大（行数 / 字节数），据此知道还要读几轮
-    if (typeof r.totalLines === 'number') {
-      const size = typeof r.totalBytes === 'number' ? ` · ${fmtBytes(r.totalBytes)}` : '';
-      chips.push({ text: `${r.totalLines} 行${size}`, tone: 'plain' });
-    } else if (typeof r.imagePath === 'string' && typeof r.totalBytes === 'number') {
-      // 图片：原文件多大（本身在正文里也会写一遍）
-      chips.push({ text: fmtBytes(r.totalBytes), tone: 'plain' });
-    }
-
-    // edit
-    if (typeof r.message === 'string') chips.push({ text: r.message, tone: 'plain' });
-    if (typeof r.firstChangedLine === 'number') {
-      chips.push({ text: `第 ${r.firstChangedLine} 行起`, tone: 'plain' });
-    }
-
-    const failed = typeof r.exit_code === 'number' && r.exit_code !== 0;
-
-    const image = typeof r.imagePath === 'string' ? r.imagePath : null;
-
-    if (typeof r.diff === 'string') {
-      return { chips, label: '改动', failed: false, body: r.diff, diff: true, path: null, image };
-    }
-
-    if (typeof r.output === 'string') {
-      return {
-        chips,
-        label: '输出',
-        failed,
-        body: r.output,
-        diff: false,
-        path: typeof r.full_output_path === 'string' ? r.full_output_path : null,
-        image,
-      };
-    }
-
-    return { chips, label: '结果', failed: false, body: kv(o), diff: false, path: null, image };
-  }
+  /** 参数还在流式时从半截 JSON 里抠（见 partialArgs） */
+  const argsOf = (t: ToolPart) => (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
 
   /**
    * 输出在长的时候跟到最底下，像终端一样。
@@ -322,7 +154,7 @@
     return 'text-muted';
   };
 
-  const CHIP: Record<Chip['tone'], string> = {
+  const CHIP: Record<Tone, string> = {
     ok: 'bg-ok/15 text-ok',
     bad: 'bg-bad/15 text-bad',
     warn: 'bg-warn/15 text-warn',
@@ -535,6 +367,26 @@
   }
 </style>
 
+{#snippet fields(title: string, list: { key: string; text: string; block: boolean }[])}
+  <div class="flex flex-col gap-1.5">
+    <span class="text-meta text-faint">{title}</span>
+    {#each list as f}
+      {#if f.block}
+        <div class="flex flex-col gap-1">
+          <span class="font-mono text-meta text-muted">{f.key}</span>
+          <pre
+            class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5 whitespace-pre-wrap break-all">{f.text}</pre>
+        </div>
+      {:else}
+        <p class="font-mono text-[13px] leading-5 break-all">
+          <span class="text-muted">{f.key}</span>
+          {f.text}
+        </p>
+      {/if}
+    {/each}
+  </div>
+{/snippet}
+
 {#if sheet}
   {#if sheet.kind === 'reasoning'}
     <Sheet title="思考" onclose={() => (sheet = null)}>
@@ -545,19 +397,22 @@
     <!-- 存成 const：sheet 是 $state，在 onclick 闭包里 TS 收窄不了 -->
     {@const s = sheet}
     {@const t = s.tool}
-    {@const res = result(t)}
+    {@const res = describeResult(t)}
+    {@const inp = describeInput(t, argsOf(t))}
     <Sheet title={toolTitle(t)} onclose={() => (sheet = null)}>
       <div class="flex flex-col gap-4">
-        {#if primary(t)}
+        {#if inp.primary}
           <pre
-            class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5 whitespace-pre-wrap break-all">{primary(
-              t,
-            )}</pre>
+            class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5 whitespace-pre-wrap break-all">{inp.primary}</pre>
+        {/if}
+        {#if inp.params.length}
+          <!-- 主行之外的参数（bash 的 timeout、read 的 offset/limit、edit 新建时的全文 …） -->
+          {@render fields('参数', inp.params)}
         {/if}
 
         {#if res}
           <div class="flex flex-col gap-2">
-            <!-- 元信息药丸：退出码 / 耗时 / 是否截断 / 替换处数 -->
+            <!-- 元信息药丸：退出码 / 耗时 / 是否截断 / 替换处数 … -->
             <div class="flex flex-wrap items-center gap-1.5">
               <span class="text-meta {res.failed ? 'text-bad' : 'text-faint'}">{res.label}</span>
               {#each res.chips as c}
@@ -566,36 +421,67 @@
             </div>
 
             {#if res.image}
-              <!-- read 读到的图：直接展示原图（沙箱路由），模型看的是缩放后的那份 -->
+              <!-- 工具返回的图：直接展示原图（沙箱路由），模型看的是缩放后的那份 -->
               <img
                 src={sandboxPath(res.image)}
                 alt="工具返回的图片"
                 class="max-h-80 w-auto self-start rounded-xl bg-hairline-soft object-contain"
               />
+              <p class="text-meta text-faint">图片：<code class="font-mono break-all">{res.image}</code></p>
             {/if}
 
-            {#if res.diff}
-              <div
-                class="overflow-x-auto rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5"
-              >
-                {#each res.body.split('\n') as line}
-                  <p class="whitespace-pre {diffLine(line)}">{line || ' '}</p>
-                {/each}
-              </div>
-            {:else}
-              <pre
-                use:followTail
-                class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-all {res.failed
-                  ? 'text-bad'
-                  : ''}">{res.body}</pre>
+            {#if res.body !== null}
+              {#if res.diff}
+                <div
+                  class="overflow-x-auto rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5"
+                >
+                  {#each res.body.split('\n') as line}
+                    <p class="whitespace-pre {diffLine(line)}">{line || ' '}</p>
+                  {/each}
+                </div>
+              {:else}
+                <pre
+                  use:followTail
+                  class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-all {res.failed
+                    ? 'text-bad'
+                    : ''}">{res.body}</pre>
+              {/if}
             {/if}
 
             {#if res.path}
               <p class="text-meta text-faint">
-                完整输出：<code class="font-mono">{res.path}</code>
+                完整输出：<code class="font-mono break-all">{res.path}</code>
               </p>
             {/if}
+
+            {#if res.urls.length}
+              <!-- 输出里挑出来的网址：模型拿到的是同一份清单 -->
+              <div class="flex flex-col gap-1">
+                <span class="text-meta text-faint">网址</span>
+                {#each res.urls as u}
+                  <a href={u} target="_blank" rel="noreferrer" class="font-mono text-[13px] break-all underline decoration-faint underline-offset-2"
+                    >{u}</a
+                  >
+                {/each}
+              </div>
+            {/if}
           </div>
+
+          {#if res.fields.length}
+            <!-- 没有专门样式的字段：一个都不藏（模型看得到的，这里就得看得到） -->
+            {@render fields('其他字段', res.fields)}
+          {/if}
+
+          {#if res.raw !== null}
+            <details class="group">
+              <summary class="cursor-default list-none text-meta text-faint">
+                <span class="inline-block transition-transform group-open:rotate-90">›</span>
+                模型收到的原始结果{res.image ? '（另附上面那张图，缩放后）' : ''}
+              </summary>
+              <pre
+                class="mt-2 rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[12px] leading-5 whitespace-pre-wrap break-all text-muted">{res.raw}</pre>
+            </details>
+          {/if}
         {:else if t.state === 'streaming'}
           <p class="text-sm text-muted">执行中…</p>
         {/if}
