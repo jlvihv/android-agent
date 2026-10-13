@@ -295,6 +295,8 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #     截图落在 /root/.browser/，要 read 它才看得见（screenshot 的返回里会提醒）。
 #     其他参数直接给 JSON：agent browser '{"action":"click","x":100,"y":200}'
 #   agent search <检索意图> [条数]   联网搜索（Exa），拿标题 + 链接 + 片段
+#     输出是**排好版的文字**（不是 JSON）：抬头一行「N 条 · exa-mcp」，
+#     下面每条三行（标题 / 网址 / 片段）。
 #   agent get <path>         直接 GET 自己的接口（逃生口）
 #   agent post <path> <json> 直接 POST
 #
@@ -502,7 +504,11 @@ EOT
       exit 2
     fi
     q=$(esc "$1")
-    if [ -n "${2:-}" ]; then body="{\"query\":\"$q\",\"num_results\":$2}"; else body="{\"query\":\"$q\"}"; fi
+    # format=text：让核心直接回**排好版的文字**，不是 JSON。
+    # 打 JSON 的话模型和界面上看到的是一串带 \n 转义的字符串（“网址后面怎么都有个
+    # \n”），CLI 还得靠 jq 才能把它拆开。抬头那行（`3 条 · exa-mcp`）是唯一丢掉的
+    # 元信息，排查走哪条路时够用；要原始 JSON 就直接 agent post /api/websearch。
+    if [ -n "${2:-}" ]; then body="{\"query\":\"$q\",\"num_results\":$2,\"format\":\"text\"}"; else body="{\"query\":\"$q\",\"format\":\"text\"}"; fi
     post /api/websearch "$body"
     ;;
   help|-h|--help)

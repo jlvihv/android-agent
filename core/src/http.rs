@@ -327,38 +327,70 @@ async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>
     }
 }
 
-/// `POST /api/websearch` → 联网搜索（`{query, num_results?}`）。
+/// `POST /api/websearch` → 联网搜索（`{query, num_results?, format?}`）。
 ///
 /// **这是联网搜索的唯一入口**：沙箱里的 `agent search` 走它（以前还有一个
 /// `search` 工具，已删 —— 能在一行 shell 里说清的能力不必再开一个工具）。
-/// 响应里的 `output` 就是给模型看的那段文字（见 `search::format_hits`）。
 ///
-/// body：`{query, num_results?}`。和 `/api/browser` 一样的理由存在：
-/// 调试、以及让沙箱里的 `agent search` 能直接用。
+/// 两种回法：
+///
+/// - 默认 JSON：`{ok, provider, count, output}`。`output` 是给模型看的那段文字
+///   （见 `search::format_hits`）—— 格式化发生在这里，不在 CLI 里，因为两处各写
+///   一份就会漂。
+/// - `format: "text"`：直接回 `text/plain`，就是那段文字 + 一行抬头
+///   （`3 条 · exa-mcp`）。**`agent search` 用这个** —— 打 JSON 的话模型和界面上
+///   看到的是一串带 `\n` 转义的字符串（“网址后面怎么都有个 \n”），
+///   而且 CLI 还得依赖 jq 才能把它拆开。
+///
+/// 和 `/api/browser` 一样的理由存在：调试、以及让沙箱里的 `agent search` 能直接用。
 async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let core = Core { state: st.clone() };
     let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let as_text = body.get("format").and_then(|v| v.as_str()) == Some("text");
+    let text = |s: String| {
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            s,
+        )
+            .into_response()
+    };
     if query.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "缺少 query").into_response();
+        return if as_text {
+            text("缺少 query（用法：agent search <检索意图> [条数]）".into())
+        } else {
+            (StatusCode::BAD_REQUEST, "缺少 query").into_response()
+        };
     }
     let num = body
         .get("num_results")
         .and_then(|v| v.as_u64())
         .unwrap_or(5) as usize;
     match core.search_web(query, num).await {
-        Ok(found) => Json(json!({
-            "ok": true,
-            "provider": found.provider,
-            "count": found.hits.len(),
-            // `output` 是给模型看的那段文字（每条片段截 400 字、整段封顶 4000 字）。
-            // 搜索现在不是工具了，格式化就发生在这一层 —— 沙箱里的 `agent search`
-            // 原样把这个 JSON 打给模型，两边不能再各写一份（各写一份就会漂）。
-            "output": crate::search::format_hits(&found),
-        }))
-        .into_response(),
+        Ok(found) => {
+            if as_text {
+                return text(format!(
+                    "{} 条 · {}\n\n{}",
+                    found.hits.len(),
+                    found.provider,
+                    crate::search::format_hits(&found)
+                ));
+            }
+            Json(json!({
+                "ok": true,
+                "provider": found.provider,
+                "count": found.hits.len(),
+                "output": crate::search::format_hits(&found),
+            }))
+            .into_response()
+        }
         // 429 之类的“能自己恢复”的失败：200 + error 字段，调用方（模型/CLI）
         // 看得到原因和解法，而不是一句 500
-        Err(e) => Json(json!({ "ok": false, "error": format!("{e:#}") })).into_response(),
+        Err(e) => {
+            if as_text {
+                return text(format!("搜索失败：{:#}", e));
+            }
+            Json(json!({ "ok": false, "error": format!("{e:#}") })).into_response()
+        }
     }
 }
 

@@ -89,9 +89,15 @@ just phone
   /bash agent search "alpine 3.21 release notes"
 ```
 
-`/api/websearch` 是它的后端（`{query, num_results?}`）。**它也是联网搜索的唯一入口**
-（`search` 工具已删，理由见 [docs/10](10-tools-vs-sandbox.md)）—— 响应里的 `output`
-就是给模型看的那段文字，另外带 `provider`（`exa-mcp` / `exa-api`）和 `count`，
-一眼能看出走的是哪条路。
+`/api/websearch` 是它的后端（`{query, num_results?, format?}`）。**它也是联网搜索的
+唯一入口**（`search` 工具已删，理由见 [docs/10](10-tools-vs-sandbox.md)）。
+
+两种回法：
+
+- 默认 JSON：`{ok, provider, count, output}` —— `output` 就是给模型看的那段文字；
+- `format: "text"`：直接回 `text/plain`（一段抬头 `3 条 · exa-mcp` + 正文）。
+  **`agent search` 用这个**：JSON 里的换行是 `\n` 转义，模型和界面上看到的就是
+  一长串带转义的字符串（“网址后面怎么都有个 `\n`”），而且 CLI 还得靠 `jq`
+  才能把它拆开。要原始 JSON 就直接 `agent post /api/websearch '{…}'`。
 
 日志：失败会带原始响应片段；成功的搜索结果不进日志（那是模型上下文的事）。
