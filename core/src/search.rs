@@ -52,6 +52,34 @@ pub struct Found {
     pub provider: &'static str,
 }
 
+/// 搜索结果 → 模型看的文本。
+///
+/// 这段文字会进历史、进提示词缓存，所以**按钱算**：每条片段截到 400 字、
+/// 整段封顶 4000 字。要读全文是另一件事，让模型自己挑一条去 `curl` / 
+/// `agent browser`。把十篇全文（几十 KB）塞进历史才是真浪费。
+///
+/// 放这儿而不是 `agent.rs`：搜索已经不是工具了（唯一入口是沙箱里的
+/// `agent search`），这段文字由 `/api/websearch` 直接回给 CLI。
+pub fn format_hits(found: &Found) -> String {
+    if found.hits.is_empty() {
+        return "没搜到结果。换个说法，或者用 `agent browser navigate` 打开搜索引擎自己翻。"
+            .to_string();
+    }
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for (i, h) in found.hits.iter().enumerate() {
+        let snip: String = h.snippet.chars().take(400).collect();
+        let item = format!("{}. {}\n   {}\n   {}\n", i + 1, h.title, h.url, snip);
+        chars += item.chars().count();
+        out.push_str(&item);
+        if chars > 4000 {
+            out.push_str("…（结果太长，已截断；调小条数或换更准的说法）\n");
+            break;
+        }
+    }
+    out
+}
+
 /// 找 key：环境变量优先（桌面开发），其次会话库的 `search` 行（手机）。
 ///
 /// 会话库那行的形状是 `{"exaApiKey":"exa-…"}`。存库而不是存文件，和 provider

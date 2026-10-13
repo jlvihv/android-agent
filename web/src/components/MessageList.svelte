@@ -58,6 +58,8 @@
         // 工具调用得照旧显示成人话。
         return `浏览器 ${browserSummary(a)}`;
       case 'search':
+        // 同 browser：`search` 工具也删了（唯一入口是沙箱里的 `agent search`，
+        // 结果长在 bash 卡片里）。这里只为回放老会话。
         return `搜索 ${firstLine(s(a.query))}`.trim();
       default:
         return t.toolName || '工具调用';
@@ -124,6 +126,7 @@
       case 'browser':
         return '浏览器';
       case 'search':
+        // 同 browser：老会话回放用（`search` 工具已删）
         return '联网搜索';
       default:
         return t.toolName || '工具调用';

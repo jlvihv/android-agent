@@ -212,7 +212,7 @@ req["stream_options"] = json!({ "include_usage": true });
 | `the_request_is_the_history_verbatim` | 请求体长度 == 历史长度：不拼、不前置、不插上下文块 |
 | `tool_schema_order_and_names_are_fixed` | 工具表顺序钉死（想改顺序必须先改测试） |
 | `tool_schemas_serialize_byte_identically` | schema 序列化字节确定 |
-| `browser_is_only_reachable_through_the_sandbox_cli` | 浏览器只能从沙箱那个门进（工具表里不能有 `browser`，提示词里必须有 `agent browser`） |
+| `browser_and_search_are_only_reachable_through_the_sandbox_cli` | 浏览器和搜索只能从沙箱那个门进（工具表里不能有 `browser` / `search`，提示词里必须有 `agent browser` / `agent search`） |
 | `usage_understands_both_cache_field_styles` | 两套缓存字段都认，同时在时取大的那个 |
 
 `full_request_body_is_prefix_stable_across_turns` 是硬的那条：它不断言中间函数，

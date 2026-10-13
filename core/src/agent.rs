@@ -104,20 +104,6 @@ fn build_tools() -> Vec<ToolSpec> {
                 })
             },
         },
-        ToolSpec {
-            name: "search",
-            description: "联网搜索（Exa）：给一句自然语言描述的检索意图，拿回标题 + 链接 + 摘要片段。写检索意图而不是关键词。",
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string", "description": "检索意图（自然语言）" },
-                        "num_results": { "type": "integer", "description": "要几条（默认 5，上限 20）" }
-                    },
-                    "required": ["query"]
-                })
-            },
-        },
     ]
 }
 
@@ -649,7 +635,7 @@ pub const SYSTEM_PROMPT: &str = "\
 \n\
 - cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。成品放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。\n\
 - 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`，也支持外部网页或 App 深链，用户点击时能用对应 App 打开；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、`agent command`（按键/点击/滑动/启动应用/打开 URI）、`agent browser`（真 WebView：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；截图落 /root/.browser/，用 read 看），`agent help` 看全部。\n\
+- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、`agent command`（按键/点击/滑动/启动应用/打开 URI）、`agent browser`（真 WebView：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；截图落 /root/.browser/，用 read 看）、`agent search`（联网搜索），`agent help` 看全部。\n\
 \n\
 回答要言简意赅。";
 
@@ -2501,27 +2487,9 @@ async fn execute_tool(
         };
     }
 
-    if name == "search" {
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        if query.trim().is_empty() {
-            return ToolOutcome::json(json!({ "error": "缺少参数 query" }));
-        }
-        let num = args
-            .get("num_results")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5) as usize;
-
-        return match core.search_web(query, num).await {
-            Ok(found) => ToolOutcome::json(json!({
-                "ok": true,
-                "output": format_hits(&found),
-                "count": found.hits.len(),
-                "provider": found.provider,
-                "truncated": false,
-            })),
-            Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
-        };
-    }
+    // 联网搜索也不再是工具：唯一入口是沙箱里的 `agent search`（见 `linux.rs`
+    // 的 AGENT_CLI）。同一个道理 —— 能在一行 shell 里说清的能力，不必再开一个
+    // 工具；而且这样它能和 `curl` / `jq` / 循环凑在一起用。
 
     // 浏览器**不再是一个工具**：唯一入口是沙箱里的 `agent browser`（见
     // `linux.rs` 的 AGENT_CLI）。
@@ -2535,31 +2503,6 @@ async fn execute_tool(
     // 和上面那段设备操作同一个道理：能在 shell 里说清的能力，就别再开一个工具。
 
     ToolOutcome::json(json!({ "error": format!("未知工具 {name}") }))
-}
-
-/// 搜索结果 → 模型看的文本。
-///
-/// 这段文字会进历史、进提示词缓存，所以**按钱算**：每条片段截到 400 字、
-/// 整段封顶 4000 字。要更多就让模型自己挑一条去 curl / browser 读全文 ——
-/// 把十篇全文（几十 KB）塞进历史才是真浪费。
-fn format_hits(found: &crate::search::Found) -> String {
-    if found.hits.is_empty() {
-        return "没搜到结果。换个说法，或者用 `agent browser navigate` 打开搜索引擎自己翻。"
-            .to_string();
-    }
-    let mut out = String::new();
-    let mut chars = 0usize;
-    for (i, h) in found.hits.iter().enumerate() {
-        let snip: String = h.snippet.chars().take(400).collect();
-        let item = format!("{}. {}\n   {}\n   {}\n", i + 1, h.title, h.url, snip);
-        chars += item.chars().count();
-        out.push_str(&item);
-        if chars > 4000 {
-            out.push_str("…（结果太长，已截断；调小 num_results 或换更准的说法）\n");
-            break;
-        }
-    }
-    out
 }
 
 /// 图片结果：缩好的字节落盘（历史回放时还要重发），回给模型一段能读的说明
@@ -3405,9 +3348,9 @@ mod tests {
         //
         // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）暂时**不作为工具**
         // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
-        // 浏览器同理，已经删掉了（唯一入口是 `agent browser`）。
+        // 浏览器和搜索同理，已经删掉了（唯一入口是 `agent browser` / `agent search`）。
         let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["read", "bash", "edit", "search"]);
+        assert_eq!(names, vec!["read", "bash", "edit"]);
         // 重复调用必须完全一致
         assert_eq!(names, tools().iter().map(|t| t.name).collect::<Vec<_>>());
     }
@@ -3431,29 +3374,38 @@ mod tests {
         }
     }
 
-    /// 浏览器只能从**一个门**进：沙箱里的 `agent browser`。
+    /// 浏览器和联网搜索都只能从**一个门**进：沙箱里的 `agent browser` / `agent search`。
     ///
-    /// 以前是两条路（`browser` 工具 + 沙箱命令），实测同一个会话里模型 45 : 3
-    /// 选沙箱那条 —— 一条 bash 能连做多个动作，省的是整轮 LLM 请求。工具那条
-    /// 留着只有两个后果：前缀里多 2400 字（工具表的 54%），以及两处动作表各自
-    /// 漂移（`agent browser new_tab URL` 把 URL 静默吃掉就是这么来的）。
+    /// 浏览器以前是两条路（`browser` 工具 + 沙箱命令），实测同一个会话里模型
+    /// 45 : 3 选沙箱那条 —— 一条 bash 能连做多个动作，省的是整轮 LLM 请求。工具
+    /// 那条留着只有两个后果：前缀里多 2400 字（工具表的 54%），以及两处动作表各自
+    /// 漂移（`agent browser new_tab URL` 把 URL 静默吃掉就是这么来的）。搜索同理，
+    /// 而且它本来就能和 `curl` / `jq` / 循环凑在一起用。
     #[test]
-    fn browser_is_only_reachable_through_the_sandbox_cli() {
-        assert!(
-            !tools().iter().any(|t| t.name == "browser"),
-            "browser 工具又回来了？加回去前先看看它和沙箱命令的重复度"
-        );
-        assert!(
-            SYSTEM_PROMPT.contains("agent browser"),
-            "提示词得告诉模型去哪开网页（不然它得自己跑 agent help 才发现）"
-        );
-        // 那几个只属于它的参数不能再出现在工具表里（工具表是可缓存前缀的一部分）
+    fn browser_and_search_are_only_reachable_through_the_sandbox_cli() {
+        for tool in ["browser", "search"] {
+            assert!(
+                !tools().iter().any(|t| t.name == tool),
+                "{tool} 工具又回来了？加回去前先看看它和沙箱命令的重复度"
+            );
+            assert!(
+                SYSTEM_PROMPT.contains(&format!("agent {tool}")),
+                "提示词得告诉模型去哪用它（不然它得自己跑 agent help 才发现）"
+            );
+        }
+        // 只属于它们的参数不能再出现在工具表里（工具表是可缓存前缀的一部分）
         let dump = serde_json::to_string(
             &tools().iter().map(|t| (t.schema)()).collect::<Vec<_>>(),
         )
         .unwrap();
-        for k in ["full_page", "max_depth", "set_user_agent", "find_elements"] {
-            assert!(!dump.contains(k), "工具表里还有 browser 的参数 {k}");
+        for k in [
+            "full_page",
+            "max_depth",
+            "set_user_agent",
+            "find_elements",
+            "num_results",
+        ] {
+            assert!(!dump.contains(k), "工具表里还有删掉的参数 {k}");
         }
     }
 

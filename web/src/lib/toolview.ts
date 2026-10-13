@@ -164,6 +164,7 @@ export function describeInput(t: ToolPart, args: Record<string, unknown>): Input
       break;
     }
     case 'search':
+      // 老会话回放用：`search` 工具已删（唯一入口是沙箱里的 `agent search`）
       primary = take('query');
       break;
     case 'browser': {

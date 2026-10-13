@@ -327,7 +327,11 @@ async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>
     }
 }
 
-/// `POST /api/websearch` → 联网搜索（对应 `search` 工具）。
+/// `POST /api/websearch` → 联网搜索（`{query, num_results?}`）。
+///
+/// **这是联网搜索的唯一入口**：沙箱里的 `agent search` 走它（以前还有一个
+/// `search` 工具，已删 —— 能在一行 shell 里说清的能力不必再开一个工具）。
+/// 响应里的 `output` 就是给模型看的那段文字（见 `search::format_hits`）。
 ///
 /// body：`{query, num_results?}`。和 `/api/browser` 一样的理由存在：
 /// 调试、以及让沙箱里的 `agent search` 能直接用。
@@ -346,7 +350,10 @@ async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) ->
             "ok": true,
             "provider": found.provider,
             "count": found.hits.len(),
-            "results": found.hits,
+            // `output` 是给模型看的那段文字（每条片段截 400 字、整段封顶 4000 字）。
+            // 搜索现在不是工具了，格式化就发生在这一层 —— 沙箱里的 `agent search`
+            // 原样把这个 JSON 打给模型，两边不能再各写一份（各写一份就会漂）。
+            "output": crate::search::format_hits(&found),
         }))
         .into_response(),
         // 429 之类的“能自己恢复”的失败：200 + error 字段，调用方（模型/CLI）
