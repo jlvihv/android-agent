@@ -20,6 +20,7 @@
   import { viewer } from './lib/viewer.svelte.ts';
   import { models } from './lib/models.svelte.ts';
   import { agentHasBrowser, openAgentBrowser } from './lib/overlay';
+  import { wide } from './lib/wide.svelte.ts';
 
   let input = $state('');
   /** 当前看着的这个会话，本地正连着它的流。 */
@@ -29,6 +30,26 @@
   let serverBusy = $state(false);
   let messages = $state<Message[]>([]);
   let sessions = $state<Session[]>([]);
+
+  /**
+   * 排队中的消息。
+   *
+   * 模型还在说的时候用户又发了话，不进 `messages` 也不发请求 —— 先在这里排着
+   * （界面上是输入框上方那几条「排队中」），等这个回合**收尾**再依次发出去。
+   *
+   * 两个刻意的选择：
+   *
+   * 1. **不先落成用户气泡**。落进去它就成了本地历史的一部分，而服务端此时还
+   *    没有这条消息 —— 流结束后的那次 `loadMessages` 会按服务端重写 `messages`
+   *    （id 全新、DOM 重建），气泡要么闪一下就没，要么被冲到别处。
+   *    排队 ≠ 说过，所以它在输入区，不在正文里。
+   * 2. **每条记着自己属于哪个会话**。回合在后台跑着时用户可能已经切走了，
+   *    队列不能跟着当前视图跑 —— `flushQueue` 只发属于**当前**会话的那些。
+   */
+  type Queued = { id: string; sid: string; text: string; attachments: Upload[] };
+  let queue = $state<Queued[]>([]);
+  /** 正在把队列里的一条发出去（挡住重入：effect / 流结束回调会重复触发） */
+  let flushing = false;
 
   /**
    * 本地正连着的那条流。**只属于当前看着的会话**。
@@ -180,8 +201,13 @@
    */
   let rev = '';
 
-  /** 当前会话 id（从 rev 里解出来）。切会话时清掉，避免跨会话复用消息对象。 */
-  let sessionId = '';
+  /**
+   * 当前会话 id（从 rev 里解出来）。切会话时清掉，避免跨会话复用消息对象。
+   *
+   * `$state`：**队列要跟着它走**（输入框上面那几条「排队中」只看当前会话的，
+   * 切回去才轮到它发）。原来是普通的 let —— 那时没人从模板里读它，现在有了。
+   */
+  let sessionId = $state('');
 
   /**
    * 能复用的旧消息对象原样留着，Svelte 就不会重新渲染它们的 DOM。
@@ -227,6 +253,10 @@
     rev = '';
     sessionId = '';
     messages = [];
+    // 新会话在服务端**还不存在**，所以它一定没在跑 —— 不清的话会留着上一条
+    // 会话的「服务端还在跑」，输入框要等一个轮询周期才解冻（而且队列会以为
+    // 自己该排队）。
+    serverBusy = false;
     drawer = false;
   }
 
@@ -255,6 +285,8 @@
 
   async function deleteSession(id: string) {
     if (id === sessionId) detach();
+    // 这个会话没了，它排着的队也没地方发了
+    queue = queue.filter((q) => q.sid !== id);
     await fetch('/api/sessions/delete', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -304,6 +336,40 @@
     return () => clearInterval(t);
   });
 
+  // 服务端这个会话从「在跑」变成「没跑」→ 看队列里有没有要发的。
+  //
+  // 这条路是给**本地没连着流**的情况用的（切走又切回来 / 从后台回来 / 按了
+  // 停止）：那时只能靠上面的轮询知道它跑完了，`run` 的 finally 根本没经过。
+  // `queue.length` 和 `sessionId` 都要在这里读一下，否则它们变了不重跑。
+  $effect(() => {
+    void queue.length;
+    void sessionId;
+    if (busy || serverBusy) return;
+    // untrack：flushQueue 里会 `await loadSessions()` / `deliver()`，那一串对
+    // sessions / messages / rev 的读写要是被记成依赖，这个 effect 会被自己刚
+    // 写的东西反复叫醒。
+    untrack(() => void flushQueue());
+  });
+
+  // 当前会话里排队的那几条。其它会话的队列在内存里排着，切回去才又看得见
+  // （也才轮得到它发，见 flushQueue）。
+  let queued = $derived(queue.filter((q) => q.sid === sessionId));
+
+  // 它们按「**还没发出去**的用户消息」渲染（`done: false`）—— 消息列表里就是
+  // 普通用户气泡的样子，只多一圈虚线和左边一个 ×。数据上仍在 `queue` 里：
+  // 没进 `messages`（详见上面 Queued 的注释）。
+  let queuedMsgs = $derived(
+    queued.map(
+      (q): Message => ({
+        id: q.id,
+        role: 'user',
+        parts: userParts(q.text, q.attachments),
+        steps: 0,
+        done: false,
+      }),
+    ),
+  );
+
   // 打开抽屉时**显式**刷新列表。
   //
   // 不能只靠 `$effect(() => { if (drawer) ... })`：抽屉一直开着的时候
@@ -339,6 +405,8 @@
         busy = false;
       }
       void loadSessions();
+      // 这个回合完了 → 看队列里有没有等着发的（见 flushQueue）
+      void flushQueue();
     }
   }
 
@@ -358,16 +426,35 @@
     }
   }
 
+  /**
+   * 发一条消息：没人跑就直接发，有人在跑就排队。
+   *
+   * 这是「模型说话时用户也能说话」的入口 —— 输入框一直是活的，只是这条
+   * 消息要等到 agent 收尾才真的出去（见 `flushQueue`）。
+   */
   async function send(attachments: Upload[]) {
     const text = input.trim();
-    // serverBusy：本地没连着流（从后台 / 别的会话切回来），但这个会话的回合
-    // 还在跑。这时再发一条，服务端会回 409（一个会话同时只跑一个回合）。
-    if ((!text && attachments.length === 0) || busy || serverBusy) return;
+    if (!text && attachments.length === 0) return;
     input = '';
 
-    // 附件先作为 part 拼进本地气泡（和 session_view 恢复出来的形状一致）——
-    // 否则发出去的下一秒，自己的图片就看不见了。
-    const parts: Part[] = [
+    // 这个会话有人占着：本地连着流（busy），或者本地没连着而服务端还在跑
+    // （serverBusy，切回来 / 从后台回来）。两种都只能排队 —— 直接发会撞 409
+    // （一个会话同时只跑一个回合）。
+    if (busy || serverBusy) {
+      queue = [...queue, { id: uid(), sid: sessionId, text, attachments }];
+      return;
+    }
+    await deliver(text, attachments);
+  }
+
+  /**
+   * 一条用户消息的 parts：正文 + 附件。
+   *
+   * 发出去的那条（`deliver`）和排队的那条（`queuedMsgs`）用的都是它 ——
+   * 所以排队中那条能直接当用户消息渲染，长得和发出去的一模一样。
+   */
+  function userParts(text: string, attachments: Upload[]): Part[] {
+    return [
       { type: 'text', id: 'u', text },
       ...attachments.map(
         (a, i): Part =>
@@ -376,6 +463,17 @@
             : { type: 'file', id: `a${i}`, url: a.url, name: a.name, mime: a.mime },
       ),
     ];
+  }
+
+  /**
+   * 真的把一条消息发出去：先落本地两个气泡，再起流。
+   *
+   * 和「排队」分开：`send` 只管该不该排队，这里只管发。`flushQueue` 也走这里。
+   */
+  async function deliver(text: string, attachments: Upload[]) {
+    // 附件先作为 part 拼进本地气泡（和 session_view 恢复出来的形状一致）——
+    // 否则发出去的下一秒，自己的图片就看不见了。
+    const parts = userParts(text, attachments);
 
     messages.push({
       id: uid(),
@@ -402,6 +500,44 @@
     });
   }
 
+  /**
+   * 队列里**属于当前会话**的第一条，现在没人占着 → 发出去。
+   *
+   * 什么时候会被叫：回合收尾（`run` 的 finally）、服务端从「在跑」变成
+   * 「没跑」（下面的 $effect）、以及切回某条会话。
+   */
+  async function flushQueue() {
+    if (flushing || busy || serverBusy) return;
+    if (!queue.some((q) => q.sid === sessionId)) return;
+    flushing = true;
+    try {
+      // 本地这条流结束**不等于**服务端那个回合已经收尾 —— 按停止时尤其是
+      // 这样（abort 要传过去，服务端还得补上「已停止」的工具结果）。
+      await syncServerBusy();
+      if (busy || serverBusy) return;
+      const i = queue.findIndex((q) => q.sid === sessionId);
+      if (i < 0) return;
+      const [item] = queue.splice(i, 1);
+      await deliver(item.text, item.attachments);
+    } finally {
+      flushing = false;
+    }
+  }
+
+  /**
+   * 服务端这个会话还在跑吗？
+   *
+   * 只看会话清单里那个 `busy` 标记（抽屉那份，接口顺带刷了），**不碰消息**
+   * —— `flushQueue` 不需要重传历史，更不需要因此把本地消息换成服务端的 id
+   * （那是一次整列表的 DOM 重建）。
+   */
+  async function syncServerBusy() {
+    await loadSessions();
+    serverBusy = !!sessions.find((s) => s.id === sessionId)?.busy;
+  }
+
+  const dropQueued = (id: string) => (queue = queue.filter((q) => q.id !== id));
+
   const stop = () => {
     // 服务端循环看不到 SSE 断连（tx.send 失败会被忽略），得显式告诉它停。
     // 否则前端显示停了，agent 还在后台一轮轮跑工具、烧 token。
@@ -421,92 +557,108 @@
   };
 </script>
 
-<div class="shell relative h-full overflow-hidden bg-ink" style:--composer-h="{composerH}px">
-  <!-- 消息列表铺满整个高度：内容从头部和输入卡片下面穿过去。
-       顶部/底部的渐隐是 `.shell` 的伪元素（只为了装饰，不值得占两个 div）。 -->
-  <!-- 不要给 main 加 z-index：`z-0` 会形成层叠上下文，把里面
-       弹出面板的 z-50 困住，压不过同级 z-20 的输入框（踩过）。
-       z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
-  <main class="absolute inset-0">
-    {#if messages.length === 0}
-      <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
-    {:else}
-      <MessageList {messages} />
-    {/if}
-  </main>
-
-  <!--
-    渐隐用浮层而不是滚动容器上的 mask。
-    mask 会让滚动容器每帧重新合成 —— 实测手机上划动明显卡顿。
-  -->
-
-  <!-- 头部浮在内容上 -->
-  <header
-    class="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-center justify-between
-           px-4 pb-1 pt-[calc(0.25rem+env(safe-area-inset-top))]"
-  >
-    <button onclick={openDrawer} aria-label="菜单" class="pointer-events-auto p-1 text-fg">
-      <Icon name="menu" size={20} />
-    </button>
-    <!-- 右上角 = 新对话（对齐 Claude 移动端：左边菜单，右边开新会话）。
-         设备状态点挪进抽屉左下角的设置按钮（作为角标）。 -->
-    <div class="pointer-events-auto flex items-center gap-1">
-      <!-- agent 的浏览器：它自己在后台开了网页时，用户可以看看它在干什么、
-           也能自己接着操作（壳里那块是**同一只** WebView）。
-           **只在它真开着页面时才出现** —— 没开过页面时点它只会弹一句
-           「还没打开过网页」，那就不该显示（也少一个常驻图标）。 -->
-      {#if browserAvailable}
-        <button
-          onclick={openAgentBrowser}
-          aria-label="看 agent 的浏览器"
-          title="看 agent 的浏览器"
-          class="p-1 text-fg"
-        >
-          <Icon name="globe" size={20} />
-        </button>
-      {/if}
-      <button
-        onclick={newSession}
-        aria-label="新对话"
-        title="新对话"
-        class="p-1 text-fg"
-      >
-        <Icon name="newchat" size={20} />
-      </button>
-    </div>
-  </header>
-
-  <!-- 输入卡片也浮在内容上 -->
-  <div class="absolute inset-x-0 bottom-0 z-20" bind:offsetHeight={composerH}>
-    {#if serverBusy && !busy}
-      <!-- 服务端在跑但本地没连着流（刚从后台回来）-->
-      <div class="flex items-center gap-2 px-5 pb-1 text-xs text-muted">
-        <span class="size-1.5 animate-pulse rounded-full bg-warn"></span>
-        agent 正在运行…
-      </div>
-    {/if}
-
-    <Composer
-      bind:value={input}
-      busy={busy || serverBusy}
-      onsend={send}
-      onstop={stop}
-      onmodel={() => (sheet = true)}
+<div class="flex h-full overflow-hidden bg-ink">
+  <!-- 宽屏：侧边栏**并排**在左边（不是抽屉），一直是开着的。
+       窄屏：它还是盖在对话上的抽屉，由头部的菜单按钮控制（见下面）。 -->
+  {#if wide.on}
+    <Drawer
+      {sessions}
+      onclose={close}
+      onnew={newSession}
+      onswitch={switchSession}
+      ondelete={deleteSession}
+      onrename={renameSession}
+      onsettings={() => (settings = true)}
+      pinned
     />
-  </div>
-</div>
+  {/if}
 
-{#if drawer}
-  <Drawer
-    {sessions}
-    onclose={close}
-    onnew={newSession}
-    onswitch={switchSession}
-    ondelete={deleteSession}
-    onrename={renameSession}
-    onsettings={() => (settings = true)}
-  />
-{/if}
+  <!-- 对话区：把侧边栏剩下的宽度**全部**拿走（不限宽）。 -->
+  <div
+    class="shell relative h-full w-full min-w-0 flex-1 overflow-hidden"
+    style:--composer-h="{composerH}px"
+  >
+    <!-- 消息列表铺满整个高度：内容从头部和输入卡片下面穿过去。
+         顶部/底部的渐隐是 `.shell` 的伪元素（只为了装饰，不值得占两个 div）。 -->
+    <!-- 不要给 main 加 z-index：`z-0` 会形成层叠上下文，把里面
+         弹出面板的 z-50 困住，压不过同级 z-20 的输入框（踩过）。
+         z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
+    <main class="absolute inset-0">
+      {#if messages.length === 0}
+        <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
+      {:else}
+        <MessageList {messages} pending={queuedMsgs} ondrop={dropQueued} />
+      {/if}
+    </main>
+
+    <!--
+      渐隐用浮层而不是滚动容器上的 mask。
+      mask 会让滚动容器每帧重新合成 —— 实测手机上划动明显卡顿。
+    -->
+
+    <!-- 头部浮在内容上 -->
+    <header
+      class="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-center justify-between
+             px-4 pb-1 pt-[calc(0.25rem+env(safe-area-inset-top))]"
+    >
+      <!-- 窄屏才需要它（宽屏侧边栏一直在，见上） -->
+      <button
+        onclick={openDrawer}
+        aria-label="菜单"
+        class="pointer-events-auto p-1 text-fg {wide.on ? 'hidden' : ''}"
+      >
+        <Icon name="menu" size={20} />
+      </button>
+      <!-- 右上角 = 新对话（对齐 Claude 移动端：左边菜单，右边开新会话）。 -->
+      <div class="pointer-events-auto ml-auto flex items-center gap-1">
+        <!-- agent 的浏览器：它自己在后台开了网页时，用户可以看看它在干什么、
+             也能自己接着操作（壳里那块是**同一只** WebView）。
+             **只在它真开着页面时才出现** —— 没开过页面时点它只会弹一句
+             「还没打开过网页」，那就不该显示（也少一个常驻图标）。 -->
+        {#if browserAvailable}
+          <button
+            onclick={openAgentBrowser}
+            aria-label="看 agent 的浏览器"
+            title="看 agent 的浏览器"
+            class="p-1 text-fg"
+          >
+            <Icon name="globe" size={20} />
+          </button>
+        {/if}
+        <button onclick={newSession} aria-label="新对话" title="新对话" class="p-1 text-fg">
+          <Icon name="newchat" size={20} />
+        </button>
+      </div>
+    </header>
+
+    <!-- 输入卡片也浮在内容上 -->
+    <div class="absolute inset-x-0 bottom-0 z-20" bind:offsetHeight={composerH}>
+      <!-- 排队中那几条不在这里（输入框上方）—— 它们画在**消息列表末尾**，
+           和已发送的用户气泡同一个样子（虚线 + 左边一个 ×），见 MessageList。 -->
+
+      <Composer
+        bind:value={input}
+        busy={busy || serverBusy}
+        onsend={send}
+        onstop={stop}
+        onmodel={() => (sheet = true)}
+      />
+    </div>
+  </div>
+
+  <!-- 窄屏：抽屉盖在对话上（宽屏它已经并排在左边了） -->
+  {#if !wide.on && drawer}
+    <Drawer
+      {sessions}
+      onclose={close}
+      onnew={newSession}
+      onswitch={switchSession}
+      ondelete={deleteSession}
+      onrename={renameSession}
+      onsettings={() => (settings = true)}
+    />
+  {/if}
+</div>
 
 {#if sheet}<ModelSheet onclose={close} onconfig={() => (settings = true)} rev={settingsRev} />{/if}
 

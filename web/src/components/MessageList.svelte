@@ -20,7 +20,23 @@
   import Sheet from './Sheet.svelte';
   import ThoughtLine from './ThoughtLine.svelte';
 
-  let { messages }: { messages: Message[] } = $props();
+  let {
+    messages,
+    /**
+     * 排队中（还没发出去）的用户消息。
+     *
+     * 走**和已经发出去的那条一模一样的气泡**（同一个 snippet、同一套尺寸/
+     * 颜色/对齐），只多一圈虚线和一个 ×。`done: false` 就是这个意思 —— 正文
+     * 里的用户消息永远是 `true`。
+     */
+    pending = [],
+    ondrop,
+  }: {
+    messages: Message[];
+    pending?: Message[];
+    /** 把排队的那条从队列里去掉（点那个 ×） */
+    ondrop?: (id: string) => void;
+  } = $props();
 
   let scroller: HTMLDivElement | null = $state(null);
 
@@ -280,6 +296,69 @@
   });
 </script>
 
+<!-- 用户消息的气泡。**排队中那条也走这里** —— 同一个气泡、同一套尺寸、
+     颜色、对齐，只多一圈虚线；× 挂在气泡**左边**（那个位置本来就是空的：
+     用户消息贴右）。挂出去而不是挤进去，气泡的宽度就和发出去的一模一样。 -->
+{#snippet userMessage(msg: Message)}
+  {@const atts = msg.parts.filter((p) => p.type === 'image' || p.type === 'file')}
+  {@const text = msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
+  {@const queued = !msg.done}
+  {#if atts.length === 0}
+    <!-- 常见情况：只有正文，一层 <p> 就够。不为了「可能会有的附件」
+         恒常多套一层 div（对齐 + 收缩 + 上限 84%）。 -->
+    <p
+      class="self-end max-w-[84%] rounded-card px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words
+             {queued ? 'relative border border-dashed border-control bg-bubble/40' : 'bg-bubble'}"
+    >
+      {text}
+      {#if queued}{@render dropBtn(msg.id)}{/if}
+    </p>
+  {:else}
+    <!-- 有附件：缩略图/药丸在上，正文气泡在下 -->
+    <div class="flex max-w-[84%] flex-col items-end gap-2 self-end {queued ? 'relative' : ''}">
+      {#if queued}{@render dropBtn(msg.id)}{/if}
+      <div class="flex flex-wrap justify-end gap-2">
+        {#each atts as a (a.id)}
+          {#if a.type === 'image'}
+            <img
+              src={a.url}
+              alt={a.name}
+              class="max-h-48 max-w-full rounded-card border border-hairline object-cover"
+            />
+          {:else}
+            <span
+              class="flex items-center gap-1.5 rounded-card bg-bubble px-3 py-2 text-meta text-fg"
+            >
+              <Icon name="file" size={16} class="shrink-0 text-muted" />
+              <span class="max-w-52 truncate">{a.name}</span>
+            </span>
+          {/if}
+        {/each}
+      </div>
+      {#if text}
+        <p
+          class="max-w-full rounded-card px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words
+                 {queued ? 'border border-dashed border-control bg-bubble/40' : 'bg-bubble'}"
+        >
+          {text}
+        </p>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+{#snippet dropBtn(id: string)}
+  <button
+    onclick={() => ondrop?.(id)}
+    aria-label="从队列里去掉"
+    title="从队列里去掉"
+    class="absolute top-1/2 -left-7 grid size-5 -translate-y-1/2 place-items-center rounded-full
+           bg-ink text-fg ring-1 ring-hairline"
+  >
+    <Icon name="close" size={11} />
+  </button>
+{/snippet}
+
 <!-- 底部留白 = 输入区高度 + 一点余量：输入区是浮在上面的，
      不留够的话最后一条消息永远有半截压在卡片下面。 -->
 <div
@@ -298,46 +377,7 @@
   {/if}
   {#each messages.slice(start) as msg (msg.id)}
     {#if msg.role === 'user'}
-      {@const atts = msg.parts.filter((p) => p.type === 'image' || p.type === 'file')}
-      {@const text = msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
-      {#if atts.length === 0}
-        <!-- 常见情况：只有正文，一层 <p> 就够。不为了「可能会有的附件」
-             恒常多套一层 div（对齐 + 收缩 + 上限 84%）。 -->
-        <p
-          class="self-end max-w-[84%] rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
-        >
-          {text}
-        </p>
-      {:else}
-        <!-- 有附件：缩略图/药丸在上，正文气泡在下 -->
-        <div class="flex max-w-[84%] flex-col items-end gap-2 self-end">
-          <div class="flex flex-wrap justify-end gap-2">
-            {#each atts as a (a.id)}
-              {#if a.type === 'image'}
-                <img
-                  src={a.url}
-                  alt={a.name}
-                  class="max-h-48 max-w-full rounded-card border border-hairline object-cover"
-                />
-              {:else}
-                <span
-                  class="flex items-center gap-1.5 rounded-card bg-bubble px-3 py-2 text-meta text-fg"
-                >
-                  <Icon name="file" size={16} class="shrink-0 text-muted" />
-                  <span class="max-w-52 truncate">{a.name}</span>
-                </span>
-              {/if}
-            {/each}
-          </div>
-          {#if text}
-            <p
-              class="max-w-full rounded-card bg-bubble px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words"
-            >
-              {text}
-            </p>
-          {/if}
-        </div>
-      {/if}
+      {@render userMessage(msg)}
     {:else}
       <div class="flex flex-col gap-2.5 text-base leading-relaxed">
         {#each msg.parts as part, i (i)}
@@ -383,6 +423,14 @@
 
       </div>
     {/if}
+  {/each}
+
+  <!-- 排队中（还没发出去）的那几条：画在正文末尾，就是普通用户气泡的样子，
+       只是虚线 + 左边一个 ×。数据上它们不在 `messages` 里（没发过、服务端
+       不知道），发出去的那一刻才变成真正的那条 —— 样子几乎不变，所以看起来
+       就是「虚线变实」。 -->
+  {#each pending as p (p.id)}
+    {@render userMessage(p)}
   {/each}
 </div>
 </div>

@@ -2,6 +2,7 @@
   import Icon from './Icon.svelte';
   import AttachSheet from './AttachSheet.svelte';
   import { store } from '../lib/store.svelte.ts';
+  import { effortLabel } from '../lib/effort';
   import type { Upload } from '../lib/sse';
 
   let {
@@ -45,8 +46,11 @@
   let photoInput: HTMLInputElement | null = $state(null);
   let fileInput: HTMLInputElement | null = $state(null);
 
+  // 「可以发」不再看 busy：模型还在说的时候发的下一条进队列，等它收尾再发
+  // （见 App.svelte 的 send / flushQueue）。所以 streaming 时输入区是**活的**，
+  // 只是右边多一个停止键。
   const canSend = $derived(
-    (value.trim().length > 0 || ready.length > 0) && !busy && !uploading,
+    (value.trim().length > 0 || ready.length > 0) && !uploading,
   );
 
   // 按内容长高，最多 5 行，再多就在框里滚。
@@ -219,33 +223,48 @@
       <Icon name="plus" size={19} />
     </button>
 
+    <!-- 模型药丸：模型名 + **当前思考强度**。两个都要看得见 ——
+         强度是会直接影响“要等多久”的开关，藏在面板里没道理。
+         强度用 muted：它是副信息，但读得出来。 -->
     <button
       onclick={onmodel}
-      class="h-9 max-w-[60%] shrink-0 truncate rounded-full bg-control px-4 text-sm text-fg"
+      title="模型 / 思考强度"
+      class="flex h-9 max-w-[68%] shrink-0 items-center rounded-full bg-control px-4 text-sm
+             text-fg"
     >
-      {store.llm?.model ?? '未配置模型'}
+      <span class="min-w-0 truncate">{store.llm?.model ?? '未配置模型'}</span>
+      {#if store.llm}
+        <span class="ml-1.5 shrink-0 text-muted">· {effortLabel(store.llm.reasoningEffort)}</span>
+      {/if}
     </button>
 
-    {#if busy}
-      <button
-        onclick={onstop}
-        aria-label="停止"
-        class="ml-auto grid size-9 shrink-0 place-items-center rounded-full bg-control text-fg"
-      >
-        <Icon name="stop" size={18} />
-      </button>
-    {:else}
-      <!-- 发送：空态是暗的，有字或附件才变白底黑箭头 -->
-      <button
-        onclick={send}
-        disabled={!canSend}
-        aria-label="发送"
-        class="ml-auto grid size-9 shrink-0 place-items-center rounded-full transition-colors
-               {canSend ? 'bg-fg text-ink' : 'bg-control text-faint'}"
-      >
-        <Icon name="send" size={18} />
-      </button>
-    {/if}
+    <!-- 右边一组：还在跑 → 停止键（左边）；有字/附件或空闲 → 发送键（可以两个同时在）。
+         空闲时发送键也**一定在**（暗着）—— 不能让它一会出现一会消失。 -->
+    <div class="ml-auto flex shrink-0 items-center gap-2">
+      {#if busy}
+        <button
+          onclick={onstop}
+          aria-label="停止"
+          class="grid size-9 shrink-0 place-items-center rounded-full bg-control text-fg"
+        >
+          <Icon name="stop" size={18} />
+        </button>
+      {/if}
+      {#if !busy || canSend}
+        <!-- 发送：空态是暗的，有字或附件才变白底黑箭头。
+             还在跑时发出去的是「排队」，title 说清楚。 -->
+        <button
+          onclick={send}
+          disabled={!canSend}
+          aria-label={busy ? '排队发送（agent 说完就发）' : '发送'}
+          title={busy ? '排队发送：agent 说完这条就发出去' : '发送'}
+          class="grid size-9 shrink-0 place-items-center rounded-full transition-colors
+                 {canSend ? 'bg-fg text-ink' : 'bg-control text-faint'}"
+        >
+          <Icon name="send" size={18} />
+        </button>
+      {/if}
+    </div>
   </div>
 
   <input

@@ -9,9 +9,13 @@
    *
    * 去掉了：agent 标题栏 + 版本号、事件入口、分割线、「最近对话」标题。
    * 搜索框替掉标题栏：边栏本来就是用来找对话的，搜索比版本号有用。
-   * 事件日志（EventLog）以后挂进「设置」里。
    *
    * **长按**对话行 → 重命名 / 删除。跟 Claude 一样，列表里不放常驻按钮。
+   *
+   * 两种形态（`pinned`）：
+   *   窄屏 —— 抽屉：盖在对话上（遮罩 / 往左拖 / 返回键 / 滑进滑出）
+   *   宽屏 —— 并排的一栏：没有遮罩、不能拖、不接返回键，头部那个菜单按钮也没了
+   * 中间那一段（搜索框 + 列表 + 底栏）是同一个 snippet，两边都用它。
    *
    * DOM 刻意浅：aside 只有三个孩子（搜索框 / 列表 / 底栏），
    * 中间那层仅仅是滚动容器 —— 滚动区必须是单个元素，省不掉。
@@ -22,7 +26,6 @@
    */
   import { fade } from 'svelte/transition';
   import { quintOut } from 'svelte/easing';
-  import { store } from '../lib/store.svelte.ts';
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
   import Icon from './Icon.svelte';
@@ -46,6 +49,8 @@
     ondelete,
     onrename,
     onsettings,
+    /** 宽屏：**并排**的一栏（不是抽屉）。见 lib/wide.svelte.ts */
+    pinned = false,
   }: {
     sessions: Session[];
     onclose: () => void;
@@ -55,6 +60,7 @@
     onrename: (id: string, title: string) => void;
     /** 左下角的齿轮 → 设置页 */
     onsettings: () => void;
+    pinned?: boolean;
   } = $props();
 
   // —— 搜索 ——
@@ -162,7 +168,13 @@
 
   // 返回键关抽屉；拖拽三件套也是「预测性返回」的跟手位移
   // （系统手势划到哪，抽屉就跟着挪到哪。Android 14+；桌面可手动 __predictiveBack 模拟）
-  $effect(() => onBack(() => onclose(), drag));
+  //
+  // 并排那一栏**不接**返回键：它不是盖在东西上面的，返回键没有「关掉它」这回事
+  // （在桌面浏览器上按返回应该是浏览器自己的历史）。
+  $effect(() => {
+    if (pinned) return;
+    return onBack(() => onclose(), drag);
+  });
 
   /** 进场：从左边整个滑进来 */
   function slideIn(_: Element) {
@@ -226,25 +238,7 @@
   }
 </script>
 
-<button
-  class="fixed inset-0 z-40 bg-scrim"
-  style:opacity={1 - off}
-  style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
-  aria-label="关闭"
-  onclick={onclose}
-  transition:fade|global={{ duration: 220 }}
-></button>
-
-<aside
-  bind:this={aside}
-  use:dismissable={drag}
-  style:transform={off ? `translateX(${-off * 100}%)` : null}
-  style:transition={dragging ? 'none' : RELEASE}
-  class="fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[92%] flex-col bg-drawer
-         pt-[env(safe-area-inset-top)] will-change-transform"
-  in:slideIn|global
-  out:slideOut|global
->
+{#snippet body()}
   <!-- 全圆角 + 里面一个放大镜。放大镜是 CSS 背景图（不套 div/span）：
        纯装饰，为它多一层 DOM 不值当。图形跟 Icon.svelte 一个规格
        （20 画布 / 描边 1.8），颜色取 muted。 -->
@@ -328,22 +322,15 @@
   <div
     class="flex shrink-0 items-center gap-3 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
   >
-    <!-- 左下角 = 设置。图标本身说明用途。
-         连接状态当角标挂在这个按钮上，顺手保留了原来那个点的信息。 -->
+    <!-- 左下角 = 设置。图标本身说明用途。 -->
     <button
       type="button"
       onclick={onsettings}
       aria-label="设置"
       title="设置"
-      class="relative grid size-11 shrink-0 place-items-center rounded-full bg-hairline text-muted"
+      class="grid size-11 shrink-0 place-items-center rounded-full bg-hairline text-muted"
     >
       <Icon name="gear" size={20} />
-      <span
-        aria-hidden="true"
-        title={store.device?.name ?? '未连接设备'}
-        class="absolute right-0.5 bottom-0.5 size-2.5 rounded-full ring-2 ring-drawer
-               {store.device?.connected ? 'bg-ok' : 'bg-faint'}"
-      ></span>
     </button>
 
     <button
@@ -354,7 +341,40 @@
       新建会话
     </button>
   </div>
-</aside>
+{/snippet}
+
+{#if pinned}
+  <!-- 宽屏：并排的一栏。没有遮罩、不能往左拖、也不接返回键 ——
+       它本来就不是「盖在上面」的东西，宽度写死，跟对话平分剩下的地方。 -->
+  <aside
+    class="flex h-full w-72 shrink-0 flex-col border-r border-hairline bg-drawer
+           pt-[env(safe-area-inset-top)]"
+  >
+    {@render body()}
+  </aside>
+{:else}
+  <button
+    class="fixed inset-0 z-40 bg-scrim"
+    style:opacity={1 - off}
+    style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
+    aria-label="关闭"
+    onclick={onclose}
+    transition:fade|global={{ duration: 220 }}
+  ></button>
+
+  <aside
+    bind:this={aside}
+    use:dismissable={drag}
+    style:transform={off ? `translateX(${-off * 100}%)` : null}
+    style:transition={dragging ? 'none' : RELEASE}
+    class="fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[92%] flex-col bg-drawer
+           pt-[env(safe-area-inset-top)] will-change-transform"
+    in:slideIn|global
+    out:slideOut|global
+  >
+    {@render body()}
+  </aside>
+{/if}
 
 {#if menu}
   {@const m = menu}

@@ -15,8 +15,8 @@
    *
    * 各图标墨迹（上面这条规矩的实测值，20px 渲染时就是像素）：
    *   gear 16.8 · newchat 16.8 · clock 16.6 · menu 16.2×10.2 · sparkle 15.8
-   *   chat 15.0 · pencil 14.9 · trash 14.6 · plus 14.2 · mic 13.0×17.4
-   *   list 13.6 · send 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
+   *   chat 15.0 · pencil 14.9 · trash 14.6 · plus 14.2
+   *   send 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
    */
   type Name =
     | 'menu'
@@ -24,14 +24,11 @@
     | 'plus'
     | 'send'
     | 'stop'
-    | 'mic'
-    | 'refresh'
     | 'back'
     | 'chevron'
     | 'sparkle'
     | 'clock'
     | 'chat'
-    | 'list'
     | 'pencil'
     | 'trash'
     | 'gear'
@@ -92,21 +89,6 @@
   <svg width={size} height={size} viewBox="0 0 20 20" fill="currentColor" class={cls}>
     <rect x="6" y="6" width="8" height="8" rx="1.6" />
   </svg>
-{:else if name === 'mic'}
-  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <rect x="7.4" y="2.4" width="5.2" height="9.4" rx="2.6" stroke="currentColor" stroke-width="1.8" />
-    <path d="M4.4 9.6a5.6 5.6 0 0 0 11.2 0M10 15.2V18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-  </svg>
-{:else if name === 'refresh'}
-  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <path
-      d="M16.4 10a6.4 6.4 0 1 1-1.9-4.5M16.4 3.6v4h-4"
-      stroke="currentColor"
-      stroke-width="1.8"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-    />
-  </svg>
 {:else if name === 'back'}
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <path d="M12.5 4.5 7 10l5.5 5.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
@@ -153,15 +135,6 @@
       stroke="currentColor"
       stroke-width="1.8"
       stroke-linejoin="round"
-    />
-  </svg>
-{:else if name === 'list'}
-  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <path
-      d="M6.6 5.6h9.2M6.6 10h9.2M6.6 14.4h9.2M4 5.6h.01M4 10h.01M4 14.4h.01"
-      stroke="currentColor"
-      stroke-width="1.8"
-      stroke-linecap="round"
     />
   </svg>
 {:else if name === 'clock'}
