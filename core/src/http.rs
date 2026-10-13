@@ -393,12 +393,15 @@ async fn alpine_upgrade(
     };
     let to = match body.and_then(|b| b.0.to) {
         Some(v) => v,
-        None => match crate::alpine::fetch_latest(&st.alpine, &crate::alpine::arch(&rootfs)).await {
-            Ok(v) => v,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("查不到最新版本：{e:#}")).into_response()
+        None => {
+            match crate::alpine::fetch_latest(&st.alpine, &crate::alpine::arch(&rootfs)).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return (StatusCode::BAD_GATEWAY, format!("查不到最新版本：{e:#}"))
+                        .into_response()
+                }
             }
-        },
+        }
     };
     if !crate::alpine::is_newer(&to, &from) {
         return (StatusCode::CONFLICT, format!("已经是 {from}，不比 {to} 旧")).into_response();
@@ -406,7 +409,13 @@ async fn alpine_upgrade(
     if !st.alpine.try_begin(&from, &to) {
         return (StatusCode::CONFLICT, "已经在升级了").into_response();
     }
-    tokio::spawn(crate::alpine::run(st.clone(), sb, rootfs, from.clone(), to.clone()));
+    tokio::spawn(crate::alpine::run(
+        st.clone(),
+        sb,
+        rootfs,
+        from.clone(),
+        to.clone(),
+    ));
     Json(json!({ "ok": true, "from": from, "to": to })).into_response()
 }
 
@@ -1765,14 +1774,32 @@ async fn ws_upgrade(
 ) -> Response {
     // WebSocket 不受 CORS 管：手机浏览器里随便一个网页都能连
     // ws://127.0.0.1:<端口>，然后给设备下指令。只放行本机来源（App 自己、
-    // Vite 开发服务器）和不带 Origin 的非浏览器客户端。沙箱里的 HTML 是
-    // opaque origin（Origin: null），也挡在外面。
+    // Vite 开发服务器）、**同源**的页面（局域网里用手机浏览器开电脑上的核心时，
+    // 来源是 `http://192.168.x.x:8787`，就是我们自己），和不带 Origin 的非浏览器
+    // 客户端。沙箱里的 HTML 是 opaque origin（Origin: null），也挡在外面；
+    // `sandbox.localhost` 那个源和 Host 对不上，同样挡住。
     if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
-        if !is_loopback_origin(origin.to_str().unwrap_or("")) {
+        let origin = origin.to_str().unwrap_or("");
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        if !is_loopback_origin(origin) && !is_same_origin(origin, host) {
             return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
         }
     }
     ws.on_upgrade(move |socket| ws_loop(socket, st))
+}
+
+/// `Origin`（`http://host:port`）和请求的 `Host` 头是不是同一个地址。
+fn is_same_origin(origin: &str, host: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    !host.is_empty() && rest.trim_end_matches('/').eq_ignore_ascii_case(host)
 }
 
 fn is_loopback_origin(origin: &str) -> bool {
@@ -2258,7 +2285,9 @@ fn cmd_name(c: &Command) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesce, is_loopback_origin, parse_range, parse_rev, session_rev};
+    use super::{
+        coalesce, is_loopback_origin, is_same_origin, parse_range, parse_rev, session_rev,
+    };
     use super::{sandbox_page_url, sandbox_url_to_guest};
 
     /// 一个开着凭据、带一个真 rootfs 目录的核心：rootfs/workspace/site/index.html。
@@ -2821,6 +2850,21 @@ mod tests {
         }
         assert!(
             !is_loopback_origin("http://sandbox.localhost:4000"),
+            "沙箱那个源不算本机来源"
+        );
+        // 局域网里用手机浏览器开电脑上的核心：同源放行，别的源不放
+        assert!(is_same_origin(
+            "http://192.168.0.5:8787",
+            "192.168.0.5:8787"
+        ));
+        assert!(!is_same_origin(
+            "http://evil.example:8787",
+            "192.168.0.5:8787"
+        ));
+        assert!(!is_same_origin("null", "192.168.0.5:8787"));
+        assert!(!is_same_origin("http://192.168.0.5:8787", ""));
+        assert!(
+            !is_same_origin("http://sandbox.localhost:8787", "127.0.0.1:8787"),
             "沙箱网页的源不能连 WebSocket"
         );
     }

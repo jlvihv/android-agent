@@ -2002,9 +2002,9 @@ impl LinuxSandbox {
     /// 兜底不能当主路径用），proot 被 SIGKILL，它 trace 的常驻进程全成了没翻译
     /// 的孤儿。`is_alpine_rootfs()` 上有同样的教训。
     fn setsid_guest(cfg: &SandboxConfig) -> Option<&'static str> {
-        SETSID_PATHS.into_iter().find(|p| {
-            std::fs::symlink_metadata(cfg.rootfs.join(p.trim_start_matches('/'))).is_ok()
-        })
+        SETSID_PATHS
+            .into_iter()
+            .find(|p| std::fs::symlink_metadata(cfg.rootfs.join(p.trim_start_matches('/'))).is_ok())
     }
 
     /// 构造完整命令行。抽出来单独测试，不需要真的跑 proot。
@@ -4033,7 +4033,10 @@ mod tests {
             workspace: None,
             shared: None,
         });
-        let env: BTreeMap<_, _> = sb.guest_env(sb.proot_config().unwrap()).into_iter().collect();
+        let env: BTreeMap<_, _> = sb
+            .guest_env(sb.proot_config().unwrap())
+            .into_iter()
+            .collect();
 
         assert_eq!(
             env.get("PROOT_LOADER").map(String::as_str),
@@ -4206,7 +4209,7 @@ mod tests {
             LinuxSandbox::new(SandboxConfig {
                 proot: PathBuf::from("proot"),
                 rootfs: self.dir.clone(),
-                    binds: vec![],
+                binds: vec![],
                 tmp: None,
                 dns: vec!["1.1.1.1".into()],
                 tz_offset_minutes: None,
@@ -4810,11 +4813,18 @@ mod tests {
         let t = TempRoot::new("agentport");
         let sb = t.sandbox();
 
-        let has = |k: &str| sb.guest_env(sb.proot_config().unwrap()).iter().any(|(n, _)| n == k);
+        let has = |k: &str| {
+            sb.guest_env(sb.proot_config().unwrap())
+                .iter()
+                .any(|(n, _)| n == k)
+        };
         assert!(!has("AGENT_PORT"), "还没 bind 就不该有端口");
 
         sb.set_agent_port(41234);
-        let env: BTreeMap<String, String> = sb.guest_env(sb.proot_config().unwrap()).into_iter().collect();
+        let env: BTreeMap<String, String> = sb
+            .guest_env(sb.proot_config().unwrap())
+            .into_iter()
+            .collect();
         assert_eq!(env.get("AGENT_PORT").map(String::as_str), Some("41234"));
         assert_eq!(
             env.get("AGENT_BASE").map(String::as_str),

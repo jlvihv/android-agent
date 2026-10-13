@@ -643,7 +643,17 @@ impl Core {
 
     /// 绑定端口并开始服务。返回实际端口（传 0 则由系统分配）。
     pub async fn serve(&self, port: u16) -> anyhow::Result<u16> {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        self.serve_on(std::net::Ipv4Addr::LOCALHOST.into(), port)
+            .await
+    }
+
+    /// 同 `serve`，但听在给定的地址上。
+    ///
+    /// 只有桌面的 `AGENT_BIND`（局域网里用手机连电脑上的核心）会给非 loopback
+    /// 的地址 —— 那时**必须**设了凭据（`agent-dev` 的 `main` 里保证），否则局域网
+    /// 里任何人都能在这台电脑上跑命令。手机上永远是 `serve`（127.0.0.1）。
+    pub async fn serve_on(&self, ip: std::net::IpAddr, port: u16) -> anyhow::Result<u16> {
+        let listener = tokio::net::TcpListener::bind((ip, port)).await?;
         let actual = listener.local_addr()?.port();
         self.state.port.store(actual, Ordering::Relaxed);
 

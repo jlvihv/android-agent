@@ -383,7 +383,13 @@ pub fn precheck(st: &AppState, sb: &LinuxSandbox) -> Result<(PathBuf, String), S
 /// 升到 `to`（如 `3.24.2`）。在后台跑，进度在 `st.alpine.job()`。
 ///
 /// 调之前先过 `precheck`，并用 `Upgrader::try_begin` 占住。
-pub async fn run(st: Arc<AppState>, sb: Arc<LinuxSandbox>, rootfs: PathBuf, from: String, to: String) {
+pub async fn run(
+    st: Arc<AppState>,
+    sb: Arc<LinuxSandbox>,
+    rootfs: PathBuf,
+    from: String,
+    to: String,
+) {
     let up = &st.alpine;
     sb.set_maintenance(true);
     let res = upgrade(&st, &sb, &rootfs, &to).await;
@@ -507,7 +513,11 @@ async fn apply(
     let script = "apk update && apk upgrade --available";
     let (res, ()) = tokio::join!(sb.run_maintenance(script, APK_TIMEOUT, Some(tx)), pump);
     let res = res?;
-    anyhow::ensure!(!res.timed_out, "apk 跑了 {} 分钟还没完", APK_TIMEOUT.as_secs() / 60);
+    anyhow::ensure!(
+        !res.timed_out,
+        "apk 跑了 {} 分钟还没完",
+        APK_TIMEOUT.as_secs() / 60
+    );
     // 退出码只记下来，不当判据（见模块说明）
     if res.code != 0 {
         up.log_line(format!("（apk 退出码 {}，以下面的验收为准）", res.code));
@@ -522,13 +532,18 @@ async fn apply(
     );
     let check = "/bin/sh -c 'echo sh-ok' && apk --version >/dev/null && echo apk-ok \
                  && { [ ! -e /bin/bash ] || bash -c 'echo bash-ok'; }";
-    let r = sb.run_maintenance(check, Duration::from_secs(60), None).await?;
+    let r = sb
+        .run_maintenance(check, Duration::from_secs(60), None)
+        .await?;
     anyhow::ensure!(
         r.code == 0 && r.stdout.contains("sh-ok") && r.stdout.contains("apk-ok"),
         "升级后跑不起来基本命令：{}",
         r.to_text()
     );
-    up.log_line(format!("✓ {}", r.stdout.split_whitespace().collect::<Vec<_>>().join(" ")));
+    up.log_line(format!(
+        "✓ {}",
+        r.stdout.split_whitespace().collect::<Vec<_>>().join(" ")
+    ));
     Ok(())
 }
 
@@ -594,8 +609,11 @@ mod tests {
         std::fs::create_dir_all(src.join("bin")).unwrap();
         std::fs::create_dir_all(src.join("tmp")).unwrap();
         std::fs::write(src.join("bin/busybox"), "elf").unwrap();
-        std::fs::set_permissions(src.join("bin/busybox"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            src.join("bin/busybox"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         // Alpine 式的绝对链接：不能被解析到宿主机上
         std::os::unix::fs::symlink("/bin/busybox", src.join("bin/sh")).unwrap();
         std::fs::write(src.join("tmp/junk"), "x").unwrap();
@@ -606,7 +624,10 @@ mod tests {
             std::fs::read_link(dst.join("bin/sh")).unwrap(),
             Path::new("/bin/busybox")
         );
-        let mode = std::fs::metadata(dst.join("bin/busybox")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(dst.join("bin/busybox"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o755);
         assert!(!dst.join("tmp").exists(), "tmp 不进快照");
         std::fs::remove_dir_all(root).unwrap();

@@ -1209,7 +1209,11 @@ impl CdpBrowser {
                     json!({ "targetId": t.target, "flatten": true }),
                 )
                 .ok()
-                .and_then(|r| r.get("sessionId").and_then(|v| v.as_str()).map(String::from));
+                .and_then(|r| {
+                    r.get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
             let Some(session) = attached else {
                 continue; // 那只标签已经没了
             };
@@ -1416,7 +1420,11 @@ fn parse_ps(text: &str) -> Vec<(i32, i32, String)> {
             let (pid, rest) = l.split_once(char::is_whitespace)?;
             let rest = rest.trim_start();
             let (ppid, cmd) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-            Some((pid.parse().ok()?, ppid.parse().ok()?, cmd.trim().to_string()))
+            Some((
+                pid.parse().ok()?,
+                ppid.parse().ok()?,
+                cmd.trim().to_string(),
+            ))
         })
         .collect()
 }

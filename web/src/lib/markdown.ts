@@ -327,8 +327,18 @@ export function sandboxPath(guestPath: string): string {
  * 只给**网页**用（查看器的 iframe）。图片 / 音视频 / 文本是 App 自己取的，
  * 留在同源（拉文本要读响应，跨源还得配 CORS）。
  */
+/** 这个主机名是不是本机（App 的 WebView、电脑上的浏览器、Vite 开发服务器） */
+function isLoopbackHost(h: string): boolean {
+  return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+}
+
 export function sandboxPageUrl(url: string): string {
   if (!url.startsWith('/sandbox/')) return url;
+  // 局域网里用手机浏览器开电脑上的核心（`just dev-lan`）时，`sandbox.localhost`
+  // 解析到的是**手机自己** —— 打不开。那就留在同源：服务端给同源的沙箱文件
+  // 加了 CSP sandbox（opaque origin），照样碰不到 App 的凭据，只是页面用不了
+  // localStorage 之类。
+  if (!isLoopbackHost(location.hostname)) return url;
   const port = location.port ? `:${location.port}` : '';
   return `${location.protocol}//sandbox.localhost${port}${url}`;
 }

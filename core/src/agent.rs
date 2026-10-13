@@ -20,11 +20,11 @@ use crate::openai::{
     ChatRequest, FileData, FunctionCall, FunctionDef, ImageUrl, Message, Part, StreamOptions, Tool,
     ToolCall, Usage, UserContent,
 };
+use crate::platform::Platform;
 use crate::responses::{
     AssistantItem, FunctionCallItem, FunctionCallOutputItem, InputItem, InputPart, MessageContent,
     MessageItem, OutputPart, Reasoning, ResponsesRequest, ToolOutput,
 };
-use crate::platform::Platform;
 use crate::{linux, sse, Core};
 
 // ---------------------------------------------------------------------------
@@ -43,7 +43,8 @@ pub struct ToolSpec {
 /// 每个 step 都要把整张表序列化进请求（含那段很长的 `bash` 描述），
 /// 工具表是**可缓存前缀的一部分**，只建一次也让「字节确定」更保险。
 pub fn tools(p: Platform) -> &'static [ToolSpec] {
-    static TOOLS: [OnceLock<Vec<ToolSpec>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static TOOLS: [OnceLock<Vec<ToolSpec>>; 3] =
+        [OnceLock::new(), OnceLock::new(), OnceLock::new()];
     TOOLS[p as usize].get_or_init(|| build_tools(p))
 }
 
@@ -1026,38 +1027,40 @@ fn user_message(
 pub fn tool_definitions(p: Platform) -> std::sync::Arc<[Tool]> {
     static DEFS: [OnceLock<std::sync::Arc<[Tool]>>; 3] =
         [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    DEFS[p as usize].get_or_init(|| {
-        tools(p)
-            .iter()
-            .map(|t| Tool {
-                kind: "function".into(),
-                function: FunctionDef {
-                    name: t.name.to_string(),
-                    description: t.description.clone(),
-                    parameters: (t.schema)(),
-                },
-            })
-            .collect()
-    })
-    .clone()
+    DEFS[p as usize]
+        .get_or_init(|| {
+            tools(p)
+                .iter()
+                .map(|t| Tool {
+                    kind: "function".into(),
+                    function: FunctionDef {
+                        name: t.name.to_string(),
+                        description: t.description.clone(),
+                        parameters: (t.schema)(),
+                    },
+                })
+                .collect()
+        })
+        .clone()
 }
 
 /// Responses API 的工具表：**扁平**的 `{"type":"function","name":…}`。
 fn tool_definitions_responses(p: Platform) -> std::sync::Arc<[crate::responses::Tool]> {
     static DEFS: [OnceLock<std::sync::Arc<[crate::responses::Tool]>>; 3] =
         [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    DEFS[p as usize].get_or_init(|| {
-        tools(p)
-            .iter()
-            .map(|t| crate::responses::Tool {
-                kind: "function",
-                name: t.name.to_string(),
-                description: t.description.clone(),
-                parameters: (t.schema)(),
-            })
-            .collect()
-    })
-    .clone()
+    DEFS[p as usize]
+        .get_or_init(|| {
+            tools(p)
+                .iter()
+                .map(|t| crate::responses::Tool {
+                    kind: "function",
+                    name: t.name.to_string(),
+                    description: t.description.clone(),
+                    parameters: (t.schema)(),
+                })
+                .collect()
+        })
+        .clone()
 }
 
 /// 保证历史里有当前版本的系统提示词。
@@ -2910,7 +2913,8 @@ mod tests {
             },
             tool("c1"),
         ];
-        let req = build_responses_request(&sess, Platform::Android, "m", false, false, None).unwrap();
+        let req =
+            build_responses_request(&sess, Platform::Android, "m", false, false, None).unwrap();
         let input = serde_json::to_value(&req).unwrap()["input"].clone();
         let kinds: Vec<&str> = input
             .as_array()
@@ -3031,9 +3035,10 @@ mod tests {
             "补的结果要紧跟在那批调用后面"
         );
 
-        let r =
-            serde_json::to_value(build_responses_request(&sess, Platform::Android, "m", true, true, None).unwrap())
-                .unwrap();
+        let r = serde_json::to_value(
+            build_responses_request(&sess, Platform::Android, "m", true, true, None).unwrap(),
+        )
+        .unwrap();
         let outs = r["input"]
             .as_array()
             .unwrap()
@@ -3174,9 +3179,18 @@ mod tests {
     fn every_platform_gets_a_frozen_prompt_that_matches_its_machine() {
         for p in Platform::ALL {
             let prompt = system_prompt(p);
-            let bash = &tools(p).iter().find(|t| t.name == "bash").unwrap().description;
-            assert!(std::ptr::eq(prompt, system_prompt(p)), "{p:?}: 每次都该是同一份");
-            for dynamic in ["/home/", "/Users/", "/data/", "rootfs", "Arch", "Ubuntu", "1080"] {
+            let bash = &tools(p)
+                .iter()
+                .find(|t| t.name == "bash")
+                .unwrap()
+                .description;
+            assert!(
+                std::ptr::eq(prompt, system_prompt(p)),
+                "{p:?}: 每次都该是同一份"
+            );
+            for dynamic in [
+                "/home/", "/Users/", "/data/", "rootfs", "Arch", "Ubuntu", "1080",
+            ] {
                 assert!(
                     !prompt.contains(dynamic) && !bash.contains(dynamic),
                     "{p:?}: 不该出现这台机器的具体信息: {dynamic}"
@@ -3191,20 +3205,33 @@ mod tests {
             if p.is_host() {
                 // 以前宿主提示词得整句反驳工具表（「那几句是手机版写法」）——
                 // 现在工具表本身就是这台机器的，Alpine / apk 一个字都不该有
-                for phone in ["Alpine", "apk add", "agent ps", "agent command", "/root/", "/sdcard"] {
+                for phone in [
+                    "Alpine",
+                    "apk add",
+                    "agent ps",
+                    "agent command",
+                    "/root/",
+                    "/sdcard",
+                ] {
                     assert!(
                         !prompt.contains(phone) && !bash.contains(phone),
                         "{p:?}: 宿主模式里还在说手机上的 {phone}"
                     );
                 }
-                assert!(prompt.contains("agent open"), "{p:?}: 电脑上开网页走 agent open");
+                assert!(
+                    prompt.contains("agent open"),
+                    "{p:?}: 电脑上开网页走 agent open"
+                );
             } else {
                 assert!(bash.contains("Alpine") && bash.contains("apk add"));
                 assert!(prompt.contains("agent command"));
             }
         }
         let mac = &tools(Platform::Macos)[1].description;
-        assert!(mac.contains("brew") && mac.contains("BSD"), "macOS 要点名 BSD 用户态");
+        assert!(
+            mac.contains("brew") && mac.contains("BSD"),
+            "macOS 要点名 BSD 用户态"
+        );
         assert!(!tools(Platform::Linux)[1].description.contains("brew"));
     }
 
@@ -3244,7 +3271,15 @@ mod tests {
         sess.messages.push(ChatMessage::User("第一问".into()));
         // 转成 Value 是为了断言请求体本身；线上路径不经过这一步
         let req1 = serde_json::to_value(
-            build_request(&sess, Platform::Android, "deepseek-v4.1-flash", true, true, None).unwrap(),
+            build_request(
+                &sess,
+                Platform::Android,
+                "deepseek-v4.1-flash",
+                true,
+                true,
+                None,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -3265,7 +3300,15 @@ mod tests {
         });
         sess.messages.push(ChatMessage::User("第二问".into()));
         let req2 = serde_json::to_value(
-            build_request(&sess, Platform::Android, "deepseek-v4.1-flash", true, true, None).unwrap(),
+            build_request(
+                &sess,
+                Platform::Android,
+                "deepseek-v4.1-flash",
+                true,
+                true,
+                None,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -3290,20 +3333,25 @@ mod tests {
         ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
         sess.messages.push(ChatMessage::User("嗨".into()));
 
-        let chat =
-            serde_json::to_value(build_request(&sess, Platform::Android, "m", true, true, None).unwrap()).unwrap();
+        let chat = serde_json::to_value(
+            build_request(&sess, Platform::Android, "m", true, true, None).unwrap(),
+        )
+        .unwrap();
         assert!(chat.get("reasoning_effort").is_none(), "{chat}");
-        let resp =
-            serde_json::to_value(build_responses_request(&sess, Platform::Android, "m", true, true, None).unwrap())
-                .unwrap();
+        let resp = serde_json::to_value(
+            build_responses_request(&sess, Platform::Android, "m", true, true, None).unwrap(),
+        )
+        .unwrap();
         assert!(resp.get("reasoning").is_none(), "{resp}");
 
-        let chat =
-            serde_json::to_value(build_request(&sess, Platform::Android, "m", true, true, Some("high")).unwrap())
-                .unwrap();
+        let chat = serde_json::to_value(
+            build_request(&sess, Platform::Android, "m", true, true, Some("high")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(chat["reasoning_effort"], "high");
         let resp = serde_json::to_value(
-            build_responses_request(&sess, Platform::Android, "m", true, true, Some("low")).unwrap(),
+            build_responses_request(&sess, Platform::Android, "m", true, true, Some("low"))
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(resp["reasoning"]["effort"], "low");
@@ -3516,7 +3564,13 @@ mod tests {
         let names: Vec<&str> = tools(Platform::Android).iter().map(|t| t.name).collect();
         assert_eq!(names, vec!["read", "bash", "edit"]);
         // 重复调用必须完全一致
-        assert_eq!(names, tools(Platform::Android).iter().map(|t| t.name).collect::<Vec<_>>());
+        assert_eq!(
+            names,
+            tools(Platform::Android)
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// 删掉的设备工具不能在提示词里留名字。
@@ -3533,8 +3587,14 @@ mod tests {
             "device_launch",
         ];
         for g in gone {
-            assert!(!system_prompt(Platform::Android).contains(g), "提示词还在提 {g}");
-            assert!(!tools(Platform::Android).iter().any(|t| t.name == g), "工具表里还有 {g}");
+            assert!(
+                !system_prompt(Platform::Android).contains(g),
+                "提示词还在提 {g}"
+            );
+            assert!(
+                !tools(Platform::Android).iter().any(|t| t.name == g),
+                "工具表里还有 {g}"
+            );
         }
     }
 
@@ -3558,8 +3618,13 @@ mod tests {
             );
         }
         // 只属于它们的参数不能再出现在工具表里（工具表是可缓存前缀的一部分）
-        let dump = serde_json::to_string(&tools(Platform::Android).iter().map(|t| (t.schema)()).collect::<Vec<_>>())
-            .unwrap();
+        let dump = serde_json::to_string(
+            &tools(Platform::Android)
+                .iter()
+                .map(|t| (t.schema)())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         for k in [
             "full_page",
             "max_depth",
@@ -3573,11 +3638,20 @@ mod tests {
 
     #[test]
     fn tool_schemas_serialize_byte_identically() {
-        let once = serde_json::to_string(&tools(Platform::Android).iter().map(|t| (t.schema)()).collect::<Vec<_>>())
-            .unwrap();
-        let twice =
-            serde_json::to_string(&tools(Platform::Android).iter().map(|t| (t.schema)()).collect::<Vec<_>>())
-                .unwrap();
+        let once = serde_json::to_string(
+            &tools(Platform::Android)
+                .iter()
+                .map(|t| (t.schema)())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let twice = serde_json::to_string(
+            &tools(Platform::Android)
+                .iter()
+                .map(|t| (t.schema)())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         assert_eq!(once, twice);
     }
 

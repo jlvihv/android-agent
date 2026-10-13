@@ -70,8 +70,7 @@ impl DeviceApi for HostDevice {
                 }
             }
             Command::TapXy { .. } | Command::Swipe { .. } | Command::Key { .. } => Err(
-                "电脑上没有点击 / 滑动 / 按键 —— 那是手机上的设备操作。网页用 agent browser"
-                    .into(),
+                "电脑上没有点击 / 滑动 / 按键 —— 那是手机上的设备操作。网页用 agent browser".into(),
             ),
         }
     }

@@ -24,17 +24,59 @@ async fn run() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8787);
 
+    // 听在哪：默认只听本机。`AGENT_BIND=0.0.0.0` = 局域网里的手机也能连
+    // （`just dev-lan`）—— 用手机上的界面操控这台电脑。
+    let bind: std::net::IpAddr = match std::env::var("AGENT_BIND") {
+        Ok(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse()
+            .with_context(|| format!("AGENT_BIND={v} 不是 IP 地址"))?,
+        _ => std::net::Ipv4Addr::LOCALHOST.into(),
+    };
+    let lan = !bind.is_loopback();
+
     let core = agent_core::Core::desktop();
-    // 桌面上默认不设防（只有自己在用）；设了 AGENT_TOKEN 就和手机上一样要凭据
-    let token = std::env::var("AGENT_TOKEN").ok().filter(|t| !t.is_empty());
+    // 凭据：只在本机时默认不设防（只有自己在用）；设了 AGENT_TOKEN 就和手机上
+    // 一样要凭据。**听在局域网上就必须有** —— 不然同一个 Wi-Fi 里谁都能在这台
+    // 电脑上跑命令（宿主模式下就是你的真机器）。没给的话用库里那把（宿主模式
+    // 有库，重启不变，手机上收藏的地址一直能用），没库就现编一把。
+    let env_token = std::env::var("AGENT_TOKEN").ok().filter(|t| !t.is_empty());
+    let token = match (env_token, lan) {
+        (Some(t), _) => Some(t),
+        (None, true) => Some(
+            core.state
+                .auth()
+                .token
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
+        ),
+        (None, false) => None,
+    };
     core.state.set_token(token.clone());
-    let actual = core.serve(port).await.context("启动 HTTP 服务失败")?;
+    let actual = core
+        .serve_on(bind, port)
+        .await
+        .context("启动 HTTP 服务失败")?;
 
     println!();
     println!("  android-agent core v{}", agent_core::VERSION);
     match &token {
         Some(t) => println!("  → http://127.0.0.1:{actual}/auth?t={t}"),
         None => println!("  → http://127.0.0.1:{actual}"),
+    }
+    if lan {
+        let ips: Vec<std::net::IpAddr> = if bind.is_unspecified() {
+            lan_ips().into_iter().map(Into::into).collect()
+        } else {
+            vec![bind]
+        };
+        let t = token.as_deref().unwrap_or_default();
+        if ips.is_empty() {
+            println!("  → 手机上打开：http://<这台电脑的局域网 IP>:{actual}/auth?t={t}");
+        }
+        for ip in ips {
+            println!("  → 手机上打开：http://{ip}:{actual}/auth?t={t}");
+        }
+        println!("    （明文 HTTP：只在自己信得过的 Wi-Fi 里用；地址里的 t= 就是钥匙）");
     }
     let device = core.state.device().map(|d| d.name()).unwrap_or_default();
     println!("  （设备：{device}；Ctrl-C 退出）");
@@ -50,4 +92,36 @@ async fn run() -> anyhow::Result<()> {
         _ = sigterm.recv() => {}
     }
     Ok(())
+}
+
+/// 这台电脑在局域网里的地址：各个网卡上**私有网段**的 IPv4。
+///
+/// 不能用「往外连时系统挑哪张网卡」（UDP connect 那个办法）：开着全局代理
+/// （Clash 的 TUN 模式之类）的机器上挑中的是虚拟网卡，地址是 198.18.x.x，
+/// 手机根本连不到 —— 在这台 Mac 上就是这么打出一个错地址的。所以老实枚举
+/// 网卡，只认 192.168/16、10/8、172.16/12。
+fn lan_ips() -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs 填链表，用完 freeifaddrs；只读 ifa_addr 指向的 sockaddr_in
+    unsafe {
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return out;
+        }
+        let mut p = ifap;
+        while !p.is_null() {
+            let ifa = &*p;
+            let up = ifa.ifa_flags & (libc::IFF_UP as u32) != 0;
+            if up && !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET {
+                let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                if ip.is_private() && !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+            p = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    out
 }
