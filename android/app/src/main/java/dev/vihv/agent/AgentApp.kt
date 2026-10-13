@@ -215,16 +215,17 @@ class AgentApp : Application() {
         }
             .onSuccess {
                 Log.i(TAG, "WebView 应指向 http://127.0.0.1:$port")
-                // 把端口落到 files/port。调试时 `adb shell run-as <pkg> cat
-                // files/port` 一条命令就拿到，不用去翻 logcat
-                // （logcat 环形缓冲会被冲掉 —— 实测踩过）。
-                // 见 scripts/phone-port.sh / docs/07-debugging.md。
-                runCatching { File(filesDir, "port").writeText(port.toString()) }
+                // 把端口落两份，见 scripts/phone-port.sh / docs/07-debugging.md：
+                //  - files/port：App 私有，debug 包 `run-as` 读得到
+                //  - 外部私有目录的副本：`adb shell cat` 直接读得到 —— release 包
+                //    **不是 debuggable**，run-as 会拒绝，只能靠这份（或者赌 logcat
+                //    那行还没被环形缓冲冲掉）。
+                writePortFiles(port.toString())
             }
             .onFailure {
                 Log.e(TAG, "核心启动失败", it)
                 port = 0
-                runCatching { File(filesDir, "port").delete() }
+                writePortFiles(null)
             }
 
         // 4. 如果无障碍服务已经连上了（进程重启的情况），补一次注入
@@ -233,6 +234,24 @@ class AgentApp : Application() {
         // 注意：前台服务**不在这里起**。
         // Android 12+ 会抛 ForegroundServiceStartNotAllowedException ——
         // Application.onCreate 时 App 还没进入前台。改到 MainActivity.onResume。
+    }
+
+    /**
+     * 端口落到两个地方（`text == null` = 清掉）。
+     *
+     * scripts/phone-port.sh 按「内部 → 外部 → /proc/net/tcp → logcat」找端口：
+     * 内部那份（`files/port`）只有 debug 包读得到（`run-as` 要 debuggable）；
+     * 外部那份（`/sdcard/Android/data/<pkg>/files/port`）`adb shell cat` 直接能读，
+     * release 包也能用。两份都写不出来的话还有 logcat 兵底。
+     */
+    private fun writePortFiles(text: String?) {
+        val targets = buildList {
+            add(File(filesDir, "port"))
+            getExternalFilesDir(null)?.let { add(File(it, "port")) }
+        }
+        for (f in targets) {
+            runCatching { if (text == null) f.delete() else f.writeText(text) }
+        }
     }
 
     private fun androidEnv(): AndroidEnv {
