@@ -72,7 +72,7 @@ fn build_tools() -> Vec<ToolSpec> {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "要执行的 shell 命令" },
-                        "timeout": { "type": "number", "description": "超时秒数（可选，默认 60）。下载 / apk add / 编译 / git clone 这类长任务要显式给足，上限 86400（24h）；命令一结束就返回，估大不亏。" }
+                        "timeout": { "type": "number", "description": "超时秒数（可选，默认 60，上限 86400）。" }
                     },
                     "required": ["command"]
                 })
@@ -113,7 +113,7 @@ fn build_tools() -> Vec<ToolSpec> {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；get_readable=抽正文（文章页用它，比 get_text 干净得多）；get_text=读整页/某元素的文本；click=点 selector 或坐标；type=往 selector 里输入；press=按键（Enter 会提交表单、 Tab 移焦）；find_elements=列出 selector 匹配到的元素（几个、各自坐标）；scroll=滚动；screenshot=截图（full_page=true 截整页）；set_user_agent=切桌面/移动版；back=后退；wait_for_dom_stable=等动态内容安定下来；js=在页面里执行一段 JS（返回值 JSON 化后给你）；new_tab=开新标签（可带 url）；list_tabs=列出所有标签；switch_tab / close_tab=切到 / 关掉某只标签",
+                            "description": "navigate=打开 url；get_backbone=读页面结构（含可点的 selector，**这是你「看」页面的主要方式**）；get_readable=抽正文；get_text=读整页/某元素的文本；click=点 selector 或坐标；type=往 selector 里输入；press=按键（Enter 会提交表单、 Tab 移焦）；find_elements=列出 selector 匹配到的元素（几个、各自坐标）；scroll=滚动；screenshot=截图（full_page=true 时截整页，不常用，最好滚动截视口）；set_user_agent=切桌面/移动版；back=后退；wait_for_dom_stable=等动态内容安定下来；js=在页面里执行一段 JS（返回值 JSON 化后给你）；new_tab=开新标签（可带 url）；list_tabs=列出所有标签；switch_tab / close_tab=切到 / 关掉某只标签",
                             "enum": ["navigate", "get_backbone", "get_readable", "get_text", "click", "type", "press", "find_elements", "scroll", "screenshot", "set_user_agent", "back", "wait_for_dom_stable", "js", "new_tab", "list_tabs", "switch_tab", "close_tab"]
                         },
                         "url": { "type": "string", "description": "navigate / new_tab 的目标。没写协议头就按 https 补。沙箱里的文件（比如自己写的网页）用 sandbox:/workspace/…/index.html 打开" },
@@ -676,16 +676,11 @@ impl SessionStore {
 //   ...
 
 pub const SYSTEM_PROMPT: &str = "\
-你是运行在安卓手机上的操作助手：在 Alpine Linux 沙箱里跑命令、改文件、做出成品。\n\
+你是运行在安卓手机上的 Agent。\n\
 \n\
-- cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，\n\
-  卸载不丢）。成品放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root\n\
-  （重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，\n\
-  删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。\n\
-- 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`；\n\
-  图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、\n\
-  `agent command`（按键/点击/滑动/启动应用/打开 URI），`agent help` 看全部。\n\
+- cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。成品放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。\n\
+- 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`，也支持外部网页或 App 深链，用户点击时能用对应 App 打开；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
+- 沙箱里的 `agent` 命令可查看/操作自己：`agent state|request|tools`、`agent command`（按键/点击/滑动/启动应用/打开 URI），`agent help` 看全部。\n\
 \n\
 回答要言简意赅。";
 
