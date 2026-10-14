@@ -332,8 +332,7 @@ impl StatusFile {
 impl Drop for StatusFile {
     /// 正常结束和**被取消**（用户按停止，future 被丢掉）都得清。只靠 `run_live`
     /// 末尾调一次的话，取消那条路会把 `<uuid>.pid` 留在 `.agent-exit/` 里
-    /// （`spawn` 失败、提前 `?` 返回同理）—— 真机上实测就是这么攒起来的，
-    /// 而 `prune_stale_status` 要等一天才收。
+    /// （`spawn` 失败、提前 `?` 返回同理）—— 而 `prune_stale_status` 要等一天才收。
     fn drop(&mut self) {
         self.clean_up();
     }
@@ -462,8 +461,8 @@ enum Done {
 /// 正常跑完会 `disarm()`；future 被丢掉（用户按停止 / 回合取消）时由 `Drop`
 /// 杀命令组。为什么不靠 `Command::kill_on_drop`：它只 SIGKILL proot 本身，而
 /// 被 proot trace 的 guest 进程是**独立的**宿主进程 —— proot 的
-/// `--kill-on-exit` 是 userspace 的 `atexit` 钩子，SIGKILL 根本不跑它。原来那条
-/// 路会留下一整棵孤儿树继续吃 CPU 和电。
+/// `--kill-on-exit` 是 userspace 的 `atexit` 钩子，SIGKILL 根本不跑它 —— 那样
+/// 会留下一整棵孤儿树继续吃 CPU 和电。
 struct CommandGuard {
     pid_file: PathBuf,
     /// 拿不到命令组号时的兜底：proot 自己的组（spawn 时 `process_group(0)` 建的）
@@ -535,8 +534,8 @@ fn signal_of_exit(code: i32) -> Option<i32> {
 //
 // 为什么需要：刻意脱离（`setsid` / `nohup`）的常驻进程**能活过工具调用**，
 // 但它们的父进程早就变成 init 了 —— 模型事后只能靠 `ps` 找 pid，而安卓上
-// /proc 按 uid 过滤、有些版本干脆看不见自己的后代（实测机型能看到，但这个
-// 不能假设）。能可靠知道的只有核心：它记得每次运行起的是哪个 proot，而
+// /proc 按 uid 过滤、有些版本干脆看不见自己的后代（不能假设看得见）。能可靠
+// 知道的只有核心：它记得每次运行起的是哪个 proot，而
 // guest 进程的 `TracerPid` 就是那个 proot（见 `procs()`）。
 
 /// `/proc/<pid>` 里我们要的那几个字段。
@@ -885,8 +884,8 @@ fn fmt_age(secs: u64) -> String {
 /// 两种形态共用同一套进程模型（runner + 状态文件 + 命令自己的进程组，见
 /// `run_live` / `CommandGuard`）和同一套路径解析（`resolve_path`）；不同的只有
 /// 「怎么起进程、东西放哪、要准备什么」—— 这些地方都 `match` 它，编译器替我们
-/// 盯着两边都处理到。以前是 `SandboxConfig` 里一个 `host: bool`：宿主模式也得
-/// 带着 proot / loader / dns 这些对它毫无意义的字段，分岔全靠 `if`。
+/// 盯着两边都处理到（一个 `host: bool` 做不到：宿主模式会带着 proot / loader /
+/// dns 这些对它毫无意义的字段，分岔全靠 `if`）。
 enum Mode {
     /// 安卓（以及桌面 `just dev`）：proot + Alpine rootfs
     Proot(Box<SandboxConfig>),
@@ -1285,7 +1284,7 @@ pub const TOOLSET: &[&str] = &[
 /// `agent-setup`：装上面那套（幂等）。
 ///
 /// 注意：**不能拿 `apk add` 的退出码当准**。proot 下 busybox / ca-certificates
-/// 的 trigger 常常返回非零（实测：装一个全新的小包也会报 “1 error; N packages”，
+/// 的 trigger 常常返回非零（装一个全新的小包也会报 “1 error; N packages”，
 /// 但包确实装上了）。所以脚本以**那些命令找不找得到**为准。
 const AGENT_SETUP_TEMPLATE: &str = r##"#!/bin/sh
 # agent-setup —— 把干活要用的工具装上。
@@ -1569,11 +1568,9 @@ impl LinuxSandbox {
         //    被 reparent 到 init」的样子。不卡这一条的话，任何同一个 uid、不归我们
         //    管的进程都会被列进来（单元测试里 cargo / rustc 就是）。
         // 2. **得真的是 proot**（名字对得上）—— 光看 `ppid == 1` 在**桌面上**是灾难：
-        //    systemd 的服务、用户会话的 daemon 全都是 ppid 1，实测一次扫出 40 个
-        //    （journald / NetworkManager / sshd…），把它们列成「`agent kill` 可以
-        //    停掉」比漏掉糟得多。安卓上 /proc 按 uid 过滤，这个坑看不见 —— 所以
-        //    这一版以前只在真机上验过。孤儿 proot 名下的 tracee 也要收（它们自己的
-        //    ppid 还指着 guest 里的父进程）。
+        //    systemd 的服务、用户会话的 daemon 一大片（journald / NetworkManager /
+        //    sshd…），把它们列成「`agent kill` 可以停掉」比漏掉糟得多。
+        //    孤儿 proot 名下的 tracee 也要收（它们自己的 ppid 还指着 guest 里的父进程）。
         let known: std::collections::BTreeSet<i32> = runs.runs.keys().copied().collect();
         let proot_name = self
             .proot_config()
@@ -1845,7 +1842,7 @@ impl LinuxSandbox {
         }
         let dir = host_cli_dir();
         write_if_changed(&dir.join("agent"), AGENT_CLI, true)?;
-        // 没有真 setsid 的机器（macOS）垫一个；有的话把以前垫的拿掉，别挡着真的
+        // 没有真 setsid 的机器（macOS）垫一个；有的话把垫的那个拿掉，别挡着真的
         let shim = dir.join("setsid");
         if host_has_setsid(&dir) {
             let _ = std::fs::remove_file(&shim);
@@ -1997,10 +1994,10 @@ impl LinuxSandbox {
     ///
     /// **判存在不能用 `is_file()`。** Alpine 里 `/usr/bin/setsid` 是指向
     /// `/bin/busybox` 的**绝对**符号链接，在宿主机上解析会指向宿主机的
-    /// `/bin/busybox`（不存在）—— `is_file()` 永远是 false。真机上踩过：命令行里
+    /// `/bin/busybox`（不存在）—— `is_file()` 永远是 false。漏了这一层：命令行里
     /// 没有 setsid，超时那一杀就落到 proot 自己的组上（`process_group(0)` 那个
     /// 兜底不能当主路径用），proot 被 SIGKILL，它 trace 的常驻进程全成了没翻译
-    /// 的孤儿。`is_alpine_rootfs()` 上有同样的教训。
+    /// 的孤儿。
     fn setsid_guest(cfg: &SandboxConfig) -> Option<&'static str> {
         SETSID_PATHS
             .into_iter()
@@ -2133,7 +2130,7 @@ impl LinuxSandbox {
         env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
         // 实时输出：命令的 stdout 是管道不是终端，Python 就从「按行刷」变成「攒满
         // 几 KB / 进程退出才写」—— 每秒 print 一行的脚本，界面上要等它跑完才一次
-        // 出来（实测：核心每 120ms 推一次，echo 是实时的，python 全在退出那一刻到）。
+        // 出来（核心每 120ms 推一次，echo 是实时的，python 全在退出那一刻到）。
         // C 的 printf / perl / ruby 同理，但没有通用的开关；Python 是模型最常跑的。
         env.insert("PYTHONUNBUFFERED".into(), "1".into());
         env.insert("GOMAXPROCS".into(), "2".into()); // 手机上限
@@ -2262,9 +2259,8 @@ impl LinuxSandbox {
         }
 
         // 退出状态 + 收尸走后台任务：proot 可能在给一条常驻进程当 tracer，活
-        // 多久不知道，**不能在这里等它**（原来的 `child.wait()` 就是完成信号，
-        // 现在不是了）。但也不能把 `Child` 丢了不管 —— 它是我们的子进程，
-        // 没人 `wait` 就会变僵尸。
+        // 多久不知道，**不能在这里等它**。但也不能把 `Child` 丢了不管 —— 它是
+        // 我们的子进程，没人 `wait` 就会变僵尸。
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
         let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
@@ -2274,7 +2270,7 @@ impl LinuxSandbox {
 
         // 边跑边读，内存里只留**首尾两端**（见 `Capture`）。
         //
-        // 原来是 wait_with_output() —— 整段输出全攒在内存里。`yes`、
+        // 不能整段攒在内存里（`wait_with_output()` 那种）：`yes`、
         // `cat /dev/urandom | base64` 这类命令 60 秒能吐出几个 GB，
         // 手机上直接 OOM 带走整个 App。
         // 边跑边读；结果塞进共享的 `Capture`（为什么要共享见 `drain`）。
@@ -2337,7 +2333,7 @@ impl LinuxSandbox {
         //
         // 超时不在此列：code / signal 都是我们自己定的，用不着 proot 的退出码 ——
         // 而它那会儿很可能正给一条刻意脱离的常驻进程当 tracer，白等 REAP_GRACE
-        // （真机上实测：3 秒的超时变成 5.5 秒返回）。
+        // （3 秒的超时能变成 5.5 秒返回）。
         let proot_exit = if timed_out || status_code.is_some() {
             None
         } else {
@@ -2389,7 +2385,7 @@ impl LinuxSandbox {
             stderr: stderr_text,
             duration_ms: started.elapsed().as_millis() as u64,
             truncated,
-            // 超时也把已经产出的输出带回去 —— 原来直接丢空，模型只知道
+            // 超时也把已经产出的输出带回去 —— 丢空的话模型只知道
             // "超时了"，看不到卡在哪一步
             timed_out,
             full_output_path,
@@ -2633,7 +2629,7 @@ fn confine_new(root: &Path, path: &Path, guest: &str) -> anyhow::Result<PathBuf>
 /// 系统里 rename 是原子的）。
 ///
 /// - 目标是**符号链接**：写到它指向的那个文件，不要把链接本身换成普通文件
-///   （原来 `fs::write` 也是跟着链接走的）。越界检查调用方已经做过（`confine`）。
+///   越界检查调用方已经做过（`confine`）。
 /// - 改已有文件时保留原来的权限位（不然可执行脚本改一下就不能执行了）。
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -2724,7 +2720,7 @@ fn is_alpine_rootfs(rootfs: &Path) -> bool {
 /// 就封口（切在行边界上），后面的进尾部；尾部超过 `CAPTURE_TAIL` 就从最旧的
 /// 一端挤掉，挤掉多少记在 `dropped_*` 里。
 ///
-/// 内存上界 = `CAPTURE_HEAD + CAPTURE_TAIL`，跟原来一个 4 MB 的缓冲一样。
+/// 内存上界 = `CAPTURE_HEAD + CAPTURE_TAIL`。
 #[derive(Default)]
 struct Capture {
     head: Vec<u8>,
@@ -2970,9 +2966,9 @@ async fn wait_for_quiet(
 /// 正常情况下管道会 EOF、任务自己结束。还被某条刻意脱离的进程占着的话最多
 /// 等 `grace`，超时就 abort 掉任务 —— 要的是**已读到的输出**，不是干净的收尾。
 ///
-/// 原来这里是「等 2 秒，超时就用 `unwrap_or_default()`」：那个默认值是**空的
-/// `Capture`**，等于把 2 秒内已经读到的输出全扔了。一条后台进程就能让模型
-/// 看到空输出，而且看不出来为什么。
+/// 超时不能落到 `unwrap_or_default()`：那个默认值是**空的 `Capture`**，等于把
+/// grace 里已经读到的输出全扔了 —— 一条后台进程就能让模型看到空输出，而且
+/// 看不出来为什么。
 ///
 /// 现在的调用方只有在**刚杀完命令组**时才给 grace（`DRAIN_AFTER_KILL`）；
 /// 知道命令已经退出、输出也安静了的那条路给 0。
@@ -3447,7 +3443,7 @@ mod tests {
     /// Alpine 里 `/usr/bin/setsid` 是指向 `/bin/busybox` 的**绝对**符号链接，
     /// 在宿主机上解析必然失败 —— 判存在不能 `is_file()`。
     ///
-    /// 漏了这一步的后果（真机上实测）：命令行里没有 setsid，runner 就落在
+    /// 漏了这一步的后果：命令行里没有 setsid，runner 就落在
     /// proot 自己的进程组里，超时那一杀打到 proot 头上（它忽略 SIGTERM，然后
     /// 吃 SIGKILL），被 trace 的常驻进程全部失去翻译。
     #[test]
@@ -3929,7 +3925,7 @@ mod tests {
 
     /// 管道被孙进程占着不关时：等到 grace 也得把**已经读到的**交出来。
     ///
-    /// 原来这段是 `timeout(...).unwrap_or_default()` —— 默认值是空 `Capture`，
+    /// 超时不能落到 `unwrap_or_default()` —— 默认值是空 `Capture`，
     /// 一条 `nohup x &` 就能让输出凭空消失。
     #[tokio::test]
     async fn captured_output_survives_a_pipe_that_never_closes() {
@@ -4590,9 +4586,8 @@ mod tests {
         assert!(body.contains("/api/debug/request"), "得能看自己的上下文");
         assert!(body.contains("/api/command"), "得能操作手机");
         assert!(body.contains("AGENT_PORT"), "端口从环境变量来");
-        // 浏览器现在是**唯一的门**（`browser` 工具删了），多标签那几个子命令
-        // 得在 —— 它们曾经只加在工具那边，CLI 没跟上，于是 `new_tab URL`
-        // 走进兜底分支把 URL 静默吃掉。
+        // 浏览器只能从这一个门进（`browser` 工具删了），多标签那几个子命令
+        // 得在 —— 少了哪个，模型就会走进兜底分支把参数静默吃掉。
         for sub in [
             "navigate",
             "new_tab",

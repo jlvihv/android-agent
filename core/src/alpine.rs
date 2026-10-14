@@ -40,7 +40,7 @@ const FAILED_SUFFIX: &str = ".upgrade-failed";
 const SNAPSHOT_OK: &str = ".upgrade-snapshot-ok";
 /// 快照不复制的目录：临时文件（重启就该没）、我们自己的状态文件
 const SNAPSHOT_SKIP: &[&str] = &["tmp", ".agent-exit"];
-/// `apk upgrade` 给多久。手机上实测 3.21 → 3.24（178 个包、~300MB）3 分 20 秒
+/// `apk upgrade` 给多久。手机上 3.21 → 3.24（178 个包、~300MB）要 3 分 20 秒
 const APK_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 /// 进度日志只留最后这么多行（界面上看的是尾巴）
 const LOG_KEEP: usize = 200;

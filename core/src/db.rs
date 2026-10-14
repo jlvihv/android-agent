@@ -2,8 +2,7 @@
 //!
 //! # 为什么用 SQLite 而不是 JSON 文件
 //!
-//! 一开始我写的是「把整个 SessionStore 序列化成一个 JSON，每 2 秒重写一次」。
-//! 那有两个问题：
+//! 把整个 `SessionStore` 序列化成一个 JSON、每 2 秒重写一次的话，有两个问题：
 //!
 //! 1. **全量重写**。一次 agent 会话 100 条消息、每条平均 2KB（`bash` 输出
 //!    很大）就是 200KB；10 个会话 2MB。流式输出时每 2 秒重写 2MB，
@@ -16,7 +15,7 @@
 //! 也是追加），所以一个 `saved_count` 水位线就能做增量落盘。
 //!
 //! `bundled` feature 把 SQLite 源码一起编进来 —— Android 上没有
-//! `libsqlite3.so` 可链。实测只让 .so 增加 53 KB。
+//! `libsqlite3.so` 可链（`bundled` 让 .so 大约多 53 KB）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -347,8 +346,8 @@ impl Db {
     ///
     /// 只写改过的：没变的会话一条 SQL 都不发；变了的只追加
     /// `messages[水位线..]` —— 这是用 SQLite 而不是 JSON 的全部意义所在。
-    /// 原来每次都给**每个**会话发一条 UPSERT，再拼一条 `NOT IN (全部 id)`，
-    /// 会话一多，每 2 秒都在白写。
+    /// 给**每个**会话都发一条 UPSERT、再拼一条 `NOT IN (全部 id)` 的话，
+    /// 会话一多就是每 2 秒白写一遍。
     pub fn sync(&self, store: &SessionStore) -> Result<()> {
         let mut g = self
             .inner
@@ -1087,7 +1086,7 @@ mod tests {
 
     /// 空会话（建了、没说过话）不落盘。
     ///
-    /// 「新对话」连点几次就会攼出一堆这种会话，重启后还在抽屉里占位 —— 踩过。
+    /// 「新对话」连点几次就会攼出一堆这种会话，重启后还在抽屉里占位。
     #[test]
     fn empty_sessions_are_not_persisted() {
         let db = Db::in_memory().unwrap();

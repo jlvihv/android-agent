@@ -153,7 +153,7 @@ fn prefix_len(n: usize) -> usize {
 /// - 结尾没有 `\n` 时也不补 `\n`。
 ///
 /// 第二点是 GNU 跟 busybox 的分叉：Alpine 的 busybox `cat -n` 会白补一个
-/// `\n`（实测 1.37）。这里跟 GNU 走 —— 不加号时的正文就是文件原文，
+/// `\n`（busybox 1.37）。这里跟 GNU 走 —— 不加号时的正文就是文件原文，
 /// 加号只应该“插入前缀”，不该动换行。
 fn render(lines: &[&str], first_number: usize, numbered: bool, phantom: bool) -> String {
     if !numbered {
@@ -518,7 +518,7 @@ mod tests {
 
     /// 有 GNU coreutils 的 `cat` 才能拿它当基准。
     ///
-    /// busybox 的 `cat -n` 对结尾没换行的文件会白补一个 `\n`（实测 1.37），
+    /// busybox 的 `cat -n` 对结尾没换行的文件会白补一个 `\n`（busybox 1.37），
     /// 跟 GNU 不一样，所以不能拿 busybox 当标准。
     fn have_gnu_cat() -> bool {
         std::process::Command::new("cat")

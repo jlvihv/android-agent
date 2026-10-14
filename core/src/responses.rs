@@ -328,7 +328,7 @@ impl Mapper {
             } => {
                 // `insert` 返回 false = 之前已经有过参数（delta 或这一次）。
                 // 记下来，后面的 `output_item.done` 就不会把整段参数再拼一遍 ——
-                // 只发 done、不发 delta 的实现，原来会得到 `{…}{…}` 这种坏 JSON。
+                // 只发 done、不发 delta 的实现，不记这一笔就会拼出 `{…}{…}` 这种坏 JSON。
                 if self.saw_args_delta.insert(output_index) {
                     one(tool_delta(output_index, None, None, Some(arguments)))
                 } else {
@@ -497,7 +497,7 @@ mod tests {
     }
 
     /// 思考条目（`output_item.done` 里 `type: "reasoning"` 的那个）要**原样**
-    /// 拿到，下一次请求原样回传；别的输出项照旧走原来那条路。
+    /// 拿到，下一次请求原样回传；别的输出项照旧走常规那条路。
     #[test]
     fn reasoning_items_are_captured_verbatim() {
         let mut m = Mapper::default();
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn arguments_given_only_at_done_are_not_repeated_by_item_done() {
         // 不发 delta、只在 done 里给整段参数的实现：args.done 和 output_item.done
-        // 都带着参数。原来两边各拼一遍，得到 `{…}{…}`。
+        // 都带着参数；不挡的话两边各拼一遍，得到 `{…}{…}`。
         let item = json!({ "type": "function_call", "call_id": "c1", "name": "bash",
                            "arguments": r#"{"command":"ls"}"# });
         let args = args_after(&[

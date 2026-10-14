@@ -83,7 +83,7 @@ pub fn init_tracing() {
     //
     // 必须说话：Rust 的 panic 默认打到 stderr，而 **Android 上 stderr 是
     // 丢掉的**。不装 hook 的话，任务里 panic 了只会看到流莫名断掉，完全
-    // 查不出原因（实测踩过：只有 start/start-step 然后就 [DONE]）。
+    // 查不出原因（流里只有 start/start-step，然后就是 [DONE]）。
     //
     // 这也是进程死掉**之前**唯一一次说话的机会：这条 log 后面紧跟着就是
     // debuggerd 的 tombstone。别删。
@@ -448,7 +448,7 @@ impl Core {
             serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "text": raw }));
         rewrite_strings(&mut v, &|s| http::sandbox_url_to_guest(s, port, &key));
         // 截图：图本体在沙箱里（Kotlin 写的），**不会**自动进上下文 ——
-        // 以前靠 `browser` 工具把它挂到工具结果上，工具删了就得让模型自己 read。
+        // 没有工具能把它挂到工具结果上，所以要让模型自己 read。
         // 把它写进 text 而不是让 CLI 另打一行：text 是 JSON 里的字段，
         // 模型 `| jq` / `| python3 -c json.load` 的时候不会被打断。
         if let Some(shot) = v.get("image").and_then(|i| i.as_str()) {
@@ -982,7 +982,7 @@ mod tests {
         // **直接构造 mock**，不走 `Core::desktop()` —— 它挂哪台设备是**按环境**二选一的
         // （`AGENT_LINUX_HOST=1` 时挂的是 `desktop::HostDevice`，而电脑上根本没有点击 /
         // 按键可做），拿它来断言 mock 的行为等于让测试跟着环境变：终端里带着
-        // `AGENT_LINUX_HOST=1` 跑 `just test`，这条就是红的（实测踩过）。
+        // `AGENT_LINUX_HOST=1` 跑 `just test` 这条就会红。
         // 「宿主设备会拒绝手机操作」由 `desktop.rs` 自己的测试盯着。
         let dev = crate::mock::MockDevice::new();
         assert!(dev

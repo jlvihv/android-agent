@@ -155,9 +155,9 @@ pub enum Event {
     /// 一个回合此刻在干什么（见 `status::Snapshot`）。
     ///
     /// 它和其他事件走**同一条总线**（`/api/ws`，外加一条给壳用的 SSE：`/api/turns/stream`）。
-    /// 以前这里不是总线：同进程的壳走 UniFFI 回调直接拿（`TurnApi::status`），而
-    /// 「手机连到电脑上的核心」那条就什么都拿不到 —— 两套形状、同一份状态语义要维护两遍。
-    /// 现在所有订阅者（手机壳、前端、脚本）拿的是同一份 JSON（见 docs/06）。
+    /// 所有订阅者（手机壳、前端、脚本）拿的是同一份 JSON（见 docs/06）：同进程的壳也
+    /// 走这条路，不然「手机连到电脑上的核心」那条就什么都拿不到 —— 两套形状、
+    /// 同一份状态语义要维护两遍。
     Turn {
         status: crate::status::Snapshot,
     },
@@ -309,7 +309,7 @@ pub struct AppState {
     /// 会话有改动，等着落盘。定时器每 2s 检查一次。
     ///
     /// 不用「改一次写一次」：一轮对话会产生几十次变更，每次都写盘太浪费。
-    /// 也不能不写：进程被 kill 会话就没了（实测 force-stop 之后抽屉空了）。
+    /// 也不能不写：进程被 kill 会话就没了（force-stop 之后抽屉会空）。
     pub sessions_dirty: AtomicBool,
     /// 运行时覆盖的系统提示词（`POST /api/debug/system-prompt`）。
     ///

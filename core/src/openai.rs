@@ -1,9 +1,8 @@
 //! 自研的 OpenAI 兼容 Chat Completions 协议。
 //!
-//! # 为什么不用 `async-openai`
+//! # 为什么手写协议（不用 `async-openai`）
 //!
-//! 原本（决策 D4）是「不手写协议」，用 `async-openai`。后来发现它有两个
-//! 我们控制不了的问题：
+//! 它有两个我们控制不了的问题：
 //!
 //! 1. `Client::with_config()` 内部**先** `reqwest::Client::new()` 造一个默认
 //!    连接，然后才轮到我们 `with_http_client` 覆盖它。在
@@ -236,7 +235,7 @@ pub struct FunctionChunk {
 /// - OpenAI 系：`prompt_tokens_details.cached_tokens`
 /// - DeepSeek 系：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
 ///
-/// （实测 OpenCode Go 的 `deepseek-v4.1-flash` 走的是**前者**。）
+/// （OpenCode Go 的 `deepseek-v4.1-flash` 走的是**前者**。）
 ///
 /// 这两个数字是验证 prompt cache 真的命中的唯一手段 —— 缓存命中价差 50 倍，
 /// 不能只靠"我写对了"来相信。
@@ -329,9 +328,9 @@ where
     use tokio_stream::StreamExt;
 
     let mut stream = resp.bytes_stream();
-    // **按字节**攒，凑齐一帧再解码。原来是每个网络分片各自
-    // `from_utf8_lossy` —— 一个汉字的三个字节被切在两片里，两边都变成 `�`，
-    // 回复里时不时冒出乱码。帧边界（空行）是纯 ASCII，切字节是安全的。
+    // **按字节**攒，凑齐一帧再解码：每个网络分片各自
+    // `from_utf8_lossy` 的话，一个汉字的三个字节被切在两片里，两边都变成 `�`，
+    // 回复里就会冒乱码。帧边界（空行）是纯 ASCII，切字节是安全的。
     let mut buf: Vec<u8> = Vec::new();
     // 收到过结束标记没有：`[DONE]`（Chat），或者带 finish_reason / 用量的那一帧
     // （Responses 没有 `[DONE]`，`response.completed` 映射成后者）。
@@ -367,10 +366,9 @@ where
     // 连接在结束标记之前断了（切网络、网关超时）。不报错的话，这半截回复
     // 会被当成完整的一步：半截的工具参数照样拿去执行，回合「正常」结束。
     //
-    // 原来这里有一行 `drop(on_chunk)`：`on_chunk` 闭包可变借走了 `terminal`，
-    // 想手动在读 `terminal` 前把借还了。现在不需要 —— NLL 在闭包最后一次使用
-    // （上面那个 `handle_frame`）之后就把借结束了；而 clippy 的 `drop_non_drop`
-    // 还会报它（闭包不是 `Drop` 类型，那句只是延长了自己的生命周期）。
+    // 不要在这里加 `drop(on_chunk)`：NLL 在闭包最后一次使用（上面那个 `handle_frame`）
+    // 之后就把借结束了，加它反而会被 clippy 的 `drop_non_drop` 拦（闭包不是 `Drop`
+    // 类型，那句只是延长了自己的生命周期）。
     anyhow::ensure!(terminal, "连接在回复结束前断开了");
     Ok(())
 }
@@ -581,7 +579,7 @@ mod tests {
 
     #[test]
     fn usage_understands_both_cache_field_styles() {
-        // OpenAI 系（实测 OpenCode Go 的 deepseek-v4.1-flash 用这个）
+        // OpenAI 系（OpenCode Go 的 `deepseek-v4.1-flash` 用这个）
         let openai: Usage = serde_json::from_value(json!({
             "prompt_tokens": 2138,
             "completion_tokens": 139,

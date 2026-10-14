@@ -126,9 +126,8 @@ pub fn apply(raw: &str, edits: &[Edit], path: &str) -> anyhow::Result<EditOutcom
         .map(|e| Edit::new(lf(&e.old_text), lf(&e.new_text)))
         .collect();
 
-    // fuzzy 归一化要整文件扫一遍、再拼一份新字符串，**只算一次**。
-    // 原来它在三个地方各调一次（包括循环里每个 edit 一次）——
-    // E 个 edit 就是全文件拷贝 E 次。
+    // fuzzy 归一化要整文件扫一遍、再拼一份新字符串：**只算一次**，
+    // 别在循环里对每个 edit 各算一遍（E 个 edit 就是全文件拷贝 E 次）。
     let folded = fuzzy(&original);
 
     // 只要有一项在原文里找不到，就整体切到 fuzzy 模式
@@ -305,8 +304,8 @@ const CONTEXT: usize = 4;
 
 /// 生成 unified patch：**每处改动一个 hunk**，各带 `CONTEXT` 行上下文。
 ///
-/// 为什么不再搞公共前缀/后缀合成一个 hunk：那样「改开头 + 改结尾」会把中间
-/// 整段都列成 `-`/`+`。实测 2000 行的文件改第 5 行和第 1990 行 → 3983 行
+/// 为什么不把公共前缀/后缀合成一个 hunk：那样「改开头 + 改结尾」会把中间
+/// 整段都列成 `-`/`+` —— 2000 行的文件改第 5 行和第 1990 行就是 3983 行
 /// patch（几乎把文件抄两遍），而这段是要进模型上下文的。
 ///
 /// 改动位置直接用 `edit` 定位的结果（`changes`，**原文**坐标系的字节范围 +

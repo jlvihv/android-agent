@@ -1005,7 +1005,7 @@ struct Conn {
     events: Vec<Value>,
     /// 连接已经断了（收发碰到真的 IO 错误 / 对面 Close）。`execute` 看到它就
     /// 重连一次（见 `reconnect`）—— 不然之后每个动作都报同一句 Broken pipe，
-    /// 只能重启核心。实测：Mac 上空闲半小时后就这么断过一次，Chrome 本身还活着。
+    /// 只能重启核心（Chrome 自己还活着，连接空闲一会儿就可能断）。
     dead: bool,
 }
 
@@ -1623,8 +1623,8 @@ fn http_get_json(endpoint: &str, path: &str) -> Result<Value, String> {
 
     // 自己按 `Content-Length` 收工，**不用 `read_to_end`**：Chrome 有时不关
     // 连接（keep-alive），而 `read_to_end` 要等 EOF —— 等到读超时的那一刻
-    // 它连**已经读到的**字节一起丢掉（实测就是这么报「Resource temporarily
-    // unavailable」的）。
+    // 它连**已经读到的**字节一起丢掉（就是「Resource temporarily
+    // unavailable」）。
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
     let mut want: Option<usize> = None;

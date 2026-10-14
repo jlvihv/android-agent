@@ -586,7 +586,7 @@ const READABLE_JS: &str = r##"
     try { return !!el.closest('nav, footer, aside, header, form, [aria-hidden="true"]'); } catch (e) { return false; }
   }
   // 自己或**上面 6 层**里任何一层像周边，就当周边。只查自己不够 ——
-  // 实测 CNBC 的 cookie 声明是一堆正常 <p>，包在一个 `#...CookieNotice` 壳里。
+  // 周边信息常常长这样：一堆正常 `<p>` 包在一个 `#...CookieNotice` 壳里。
   function junk(el) {
     var cur = el, depth = 0;
     while (cur && cur !== document.body && depth++ < 6) {

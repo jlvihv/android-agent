@@ -687,7 +687,7 @@ const ANDROID: Phrasing = Phrasing {
 const HOST: Phrasing = Phrasing {
     who: "",
     files: "cwd 是启动核心时的那个目录（`pwd` 就是它）。`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或者真实路径。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。",
-    // 实测：模型以为只能链 /workspace 里的，先把截图拷进来再给链接，白跑一步
+    // 不说这句它会以为只能链 /workspace 里的，先把截图拷进来再给链接
     link_extra: "（`sandbox:` 后面任何绝对路径都行，截图不用先拷进来）",
     cli_intro: "`agent` 命令（已在 PATH 里）可查看/操作自己",
     cli_device: "`agent open <uri>`（用这台电脑的默认程序打开网页/文件）",
@@ -759,7 +759,7 @@ fn bash_description(p: Platform) -> String {
 /// 回合被打断时留下的工具调用结果。
 ///
 /// 正常情况下停止会把没跑完的调用补上结果（见 `drive`），这里是兜底：
-/// 进程在两步之间被杀、或者老版本留下的会话。
+/// 进程在两步之间被杀留下的会话。
 const INTERRUPTED: &str = r#"{"error":"没有结果：回合被中断（用户停止或 App 被关闭）"}"#;
 
 /// 历史 + 给没有结果的工具调用补上「被中断」。
@@ -1129,8 +1129,8 @@ pub fn queued_view(msgs: &[crate::state::QueuedMsg]) -> Vec<Value> {
 /// 把服务端会话转成前端 `Message[]` 的形状。
 ///
 /// **为什么需要**：前端的消息是纯客户端状态，Activity 重建 / 页面刷新 /
-/// 从后台回来都可能把它清掉 —— 实测切出去再回来对话就空了。
-/// 而服务端一直留着完整历史（`ChatSession`），所以刷新后能从这里恢复。
+/// 从后台回来都会把它清掉（切出去再回来对话就空了）；而服务端一直留着完整
+/// 历史（`ChatSession`），刷新后能从这里恢复。
 ///
 /// 形状必须和 `web/src/lib/sse.ts` 的 `Message` 一致。
 pub fn session_view(sess: &ChatSession) -> Vec<Value> {
@@ -1301,13 +1301,13 @@ fn is_visible_assistant(m: &ChatMessage) -> bool {
 /// 增量同步：客户端手上是 `messages[..client_len]` 的视图，给它补到最新。
 ///
 /// 会话是只追加的，前面的消息都是最终的；唯一会变的是**当前回合**那条
-/// assistant 消息 —— 一个回合的多步都并在它里面。以前的做法是退回回合起点、
-/// 把整个回合重发一遍：回合不限步数，100 步、每步一个 50KB 的 bash 输出，
-/// 轮询一次就是几 MB（服务端拼、客户端 parse、整条消息重新渲染），越跑越慢。
+/// assistant 消息 —— 一个回合的多步都并在它里面。
 ///
-/// 现在只退回到 `client_len` 之前**最后一步**（那一步的工具结果可能是新到的），
+/// 只退回到 `client_len` 之前**最后一步**（那一步的工具结果可能是新到的），
 /// 并告诉客户端：那条 assistant 消息的前 `keep_parts` 个 part 留着，后面换成
-/// 新发的。重发量和回合长度无关。
+/// 新发的。**不能整段重发**：回合不限步数，100 步、每步一个 50KB 的 bash 输出，
+/// 重发一次就是几 MB（服务端拼、客户端 parse、整条消息重新渲染），越跑越慢；
+/// 这样退回去多少与回合长度无关。
 pub struct SessionPatch {
     /// 客户端的消息数组从这里开始替换
     pub replace_from: usize,
@@ -1658,8 +1658,7 @@ async fn drive(
 ///
 /// 为什么非换不可：历史里这两条用户消息后面跟着的是新的一段 assistant
 ///（`session_view_from` 的合并规则里 User 会打断合并），所以刷新之后看到的是
-/// **两条**助手消息。流式这里不换的话，实时看着是一条、刷新变成两条，排版会跳 ——
-/// 这个坑 `session_view` 那段注释里已经踩过一次。
+/// **两条**助手消息。流式这里不换的话，实时看着是一条、刷新变成两条，排版会跳。
 async fn deliver_queued(
     core: &Core,
     sid: &str,
@@ -1684,7 +1683,7 @@ async fn deliver_queued(
     }
     send(tx, sse::queued_delivered(&ids)).await;
     send(tx, sse::start(&uuid::Uuid::now_v7().to_string())).await;
-    // 通知栏那行：又要开始想了（原来可能停在某个工具上）
+    // 通知栏那行回到「正在想」（它可能还停在某个工具上）
     status.thinking();
     true
 }
@@ -1840,8 +1839,8 @@ fn build_responses_input(
                 // `ChatMessage::Assistant::reasoning_items`），再正文，再每个 function_call。
                 //
                 // 只回传带 `encrypted_content` 的：`store: false` 时服务端不留东西，
-                // 光有 id 的条目 OpenAI 会去找、找不到就 400。不带的（比如老会话、
-                // 不给加密内容的服务端）跳过 —— 那就和以前一样，只是少了这一步的思考。
+                // 光有 id 的条目 OpenAI 会去找、找不到就 400。不带加密内容的
+                //（历史里就是没有、或者服务端不给）跳过 —— 少了这一步的思考，别的照旧。
                 for item in reasoning_items.iter().filter(|i| replayable(i)) {
                     out.push(InputItem::Raw(item.clone()));
                 }
@@ -2803,18 +2802,15 @@ async fn execute_tool(
         };
     }
 
-    // 联网搜索也不再是工具：唯一入口是沙箱里的 `agent search`（见 `linux.rs`
+    // 联网搜索不是一个工具：唯一入口是沙箱里的 `agent search`（见 `linux.rs`
     // 的 AGENT_CLI）。同一个道理 —— 能在一行 shell 里说清的能力，不必再开一个
     // 工具；而且这样它能和 `curl` / `jq` / 循环凑在一起用。
 
-    // 浏览器**不再是一个工具**：唯一入口是沙箱里的 `agent browser`（见
-    // `linux.rs` 的 AGENT_CLI）。
-    //
-    // 为什么删：实测同一个会话里模型 45 : 3 选沙箱那条 —— 一条 bash 能连做多个
-    // 动作（`navigate && get_backbone && click`），省的是**整轮 LLM 请求**；
-    // 而工具那条一次只做一个动作。留着两条路的代价是实打实的：前缀里多 2400 字
-    // （工具表的 54%），以及两处动作表各自演化 —— `new_tab URL` 被 CLI 静默
-    // 吃掉（开出一只空白标签，模型对着白屏截图）就是这么来的。
+    // 浏览器也不是一个工具：唯一入口是沙箱里的 `agent browser`（见
+    // `linux.rs` 的 AGENT_CLI）。一条 bash 能连做多个动作
+    //（`navigate && get_backbone && click`），省的是**整轮 LLM 请求**，工具那条
+    // 一次只做一个动作；留着两条路的代价是实打实的：前缀里多 2400 字（工具表的
+    // 54%），两处动作表还各自演化（`new_tab URL` 被 CLI 静默吃掉、开出一只空白标签）。
     //
     // 和上面那段设备操作同一个道理：能在 shell 里说清的能力，就别再开一个工具。
 
@@ -3557,8 +3553,7 @@ mod tests {
             assert!(bash.contains(p.proc_tools()), "{p:?}: 之后怎么看还剩什么");
 
             if p.is_host() {
-                // 以前宿主提示词得整句反驳工具表（「那几句是手机版写法」）——
-                // 现在工具表本身就是这台机器的，Alpine / apk 一个字都不该有
+                // 工具表本身就是这台机器的，Alpine / apk 一个字都不该有
                 for phone in [
                     "Alpine",
                     "apk add",
@@ -3912,9 +3907,9 @@ mod tests {
         // 工具表也是可缓存前缀的一部分。顺序必须稳定，
         // 所以这里把顺序钉死：谁想改都得先改这个测试。
         //
-        // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）暂时**不作为工具**
-        // 暴露给模型，以后收进沙箱里的一个命令、由 bash 调用。
-        // 浏览器和搜索同理，已经删掉了（唯一入口是 `agent browser` / `agent search`）。
+        // 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）不作为工具
+        // 暴露给模型，它们是沙箱里的命令、由 bash 调用。
+        // 浏览器和搜索同理：唯一入口是 `agent browser` / `agent search`。
         let names: Vec<&str> = tools(Platform::Android).iter().map(|t| t.name).collect();
         assert_eq!(names, vec!["read", "bash", "edit"]);
         // 重复调用必须完全一致
@@ -3929,8 +3924,8 @@ mod tests {
 
     /// 删掉的设备工具不能在提示词里留名字。
     ///
-    /// 留了模型就会去调一个不存在的工具，换回「错误：没有名为 device_snapshot
-    /// 的工具」，白烧一轮，而且这种提示词与实际工具表不一致的 bug 很难在真机上看出来。
+    /// 留了模型就会去调一个不存在的工具，拿回「错误：没有名为 device_snapshot
+    /// 的工具」，白烧一轮；而且这种「提示词与实际工具表不一致」的 bug 很难在真机上看出来。
     #[test]
     fn removed_device_tools_are_gone_from_prompt_and_registry() {
         let gone = [
@@ -3954,9 +3949,7 @@ mod tests {
 
     /// 浏览器和联网搜索都只能从**一个门**进：沙箱里的 `agent browser` / `agent search`。
     ///
-    /// 浏览器以前是两条路（`browser` 工具 + 沙箱命令），实测同一个会话里模型
-    /// 45 : 3 选沙箱那条 —— 一条 bash 能连做多个动作，省的是整轮 LLM 请求。工具
-    /// 那条留着只有两个后果：前缀里多 2400 字（工具表的 54%），以及两处动作表各自
+    /// 工具那条路有实际代价：前缀里多 2400 字（工具表的 54%），两处动作表各自
     /// 漂移（`agent browser new_tab URL` 把 URL 静默吃掉就是这么来的）。搜索同理，
     /// 而且它本来就能和 `curl` / `jq` / 循环凑在一起用。
     #[test]
@@ -4535,7 +4528,7 @@ mod tests {
 
     /// 建了会话但一句话没说 → 不进侧边栏列表。
     ///
-    /// 前端点「新对话」已经不再让服务端建会话了，这里是兜底：
+    /// 前端点「新对话」不会让服务端建会话，这里是兜底：
     /// 调试端/CLI 直接 create、`/api/reset` 清空后的会话都走这条。
     #[test]
     fn empty_sessions_stay_out_of_the_list() {

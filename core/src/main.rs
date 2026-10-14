@@ -113,8 +113,8 @@ async fn run() -> anyhow::Result<()> {
         let mut advert = agent_core::desktop::advertise(&name, actual, &core.state.instance_id());
         // 广播进程起来后**立刻退出**是常事（avahi-daemon 没跑、这个名字已经被这台
         // 机器上另一个核心占了），而它只往 stderr 说一句就不再出声 —— 不确认一下
-        // 的话，下面那句「手机上点「{name}」」就是空头支票（这台机器上就这么空转了
-        // 很久）。隔一下问一句，不在就把原因原样打出来。见 `desktop::Advert`。
+        // 不确认一下的话，下面那句「手机上点「{name}」」就是空头支票。
+        // 隔一下问一句，不在就把原因原样打出来。见 `desktop::Advert`。
         let quiet = match advert.as_mut() {
             Some(a) => {
                 tokio::time::sleep(agent_core::desktop::ADVERT_SETTLE).await;

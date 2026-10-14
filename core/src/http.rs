@@ -501,8 +501,8 @@ async fn remote(State(st): State<Arc<AppState>>) -> Response {
 /// `GET /api/pairing` → 手机上「连接电脑」要输的那个 6 位码（设置页展示，见前端
 /// `PairingSection.svelte`）。
 ///
-/// 以前这个码只在核心启动时往终端打一行 —— 后台跑的核心（`setsid` / 日志重定向到
-/// 文件）就等于没地方看，而后台跑恰恰是常态。
+/// 这个码要只在核心启动时往终端打一行，后台跑的核心（`setsid` / 日志重定向到
+/// 文件）就等于没地方看 —— 而后台跑恰恰是常态。
 ///
 /// **只回给这台电脑自己（loopback）**：配对码的全部意义是「证明你人在电脑前」，
 /// 从局域网里也能读到的话这一步就白做了。手机上看到的界面正好在局域网那头，
@@ -691,8 +691,8 @@ async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>
 
 /// `POST /api/websearch` → 联网搜索（`{query, num_results?, format?}`）。
 ///
-/// **这是联网搜索的唯一入口**：沙箱里的 `agent search` 走它（以前还有一个
-/// `search` 工具，已删 —— 能在一行 shell 里说清的能力不必再开一个工具）。
+/// **这是联网搜索的唯一入口**：沙箱里的 `agent search` 走它（能在一行 shell 里
+/// 说清的能力不必再开一个工具）。
 ///
 /// 两种回法：
 ///
@@ -926,9 +926,9 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     // 会在步边界把它取走交给模型（`agent::deliver_queued`）—— 模型一空下来就拿到，
     // 不用等整个回合结束。
     //
-    // 为什么不接着让前端自己排队（老做法）：前端那个队列活在 WebView 里，
-    // App 切到后台、WebView 被冻住或回收，那条消息就永远发不出去了 —— 而
-    // 「等一会儿再发同一个请求」本来就是核心该保证的事。
+    // 队列不能放在前端：那个队列活在 WebView 里，App 切到后台、WebView 被冻住
+    // 或回收，那条消息就永远发不出去了 —— 而「等一会儿再发同一个请求」本来就是
+    // 核心该保证的事。
     //
     // 队列里**已经有**等着的（上个回合出错或被停止后留下的）也排进去：不然这条会
     // 插到它们前面先跑。排进去之后由这里开回合（`continue_with_queued`），按原来的
@@ -1577,7 +1577,7 @@ async fn get_session(
         return Json(json!({ "messages": [], "queued": [], "rev": "", "busy": false }));
     };
     let mut v = session_body(&st, &id, &q.rev).await;
-    // 哪个会话：前端按它过滤排队那几条（以前从 `rev` 的格式里解，太脆）
+    // 哪个会话：前端按它过滤排队那几条
     v["session"] = json!(id);
     // 上一个回合是怎么失败的（没在跑时才报）。排队消息接着开的回合没有人订阅它的流，
     // 错误只有这一条路能让界面看见；前台回合的错误刷新之后也还在
@@ -2171,7 +2171,7 @@ async fn sandbox_file(
 ///
 /// ⚠️ **不能直接信 `mime_guess`**：`.sh` → `application/x-sh`、`.py` →
 /// `text/x-python`、`.json` → `application/json` —— 这些类型 WebView 不保证
-/// 当文本渲染，iframe 里就是一片空白（实测：点开一个 `.sh` 链接是空的）。
+/// 当文本渲染，iframe 里就是一片空白（点开一个 `.sh` 链接是空的）。
 ///
 /// 规则：
 /// - 网页**和它要的子资源**（html/css/js/json/xml）按原样 —— 生成的网页靠这个能跑

@@ -225,8 +225,8 @@ impl Provider {
     /// Expect rustls-platform-verifier to be initialized
     /// ```
     ///
-    /// （实测踩过：`/api/chat` 只发出 start/start-step 就断了，因为 panic
-    /// 打到 stderr，而 Android 上 stderr 是丢掉的 —— 加了 panic hook 才看见。）
+    /// （不装 hook 的话，`/api/chat` 只会发出 start/start-step 就断掉 —— panic
+    /// 打到 stderr，而 Android 上 stderr 是丢掉的。）
     ///
     /// 初始化需要 JNIEnv + Android `Context`。在 Rust 里拿这两个要手写
     /// `JNI_OnLoad` + 反调 `ActivityThread.currentApplication()` —— 正是
@@ -422,8 +422,8 @@ pub enum StreamError {
 impl StreamError {
     /// 是不是「端点不支持这个 API」。
     ///
-    /// 400 只在报错**说的是路由/端点本身**时才算 —— 以前只要带 "unknown" 就算，
-    /// 于是「unknown parameter」「unknown model」这种跟协议无关的 400 也会让这次
+    /// 400 只在报错**说的是路由/端点本身**时才算 —— 只要带 "unknown" 就算的话，
+    /// 「unknown parameter」「unknown model」这种跟协议无关的 400 会让这次
     /// 运行剩下的时间全切到 Chat Completions。
     pub fn is_unsupported_endpoint(&self) -> bool {
         match self {

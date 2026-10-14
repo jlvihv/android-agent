@@ -29,7 +29,6 @@ pub const MAX_INLINE_BYTES: usize = 4_718_592;
 /// JPEG 质量档位（PNG 塞不下就依次往下试）
 ///
 /// 必须从高到低：循环命中即返回，先试高质量才能“同等尺寸下尽量保真”。
-/// （曾经写成 `[80, 85, …]`，`85` 永远轮不到，是条死条目。）
 const JPEG_QUALITIES: [u8; 5] = [85, 80, 70, 55, 40];
 /// 源文件字节上限：再大就不读进内存了（正常手机图片不会到这）
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
@@ -113,24 +112,18 @@ pub fn load_if_image_bytes(source: &[u8]) -> anyhow::Result<Option<Encoded>> {
         return Ok(None);
     };
 
-    // **故意不兜 panic**（release 是 `panic = "abort"`，见 Cargo.toml）。
+    // **故意不兜 panic**（release 是 `panic = "abort"`，见 Cargo.toml）：这些
+    // 解码器的公开 API 本来就是 `Result`，畸形输入走 `Err`，会 panic 就是它们的
+    // bug（上游靠 fuzz 一个个抓）。对 bug 的正确反应是让它暴露、然后修掉，不是
+    // 给它盖毯子 —— 盖上之后这类 bug 永远只在用户那里变成「read 报了个看不懂的
+    // 错」，我们这边一点信号都没有。
     //
-    // 这里曾经套过一层 `catch_unwind`，理由是「`image` / `zune_jpeg` / `png`
-    // 的解码器碰到畸形文件时可能 panic 而不是返回 Err，一张坏图不该带走
-    // 整个 App」。那个理由站不住：
+    // 真遇到解码器 panic：logcat 里会有 `RUST PANIC` + 那个 crate 的源码路径
+    //（版本号就在路径里，例如 `zune-jpeg-0.5.15/src/…`），顺着找过去**修 / 换 /
+    // 自己写**那个解码器，而不是把 abort 改回去。
     //
-    // - 这些解码器的**公开 API 本来就是 `Result`**，畸形输入走 `Err`；
-    //   会 panic 就是它们的 bug（上游靠 fuzz 一个个抓）。
-    // - 对一个 bug 的正确反应是让它暴露、然后修掉，不是给它盖毯子。盖上
-    //   之后这类 bug 永远只在用户那里变成「read 报了个看不懂的错」，我们
-    //   这边一点信号都没有 —— 正好是这套策略要防的事。
-    //
-    // 所以真遇到解码器 panic 时：logcat 里会有 `RUST PANIC` + 那个 crate 的
-    // 源码路径（版本号就在路径里，例如 `zune-jpeg-0.5.15/src/…`），顺着找过去，
-    // 然后**修 / 换 / 自己写**那个解码器，而不是把 abort 改回去。
-    //
-    // 上面那两道防线保留：`header()` 预检 + `Limits`（宽高/分配上限）把
-    // 畸形输入变成正常的 `Err`，那是防患于未然，和「兜 panic」不是一回事。
+    // 上面那两道防线保留：`header()` 预检 + `Limits`（宽高/分配上限）把畸形输入
+    // 变成正常的 `Err`，那是防患于未然，和「兜 panic」不是一回事。
     encode(source, source_mime).map(Some)
 }
 
@@ -149,9 +142,9 @@ pub fn data_url(mime: &str, bytes: &[u8]) -> String {
 
 /// data URL 进程内缓存的上限（按 base64 后的字节算）。
 ///
-/// 原来是 32MB、超了整个清空：一个 32MB 的 PDF 编出来 43MB，**永远放不
-/// 进去**，于是每一步都重新读盘、重新 base64 一遍；图多的会话也会在
-/// 「装满 → 清空 → 重新装」之间来回抖。现在是 LRU：只挤掉最久没用的。
+/// **要按 LRU 挤**：整块清空的话，一个 43MB 的 PDF（32MB 源）永远放不进去，
+/// 于是每一步都重新读盘、重新 base64 一遍；图多的会话还会在「装满 → 清空 →
+/// 重新装」之间来回抖。
 const URL_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
