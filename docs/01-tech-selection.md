@@ -201,27 +201,26 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ### D12 — 其它小项
 
-| 项 | 选项 | 倾向 |
+| 项 | 选项 | 定了哪个 |
 |---|---|---|
 | 包管理 | bun（已装）/ npm | bun |
 | 样式 | Tailwind v4 / CSS Modules | Tailwind v4 |
-| 组件 | shadcn/ui / 手写 | shadcn/ui（复制进仓库，无版本锁定） |
-| Markdown 流式渲染 | streamdown / react-markdown + shiki | streamdown（专为流式设计） |
-| 前端状态 | zustand / jotai | zustand |
-| 事件推送（非流式） | WebSocket / SSE | WebSocket（agent 状态、日志、设备事件） |
+| 组件 | shadcn/ui / 手写 | **手写**（Svelte 侧，shadcn 是 React 的） |
+| Markdown 渲染 | 现成库 / 自己写 | 自己写（`lib/markdown.ts`） |
+| 事件推送 | WebSocket / SSE | 两个都用：`/api/ws`（事件、日志、设备状态）+ SSE（回合流） |
 | 日志 | `tracing` + `android_logger` | 同一套宏同时输出 logcat 与 stdout |
-| API key 存储 | 明文私有目录 / Android Keystore | 先明文，后补 Keystore |
+| API key 存储 | 明文私有目录 / Android Keystore | 明文私有目录（库里的 `providers` 表） |
 | 错误处理 | `thiserror`(lib) + `anyhow`(bin) | 惯例 |
 
 ---
 
-## 4. 推荐组合一览（若全部采纳我的倾向）
+## 4. 现在长这样
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ WebView  http://127.0.0.1:<随机端口>                          │
-│   React 19 + Vite + TS + Tailwind v4 + shadcn/ui             │
-│   assistant-ui + AI SDK 7 (@ai-sdk/react)                    │
+│   Svelte 5 + Vite + TS + Tailwind v4（运行时零依赖）          │
+│   自写 SSE 解析器（web/src/lib/sse.ts，见 §10）               │
 │   ← SSE: x-vercel-ai-ui-message-stream: v1                    │
 │   ← WS: agent 事件 / 日志 / 设备状态                           │
 └──────────────────────────────────────────────────────────────┘
@@ -230,34 +229,35 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 │ Rust core (.so, 进程内, tokio + axum)                         │
 │   axum 0.8 + tower-http      HTTP/SSE/WS                     │
 │   rust-embed + mime_guess    前端资源编进 .so                  │
-│   genai                      LLM provider（多协议原生）        │
-│   自研 agent loop            事件流 / 审批 / 中断 / 预算        │
-│   rmcp 2.x                   MCP client（官方 Rust SDK）       │
+│   自研 LLM transport         openai.rs / responses.rs（D4）    │
+│   自研 agent loop            事件流 / 队列 / 停止 / 上下文       │
+│   rusqlite（bundled）        会话库 + 配置表（D3、docs/06）     │
 │   serde / tracing / thiserror                                │
-│   uniffi 0.30+               正向绑定 + 反向 callback          │
+│   uniffi 0.30+               正向绑定 + 反向 callback（D2）     │
 └──────────────────────────────────────────────────────────────┘
                               │ UniFFI callback
 ┌──────────────────────────────────────────────────────────────┐
-│ Kotlin 薄壳（目标 < 800 行，不随功能增长）                      │
-│   MainActivity        WebView + 权限                          │
-│   AgentAccessibilityService   执行 tap·swipe·key·launch      │
-│   DeviceApiImpl       实现 UniFFI callback trait              │
-│   AgentForegroundService      后台常驻 + 通知渠道               │
-│   Application         启动时把 JavaVM/Context 交给 native      │
+│ Kotlin 壳（只放非它不可的平台能力）                              │
+│   MainActivity                WebView + 面板 + 权限           │
+│   AgentAccessibilityService   坐标点击·滑动·按键·启动应用      │
+│   DeviceHostImpl              实现 UniFFI callback trait      │
+│   AgentForegroundService      回合进行中才挂的前台服务          │
+│   TurnStream                  订阅 /api/turns/stream（SSE）    │
+│   BrowserController / …        agent 的 WebView + 注入的 JS    │
+│   Application                 启动时把 JavaVM/Context 交给 native │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 **"少量原生模块"到底是多少**——这些省不掉，因为是 Android 框架要求（系统靠反射实例化）：
 
-| 必须存在 | 原因 | 估算行数 |
-|---|---|---|
-| `MainActivity` | 入口；`requestPermissions` 只能在 Activity 发起 | ~80 |
-| `AgentAccessibilityService` | 操控其他 App 的**唯一**途径，必须继承该基类 | ~150 |
-| `DeviceApiImpl` | 实现 Rust 定义的 callback trait | ~150 |
-| `AgentForegroundService` + 通知渠道 | 后台常驻；Android 14+ 要 `foregroundServiceType` | ~120 |
-| `Application` | 把 `JavaVM`/`Context` 存进 native 全局 | ~30 |
-| `AndroidManifest.xml` + `accessibility_service_config.xml` | 组件与权限声明 | ~80 |
-| **合计** | | **~760 行** |
+| 必须存在 | 原因 |
+|---|---|
+| `MainActivity` | 入口；`requestPermissions` 只能在 Activity 发起 |
+| `AgentAccessibilityService` | 操控其他 App 的**唯一**途径，必须继承该基类 |
+| `DeviceHostImpl` | 实现 Rust 定义的 callback trait |
+| `AgentForegroundService` + 通知渠道 | 回合期间保活；Android 14+ 要 `foregroundServiceType` |
+| `Application` | 把 `JavaVM`/`Context` 存进 native 全局 |
+| `AndroidManifest.xml` + `accessibility_service_config.xml` | 组件与权限声明 |
 
 **设计铁律**：native 侧**不写任何反调 Java 的代码**。跨语言边界只有 JSON 字符串：
 Rust 回传指令（`tap_xy` / `swipe` / `key` / `launch`），Kotlin 执行。
@@ -269,7 +269,8 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 > 反方向那条（Kotlin 把 UI 树拍平成扁平 JSON 推给 Rust，D10）现在没有 ——
 > 要做读 UI 树时再加。
 
-另外：`onAccessibilityEvent` 跑在**主线程**，绝对不能阻塞——native 侧收到立刻入队返回。
+另外：`onAccessibilityEvent` 跑在**主线程**，绝对不能阻塞 —— native 侧收到立刻入队返回。
+（现在它什么都不做：读 UI 树那套不在，见 docs/04 §6。）
 
 ---
 
@@ -284,15 +285,10 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 | Kotlin | 2.x 最新 | |
 | axum | 0.8 | |
 | tokio | 1.x | |
-| genai | 0.6.5 / 0.7.x | 0.7.0-beta 于 2026-09 前后发布，装之前看 crates.io 实际 |
-| rig | 0.44.0 | 仅组合 B 需要 |
-| rmcp | 2.x | 官方 `modelcontextprotocol/rust-sdk` |
-| uniffi | 0.30+ | |
+| rusqlite | 0.3x（`bundled`） | 会话库 / 配置表；`.so` 多 ~50 KB |
+| uniffi | 0.30+ | Kotlin 后端只有 JNA（R4） |
 | llama-cpp-2 | pin 死 | 仅 D11 选 B 时；上游声明不遵守 semver |
-| ai | 7.0.x | 2026-06-25 发布 |
-| @ai-sdk/react | 4.x | |
-| assistant-ui | 需 `ai@^7` + `@ai-sdk/react@^4` | |
-| React | 19 | |
+| Svelte | 5 | 前端 |
 | Vite | 7 | |
 | Tailwind | 4 | |
 
@@ -329,7 +325,7 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 | — | `async-openai` | **砍掉**：协议自研（见 D4+D5） |
 | — | `genai` | **砍掉** |
 | — | `rig` | **砍掉** |
-| — | `rmcp` / MCP | **砍掉**，但 `Tool` 做成 trait 留口子（后补 ~200 行 adapter） |
+| — | `rmcp` / MCP | **砍掉** |
 
 ---
 

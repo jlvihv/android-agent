@@ -192,7 +192,7 @@ Android 12+ 禁止从后台起前台服务。`Application.onCreate` 时 uid 状�
 
 **解法**：解压完成后再调一次 `setupLinux()`（幂等）。
 
-### 坑 8 — **R9 命中**：rustls-platform-verifier 在 Android 上 panic
+### 坑 8 — rustls-platform-verifier 在 Android 上 panic
 
 **症状**：`/api/chat` 只发出 `start` / `start-step` 就断了，没有任何错误信息。
 
