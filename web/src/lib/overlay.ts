@@ -69,6 +69,11 @@ export type FoundCore = {
   paired: boolean;
   /** 现在连着的就是它 */
   current: boolean;
+  /**
+   * 经服务器（中继）连：局域网里找不到它（出门了），但配对时它给过中继。
+   * 局域网里找得到就只有直连那一条，同一台电脑不会出现两次（壳里去重）。
+   */
+  relay: boolean;
 };
 
 /** 现在有谁在「找电脑」（见 `discoverCores`） */

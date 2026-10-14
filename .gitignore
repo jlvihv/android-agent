@@ -5,6 +5,7 @@
 
 # rust
 core/target/
+relay/target/
 
 # android
 android/.gradle/

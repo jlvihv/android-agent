@@ -124,6 +124,8 @@ impl BrowserApi for BrowserAdapter {
 #[derive(uniffi::Object)]
 pub struct AgentCore {
     core: Core,
+    /// 经中继连家里电脑的那条隧道（同一时刻最多一条：只连得着一台电脑）
+    tunnel: std::sync::Mutex<Option<crate::tunnel::Tunnel>>,
 }
 
 #[uniffi::export]
@@ -131,7 +133,10 @@ impl AgentCore {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         crate::init_tracing();
-        Arc::new(Self { core: Core::new() })
+        Arc::new(Self {
+            core: Core::new(),
+            tunnel: Default::default(),
+        })
     }
 
     /// 绑定端口并开始服务（后台线程 + 独立 tokio runtime）。
@@ -156,6 +161,47 @@ impl AgentCore {
 
     pub fn port(&self) -> u16 {
         self.core.port()
+    }
+
+    /// 起一条经中继到家里那台电脑的隧道（见 `tunnel.rs`），返回本机端口：
+    /// WebView 加载 `http://localhost:<它>/auth?t=<那台电脑的 token>` 就行。
+    ///
+    /// 已经有一条就先关掉（只连得着一台）。只是在本机绑个端口，**不联网** ——
+    /// 真正拨号发生在 WebView 第一次请求的时候，连不上的原因会作为一页 502 显示出来。
+    pub fn start_tunnel(
+        &self,
+        relay: String,
+        key: String,
+        host_id: String,
+        fingerprint: String,
+    ) -> Result<u16, CoreError> {
+        let failed = |e: String| CoreError::Failed { message: e };
+        let rt = self
+            .core
+            .state
+            .rt
+            .get()
+            .ok_or_else(|| failed("核心还没启动".into()))?;
+        let t = rt
+            .block_on(crate::tunnel::start(crate::tunnel::Target {
+                relay,
+                key,
+                host_id,
+                fingerprint,
+            }))
+            .map_err(|e| failed(format!("{e:#}")))?;
+        let port = t.port;
+        if let Ok(mut g) = self.tunnel.lock() {
+            *g = Some(t);
+        }
+        Ok(port)
+    }
+
+    /// 关掉隧道（回到手机自己的核心、或者换成局域网直连时）。
+    pub fn stop_tunnel(&self) {
+        if let Ok(mut g) = self.tunnel.lock() {
+            *g = None;
+        }
     }
 
     pub fn version(&self) -> String {

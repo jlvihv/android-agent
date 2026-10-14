@@ -16,6 +16,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
 | Linux 沙箱 | ✅ **Alpine 3.24 aarch64 在真机上跑起来**，`apk add` 可用；设置里能一键原地升级 Alpine |
 | 桌面宿主模式 | ✅ `just dev-host`：不套沙箱，`bash`/`read`/`edit` 直接作用在这台机器上；**Linux 和 macOS** 都行（[docs/11](docs/11-host-mode.md)） |
+| 出门在外连家里电脑 | ✅ 一台有公网 IP 的服务器当中继（`just relay-deploy root@IP`）；端到端 TLS，中继看不到内容（[docs/12](docs/12-relay.md)） |
 | 桌面浏览器 | ✅ 核心**自己起**无头 Chrome（CDP），`agent browser` 在桌面上也能用（[docs/08](docs/08-browser.md) 第 15 节） |
 | 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI（读 UI 树那套已删，见下） |
 | Prompt cache | ✅ 实测命中 73–87% |
@@ -163,6 +164,7 @@ App 随时被杀都没关系。
 | [docs/09-search.md](docs/09-search.md) | 联网搜索：Exa 的两条路、为什么不要钱 |
 | [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md) | **工具表为什么只有三个**：判据、实测、加能力的步骤 |
 | [docs/11-host-mode.md](docs/11-host-mode.md) | **宿主模式**：桌面上不套沙箱，直接用这台机器（怎么做的、代价） |
+| [docs/12-relay.md](docs/12-relay.md) | **中继**：出门在外经自己的服务器连家里的电脑（形状、加密、部署、验证） |
 
 ## 脚本
 

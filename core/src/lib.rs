@@ -39,12 +39,15 @@ pub mod openai;
 pub mod platform;
 pub mod providers;
 pub mod reader;
+#[cfg(not(target_os = "android"))]
+pub mod remote;
 pub mod responses;
 pub mod search;
 pub mod single;
 pub mod sse;
 pub mod state;
 pub mod status;
+pub mod tunnel;
 pub mod urls;
 
 use std::sync::atomic::Ordering;
@@ -658,6 +661,7 @@ impl Core {
         let listener = tokio::net::TcpListener::bind((ip, port)).await?;
         let actual = listener.local_addr()?.port();
         self.state.port.store(actual, Ordering::Relaxed);
+        let _ = self.state.rt.set(tokio::runtime::Handle::current());
 
         // 会话在后台从库里读（不卡 App 启动）。必须在服务起来之前调：
         // 它先占住会话的写锁，读完之前进来的请求排队等，而不是看到空列表。

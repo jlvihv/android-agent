@@ -1,0 +1,26 @@
+[package]
+name = "agent-relay"
+version = "0.1.0"
+edition = "2021"
+description = "中继：手机在外面也能连上家里电脑的核心（见 docs/12-relay.md）"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-relay"
+path = "src/main.rs"
+
+# 刻意只用纯 Rust 的依赖（没有 ring / C 代码）：这样在 macOS 上就能直接交叉编译出
+# Linux x86_64 的静态二进制（musl + rust-lld），扔到服务器上就能跑。
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

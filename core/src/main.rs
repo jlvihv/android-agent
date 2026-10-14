@@ -142,6 +142,30 @@ async fn run() -> anyhow::Result<()> {
                 println!("     这台机器上已经有另一个核心在广播的话，给新的换个名字：AGENT_ADVERT_NAME=…");
             }
         }
+        // 出门在外：证书一直有（配对时手机就记下指纹，之后配上中继不用重新配对）；
+        // 设了 AGENT_RELAY / AGENT_RELAY_KEY 就挂到中继上。见 `remote.rs`、docs/12。
+        let identity = agent_core::remote::Identity::load_or_create(
+            &agent_core::desktop::data_root().join("remote"),
+        )
+        .context("准备这台电脑的 TLS 证书失败")?;
+        match agent_core::remote::relay_from_env() {
+            Ok(relay) => {
+                match &relay {
+                    Some(r) => println!(
+                        "  → 出门在外：经中继 {}（手机在局域网里连过一次就记住了）",
+                        r.addr
+                    ),
+                    None => println!(
+                        "  → 出门在外也想连：设 AGENT_RELAY / AGENT_RELAY_KEY（见 docs/12-relay.md）"
+                    ),
+                }
+                agent_core::remote::start(core.state.clone(), identity, relay)?;
+            }
+            Err(e) => {
+                println!("  ⚠️  中继配置不对：{e} —— 这次只能在局域网里用");
+                agent_core::remote::start(core.state.clone(), identity, None)?;
+            }
+        }
         let ips: Vec<std::net::IpAddr> = if bind.is_unspecified() {
             lan_ips().into_iter().map(Into::into).collect()
         } else {

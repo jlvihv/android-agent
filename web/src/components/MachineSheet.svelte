@@ -7,7 +7,8 @@
    * 这是换机器的**唯一**入口（设置页里不再有「连接电脑」那一栏）。
    *
    * 找电脑是壳的 `CoreDiscovery`（面板挂着才找、关掉就停，见 `lib/overlay.ts` 的
-   * `discoverCores`）。点了直接切，不再确认；第一次连的那台要输配对码 —— 那是壳的
+   * `discoverCores`）。配过中继、局域网里又找不到的那台显示成「经服务器」
+   * （见 docs/12-relay.md）。点了直接切，不再确认；第一次连的那台要输配对码 —— 那是壳的
    * **原生**对话框（页面给不了任意地址，只能点「真的找到过」的 id）。
    *
    * 只在 App 里出现（`canSwitchCore()`）：电脑浏览器、手机浏览器里没有壳，
@@ -33,7 +34,7 @@
 
 <!-- 一行机器。当前那台不画成按钮（点它等于什么也不做），勾在右边，和「选择模型」一致。 -->
 {#snippet row(
-  icon: 'phone' | 'computer',
+  icon: 'phone' | 'computer' | 'globe',
   name: string,
   sub: string,
   current: boolean,
@@ -69,11 +70,13 @@
 
     {#each cores as c (c.id)}
       {@render row(
-        'computer',
+        c.relay ? 'globe' : 'computer',
         c.name,
-        c.current
-          ? `${c.host}:${c.port}`
-          : `${c.host}:${c.port} · ${c.paired ? '已配对' : '第一次连要输配对码'}`,
+        c.relay
+          ? '经服务器连（不在同一个 Wi-Fi 里）'
+          : c.current
+            ? `${c.host}:${c.port}`
+            : `${c.host}:${c.port} · ${c.paired ? '已配对' : '第一次连要输配对码'}`,
         c.current,
         () => connectDiscoveredCore(c.id),
       )}
@@ -84,7 +87,7 @@
     </p>
   </div>
   <p class="px-1 pt-3 text-meta leading-relaxed text-faint">
-    电脑上跑 <code class="font-mono">just dev-host</code>，它会出现在上面。手机和电脑要在同一个
-    Wi-Fi 里；是明文 HTTP，只在自己信得过的网络里用。
+    电脑上跑 <code class="font-mono">just dev-host</code>，它会出现在上面；第一次要在同一个 Wi-Fi
+    里配对。电脑配了中继的话，出门在外它也在这里（经服务器，端到端加密）。
   </p>
 </Sheet>

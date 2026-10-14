@@ -193,6 +193,28 @@ struct PersistedProvider {
     reasoning_effort: Option<String>,
 }
 
+/// 手机出门在外连这台电脑要的东西（见 `remote.rs` 和 docs/12-relay.md）。
+///
+/// 配对时（`/api/pair`）连同 token 一起给手机；配对过的手机在局域网里连上时也会
+/// 再取一次（`/api/remote`）—— 中继是后来才配上的、或者换了服务器，都不用重新配对。
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteInfo {
+    /// 这台电脑 TLS 证书的 SHA-256（十六进制）。手机经中继连过来时只认这一张：
+    /// 中继只搬字节，冒充不了这台电脑
+    pub fingerprint: String,
+    /// 中继（没配就是 None，那就只能在局域网里用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayAddr>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RelayAddr {
+    /// `IP:端口`
+    pub addr: String,
+    /// 中继的共享密钥（十六进制）。手机拨号要用它
+    pub key: String,
+}
+
 /// 一条**排队等着交给模型**的用户消息（见 `AppState::queued`）。
 ///
 /// 形状刻意和 `/api/chat` 的请求体对齐（`id` 是客户端给的那个，没给就现生成一个）
@@ -251,6 +273,12 @@ pub struct AppState {
     pub alpine: crate::alpine::Upgrader,
     /// 局域网配对码（只有桌面宿主模式对局域网开放时才有，见 `desktop::Pairing`）
     pub pairing: RwLock<Option<Arc<crate::desktop::Pairing>>>,
+    /// 出门在外连这台电脑要用的东西（证书指纹 + 中继地址），配对时和 `/api/remote`
+    /// 交给手机。只有桌面宿主模式对局域网开放时才有（见 `remote.rs`）。
+    pub remote: RwLock<Option<RemoteInfo>>,
+    /// 核心跑在哪个 tokio runtime 上。手机的壳从 Kotlin 线程起中继隧道时要用
+    /// （`ffi::AgentCore::start_tunnel`）—— runtime 本身归 `serve_in_background` 那个线程。
+    pub rt: std::sync::OnceLock<tokio::runtime::Handle>,
     /// 本机（loopback）来的请求不要凭据。**只有桌面**会打开（`agent-dev` 的 main）：
     /// 对局域网开放时凭据是给手机的，电脑自己用浏览器照旧免登录。手机上永远是
     /// false —— 那里别的 App 也能连 127.0.0.1。
@@ -338,6 +366,8 @@ impl AppState {
             data_dir: RwLock::new(None),
             alpine: Default::default(),
             pairing: RwLock::new(None),
+            remote: RwLock::new(None),
+            rt: std::sync::OnceLock::new(),
             trust_loopback: AtomicBool::new(false),
             sessions_loaded: AtomicBool::new(false),
             turns: Mutex::new(HashMap::new()),

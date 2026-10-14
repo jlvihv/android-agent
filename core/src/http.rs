@@ -67,6 +67,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/rename", post(rename_session))
         .route("/api/sessions/delete", post(delete_session))
         .route("/api/sessions/unqueue", post(unqueue))
+        .route("/api/remote", get(remote))
         .route("/api/reset", post(reset))
         .route("/api/device/log", post(device_log))
         .route("/api/ws", get(ws_upgrade))
@@ -168,6 +169,12 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
         .map(|(_, v)| v)
 }
 
+/// 这个请求是经中继进来的（出门在外的手机，见 `remote.rs`）。`require_auth` 据此
+/// 不让它碰 `/api/pair`：配对码只该在局域网里输 —— 不然公网上谁拿到中继密钥都能来猜，
+/// 猜错五次还会把配对整个停掉。
+#[derive(Clone, Copy)]
+pub struct ViaRelay;
+
 async fn require_auth(
     State(st): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -175,6 +182,9 @@ async fn require_auth(
 ) -> Response {
     // 沙箱文件在 handler 里核对路径上的钥匙；静态资源和 /auth 本身不设防
     // `/api/pair` 是**换**凭据的那一步（拿配对码换 token），它自己核对配对码
+    if req.uri().path() == "/api/pair" && req.extensions().get::<ViaRelay>().is_some() {
+        return (StatusCode::FORBIDDEN, "配对只能在局域网里做").into_response();
+    }
     if !req.uri().path().starts_with("/api/") || req.uri().path() == "/api/pair" {
         return next.run(req).await;
     }
@@ -385,6 +395,25 @@ async fn pair(State(st): State<Arc<AppState>>, Json(b): Json<PairBody>) -> Respo
         "token": token,
         "id": st.instance_id(),
         "name": crate::desktop::computer_name(),
+        // 出门在外怎么连（证书指纹 + 中继），见 `remote.rs`
+        "remote": remote_info(&st),
+    }))
+    .into_response()
+}
+
+fn remote_info(st: &AppState) -> Option<crate::state::RemoteInfo> {
+    st.remote.read().ok().and_then(|g| g.clone())
+}
+
+/// `GET /api/remote` → 出门在外怎么连这台电脑（要凭据）。
+///
+/// 配对过的手机在局域网里连上时取一次：中继是后来才配的、或者换了服务器，都不用
+/// 重新配对。没开（手机自己的核心、只听本机）就是 `null`。
+async fn remote(State(st): State<Arc<AppState>>) -> Response {
+    Json(json!({
+        "id": st.instance_id(),
+        "name": crate::desktop::computer_name(),
+        "remote": remote_info(&st),
     }))
     .into_response()
 }
