@@ -251,6 +251,14 @@ Rust status::Reporter ──TurnHost.status(JSON)──▶ 壳 LiveTurnStatus（
    不提升时 logcat 里（tag `AgentNotif`）会把每一项前提都列出来 —— 包括上色、样式
    （`android.template`）和那条 `hasPromotableCharacteristics()=false`，不靠猜。
 
+   ⚠️ **验证的时候注意**：芯片上的**字**只在 **App 不在前台**时才画。App 正开着（你在
+   看聊天）时，系统只给一枚小图标 —— 你已经在看它了，不必再重复一遍。（SystemUI 的
+   `PromotedNotificationContentModel` 里就带着 `isAppVisible`/`lastAppVisibleTime`。）
+   实踩：盯着 App 截图，看见「只有图标、没字」，差点去排查一个不存在的 bug；按一下
+   HOME 再截，同一秒就是 `>_ 运行 TIM…` 那种药丸——芯片文字的口径和 OpenMinis 的
+   `chipContentText` 一样：CJK 算两格、上限 9 格 / 6 个字符，所以四个汉字正好截成
+   「写胰岛素…」。
+
 一个实测踩到的坑（改了两处才收干净）：**更新前台服务的通知要用 `startForeground()`，不要用
 `NotificationManager.notify()`**。`notify()` 能把同 id 的通知换掉，但会把记录上的
 `FLAG_FOREGROUND_SERVICE` 抹掉 —— 于是**服务死掉时系统不再顺手收它**，通知栏里留一条
