@@ -122,12 +122,31 @@ object TurnStream {
             setRequestProperty("Accept", "text/event-stream")
         }
         try {
+            // 先确认对面真的是这条流。**不能只看「连接成功了」**：核心还没升级时，
+            // 未知路径会被前端的 SPA fallback 接走 —— 回 200 + 一页 index.html，
+            // 我们读几行 HTML 然后 EOF，看着像「连上又断了」，于是每 2 秒重试一次刷屏
+            // （实测踩到：手机订着旧核心）。所以按 content-type 认人，认不出就当成
+            // 「这个核心还没有这个端点」，交给退避慢慢等。
+            val code = conn.responseCode
+            val type = conn.contentType.orEmpty()
+            if (code != HttpURLConnection.HTTP_OK || !type.startsWith("text/event-stream")) {
+                throw IllegalStateException(
+                    "不是回合状态流（HTTP $code, ${type.ifBlank { "无 content-type" }}）" +
+                        " —— 核心可能还是旧版本，还没这个端点",
+                )
+            }
             val reader = conn.inputStream.bufferedReader()
-            // 连上了：退避归位（下次真断了要快点接回来）
-            s.retry = RETRY_MS
+            var sawLine = false
             while (!s.stop) {
                 // 返回 null = 对端关了（或者读超时）—— 交给 follow() 重连
                 val line = reader.readLine() ?: return
+                if (!sawLine) {
+                    // **真读到东西才算连上**，退避这时才归位：核心还没升级、没有这个端点时，
+                    // 连接会「成功」然后立刻结束 —— 那时不能让退避归位，否则就是每 2 秒重试
+                    // 一次、日志还刷屏（实测踩到：手机订着旧核心）
+                    sawLine = true
+                    s.retry = RETRY_MS
+                }
                 // SSE：只认 `data:` 行；空行和 `:` 开头的 keep-alive 注释都不管
                 if (line.startsWith("data:")) handle(s, line.removePrefix("data:").trim())
             }
