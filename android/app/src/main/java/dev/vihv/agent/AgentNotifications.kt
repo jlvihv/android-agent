@@ -66,6 +66,17 @@ object AgentNotifications {
     /** 状态栏芯片那一行只有几个字宽（见 [chipText]）。 */
     private const val CHIP_MAX_UNITS = 9
 
+    /** 上一次「请求了提升、系统却没给」的诊断（只在变化时记日志，不是每帧都反射一遍） */
+    @Volatile
+    private var lastNotPromotable: Boolean? = null
+
+    /**
+     * 点通知回到 App 的那个 intent。内容永远一样，建一次就够：
+     * `PendingIntent.getActivity` 是一次 binder 往返，而进行中那条通知半秒就重建一次。
+     */
+    @Volatile
+    private var openCached: PendingIntent? = null
+
     /** 上一次画在哪个面上（true = 提升成芯片，false = 普通通知）；只在切换时记日志 */
     @Volatile
     private var lastSurface: Boolean? = null
@@ -203,8 +214,12 @@ object AgentNotifications {
         val n = b.build()
         // 提升不成功不是错误：退化成普通常驻通知，只是不上芯片。把每一项前提都打出来，
         // 真机上不提升时才知道是哪一条不满足。
-        if (!n.hasPromotableCharacteristics()) {
-            Log.w(TAG, "Live Update 没拿到提升资格 —— 逐项拆开看: ${promotableDetail(n)}")
+        val notPromotable = !n.hasPromotableCharacteristics()
+        if (notPromotable != lastNotPromotable) {
+            lastNotPromotable = notPromotable
+            if (notPromotable) {
+                Log.w(TAG, "Live Update 没拿到提升资格 —— 逐项拆开看: ${promotableDetail(n)}")
+            }
         }
         return n
     }
@@ -353,14 +368,14 @@ object AgentNotifications {
     }
 
     /** 点一下回到 App（和以前同一条路：不用 deep link，打开的就是刚才那个会话）。 */
-    private fun openIntent(ctx: Context): PendingIntent = PendingIntent.getActivity(
-        ctx,
+    private fun openIntent(ctx: Context): PendingIntent = openCached ?: PendingIntent.getActivity(
+        ctx.applicationContext,
         0,
         Intent(ctx, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
         // IMMUTABLE：Android 12+ 必须显式指定
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-    )
+    ).also { openCached = it }
 
     /**
      * 芯片那一行的文本：比通知栏窄得多，得先按**显示宽度**截。

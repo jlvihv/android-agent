@@ -40,7 +40,7 @@ pub fn data_root() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// 局域网：广播自己 + 配对（手机 App 的「连接电脑」用）
+// 局域网：广播自己 + 配对（手机 App 的「选择机器」用）
 // ---------------------------------------------------------------------------
 
 /// mDNS 服务类型。手机那边（`MainActivity` 的 NsdManager）找的就是它。
@@ -114,7 +114,15 @@ impl Pairing {
 }
 
 /// 这台电脑给人看的名字（macOS 的「电脑名称」；Linux 用主机名）。
+///
+/// 只取一次：macOS 上要起一个 `scutil` 子进程，而 `/api/health` 每次都要它
+/// （那是 async handler，同步等子进程会卡住一个 tokio worker）。
 pub fn computer_name() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(probe_computer_name).clone()
+}
+
+fn probe_computer_name() -> String {
     if cfg!(target_os = "macos") {
         if let Ok(o) = Proc::new("scutil").args(["--get", "ComputerName"]).output() {
             let n = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -220,7 +228,7 @@ impl Drop for Advert {
 /// 广播出去，手机解析到它就连不上（打印地址时已经踩过一次同样的坑）。
 ///
 /// TXT 里只有实例 id 和版本 —— **没有凭据**（见 `Pairing`）。
-/// 工具不在就返回 None（手动输入地址那条路照样能用）；工具在、但起不来（daemon
+/// 工具不在就返回 None（那手机 App 就找不到这台，只有浏览器能直接开地址）；工具在、但起不来（daemon
 /// 没跑、名字撞了）是另一回事，由 `Advert::failure` 负责说出来。
 pub fn advertise(name: &str, port: u16, id: &str) -> Option<Advert> {
     let port = port.to_string();
@@ -249,7 +257,7 @@ fn start(cmd: &mut Proc) -> Option<Advert> {
         Ok(child) => Some(Advert { child, error: None }),
         Err(e) => {
             tracing::warn!(
-                "没法在局域网里广播（{:?}: {e}）—— 手机上搜不到这台电脑，只能手动输地址",
+                "没法在局域网里广播（{:?}: {e}）—— 手机 App 里搜不到这台电脑",
                 cmd.get_program()
             );
             None

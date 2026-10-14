@@ -138,13 +138,7 @@
    */
   let sidebar = $state(false);
   let sheet = $state(false);
-  /**
-   * 「选择机器」面板（侧栏底栏那个机器标签点开的）。
-   *
-   * 它和设置页的关系：面板里那条「手动输入地址」把设置页**叠在面板上面**打开
-   * （不关面板）—— 跟模型面板里「管理模型提供商」一个走法。所以这里不需要
-   * 「关掉面板再开设置」那种会把返回键的历史搞脏的接法。
-   */
+  /** 「选择机器」面板（侧栏底栏那个机器标签点开的，见 MachineSheet） */
   let machineSheet = $state(false);
   /** 壳在不在（能在手机核心 / 电脑核心之间切）。桌面浏览器、手机浏览器里没有壳 */
   const canSwitch = canSwitchCore();
@@ -793,12 +787,7 @@
 
 {#if sheet}<ModelSheet onclose={close} onconfig={() => (settings = true)} rev={settingsRev} />{/if}
 
-{#if machineSheet}
-  <MachineSheet
-    onclose={() => (machineSheet = false)}
-    onsettings={() => (settings = true)}
-  />
-{/if}
+{#if machineSheet}<MachineSheet onclose={() => (machineSheet = false)} />{/if}
 
 {#if settings}<Settings onclose={closeSettings} />{/if}
 

@@ -35,8 +35,8 @@ import android.widget.TextView
  * 明文流量由 `res/xml/network_security_config.xml` 放行，
  * 否则 Android 9+ 会直接报 ERR_CLEARTEXT_NOT_PERMITTED。
  *
- * **也能连电脑上的核心**（设置 → 连接电脑）：电脑上 `just dev-host`，自动找到它（或者粘它打出来
- * 的地址粘进来，这个 WebView 就改加载那台电脑 —— 界面一样，命令跑在电脑上。
+ * **也能连电脑上的核心**（侧栏底栏的机器标签 →「选择机器」）：电脑上 `just dev-host`，
+ * 手机在局域网里找到它，点一下这个 WebView 就改加载那台电脑 —— 界面一样，命令跑在电脑上。
  * 选择记在 SharedPreferences 里（下次启动直接连）；连不上时给原生的错误页，
  * 能「重试」或「回到手机」。手机自己的核心照常在后台跑着，切回来是瞬间的。
  */
@@ -92,7 +92,7 @@ class MainActivity : Activity() {
     /** 下一次页面加载完就清掉历史：切换核心之后，返回键不该退回另一台的页面 */
     private var clearHistoryOnLoad = false
 
-    /** 局域网里找电脑（「连接电脑」那一栏开着时才找，见 CoreDiscovery） */
+    /** 局域网里找电脑（「选择机器」面板开着时才找，见 CoreDiscovery） */
     private val discovery by lazy {
         CoreDiscovery(this) { runOnUiThread { pushCoresFound() } }
     }
@@ -340,7 +340,7 @@ class MainActivity : Activity() {
                 val remote = remoteUrl() ?: return
                 if (request?.isForMainFrame != true || response?.statusCode != 403) return
                 remoteId()?.let { forgetPaired(it) }
-                setContentView(remoteErrorView(remote, "这台电脑不认手机记着的钥匙了（电脑上换过库？）—— 回到手机，在 设置 → 连接电脑 里点它重新配对。"))
+                setContentView(remoteErrorView(remote, "这台电脑不认手机记着的钥匙了（电脑上换过库？）—— 回到手机，在侧栏底栏的「选择机器」里点它重新配对。"))
             }
 
             override fun onReceivedError(
@@ -555,22 +555,19 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 点了列表里的某台电脑。只认**真的找到过**的（按 id 查 discovery 的结果）——
-     * 页面给不了任意地址。配对过的：原生确认一下就连；没配对的：原生对话框里输
-     * 电脑终端上显示的 6 位配对码，换回 token 再连。两样都是原生的，理由见
-     * [confirmConnect]。
+     * 点了「选择机器」里的某台电脑。只认**真的找到过**的（按 id 查 discovery 的结果）——
+     * 页面给不了任意地址。配对过的直接连（不再确认）；没配对的弹原生对话框输电脑终端上
+     * 显示的 6 位配对码，换回 token 再连。
+     *
+     * 为什么不确认也可以：`AgentHost` 每个 frame 都看得见（包括查看器里 AI 写的网页），
+     * 但能连的只有「这台手机自己在局域网里找到、而且用配对码配过」的电脑 —— 都是自己的
+     * 机器，网页带不走到别人的服务器上。陌生的那台还是要配对码，那一步是原生的。
      */
     private fun pickDiscovered(id: String) {
         val f = discovery.current().firstOrNull { it.id == id } ?: return
         val base = "http://${f.host}:${f.port}"
-        val token = pairedToken(id)
-        if (token != null) {
-            android.app.AlertDialog.Builder(this)
-                .setTitle("连接到「${f.name}」？")
-                .setMessage("${f.host}:${f.port}\n\n之后界面、命令、文件都在那台电脑上。随时可以在 设置 → 连接电脑 里回到手机。")
-                .setPositiveButton("连接") { _, _ -> connectTo("$base/auth?t=$token", id) }
-                .setNegativeButton("取消", null)
-                .show()
+        pairedToken(id)?.let { token ->
+            connectTo("$base/auth?t=$token", id)
             return
         }
         val input = android.widget.EditText(this).apply {
@@ -628,32 +625,6 @@ class MainActivity : Activity() {
         syncTurnStream()
         Log.i(TAG, "回到手机自己的核心")
         switchTo(localUrl())
-    }
-
-    /**
-     * 页面要连某台电脑：**先弹原生确认框**。
-     *
-     * 为什么必须确认：`addJavascriptInterface` 注入的对象**每个 frame 都看得见**，
-     * 包括查看器里 AI 写的网页（iframe）。不确认的话，那种网页一句
-     * `AgentHost.connectRemote("http://…")` 就能把整个 App 带到别人的服务器上。
-     * 对话框是原生的，网页画不出来、也点不了。
-     */
-    private fun confirmConnect(raw: String) {
-        val uri = runCatching { Uri.parse(raw.trim()) }.getOrNull()
-        if (uri == null || (uri.scheme != "http" && uri.scheme != "https") || uri.host.isNullOrEmpty()) {
-            android.widget.Toast.makeText(this, "地址不对：要 http://电脑IP:端口/auth?t=… 那一整行", android.widget.Toast.LENGTH_LONG).show()
-            return
-        }
-        val where = "${uri.host}:${portOf(uri)}"
-        android.app.AlertDialog.Builder(this)
-            .setTitle("连接到电脑？")
-            .setMessage(
-                "$where\n\n之后界面、命令、文件都在那台电脑上（明文 HTTP，只在自己信得过的 Wi-Fi 里用）。" +
-                    "随时可以在 设置 → 连接电脑 里回到手机。",
-            )
-            .setPositiveButton("连接") { _, _ -> connectTo(uri.toString(), null) }
-            .setNegativeButton("取消", null)
-            .show()
     }
 
     /** 电脑连不上：说清楚，给「重试」和「回到手机」两条路（不然只能清数据） */
@@ -923,13 +894,7 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun hasBrowser(): Boolean = remoteUrl() == null && AgentApp.browser?.hasPage() == true
 
-        /** 设置 → 连接电脑 → 连接。会先弹原生确认框（见 [confirmConnect]） */
-        @JavascriptInterface
-        fun connectRemote(url: String) {
-            runOnUiThread { confirmConnect(url) }
-        }
-
-        /** 「连接电脑」那一栏打开了：开始在局域网里找（找到的推给 `window.__coresFound`） */
+        /** 「选择机器」面板打开了：开始在局域网里找（找到的推给 `window.__coresFound`） */
         @JavascriptInterface
         fun startDiscovery() {
             runOnUiThread {
@@ -939,7 +904,7 @@ class MainActivity : Activity() {
             }
         }
 
-        /** 那一栏关了：不找了 */
+        /** 面板关了：不找了 */
         @JavascriptInterface
         fun stopDiscovery() {
             runOnUiThread {
@@ -959,7 +924,7 @@ class MainActivity : Activity() {
             runOnUiThread { pickDiscovered(id) }
         }
 
-        /** 设置 → 连接电脑 → 回到手机。没有风险，不用确认 */
+        /** 「选择机器」→ 这台手机。没有风险，不用确认 */
         @JavascriptInterface
         fun useLocal() {
             runOnUiThread { useLocalCore() }

@@ -2191,6 +2191,8 @@ async fn stream_one(
         if let Some(c) = blocks.close() {
             send(tx, c).await;
         }
+        // 通知栏：这一步说了什么，结束那一条拿它当回复预览
+        status.step_text(&text_acc);
 
         // 把缓存命中情况摆出来 —— 这是验证 prompt cache 的唯一硬证据
         if let Some(u) = &usage {

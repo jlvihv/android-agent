@@ -65,6 +65,10 @@ object TurnStream {
         /** 上一次是**失败**收场（没读到过东西）。回到前台时据此立刻重试一次。 */
         @Volatile
         var failed = false
+
+        /** 正连着的那条。退订时直接断开它，读线程才不会卡在 `readLine` 里再处理一帧旧状态 */
+        @Volatile
+        var conn: HttpURLConnection? = null
     }
 
     private val subs = ConcurrentHashMap<String, Sub>()
@@ -90,10 +94,11 @@ object TurnStream {
     private fun start(base: String, token: String) {
         if (base.isBlank() || token.isBlank()) return
         subs[base]?.let { cur ->
-            if (cur.token != token) return stop(base)
-            if (!cur.failed) return
-            // 这个目标还在重试里（可能正等在 30 秒的退避上）。回到前台/切核心时重新算清单
-            // 就是一个「现在再试一次」的机会 —— 不重起的话，用户重启完核心还得干等退避。
+            // token 没变、而且连得好好的：什么都不用做。
+            // token 变了（重新配对）要换；还在重试里（可能正等在 30 秒的退避上）也换 ——
+            // 回到前台/切核心时重新算清单就是一个「现在再试一次」的机会，不然用户重启完
+            // 核心还得干等退避。
+            if (cur.token == token && !cur.failed) return
             stop(base)
         }
         val s = Sub(base, token)
@@ -106,6 +111,8 @@ object TurnStream {
         val s = subs.remove(base) ?: return
         s.stop = true
         s.active = false
+        // 断开在另一个线程上：disconnect 可能要碰网络，不能放在调用方（主线程）上
+        s.conn?.let { c -> Thread { runCatching { c.disconnect() } }.start() }
         Log.i(TAG, "退订: $base")
         // 可能刚才是它在撑着前台服务
         refreshForeground()
@@ -137,6 +144,7 @@ object TurnStream {
             setRequestProperty("Cookie", "agent_token=${s.token}")
             setRequestProperty("Accept", "text/event-stream")
         }
+        s.conn = conn
         try {
             // 先确认对面真的是这条流。**不能只看「连接成功了」**：核心还没升级时，
             // 未知路径会被前端的 SPA fallback 接走 —— 回 200 + 一页 index.html，
@@ -168,11 +176,14 @@ object TurnStream {
                 if (line.startsWith("data:")) handle(s, line.removePrefix("data:").trim())
             }
         } finally {
+            s.conn = null
             runCatching { conn.disconnect() }
         }
     }
 
     private fun handle(s: Sub, json: String) {
+        // 已经退订了：这一帧是断开前最后读到的，不能再拿它改状态
+        if (s.stop) return
         val o = runCatching { JSONObject(json) }.getOrNull() ?: return
         when (o.optString("type")) {
             "turn" -> o.optJSONObject("status")?.let { status ->

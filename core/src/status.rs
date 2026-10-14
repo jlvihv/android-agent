@@ -8,7 +8,7 @@
 //! 形状照抄 OpenMinis（`SessionActivityTracker` + `AgentNotificationContent`）：
 //! 那边有一个 tracker 对象当**唯一事实来源**，前台服务订阅它、就地把通知改一遍。
 //! 我们的状态在 Rust 里，所以事实来源留在这边：agent loop 在值得看一眼的时刻推一
-//! 份 JSON 快照到**总线**上（`Event::Turn`，见 `state.rs`：前端走 `/api/ws`，手机壳
+//! 份快照到**总线**上（`Event::Turn`，见 `state.rs`：前端走 `/api/ws`，手机壳
 //! 走 `/api/turns/stream`），订阅者只管画。这样「什么算一个阶段」「细节取哪一行」这些
 //! 判断都留在能写测试的地方（见文件末尾）。
 //!
@@ -43,12 +43,14 @@ const TAIL_SCAN: usize = 2048;
 /// 跟着一整份文件内容（几十 KB）。
 const ARGS_SCAN: usize = 2048;
 
-/// 一个回合此刻处在哪个阶段。
+/// 一个回合此刻处在哪个阶段。序列化成小写名字（`thinking` …），这是**跨语言约定**：
+/// 壳的 `Phase.of()` 按它解析、按它挑默认文案（见壳里的 `strings.xml`）。
 ///
 /// 和 OpenMinis 的 `AgentPhase` 一一对应（COMPLETED/TOOL/THINKING/GENERATING/IDLE）——
 /// 少一个 IDLE：我们这边没有「服务活着但什么都没跑」的状态（回合结束就停服务，
 /// 见 `AgentForegroundService`）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Phase {
     /// 模型在输出思考，还没有可见正文
     Thinking,
@@ -60,18 +62,6 @@ pub enum Phase {
     Done,
 }
 
-impl Phase {
-    /// 跨语言的名字。壳按它挑默认文案（见壳里的 `strings.xml`）。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Phase::Thinking => "thinking",
-            Phase::Streaming => "streaming",
-            Phase::Tool => "tool",
-            Phase::Done => "done",
-        }
-    }
-}
-
 /// 推给壳的一份快照。字段刻意全是「原样的事实」，文案在壳那边（`strings.xml`）——
 /// 通知栏的话术是界面的事，而这里的字段是 agent loop 的事实。
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -80,8 +70,7 @@ pub struct Snapshot {
     pub sid: String,
     /// 会话标题（侧边栏那一行）。空串 = 还没起标题，壳用兜底文案
     pub title: String,
-    /// `thinking` / `streaming` / `tool` / `done`
-    pub phase: &'static str,
+    pub phase: Phase,
     /// 正在跑的工具名（`bash` / `read` / `edit`），没有就是不带这个字段
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -90,9 +79,8 @@ pub struct Snapshot {
     pub detail: Option<String>,
     /// 本回合开始的时刻（**wall clock 毫秒**）。
     ///
-    /// 刻意不是 `elapsedRealtime`：通知的 `setWhen` 用的是 wall clock，混着用就
-    /// 是 OpenMinis 踩过的那个坑 —— 计时器的原点落在「开机时刻」，一台开了五天的
-    /// 手机显示 `120:00:00`，不崩不报错，就是读数离谱。
+    /// 刻意不是 `elapsedRealtime`：通知的 `setWhen` 用的是 wall clock，混着用的话
+    /// 计时器的原点落在「开机时刻」，一台开了五天的手机显示 `120:00:00`。
     pub started_at_ms: u64,
     /// 还在跑吗（`false` = 这一条是「已经完事」的状态）
     pub active: bool,
@@ -107,8 +95,7 @@ pub struct Snapshot {
 
 /// 一个回合的状态播报器。`run_turn` 建一个，agent loop 拿着它推。
 ///
-/// 拿在手里的是 `Arc<AppState>` 而不是 `&Core`：推的时候只用到「谁在听」这一个
-/// 字段，生命周期比 `Core` 那层借用宽松得多。
+/// 拿在手里的是 `Arc<AppState>` 而不是 `&Core`：推的时候只用到总线这一个字段。
 pub struct Reporter {
     state: Arc<AppState>,
     sid: String,
@@ -120,17 +107,25 @@ pub struct Reporter {
 /// 上一次推的是什么。用来做两件事：同样的东西不重复推、流式内容按时间攒着推。
 #[derive(Default)]
 struct Last {
-    /// 上一次推出去的阶段名（`thinking` 连着一千个 delta 只该推一次）。
-    /// 存字符串而不是 `Phase`：`send` 手上只有快照，枚举在 `running()` 那层就
-    /// 变成跨语言的名字了。
-    phase: Option<&'static str>,
+    /// 上一次真推出去的那份（完全相同就不推了）
+    sent: Option<Snapshot>,
     /// 上一次真推出去的时刻
     at: Option<Instant>,
-    /// 最后一段可见正文的预览。结束那一条要拿它当「回复预览」——
-    /// 工具跑完、思考这些阶段不碰它，所以它一直是「模型最后说的话」。
+    /// 最后一段可见正文的预览，结束那一条拿它当「回复预览」。
+    /// 每一步流完时记一次（见 [Reporter::step_text]），所以它一直是「模型最后说的话」。
     reply: Option<String>,
-    /// 上一次推出去的 JSON（逐字节相同就不推了）
-    json: String,
+}
+
+impl Last {
+    fn phase(&self) -> Option<Phase> {
+        self.sent.as_ref().map(|s| s.phase)
+    }
+
+    /// 同一个流式阶段里、离上一次推送还不到 [STREAM_INTERVAL]
+    fn throttled(&self) -> bool {
+        self.phase() == Some(Phase::Streaming)
+            && self.at.is_some_and(|at| at.elapsed() < STREAM_INTERVAL)
+    }
 }
 
 impl Reporter {
@@ -147,45 +142,38 @@ impl Reporter {
 
     /// 模型开始（重新）生成：一步开始了，或者一个工具刚跑完。
     ///
-    /// 连着调只有第一次有用（阶段没变就直接返回，连 JSON 都不拼）。
+    /// 每个思考 delta 都会调到这里，所以阶段没变就直接返回（不拼快照）。
     pub fn thinking(&self) {
-        {
-            let Ok(mut last) = self.last.lock() else {
-                return;
-            };
-            if last.phase == Some(Phase::Thinking.as_str()) {
-                return;
-            }
-            // 先占住阶段。下面还要拼 JSON、再判断一次，但那之间不可能有第二个
-            // 线程进来（一个回合只有一个 loop）。
-            last.phase = Some(Phase::Thinking.as_str());
+        if self.last_phase() == Some(Phase::Thinking) {
+            return;
         }
         self.send(self.running(Phase::Thinking, None, None), false);
     }
 
-    /// 可见正文又长了一截。`text` 是这**一步**到目前为全部的可见正文。
+    /// 可见正文又长了一截。`text` 是这**一步**到目前为止的全部可见正文。
     ///
-    /// 每一块都算一次预览（只扫尾部两千字，有界），但只有跟上一次推出去的隔了
-    /// [STREAM_INTERVAL] 才真的推 —— 中间那些块的效果是「下次推的时候更新」。
+    /// 只有跟上一次推出去的隔了 [STREAM_INTERVAL] 才真的推（也只有那时才算预览）——
+    /// 中间那些块的效果是「下次推的时候更新」。
     pub fn streaming(&self, text: &str) {
-        let detail = reply_preview(text);
-        {
-            let Ok(mut last) = self.last.lock() else {
-                return;
-            };
-            // 先记住：结束那一条要用它当回复预览（**不受节流限制**，
-            // 否则最后半秒写的东西会在「完成」通知里缺席）
-            last.reply = detail.clone();
-            // 已经在这个阶段里、而且刚推过：攒着（下次推的时候内容自然是最新的）
-            if last.phase == Some(Phase::Streaming.as_str()) {
-                if let Some(at) = last.at {
-                    if at.elapsed() < STREAM_INTERVAL {
-                        return;
-                    }
-                }
-            }
+        if self.last.lock().map_or(true, |l| l.throttled()) {
+            return;
         }
-        self.send(self.running(Phase::Streaming, None, detail), false);
+        self.send(
+            self.running(Phase::Streaming, None, reply_preview(text)),
+            false,
+        );
+    }
+
+    /// 一步流完了：记下这一步的正文预览，结束那一条要拿它当「回复预览」。
+    ///
+    /// 放在步尾而不是每块都记：节流会吞掉最后半秒的块，但这里拿的是整步的正文。
+    pub fn step_text(&self, text: &str) {
+        let Some(preview) = reply_preview(text) else {
+            return;
+        };
+        if let Ok(mut last) = self.last.lock() {
+            last.reply = Some(preview);
+        }
     }
 
     /// 开始跑一个工具。`args` 可能**还没流完**（模型正在写参数）——
@@ -206,26 +194,25 @@ impl Reporter {
 
     /// 回合结束。`stopped` = 用户按了停止，`ok` = 没出错。
     ///
-    /// 这一条是**最后一条**：壳收到它就去发「任务完成」那条通知（独立于前台服务，
-    /// 因为服务在这前后就被停掉了，两条路谁先谁后都得能收场）。
+    /// 这一条是**最后一条**：壳收到它就去发「任务完成」那条通知。
     pub fn finish(&self, ok: bool, stopped: bool) {
         let reply = self.last.lock().ok().and_then(|g| g.reply.clone());
         self.send(
             Snapshot {
-                sid: self.sid.clone(),
-                title: self.title.clone(),
-                phase: Phase::Done.as_str(),
-                tool: None,
                 detail: reply,
-                started_at_ms: self.started_at_ms,
                 active: false,
                 finished_at_ms: Some(now_ms()),
                 ok,
                 stopped,
+                ..self.running(Phase::Done, None, None)
             },
             // 结束那一条必须落地：它是壳发「任务完成」通知的依据
             true,
         );
+    }
+
+    fn last_phase(&self) -> Option<Phase> {
+        self.last.lock().ok().and_then(|l| l.phase())
     }
 
     /// 还在跑的那几个阶段共用的形状（没有结束时刻，`ok` 无意义）。
@@ -233,7 +220,7 @@ impl Reporter {
         Snapshot {
             sid: self.sid.clone(),
             title: self.title.clone(),
-            phase: phase.as_str(),
+            phase,
             tool,
             detail,
             started_at_ms: self.started_at_ms,
@@ -246,36 +233,23 @@ impl Reporter {
 
     /// 真正推一份快照出去。返回有没有推（测试用）。
     ///
-    /// `force` = 忽略节流（结束那一条必须落地）。
+    /// `force` = 忽略节流（结束那一条必须落地）。节流只管「同一个流式阶段里的
+    /// 重复推送」：阶段切换（想 → 写、工具 → 想）是「有事发生了」，再快也得让壳看到。
     fn send(&self, snap: Snapshot, force: bool) -> bool {
-        // 序列化失败只可能是我们自己的字段有问题（全是 String / 数字），
-        // 那就当这次没推 —— 通知栏少一帧，比把 agent loop 打断强。
-        let Ok(json) = serde_json::to_string(&snap) else {
-            return false;
-        };
         {
             let Ok(mut last) = self.last.lock() else {
                 return false;
             };
-            if last.json == json {
+            if last.sent.as_ref() == Some(&snap) {
                 return false;
             }
-            // 节流只管「同一个流式阶段里的重复推送」：阶段切换（想 → 写、
-            // 工具 → 想）是「有事发生了」，再快也得让壳看到。
-            let still_streaming = snap.phase == Phase::Streaming.as_str()
-                && last.phase == Some(Phase::Streaming.as_str());
-            if !force && still_streaming {
-                if let Some(at) = last.at {
-                    if at.elapsed() < STREAM_INTERVAL {
-                        return false;
-                    }
-                }
+            if !force && snap.phase == Phase::Streaming && last.throttled() {
+                return false;
             }
-            last.phase = Some(snap.phase);
+            last.sent = Some(snap.clone());
             last.at = Some(Instant::now());
-            last.json = json.clone();
         }
-        self.state.push_turn_status(&json);
+        self.state.push_turn_status(snap);
         true
     }
 }
@@ -545,7 +519,7 @@ mod tests {
         let snap = Snapshot {
             sid: "abc".into(),
             title: "建个 fizzbuzz".into(),
-            phase: Phase::Thinking.as_str(),
+            phase: Phase::Thinking,
             tool: None,
             detail: None,
             started_at_ms: 1,
@@ -611,12 +585,26 @@ mod tests {
     }
 
     #[test]
-    fn reporter_pushes_a_status_for_every_phase_of_a_turn() {
-        // 阶段名是**跨语言约定**（壳的 `Phase.of()` 按它解析），所以在这里钉住。
-        // 至于「谁在听」：那是总线的事，跟播报器无关（没有订阅者时发出去就是没人收）。
-        assert_eq!(Phase::Thinking.as_str(), "thinking");
-        assert_eq!(Phase::Streaming.as_str(), "streaming");
-        assert_eq!(Phase::Tool.as_str(), "tool");
-        assert_eq!(Phase::Done.as_str(), "done");
+    fn phase_names_are_the_cross_language_contract() {
+        // 壳的 `Phase.of()` 按这几个名字解析，所以在这里钉住
+        for (p, name) in [
+            (Phase::Thinking, "thinking"),
+            (Phase::Streaming, "streaming"),
+            (Phase::Tool, "tool"),
+            (Phase::Done, "done"),
+        ] {
+            assert_eq!(serde_json::to_value(p).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn finish_carries_the_last_step_text_as_the_reply() {
+        let r = reporter();
+        r.streaming("第一");
+        // 节流吞掉了这一块，但步尾记下的是整步正文
+        r.streaming("第一\n最后一句");
+        r.step_text("第一\n最后一句");
+        let reply = r.last.lock().unwrap().reply.clone();
+        assert_eq!(reply.as_deref(), Some("最后一句"));
     }
 }

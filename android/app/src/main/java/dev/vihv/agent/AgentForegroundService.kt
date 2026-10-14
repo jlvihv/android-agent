@@ -69,7 +69,7 @@ class AgentForegroundService : Service() {
         }
     }
 
-    /** 主线程的把手：状态是从 Rust 的 tokio 线程推过来的，碰通知要回到主线程。 */
+    /** 主线程的把手：状态是从 [TurnStream] 的读线程推过来的，碰通知要回到主线程。 */
     private val main = Handler(Looper.getMainLooper())
     private val redraw = Runnable { render() }
 

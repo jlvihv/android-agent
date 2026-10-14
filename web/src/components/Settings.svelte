@@ -20,8 +20,8 @@
    * 设置页。从抽屉左下角的齿轮、或者选择模型面板里「模型提供商」页最下面的「管理模型提供商」进来。
    *
    * 三栏：「模型提供商」、「连接手机」（配对码，见 PairingSection；只有电脑上自己开这个
-   * 页面时才有）、「连接电脑」（App 里才有，见 RemoteSection）和「Linux 沙箱」（Alpine 版本 / 升级，见 SandboxSection；
-   * 桌面宿主模式下没有这一栏）。模型提供商：内置几家服务商，每家只填 API Key；Base URL、
+   * 页面时才有）和「Linux 沙箱」（Alpine 版本 / 升级，见 SandboxSection；
+   * 桌面宿主模式下没有这一栏）。换机器不在这里：在侧栏底栏的机器标签（见 MachineSheet）。模型提供商：内置几家服务商，每家只填 API Key；Base URL、
    * 协议都内置好了，模型清单自动拉（见 core/src/providers.rs）。几家可以
    * 同时配好，在选择模型面板里点哪家的模型就切到哪家。
    */
@@ -29,7 +29,6 @@
   import Page from './Page.svelte';
   import PairingSection from './PairingSection.svelte';
   import ProviderPage from './ProviderPage.svelte';
-  import RemoteSection from './RemoteSection.svelte';
   import SandboxSection from './SandboxSection.svelte';
   import { store } from '../lib/store.svelte.ts';
 
@@ -93,7 +92,6 @@
   </p>
 
   <PairingSection />
-  <RemoteSection />
   <SandboxSection />
 </Page>
 

@@ -11,7 +11,7 @@ import java.net.Inet4Address
  * 在局域网里找电脑上的核心（宿主模式的 `just dev-host` 用 mDNS 广播 `_agent-core._tcp`，
  * 见 core 的 `desktop::advertise`）。
  *
- * **只在「连接电脑」那一栏开着的时候找**：页面挂上时 `start`、关掉时 `stop`
+ * **只在「选择机器」面板开着的时候找**：页面挂上时 `start`、关掉时 `stop`
  * （App 切到后台也停，回来再接着找）。不常驻 —— 多播发现费电，也没必要。
  *
  * 用平台的 `NsdManager`（不引第三方库，也不用自己开 MulticastLock：系统的

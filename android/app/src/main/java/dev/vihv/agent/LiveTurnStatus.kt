@@ -104,8 +104,19 @@ object LiveTurnStatus {
     data class View(val status: TurnStatus, val activeCount: Int)
 
     /**
-     * Rust 那边的一份状态（`status::Snapshot` 的 JSON）。从 agent 的 tokio 线程调用，
-     * 所以这里只做「改一份内存里的状态 + 让订阅者去重画」。
+     * 「已完成」通知发过的回合：sid → 它的结束时刻。
+     *
+     * 同一个回合的结束只该提醒一次。新核心不会重放完事的回合，但旧版本的核心
+     * （手机连着的电脑可能还没升级）每次重连都会把它们再推一遍。
+     */
+    private val doneShown = HashMap<String, Long>()
+
+    /**
+     * 核心推过来的一份状态（`status::Snapshot` 的 JSON）。
+     *
+     * 从 [TurnStream] 的读线程调用，而且**可能不止一条**（手机自己的核心 + 连着的电脑），
+     * 所以改地图要加锁（`@Volatile` 只管可见，不管「读出来、加一项、写回去」这一整步）。
+     * 这里只做「改一份内存里的状态 + 让订阅者去重画」。
      */
     fun update(app: Context, json: String) {
         val s = try {
@@ -116,14 +127,16 @@ object LiveTurnStatus {
             Log.w(TAG, "状态解析失败: ${t.message}（$json）")
             return
         }
-        bySession = bySession + (s.sid to s)
+        val firstDone = synchronized(this) {
+            bySession = bySession + (s.sid to s)
+            !s.active && doneShown.put(s.sid, s.finishedAtMs ?: 0L) != (s.finishedAtMs ?: 0L)
+        }
         for (l in listeners) {
             runCatching { l() }.onFailure { Log.w(TAG, "刷新通知失败: ${it.message}") }
         }
-        // 完事那一条：用户没在看的时候提醒一声（正看着就不用 —— 结果就在眼前）。
-        // 放在这里而不是前台服务里：服务在这之后马上就被停掉了（`turn(false)`），
-        // 而这条通知得留下来等人回来看。
-        if (!s.active) AgentNotifications.showDone(app, s)
+        // 完事那一条：留一条通知等人回来看。放在这里而不是前台服务里：服务在这之后
+        // 马上就被停掉了（`turn(false)`），而这条通知得留下来。
+        if (firstDone) AgentNotifications.showDone(app, s)
     }
 
     /**
@@ -133,6 +146,7 @@ object LiveTurnStatus {
      * 见 [view]），更早的那些扔掉 —— 它们该做的都做完了（完成通知已经发出去），
      * 留着只会让下次「谁在跑 / 有几个」算错。
      */
+    @Synchronized
     fun turn(active: Boolean) {
         if (active) return
         val now = SystemClock.elapsedRealtime()

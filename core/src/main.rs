@@ -50,7 +50,7 @@ async fn run() -> anyhow::Result<()> {
 
     let core = agent_core::Core::desktop();
 
-    // 听在哪：**宿主模式默认对局域网开放**（0.0.0.0）—— 手机 App 的「连接电脑」
+    // 听在哪：**宿主模式默认对局域网开放**（0.0.0.0）—— 手机 App 的「选择机器」
     // 能自动找到这台、输一次配对码就能用它，不用另起一个特殊命令。只想自己用：
     // `AGENT_BIND=127.0.0.1`。沙箱模式（`just dev`，在电脑上复现手机）默认只听本机。
     let host_mode = core.state.linux().is_some_and(|s| s.is_host());
@@ -101,7 +101,7 @@ async fn run() -> anyhow::Result<()> {
         Some(t) if !trusted => println!("  → http://127.0.0.1:{actual}/auth?t={t}"),
         _ => println!("  → http://127.0.0.1:{actual}"),
     }
-    // 局域网：广播自己 + 配对码（手机 App 的「连接电脑」自动发现、第一次连时输码）。
+    // 局域网：广播自己 + 配对码（手机 App 的「选择机器」自动发现、第一次连时输码）。
     // `_advert` 活到 main 结束：Drop 就停广播
     let mut _advert = None;
     if lan {
@@ -127,17 +127,19 @@ async fn run() -> anyhow::Result<()> {
         _advert = advert;
         match quiet {
             None => println!(
-                "  → 手机 App：设置 → 连接电脑，点「{name}」，配对码 {}",
+                "  → 手机 App：侧栏底栏的机器标签 → 选择机器，点「{name}」，配对码 {}",
                 pairing.code()
             ),
             Some(why) => {
-                println!("  → 配对码 {}（手机手动输地址时用）", pairing.code());
-                println!("    ⚠️  局域网广播没起来：{why}");
-                println!("       手机上搜不到这台电脑，只能用下面的地址。");
+                println!("  ⚠️  局域网广播没起来：{why}");
                 println!(
-                    "       起好系统的 mDNS 服务再重启核心（Linux: systemctl enable --now avahi-daemon）；"
+                    "     手机 App 只能连广播找得到的电脑（没有手动输入地址），所以这次连不上；"
                 );
-                println!("       这台机器上已经有另一个核心在广播的话，给新的换个名字：AGENT_ADVERT_NAME=…");
+                println!("     手机浏览器打开下面的地址还能用。");
+                println!(
+                    "     起好系统的 mDNS 服务再重启核心（Linux: systemctl enable --now avahi-daemon）；"
+                );
+                println!("     这台机器上已经有另一个核心在广播的话，给新的换个名字：AGENT_ADVERT_NAME=…");
             }
         }
         let ips: Vec<std::net::IpAddr> = if bind.is_unspecified() {

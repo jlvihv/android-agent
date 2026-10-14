@@ -380,30 +380,19 @@
          图标在名字**右边**（贴右边缘），像行尾那个 `›` ：它点开的是「选择机器」
          面板，就地换一台（面板里的内容见 MachineSheet.svelte）。没有壳的时候
          （电脑浏览器 / 手机浏览器）只有一个核心，没得换 —— 那它就不是按钮。
-         `text-sm` + `muted`，和输入框那个模型药丸同档 —— 它是状态，不是按钮。
-         名字太长就截断：`min-w-0` 让整块可以在需要时收窄（不写死宽度上限）。 -->
-    {#snippet machineLabel()}
+         `text-sm` + `muted`，和输入框那个模型药丸同档。名字太长就截断：`min-w-0`
+         让整块可以在需要时收窄（不写死宽度上限）。 -->
+    <svelte:element
+      this={onmachine ? 'button' : 'span'}
+      type={onmachine ? 'button' : undefined}
+      role={onmachine ? undefined : 'status'}
+      onclick={onmachine ?? undefined}
+      title={onmachine ? `现在连的是${machine.name}（点一下换一台）` : `现在连的是${machine.name}`}
+      class="ml-auto flex min-w-0 items-center gap-1.5 text-sm text-muted"
+    >
       <span class="truncate">{machine.name}</span>
       <Icon name={machine.phone ? 'phone' : 'computer'} size={15} class="shrink-0" />
-    {/snippet}
-    {#if onmachine}
-      <button
-        type="button"
-        onclick={onmachine}
-        title="现在连的是{machine.name}（点一下换一台）"
-        aria-label="现在连的是{machine.name}，打开「选择机器」"
-        class="ml-auto flex min-w-0 items-center gap-1.5 text-sm text-muted"
-      >
-        {@render machineLabel()}
-      </button>
-    {:else}
-      <span
-        class="ml-auto flex min-w-0 items-center gap-1.5 text-sm text-muted"
-        title="现在连的是{machine.name}"
-      >
-        {@render machineLabel()}
-      </span>
-    {/if}
+    </svelte:element>
   </div>
 {/snippet}
 

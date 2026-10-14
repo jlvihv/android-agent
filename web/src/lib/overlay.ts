@@ -50,14 +50,12 @@ type BackHost = {
   openBrowser?: () => void;
   /** agent 现在有没有开着的浏览器页面（头部的地球按钮据此显隐）。同步返回 */
   hasBrowser?: () => boolean;
-  /** 改连电脑上的核心（壳会先弹原生确认框）。见 MainActivity.confirmConnect */
-  connectRemote?: (url: string) => void;
   /** 回到手机自己的核心 */
   useLocal?: () => void;
   /** 开始 / 停止在局域网里找电脑（找到的推给 `window.__coresFound`） */
   startDiscovery?: () => void;
   stopDiscovery?: () => void;
-  /** 点了找到的某台电脑（壳只认找到过的 id；配对 / 确认都是原生对话框） */
+  /** 点了找到的某台电脑（壳只认找到过的 id；配过对的直接连，没配过的弹原生的配对码框） */
   connectDiscovered?: (id: string) => void;
 };
 
@@ -75,31 +73,32 @@ export type FoundCore = {
 
 /** 现在有谁在「找电脑」（见 `discoverCores`） */
 const listeners = new Set<(cores: FoundCore[]) => void>();
+/** 壳最近推过来的那份列表：后挂上来的订阅者先拿到它，不用等下一次变化 */
+let lastFound: FoundCore[] = [];
 
 /**
  * 在局域网里找电脑：`onFound` 每次拿到完整的列表。返回停止函数 ——
- * 「选择机器」面板 / 设置里「连接电脑」那一栏挂上时开始找、卸掉时停，不常驻。
+ * 「选择机器」面板挂上时开始找、卸掉时停，不常驻。
  *
- * **可以同时有多个订阅者**：壳那边只有一个推口（`window.__coresFound`），
- * 这里自己分发给所有订阅者，最后一个人走了才真停。
- *
- * 为什么不能只管一个：两个地方会同时开着 —— 从「选择机器」面板点「手动输入地址」
- * 进设置页时，设置里那一拦会**叠在面板上面**（面板还在，没卸）。只认最后一个的话，
- * 面板那张清单当场就冻在那儿不再更新（而且先走的那个人会把发现整个停掉）。
+ * 壳那边只有一个推口（`window.__coresFound`），这里自己分发给所有订阅者，
+ * 最后一个人走了才真停。壳只在开始找和列表变化时推，所以新来的订阅者
+ * 先回放一次 `lastFound`。
  */
 export function discoverCores(onFound: (cores: FoundCore[]) => void): () => void {
   const w = globalThis as { __coresFound?: (c: FoundCore[]) => void };
   listeners.add(onFound);
-  // 壳推给单个全局口，这里转发给每一个人
   w.__coresFound = (c) => {
+    lastFound = c;
     for (const l of listeners) l(c);
   };
   if (listeners.size === 1) host()?.startDiscovery?.();
+  else onFound(lastFound);
   return () => {
     listeners.delete(onFound);
     if (listeners.size) return;
     host()?.stopDiscovery?.();
     delete w.__coresFound;
+    lastFound = [];
   };
 }
 
@@ -111,11 +110,7 @@ const host = (): BackHost | undefined =>
 
 /** 在 App 里吗（能在手机核心 / 电脑核心之间切）。桌面浏览器、手机浏览器上都没有壳 */
 export function canSwitchCore(): boolean {
-  return typeof host()?.connectRemote === 'function';
-}
-
-export function connectRemoteCore(url: string): void {
-  host()?.connectRemote?.(url);
+  return typeof host()?.connectDiscovered === 'function';
 }
 
 export function useLocalCore(): void {
