@@ -260,7 +260,11 @@
 </script>
 
 {#snippet body()}
-  <!-- 全圆角 + 里面一个放大镜。放大镜是 CSS 背景图（不套 div/span）：
+  <!-- 搜索框**浮在列表上**（内容从它下面穿过去）：原来是 flex 里占一行的一块，
+       现在改成浮层 —— 位置一个像素没动（`mt-` 里那个安全区和 `mx-4` 都还在）。
+       上下两块浮层占多高、列表要留多少白，都是 app.css 里的
+       `--drawer-top` / `--drawer-bottom`（两头的渐隐也是同一组数）。
+       全圆角 + 里面一个放大镜。放大镜是 CSS 背景图（不套 div/span）：
        纯装饰，为它多一层 DOM 不值当。图形跟 Icon.svelte 一个规格
        （20 画布 / 描边 1.8），颜色取 muted。 -->
   <input
@@ -270,13 +274,20 @@
     spellcheck="false"
     autocomplete="off"
     aria-label="搜索对话"
-    class="search-input mx-4 mt-1 mb-3 shrink-0 rounded-full bg-surface py-3 pr-4 pl-10 text-base
-           text-fg placeholder:text-faint outline-none"
+    class="search-input absolute inset-x-0 top-0 z-20 mx-4 mt-[calc(0.25rem+env(safe-area-inset-top))]
+           rounded-full bg-surface py-3 pr-4 pl-10 text-base text-fg
+           placeholder:text-faint outline-none"
   />
 
-  <!-- 列表的左右边距跟搜索框和底栏对齐（`px-4`）—— 都是顶层表面，内部要一个值。
+  <!-- 列表铺满整个抽屉（浮层在它上面）：上下留白 = 浮层高度 + 渐隐长度，
+       这样滚到顶 / 滚到底时内容能完整地停在浮层之外。
+       左右边距跟搜索框和底栏对齐（`px-4`）—— 都是顶层表面，内部要一个值。
        行自己的 `px-3` 是药丸内的内边距，不是这里说的边距。 -->
-  <div class="min-h-0 flex-1 overflow-y-auto px-4 pt-1 pb-1">
+  <div
+    class="absolute inset-0 overflow-y-auto px-4
+           pt-[calc(var(--drawer-top)+var(--fade-top))]
+           pb-[calc(var(--drawer-bottom)+var(--fade-top))]"
+  >
     {#if q.trim()}
       {#if hits.length === 0}
         <p class="px-3 py-3 text-sm text-faint">
@@ -342,8 +353,12 @@
     {/if}
   </div>
 
+  <!-- 底栏也浮在内容上（就一个设置按钮）。
+       `pointer-events-none` 给容器、`pointer-events-auto` 给按钮：
+       条子右边那片空白跟渐隐层一样「不存在」，下面的会话行照样点得到。 -->
   <div
-    class="flex shrink-0 items-center gap-3 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+    class="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex items-center gap-3 px-4 pt-3
+           pb-[max(0.75rem,env(safe-area-inset-bottom))]"
   >
     <!-- 左下角 = 设置。图标本身说明用途。 -->
     <button
@@ -351,7 +366,8 @@
       onclick={onsettings}
       aria-label="设置"
       title="设置"
-      class="grid size-11 shrink-0 place-items-center rounded-full bg-hairline text-muted"
+      class="pointer-events-auto grid size-11 shrink-0 place-items-center rounded-full bg-hairline
+             text-muted"
     >
       <Icon name="gear" size={20} />
     </button>
@@ -365,8 +381,7 @@
   <aside
     in:slide|global={{ axis: 'x', duration: PIN_MS }}
     out:slide|global={{ axis: 'x', duration: PIN_MS }}
-    class="flex h-full w-72 shrink-0 flex-col border-r border-hairline bg-drawer
-           pt-[env(safe-area-inset-top)]"
+    class="drawer-shell relative h-full w-72 shrink-0 border-r border-hairline bg-drawer"
   >
     {@render body()}
   </aside>
@@ -385,8 +400,8 @@
     use:dismissable={drag}
     style:transform={off ? `translateX(${-off * 100}%)` : null}
     style:transition={dragging ? 'none' : RELEASE}
-    class="fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[var(--drawer-w)] flex-col
-           bg-drawer pt-[env(safe-area-inset-top)] will-change-transform"
+    class="drawer-shell fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 w-[var(--drawer-w)]
+           bg-drawer will-change-transform"
     in:slideIn|global
     out:slideOut|global
   >
