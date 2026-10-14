@@ -30,6 +30,14 @@ sdk_home := env_var_or_default("ANDROID_HOME", `for d in "$HOME/Android/Sdk" "$H
 export ANDROID_HOME := sdk_home
 ndk_home := env_var_or_default("AGENT_NDK_HOME", `ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/*/ "$HOME"/Android/Sdk/ndk/*/ "$HOME"/Library/Android/sdk/ndk/*/ 2>/dev/null | sort -V | tail -1`)
 export ANDROID_NDK_HOME := ndk_home
+# `NDK_HOME` 也指到同一个地方。
+#
+# 为什么要多这一行：cargo-ndk 会**比对这两个变量**，不一致就骂一句
+# （`Environment variable ANDROID_NDK_HOME = … doesn't match NDK_HOME = …`）。
+# 而 Arch 的 android-ndk 包会把 `/opt/android-ndk` 写进 NDK_HOME，我们只认 SDK
+# 里那个（上面那行就是「不依赖环境变量」的意思）—— 于是每台装过包的机器都吃这条警告。
+# 只影响 recipe 自己的环境，不动用户的 shell。
+export NDK_HOME := ndk_home
 
 # JAVA_HOME 不在这里设。
 #
@@ -242,9 +250,14 @@ android-bindings:
     cargo build --lib
     # 宿主动态库的扩展名：Linux .so / macOS .dylib
     ext=so; [ "$(uname)" = Darwin ] && ext=dylib
+    # bindgen 生成完会用 ktlint 排一下版；没装 ktlint 时它会打一条
+    # 「Unable to auto-format … No such file or directory」的警告 —— 看着像出错了，
+    # 其实只是它试了一下没找到工具。没装就告诉它别试（生成物在 .gitignore 里，
+    # 排版无关紧要），装了的话照旧让它排。
+    fmt=(); command -v ktlint >/dev/null || fmt=(--no-format)
     cargo run --features uniffi-bindgen --bin uniffi-bindgen -- \
       generate --library "target/debug/libagent_core.$ext" \
-      --language kotlin --out-dir ../{{mod}}/src/main/java
+      --language kotlin --out-dir ../{{mod}}/src/main/java "${fmt[@]}"
 
 # 2) 交叉编译 Rust 核心 → jniLibs
 #

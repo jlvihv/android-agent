@@ -964,8 +964,12 @@ mod tests {
 
     #[test]
     fn mock_device_takes_commands_and_reports_garbage() {
-        let core = Core::desktop();
-        let dev = core.state.device().unwrap();
+        // **直接构造 mock**，不走 `Core::desktop()` —— 它挂哪台设备是**按环境**二选一的
+        // （`AGENT_LINUX_HOST=1` 时挂的是 `desktop::HostDevice`，而电脑上根本没有点击 /
+        // 按键可做），拿它来断言 mock 的行为等于让测试跟着环境变：终端里带着
+        // `AGENT_LINUX_HOST=1` 跑 `just test`，这条就是红的（实测踩过）。
+        // 「宿主设备会拒绝手机操作」由 `desktop.rs` 自己的测试盯着。
+        let dev = crate::mock::MockDevice::new();
         assert!(dev
             .execute(r#"{"type":"key","name":"back"}"#)
             .unwrap()

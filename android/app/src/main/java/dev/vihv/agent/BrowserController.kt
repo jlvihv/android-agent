@@ -746,7 +746,7 @@ class BrowserController(private val app: Application) : BrowserHost {
                 if (lv == android.webkit.ConsoleMessage.MessageLevel.ERROR ||
                     lv == android.webkit.ConsoleMessage.MessageLevel.WARNING
                 ) {
-                    Log.d(TAG, "[page:$lv] ${m?.message()?.take(300)} @${m?.lineNumber()}")
+                    Log.d(TAG, "[page:$lv] ${m.message()?.take(300)} @${m.lineNumber()}")
                 }
                 return true
             }

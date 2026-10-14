@@ -200,6 +200,10 @@ class MainActivity : Activity() {
             window.navigationBarColor = Color.TRANSPARENT
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // 平台自带的都标了 deprecated（官方让用 AndroidX 的 `enableEdgeToEdge()`），
+            // 而这个工程刻意不引 AndroidX（一个依赖都不多要，见 build.gradle.kts）。
+            // 两行平台 API 就能干完的事，不值得为它拉一整套 WindowCompat，所以留着。
+            @Suppress("DEPRECATION")
             window.setDecorFitsSystemWindows(false)
         } else {
             @Suppress("DEPRECATION")
@@ -737,8 +741,17 @@ class MainActivity : Activity() {
         data.data?.let { out.add(it) }
         // 有些实现把 URI 塞在 extra 里（EXTRA_STREAM 可能是单个 Uri，也可能是
         // ArrayList<Uri>）。类型对不上会抛，包起来。
-        runCatching { data.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) }
-            .getOrNull()?.let { out.add(it) }
+        //
+        // API 33 起旧的那个 `getParcelableExtra(String)` 标了 deprecated（新重载多一个
+        // Class 参数，不用反射猜类型），而低版本上没有新重载 —— 所以两边都要写。
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                data.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                data.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+            }
+        }.getOrNull()?.let { out.add(it) }
         @Suppress("DEPRECATION")
         runCatching { data.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM) }
             .getOrNull()?.forEach { out.add(it) }

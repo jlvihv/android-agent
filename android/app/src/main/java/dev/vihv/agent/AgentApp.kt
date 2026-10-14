@@ -283,6 +283,12 @@ class AgentApp : Application() {
         // 所以按可达性排序：非 VPN 网络优先，VPN 次之，公网兜底。
         val nonVpn = mutableListOf<String>()
         val vpn = mutableListOf<String>()
+        // `allNetworks` 从 API 31 起标了 deprecated（官方建议改用 NetworkCallback），
+        // 但这里是**启动时一次性的快照**：要的就是「现在这几张网的 DNS 各是什么」。
+        // callback 是「以后变了告诉我」的模型，搬过来得注册 / 等 / 注注销，还得挂个
+        // Looper；而拿不到就退回 1.1.1.1 / 8.8.8.8（见下面的兜底），为它引一套异步
+        // 状态机不值当。所以这里显式压掉警告，而不是留一条噪音。
+        @Suppress("DEPRECATION")
         for (net in cm.allNetworks) {
             val lp = cm.getLinkProperties(net) ?: continue
             val caps = cm.getNetworkCapabilities(net)
