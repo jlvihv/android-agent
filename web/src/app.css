@@ -94,15 +94,12 @@ body,
   /* 抽屉宽度。`Drawer.svelte` 里 aside 的宽度，和长按菜单「往右不许超出抽屉」
      的夹取用的是同一个数 —— 改宽度只改这里。 */
   --drawer-w: 92%;
-  /* 抽屉里上下两块浮层（搜索框 / 设置按钮）占的高度 —— 和 --hdr 一个道理：
-     它们决定两件事，**两个数只写这里** ——
-       · 会话列表的上下留白（内容从浮层下面穿过去）
-       · 上下两层渐隐要多高
-     顶部 = mt-1(0.25rem) + 搜索框（py-3 上下各 0.75rem + 一行 1.5rem = 3rem）
-            + mb-3(0.75rem) = 4rem
-     底部 = pt-3(0.75rem) + 设置按钮（size-11 = 2.75rem）+ pb(0.75rem) = 3.5rem
-     两处都还要让开状态栏 / 手势条（搜索框自己那个 mt- 里也写了同一个 inset）。
-     改 Drawer.svelte 里那两个的 padding 就要同步改这里（实测 4rem/4.25rem）。 */
+  /* 抽屉上下两块各占多高：顶部 = 搜索框那一行（mt-1 0.25rem + 框 3rem + mb-3
+     0.75rem = 4rem），底部 = 底栏那一行（pt-3 0.75rem + 齿轮 2.75rem + pb 0.75rem
+     = 3.5rem）。两块都还要让开状态栏 / 手势条。
+     **它们只用在 app.css 里那两条抽屉渐隐的定位上**（贴着这两块的边画），
+     抽屉本身不浮动 —— 搜索框 / 列表 / 底栏都在流里（见 docs/05-ui.md）。
+     改 Drawer.svelte 里那两行的 padding 就要同步改这里（实测 4rem / 4.25rem）。 */
   --drawer-top: calc(4rem + env(safe-area-inset-top));
   --drawer-bottom: calc(
     3.5rem + max(0.75rem, env(safe-area-inset-bottom))
@@ -177,6 +174,11 @@ a:focus-visible {
  * 而不是几个空 div —— DOM 里就只剩 `main` / `header` / 输入区，以及抽屉里的
  * 搜索框 / 列表 / 底栏三块。
  * 定位和 z-index 写在这里（伪元素不继承 Tailwind 的 absolute/z-10）。
+ *
+ * **抽屉那两条不是浮层**：搜索框和列表都在流里，渐隐只贴在列表的上下沿那一
+ * 小段上。试过把它们做成浮层（列表铺满整栏、内容从它们下面穿过去），实测
+ * 字节不差 —— 因为不透明段盖的正好就是浮层那个盒子，底下有没有内容都看不见，
+ * 白换来一组绝对定位。见 docs/05-ui.md 的「抽屉顶部」那一节。
  */
 .shell::before,
 .shell::after,
@@ -200,17 +202,16 @@ a:focus-visible {
   --a7: var(--fade-color);
 }
 
-/* 抽屉里也浮着搜索框和设置按钮，但底色是 `--color-drawer` */
+/* 抽屉那两条的底色是 `--color-drawer` */
 .drawer-shell::before,
 .drawer-shell::after {
   --fade-color: var(--color-drawer);
 }
 
 /* 顶部：头部（抽屉里是搜索框）区域全遮，往下 --fade-top 淡到全透明。
-   浮层多高，渐隐就从多高处开始 —— 那个高度和列表的顶部留白是同一个数 */
+   两块占多高就遮多高，那个高度和下面列表的留白是同一个数 */
 .shell::before,
 .drawer-shell::before {
-  top: 0;
   --l: var(--fade-top);
   background: linear-gradient(
     to top,
@@ -225,19 +226,21 @@ a:focus-visible {
   );
 }
 .shell::before {
+  top: 0;
   height: calc(var(--hdr) + var(--l));
 }
+/* 抽屉：搜索框带（--drawer-top）下面那一段，高度就是渐隐本身的长 */
 .drawer-shell::before {
-  height: calc(var(--drawer-top) + var(--l));
+  top: var(--drawer-top);
+  height: var(--l);
 }
 
 /*
  * 屏幕底边：卡片（抽屉里是那个设置按钮）本身不淡（正文贴着它上缘直接从它后面
- * 穿过去），只在它下沿到屏幕底这一段淡掉。
+ * 穿过去），只在它下沿到屏幕底这一段淡掉 —— 抽屉则是列表下沿到它上沿那一段。
  */
 .shell::after,
 .drawer-shell::after {
-  bottom: 0;
   --l: var(--fade-top);
   background: linear-gradient(
     to bottom,
@@ -252,11 +255,14 @@ a:focus-visible {
   );
 }
 .shell::after {
+  bottom: 0;
   --l: calc(var(--composer-gap) + 2.5rem);
   height: var(--l);
 }
+/* 抽屉：底栏带（--drawer-bottom）上面那一段 */
 .drawer-shell::after {
-  height: calc(var(--drawer-bottom) + var(--l));
+  bottom: var(--drawer-bottom);
+  height: var(--l);
 }
 
 /*
