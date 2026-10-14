@@ -37,6 +37,7 @@
   import { models } from './lib/models.svelte.ts';
   import { agentHasBrowser, canSwitchCore, openAgentBrowser } from './lib/overlay';
   import { wide } from './lib/wide.svelte.ts';
+  import { dismissable } from './lib/drag';
 
   let input = $state('');
   /** 当前看着的这个会话，本地正连着它的流。 */
@@ -509,6 +510,51 @@
     sheet = false;
   };
 
+  // —— 在对话区往右滑，打开抽屉（窄屏）——
+  //
+  // 跟手：拖多少抽屉就出来多少，松手看速度 / 位置决定展开还是收回 —— 和往左拖关抽屉
+  // 是同一套手势（lib/drag.ts），只是方向反过来、拖的是还没出来的抽屉。
+  //
+  // 从屏幕**最左边**起手的那一下归系统（Android 的返回手势），轮不到页面；从对话中间
+  // 往右划就行。
+
+  /** 拖着打开时抽屉拉出来的比例（交给 Drawer 的 `peek`）；null = 不在跟手 */
+  let peek = $state<number | null>(null);
+  /** 触屏才开：桌面上用鼠标往右拖是在选字，不是想开抽屉 */
+  const touch = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+
+  /** 这一下能不能当成「开抽屉」：输入框里是拖光标；能横着滚、又没在最左的内容（代码块、
+   *  宽表格）是想把它往回滚 */
+  function swipeable(t: EventTarget | null): boolean {
+    for (let el = t instanceof Element ? t : null; el && el !== document.body; el = el.parentElement) {
+      if (el.matches('input, textarea, [contenteditable="true"]')) return false;
+      if (el.scrollLeft > 0) return false;
+    }
+    return true;
+  }
+
+  const openDrag = {
+    axis: 'x' as const,
+    dir: 1 as const,
+    // 抽屉宽 92%（app.css 的 --drawer-w）：手指走完这么远就是整个拉出来了
+    size: () => innerWidth * 0.92,
+    canStart: (t: EventTarget | null) => touch && !wide.on && !drawer && swipeable(t),
+    onStart: () => {
+      peek = 0;
+      drawer = true;
+      void loadSessions();
+    },
+    onMove: (p: number) => (peek = p),
+    onEnd: (open: boolean) => {
+      if (open) peek = null;
+      else drawer = false; // 出场动画从当前位置接着收（Drawer 的 slideOut）
+    },
+  };
+  // 收回之后把跟手状态清掉，下次点菜单打开就是正常的进场动画
+  $effect(() => {
+    if (!drawer) peek = null;
+  });
+
   // —— 对话 ——
 
   /**
@@ -716,6 +762,7 @@
   <div
     class="shell relative h-full w-full min-w-0 flex-1 overflow-hidden"
     style:--composer-h="{composerH}px"
+    use:dismissable={openDrag}
   >
     <!-- 消息列表铺满整个高度：内容从头部和输入卡片下面穿过去。
          顶部/底部的渐隐是 `.shell` 的伪元素（只为了装饰，不值得占两个 div）。 -->
@@ -791,6 +838,7 @@
   <!-- 窄屏：抽屉盖在对话上（宽屏它已经并排在左边了） -->
   {#if !wide.on && drawer}
     <Drawer
+      {peek}
       {sessions}
       onclose={close}
       onswitch={switchSession}

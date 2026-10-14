@@ -55,6 +55,11 @@
     onsettings,
     /** 宽屏：**并排**的一栏（不是抽屉）。见 lib/wide.svelte.ts */
     pinned = false,
+    /**
+     * 从对话区往右拖着打开时，手指拉出来的比例（0 = 还完全在外面，1 = 整个拉出来）。
+     * `null` = 不在跟手（点菜单打开、或者已经松手）。见 App.svelte 的 `openDrag`。
+     */
+    peek = null,
     /** 现在连的是哪台机器（`store.machine`）：`phone` = 手机自己的核心 */
     machine,
     onmachine,
@@ -67,6 +72,7 @@
     /** 左下角的齿轮 → 设置页 */
     onsettings: () => void;
     pinned?: boolean;
+    peek?: number | null;
     machine: { name: string; phone: boolean };
     /** 点底栏那个机器标签 → 「选择机器」面板。**壳不在时是 null**
      *  （电脑浏览器 / 手机浏览器里只有一个核心，没得换）——那就只显示，不可点。 */
@@ -197,6 +203,22 @@
     },
   };
 
+  // 从对话区往右拖着打开：位置由外面的手指定（`peek`），这期间关掉回弹过渡。
+  // 松手展开时 `peek` 变回 null：回到 0，由 RELEASE 过渡接着走完；松手收回则是外面
+  // 直接卸掉抽屉，出场动画从当前位置接着往左收（见 slideOut）。
+  let peeking = false;
+  $effect(() => {
+    if (peek != null) {
+      peeking = true;
+      dragging = true;
+      off = 1 - peek;
+    } else if (peeking) {
+      peeking = false;
+      dragging = false;
+      off = 0;
+    }
+  });
+
   // 返回键关抽屉；拖拽三件套也是「预测性返回」的跟手位移
   // （系统手势划到哪，抽屉就跟着挪到哪。Android 14+；桌面可手动 __predictiveBack 模拟）
   //
@@ -207,8 +229,9 @@
     return onBack(() => onclose(), drag);
   });
 
-  /** 进场：从左边整个滑进来 */
+  /** 进场：从左边整个滑进来（跟着手指拉出来的那种不要进场动画：位置归手指管） */
   function slideIn(_: Element) {
+    if (peek != null) return { duration: 0 };
     return {
       duration: SLIDE_IN_MS,
       easing: quintOut,

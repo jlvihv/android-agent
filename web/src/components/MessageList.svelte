@@ -16,6 +16,7 @@
   import { sandboxPath } from '../lib/markdown';
   import { BROWSER_ACTION, describeInput, describeResult, type Tone } from '../lib/toolview';
   import Icon from './Icon.svelte';
+  import { openViewer } from '../lib/viewer.svelte.ts';
   import Markdown from './Markdown.svelte';
   import Sheet from './Sheet.svelte';
   import ThoughtLine from './ThoughtLine.svelte';
@@ -331,11 +332,15 @@
       <div class="flex flex-wrap justify-end gap-2">
         {#each atts as a (a.id)}
           {#if a.type === 'image'}
-            <img
-              src={a.url}
-              alt={a.name}
-              class="max-h-48 max-w-full rounded-card border border-hairline object-cover"
-            />
+            <!-- 点开看大图：和回复里的图片同一个查看器（Viewer.svelte） -->
+            <button
+              type="button"
+              onclick={() => openViewer(a.url, a.name, 'image')}
+              aria-label="查看大图：{a.name}"
+              class="block max-w-full overflow-hidden rounded-card border border-hairline"
+            >
+              <img src={a.url} alt={a.name} class="block max-h-48 max-w-full object-cover" />
+            </button>
           {:else}
             <span
               class="flex items-center gap-1.5 rounded-card bg-bubble px-3 py-2 text-meta text-fg"

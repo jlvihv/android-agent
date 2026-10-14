@@ -32,11 +32,14 @@
   const HAS_EXT = /\.[a-z0-9]+$/i;
 
   const path = $derived((viewer.url ?? '').split(/[?#]/)[0]);
-  const isImage = $derived(IMAGE.test(path));
+  const isImage = $derived(viewer.kind === 'image' || IMAGE.test(path));
   // 目录列表是服务端生成的 HTML：带结尾斜杠的、或者**没有扩展名**的都可能是它
   // （服务端对不带斜杠的目录会 302 到带斜杠的，fetch 会跟着走，拿回来是 HTML）。
   // 反过来，有扩展名的（.sh/.py/.json/…）才走文本视图。
-  const isWebPage = $derived(HTMLISH.test(path) || path.endsWith('/') || !HAS_EXT.test(path));
+  // 明说了是图片（没有扩展名的附件地址）就不是网页 —— 不然下面会白拉一次去探背景色
+  const isWebPage = $derived(
+    !isImage && (HTMLISH.test(path) || path.endsWith('/') || !HAS_EXT.test(path)),
+  );
   const media = $derived(mediaKind(viewer.url ?? ''));
 
   /** iframe 实际加载的地址（沙箱网页换到独立的源上） */
