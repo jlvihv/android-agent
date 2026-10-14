@@ -15,6 +15,7 @@ import type {
 } from './types';
 import type { Message } from './sse';
 import { uid } from './uid';
+import { isLoopbackHost } from './host';
 
 export type LogItem = { id: number; ts: number; level: string; msg: string };
 
@@ -33,6 +34,35 @@ class AgentStore {
   connected = $state(false);
   hello = $state<Hello | null>(null);
   device = $state<DeviceInfo | null>(null);
+  /**
+   * 这个核心跑在哪台机器上（`/api/health` 的 `computer`）。
+   *
+   * 手机上是 `null` —— 安卓进程里的主机名就是 `localhost`，没信息量
+   * （core 那边干脆不发，见 `http.rs` 的 `computer_name`）。电脑上是它的名字，
+   * 和 mDNS 广播 / 配对码那两处是同一个（`desktop::computer_name`）。
+   */
+  computer = $state<string | null>(null);
+  /** 跑这个核心的系统（`/api/health` 的 `platform`）：`android` = 手机自己的核心 */
+  platform = $state('');
+
+  /**
+   * 侧栏底栏那个小标签上写什么 —— 现在连的是哪台机器。
+   *
+   *   - 手机自己的核心 →「本机」
+   *   - 电脑上的核心 → 那台电脑的名字（`/api/health` 的 `computer`）
+   *
+   * 两个来源都还没到（页面刚起来那一两帧）就退到地址上：不是 loopback 就是
+   * 连着电脑，先拿它报的主机号撑着 —— 总比空着强，而且**不会说错**（写
+   * 「本机」才是错的，那是另一台机器）。
+   */
+  machine = $derived.by((): { name: string; phone: boolean } => {
+    const os = this.platform || this.hello?.platform || '';
+    if (os === 'android') return { name: '本机', phone: true };
+    if (os) return { name: this.computer ?? location.hostname, phone: false };
+    return isLoopbackHost(location.hostname)
+      ? { name: '本机', phone: true }
+      : { name: location.hostname, phone: false };
+  });
   /** 从 /api/health 读到的 provider 信息；null = 未配置，会走演示流 */
   llm = $state<{
     name: string;
@@ -126,10 +156,14 @@ class AgentStore {
         } | null;
         capabilities?: { vision: boolean; pdf: boolean } | null;
         sandboxKey?: string;
+        platform?: string;
+        computer?: string | null;
       };
       this.llm = h.llm ?? null;
       if (h.sandboxKey) this.sandboxKey = h.sandboxKey;
       this.capabilities = h.capabilities ?? { vision: true, pdf: false };
+      if (h.platform) this.platform = h.platform;
+      this.computer = h.computer ?? null;
     } catch {
       // health 失败不影响主流程
     }

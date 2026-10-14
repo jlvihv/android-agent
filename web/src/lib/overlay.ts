@@ -73,17 +73,33 @@ export type FoundCore = {
   current: boolean;
 };
 
+/** 现在有谁在「找电脑」（见 `discoverCores`） */
+const listeners = new Set<(cores: FoundCore[]) => void>();
+
 /**
  * 在局域网里找电脑：`onFound` 每次拿到完整的列表。返回停止函数 ——
- * 「连接电脑」那一栏挂上时开始找、卸掉时停，不常驻。
+ * 「选择机器」面板 / 设置里「连接电脑」那一栏挂上时开始找、卸掉时停，不常驻。
+ *
+ * **可以同时有多个订阅者**：壳那边只有一个推口（`window.__coresFound`），
+ * 这里自己分发给所有订阅者，最后一个人走了才真停。
+ *
+ * 为什么不能只管一个：两个地方会同时开着 —— 从「选择机器」面板点「手动输入地址」
+ * 进设置页时，设置里那一拦会**叠在面板上面**（面板还在，没卸）。只认最后一个的话，
+ * 面板那张清单当场就冻在那儿不再更新（而且先走的那个人会把发现整个停掉）。
  */
 export function discoverCores(onFound: (cores: FoundCore[]) => void): () => void {
   const w = globalThis as { __coresFound?: (c: FoundCore[]) => void };
-  w.__coresFound = onFound;
-  host()?.startDiscovery?.();
+  listeners.add(onFound);
+  // 壳推给单个全局口，这里转发给每一个人
+  w.__coresFound = (c) => {
+    for (const l of listeners) l(c);
+  };
+  if (listeners.size === 1) host()?.startDiscovery?.();
   return () => {
+    listeners.delete(onFound);
+    if (listeners.size) return;
     host()?.stopDiscovery?.();
-    if (w.__coresFound === onFound) delete w.__coresFound;
+    delete w.__coresFound;
   };
 }
 

@@ -11,7 +11,7 @@
    *
    * 只在 App 里出现（`canSwitchCore`）：电脑浏览器、手机浏览器里没有壳，切不了。
    */
-  import { isLoopbackHost } from '../lib/markdown';
+  import { isLoopbackHost } from '../lib/host';
   import {
     canSwitchCore,
     connectDiscoveredCore,

@@ -5,10 +5,12 @@
    *   [ 搜索对话… ]                  ← 顶上就一个搜索框，输入即搜（跨会话搜正文）
    *   💬 新对话                     ← 没搜 = 最近对话；搜了 = 命中（标题 + 摘要）
    *   💬 帮我看看屏幕上是什么界面
-   *   (⚙)
+   *   (⚙)                     jl 🖥  ← 齿轮（左）+ 现在连的是哪台机器（右对齐）
    *
    * 去掉了：agent 标题栏 + 版本号、事件入口、分割线、「最近对话」标题。
    * 搜索框替掉标题栏：边栏本来就是用来找对话的，搜索比版本号有用。
+   * 底栏（`px-4` 那一行）：左边齿轮 = 设置，最右边是**现在连的是哪台机器**
+   * （手机自己的核心 =「本机」，连着电脑 = 那台电脑的名字，见 `machine` prop）。
    *
    * 底栏那个白底的「新建会话」也去掉了 —— 它是这一屏最亮的东西，比对话本身还
    * 抢眼；开新对话本来就有头部右上角那个图标，不需要再来一个。
@@ -53,6 +55,9 @@
     onsettings,
     /** 宽屏：**并排**的一栏（不是抽屉）。见 lib/wide.svelte.ts */
     pinned = false,
+    /** 现在连的是哪台机器（`store.machine`）：`phone` = 手机自己的核心 */
+    machine,
+    onmachine,
   }: {
     sessions: Session[];
     onclose: () => void;
@@ -62,6 +67,10 @@
     /** 左下角的齿轮 → 设置页 */
     onsettings: () => void;
     pinned?: boolean;
+    machine: { name: string; phone: boolean };
+    /** 点底栏那个机器标签 → 「选择机器」面板。**壳不在时是 null**
+     *  （电脑浏览器 / 手机浏览器里只有一个核心，没得换）——那就只显示，不可点。 */
+    onmachine: (() => void) | null;
   } = $props();
 
   /** 搜索防抖（ms）：输入停顿这么久再打后端。一边打字一边发请求纯属浪费；
@@ -363,6 +372,38 @@
     >
       <Icon name="gear" size={20} />
     </button>
+
+    <!-- 最右边 = 现在连的是哪台机器。整个侧栏就这一处能回答「我在跟谁说话」——
+         界面、命令、文件到底在手机上还是在电脑上，不看它得点进设置才知道。
+         手机自己的核心写「本机」；连着电脑就写那台电脑的名字（`/api/health`
+         的 `computer`，和手机搜到的、配对码那一栏是同一个名字）。
+         图标在名字**右边**（贴右边缘），像行尾那个 `›` ：它点开的是「选择机器」
+         面板，就地换一台（面板里的内容见 MachineSheet.svelte）。没有壳的时候
+         （电脑浏览器 / 手机浏览器）只有一个核心，没得换 —— 那它就不是按钮。
+         `text-sm` + `muted`，和输入框那个模型药丸同档 —— 它是状态，不是按钮。
+         名字太长就截断：`min-w-0` 让整块可以在需要时收窄（不写死宽度上限）。 -->
+    {#snippet machineLabel()}
+      <span class="truncate">{machine.name}</span>
+      <Icon name={machine.phone ? 'phone' : 'computer'} size={15} class="shrink-0" />
+    {/snippet}
+    {#if onmachine}
+      <button
+        type="button"
+        onclick={onmachine}
+        title="现在连的是{machine.name}（点一下换一台）"
+        aria-label="现在连的是{machine.name}，打开「选择机器」"
+        class="ml-auto flex min-w-0 items-center gap-1.5 text-sm text-muted"
+      >
+        {@render machineLabel()}
+      </button>
+    {:else}
+      <span
+        class="ml-auto flex min-w-0 items-center gap-1.5 text-sm text-muted"
+        title="现在连的是{machine.name}"
+      >
+        {@render machineLabel()}
+      </span>
+    {/if}
   </div>
 {/snippet}
 

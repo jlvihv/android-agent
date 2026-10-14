@@ -14,7 +14,8 @@
    *     撑满画布反而把行高顶开
    *
    * 各图标墨迹（上面这条规矩的实测值，20px 渲染时就是像素）：
-   *   gear 16.8 · newchat 16.8 · clock 16.6 · menu 16.2×10.2 · sparkle 15.8
+   *   gear 16.8 · newchat 16.8 · clock 16.6 · menu 16.2×10.2 · phone 10×16.6
+   *   computer 16.2×15.5 · sparkle 15.8
    *   chat 15.0 · pencil 14.9 · trash 14.6 · plus 14.2
    *   send 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
    */
@@ -37,6 +38,8 @@
     | 'file'
     | 'check'
     | 'globe'
+    | 'phone'
+    | 'computer'
     | 'close';
 
   let { name, size = 20, class: cls = '' }: { name: Name; size?: number; class?: string } =
@@ -202,6 +205,23 @@
     <circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.8" />
     <ellipse cx="10" cy="10" rx="3.6" ry="7.5" stroke="currentColor" stroke-width="1.8" />
     <path d="M2.5 10h15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+  </svg>
+{:else if name === 'phone'}
+  <!-- 手机：竖圆角矩形 + 底部一条横线。宽 8.2 是手机的天然比例（进不了
+       13.6–16.8 那一档，跟 menu 的 10.2 是一个道理），高度 14.8 对齐 clock
+       的 16.6 墨迹 —— 侧栏底栏那个小标签里，它和 computer 是同一行的邻居，
+       高度对齐才不会一个高一个矮。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <rect x="5.9" y="2.6" width="8.2" height="14.8" rx="2.2" stroke="currentColor" stroke-width="1.8" />
+    <path d="M8.9 15.2h2.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+  </svg>
+{:else if name === 'computer'}
+  <!-- 显示器：屏 + 立柱 + 底座。墨迹 16.2×15.5（和 menu 同为 16.2 宽）。
+       底边比顶边略多让一点（2.3 / 2.2）—— 立柱和底座把重心往下带，
+       几何居中反而看着偏上。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <rect x="2.8" y="3.2" width="14.4" height="10.4" rx="1.8" stroke="currentColor" stroke-width="1.8" />
+    <path d="M10 13.6v3.3M6.7 16.9h6.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
   </svg>
 {:else if name === 'close'}
   <!-- 叉：两条对角线，墨迹 11.6×11.6（跟 send 同档）。 -->

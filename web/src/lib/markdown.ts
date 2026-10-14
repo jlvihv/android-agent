@@ -22,6 +22,7 @@
  */
 
 import { store } from './store.svelte.ts';
+import { isLoopbackHost } from './host';
 
 export type Span =
   | { t: 'text'; v: string }
@@ -327,11 +328,6 @@ export function sandboxPath(guestPath: string): string {
  * 只给**网页**用（查看器的 iframe）。图片 / 音视频 / 文本是 App 自己取的，
  * 留在同源（拉文本要读响应，跨源还得配 CORS）。
  */
-/** 这个主机名是不是本机（App 的 WebView、电脑上的浏览器、Vite 开发服务器） */
-export function isLoopbackHost(h: string): boolean {
-  return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
-}
-
 export function sandboxPageUrl(url: string): string {
   if (!url.startsWith('/sandbox/')) return url;
   // 局域网里用手机浏览器开电脑上的核心（`just dev-host`）时，`sandbox.localhost`

@@ -25,12 +25,13 @@
   import Composer from './components/Composer.svelte';
   import MessageList from './components/MessageList.svelte';
   import Drawer, { type Session } from './components/Drawer.svelte';
+  import MachineSheet from './components/MachineSheet.svelte';
   import ModelSheet from './components/ModelSheet.svelte';
   import Settings from './components/Settings.svelte';
   import Viewer from './components/Viewer.svelte';
   import { viewer } from './lib/viewer.svelte.ts';
   import { models } from './lib/models.svelte.ts';
-  import { agentHasBrowser, openAgentBrowser } from './lib/overlay';
+  import { agentHasBrowser, canSwitchCore, openAgentBrowser } from './lib/overlay';
   import { wide } from './lib/wide.svelte.ts';
 
   let input = $state('');
@@ -132,6 +133,16 @@
    */
   let sidebar = $state(false);
   let sheet = $state(false);
+  /**
+   * 「选择机器」面板（侧栏底栏那个机器标签点开的）。
+   *
+   * 它和设置页的关系：面板里那条「手动输入地址」把设置页**叠在面板上面**打开
+   * （不关面板）—— 跟模型面板里「管理模型提供商」一个走法。所以这里不需要
+   * 「关掉面板再开设置」那种会把返回键的历史搞脏的接法。
+   */
+  let machineSheet = $state(false);
+  /** 壳在不在（能在手机核心 / 电脑核心之间切）。桌面浏览器、手机浏览器里没有壳 */
+  const canSwitch = canSwitchCore();
   /** 设置页。可以从抽屉的齿轮进，也可以从模型面板「模型提供商」页的「管理模型提供商」进 ——
    *  后者是叠在模型面板上面的，关掉之后回到模型面板。每层各自在
    *  lib/overlay.ts 里登记，返回键先关最上面那层。 */
@@ -647,6 +658,8 @@
       ondelete={deleteSession}
       onrename={renameSession}
       onsettings={() => (settings = true)}
+      machine={store.machine}
+      onmachine={canSwitch ? () => (machineSheet = true) : null}
       pinned
     />
   {/if}
@@ -736,11 +749,20 @@
       ondelete={deleteSession}
       onrename={renameSession}
       onsettings={() => (settings = true)}
+      machine={store.machine}
+      onmachine={canSwitch ? () => (machineSheet = true) : null}
     />
   {/if}
 </div>
 
 {#if sheet}<ModelSheet onclose={close} onconfig={() => (settings = true)} rev={settingsRev} />{/if}
+
+{#if machineSheet}
+  <MachineSheet
+    onclose={() => (machineSheet = false)}
+    onsettings={() => (settings = true)}
+  />
+{/if}
 
 {#if settings}<Settings onclose={closeSettings} />{/if}
 

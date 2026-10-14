@@ -249,6 +249,9 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "platform": std::env::consts::OS,
         "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),
         "device": dev.map(|d| d.name()),
+        // 这个核心跑在哪台机器上：界面（侧栏底栏那个小标签）靠它显示
+        // 「现在连的是哪台电脑」。手机上给 `null`（本机就是这台手机，见函数注释）。
+        "computer": computer_name(),
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
             "host": s.is_host(),
@@ -270,6 +273,17 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         // 所以只有 App 自己的页面拿得到。
         "sandboxKey": st.auth().sandbox_key,
     }))
+}
+
+/// 这台机器叫什么（macOS 是「电脑名称」，Linux 是主机名）。
+///
+/// **手机上刻意是 `None`**：安卓进程里的 `gethostname()` 是 `localhost`，
+/// 一点信息量都没有 —— 那里「本机」的意思很明确（就是你手里这台手机），
+/// 界面自己说得出来。电脑上这个名字才有用：手机可能连的是客厅那台，
+/// 也可能是书房的。名字的取法和 mDNS 广播、配对码那一栏**同一个**
+/// （`desktop::computer_name`），三处显示的是同一台机器。
+fn computer_name() -> Option<String> {
+    (std::env::consts::OS != "android").then(crate::desktop::computer_name)
 }
 
 #[derive(Deserialize)]
@@ -2821,6 +2835,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(h["sandboxKey"], key.as_str());
+        // 「现在连的是哪台机器」：桌面上就是这台机器的主机名 ——
+        // 名字和 mDNS 广播 / 配对码那两处取的是同一个（`desktop::computer_name`），
+        // 界面上显示的和手机搜到的那台得对得上
+        assert_eq!(h["computer"], crate::desktop::computer_name().as_str());
 
         // App 的 WebView：/auth 种 cookie，再跳回首页
         assert_eq!(
