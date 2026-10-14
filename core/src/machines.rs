@@ -12,7 +12,6 @@
 //! 记账在库里的 `machines` 表（每台电脑一行：凭据、证书指纹、中继、局域网地址），
 //! 「上次连的是哪台」也在库里（`meta` 表的 `current_machine`）—— 手机下次启动接着连。
 
-use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -567,18 +566,6 @@ fn host_port(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
-}
-
-/// 写一个只给自己读的文件（0600）：里面有私钥。
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    o.mode(0o600);
-    o.open(path)?.write_all(bytes)
 }
 
 #[cfg(test)]

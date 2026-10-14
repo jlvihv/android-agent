@@ -62,6 +62,21 @@ fn checked(r: RelayAddr) -> Result<RelayAddr, String> {
     Ok(RelayAddr { addr, key })
 }
 
+/// 写一个只给自己读的文件（0600）：里面有私钥。
+///
+/// 只有这里用得上（手机那一头没这个模块）—— 放在 `machines.rs` 里的话，
+/// 安卓构建会报「never used」。
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    o.mode(0o600);
+    o.open(path)?.write_all(bytes)
+}
+
 /// 这台电脑的 TLS 身份（证书 + 私钥）。
 pub struct Identity {
     cert: CertificateDer<'static>,
@@ -80,7 +95,7 @@ impl Identity {
                     rcgen::generate_simple_self_signed(vec![crate::tunnel::SERVER_NAME.into()])?;
                 let (cert, key) = (c.cert.der().to_vec(), c.signing_key.serialize_der());
                 std::fs::create_dir_all(dir)?;
-                crate::machines::write_private(&key_p, &key)?;
+                write_private(&key_p, &key)?;
                 std::fs::write(&cert_p, &cert)?;
                 tracing::info!("生成了这台电脑的 TLS 证书：{}", cert_p.display());
                 (cert, key)
