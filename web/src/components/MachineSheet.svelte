@@ -151,15 +151,6 @@
       <p class="px-3.5 pt-3 text-meta leading-relaxed text-red-400">{machines.err}</p>
     {/if}
 
-    <p class="px-3.5 py-3 text-meta text-faint">
-      {machines.list.length ? '还在找…' : '正在局域网里找电脑…'}
-    </p>
-    {#if hasShell()}
-      <p class="px-1 text-meta leading-relaxed text-faint">
-        电脑上跑 <code class="font-mono">just dev-host</code>，它会出现在上面；第一次要在同一个
-        Wi-Fi 里配对。电脑配了中继的话，出门在外它也在这里（经服务器，端到端加密）。
-      </p>
-    {/if}
   {:else if page === 'pair'}
     <div class="rounded-2xl bg-surface p-3.5">
       <p class="text-meta leading-relaxed text-muted">

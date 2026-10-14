@@ -85,12 +85,6 @@
     {/each}
   </div>
   {#if err}<p class="px-1 pt-3 text-xs text-bad">{err}</p>{/if}
-
-  <p class="px-1 pt-3 text-meta leading-relaxed text-faint">
-    每家只要填 API Key，模型清单会自动拉。几家可以同时配好，在「选择模型」里点哪家的模型就用哪家。
-    Key 只存在这台手机上，也只发给对应的服务商。
-  </p>
-
   <PairingSection />
   <SandboxSection />
 </Page>

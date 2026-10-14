@@ -160,8 +160,4 @@
     {/if}
   </div>
   {#if err}<p class="px-1 pt-3 text-xs text-bad">{err}</p>{/if}
-  <p class="px-1 pt-3 text-meta leading-relaxed text-faint">
-    原地升级：装过的包、/root 里的东西都留着。会先把整个沙箱备份一份，升级不成功就自动换回。
-    要下载几百 MB、用几分钟，期间不能跑命令 —— 请留在 App 里。
-  </p>
 {/if}
