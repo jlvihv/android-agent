@@ -1,22 +1,43 @@
 package dev.vihv.agent
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * 阶段。Rust 那边（`status::Phase`）传过来的是字符串，这里**一次收敛成枚举** ——
+ * 免得界面代码里到处比字符串（改了好几轮 phase，字符串漏一个就静默落到兜底文案上）。
+ *
+ * [OTHER] 是留给**比壳新的核心**的：核心加了第五个阶段时，旧壳不会崩，只是说句兜底的话。
+ */
+enum class Phase {
+    THINKING,
+    STREAMING,
+    TOOL,
+    DONE,
+    OTHER;
+
+    companion object {
+        fun of(raw: String) = when (raw) {
+            "thinking" -> THINKING
+            "streaming" -> STREAMING
+            "tool" -> TOOL
+            "done" -> DONE
+            else -> OTHER
+        }
+    }
+}
 
 /**
  * 一个会话此刻在干什么 —— Rust 推过来的那份快照（见 `core/src/status.rs`）。
- *
- * `phase` 四档：`thinking`（在想，还没有可见正文）/ `streaming`（正文在流）/
- * `tool`（一个工具在跑）/ `done`（这个回合结束了）。
  */
 data class TurnStatus(
     val sid: String,
     /** 会话标题（侧边栏那一行）。空串 = 还没起标题，通知栏用兜底文案 */
     val title: String,
-    val phase: String,
+    val phase: Phase,
     /** 正在跑的工具名（`bash` / `read` / `edit`），没有就是 null */
     val tool: String?,
     /** 一行细节：命令、路径、或正在写的那一行 */
@@ -31,10 +52,12 @@ data class TurnStatus(
     val ok: Boolean,
     /** 结束是不是因为用户按了停止 */
     val stopped: Boolean,
-    /** 收到它的次序（越大越新）。只用来挑「最近在动的那个会话」，不显示 */
-    val receivedAt: Long,
-    /** 收到它的时刻（wall clock 毫秒）。用来判断「刚完事的那一条还新不新鲜」 */
-    val receivedAtMs: Long,
+    /**
+     * 收到它的时刻（**单调时钟** `elapsedRealtime`）。两件事都用它：
+     * 挑「最近动过的那个会话」排序，以及判断「刚完事的那一条还新不新鲜」。
+     * 单调而不是墙钟：只做先后比较，不涉及时区/校时。
+     */
+    val at: Long,
 )
 
 /**
@@ -65,9 +88,6 @@ object LiveTurnStatus {
 
     /** 状态变了要重画通知的人（前台服务一个，随服务生死）。 */
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
-
-    /** 收到次序。多会话同时跑时，推过来的顺序就是「谁最近动过」的顺序。 */
-    private val seq = AtomicLong(0)
 
     /**
      * 「刚完事」那一条还能拿来当最后一帧看多久。
@@ -114,8 +134,8 @@ object LiveTurnStatus {
      */
     fun turn(active: Boolean) {
         if (active) return
-        val now = System.currentTimeMillis()
-        val kept = bySession.filterValues { it.active || now - it.receivedAtMs <= DONE_FRESH_MS }
+        val now = SystemClock.elapsedRealtime()
+        val kept = bySession.filterValues { it.active || now - it.at <= DONE_FRESH_MS }
         if (kept.size != bySession.size) bySession = kept
     }
 
@@ -130,12 +150,12 @@ object LiveTurnStatus {
         val all = bySession.values
         val live = all.filter { it.active }
         // 有在跑的：画最近动过的那个（多会话时只画一个，另外几个用文字带上）
-        if (live.isNotEmpty()) return View(live.maxByOrNull { it.receivedAt }!!, live.size)
+        if (live.isNotEmpty()) return View(live.maxByOrNull { it.at }!!, live.size)
         // 没有在跑的：只认「刚完事」的那一条 —— 这一帧正是「刚跑完」
-        val fresh = System.currentTimeMillis() - DONE_FRESH_MS
+        val fresh = SystemClock.elapsedRealtime() - DONE_FRESH_MS
         return all
-            .filter { !it.active && it.receivedAtMs >= fresh }
-            .maxByOrNull { it.receivedAtMs }
+            .filter { !it.active && it.at >= fresh }
+            .maxByOrNull { it.at }
             ?.let { View(it, 0) }
     }
 
@@ -144,7 +164,7 @@ object LiveTurnStatus {
         return TurnStatus(
             sid = o.getString("sid"),
             title = o.optString("title"),
-            phase = o.optString("phase", "thinking"),
+            phase = Phase.of(o.optString("phase")),
             tool = o.optString("tool").takeIf { it.isNotEmpty() },
             detail = o.optString("detail").takeIf { it.isNotEmpty() },
             startedAtMs = o.optLong("started_at_ms"),
@@ -152,8 +172,7 @@ object LiveTurnStatus {
             active = o.optBoolean("active", true),
             ok = o.optBoolean("ok", true),
             stopped = o.optBoolean("stopped", false),
-            receivedAt = seq.incrementAndGet(),
-            receivedAtMs = System.currentTimeMillis(),
+            at = SystemClock.elapsedRealtime(),
         )
     }
 }

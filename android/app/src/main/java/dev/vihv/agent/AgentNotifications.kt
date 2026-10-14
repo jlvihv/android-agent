@@ -298,11 +298,11 @@ object AgentNotifications {
     private fun textual(ctx: Context, view: LiveTurnStatus.View?): String {
         val s = view?.status ?: return ctx.getString(R.string.notif_turn_text)
         val base = when (s.phase) {
-            "tool" -> toolLine(ctx, s)
-            "streaming" -> s.detail ?: ctx.getString(R.string.notif_phase_writing)
-            "thinking" -> ctx.getString(R.string.notif_phase_thinking)
-            "done" -> doneLine(ctx, s)
-            else -> ctx.getString(R.string.notif_turn_text)
+            Phase.TOOL -> toolLine(ctx, s)
+            Phase.STREAMING -> s.detail ?: ctx.getString(R.string.notif_phase_writing)
+            Phase.THINKING -> ctx.getString(R.string.notif_phase_thinking)
+            Phase.DONE -> doneLine(ctx, s)
+            Phase.OTHER -> ctx.getString(R.string.notif_turn_text)
         }
         // 多会话同时跑：主会话的细节 + 还有几个（不然用户以为只有一个在跑）
         val others = (view.activeCount - 1).coerceAtLeast(0)
@@ -339,9 +339,10 @@ object AgentNotifications {
      */
     private fun iconFor(s: TurnStatus?): Int = when {
         s == null -> R.drawable.ic_notif_work
-        s.phase == "done" -> if (s.ok && !s.stopped) R.drawable.ic_notif_done else R.drawable.ic_notif_work
-        s.phase == "tool" && s.tool == "bash" -> R.drawable.ic_notif_shell
-        s.phase == "tool" && (s.tool == "read" || s.tool == "edit") -> R.drawable.ic_notif_file
+        s.phase == Phase.DONE && s.ok && !s.stopped -> R.drawable.ic_notif_done
+        s.phase != Phase.TOOL -> R.drawable.ic_notif_work
+        s.tool == "bash" -> R.drawable.ic_notif_shell
+        s.tool == "read" || s.tool == "edit" -> R.drawable.ic_notif_file
         else -> R.drawable.ic_notif_work
     }
 
