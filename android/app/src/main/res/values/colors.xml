@@ -11,6 +11,6 @@
     <!-- 圆形按钮 / 药丸的底（web 的 color-control 令牌）：浏览器看板的标签用 -->
     <color name="control">#FF313131</color>
 
-    <!-- 应用图标的底色。就是 ink —— 图标和 App 同一个底色 -->
-    <color name="ic_launcher_background">#FF151515</color>
+    <!-- 应用图标的底色：暖白（= fg），机器人是 ink（= 黑）。白底黑画。 -->
+    <color name="ic_launcher_background">#FFF9F9F7</color>
 </resources>
