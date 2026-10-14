@@ -1104,6 +1104,28 @@ fn user_view_parts(text: &str, attachments: &[Attachment]) -> Vec<Value> {
     parts
 }
 
+/// 排队等着交给模型的用户消息 → 前端视图（`/api/session` 的 `queued`）。
+///
+/// 形状就是一条普通用户消息（`{id, role, parts, done}`，和 `session_view` 里
+/// 那些一样），`done: false` 是唯一的区别 —— 界面拿它直接当一条消息渲染，
+/// 「排队中」那些虚线气泡就是这么来的（`App.svelte` 的 `pending`）。
+///
+/// 为什么不在前端自己攒：App 切到后台、WebView 被回收之后，前端那份就没了 ——
+/// 而排队的消息还在（服务端排的），回来得看得见、也能撤。
+pub fn queued_view(msgs: &[crate::state::QueuedMsg]) -> Vec<Value> {
+    msgs.iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "role": "user",
+                "steps": 0,
+                "done": false,
+                "parts": user_view_parts(&m.text, &m.attachments),
+            })
+        })
+        .collect()
+}
+
 /// 把服务端会话转成前端 `Message[]` 的形状。
 ///
 /// **为什么需要**：前端的消息是纯客户端状态，Activity 重建 / 页面刷新 /
@@ -1357,6 +1379,25 @@ pub async fn run_turn(
     turn: std::sync::Arc<crate::state::Turn>,
     tx: mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
+    let res = turn_once(core, provider, user_text, attachments, sid, turn, tx).await;
+    // 这个回合收尾了，但队列里还有等着交给模型的用户消息：**立刻**用第一条开
+    // 下一回合。取队列的唯一入口是回合循环，没有回合在跑，那几条就永远等在那儿
+    // （界面上一直显示「排队中」）。两种典型：用户按了停止（那一轮直接返回，队列
+    // 一动没动），以及刚好卡在「查完队列、决定结束这个回合」那一瞬间进来的消息。
+    continue_with_queued(core, provider, sid);
+    res
+}
+
+/// 一个回合本身（`TurnGuard` 在这层里：返回时这个会话的「在跑」就没了）。
+async fn turn_once(
+    core: &Core,
+    provider: &Provider,
+    user_text: &str,
+    attachments: Vec<Attachment>,
+    sid: &str,
+    turn: std::sync::Arc<crate::state::Turn>,
+    tx: mpsc::UnboundedSender<Value>,
+) -> anyhow::Result<()> {
     let _guard = TurnGuard(core.clone(), sid.to_string());
     // 系统提示词可能被 /api/debug/system-prompt 覆盖过，所以不能直接用常量。
     // 在拿会话写锁之前先取出来，避免锁套锁。
@@ -1482,14 +1523,31 @@ async fn drive(
     status.thinking();
 
     // 不设轮数上限：任务要多少轮就跑多少轮，"干到一半停下" 不是可接受的
-    // 行为。唯一的出口是模型自己不再调工具，或者用户按停止
+    // 行为。唯一的出口是模型自己不再调工具（且没有排队的消息），或者用户按停止
     //（`POST /api/stop` → `abort_requested`）。
+    //
+    // `step_no` 只为一件事存在：**第一轮不取队列**（见下面 `deliver_queued`）。
+    let mut step_no = 0usize;
     loop {
         if turn.abort_requested() {
             send(tx, sse::abort("已停止")).await;
             send(tx, sse::finish()).await;
             return Ok(());
         }
+        // 排队等着交给模型的用户消息，这里交给它。
+        //
+        // **这是唯一不打断任何东西的时刻**：上一轮的 LLM 调用已经结束、它要的工具
+        // 也全跑完了，模型此刻空着。别的地方都不行 —— 正在流的那一步不能往历史里
+        // 插东西（请求已经发出去了）。
+        //
+        // 第一轮例外：那条消息（真有的话）是在这个回合**开始之后**才排进来的 ——
+        // 回合刚起步、模型一个字都还没说，没有「空下来」可言。真在这里插，前一条
+        // 用户消息后面会跟上一条空的助手消息（前端那里就是一闪而过的空气泡）。
+        // 留给第一个步边界就行。
+        if step_no > 0 {
+            deliver_queued(core, sid, tx, status).await;
+        }
+        step_no += 1;
         send(tx, sse::start_step()).await;
 
         let step_out = match stream_one(core, provider, sid, turn, status, tx).await {
@@ -1530,9 +1588,14 @@ async fn drive(
 
         let calls = step.calls;
         if calls.is_empty() {
-            // 模型不再要求工具 → 本回合结束
-            send(tx, sse::finish()).await;
-            return Ok(());
+            // 模型不再要求工具 → 除非**还有排队的用户消息**，本回合就结束了。
+            // 有的话接着跑：下一轮开头会把它交给模型（这就是「只要模型空下来就
+            // 立刻给它」那条路 —— 不用等这个回合彻底结束）。
+            if !core.state.has_queued(sid) {
+                send(tx, sse::finish()).await;
+                return Ok(());
+            }
+            continue;
         }
 
         for (n, call) in calls.iter().enumerate() {
@@ -1577,6 +1640,85 @@ async fn drive(
         }
         // 工具结果回灌，继续下一轮
     }
+}
+
+/// 把排队等着的用户消息交给模型（`AppState::queued`，步边界调一次）。
+///
+/// 三件事：写进历史（和 `/api/chat` 开头那条走的是同一套）、告诉客户端「这几条
+/// 出门了」、以及**换一条助手消息**。
+///
+/// 为什么非换不可：历史里这两条用户消息后面跟着的是新的一段 assistant
+///（`session_view_from` 的合并规则里 User 会打断合并），所以刷新之后看到的是
+/// **两条**助手消息。流式这里不换的话，实时看着是一条、刷新变成两条，排版会跳 ——
+/// 这个坑 `session_view` 那段注释里已经踩过一次。
+async fn deliver_queued(
+    core: &Core,
+    sid: &str,
+    tx: &mpsc::UnboundedSender<Value>,
+    status: &crate::status::Reporter,
+) -> bool {
+    let msgs = core.state.drain_queued(sid);
+    if msgs.is_empty() {
+        return false;
+    }
+    let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+    for m in msgs {
+        let msg = if m.attachments.is_empty() {
+            ChatMessage::User(m.text)
+        } else {
+            ChatMessage::UserFiles {
+                text: m.text,
+                attachments: m.attachments,
+            }
+        };
+        append(core, sid, msg).await;
+    }
+    send(tx, sse::queued_delivered(&ids)).await;
+    send(tx, sse::start(&uuid::Uuid::now_v7().to_string())).await;
+    // 通知栏那行：又要开始想了（原来可能停在某个工具上）
+    status.thinking();
+    true
+}
+
+/// 回合收尾之后队列里还有排队的用户消息：立刻用第一条开下一回合。
+///
+/// 剩下那几条不用管 —— 新回合的第一个步边界会把它们一起交给模型（`deliver_queued`）。
+///
+/// 新回合**没有人订阅那条流**（`tx` 的那一半直接丢掉）：客户端不需要它 ——
+/// 它要么已经从上面那个 `data-queued` 知道这条排上了，要么靠 `/api/sessions`
+/// 的 `busy` + 轮询 `/api/session` 看结果。推给没人收的通道是浪费，`send` 也
+/// 本来就是尽力而为。
+fn continue_with_queued(core: &Core, provider: &Provider, sid: &str) {
+    if !core.state.has_queued(sid) {
+        return;
+    }
+    // 先占坑再取消息：占不到（别的请求刚给它开了新回合）就让那个回合去取，
+    // 消息留在队列里不会丢。
+    let Some(turn) = core.state.begin_turn(sid) else {
+        return;
+    };
+    let Some(first) = core.state.pop_queued(sid) else {
+        core.state.end_turn(sid);
+        return;
+    };
+    let (core, provider, sid) = (core.clone(), provider.clone(), sid.to_string());
+    tokio::spawn(async move {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        if let Err(e) = run_turn(
+            &core,
+            &provider,
+            &first.text,
+            first.attachments,
+            &sid,
+            turn,
+            tx,
+        )
+        .await
+        {
+            tracing::warn!("接着跑排队的消息失败了（{sid}）: {e:#}");
+        }
+    });
 }
 
 /// 停在一批工具调用的中间：没跑完 / 没跑的那些也要有结果。
@@ -2928,6 +3070,171 @@ mod tests {
         let (r, _, _) = run_scripted(&base).await;
         assert!(r.is_err(), "流出过内容就断了：报错，不重来");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// 一次「调工具、拿结果、再来一步」的假回话：第一步要一个**不存在的工具**
+    ///（`execute_tool` 立刻回「未知工具」——不用沙箱，也不碰网络）。
+    const TOOL_CALL_REPLY: [&str; 3] = [
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"nope","arguments":"{}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ];
+
+    /// **排队的消息在下一个步边界就交给模型**，不用等整个回合结束。
+    ///
+    /// 用户要的是「模型一空下来就给它」：一个回合可能跑十几步、几分钟，等它彻底
+    /// 结束才发下一条太晚了。这里让第一步去调一个工具 —— 工具跑完就是步边界，
+    /// 那一刻模型手里没活。
+    ///
+    /// 「交出去了」只能从模型的**输入**里看：所以假端点把每次请求体都留着。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_message_is_handed_over_at_the_next_step_boundary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        crate::llm::install_crypto_provider();
+
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let core = Core::new();
+        let sid = core.state.chat.write().await.create();
+        // 这个「用户消息」是在回合**跑着**的时候来的：假端点处理第一次请求时把它
+        // 排进去（时序上等价于「模型正在干活时用户发了句话」，而且不会打架）。
+        let (enq_core, enq_sid) = (core.clone(), sid.clone());
+        let (b, n) = (bodies.clone(), calls.clone());
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |body: String| {
+                let (b, n, enq_core, enq_sid) =
+                    (b.clone(), n.clone(), enq_core.clone(), enq_sid.clone());
+                async move {
+                    b.lock().unwrap().push(body);
+                    let frames: &[&str] = if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                        enq_core.state.enqueue(
+                            &enq_sid,
+                            crate::state::QueuedMsg {
+                                id: "q1".into(),
+                                text: "顺便看看磁盘".into(),
+                                attachments: vec![],
+                            },
+                        );
+                        &TOOL_CALL_REPLY
+                    } else {
+                        &OK_REPLY
+                    };
+                    let body: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+                    ([("content-type", "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut p = Provider::compatible("fake", &base, "m", "k");
+        p.api_style = crate::llm::ApiStyle::Chat;
+        *core.state.vision.write().unwrap() = Some((format!("{base}|m"), false));
+        *core.state.files.write().unwrap() = Some((format!("{base}|m"), false));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let t = core.state.begin_turn(&sid).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_turn(&core, &p, "你好", vec![], &sid, t, tx),
+        )
+        .await
+        .expect("回合卡住了")
+        .unwrap();
+
+        // 队列空了 = 交出去了
+        assert!(core.state.queued_list(&sid).is_empty());
+
+        // 第二次请求里能看到它 —— 这就是「交给模型」的定义。
+        // 单独一个块：锁不能跨 await（下面还要读会话），clippy 认块不认 `drop`
+        {
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "步边界应该只多打一次请求");
+            assert!(
+                bodies[1].contains("顺便看看磁盘"),
+                "排队那条没进模型的输入：{}",
+                bodies[1]
+            );
+            assert!(
+                !bodies[0].contains("顺便看看磁盘"),
+                "第一个请求里不该有它（那时它还没排进来）"
+            );
+        }
+
+        let mut chunks = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            chunks.push(c);
+        }
+        let delivered = chunks
+            .iter()
+            .find(|c| c["type"] == "data-queued-delivered")
+            .expect("得告诉界面这几条出门了");
+        assert_eq!(delivered["data"]["ids"][0], "q1");
+        let starts: Vec<&str> = chunks
+            .iter()
+            .filter(|c| c["type"] == "start")
+            .map(|c| c["messageId"].as_str().unwrap())
+            .collect();
+        assert_eq!(starts.len(), 2, "交给模型之后要换一条助手消息");
+        assert_ne!(starts[0], starts[1]);
+
+        // 历史形状：两条用户消息、两段助手输出 —— 刷新之后看到的也是这两条
+        //（`session_view` 的合并规则里，User 会打断合并）
+        let store = core.state.chat.read().await;
+        let view = session_view(store.get(&sid).unwrap());
+        let roles: Vec<&str> = view.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+        assert_eq!(view[2]["parts"][0]["text"], "顺便看看磁盘");
+    }
+
+    /// 回合收尾了但队列里还有东西（按停止、或者刚好卡在「查完队列决定结束」那一
+    /// 瞬间进来的消息）：**立刻**开下一回合把它送出去，不能烂在队里。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_messages_left_over_after_a_turn_start_the_next_one() {
+        crate::llm::install_crypto_provider();
+        let (base, hits) =
+            scripted_provider(vec![Ok(OK_REPLY.to_vec()), Ok(OK_REPLY.to_vec())]).await;
+        let mut p = Provider::compatible("fake", &base, "m", "k");
+        p.api_style = crate::llm::ApiStyle::Chat;
+
+        let core = Core::new();
+        let sid = core.state.chat.write().await.create();
+        *core.state.vision.write().unwrap() = Some((format!("{base}|m"), false));
+        *core.state.files.write().unwrap() = Some((format!("{base}|m"), false));
+        core.state.enqueue(
+            &sid,
+            crate::state::QueuedMsg {
+                id: "q1".into(),
+                text: "接着说".into(),
+                attachments: vec![],
+            },
+        );
+
+        // 没有回合在跑（队列里却有条消息）：这就是「按了停止」之后的样子
+        continue_with_queued(&core, &p, &sid);
+
+        // 等那个新回合跑完（它没人订阅流，看历史）
+        for _ in 0..200 {
+            if !core.state.is_busy(&sid) && core.state.queued_list(&sid).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(core.state.queued_list(&sid).is_empty(), "还留在队列里");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let store = core.state.chat.read().await;
+        let msgs = &store.get(&sid).unwrap().messages;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, ChatMessage::User(t) if t == "接着说")),
+            "排队的消息没进历史：{msgs:?}"
+        );
+        assert!(
+            matches!(msgs.last(), Some(ChatMessage::Assistant { content, .. }) if content == "好了")
+        );
     }
 
     /// Responses API：上一步的思考条目原样放回 input，排在那一步的正文和

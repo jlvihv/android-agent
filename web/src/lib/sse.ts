@@ -210,6 +210,39 @@ export function onUsage(fn: ((u: Usage) => void) | null): void {
   usageSink = fn;
 }
 
+/**
+ * 服务端把排队的那几条用户消息**交给模型了**（`data-queued-delivered`）。
+ *
+ * UI 靠它把那几条从「排队中」（虚线圈 + ×）挪进正文 —— 交出去之后它们就在
+ * 服务端的历史里了，不是「还没发出去」的东西了。
+ *
+ * 和 `onUsage` 同一个理由放在这里：一个个 delta 都往 UI 里推太吵，由 reducer
+ * 直接报一声。
+ */
+let queuedSink: ((ids: string[]) => void) | null = null;
+export function onQueuedDelivered(fn: ((ids: string[]) => void) | null): void {
+  queuedSink = fn;
+}
+
+/** 这条消息排进服务端的队列了（`POST /api/chat` 的全部回应就这一帧）。 */
+export function isQueued(c: UiChunk | null): c is { type: 'data-queued'; data: { id: string } } {
+  return c?.type === 'data-queued';
+}
+
+/**
+ * 把已经读过的一帧塞回流的最前面。
+ *
+ * 发消息时要先看首帧才知道服务端是「开跑了」还是「排队了」（`send` 里那段），
+ * 那帧不能丢 —— 后面的 reducer 还要吃它。
+ */
+export async function* prepend(
+  first: UiChunk | null,
+  rest: AsyncGenerator<UiChunk, void, undefined>,
+): AsyncGenerator<UiChunk, void, undefined> {
+  if (first) yield first;
+  yield* rest;
+}
+
 export type ToolPart = {
   type: 'tool';
   toolCallId: string;
@@ -378,6 +411,10 @@ export function applyChunk(msg: Message, c: UiChunk): void {
         });
         // 用量单独报一声（圆环要实时的，不想让 UI 去扫 parts）
         if (c.type === 'data-usage') usageSink?.(c.data as Usage);
+        // 排队的消息交出去了：界面把那几条从「排队中」挪进正文
+        if (c.type === 'data-queued-delivered') {
+          queuedSink?.((c.data as { ids: string[] }).ids ?? []);
+        }
       }
       break;
     }
@@ -389,12 +426,34 @@ export async function consume(
   msg: Message,
   stream: AsyncGenerator<UiChunk, void, undefined>,
   onUpdate?: (m: Message) => void,
+  /**
+   * 流里又出现一个 `start` —— 服务端把排队的消息交给模型了，接下来的输出属于
+   * **新的一条**助手消息（服务端的历史里也是新的一条：`session_view` 的合并
+   * 规则里，User 会打断合并）。返回新消息接着写，`null` = 还是写这一条。
+   *
+   * 不给这个回调的调用方（脚本 / 测试）一直写同一条。
+   */
+  onRestart?: (prev: Message) => Message | null,
 ): Promise<Message> {
+  let cur = msg;
+  // 第一条 `start` 对应的消息调用方已经建好了（`beginStreaming`），不换
+  let started = false;
   for await (const c of stream) {
-    applyChunk(msg, c);
-    onUpdate?.(msg);
+    if (c.type === 'start') {
+      if (started && onRestart) {
+        const next = onRestart(cur);
+        if (next) {
+          cur = next;
+          continue;
+        }
+      }
+      started = true;
+      continue;
+    }
+    applyChunk(cur, c);
+    onUpdate?.(cur);
   }
-  msg.done = true;
-  onUpdate?.(msg);
-  return msg;
+  cur.done = true;
+  onUpdate?.(cur);
+  return cur;
 }

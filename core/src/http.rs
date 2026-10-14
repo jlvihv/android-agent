@@ -66,6 +66,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/activate", post(activate_session))
         .route("/api/sessions/rename", post(rename_session))
         .route("/api/sessions/delete", post(delete_session))
+        .route("/api/sessions/unqueue", post(unqueue))
         .route("/api/reset", post(reset))
         .route("/api/device/log", post(device_log))
         .route("/api/ws", get(ws_upgrade))
@@ -743,6 +744,12 @@ struct ChatBody {
     /// 服务端从 `pending_attachments` 取出完整描述后跟着用户消息进历史。
     #[serde(default)]
     attachments: Vec<String>,
+    /// 这条消息在界面上的 id。
+    ///
+    /// 排队时用得上：界面拿它把「排队中」那个气泡和 `data-queued` 对上，
+    /// `/api/sessions/unqueue` 也拿它撤。不给就现生成一个（老客户端 / 脚本）。
+    #[serde(default)]
+    id: Option<String>,
 }
 
 /// `POST /api/chat` → AI SDK UI Message Stream。
@@ -773,24 +780,11 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
         }
     };
 
-    // 一个会话同时只跑一个回合（两个回合往同一段历史里交错追加就乱了）；
-    // 不同会话可以各跑各的。
-    let turn = match &provider {
-        Some(_) => match st.begin_turn(&sid) {
-            Some(t) => Some(t),
-            None => {
-                return (
-                    StatusCode::CONFLICT,
-                    "这个会话还有回合在运行，先停止它或等它结束",
-                )
-                    .into_response()
-            }
-        },
-        None => None,
-    };
-
     // 取出这条消息带的附件。刚从上传接口存进来的，按 id 取走（取走就从
     // pending 里消失，同一份附件不会被两条消息重复引用）。
+    //
+    // **排在回合检查之前**：排队的消息也要把附件拿在手里，不然「排队期间
+    // 上传的那张图」到交给模型时已经不在 pending 里了。
     let mut attachments: Vec<crate::agent::Attachment> = Vec::new();
     if !body.attachments.is_empty() {
         let mut pending = st
@@ -802,7 +796,6 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
                 Some((_, a)) => attachments.push(a),
                 None => {
                     drop(pending);
-                    st.end_turn(&sid);
                     return (
                         StatusCode::BAD_REQUEST,
                         format!("附件已失效（{id}），请重新添加"),
@@ -812,6 +805,36 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
             }
         }
     }
+
+    // 一个会话同时只跑一个回合（两个回合往同一段历史里交错追加就乱了）；
+    // 不同会话可以各跑各的。
+    //
+    // **正跑着的时候不再回 409**：这条消息排进**服务端的**队列，正在跑的那个回合
+    // 会在步边界把它取走交给模型（`agent::deliver_queued`）—— 模型一空下来就拿到，
+    // 不用等整个回合结束。
+    //
+    // 为什么不接着让前端自己排队（老做法）：前端那个队列活在 WebView 里，
+    // App 切到后台、WebView 被冻住或回收，那条消息就永远发不出去了 —— 而
+    // 「等一会儿再发同一个请求」本来就是核心该保证的事。
+    let turn = match &provider {
+        Some(_) => match st.begin_turn(&sid) {
+            Some(t) => Some(t),
+            None => {
+                let id = body.id.clone().unwrap_or_else(new_id);
+                st.enqueue(
+                    &sid,
+                    crate::state::QueuedMsg {
+                        id: id.clone(),
+                        text: body.text,
+                        attachments,
+                    },
+                );
+                st.log("info", format!("这个会话在跑，消息先排队（{}）", sid));
+                return queued_response(&id);
+            }
+        },
+        None => None,
+    };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let core = Core { state: st.clone() };
@@ -1426,28 +1449,34 @@ async fn get_session(
         }
     };
     let Some(id) = id else {
-        return Json(json!({ "messages": [], "rev": "", "busy": false }));
+        return Json(json!({ "messages": [], "queued": [], "rev": "", "busy": false }));
     };
     // 「进行中」看的是**这个**会话：别的会话在跑不影响这里发消息
     let busy = st.is_busy(&id);
     // 不活跃的会话消息不在内存里，先读回来
     if let Err(e) = st.ensure_loaded(&id).await {
-        return Json(json!({ "messages": [], "rev": "", "busy": busy, "error": format!("{e:#}") }));
+        return Json(
+            json!({ "messages": [], "queued": [], "rev": "", "busy": busy, "error": format!("{e:#}") }),
+        );
     }
 
     // 读锁一直持到拼完 —— rev 和它对应的那份 messages 必须来自同一个瞬间，
     // 不然客户端会存下一个「对不上的 rev」，之后就永远以为自己是最新的。
+    // 排队等着交给模型的那些（界面上的「排队中」）。**每次都要带**：它们的变化
+    // 不进 `rev`（那是消息的版本号），光看 rev 是看不出「这条交出去了」的。
+    let queued = crate::agent::queued_view(&st.queued_list(&id));
+
     let store = st.chat.read().await;
     let Some(sess) = store.get(&id) else {
-        return Json(json!({ "messages": [], "rev": "", "busy": false }));
+        return Json(json!({ "messages": [], "queued": queued, "rev": "", "busy": false }));
     };
     if !sess.resident() {
         // 读进来之后、拿锁之前又被放掉了（极少见）：让客户端下次再来
-        return Json(json!({ "unchanged": true, "rev": q.rev, "busy": busy }));
+        return Json(json!({ "unchanged": true, "queued": queued, "rev": q.rev, "busy": busy }));
     }
     let rev = session_rev(sess);
     if !q.rev.is_empty() && q.rev == rev {
-        return Json(json!({ "unchanged": true, "rev": rev, "busy": busy }));
+        return Json(json!({ "unchanged": true, "queued": queued, "rev": rev, "busy": busy }));
     }
 
     // token 用量（输入框那个上下文圆环）。它只在有 LLM 调用时才变，
@@ -1462,6 +1491,7 @@ async fn get_session(
             drop(store);
             return Json(json!({
                 "messages": p.messages,
+                "queued": queued,
                 "rev": rev,
                 "busy": busy,
                 "append": true,
@@ -1477,7 +1507,7 @@ async fn get_session(
 
     // busy 让前端知道「服务端还在跑」—— App 切到后台时 agent 不会停，
     // 切回来要能看出还在进行中，而不是以为卡住了。
-    Json(json!({ "messages": msgs, "rev": rev, "busy": busy, "usage": usage }))
+    Json(json!({ "messages": msgs, "queued": queued, "rev": rev, "busy": busy, "usage": usage }))
 }
 
 /// 从 rev 里解出 (会话 id, 已存消息数)。格式见 `session_rev`。
@@ -1786,6 +1816,21 @@ async fn delete_session(
     Json(json!({ "ok": true })).into_response()
 }
 
+#[derive(Deserialize)]
+struct UnqueueBody {
+    session: String,
+    id: String,
+}
+
+/// `POST /api/sessions/unqueue` → 撤掉一条**还在排队**的用户消息。
+///
+/// 界面上「排队中」那条气泡左边那个 ×。已经交给模型的撤不掉（那时它是历史了），
+/// 这时回 `removed: false` —— 不是什么错误，界面刷新一下就看到它已经落进正文了。
+async fn unqueue(State(st): State<Arc<AppState>>, Json(body): Json<UnqueueBody>) -> Response {
+    let removed = st.unqueue(&body.session, &body.id);
+    Json(json!({ "ok": true, "removed": removed })).into_response()
+}
+
 /// `POST /api/reset` → 清空会话历史。
 async fn reset(State(st): State<Arc<AppState>>) -> Response {
     match st.reset_active().await {
@@ -1795,6 +1840,22 @@ async fn reset(State(st): State<Arc<AppState>>) -> Response {
         }
         Err(why) => (StatusCode::CONFLICT, why).into_response(),
     }
+}
+
+/// 一个现生成的 id（客户端没给 `id` 时用：脚本、老客户端）。
+fn new_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+/// 「这条消息排上队了」的回应：一条只有一帧（`data-queued`）的流。
+///
+/// 刻意**和正常回合同一种形状**（SSE + 同一个 header）：前端那一路就多一个
+/// 「先看首帧」的判断，不用为一个状态分出一条 HTTP 分支。
+fn queued_response(id: &str) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let _ = tx.send(sse::queued(id));
+    drop(tx); // 通道关掉 → 转发任务补上 [DONE]
+    sse_response(rx)
 }
 
 /// 把 chunk 通道包成带正确 header 的 SSE 响应，并在结束时补 `[DONE]`。
@@ -2887,9 +2948,9 @@ mod tests {
         );
     }
 
-    /// 不同会话可以各跑一个回合；同一个会话不行。
+    /// 不同会话可以各跑一个回合；同一个会话跑着时，新消息进**队列**（不是 409）。
     #[tokio::test]
-    async fn a_busy_session_refuses_a_second_turn_but_others_do_not_care() {
+    async fn a_busy_session_queues_the_second_message_but_others_do_not_care() {
         let st = crate::state::AppState::new();
         *st.llm.write().unwrap() = Some(crate::llm::Provider::compatible(
             "x",
@@ -2904,13 +2965,60 @@ mod tests {
         let _running = st.begin_turn(&a).unwrap();
         let (base, c) = serve(st.clone()).await;
 
+        // a 正跑着：这条消息排进服务端的队列（回一条只有 data-queued 的流），
+        // 不是 409 —— 前端那个队列活在 WebView 里，App 切后台就发不出去了
         let r = c
             .post(format!("{base}/api/chat"))
-            .json(&serde_json::json!({ "text": "再来", "session": a }))
+            .json(&serde_json::json!({ "text": "再来", "session": a, "id": "q1" }))
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status().as_u16(), 409);
+        assert_eq!(r.status().as_u16(), 200);
+        let body = r.text().await.unwrap();
+        assert!(body.contains("data-queued"), "得告诉界面这条排上了：{body}");
+        assert!(!body.contains("data-error"), "{body}");
+        let q = st.queued_list(&a);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, "q1", "客户端给的 id 得原样留着（界面靠它撤）");
+        assert_eq!(q[0].text, "再来");
+
+        // 会话里的排队清单（界面画「排队中」那些气泡）：形状就是一条用户消息
+        let v: serde_json::Value = c
+            .get(format!("{base}/api/session?id={a}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["queued"][0]["id"], "q1");
+        assert_eq!(v["queued"][0]["role"], "user");
+        assert_eq!(v["queued"][0]["done"], false);
+        assert_eq!(v["queued"][0]["parts"][0]["text"], "再来");
+
+        // 撤掉它（气泡左边那个 ×）
+        let v: serde_json::Value = c
+            .post(format!("{base}/api/sessions/unqueue"))
+            .json(&serde_json::json!({ "session": a, "id": "q1" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["removed"], true);
+        assert!(st.queued_list(&a).is_empty());
+        // 再撤一次就没得撤了（不是错误）
+        let v: serde_json::Value = c
+            .post(format!("{base}/api/sessions/unqueue"))
+            .json(&serde_json::json!({ "session": a, "id": "q1" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["removed"], false);
 
         // b 不受 a 影响：能开始（provider 是个连不上的地址，回合会以报错结束）
         let r = c

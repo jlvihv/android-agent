@@ -10,11 +10,15 @@
   import { store } from './lib/store.svelte.ts';
   import {
     consume,
+    isQueued,
+    prepend,
     streamFrom,
+    onQueuedDelivered,
     onUsage,
     cachedTokens,
     type Message,
     type Part,
+    type UiChunk,
     type Upload,
     type Usage,
     type UsageTotals,
@@ -44,24 +48,25 @@
   let sessions = $state<Session[]>([]);
 
   /**
-   * 排队中的消息。
+   * 排队等着交给模型的消息 —— 它是**服务端**那份队列的本地镜子。
    *
-   * 模型还在说的时候用户又发了话，不进 `messages` 也不发请求 —— 先在这里排着
-   * （界面上是输入框上方那几条「排队中」），等这个回合**收尾**再依次发出去。
+   * 队列本身在核心（`AppState::queued`）：`POST /api/chat` 碰上这个会话正跑着
+   * 就把它排进去，正在跑的那个回合**一空下来**（步边界）就把它交给模型 —— 不用
+   * 等整个回合结束。为什么不在前端排：前端那个队列活在 WebView 里，App 切到
+   * 后台、WebView 被冻住或回收，这条消息就永远发不出去了（见 docs/05 的「排队」）。
    *
-   * 两个刻意的选择：
+   * 这一份只负责**画**（虚线气泡 + 左边那个 ×），三个来源：
    *
-   * 1. **不先落成用户气泡**。落进去它就成了本地历史的一部分，而服务端此时还
-   *    没有这条消息 —— 流结束后的那次 `loadMessages` 会按服务端重写 `messages`
-   *    （id 全新、DOM 重建），气泡要么闪一下就没，要么被冲到别处。
-   *    排队 ≠ 说过，所以它在输入区，不在正文里。
-   * 2. **每条记着自己属于哪个会话**。回合在后台跑着时用户可能已经切走了，
-   *    队列不能跟着当前视图跑 —— `flushQueue` 只发属于**当前**会话的那些。
+   * 1. `send` 里刚发出去、还没听到回话的那条（`pending: true`）—— 服务端说
+   *    「排队了」就坐实，说「开跑了」就翻进正文（见 `deliver`）。
+   * 2. 服务端把排队的消息交给模型时推的 `data-queued-delivered`：从这里挪进正文。
+   * 3. `loadMessages` 每次按 `/api/session` 的 `queued` **整份重来** —— App 被
+   *    回收过 / 换了设备 / 界面刚刷新时，那几条就是从这儿回来的。
+   *
+   * 每条记着自己属于哪个会话：回合在后台跑着时用户可能已经切走了。
    */
-  type Queued = { id: string; sid: string; text: string; attachments: Upload[] };
+  type Queued = { id: string; sid: string; parts: Part[]; pending?: boolean };
   let queue = $state<Queued[]>([]);
-  /** 正在把队列里的一条发出去（挡住重入：effect / 流结束回调会重复触发） */
-  let flushing = false;
 
   /**
    * 本会话的 token 用量（输入框里那个上下文圆环）。
@@ -217,6 +222,8 @@
         append?: boolean;
         /** 增量时从哪里开始替换 */
         replaceFrom?: number;
+        /** 服务端队列里等着交给模型的那几条（`Message` 的形状，`done: false`） */
+        queued?: Message[];
         /**
          * 增量且是同一回合的延续：`messages[0]` 接在本地第 `replaceFrom` 条
          * （assistant）的前 `keepParts` 个 part 后面 —— 服务端只重发最后一步，
@@ -227,6 +234,22 @@
         usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
       };
       serverBusy = !!d.busy;
+      rev = d.rev ?? '';
+      // 排队那几条按服务端**整份重来**（`unchanged` 时也要）：它们的变化不进
+      // `rev`（那是消息的版本号），光看 rev 看不出「排队里少了一条」。
+      // `pending` 的那几条是刚发出去、还没听到回话的，留着 —— 服务端下一份就会
+      // 报上它们（或者它们已经开跑了）。
+      // 会话 id 从 rev 里解（`会话id:消息数:更新时间`）。**不能读 `sessionId`**：
+      // 它要到下面几行才赋值，而排队那几条得按会话过滤 —— 刚刷新进来的那一份
+      // 会话 id 在这里还是空的（那几条就全被滤掉了，实测踩过）。
+      const sid = rev.split(':')[0] || sessionId;
+      if (d.queued) {
+        const inflight = queue.filter((q) => q.pending && q.sid === sessionId);
+        queue = [
+          ...d.queued.map((m): Queued => ({ id: m.id, sid, parts: m.parts })),
+          ...inflight,
+        ];
+      }
       // 服务端说没变：连 JSON 里都不带 messages，什么都不用做
       if (d.unchanged) return;
       // 用量整份换成服务端的：它数的是这个会话的**全部**调用，而我们手上
@@ -242,10 +265,8 @@
             },
           }
         : null;
-      rev = d.rev ?? '';
-      // rev 的格式是 `会话id:消息数:更新时间`。会话 id 变了（切会话 / 重置）
-      // 就不能按 id 复用旧消息 —— `u1` 这种 id 每条会话都会有。
-      const sid = rev.split(':')[0];
+      // 会话 id 变了（切会话 / 重置）就不能按 id 复用旧消息 ——
+      // `u1` 这种 id 每条会话都会有。`sid` 在上面算过了。
       const same = sid === sessionId;
       if (d.append && same) {
         // 服务端只补了差的那段：前面的原样留着，从 replaceFrom 换掉尾部
@@ -334,8 +355,7 @@
     // 新会话还没跑过，用量也从零开始
     usage = null;
     // 新会话在服务端**还不存在**，所以它一定没在跑 —— 不清的话会留着上一条
-    // 会话的「服务端还在跑」，输入框要等一个轮询周期才解冻（而且队列会以为
-    // 自己该排队）。
+    // 会话的「服务端还在跑」，输入框要等一个轮询周期才解冻。
     serverBusy = false;
     drawer = false;
   }
@@ -420,37 +440,34 @@
     return () => clearInterval(t);
   });
 
-  // 服务端这个会话从「在跑」变成「没跑」→ 看队列里有没有要发的。
-  //
-  // 这条路是给**本地没连着流**的情况用的（切走又切回来 / 从后台回来 / 按了
-  // 停止）：那时只能靠上面的轮询知道它跑完了，`run` 的 finally 根本没经过。
-  // `queue.length` 和 `sessionId` 都要在这里读一下，否则它们变了不重跑。
+  /**
+   * 服务端把排队的消息交给模型了 → 把那几条从「排队中」挪进正文。
+   *
+   * 挪进去就成了本地历史的一部分（`done: true`）：服务端那边它们也确实是历史了
+   * —— 紧接着流里会来一个 `start`，模型的回答进**新的一条**助手消息（`consume`
+   * 的 `onRestart`），和服务端历史的形状一致（`session_view` 里 User 会打断
+   * 助手消息的合并）。
+   */
   $effect(() => {
-    void queue.length;
-    void sessionId;
-    if (busy || serverBusy) return;
-    // untrack：flushQueue 里会 `await loadSessions()` / `deliver()`，那一串对
-    // sessions / messages / rev 的读写要是被记成依赖，这个 effect 会被自己刚
-    // 写的东西反复叫醒。
-    untrack(() => void flushQueue());
+    onQueuedDelivered((ids) => {
+      if (!ids.length) return;
+      const moved = queue.filter((q) => ids.includes(q.id));
+      if (moved.length) queue = queue.filter((q) => !ids.includes(q.id));
+      for (const q of moved) {
+        messages.push({ id: q.id, role: 'user', parts: q.parts, steps: 0, done: true });
+      }
+    });
+    return () => onQueuedDelivered(null);
   });
 
-  // 当前会话里排队的那几条。其它会话的队列在内存里排着，切回去才又看得见
-  // （也才轮得到它发，见 flushQueue）。
+  // 当前会话里排队的那几条（其它会话的排着队，切回去才看得见）。
   let queued = $derived(queue.filter((q) => q.sid === sessionId));
 
   // 它们按「**还没发出去**的用户消息」渲染（`done: false`）—— 消息列表里就是
-  // 普通用户气泡的样子，只多一圈虚线和左边一个 ×。数据上仍在 `queue` 里：
-  // 没进 `messages`（详见上面 Queued 的注释）。
+  // 普通用户气泡的样子，只多一圈虚线和左边一个 ×（详见上面 Queued 的注释）。
   let queuedMsgs = $derived(
     queued.map(
-      (q): Message => ({
-        id: q.id,
-        role: 'user',
-        parts: userParts(q.text, q.attachments),
-        steps: 0,
-        done: false,
-      }),
+      (q): Message => ({ id: q.id, role: 'user', parts: q.parts, steps: 0, done: false }),
     ),
   );
 
@@ -479,24 +496,36 @@
 
   // —— 对话 ——
 
-  async function run(msg: Message, path: string, body: unknown) {
-    const me: Run = { controller: new AbortController() };
+  /**
+   * 收一条流：把 chunk 一个个喂进 `msg`，直到流结束。
+   *
+   * `me` 是这条流的身份（`live` 和停止键认它）；`msg` 是这条流往里写的消息 ——
+   * 服务端把排队的消息交给模型时会再来一个 `start`，那时换**新的一条**写
+   * （见下面 `onRestart`），和服务端历史的形状一致。
+   */
+  async function run(me: Run, msg: Message, stream: AsyncGenerator<UiChunk, void, undefined>) {
     live = me;
     busy = true;
+    let cur = msg;
     try {
-      await consume(msg, streamFrom(path, body, me.controller.signal));
+      await consume(msg, stream, undefined, (prev) => {
+        prev.done = true;
+        cur = store.beginStreaming();
+        messages.push(cur);
+        return cur;
+      });
     } catch (e) {
-      if (!me.controller.signal.aborted) msg.parts.push({ type: 'error', text: String(e) });
+      if (!me.controller.signal.aborted) {
+        cur.parts.push({ type: 'error', text: String(e) });
+      }
     } finally {
-      msg.done = true;
+      cur.done = true;
       // 已经被 detach（切走了）、或者后面又开了一条：别把别人的状态清掉
       if (live === me) {
         live = null;
         busy = false;
       }
       void loadSessions();
-      // 这个回合完了 → 看队列里有没有等着发的（见 flushQueue）
-      void flushQueue();
     }
   }
 
@@ -517,24 +546,34 @@
   }
 
   /**
-   * 发一条消息：没人跑就直接发，有人在跑就排队。
+   * 发一条消息。
    *
-   * 这是「模型说话时用户也能说话」的入口 —— 输入框一直是活的，只是这条
-   * 消息要等到 agent 收尾才真的出去（见 `flushQueue`）。
+   * **谁跑谁排队由服务端说了算**，前端不猜：先按「排队中」画出来，然后看
+   * `POST /api/chat` 的**首帧** ——
+   *
+   *   - 正常流（`start` 开头）= 这个回合开跑了 → 那条气泡翻进正文，接着收流；
+   *   - `data-queued` = 这个会话正跑着，消息进了**服务端的**队列 → 虚线气泡留着，
+   *     等回合跑到步边界时服务端会把它交给模型（`data-queued-delivered`）。
+   *
+   * 为什么不再由前端判断「正跑着 → 排队」：那样队列就活在 WebView 里，App 切到
+   * 后台、WebView 被冻住或回收，这条消息永远发不出去；而且只有等整个回合结束
+   * 才发得出去，模型中途空下来也拿不到它。
    */
   async function send(attachments: Upload[]) {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
     input = '';
 
-    // 这个会话有人占着：本地连着流（busy），或者本地没连着而服务端还在跑
-    // （serverBusy，切回来 / 从后台回来）。两种都只能排队 —— 直接发会撞 409
-    // （一个会话同时只跑一个回合）。
-    if (busy || serverBusy) {
-      queue = [...queue, { id: uid(), sid: sessionId, text, attachments }];
+    const id = uid();
+    const parts = userParts(text, attachments);
+    const sid = await ensureSession();
+    if (!sid) {
+      messages.push({ id, role: 'user', parts, steps: 0, done: true });
+      messages.push({ id: uid(), role: 'assistant', steps: 0, done: true, parts: [{ type: 'error', text: '建会话失败，再试一次' }] });
       return;
     }
-    await deliver(text, attachments);
+    queue = [...queue, { id, sid, parts, pending: true }];
+    await deliver(id, sid, text, attachments, parts);
   }
 
   /**
@@ -556,77 +595,74 @@
   }
 
   /**
-   * 真的把一条消息发出去：先落本地两个气泡，再起流。
-   *
-   * 和「排队」分开：`send` 只管该不该排队，这里只管发。`flushQueue` 也走这里。
+   * 真的把一条消息交给服务端（首帧决定它是「开跑」还是「排队」）。
    */
-  async function deliver(text: string, attachments: Upload[]) {
-    // 附件先作为 part 拼进本地气泡（和 session_view 恢复出来的形状一致）——
-    // 否则发出去的下一秒，自己的图片就看不见了。
-    const parts = userParts(text, attachments);
-
-    messages.push({
-      id: uid(),
-      role: 'user',
-      parts,
-      steps: 0,
-      done: true,
-    });
-    const msg = store.beginStreaming();
-    messages.push(msg);
-    busy = true; // 建会话那一下也算在跑：别让人连点两次
-    const sid = await ensureSession();
-    if (!sid) {
-      busy = false;
-      msg.parts.push({ type: 'error', text: '建会话失败，再试一次' });
-      msg.done = true;
+  async function deliver(id: string, sid: string, text: string, attachments: Upload[], parts: Part[]) {
+    const me: Run = { controller: new AbortController() };
+    const stream = streamFrom(
+      '/api/chat',
+      { text, id, session: sid, attachments: attachments.map((a) => a.id) },
+      me.controller.signal,
+    );
+    let first: UiChunk | null = null;
+    try {
+      first = (await stream.next()).value ?? null;
+    } catch (e) {
+      // 连请求都没发出去：把那条虚线气泡撤了，用一条错误消息说清楚（字不能丢）
+      queue = queue.filter((q) => q.id !== id);
+      messages.push({ id, role: 'user', parts, steps: 0, done: true });
+      messages.push({
+        id: uid(),
+        role: 'assistant',
+        steps: 0,
+        done: true,
+        parts: [{ type: 'error', text: String(e) }],
+      });
       return;
     }
-    void run(msg, '/api/chat', {
-      text,
-      // 明确写进哪个会话：回合在后台跑着时用户可能已经切走了
-      session: sid,
-      attachments: attachments.map((a) => a.id),
+
+    if (isQueued(first)) {
+      // 排上了：服务端那边已经有它了，这条流到此为止（读完就扔，别挂着连接）
+      queue = queue.map((q) => (q.id === id ? { ...q, pending: false } : q));
+      void (async () => {
+        try {
+          for await (const _ of stream) void _;
+        } catch {
+          /* 一帧就结束的流，读不完也无所谓 */
+        }
+      })();
+      // 本地这条流结束了 ≠ 服务端那个回合结束了：此刻还在跑的是**另一条**流
+      // （或者根本没连着）。所以这里 busy 一点都不动。
+      return;
+    }
+
+    // 开跑了：那条虚线气泡翻进正文（换了个 id 的影子都没有 —— 就是同一个 id）
+    queue = queue.filter((q) => q.id !== id);
+    messages.push({ id, role: 'user', parts, steps: 0, done: true });
+    const msg = store.beginStreaming();
+    messages.push(msg);
+    await run(me, msg, prepend(first, stream));
+  }
+
+  /**
+   * 撤掉一条**还在排队**的消息（虚线气泡左边那个 ×）。
+   *
+   * 队列在服务端，所以得告诉它 —— 不然那条照样会在下一个步边界交给模型。界面上
+   * 立刻撤掉（不等回话）：真撤不掉（刚好在这一刻被交出去了）也没关系，下一次
+   * `loadMessages` 就看到它已经落进正文了。
+   */
+  function dropQueued(id: string) {
+    const item = queue.find((q) => q.id === id);
+    queue = queue.filter((q) => q.id !== id);
+    if (!item) return;
+    void fetch('/api/sessions/unqueue', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session: item.sid, id }),
+    }).catch(() => {
+      /* 撤不掉就算了：它已经落进正文，或者下次轮询会纠正 */
     });
   }
-
-  /**
-   * 队列里**属于当前会话**的第一条，现在没人占着 → 发出去。
-   *
-   * 什么时候会被叫：回合收尾（`run` 的 finally）、服务端从「在跑」变成
-   * 「没跑」（下面的 $effect）、以及切回某条会话。
-   */
-  async function flushQueue() {
-    if (flushing || busy || serverBusy) return;
-    if (!queue.some((q) => q.sid === sessionId)) return;
-    flushing = true;
-    try {
-      // 本地这条流结束**不等于**服务端那个回合已经收尾 —— 按停止时尤其是
-      // 这样（abort 要传过去，服务端还得补上「已停止」的工具结果）。
-      await syncServerBusy();
-      if (busy || serverBusy) return;
-      const i = queue.findIndex((q) => q.sid === sessionId);
-      if (i < 0) return;
-      const [item] = queue.splice(i, 1);
-      await deliver(item.text, item.attachments);
-    } finally {
-      flushing = false;
-    }
-  }
-
-  /**
-   * 服务端这个会话还在跑吗？
-   *
-   * 只看会话清单里那个 `busy` 标记（抽屉那份，接口顺带刷了），**不碰消息**
-   * —— `flushQueue` 不需要重传历史，更不需要因此把本地消息换成服务端的 id
-   * （那是一次整列表的 DOM 重建）。
-   */
-  async function syncServerBusy() {
-    await loadSessions();
-    serverBusy = !!sessions.find((s) => s.id === sessionId)?.busy;
-  }
-
-  const dropQueued = (id: string) => (queue = queue.filter((q) => q.id !== id));
 
   const stop = () => {
     // 服务端循环看不到 SSE 断连（tx.send 失败会被忽略），得显式告诉它停。

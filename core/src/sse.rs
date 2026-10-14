@@ -141,6 +141,27 @@ pub fn data_part(name: &str, data: Value) -> Value {
     json!({ "type": format!("data-{name}"), "data": data })
 }
 
+// --- 排队（见 `AppState::queued`） --------------------------------------
+
+/// 这条消息**进了服务端的队列**：这个会话正跑着，等模型空下来再交给它。
+///
+/// 它就是 `POST /api/chat` 排上队时的全部回应（一帧 + `[DONE]`）—— 界面看到它
+/// 就把这条画成「排队中」（虚线圈 + ×），而不是一条要收流的回合。
+///
+/// 为什么不回 409 让前端自己排队：前端那个队列活在 WebView 里，App 切到后台、
+/// WebView 被冻住/回收，那条消息就永远发不出去了。
+pub fn queued(id: &str) -> Value {
+    data_part("queued", json!({ "id": id }))
+}
+
+/// 队列里这几条**交给模型了**（回合跑到步边界时取走的，见 `agent::deliver_queued`）。
+///
+/// 界面靠它把那几条从「排队中」挪进正文；紧跟的 `start` 会让接下来的输出进
+/// **新的一条**助手消息（服务端历史里也是新的那一条）。
+pub fn queued_delivered(ids: &[String]) -> Value {
+    data_part("queued-delivered", json!({ "ids": ids }))
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -171,5 +192,16 @@ mod tests {
         let v = data_part("warning", json!({ "message": "x" }));
         assert_eq!(v["type"], "data-warning");
         assert_eq!(v["data"]["message"], "x");
+    }
+
+    #[test]
+    fn the_queue_has_two_amounts() {
+        // 「这条排上了」和「这几条交出去了」是两件事：前者是 `POST /api/chat` 的
+        // 全部回应，后者走正在跑的那条流。名字别合并成一个
+        assert_eq!(queued("q1")["type"], "data-queued");
+        assert_eq!(queued("q1")["data"]["id"], "q1");
+        let v = queued_delivered(&["q1".into(), "q2".into()]);
+        assert_eq!(v["type"], "data-queued-delivered");
+        assert_eq!(v["data"]["ids"][1], "q2");
     }
 }

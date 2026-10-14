@@ -5,7 +5,7 @@
 //! Rust 只回传指令。所以这里所有跨边界类型都是 JSON 可序列化的。
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -193,6 +193,19 @@ struct PersistedProvider {
     reasoning_effort: Option<String>,
 }
 
+/// 一条**排队等着交给模型**的用户消息（见 `AppState::queued`）。
+///
+/// 形状刻意和 `/api/chat` 的请求体对齐（`id` 是客户端给的那个，没给就现生成一个）
+/// —— 界面上那条「排队中」的气泡、以及撤掉它（`/api/sessions/unqueue`）都要认
+/// 同一个 id。
+#[derive(Clone)]
+pub struct QueuedMsg {
+    pub id: String,
+    pub text: String,
+    /// 已经从 `pending_attachments` 里取出来的附件（排队期间留着，交给模型时用）
+    pub attachments: Vec<crate::agent::Attachment>,
+}
+
 pub struct AppState {
     pub tx: broadcast::Sender<Event>,
     pub device: RwLock<Option<Arc<dyn DeviceApi>>>,
@@ -257,6 +270,17 @@ pub struct AppState {
     /// 失败但被忽略，循环照跑、工具照执行、LLM 照调 —— 所以 App 切到
     /// 后台、或者切到别的会话，agent 都在继续干活（前台服务保着进程）。
     pub turns: Mutex<HashMap<String, Arc<Turn>>>,
+    /// 排队等着交给模型的用户消息：会话 id → 那条队。
+    ///
+    /// **为什么在服务端排**：前端那个队列活在 WebView 里 —— App 切到后台、
+    /// WebView 被冻住或回收，那条消息就永远发不出去了（排队 = 等一会儿再发同一个
+    /// 请求，而「等」这件事前端没有能力保证）。这里排着的话，正在跑的那个回合
+    /// 会在**步边界**把它取走交给模型（`agent::deliver_queued`），跟客户端
+    /// 在不在、死没死都没关系。
+    ///
+    /// 取走的唯一入口是回合循环；没有回合在跑时由 `agent::continue_with_queued`
+    /// 立刻开一个 —— 否则它们会一直等在那儿（界面上一直显示「排队中」）。
+    pub queued: Mutex<HashMap<String, VecDeque<QueuedMsg>>>,
     /// 本地 API 的访问凭据。见 `Auth`。
     pub auth: RwLock<Auth>,
     /// 会话有改动，等着落盘。定时器每 2s 检查一次。
@@ -312,6 +336,7 @@ impl AppState {
             trust_loopback: AtomicBool::new(false),
             sessions_loaded: AtomicBool::new(false),
             turns: Mutex::new(HashMap::new()),
+            queued: Mutex::new(HashMap::new()),
             auth: RwLock::new(Auth {
                 token: None,
                 sandbox_key: random_secret(),
@@ -544,6 +569,8 @@ impl AppState {
     pub async fn delete_session(&self, id: &str) {
         self.request_abort(id);
         self.forget_usage(id);
+        // 排队等着的那些也跟着走 —— 会话都没了，没人会去取它们
+        self.drop_queued(id);
         let gone = self.chat.write().await.delete(id);
         self.mark_sessions_dirty();
         if let Some(s) = gone {
@@ -877,6 +904,85 @@ impl AppState {
             .lock()
             .map(|g| g.contains_key(sid))
             .unwrap_or(false)
+    }
+
+    // ---- 排队等着交给模型的用户消息（见 `queued` 字段） --------------------
+
+    /// 把这个会话的第一条排队的消息取走（`None` = 没排队的）。
+    ///
+    /// 一次只取一条 —— 取走的那条要开一个新回合，剩下的留在这个回合的
+    /// 第一个步边界一起交给模型（否则一个回合得带多条用户消息，历史形上也
+    /// 不好看）。
+    pub fn pop_queued(&self, sid: &str) -> Option<QueuedMsg> {
+        let mut g = self.queued.lock().ok()?;
+        let q = g.get_mut(sid)?;
+        let m = q.pop_front();
+        if q.is_empty() {
+            g.remove(sid);
+        }
+        m
+    }
+
+    /// 排队等着交给模型的那些消息（`/api/session` 报给界面看）。
+    pub fn queued_list(&self, sid: &str) -> Vec<QueuedMsg> {
+        self.queued
+            .lock()
+            .map(|g| {
+                g.get(sid)
+                    .map(|q| q.iter().cloned().collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 排进来一条（“这会儿正跑着，等模型空下来再给它”）。
+    pub fn enqueue(&self, sid: &str, m: QueuedMsg) {
+        if let Ok(mut g) = self.queued.lock() {
+            g.entry(sid.to_string()).or_default().push_back(m);
+        }
+    }
+
+    /// 取走**全部**排队的消息（回合循环在每个步边界调；没人取就一直是空的）。
+    pub fn drain_queued(&self, sid: &str) -> Vec<QueuedMsg> {
+        self.queued
+            .lock()
+            .ok()
+            .and_then(|mut g| g.remove(sid))
+            .map(|q| q.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// 还有排队的吗（回合循环靠它在「模型不调工具了」那一刻决定要不要接着跑）。
+    pub fn has_queued(&self, sid: &str) -> bool {
+        self.queued
+            .lock()
+            .map(|g| g.get(sid).is_some_and(|q| !q.is_empty()))
+            .unwrap_or(false)
+    }
+
+    /// 撤掉一条**还在排队**的（界面上面那个 ×）。已经交给模型的撤不掉 ——
+    /// 那时它是历史了。
+    pub fn unqueue(&self, sid: &str, id: &str) -> bool {
+        let Ok(mut g) = self.queued.lock() else {
+            return false;
+        };
+        let Some(q) = g.get_mut(sid) else {
+            return false;
+        };
+        let n = q.len();
+        q.retain(|m| m.id != id);
+        let removed = q.len() != n;
+        if q.is_empty() {
+            g.remove(sid);
+        }
+        removed
+    }
+
+    /// 整个会话的队列丢掉（删会话时用；不然那些消息永远没人取了）。
+    pub fn drop_queued(&self, sid: &str) {
+        if let Ok(mut g) = self.queued.lock() {
+            g.remove(sid);
+        }
     }
 
     pub fn busy_sessions(&self) -> Vec<String> {

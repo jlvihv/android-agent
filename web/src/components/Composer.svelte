@@ -53,7 +53,8 @@
   let photoInput: HTMLInputElement | null = $state(null);
   let fileInput: HTMLInputElement | null = $state(null);
 
-  // 「可以发」不再看 busy：模型还在说的时候发的下一条进队列，等它收尾再发
+  // 「可以发」不再看 busy：模型还在说的时候发的下一条进队列（**服务端**的队列，
+  // 见 App.svelte 的 send），模型一空下来就交给它。
   // （见 App.svelte 的 send / flushQueue）。所以 streaming 时输入区是**活的**，
   // 只是右边多一个停止键。
   const canSend = $derived(
@@ -262,12 +263,13 @@
       {/if}
       {#if !busy || canSend}
         <!-- 发送：空态是暗的，有字或附件才变白底黑箭头。
-             还在跑时发出去的是「排队」，title 说清楚。 -->
+             还在跑时发出去的是「排队」，title 说清楚（**不用等整个回合结束**：
+             模型一空下来就交给它）。 -->
         <button
           onclick={send}
           disabled={!canSend}
-          aria-label={busy ? '排队发送（agent 说完就发）' : '发送'}
-          title={busy ? '排队发送：agent 说完这条就发出去' : '发送'}
+          aria-label={busy ? '排队发送（模型一空下来就交给它）' : '发送'}
+          title={busy ? '排队发送：模型一空下来就把这条交给它' : '发送'}
           class="grid size-9 shrink-0 place-items-center rounded-full transition-colors
                  {canSend ? 'bg-fg text-ink' : 'bg-control text-faint'}"
         >
