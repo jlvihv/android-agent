@@ -120,12 +120,54 @@ impl BrowserApi for BrowserAdapter {
     }
 }
 
+fn failed(e: impl std::fmt::Display) -> CoreError {
+    CoreError::Failed {
+        message: format!("{e:#}"),
+    }
+}
+
+/// 一台配对过的电脑（给壳的，不带凭据）。
+#[derive(uniffi::Record)]
+pub struct MachineInfo {
+    pub id: String,
+    pub name: String,
+    /// 配了中继（出门在外也能连）
+    pub relay: bool,
+}
+
 /// 核心句柄。Kotlin 持有它，生命周期跟 Application 一致。
 #[derive(uniffi::Object)]
 pub struct AgentCore {
     core: Core,
-    /// 经中继连家里电脑的那条隧道（同一时刻最多一条：只连得着一台电脑）
-    tunnel: std::sync::Mutex<Option<crate::tunnel::Tunnel>>,
+    /// 配对过的电脑（数据目录定下来之后才有，见 `machines()`）
+    machines: std::sync::OnceLock<Arc<crate::machines::Machines>>,
+}
+
+/// 不导出给 Kotlin 的小帮手。
+impl AgentCore {
+    /// 核心的 tokio runtime（`start` 之后才有）。从 Kotlin 线程上 `block_on` 用。
+    fn rt(&self) -> Result<&tokio::runtime::Handle, CoreError> {
+        self.core
+            .state
+            .rt
+            .get()
+            .ok_or_else(|| failed("核心还没启动"))
+    }
+
+    /// 配对过的电脑。清单在库里，所以要等 `setup_linux` 打开库之后。
+    fn machines_store(&self) -> Result<Arc<crate::machines::Machines>, CoreError> {
+        if let Some(m) = self.machines.get() {
+            return Ok(m.clone());
+        }
+        let db = self.core.state.db().ok_or_else(|| failed("库还没打开"))?;
+        if let Some(dir) = self.core.state.data_dir.read().ok().and_then(|g| g.clone()) {
+            crate::machines::migrate_file(&db, &dir.join("machines.json"));
+        }
+        Ok(self
+            .machines
+            .get_or_init(|| crate::machines::Machines::load(db))
+            .clone())
+    }
 }
 
 #[uniffi::export]
@@ -135,7 +177,7 @@ impl AgentCore {
         crate::init_tracing();
         Arc::new(Self {
             core: Core::new(),
-            tunnel: Default::default(),
+            machines: Default::default(),
         })
     }
 
@@ -163,44 +205,68 @@ impl AgentCore {
         self.core.port()
     }
 
-    /// 起一条经中继到家里那台电脑的隧道（见 `tunnel.rs`），返回本机端口：
-    /// WebView 加载 `http://localhost:<它>/auth?t=<那台电脑的 token>` 就行。
-    ///
-    /// 已经有一条就先关掉（只连得着一台）。只是在本机绑个端口，**不联网** ——
-    /// 真正拨号发生在 WebView 第一次请求的时候，连不上的原因会作为一页 502 显示出来。
-    pub fn start_tunnel(
-        &self,
-        relay: String,
-        key: String,
-        host_id: String,
-        fingerprint: String,
-    ) -> Result<u16, CoreError> {
-        let failed = |e: String| CoreError::Failed { message: e };
-        let rt = self
-            .core
-            .state
-            .rt
-            .get()
-            .ok_or_else(|| failed("核心还没启动".into()))?;
-        let t = rt
-            .block_on(crate::tunnel::start(crate::tunnel::Target {
-                relay,
-                key,
-                host_id,
-                fingerprint,
-            }))
-            .map_err(|e| failed(format!("{e:#}")))?;
-        let port = t.port;
-        if let Ok(mut g) = self.tunnel.lock() {
-            *g = Some(t);
-        }
-        Ok(port)
+    /// 配对过的电脑（不带凭据）。
+    pub fn machines(&self) -> Vec<MachineInfo> {
+        self.machines_store()
+            .map(|m| m.list())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| MachineInfo {
+                relay: m.relay.is_some(),
+                id: m.id,
+                name: m.name,
+            })
+            .collect()
     }
 
-    /// 关掉隧道（回到手机自己的核心、或者换成局域网直连时）。
-    pub fn stop_tunnel(&self) {
-        if let Ok(mut g) = self.tunnel.lock() {
-            *g = None;
+    /// 和局域网里的一台电脑配对（输它显示的 6 位码）。返回它的实例 id。
+    /// **会联网（最多十来秒），别在主线程上调。**
+    pub fn pair_machine(&self, host: String, port: u16, code: String) -> Result<String, CoreError> {
+        let m = self.machines_store()?;
+        let rt = self.rt()?;
+        rt.block_on(m.pair(&host, port, &code))
+            .map(|m| m.id)
+            .map_err(failed)
+    }
+
+    /// 连上这台电脑，返回 WebView 要加载的地址（`http://localhost:<端口>/auth?t=…`）。
+    /// 选路（局域网 / 中继）在核心里，见 `tunnel.rs`。只是在本机绑端口，不联网。
+    pub fn connect_machine(&self, id: String) -> Result<String, CoreError> {
+        let m = self.machines_store()?;
+        let rt = self.rt()?;
+        rt.block_on(m.connect(&id)).map_err(failed)
+    }
+
+    /// 断开（回到手机自己的核心）。
+    pub fn disconnect_machine(&self) {
+        if let Ok(m) = self.machines_store() {
+            m.disconnect();
+        }
+    }
+
+    /// 它不认我们的凭据了（换过库）：忘掉它，下次得重新配对。
+    pub fn forget_machine(&self, id: String) {
+        if let Ok(m) = self.machines_store() {
+            m.forget(&id);
+        }
+    }
+
+    /// mDNS 在局域网里看到了这台（`host:port`）。
+    pub fn lan_seen(&self, id: String, host: String, port: u16) {
+        if let Ok(m) = self.machines_store() {
+            let addr = if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
+            m.lan_seen(&id, addr);
+        }
+    }
+
+    /// 网络变了：正连着的那台重新先试局域网。
+    pub fn network_changed(&self) {
+        if let Ok(m) = self.machines_store() {
+            m.network_changed();
         }
     }
 

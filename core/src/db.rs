@@ -53,7 +53,76 @@ CREATE TABLE IF NOT EXISTS messages (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+
+-- 配置按列存，不往一个值里塞 JSON。`meta` 只放单个的值（instance_id、token……）。
+
+-- 当前在用的 LLM（只有一行）
+CREATE TABLE IF NOT EXISTS llm (
+  id               INTEGER PRIMARY KEY CHECK (id = 1),
+  name             TEXT NOT NULL,
+  base_url         TEXT NOT NULL,
+  model            TEXT NOT NULL,
+  api_key          TEXT NOT NULL,
+  supports_images  INTEGER NOT NULL,
+  supports_files   INTEGER NOT NULL,
+  api_style        TEXT NOT NULL,
+  reasoning_effort TEXT
+);
+
+-- 各家服务商的 Key（base_url 只有「其他」那家用）
+CREATE TABLE IF NOT EXISTS providers (
+  id       TEXT PRIMARY KEY,
+  api_key  TEXT NOT NULL,
+  base_url TEXT NOT NULL
+);
+
+-- 这些端点不支持 Responses API（`base_url|model`），直接走 Chat Completions
+CREATE TABLE IF NOT EXISTS responses_unsupported (
+  endpoint TEXT PRIMARY KEY
+);
+
+-- 手机：配对过的电脑（见 machines.rs）
+CREATE TABLE IF NOT EXISTS machines (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  token       TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  relay_addr  TEXT,
+  relay_key   TEXT,
+  lan         TEXT
+);
+
+-- 电脑：手机交来的中继（只有一行，见 remote.rs）
+CREATE TABLE IF NOT EXISTS relay (
+  id   INTEGER PRIMARY KEY CHECK (id = 1),
+  addr TEXT NOT NULL,
+  key  TEXT NOT NULL
+);
+
+-- 远端资源的缓存（models.dev 的模型目录）：原样存下响应和抓取时刻
+CREATE TABLE IF NOT EXISTS http_cache (
+  url        TEXT PRIMARY KEY,
+  body       TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL
+);
 "#;
+
+/// 当前在用的 LLM（`llm` 表那一行）。
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct LlmConfig {
+    pub name: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    #[serde(default = "crate::llm::default_supports_images")]
+    pub supports_images: bool,
+    #[serde(default)]
+    pub supports_files: bool,
+    #[serde(default)]
+    pub api_style: crate::llm::ApiStyle,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
 
 struct Inner {
     conn: Connection,
@@ -108,7 +177,7 @@ impl Db {
         })
     }
 
-    #[cfg(test)]
+    /// 内存里的库（测试用；也给没有数据目录的场合）。
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
@@ -413,6 +482,249 @@ impl Db {
             "INSERT INTO meta(k, v) VALUES(?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             [k, v],
         )?;
+        Ok(())
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        Ok(f(&g.conn)?)
+    }
+
+    // —— 配置（按列存，见 SCHEMA）——
+
+    pub fn llm(&self) -> Result<Option<LlmConfig>> {
+        self.with(|c| {
+            let r = c.query_row(
+                "SELECT name, base_url, model, api_key, supports_images, supports_files, api_style, reasoning_effort FROM llm WHERE id = 1",
+                [],
+                |r| {
+                    Ok(LlmConfig {
+                        name: r.get(0)?,
+                        base_url: r.get(1)?,
+                        model: r.get(2)?,
+                        api_key: r.get(3)?,
+                        supports_images: r.get(4)?,
+                        supports_files: r.get(5)?,
+                        api_style: crate::llm::ApiStyle::parse(&r.get::<_, String>(6)?),
+                        reasoning_effort: r.get(7)?,
+                    })
+                },
+            );
+            match r {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    pub fn set_llm(&self, l: Option<&LlmConfig>) -> Result<()> {
+        self.with(|c| match l {
+            None => c.execute("DELETE FROM llm", []).map(|_| ()),
+            Some(l) => c
+                .execute(
+                    "INSERT OR REPLACE INTO llm(id, name, base_url, model, api_key, supports_images, supports_files, api_style, reasoning_effort) VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        l.name,
+                        l.base_url,
+                        l.model,
+                        l.api_key,
+                        l.supports_images,
+                        l.supports_files,
+                        l.api_style.as_str(),
+                        l.reasoning_effort
+                    ],
+                )
+                .map(|_| ()),
+        })
+    }
+
+    pub fn providers(&self) -> Result<crate::providers::Store> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id, api_key, base_url FROM providers")?;
+            let rows = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    crate::providers::Creds {
+                        api_key: r.get(1)?,
+                        base_url: r.get(2)?,
+                    },
+                ))
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// 存 / 删一家的 Key（`None` = 删）。
+    pub fn set_provider(&self, id: &str, creds: Option<&crate::providers::Creds>) -> Result<()> {
+        self.with(|c| match creds {
+            None => c
+                .execute("DELETE FROM providers WHERE id = ?1", [id])
+                .map(|_| ()),
+            Some(k) => c
+                .execute(
+                    "INSERT OR REPLACE INTO providers(id, api_key, base_url) VALUES(?1, ?2, ?3)",
+                    params![id, k.api_key, k.base_url],
+                )
+                .map(|_| ()),
+        })
+    }
+
+    pub fn responses_unsupported(&self) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT endpoint FROM responses_unsupported")?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            rows.collect()
+        })
+    }
+
+    pub fn add_responses_unsupported(&self, endpoint: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO responses_unsupported(endpoint) VALUES(?1)",
+                [endpoint],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn machines(&self) -> Result<Vec<crate::machines::Machine>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT id, name, token, fingerprint, relay_addr, relay_key, lan FROM machines ORDER BY rowid",
+            )?;
+            let rows = st.query_map([], |r| {
+                let addr: Option<String> = r.get(4)?;
+                let key: Option<String> = r.get(5)?;
+                Ok(crate::machines::Machine {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    token: r.get(2)?,
+                    fingerprint: r.get(3)?,
+                    relay: addr
+                        .zip(key)
+                        .map(|(addr, key)| crate::state::RelayAddr { addr, key }),
+                    lan: r.get(6)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn put_machine(&self, m: &crate::machines::Machine) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO machines(id, name, token, fingerprint, relay_addr, relay_key, lan) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name, token = excluded.token, fingerprint = excluded.fingerprint,
+                   relay_addr = excluded.relay_addr, relay_key = excluded.relay_key, lan = excluded.lan",
+                params![
+                    m.id,
+                    m.name,
+                    m.token,
+                    m.fingerprint,
+                    m.relay.as_ref().map(|r| &r.addr),
+                    m.relay.as_ref().map(|r| &r.key),
+                    m.lan
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn delete_machine(&self, id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM machines WHERE id = ?1", [id])
+                .map(|_| ())
+        })
+    }
+
+    pub fn relay(&self) -> Result<Option<crate::state::RelayAddr>> {
+        self.with(|c| {
+            let r = c.query_row("SELECT addr, key FROM relay WHERE id = 1", [], |r| {
+                Ok(crate::state::RelayAddr {
+                    addr: r.get(0)?,
+                    key: r.get(1)?,
+                })
+            });
+            match r {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    pub fn set_relay(&self, r: &crate::state::RelayAddr) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO relay(id, addr, key) VALUES(1, ?1, ?2)",
+                [&r.addr, &r.key],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// 缓存的响应，和抓取时刻（秒）。
+    pub fn cached(&self, url: &str) -> Result<Option<(String, u64)>> {
+        self.with(|c| {
+            let r = c.query_row(
+                "SELECT body, fetched_at FROM http_cache WHERE url = ?1",
+                [url],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
+            );
+            match r {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    pub fn put_cached(&self, url: &str, body: &str, fetched_at: u64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO http_cache(url, body, fetched_at) VALUES(?1, ?2, ?3)",
+                params![url, body, fetched_at as i64],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// **一次性搬家**（2026-10-14）：以前有几样配置是 `meta` 里的一段 JSON，搬进上面那几张
+    /// 表，然后删掉旧行。搬过一次之后这里就什么都不做了；所有库都搬完就可以删掉它。
+    pub fn migrate_json_meta(&self) -> Result<()> {
+        if let Some(raw) = self.get_meta("llm")? {
+            if let Ok(l) = serde_json::from_str::<LlmConfig>(&raw) {
+                self.set_llm(Some(&l))?;
+            }
+            self.delete_meta("llm")?;
+        }
+        if let Some(raw) = self.get_meta("providers")? {
+            let store: crate::providers::Store = serde_json::from_str(&raw).unwrap_or_default();
+            for (id, k) in &store {
+                self.set_provider(id, Some(k))?;
+            }
+            self.delete_meta("providers")?;
+        }
+        if let Some(raw) = self.get_meta("responses_unsupported")? {
+            let keys: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+            for k in &keys {
+                self.add_responses_unsupported(k)?;
+            }
+            self.delete_meta("responses_unsupported")?;
+        }
+        if let Some(raw) = self.get_meta("search")? {
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            if let Some(k) = v.get("exaApiKey").and_then(|k| k.as_str()) {
+                if !k.trim().is_empty() {
+                    self.set_meta("exa_api_key", k.trim())?;
+                }
+            }
+            self.delete_meta("search")?;
+        }
         Ok(())
     }
 

@@ -16,11 +16,12 @@
 //! 就把「能看图」刷成「不能」。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
+use crate::db::Db;
 use crate::llm::Provider;
 
 pub const CATALOG_URL: &str = "https://models.dev/api.json";
@@ -84,26 +85,41 @@ struct Limit {
     output: Option<u64>,
 }
 
-/// 读目录：先用新鲜的磁盘缓存；没有就联网拉。联网失败退回旧缓存。
-async fn catalog(refresh: bool, data_dir: Option<&Path>) -> Option<Catalog> {
-    let path = cache_path(data_dir);
+/// 读目录：先用新鲜的缓存（库里的 `http_cache`）；没有就联网拉。联网失败退回旧缓存。
+/// 没有库（桌面开发）就每次都联网。
+async fn catalog(refresh: bool, db: Option<&Db>) -> Option<Catalog> {
+    let cached = || -> Option<(Catalog, u64)> {
+        let (body, at) = db?.cached(CATALOG_URL).ok()??;
+        Some((serde_json::from_str(&body).ok()?, at))
+    };
     if !refresh {
-        if let Some(cat) = read_cache(&path, Some(TTL)) {
-            return Some(cat);
+        if let Some((cat, at)) = cached() {
+            if now_secs().saturating_sub(at) < TTL.as_secs() {
+                return Some(cat);
+            }
         }
     }
     match fetch_catalog().await {
         Ok((cat, raw)) => {
-            if let Err(e) = std::fs::write(&path, raw) {
-                tracing::warn!("写 models.dev 缓存失败: {e}");
+            if let Some(db) = db {
+                if let Err(e) = db.put_cached(CATALOG_URL, &raw, now_secs()) {
+                    tracing::warn!("写 models.dev 缓存失败: {e:#}");
+                }
             }
             Some(cat)
         }
         Err(e) => {
             tracing::warn!("拉 models.dev 失败（用旧缓存）: {e:#}");
-            read_cache(&path, None)
+            cached().map(|(cat, _)| cat)
         }
     }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 async fn fetch_catalog() -> anyhow::Result<(Catalog, String)> {
@@ -123,26 +139,6 @@ async fn fetch_catalog() -> anyhow::Result<(Catalog, String)> {
     let cat: Catalog = serde_json::from_str(&raw)?;
     anyhow::ensure!(!cat.is_empty(), "models.dev 目录是空的");
     Ok((cat, raw))
-}
-
-fn cache_path(data_dir: Option<&Path>) -> PathBuf {
-    match data_dir {
-        Some(d) => d.join("models-dev.json"),
-        None => std::env::temp_dir().join("android-agent-models-dev.json"),
-    }
-}
-
-fn read_cache(path: &Path, max_age: Option<Duration>) -> Option<Catalog> {
-    let meta = std::fs::metadata(path).ok()?;
-    if let Some(max) = max_age {
-        let modified = meta.modified().ok()?;
-        let age = SystemTime::now().duration_since(modified).ok()?;
-        if age > max {
-            return None;
-        }
-    }
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -177,9 +173,9 @@ struct ModelsResponse {
 pub async fn list(
     provider: &Provider,
     refresh: bool,
-    data_dir: Option<&Path>,
+    db: Option<&Db>,
 ) -> anyhow::Result<Vec<ModelInfo>> {
-    let cat = catalog(refresh, data_dir).await.unwrap_or_default();
+    let cat = catalog(refresh, db).await.unwrap_or_default();
     let entry = provider_entry(&cat, &provider.base_url);
 
     match fetch_models(provider).await {
@@ -279,9 +275,9 @@ pub async fn vision_for(
     provider: &Provider,
     model_id: &str,
     refresh: bool,
-    data_dir: Option<&Path>,
+    db: Option<&Db>,
 ) -> Option<bool> {
-    let cat = catalog(refresh, data_dir).await?;
+    let cat = catalog(refresh, db).await?;
     let key = provider_entry(&cat, &provider.base_url).map(|(k, _)| k);
     let m = find_model(&cat, key, model_id)?;
     model_vision(m)
@@ -292,9 +288,9 @@ pub async fn pdf_for(
     provider: &Provider,
     model_id: &str,
     refresh: bool,
-    data_dir: Option<&Path>,
+    db: Option<&Db>,
 ) -> Option<bool> {
-    let cat = catalog(refresh, data_dir).await?;
+    let cat = catalog(refresh, db).await?;
     let key = provider_entry(&cat, &provider.base_url).map(|(k, _)| k);
     let m = find_model(&cat, key, model_id)?;
     model_pdf(m)

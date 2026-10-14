@@ -48,20 +48,6 @@ class MainActivity : Activity() {
         private const val KEY_ASKED_A11Y = "asked_accessibility"
         private const val KEY_ASKED_FILES = "asked_all_files"
         private const val KEY_ASKED_NOTIF = "asked_notifications"
-        /** 连着的电脑核心的地址（`http://192.168.x.x:8787/auth?t=…`）；没有 = 用手机自己的 */
-        private const val KEY_REMOTE = "remote_core"
-        /** 连着的那台电脑的实例 id（自动发现连上的才有） */
-        private const val KEY_REMOTE_ID = "remote_core_id"
-        /** 配对过的电脑：`paired_<实例 id>` = 它的 token */
-        private const val PAIRED_PREFIX = "paired_"
-        /**
-         * 配对过的电脑出门在外怎么连：`remote_<实例 id>` = JSON
-         * `{name, fingerprint, relay: {addr, key}}`（核心 `/api/pair` / `/api/remote` 给的，
-         * 见 core 的 `remote.rs`）。没有 relay 的那台只能在局域网里连。
-         */
-        private const val REMOTE_PREFIX = "remote_"
-        /** 现在连着的那台是怎么连的：`relay` = 经中继（隧道），没有 = 局域网直连 */
-        private const val KEY_REMOTE_VIA = "remote_core_via"
         private const val REQ_STORAGE = 2
         /** 页面 `<input type=file>` 选文件 */
         private const val REQ_FILE = 3
@@ -100,11 +86,22 @@ class MainActivity : Activity() {
     /** 下一次页面加载完就清掉历史：切换核心之后，返回键不该退回另一台的页面 */
     private var clearHistoryOnLoad = false
 
-    /** 局域网里找电脑（「选择机器」面板开着时才找，见 CoreDiscovery） */
+    /** 现在连的是哪台电脑（配对、选路、连接都在核心里，见 Remote） */
+    private val remote by lazy { Remote(this) }
+
+    /**
+     * 局域网里找电脑：「选择机器」面板开着时一直找；另外回到前台、网络变了的时候找一小会儿
+     * （[scanBriefly]）—— 找到的地址报给核心，连着的那台在家就走局域网直连。
+     */
     private val discovery by lazy {
-        CoreDiscovery(this) { runOnUiThread { pushCoresFound() } }
+        CoreDiscovery(this) { found ->
+            runOnUiThread {
+                for (f in found) runCatching { AgentApp.core.lanSeen(f.id, f.host, f.port.toUShort()) }
+                pushCoresFound()
+            }
+        }
     }
-    /** 页面想让我们找（栏开着）。App 切后台时停、回来时按它接着找 */
+    /** 页面想让我们找（面板开着）。App 切后台时停、回来时按它接着找 */
     private var discoveryWanted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -115,9 +112,9 @@ class MainActivity : Activity() {
 
         val port = AgentApp.port
         localPort = port
-        // 上次是经中继连着的：隧道的本机端口每次都不一样，先把它重新起好再加载
-        if (viaRelay()) remoteId()?.let { if (!startRelay(it)) forgetRemote() }
-        if (port == 0 && remoteUrl() == null) {
+        // 上次连着电脑：重新连上（隧道的本机端口每次都不一样）
+        remote.resume()
+        if (port == 0 && remote.conn == null) {
             setContentView(errorView("核心没起来。看 logcat 里 AgentApp 的报错。"))
         } else {
             val r = buildRoot(buildWebView(port))
@@ -134,7 +131,7 @@ class MainActivity : Activity() {
         // 两个设置页只能一个一个来：先存储（沙箱干活的地方），下次启动再无障碍
         if (!maybeAskAllFilesAccess()) maybeOpenAccessibilitySettings()
 
-        // 网络变了（出门断了家里的 Wi-Fi）：连着的电脑可能连不上了
+        // 网络变了（出门 / 回家）：告诉核心重新先试局域网，再找一下局域网里的电脑
         watchNetwork()
 
         // 冷启动也认这个 extra（见 onNewIntent）
@@ -154,8 +151,8 @@ class MainActivity : Activity() {
         AgentNotifications.clearDone(this)
         // 回到前台顺手把订阅对齐一次：连着电脑时切来切去、或者进程刚起，都靠它收口
         syncTurnStream()
-        // 回到前台时可能已经换了网络（出门 / 回家）：连着的电脑还在吗
-        recheckRemote()
+        // 回到前台时可能已经换了网络（出门 / 回家）：找一下局域网里的电脑
+        scanBriefly()
         // Android 16 的 Live Updates 授权可能在系统设置里刚被改过，回到前台重新问一次
         // （能力探针有 5 秒缓存，见 LiveUpdates）
         LiveUpdates.invalidate()
@@ -178,6 +175,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         if (current === this) current = null
         discovery.stop()
+        main.removeCallbacks(stopScan)
         super.onPause()
     }
 
@@ -269,7 +267,7 @@ class MainActivity : Activity() {
      */
     private fun pushBrowserAvailable() {
         // 连着电脑时 agent 的浏览器在电脑上，手机这只跟它无关
-        val on = remoteUrl() == null && AgentApp.browser?.hasPage() == true
+        val on = remote.conn == null && AgentApp.browser?.hasPage() == true
         web?.evaluateJavascript(
             "window.__browserAvailable && window.__browserAvailable($on)",
             null,
@@ -327,7 +325,7 @@ class MainActivity : Activity() {
             ): Boolean {
                 val uri = request?.url ?: return false
                 if (uri.host == "127.0.0.1" && uri.port == port) return false
-                if (isRemoteCore(uri)) return false
+                if (remote.conn?.let { uri.host == it.host && uri.port == it.port } == true) return false
                 openExternally(uri)
                 return true
             }
@@ -344,24 +342,29 @@ class MainActivity : Activity() {
             }
 
             /**
-             * 电脑不认手机记着的 token 了（电脑上换过库 / 换了 AGENT_TOKEN）：`/auth`
-             * 回 403。忘掉这把钥匙，提示重新配对 —— 不然每次启动都撞在同一面墙上。
+             * 连着电脑时主文档出错：
+             *
+             * - **502**：隧道两条路（局域网、中继）都没走通（原因写在那页里，见 core 的
+             *   `tunnel.rs`）—— 多半是出门了、它又没配中继，或者电脑关了。自动回到手机自己
+             *   的核心，说一句为什么；回家了在「选择机器」里再点它就行。
+             * - **403**：电脑不认手机记着的凭据了（换过库）。忘掉它，提示重新配对 ——
+             *   不然每次启动都撞在同一面墙上。
              */
             override fun onReceivedHttpError(
                 view: WebView?,
                 request: android.webkit.WebResourceRequest?,
                 response: android.webkit.WebResourceResponse?,
             ) {
-                val remote = remoteUrl() ?: return
+                val c = remote.conn ?: return
                 if (request?.isForMainFrame != true) return
-                // 经中继：隧道把「拨不通 / 证书对不上」写成一页 502（原因在页面里）
-                if (response?.statusCode == 502 && viaRelay()) {
-                    setContentView(remoteErrorView(remote, "经服务器也连不上家里那台电脑：它的核心开着吗？连上中继了吗？"))
-                    return
+                when (response?.statusCode) {
+                    502 -> fallBackToPhone(c.id)
+                    403 -> {
+                        val name = remote.name(c.id)
+                        remote.forget(c.id)
+                        setContentView(remoteErrorView(name, "这台电脑不认手机记着的钥匙了（电脑上换过库？）—— 回到手机，在侧栏底栏的「选择机器」里点它重新配对。"))
+                    }
                 }
-                if (response?.statusCode != 403) return
-                remoteId()?.let { forgetPaired(it) }
-                setContentView(remoteErrorView(remote, "这台电脑不认手机记着的钥匙了（电脑上换过库？）—— 回到手机，在侧栏底栏的「选择机器」里点它重新配对。"))
             }
 
             /**
@@ -392,14 +395,9 @@ class MainActivity : Activity() {
                 // 只关心主文档的失败，子资源失败不该盖掉页面
                 if (request?.isForMainFrame == true) {
                     Log.e(TAG, "主文档加载失败: ${error?.description}")
-                    val remote = remoteUrl()
-                    if (remote != null) {
-                        // 局域网直连不上（多半是出门了）：换路 —— 配过中继走中继，没配回本机
-                        if (!viaRelay()) {
-                            rerouteAndReload()
-                            return
-                        }
-                        setContentView(remoteErrorView(remote, error?.description?.toString()))
+                    // 隧道就在本机，加载失败说明它没了（进程刚重启之类）：回到手机自己的核心
+                    remote.conn?.let {
+                        fallBackToPhone(it.id)
                         return
                     }
                     setContentView(
@@ -498,15 +496,7 @@ class MainActivity : Activity() {
         }
 
         web = w
-        // 上次连着电脑：先确认它还连得上（出了门就连不上了），连不上就换路再加载 ——
-        // 不然 WebView 会对着一个局域网地址一直等到超时，那段时间是一整屏空白
-        checkRemote {
-            w.loadUrl(remoteUrl() ?: localUrl())
-            // 启动时直接连回了局域网里那台：也对一遍中继（没配的话把手机知道的交给它）
-            val r = remoteUrl()
-            val id = remoteId()
-            if (r != null && id != null && !viaRelay()) refreshRelayInfo(r, id)
-        }
+        w.loadUrl(remote.conn?.url ?: localUrl())
         return w
     }
 
@@ -523,11 +513,9 @@ class MainActivity : Activity() {
         return if (t != null) "http://127.0.0.1:$localPort/auth?t=$t" else "http://127.0.0.1:$localPort"
     }
 
-    private fun remoteUrl(): String? =
-        getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_REMOTE, null)?.takeIf { it.isNotBlank() }
-
     /**
-     * 把「回合状态订阅」对齐到当前的核心：手机自己的（一直在跑）+（连着电脑时）那台电脑的。
+     * 把「回合状态订阅」对齐到当前的核心：手机自己的（一直在跑）+（连着电脑时）那台电脑的
+     * （经同一条隧道）。
      *
      * 幂等，所以连着 / 切回手机 / 回到前台三处都直接调它，不用维护状态机。
      */
@@ -536,27 +524,11 @@ class MainActivity : Activity() {
             AgentApp.token?.let { t ->
                 if (localPort > 0) put("http://127.0.0.1:$localPort", t)
             }
-            remoteTurnTarget()?.let { (base, token) -> put(base, token) }
+            remote.conn?.let { c -> c.token?.let { put(c.base, it) } }
         }
         runCatching { TurnStream.sync(this, targets) }
             .onFailure { Log.w(TAG, "订阅回合状态失败", it) }
     }
-
-    /** 连着的那台电脑的订阅目标：base URL + token（token 优先用配对时存下的）。 */
-    private fun remoteTurnTarget(): Pair<String, String>? {
-        val u = remoteUrl()?.let { Uri.parse(it) } ?: return null
-        val host = u.host ?: return null
-        val token = remoteId()?.let { pairedToken(it) } ?: u.getQueryParameter("t") ?: return null
-        return "http://$host:${portOf(u)}" to token
-    }
-
-    /** 这个地址是不是连着的那台电脑（同 scheme / host / port 的都留在 WebView 里） */
-    private fun isRemoteCore(uri: Uri): Boolean {
-        val r = remoteUrl()?.let(Uri::parse) ?: return false
-        return uri.scheme == r.scheme && uri.host == r.host && portOf(uri) == portOf(r)
-    }
-
-    private fun portOf(u: Uri): Int = if (u.port != -1) u.port else if (u.scheme == "https") 443 else 80
 
     /** 切到某个地址（换核心）：错误页要是在上面先换回来，历史也清掉 */
     private fun switchTo(url: String) {
@@ -570,124 +542,64 @@ class MainActivity : Activity() {
 
     private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
 
-    private fun remoteId(): String? = prefs().getString(KEY_REMOTE_ID, null)
+    private fun toast(msg: String) =
+        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
 
-    private fun pairedToken(id: String): String? = prefs().getString(PAIRED_PREFIX + id, null)
-
-    private fun forgetPaired(id: String) {
-        prefs().edit().remove(PAIRED_PREFIX + id).apply()
+    /** 连上这台电脑并切过去 */
+    private fun connectMachine(id: String) {
+        val url = remote.connect(id) ?: return toast("连不上「${remote.name(id)}」（详情见 logcat）")
+        // 刚连上的这台在局域网里的话，地址先报给核心（不等下一次发现）
+        discovery.current().firstOrNull { it.id == id }
+            ?.let { runCatching { AgentApp.core.lanSeen(it.id, it.host, it.port.toUShort()) } }
+        switchTo(url)
+        syncTurnStream()
     }
 
-    /** 记下「现在连的是哪台」并切过去（局域网直连） */
-    private fun connectTo(url: String, id: String?) {
-        AgentApp.core.stopTunnel()
-        val e = prefs().edit().putString(KEY_REMOTE, url).remove(KEY_REMOTE_VIA)
-        if (id != null) e.putString(KEY_REMOTE_ID, id) else e.remove(KEY_REMOTE_ID)
-        e.apply()
-        // 顺手问一句「出门在外怎么连」：中继可能是配对之后才配上的
-        if (id != null) refreshRelayInfo(url, id)
-        Log.i(TAG, "连接电脑上的核心：${Uri.parse(url).host}")
-        switchTo(url)
-        // 回合状态也要订上那台电脑（本地的订阅不动）—— 不然在电脑上跑的回合，
-        // 手机上什么都不显示
+    /** 连着的电脑哪条路都不通：回到手机自己的核心，说一句为什么 */
+    private fun fallBackToPhone(id: String) {
+        val name = remote.name(id)
+        Log.i(TAG, "连不上「$name」，回到本机")
+        useLocalCore()
+        toast("连不上「$name」（不在家、它也没配中继？），已切回本机")
+    }
+
+    private fun useLocalCore() {
+        remote.disconnect()
         syncTurnStream()
+        Log.i(TAG, "回到手机自己的核心")
+        switchTo(localUrl())
+    }
+
+    // —— 局域网里找电脑 ——
+
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+    private val stopScan = Runnable { if (!discoveryWanted) discovery.stop() }
+
+    /**
+     * 找一小会儿（15 秒）：回到前台、网络变了的时候。找到的地址报给核心，连着的那台在家
+     * 就走局域网直连；找不到也没关系（核心记着上次的地址，不通就走中继）。不常驻 —— 多播
+     * 发现费电。
+     */
+    private fun scanBriefly() {
+        discovery.start()
+        main.removeCallbacks(stopScan)
+        main.postDelayed(stopScan, 15_000)
     }
 
     /** 网络变化的回调（见 [watchNetwork]）。Activity 销毁时注销 */
     private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
 
-    /** 上一次探测还没回来时别再发一次（网络变化一来就是好几个回调） */
-    @Volatile
-    private var probing = false
-
-    /**
-     * 连着的那台电脑（局域网直连）还连得上吗：TCP 连一下，1.5 秒为限。在家里连上
-     * 只要几毫秒；连不上（出门了、电脑关了）最多等 1.5 秒，而不是让 WebView 等到超时。
-     * **网络线程上调**。
-     */
-    private fun reachable(url: String): Boolean = runCatching {
-        val u = Uri.parse(url)
-        java.net.Socket().use { it.connect(java.net.InetSocketAddress(u.host, portOf(u)), 1500) }
-        true
-    }.getOrDefault(false)
-
-    /**
-     * 确认连着的电脑还在，然后（在主线程上）调 [then]，参数是「换没换路」。
-     *
-     * 只管局域网直连：经中继时隧道自己会把「拨不通」写成一页说明（见 core 的 `tunnel.rs`）。
-     */
-    private fun checkRemote(then: (Boolean) -> Unit) {
-        val remote = remoteUrl()
-        if (remote == null || viaRelay()) return then(false)
-        probing = true
-        Thread {
-            val ok = reachable(remote)
-            runOnUiThread {
-                probing = false
-                // 探测期间用户可能已经自己换了机器：只在还是同一台时才动
-                if (!ok && remoteUrl() == remote) {
-                    reroute()
-                    then(true)
-                } else {
-                    then(false)
-                }
-            }
-        }.start()
-    }
-
-    /** 已经加载着页面时再确认一次（回到前台、网络变了）；换了路就重新加载 */
-    private fun recheckRemote() {
-        if (probing || web == null) return
-        checkRemote { changed ->
-            if (changed) {
-                switchTo(remoteUrl() ?: localUrl())
-                syncTurnStream()
-            }
-        }
-    }
-
-    /**
-     * 连着的电脑连不上了：换路（只改记录、起隧道，不加载）。配过中继就经中继连同一台，
-     * 没配就回到手机自己的核心。弹一句说明 —— 界面突然换了个样，得让人知道为什么。
-     */
-    private fun reroute() {
-        val remote = remoteUrl() ?: return
-        val id = remoteId()
-        val name = id?.let { prefs().getString(REMOTE_PREFIX + it, null) }
-            ?.let { runCatching { org.json.JSONObject(it).optString("name") }.getOrNull() }
-            ?.takeIf { it.isNotBlank() }
-            ?: Uri.parse(remote).host
-        if (id != null && startRelay(id)) {
-            Log.i(TAG, "局域网连不上 $name，改走中继")
-            toast("连不上家里的「$name」，改经服务器连")
-            return
-        }
-        Log.i(TAG, "连不上 $name，回到本机")
-        AgentApp.core.stopTunnel()
-        forgetRemote()
-        toast("连不上「$name」（不在同一个网络里？），已切回本机")
-    }
-
-    /** 主文档加载失败时：换路并重新加载 */
-    private fun rerouteAndReload() {
-        reroute()
-        switchTo(remoteUrl() ?: localUrl())
-        syncTurnStream()
-    }
-
-    private fun toast(msg: String) =
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
-
-    /** 网络变化（换 Wi-Fi、断开、切到蜂窝）时重新确认连着的电脑 */
+    /** 网络变了（换 Wi-Fi、断开、切到蜂窝）：核心重新先试局域网，再找一下局域网里的电脑 */
     private fun watchNetwork() {
         val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
         val cb = object : android.net.ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
-                runOnUiThread { recheckRemote() }
+                runCatching { AgentApp.core.networkChanged() }
+                runOnUiThread { scanBriefly() }
             }
 
             override fun onLost(network: android.net.Network) {
-                runOnUiThread { recheckRemote() }
+                runCatching { AgentApp.core.networkChanged() }
             }
         }
         runCatching { cm.registerDefaultNetworkCallback(cb) }
@@ -695,125 +607,19 @@ class MainActivity : Activity() {
             .onFailure { Log.w(TAG, "监听网络变化失败：${it.message}") }
     }
 
-    private fun viaRelay(): Boolean = prefs().getString(KEY_REMOTE_VIA, null) == "relay"
-
-    /** 不再连任何电脑（回到手机自己的核心） */
-    private fun forgetRemote() {
-        prefs().edit().remove(KEY_REMOTE).remove(KEY_REMOTE_ID).remove(KEY_REMOTE_VIA).apply()
-    }
-
-    /** 这台配对过的电脑出门在外怎么连（没配中继就是 null） */
-    private fun relayInfo(id: String): org.json.JSONObject? =
-        prefs().getString(REMOTE_PREFIX + id, null)
-            ?.let { runCatching { org.json.JSONObject(it) }.getOrNull() }
-            ?.takeIf { it.optJSONObject("relay") != null && it.optString("fingerprint").isNotEmpty() }
-
-    /** 所有配过中继的电脑：id → 那份 JSON */
-    private fun relayMachines(): Map<String, org.json.JSONObject> =
-        prefs().all.keys
-            .filter { it.startsWith(REMOTE_PREFIX) }
-            .mapNotNull { k -> k.removePrefix(REMOTE_PREFIX).let { id -> relayInfo(id)?.let { id to it } } }
-            .toMap()
-
-    /** 记下核心给的 `remote`（`{fingerprint, relay}`），连同电脑的名字 */
-    private fun saveRelayInfo(id: String, name: String, remote: org.json.JSONObject?) {
-        val e = prefs().edit()
-        if (remote == null) {
-            e.remove(REMOTE_PREFIX + id)
-        } else {
-            e.putString(REMOTE_PREFIX + id, org.json.JSONObject(remote.toString()).put("name", name).toString())
-        }
-        e.apply()
-    }
-
     /**
-     * 局域网直连上之后问那台电脑一句「出门在外怎么连」（`GET /api/remote`）。
+     * 把可选的电脑推给页面（`window.__coresFound`）。同一台只出现一次：
      *
-     * 中继常常是配对之后才配上的（或者换了服务器）—— 每次在家连上都对一遍，就不用
-     * 重新配对。**它还没有中继、而手机知道一个**（连过别的配了中继的电脑）：顺手交给它
-     * （`POST /api/remote/relay`），那台电脑立刻挂上并记下来 —— 人不用去复制密钥。
-     * 网络不能上主线程，失败就算了（下次连上再问）。
-     */
-    private fun refreshRelayInfo(url: String, id: String) {
-        val u = Uri.parse(url)
-        val token = pairedToken(id) ?: u.getQueryParameter("t") ?: return
-        val base = "http://${u.host}:${portOf(u)}"
-        // 手机知道的中继（连过的其他电脑那里记下的）。在主线程上读好再带进网络线程
-        val known = relayMachines().filterKeys { it != id }.values.firstNotNullOfOrNull { it.optJSONObject("relay") }
-        Thread {
-            runCatching {
-                var j = call("$base/api/remote", token, null) ?: return@runCatching
-                var handed = false
-                val remote = j.optJSONObject("remote")
-                if (remote != null && remote.optJSONObject("relay") == null && known != null) {
-                    val body = org.json.JSONObject().put("addr", known.getString("addr")).put("key", known.getString("key"))
-                    call("$base/api/remote/relay", token, body)?.let { r ->
-                        j = org.json.JSONObject(j.toString()).put("remote", r.optJSONObject("remote"))
-                        handed = true
-                    }
-                }
-                runOnUiThread {
-                    val name = j.optString("name", "电脑")
-                    saveRelayInfo(id, name, j.optJSONObject("remote"))
-                    if (handed) toast("已把中继交给「$name」：出门在外也能连它了")
-                }
-            }.onFailure { Log.w(TAG, "取 / 交中继信息失败：${it.message}") }
-        }.start()
-    }
-
-    /** 带凭据请求一次核心（`body` 非空就是 POST JSON）。不是 200 就是 null。**网络线程上调** */
-    private fun call(url: String, token: String, body: org.json.JSONObject?): org.json.JSONObject? {
-        val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-        c.connectTimeout = 5000
-        c.readTimeout = 5000
-        c.setRequestProperty("Cookie", "agent_token=$token")
-        if (body != null) {
-            c.requestMethod = "POST"
-            c.doOutput = true
-            c.setRequestProperty("content-type", "application/json")
-            c.outputStream.use { it.write(body.toString().toByteArray()) }
-        }
-        if (c.responseCode != 200) {
-            Log.w(TAG, "$url → HTTP ${c.responseCode}")
-            return null
-        }
-        return org.json.JSONObject(c.inputStream.bufferedReader().use { it.readText() })
-    }
-
-    /**
-     * 经中继连这台电脑：起本机隧道（核心里的 `tunnel.rs`），记下 `http://localhost:<端口>`。
+     * - 局域网里找到的：带地址；`paired` = 配对过（点了直接连），没配过点了要输配对码；
+     * - 配对过、局域网里没找到、但配了中继的（出门了）：`relay = true`，「经服务器连」；
+     * - 正连着的那台无论如何都列出来（带勾）。
      *
-     * 用 `localhost` 而不是 `127.0.0.1`：cookie 按主机名分，手机自己的核心在 127.0.0.1 上，
-     * 两边的 `agent_token` 不会互相覆盖。返回 false = 没配中继或起不来（原因在 logcat）。
+     * 连的时候走哪条路不归这里管（核心在每条连接上自己选），这里只决定列哪几行。
      */
-    private fun startRelay(id: String): Boolean {
-        val info = relayInfo(id) ?: return false
-        val token = pairedToken(id) ?: return false
-        val relay = info.getJSONObject("relay")
-        val port = runCatching {
-            AgentApp.core.startTunnel(
-                relay.getString("addr"),
-                relay.getString("key"),
-                id,
-                info.getString("fingerprint"),
-            )
-        }.getOrElse {
-            Log.w(TAG, "起中继隧道失败：${it.message}")
-            return false
-        }
-        prefs().edit()
-            .putString(KEY_REMOTE, "http://localhost:${port.toInt()}/auth?t=$token")
-            .putString(KEY_REMOTE_ID, id)
-            .putString(KEY_REMOTE_VIA, "relay")
-            .apply()
-        Log.i(TAG, "经中继 ${relay.getString("addr")} 连「${info.optString("name")}」")
-        return true
-    }
-
-    /** 把找到的电脑推给页面（`window.__coresFound`）：带上「配对过没有」「是不是正连着的」 */
     private fun pushCoresFound() {
         val arr = org.json.JSONArray()
-        val cur = remoteId().takeIf { remoteUrl() != null }
+        val cur = remote.conn?.id
+        val known = remote.machines().associateBy { it.id }
         val lan = discovery.current()
         for (f in lan) {
             arr.put(
@@ -822,25 +628,22 @@ class MainActivity : Activity() {
                     .put("name", f.name)
                     .put("host", f.host)
                     .put("port", f.port)
-                    .put("paired", pairedToken(f.id) != null)
+                    .put("paired", f.id in known)
                     .put("relay", false)
-                    // 在家却还走着中继：直连那一条不算「当前」，点它就换成直连
-                    .put("current", f.id == cur && !viaRelay()),
+                    .put("current", f.id == cur),
             )
         }
-        // 配过中继、但局域网里找不到的（出门了）：显示「经服务器」那一条。
-        // 局域网里找得到就只显示直连的 —— 同一台电脑不出现两次
         val here = lan.map { it.id }.toSet()
-        for ((id, info) in relayMachines()) {
-            if (id in here || pairedToken(id) == null) continue
+        for ((id, m) in known) {
+            if (id in here || !(m.relay || id == cur)) continue
             arr.put(
                 org.json.JSONObject()
                     .put("id", id)
-                    .put("name", info.optString("name", "电脑"))
+                    .put("name", m.name)
                     .put("host", "")
                     .put("port", 0)
                     .put("paired", true)
-                    .put("relay", true)
+                    .put("relay", m.relay)
                     .put("current", id == cur),
             )
         }
@@ -848,29 +651,15 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 点了「选择机器」里的某台电脑。只认**真的找到过**的（按 id 查 discovery 的结果）——
-     * 页面给不了任意地址。配对过的直接连（不再确认）；没配对的弹原生对话框输电脑终端上
-     * 显示的 6 位配对码，换回 token 再连。
+     * 点了「选择机器」里的某台。配对过的直接连（不再确认）；没配过的（只会是局域网里找到的）
+     * 弹原生对话框输电脑上显示的 6 位配对码，核心经 TLS 去换凭据、记下证书指纹，再连。
      *
-     * 为什么不确认也可以：`AgentHost` 每个 frame 都看得见（包括查看器里 AI 写的网页），
-     * 但能连的只有「这台手机自己在局域网里找到、而且用配对码配过」的电脑 —— 都是自己的
-     * 机器，网页带不走到别人的服务器上。陌生的那台还是要配对码，那一步是原生的。
+     * 页面只能给出 id，给不了任意地址：`AgentHost` 每个 frame 都看得见（包括查看器里 AI
+     * 写的网页），而能连的只有「配对过的」和「这台手机自己在局域网里找到的」。
      */
     private fun pickDiscovered(id: String) {
-        val f = discovery.current().firstOrNull { it.id == id }
-        if (f == null) {
-            // 局域网里没有：配过中继的就经中继连（页面只会给出这种 id，见 pushCoresFound）
-            if (pairedToken(id) != null && startRelay(id)) {
-                remoteUrl()?.let { switchTo(it) }
-                syncTurnStream()
-            }
-            return
-        }
-        val base = "http://${f.host}:${f.port}"
-        pairedToken(id)?.let { token ->
-            connectTo("$base/auth?t=$token", id)
-            return
-        }
+        if (remote.known(id)) return connectMachine(id)
+        val f = discovery.current().firstOrNull { it.id == id } ?: return
         val input = android.widget.EditText(this).apply {
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
             hint = "6 位配对码"
@@ -882,57 +671,27 @@ class MainActivity : Activity() {
         }
         android.app.AlertDialog.Builder(this)
             .setTitle("和「${f.name}」配对")
-            .setMessage("输入电脑终端里显示的配对码（只要输这一次）。")
+            .setMessage("输入电脑上显示的配对码（只要输这一次）。")
             .setView(box)
-            .setPositiveButton("配对") { _, _ -> pair(f, base, input.text.toString()) }
+            .setPositiveButton("配对") { _, _ -> pair(f, input.text.toString()) }
             .setNegativeButton("取消", null)
             .show()
         input.requestFocus()
     }
 
-    /** `POST /api/pair` 拿配对码换 token（网络不能上主线程） */
-    private fun pair(f: CoreDiscovery.Found, base: String, code: String) {
+    /** 配对要联网（核心里 block_on），不能上主线程 */
+    private fun pair(f: CoreDiscovery.Found, code: String) {
         Thread {
-            val result = runCatching {
-                val c = java.net.URL("$base/api/pair").openConnection() as java.net.HttpURLConnection
-                c.requestMethod = "POST"
-                c.connectTimeout = 5000
-                c.readTimeout = 10000
-                c.doOutput = true
-                c.setRequestProperty("content-type", "application/json")
-                c.outputStream.use { it.write(org.json.JSONObject().put("code", code.trim()).toString().toByteArray()) }
-                val ok = c.responseCode == 200
-                val body = (if (ok) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
-                if (!ok) error(body.ifBlank { "HTTP ${c.responseCode}" })
-                org.json.JSONObject(body)
-            }
+            val r = runCatching { AgentApp.core.pairMachine(f.host, f.port.toUShort(), code) }
             runOnUiThread {
-                result
-                    .onSuccess { j ->
-                        val id = j.optString("id", f.id)
-                        val token = j.getString("token")
-                        prefs().edit().putString(PAIRED_PREFIX + id, token).apply()
-                        saveRelayInfo(id, j.optString("name", f.name), j.optJSONObject("remote"))
-                        connectTo("$base/auth?t=$token", id)
-                    }
-                    .onFailure {
-                        android.widget.Toast.makeText(this, "配对失败：${it.message}", android.widget.Toast.LENGTH_LONG).show()
-                    }
+                r.onSuccess { id -> connectMachine(id) }
+                    .onFailure { toast("配对失败：${it.message}") }
             }
         }.start()
     }
 
-    private fun useLocalCore() {
-        AgentApp.core.stopTunnel()
-        forgetRemote()
-        syncTurnStream()
-        Log.i(TAG, "回到手机自己的核心")
-        switchTo(localUrl())
-    }
-
-    /** 电脑连不上：说清楚，给「重试」和「回到手机」两条路（不然只能清数据） */
-    private fun remoteErrorView(url: String, why: String?): View {
-        val host = runCatching { Uri.parse(url).let { "${it.host}:${portOf(it)}" } }.getOrDefault(url)
+    /** 电脑不认我们了：说清楚，给「回到手机」这条路（不然只能清数据） */
+    private fun remoteErrorView(name: String, why: String): View {
         val box = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(64, 200, 64, 64)
@@ -940,19 +699,18 @@ class MainActivity : Activity() {
         }
         box.addView(
             TextView(this).apply {
-                text = "连不上电脑 $host\n${why.orEmpty()}\n\n" +
-                    "电脑上的核心（just dev-host）还开着吗？手机和电脑在同一个 Wi-Fi 里吗？"
+                text = "「$name」\n$why"
                 setTextColor(Color.parseColor("#e0e0e0"))
                 textSize = 15f
             },
         )
-        fun button(label: String, onClick: () -> Unit) = android.widget.Button(this).apply {
-            text = label
-            isAllCaps = false
-            setOnClickListener { onClick() }
-        }
-        box.addView(button("重试") { switchTo(url) })
-        box.addView(button("回到手机") { useLocalCore() })
+        box.addView(
+            android.widget.Button(this).apply {
+                text = "回到手机"
+                isAllCaps = false
+                setOnClickListener { useLocalCore() }
+            },
+        )
         return box
     }
 
@@ -1195,18 +953,7 @@ class MainActivity : Activity() {
          * 同步返回一个 boolean，不碰 UI，所以不用回主线程。
          */
         @JavascriptInterface
-        fun hasBrowser(): Boolean = remoteUrl() == null && AgentApp.browser?.hasPage() == true
-
-        /**
-         * **兼容旧页面**：页面来自连着的那台电脑，电脑上的核心可能比手机上的壳旧。旧版
-         * 前端靠「有没有 `connectRemote`」判断自己在不在 App 里 —— 删掉它，旧页面就把
-         * 「选择机器」那个标签画成不能点的字（实测踩到：手机连着家里旧核心，点了没反应）。
-         * 所以接口留着，但**不再接受任意地址**（手动输入地址已经去掉了）：只提示一句。
-         */
-        @JavascriptInterface
-        fun connectRemote(url: String) {
-            runOnUiThread { toast("手动输入地址已经去掉了：在「选择机器」里点局域网里找到的电脑") }
-        }
+        fun hasBrowser(): Boolean = remote.conn == null && AgentApp.browser?.hasPage() == true
 
         /** 「选择机器」面板打开了：开始在局域网里找（找到的推给 `window.__coresFound`） */
         @JavascriptInterface

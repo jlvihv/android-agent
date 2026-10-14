@@ -171,28 +171,6 @@ pub enum Event {
 // AppState
 // ---------------------------------------------------------------------------
 
-/// 落盘用的结构。和 `Provider` 分开是因为 `Provider::api_key` 标了
-/// `skip_serializing`（防止通过任何序列化路径泄给前端）。
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedProvider {
-    name: String,
-    base_url: String,
-    model: String,
-    api_key: String,
-    /// 老 llm.json 里没有这个字段 → 默认 true（模型能看图）
-    #[serde(default = "crate::llm::default_supports_images")]
-    supports_images: bool,
-    /// 老 llm.json 里没有这个字段 → 默认 false（不知道就不显示文件入口）
-    #[serde(default)]
-    supports_files: bool,
-    /// 协议偏好。老 llm.json 里没有 → Auto（优先 Responses）
-    #[serde(default)]
-    api_style: crate::llm::ApiStyle,
-    /// 思考强度。老 llm.json 里没有 → 默认档（不发）
-    #[serde(default)]
-    reasoning_effort: Option<String>,
-}
-
 /// 手机出门在外连这台电脑要的东西（见 `remote.rs` 和 docs/12-relay.md）。
 ///
 /// 配对时（`/api/pair`）连同 token 一起给手机；配对过的手机在局域网里连上时也会
@@ -285,6 +263,9 @@ pub struct AppState {
     /// 运行时换中继（`POST /api/remote/relay`：手机把它知道的中继交给这台电脑）。
     /// 只有桌面宿主模式对局域网开放时才有（见 `remote.rs`）。
     pub relay_host: RwLock<Option<Arc<dyn RelayControl>>>,
+    /// 局域网上的 TLS（手机 App 连这台电脑走它，见 `http::accept_conn`）。和中继那条用的是
+    /// 同一张证书。没有 = 只有明文（手机自己的核心、只听本机的电脑）。
+    pub lan_tls: std::sync::OnceLock<tokio_rustls::TlsAcceptor>,
     /// 核心跑在哪个 tokio runtime 上。手机的壳从 Kotlin 线程起中继隧道时要用
     /// （`ffi::AgentCore::start_tunnel`）—— runtime 本身归 `serve_in_background` 那个线程。
     pub rt: std::sync::OnceLock<tokio::runtime::Handle>,
@@ -377,6 +358,7 @@ impl AppState {
             pairing: RwLock::new(None),
             remote: RwLock::new(None),
             relay_host: RwLock::new(None),
+            lan_tls: std::sync::OnceLock::new(),
             rt: std::sync::OnceLock::new(),
             trust_loopback: AtomicBool::new(false),
             sessions_loaded: AtomicBool::new(false),
@@ -472,11 +454,15 @@ impl AppState {
         match Db::open(&path) {
             Ok(db) => {
                 let db = Arc::new(db);
-                self.load_llm(&db, dir);
+                if let Err(e) = db.migrate_json_meta() {
+                    tracing::warn!("把旧的 JSON 配置搬进表里失败（下次启动再试）: {e:#}");
+                }
+                // 模型目录的缓存以前是个文件，现在在库里（`http_cache`）
+                let _ = std::fs::remove_file(dir.join("models-dev.json"));
+                self.load_llm(&db);
                 self.load_providers(&db);
                 self.load_auth(&db);
-                if let Ok(Some(raw)) = db.get_meta(RESPONSES_UNSUPPORTED) {
-                    let keys: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+                if let Ok(keys) = db.responses_unsupported() {
                     crate::llm::load_responses_unsupported(keys);
                 }
                 if let Ok(mut g) = self.db.write() {
@@ -711,10 +697,8 @@ impl AppState {
             return;
         }
         let Some(db) = self.db() else { return };
-        let body = serde_json::to_string(&crate::llm::responses_unsupported_list())
-            .unwrap_or_else(|_| "[]".into());
-        let res =
-            tokio::task::spawn_blocking(move || db.set_meta(RESPONSES_UNSUPPORTED, &body)).await;
+        let key = crate::llm::responses_key(p);
+        let res = tokio::task::spawn_blocking(move || db.add_responses_unsupported(&key)).await;
         if !matches!(res, Ok(Ok(()))) {
             tracing::warn!("记录「不支持 Responses」失败（下次启动会再探测一次）");
         }
@@ -723,13 +707,10 @@ impl AppState {
     /// 各家的 Key。老版本只有一个 provider（`llm`）：库里还没有 `providers`
     /// 时，把它记成对应那家（按 Base URL 认）已配置。
     fn load_providers(&self, db: &Db) {
-        let store: crate::providers::Store = match db.get_meta("providers") {
-            Ok(Some(s)) => serde_json::from_str(&s).unwrap_or_else(|e| {
-                tracing::warn!("providers 解析失败: {e}");
-                Default::default()
-            }),
-            _ => Default::default(),
-        };
+        let store = db.providers().unwrap_or_else(|e| {
+            tracing::warn!("读服务商的 Key 失败: {e:#}");
+            Default::default()
+        });
         if let Ok(mut g) = self.providers.write() {
             *g = store;
         }
@@ -760,6 +741,11 @@ impl AppState {
 
     /// 存 / 删一家的 Key（`None` = 删），落库，并清掉它的模型清单缓存。
     pub fn set_provider_creds(&self, id: &str, creds: Option<crate::providers::Creds>) {
+        if let Some(db) = self.db() {
+            if let Err(e) = db.set_provider(id, creds.as_ref()) {
+                tracing::warn!("保存服务商的 Key 失败: {e:#}");
+            }
+        }
         if let Ok(mut g) = self.providers.write() {
             match creds {
                 Some(c) => {
@@ -772,17 +758,6 @@ impl AppState {
         }
         if let Ok(mut g) = self.model_lists.lock() {
             g.remove(id);
-        }
-        let Some(db) = self.db() else { return };
-        let body = self
-            .providers
-            .read()
-            .ok()
-            .and_then(|g| serde_json::to_string(&*g).ok());
-        if let Some(body) = body {
-            if let Err(e) = db.set_meta("providers", &body) {
-                tracing::warn!("保存服务商的 Key 失败: {e:#}");
-            }
         }
     }
 
@@ -804,8 +779,8 @@ impl AppState {
                 return Ok(v);
             }
         }
-        let dir = self.data_dir.read().ok().and_then(|g| g.clone());
-        let mut list = crate::models::list(provider, refresh, dir.as_deref()).await?;
+        let db = self.db();
+        let mut list = crate::models::list(provider, refresh, db.as_deref()).await?;
         list.retain(|m| crate::providers::is_chat_model(&m.id));
         if let Ok(mut g) = self.model_lists.lock() {
             g.insert(id.to_string(), (std::time::Instant::now(), list.clone()));
@@ -819,7 +794,7 @@ impl AppState {
             *g = None;
         }
         if let Some(db) = self.db() {
-            if let Err(e) = db.delete_meta("llm") {
+            if let Err(e) = db.set_llm(None) {
                 tracing::warn!("清掉 provider 配置失败: {e:#}");
             }
         }
@@ -1252,16 +1227,13 @@ impl AppState {
         tracing::debug!("文档输入能力已记录: {files}");
     }
 
-    /// provider 配置存进会话库的 `meta` 表（桌面开发没有库，只留在内存里）。
+    /// provider 配置存进库的 `llm` 表（桌面开发没有库，只留在内存里）。
     ///
-    /// 一行 UPSERT 是原子的：原来写 llm.json 时进程被杀，文件就是半截，
-    /// 下次启动解析失败，API key 跟着没了。
+    /// 用 `LlmConfig` 而不是直接存 `Provider`：后者的 api_key 是 skip_serializing
+    /// （防止泄给前端），一不小心就存丢了。
     fn persist_provider(&self, p: &Provider) {
         let Some(db) = self.db() else { return };
-        // 用独立的持久化结构，**不能**直接序列化 Provider ——
-        // 它的 api_key 是 skip_serializing（防止泄给前端），
-        // 直接存的话 key 就丢了。
-        let rec = PersistedProvider {
+        let rec = crate::db::LlmConfig {
             name: p.name.clone(),
             base_url: p.base_url.clone(),
             model: p.model.clone(),
@@ -1271,10 +1243,7 @@ impl AppState {
             api_style: p.api_style,
             reasoning_effort: p.reasoning_effort.clone(),
         };
-        let res = serde_json::to_string(&rec)
-            .map_err(anyhow::Error::from)
-            .and_then(|body| db.set_meta("llm", &body));
-        if let Err(e) = res {
+        if let Err(e) = db.set_llm(Some(&rec)) {
             tracing::warn!("保存 provider 失败: {e:#}");
         }
     }
@@ -1290,9 +1259,9 @@ impl AppState {
                 return v;
             }
         }
-        let dir = self.data_dir.read().ok().and_then(|g| g.clone());
+        let db = self.db();
         let resolved =
-            crate::models::vision_for(provider, &provider.model, false, dir.as_deref()).await;
+            crate::models::vision_for(provider, &provider.model, false, db.as_deref()).await;
         let vision = resolved.unwrap_or(provider.supports_images);
         match resolved {
             Some(v) => tracing::info!("视觉能力自动判定: {} → {v}", provider.model),
@@ -1324,9 +1293,9 @@ impl AppState {
                 return v;
             }
         }
-        let dir = self.data_dir.read().ok().and_then(|g| g.clone());
+        let db = self.db();
         let resolved =
-            crate::models::pdf_for(provider, &provider.model, false, dir.as_deref()).await;
+            crate::models::pdf_for(provider, &provider.model, false, db.as_deref()).await;
         let files = resolved.unwrap_or(provider.supports_files);
         match resolved {
             Some(v) => tracing::info!("文档输入能力自动判定: {} → {v}", provider.model),
@@ -1375,26 +1344,14 @@ impl AppState {
             .llm()
             .or_else(Provider::from_env)
             .ok_or_else(|| anyhow::anyhow!("还没有配置 LLM"))?;
-        let dir = self.data_dir.read().ok().and_then(|g| g.clone());
-        crate::models::list(&provider, refresh, dir.as_deref()).await
+        let db = self.db();
+        crate::models::list(&provider, refresh, db.as_deref()).await
     }
 
     /// 启动时从库里恢复 provider。
-    ///
-    /// 老版本存在 `<filesDir>/llm.json`：库里还没有时把它搬进来，然后删掉
-    /// 文件 —— 明文的 key 不该在两个地方各留一份。
-    fn load_llm(&self, db: &Db, dir: &std::path::Path) {
-        let raw = match db.get_meta("llm") {
-            Ok(Some(s)) => Some(s),
-            Ok(None) => migrate_llm_json(db, dir),
-            Err(e) => {
-                self.log("warn", format!("读取 provider 配置失败: {e:#}"));
-                None
-            }
-        };
-        let Some(raw) = raw else { return };
-        match serde_json::from_str::<PersistedProvider>(&raw) {
-            Ok(rec) => {
+    fn load_llm(&self, db: &Db) {
+        match db.llm() {
+            Ok(Some(rec)) => {
                 let name = rec.name.clone();
                 let model = rec.model.clone();
                 let mut p = Provider::compatible(rec.name, rec.base_url, rec.model, rec.api_key);
@@ -1415,7 +1372,8 @@ impl AppState {
                 }
                 self.log("info", format!("恢复 LLM 配置: {name} / {model}"));
             }
-            Err(e) => self.log("warn", format!("provider 配置解析失败: {e}")),
+            Ok(None) => {}
+            Err(e) => self.log("warn", format!("读取 provider 配置失败: {e:#}")),
         }
     }
 
@@ -1427,29 +1385,6 @@ impl AppState {
         self.log("info", format!("Linux 沙箱就绪: {rootfs}"));
     }
 }
-
-/// 老版本的 `llm.json` → 库。成功搬进去才删文件；返回搬进去的内容。
-fn migrate_llm_json(db: &Db, dir: &std::path::Path) -> Option<String> {
-    let f = dir.join("llm.json");
-    let body = std::fs::read_to_string(&f).ok()?;
-    // 坏文件不搬（搬进去也解析不了），留着给人看
-    serde_json::from_str::<PersistedProvider>(&body).ok()?;
-    match db.set_meta("llm", &body) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&f);
-            let _ = std::fs::remove_file(dir.join("llm.json.tmp"));
-            tracing::info!("llm.json 已迁移进 sessions.db");
-            Some(body)
-        }
-        Err(e) => {
-            tracing::warn!("迁移 llm.json 失败（下次启动再试）: {e:#}");
-            Some(body)
-        }
-    }
-}
-
-/// `meta` 表里那一行：已知不支持 Responses API 的 `base_url|model`（JSON 数组）
-const RESPONSES_UNSUPPORTED: &str = "responses_unsupported";
 
 /// 随机凭据：122 位随机数的十六进制（UUID v4 去掉版本位之外全是随机的）。
 fn random_secret() -> String {
@@ -1588,39 +1523,51 @@ mod tests {
         assert_eq!(st.system_prompt(), "改过的");
     }
 
-    /// 老版本把 provider（含明文 key）存在 llm.json：搬进库，然后删掉文件。
+    /// 配置按列存在表里，**不是** `meta` 里的一段 JSON。以前存成 JSON 的那几行在打开库时
+    /// 搬进表里、删掉旧行；之后改模型、改 Key 都落在表里，重开还在，凭据也不变。
     #[test]
-    fn llm_json_moves_into_the_database_and_the_file_goes_away() {
+    fn json_settings_move_into_tables_and_survive_a_restart() {
         let dir = temp_dir("migrate");
-        std::fs::write(
-            dir.join("llm.json"),
-            r#"{"name":"go","base_url":"https://x/v1","model":"m1","api_key":"sk-1"}"#,
-        )
-        .unwrap();
+        {
+            let old = Db::open(&dir.join("sessions.db")).unwrap();
+            old.set_meta(
+                "llm",
+                r#"{"name":"go","base_url":"https://x/v1","model":"m1","api_key":"sk-1"}"#,
+            )
+            .unwrap();
+            old.set_meta(
+                "providers",
+                r#"{"custom":{"api_key":"sk-1","base_url":"https://x/v1"}}"#,
+            )
+            .unwrap();
+            old.set_meta("responses_unsupported", r#"["https://x/v1|m1"]"#)
+                .unwrap();
+            old.set_meta("search", r#"{"exaApiKey":"exa-1"}"#).unwrap();
+        }
 
         let st = AppState::new();
         st.open_db(&dir);
-        let p = st.llm().expect("从 llm.json 恢复出 provider");
+        let p = st.llm().expect("从旧的 JSON 行恢复出 provider");
         assert_eq!((p.model.as_str(), p.api_key.as_str()), ("m1", "sk-1"));
-        assert!(
-            !dir.join("llm.json").exists(),
-            "明文 key 不该再留一份在文件里"
-        );
-        // 老配置记成「其他」那家已配置，设置页里看得到
-        let c = st
-            .provider_creds("custom")
-            .expect("老配置要出现在设置页的服务商里");
+        let c = st.provider_creds("custom").expect("服务商的 Key 搬过来了");
+        assert_eq!(c.base_url, "https://x/v1");
+        let db = st.db().unwrap();
+        for k in ["llm", "providers", "responses_unsupported", "search"] {
+            assert!(db.get_meta(k).unwrap().is_none(), "旧的 JSON 行 {k} 该删掉");
+        }
+        assert_eq!(db.responses_unsupported().unwrap(), ["https://x/v1|m1"]);
         assert_eq!(
-            (c.api_key.as_str(), c.base_url.as_str()),
-            ("sk-1", "https://x/v1")
+            db.get_meta("exa_api_key").unwrap().as_deref(),
+            Some("exa-1")
         );
 
-        // 改模型 → 存进库；重开之后还在，凭据也不变
+        // 改模型 → 存进表；重开之后还在，凭据也不变
         let mut p2 = p.clone();
         p2.model = "m2".into();
         st.set_llm(p2);
         let token = st.auth().token;
         let key = st.auth().sandbox_key;
+        drop(db);
         drop(st);
 
         let st = AppState::new();

@@ -80,10 +80,7 @@ pub fn format_hits(found: &Found) -> String {
     out
 }
 
-/// 找 key：环境变量优先（桌面开发），其次会话库的 `search` 行（手机）。
-///
-/// 会话库那行的形状是 `{"exaApiKey":"exa-…"}`。存库而不是存文件，和 provider
-/// 配置同一个理由：写 JSON 文件时进程被杀就是半截文件（见 `state::PersistedProvider`）。
+/// 找 key：环境变量优先（桌面开发），其次库里 `meta` 的 `exa_api_key`（手机）。
 pub fn read_key(state: &AppState) -> Option<String> {
     if let Ok(v) = std::env::var("EXA_API_KEY") {
         if !v.trim().is_empty() {
@@ -91,13 +88,11 @@ pub fn read_key(state: &AppState) -> Option<String> {
         }
     }
     let db = state.db.read().ok().and_then(|g| g.clone())?;
-    let raw = db.get_meta("search").ok().flatten()?;
-    let v: Value = serde_json::from_str(&raw).ok()?;
-    v.get("exaApiKey")
-        .and_then(|k| k.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    db.get_meta("exa_api_key")
+        .ok()
+        .flatten()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
 }
 
 /// 搜一次。`key` 有就直连，没有就走公开 MCP。

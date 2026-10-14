@@ -33,6 +33,7 @@ pub mod http;
 pub mod imaging;
 pub mod linux;
 pub mod llm;
+pub mod machines;
 pub mod mock;
 pub mod models;
 pub mod openai;
@@ -683,10 +684,20 @@ impl Core {
         let st = self.state.clone();
         tokio::spawn(async move {
             st.log("info", format!("http://127.0.0.1:{actual}"));
-            // 带上对端地址：桌面上「本机来的不要凭据」要靠它（`AppState::trust_loopback`）
-            let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
-            if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!("http server exited: {e}");
+            loop {
+                let (s, peer) = match listener.accept().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // 文件描述符用光这类：歇一下再接，别空转
+                        tracing::warn!("accept: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                // 对端地址跟着每个请求走：桌面上「本机来的不要凭据」要靠它
+                // （`AppState::trust_loopback`）。有 TLS 身份（电脑对局域网开放）就认 TLS
+                let tls = st.lan_tls.get().cloned();
+                tokio::spawn(http::accept_conn(s, peer, app.clone(), tls));
             }
         });
 

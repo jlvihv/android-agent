@@ -40,6 +40,26 @@ pub enum ApiStyle {
     Chat,
 }
 
+impl ApiStyle {
+    /// 存库用的名字（`llm.api_style` 列）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApiStyle::Auto => "auto",
+            ApiStyle::Responses => "responses",
+            ApiStyle::Chat => "chat",
+        }
+    }
+
+    /// 认不出来的当 `Auto`（默认）
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "responses" => ApiStyle::Responses,
+            "chat" => ApiStyle::Chat,
+            _ => ApiStyle::Auto,
+        }
+    }
+}
+
 /// `ApiStyle` 落地后的具体协议（不会再有 `Auto`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -460,7 +480,7 @@ fn responses_unsupported() -> &'static Mutex<HashSet<String>> {
     M.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn responses_key(p: &Provider) -> String {
+pub fn responses_key(p: &Provider) -> String {
     format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
 }
 

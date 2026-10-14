@@ -98,6 +98,11 @@ agent-relay = { path = "../relay" }
 # 和上面的 rustls 同一个 provider。
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 sha2 = "0.10"
+# 每条连接自己服务（`http::serve_conn`）：明文 / 局域网 TLS / 中继三种连接走同一个
+# 函数。这几个本来就经 axum 编进来了（axum::serve 底下就是它们），这里只是变成直接依赖。
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -106,12 +111,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 是阻塞接口、跑在 spawn_blocking 上。**不引新代码** —— 同一个版本早就在依赖树里
 # 了（axum 带进来的），这里只是把它变成直接依赖。
 tungstenite = { version = "0.29", default-features = false, features = ["handshake", "url"] }
-# 中继的家里那头（`remote.rs`）：自签证书 + 把路由挂到一条 TLS 连接上。
-# 只有电脑会当「家里那台」，手机不需要这几个。
+# 「家里那台」的自签证书（`remote.rs`）。只有电脑会当家里那台，手机不需要。
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
-tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # default-features = false：它的默认 feature 是 "regex"（env_filter，给

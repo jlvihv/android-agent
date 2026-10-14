@@ -170,11 +170,68 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
         .map(|(_, v)| v)
 }
 
-/// 这个请求是经中继进来的（出门在外的手机，见 `remote.rs`）。`require_auth` 据此
-/// 不让它碰 `/api/pair`：配对码只该在局域网里输 —— 不然公网上谁拿到中继密钥都能来猜，
-/// 猜错五次还会把配对整个停掉。
-#[derive(Clone, Copy)]
-pub struct ViaRelay;
+/// 这条连接是怎么进来的（`serve_conn` 给每个请求挂上，`require_auth` 看它）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    /// 明文 HTTP：手机自己的核心（127.0.0.1）、电脑上自己开的浏览器、局域网里的浏览器
+    Plain,
+    /// 局域网里的 TLS：手机 App 连电脑（只认配对时记下的证书，见 `tunnel.rs`）
+    LanTls,
+    /// 经中继进来的 TLS：出门在外的手机（见 `remote.rs`）
+    Relay,
+}
+
+/// 服务一条连接（HTTP/1.1，带 WebSocket 升级）。**三种连接都走这里**（见 `Via`）：
+/// 明文、局域网 TLS、中继 —— 界面、API、鉴权都是同一份路由，区别只在请求上挂的
+/// 对端地址和 `Via`。
+pub async fn serve_conn<IO>(io: IO, router: Router, peer: SocketAddr, via: Via)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let svc = tower::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        req.extensions_mut().insert(via);
+        let router = router.clone();
+        async move { tower::ServiceExt::oneshot(router, req).await }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(
+            hyper_util::rt::TokioIo::new(io),
+            hyper_util::service::TowerToHyperService::new(svc),
+        )
+        .with_upgrades()
+        .await;
+}
+
+/// 一条刚接进来的 TCP 连接：第一个字节是 TLS 握手（0x16）就走 TLS，否则当明文 HTTP。
+///
+/// 一个端口两种用法：电脑上自己开浏览器还是 `http://127.0.0.1:8787`，手机 App 走 TLS。
+/// 没有 TLS 身份（手机自己的核心、只听本机的电脑）就只有明文。
+pub async fn accept_conn(
+    s: tokio::net::TcpStream,
+    peer: SocketAddr,
+    router: Router,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) {
+    let _ = s.set_nodelay(true);
+    if let Some(acceptor) = tls {
+        let mut first = [0u8; 1];
+        let is_tls = matches!(
+            tokio::time::timeout(Duration::from_secs(10), s.peek(&mut first)).await,
+            Ok(Ok(1))
+        ) && first[0] == 0x16;
+        if is_tls {
+            match acceptor.accept(s).await {
+                Ok(t) => serve_conn(t, router, peer, Via::LanTls).await,
+                // 多半是对面不认这张证书（不是配对过的手机）或者半路断了
+                Err(e) => tracing::debug!("{peer}: TLS 握手失败：{e}"),
+            }
+            return;
+        }
+    }
+    serve_conn(s, router, peer, Via::Plain).await;
+}
 
 async fn require_auth(
     State(st): State<Arc<AppState>>,
@@ -183,7 +240,7 @@ async fn require_auth(
 ) -> Response {
     // 沙箱文件在 handler 里核对路径上的钥匙；静态资源和 /auth 本身不设防
     // `/api/pair` 是**换**凭据的那一步（拿配对码换 token），它自己核对配对码
-    if req.uri().path() == "/api/pair" && req.extensions().get::<ViaRelay>().is_some() {
+    if req.uri().path() == "/api/pair" && req.extensions().get::<Via>() == Some(&Via::Relay) {
         return (StatusCode::FORBIDDEN, "配对只能在局域网里做").into_response();
     }
     if !req.uri().path().starts_with("/api/") || req.uri().path() == "/api/pair" {
@@ -708,7 +765,7 @@ struct SearchConfigBody {
     exa_api_key: String,
 }
 
-/// `POST /api/websearch/config` → 存 Exa 的 key（会话库的 `search` 行）。
+/// `POST /api/websearch/config` → 存 Exa 的 key（库里 `meta` 的 `exa_api_key`）。
 ///
 /// 空字符串就是清掉。为什么不给前端做界面：这是“免费用完了才需要”的逃生口，
 /// 先用 curl / agentctl 设一下就够（见 docs/09）。
@@ -720,8 +777,12 @@ async fn set_search_config(
         return (StatusCode::SERVICE_UNAVAILABLE, "会话库没打开").into_response();
     };
     let key = body.exa_api_key.trim();
-    let rec = json!({ "exaApiKey": key });
-    match db.set_meta("search", &rec.to_string()) {
+    let res = if key.is_empty() {
+        db.delete_meta("exa_api_key")
+    } else {
+        db.set_meta("exa_api_key", key)
+    };
+    match res {
         Ok(()) => Json(json!({
             "ok": true,
             "configured": !key.is_empty(),

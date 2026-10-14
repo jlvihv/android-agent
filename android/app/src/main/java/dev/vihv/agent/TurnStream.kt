@@ -153,6 +153,10 @@ object TurnStream {
             // 「这个核心还没有这个端点」，交给退避慢慢等。
             val code = conn.responseCode
             val type = conn.contentType.orEmpty()
+            // 502 是手机核心的隧道说「那台电脑哪条路都不通」（原因在隧道的日志里，见 tunnel.rs）
+            if (code == HttpURLConnection.HTTP_BAD_GATEWAY) {
+                throw IllegalStateException("连不上那台电脑（隧道回 502）")
+            }
             if (code != HttpURLConnection.HTTP_OK || !type.startsWith("text/event-stream")) {
                 throw IllegalStateException(
                     "不是回合状态流（HTTP $code, ${type.ifBlank { "无 content-type" }}）" +
