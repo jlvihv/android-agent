@@ -182,8 +182,14 @@
   // 按住抽屉任何地方往左拖都跟手（包括会话列表上）；竖着划还是滚列表。
   // 手势判定见 lib/drag.ts。
   let aside: HTMLElement | null = $state(null);
-  /** 被往左拖出去的比例，0 = 完全展开，1 = 完全收起 */
-  let off = $state(0);
+  /**
+   * 被往左拖出去的比例，0 = 完全展开，1 = 完全收起。
+   *
+   * 跟着手指拉出来的那种，第一帧就从手指的位置算（下面那个 `$effect` 要等挂上之后才跑）——
+   * 不然挂上那一刻是 0（整个展开、遮罩全黑），会闪一下。
+   */
+  // svelte-ignore state_referenced_locally
+  let off = $state(peek != null ? 1 - peek : 0);
   /** 跟手中：关掉回弹过渡，否则拖起来发黏 */
   let dragging = $state(false);
 
@@ -237,6 +243,18 @@
       easing: quintOut,
       css: (_t: number, u: number) => `transform: translateX(${-u * 100}%)`,
     };
+  }
+
+  /**
+   * 遮罩进场：淡入。跟着手指拉出来的那种**不要**：遮罩的深浅归手指管（`1 - off`）。
+   *
+   * 不能直接 `transition:fade`：它把挂上那一刻的透明度当终点，用 CSS 动画做 0→1 ——
+   * CSS 动画盖过内联样式，那 220ms 里遮罩不管手指在哪都自己变黑，动画一完又回到手指
+   * 对应的那一点点，看着就是「闪一下」。
+   */
+  function scrimIn(node: Element) {
+    if (peek != null) return { duration: 0 };
+    return fade(node, { duration: SCRIM_FADE_MS });
   }
 
   /** 出场：从当前位置（可能被拖到一半）继续往左收（时间怎么算见上面常量） */
@@ -438,7 +456,8 @@
     style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
     aria-label="关闭"
     onclick={onclose}
-    transition:fade|global={{ duration: SCRIM_FADE_MS }}
+    in:scrimIn|global
+    out:fade|global={{ duration: SCRIM_FADE_MS }}
   ></button>
 
   <aside
