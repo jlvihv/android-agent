@@ -45,7 +45,7 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 | 调试 | 需 lldb 跨语言 | 最好：独立进程、可单独跑、可热替换 `.so` |
 | 省电 | 单进程 | 多一个常驻进程 |
 
-**倾向：A（进程内）**。理由：单进程省电、不需要 `extractNativeLibs`、日志统一、启动快。
+**定了：A（进程内）**。理由：单进程省电、不需要 `extractNativeLibs`、日志统一、启动快。
 
 **崩溃策略：`panic = "abort"` —— panic 就崩，不兜。**
 
@@ -79,7 +79,7 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 | 对称性 | 单向调用 + 回调 | 双向都是 HTTP/JSON，心智最统一 | 差 |
 | 风险 | uniffi Kotlin 后端的 JNA/JNI 模式需确认（见 R4） | Kotlin 要维护一个 server | JNI 全局引用/线程 attach 易踩坑 |
 
-**倾向：A**。这是 UniFFI 设计出来就是为了干这个的，且避免手写反向 JNI（你明确不想）。
+**定了：A**。这是 UniFFI 设计出来就是为了干这个的，且避免手写反向 JNI（你明确不想）。
 若你偏好"两端都说同一种协议"的对称美，选 B。
 
 ---
@@ -94,7 +94,7 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 | 明文流量 | 需加 localhost 例外 XML | 需加 localhost 例外 + CORS | 不需要 |
 | 开发期 | 代理到 Vite dev server（`adb reverse`）即可热更 | 一样 | 麻烦 |
 
-**倾向：A**。同源 + secure context + 开发期可代理 Vite，三件事一次解决。
+**定了：A**。同源 + secure context + 开发期可代理 Vite，三件事一次解决。
 明文例外约 10 行 XML，成本可忽略。
 
 ---
@@ -160,7 +160,7 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 | CI | 最好写 | 一般 | 一般 |
 | 增量构建 | 靠 cargo 自身 | 靠 cargo 自身 | 插件管 |
 
-**倾向：A 为主 + B 作为 release 时的可选挂钩**。Gradle 只负责把 `jniLibs/` 打进去，不感知 Rust。
+**定了：A 为主 + B 作为 release 时的可选挂钩**。Gradle 只负责把 `jniLibs/` 打进去，不感知 Rust。
 
 ### D9 — 编译哪些 ABI
 
@@ -185,7 +185,7 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 | 体积 | 大（节点几百个时明显） | 小 ~30% | 最小 |
 | 代码 | 零成本 | 低 | 要 codegen |
 
-**倾向：A + 剪枝**（只发可交互节点 + 文本 + 关键属性），先 JSON。
+**定了：A + 剪枝**（只发可交互节点 + 文本 + 关键属性），先 JSON。
 压测后再决定是否换 CBOR——接口留成 `serde` 泛型就能无痛切换。
 
 ### D11 — 本地推理（llama.cpp）现在做吗？
@@ -196,7 +196,7 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 | 编译时间 | 0 | 交叉编译 llama.cpp 很慢 |
 | 风险 | 无 | `llama-cpp-rs` 明确声明**不遵守 semver**，要 pin 死版本 |
 
-**倾向：A**。先跑通"云 LLM + 设备操作"，本地推理作为 `trait LlmBackend` 的一个实现后补。
+**定了：A**。先跑通"云 LLM + 设备操作"，本地推理作为 `trait LlmBackend` 的一个实现后补。
 （`llama-cpp-sys-2` 确实支持 Android NDK 交叉编译，有 `android-shared-stdcxx` feature，路是通的。）
 
 ### D12 — 其它小项
@@ -279,7 +279,7 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 | 组件 | 候选版本 | 备注 |
 |---|---|---|
 | rust | 1.98.0 | 已装 |
-| cargo-ndk | 4.1.2 | 待装 |
+| cargo-ndk | 4.1.2 | 已装 |
 | NDK | r27.0.12077973 | 已装；见 R1 |
 | AGP | 8.x 最新 | 配 Java 21 |
 | Kotlin | 2.x 最新 | |

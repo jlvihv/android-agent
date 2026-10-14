@@ -500,7 +500,7 @@ APK 里带的 minirootfs 只在**第一次安装**时解压（`RootfsInstaller` 
 
 ### 决策点
 
-| # | 决策 | 选项 | 倾向 |
+| # | 决策 | 选项 | 定了 |
 |---|---|---|---|
 | **D13** | proot 从哪来 | A 复用 `OpenMinis/proot` fork 自编（含 Android 必需补丁）<br>B 上游 `termux/proot` 自编<br>C 先直接用本机已编好的产物跑通 | **C 先跑通 → A 固化**。上游没有 loader/link2symlink 的 Android 处理 |
 | **D14** | rootfs 分发 | A 内置 assets（APK +3.9 MB，离线可用）<br>B 首次启动下载 | **A**。4 MB 换离线可用和启动速度，值 |
