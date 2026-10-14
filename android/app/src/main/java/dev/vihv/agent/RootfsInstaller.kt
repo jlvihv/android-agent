@@ -159,7 +159,7 @@ object RootfsInstaller {
                     // 符号链接。Alpine 里大量条目指向**绝对路径**
                     // （/bin/ls -> /bin/busybox）。这在沙箱内是正确的，
                     // 在宿主上会解析失败 —— 所以别用 File.exists() 去判断
-                    // rootfs 是否有效（踩过这个坑）。
+                    // rootfs 是否有效。
                     val link = readString(header, 157, 100)
                     target.parentFile?.mkdirs()
                     runCatching {

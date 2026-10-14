@@ -169,7 +169,7 @@ class BrowserController(private val app: Application) : BrowserHost {
      * 为什么值得写：面板那几个入口（[pageState] / [selectTabFromUi] / [attachTo]）
      * 是**从主线程**调的，而动作那几个入口是从 Rust 的 spawn_blocking 线程调的、
      * 内部用 [onMain] 跳过去。两种姿势写混的后果很重：主线程里调 [onMain] 会
-     * “自己等自己” 10 秒，然后抛异常 → **点一下标签条就闪退**（实测）。
+     * “自己等自己” 10 秒，然后抛异常 → **点一下标签条就闪退**。
      * 有这行断言，就变成一眼能看懂的报错。
      */
     private fun onMainThread(): Boolean {
@@ -488,7 +488,7 @@ class BrowserController(private val app: Application) : BrowserHost {
         Log.i(TAG, "action=$name ${a.toString().take(200)}")
 
         // 标签管理那几个动作**不要**顺手建标签：模型问“有哪些标签”不该因此多出
-        // 一只空标签（踩过：list_tabs 之前先跑 ensureWeb，结果每次列完都多一只）。
+        // 一只空标签（`list_tabs` 之前先跑 `ensureWeb` 就会每次列完都多一只）。
         val managesTabs = name == "new_tab" || name == "list_tabs" ||
             name == "close_tab" || name == "switch_tab"
 
@@ -891,7 +891,7 @@ class BrowserController(private val app: Application) : BrowserHost {
      * 抽正文（文章页用它，不要用 get_text）。
      *
      * `get_text` 给的是整个 body 的 innerText，导航/页脚/推荐位/广告语全在上面 ——
-     * 实测一篇 CNBC 报道拿回 6415 字，一半是菜单和免责声明。这里先找“最像正文的
+     * 一篇 CNBC 报道能拿回 6415 字，一半是菜单和免责声明。这里先找“最像正文的
      * 容器”（段落密度 + 链接密度惩罚），再按文档顺序只取标题/段落/列表项/引用/代码，
      * 顺带去重、去掉导航块。
      */
@@ -1098,7 +1098,7 @@ class BrowserController(private val app: Application) : BrowserHost {
     private fun applyViewport(w: WebView, css: Pair<Int, Int>?) {
         val dm = app.resources.displayMetrics
         // 默认（null）= 手机屏幕，直接用物理像素 —— 别绕一圈 CSS px 再乘回去：
-        // 两次取整会把视口缩小一像素（实测 411.4 → 410）
+        // 两次取整会把视口缩小一像素（411.4 → 410）
         val pw: Int
         val ph: Int
         if (css == null) {
@@ -1167,7 +1167,7 @@ class BrowserController(private val app: Application) : BrowserHost {
         // 两段式：先踢一脚，再轮询。
         //
         // **`evaluateJavascript` 不会等 Promise** —— 直接返回一个 async IIFE 的话，
-        // 拿回来的是 Promise 对象的序列化，也就是 `{}`（踩过）。所以把结果写到
+        // 拿回来的是 Promise 对象的序列化，也就是 `{}`。所以把结果写到
         // 一个全局变量上，再用第二个（同步的）注入去读。代价是两次往返，换来的是
         // 模型能写 `await fetch(...)` —— 这是这个动作最值钱的用法。
         val kick = """
@@ -1258,7 +1258,7 @@ class BrowserController(private val app: Application) : BrowserHost {
 
         // 先试 **GPU 合成器**（WebGL / `<video>` 只有它有），拿不到再退回软件绘制。
         // 退回很常见：整页截图超过虚拟显示的单边上限、面板正挂着它、
-        // 或者这台设备建不出虚拟显示 —— 那些情况以前什么样现在还什么样。
+        // 或者这台设备建不出虚拟显示。
         val gpu = HeadlessCapture.capture(app, w, pxW, pxH)
 
         val bmp = gpu ?: (onMain {
@@ -1389,8 +1389,8 @@ class BrowserController(private val app: Application) : BrowserHost {
             // `out = try { block() } finally { latch.countDown() }` ——
             // try/finally 是表达式：先求值、再跑 finally、**最后**才赋值，
             // 于是 countDown 发生在赋值之前，调用线程被叫醒时读到的还是 null。
-            // 实测：模型那一轮报「建不出 WebView」，栈就在 ensureWeb，
-            // 而且是 3ms 就返回（不是超时）——就是输在这个竞态上。
+            // 现象是模型那一轮报「建不出 WebView」、栈在 ensureWeb，
+            // 而且是 3ms 就返回（不是超时）—— 就是输在这个竞态上。
             try {
                 out = block()
             } catch (t: Throwable) {

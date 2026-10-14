@@ -288,8 +288,8 @@ class BrowserPanel(private val activity: Activity) {
 
     /**
      * 标签条。标签短名变了（开 / 关 / 跳到别的站）才重建；只是当前那只换了，就
-     * **原地改高亮** —— 原来每次都 removeAllViews 重建、而且点完要等下一拍轮询
-     * （最多 500ms）才重画，页面已经切过去了标签条还停在原处，看着就是卡。
+     * **原地改高亮** —— 每次都 `removeAllViews` 重建、点完还要等下一拍轮询
+     * （最多 500ms）才重画的话，页面已经切过去了标签条还停在原处，看着就是卡。
      */
     private fun syncChips(labels: List<String>, current: Int) {
         if (labels.size <= 1) {

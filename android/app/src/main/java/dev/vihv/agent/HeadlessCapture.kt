@@ -26,7 +26,7 @@ import java.util.concurrent.TimeUnit
  * `View.draw(软件 Canvas)`。
  *
  * 为什么软件绘制不行：Chromium 收到软件绘制会在 CPU 上重新栅格化，而 GPU
- * 才有的层（WebGL canvas、video）它拿不到，结果是空白（实测：同一个页面在
+ * 才有的层（WebGL canvas、video）它拿不到，结果是空白（同一个页面在
  * 屏幕上有画面，截图里那块是白的）。
  *
  * 麻烦在于：**不挂窗口的 View 没有 surface**，也没有屏幕像素可读
@@ -45,7 +45,7 @@ import java.util.concurrent.TimeUnit
  * - 第一次截图才建，之后空闲 [IDLE_RELEASE_MS] 就释放：空闲的 App 不付渲染/
  *   内存/电量的钱，而且页面不会在后台一直动画。
  * - 尺寸超过 [MAX_EDGE_PX]（整页截图必然超过）直接不走这条路，退回软件绘制。
- * - 任何一步失败都返回 null，调用方退回软件绘制 —— 最坏情况就是以前的行为。
+ * - 任何一步失败都返回 null，调用方退回软件绘制。
  * - 连续失败 [MAX_FAILURES] 次就在本进程内停用，不让一台不支持虚拟显示的设备
  *   每次都白试一遍。
  *

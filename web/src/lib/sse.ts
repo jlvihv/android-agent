@@ -202,7 +202,7 @@ export function cacheHitRatio(u: Usage): number | null {
  *
  * 输入框上那个上下文圆环靠它实时更新。为什么不让 UI 自己去扫 parts：
  * `onUpdate` 是每个 delta 都调一次的，而 parts 里可能有几十条工具输出 ——
- * 每来一个字都扫一遍太贵（这一块踩过坑，见 `summarize` 的注释）。
+ * 每来一个字都扫一遍太贵（见 `summarize` 的注释）。
  * 由 `applyChunk` 直接报一声是 O(1) 的。
  */
 const usageSinks = new Set<(u: Usage) => void>();

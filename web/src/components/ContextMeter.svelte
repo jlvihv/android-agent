@@ -47,7 +47,7 @@
   const ratio = $derived(ctxWindow ? Math.min(1, used / ctxWindow) : null);
   /**
    * 环里那两个字。四舍五入到整数，但**明明有量却不到 0.5% 时不写 0** ——
-   * 1M 窗口的头几轮就是这样（实测第一句 prompt 才 1468），写个 0 看着像坏了。
+   * 1M 窗口的头几轮就是这样（第一句 prompt 才 1468），写个 0 看着像坏了。
    */
   const ringText = $derived(
     ratio == null

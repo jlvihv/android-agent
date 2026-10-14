@@ -237,7 +237,7 @@ else
         # 末尾的 `9>&-` 不能少：fd 9 是上面那把「一次只跑一个重启」的 flock（`exec 9>…`）。
         # 子进程会**继承**它，而这个子进程最后 execve 成了新核心 —— 于是锁被跑着的核心
         # 一直攥着，**下一次**重启走到 `flock -n 9` 就悄悄说一句「已经有一个重启在跑了」
-        # 退出 0：什么都没做，看着却像成功了（实测踩到：核心的 fd 9 指着 core-restart.lock，
+        # 退出 0：什么都没做，看着却像成功了（核心的 fd 9 指着 core-restart.lock，
         # 连它拉起来的 avahi 也跟着攥着）。
         AGENT_RESTART_BIN="$bin" AGENT_RESTART_CWD="$CWD" AGENT_RESTART_ENV="$ENVFILE" \
             setsid python3 - <<'PY' >>"$LOG" 2>&1 9>&- &

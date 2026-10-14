@@ -17,10 +17,10 @@ import java.util.concurrent.TimeUnit
  *
  * 现在它只做**不需要读界面**的那几件事：坐标点击、滑动、系统按键、启动应用。
  *
- * 读界面那套（把无障碍树拍平成 JSON 推给 Rust）已经删掉了 —— 它当初是
- * `device_snapshot` / `device_tap` 那两个工具的地基，工具删了就没人要了。
- * 以后要恢复的话做法不变：树在 native 侧拍平成 JSON 推给 Rust，Rust 回传指令，
- * **native 侧一行反调 Java 的代码都没有**（决策 D2）。
+  * 读界面那套（把无障碍树拍平成 JSON 推给 Rust）不在：`device_snapshot` /
+ * `device_tap` 那两个工具已经删了，没人要它。以后要恢复的话做法不变：树在
+ * native 侧拍平成 JSON 推给 Rust，Rust 回传指令，**native 侧一行反调 Java 的
+ * 代码都没有**（决策 D2）。
  */
 class AgentAccessibilityService : AccessibilityService() {
 
@@ -52,8 +52,7 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 框架要求实现。以前这里是「去抖 + 读一次界面推给 Rust」的入口，
-     * 现在不读界面了，什么都不用做。
+     * 框架要求实现；不读界面，这里什么都不用做。
      */
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         // 故意留空

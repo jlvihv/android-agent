@@ -5,8 +5,8 @@
    * 分四种：音视频用播放器；图片居中显示；**网页**（.html / 目录列表）放 iframe；
    * 其余文本（.sh / .py / .json / …）自己拉出来渲染成等宽文本。
    *
-   * 为什么文本不丢给 iframe：`.sh` 以前是 `application/x-sh`，WebView 不认，
-   * iframe 里一片空白（用户实测）。服务端现在把这些发成 `text/plain` 了，
+   * 为什么文本不丢给 iframe：`.sh` 要是发成 `application/x-sh`，WebView 不认，
+   * iframe 里一片空白。服务端把这些发成 `text/plain` 了，
    * 能显示；但白底无样式、整段复制也难，所以还是自己渲染（见 TextView.svelte）。
    * 关闭：左上角返回箭头、返回键、按住标题栏往右拖。
    *
@@ -63,7 +63,7 @@
    * 所以这里既是 iframe 自己的背景色，也是页面没写背景时的可见底色。
    *
    *   `undefined` = 还没探到 → **不写背景（透明）**，露出 App 自己的底色；
-   *                        以前这里写死白，于是深色页先白后黑闪一下
+   *                        写死白的话，深色页会先白后黑闪一下
    *   null      = 确定页面没写背景 → 白底（浏览器对无样式文档的默认）
    */
   let frameBg = $state<string | null | undefined>(undefined);

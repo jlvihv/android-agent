@@ -10,16 +10,15 @@
 #   3. 外部私有目录里的 port 文件        —— App 写的副本，`adb shell cat` 就能读，
 #                                         release 包也能用（见 AgentApp.kt）
 #   4. /proc/net/tcp 里按 uid 筛        —— 不依赖 App 配合，任何构建都能用
-#   5. logcat 里那行 "WebView 应指向 …" —— 兜底：logcat 环形缓冲会被冲掉（实测踩过）
+#   5. logcat 里那行 "WebView 应指向 …" —— 兜底：logcat 环形缓冲会被冲掉
 #
 # 4 和 5 **都要验一遍**：核心的 `/api/health` 不带凭据回 401、带凭据回 200；
 # 别的服务器不会给这两个码。为什么要验：
 #
 #   - 4 的路子会捞出**同一个 uid 在 loopback 上的所有 LISTEN**，而沙箱里跑个
-#     `python3 -m http.server 8765` 就是其中一个。原来直接 `head -1` —— 于是
-#     `just phone` / `doctor` / `forward` 全被转发到那个服务器上去了（实测踩过：
-#     curl 回来一句 Python http.server 的 `501 Unsupported method`，看着像核心
-#     挂了）。现在逐个问 `/api/health`，只认那个应声的。
+#     `python3 -m http.server 8765` 就是其中一个。直接 `head -1` 的话，`just phone` /
+#     `doctor` / `forward` 全会被转发到那个服务器上（回来一句 `501 Unsupported
+#     method`，看着像核心挂了）。所以逐个问 `/api/health`，只认那个应声的。
 #   - 5 的路子可能是**上一次启动**留下的端口（App 重启过），验一下才知道还活着。
 #
 #   scripts/phone-port.sh          # 自动

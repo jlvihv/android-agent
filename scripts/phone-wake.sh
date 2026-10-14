@@ -10,7 +10,7 @@
 # 没人去 accept）、沙箱跑不了、WebView 也不动 —— 连 `echo` 都跑不了
 # （`/api/health` 这种纯本地、不碰 WebView 的请求一样挂）。
 #
-# 实测（Pixel 10 / Android 17，`/sys/fs/cgroup/apps/uid_X/pid_Y/cgroup.freeze`）：
+# （Pixel 10 / Android 17，`/sys/fs/cgroup/apps/uid_X/pid_Y/cgroup.freeze`）：
 #
 #   | 状态                                  | freeze | /api/health |
 #   |---------------------------------------|--------|-------------|
@@ -43,7 +43,7 @@ ICON=dev.vihv.agent/.MainActivity
 
 # ⚠️ 所有 dumpsys 都先整份读进来再 grep。
 # 直接 `dumpsys … | grep -m1` 会让 adb 吃到 broken pipe 而**非零退出**，
-# 配上 set -o pipefail 就变成一个永远失败的判断（踩过：明明在前台却报「不是」）。
+# 配上 set -o pipefail 就变成一个永远失败的判断（明明在前台也会报「不是」）。
 dump() { "$ADB" shell "dumpsys $1" 2>/dev/null | tr -d '\r' || true; }
 
 # oom adj 才是 freezer 真正看的东西：0 = 前台（不会被冻），700 / 900+ = cached（会被冻）。
@@ -115,7 +115,7 @@ case "${1:-status}" in
       "$ADB" shell "dumpsys deviceidle whitelist +$PKG" >/dev/null
     fi
     # 2) 叫到前台：**这一步治「失去焦点被冻」**。锁屏挡在前面也没关系 ——
-    #    只要焦点还在我们身上，freezer 就不碰它（熄屏 Dozing 实测稳）。
+    #    只要焦点还在我们身上，freezer 就不碰它（熄屏 Dozing 下也稳）。
     #    已经在前台时 am start 只是把 task 提到前面，无副作用（而且它自己会
     #    报「intent has been delivered to currently running top-most instance」）。
     "$ADB" shell "am start -n $ICON" >/dev/null 2>&1 || true

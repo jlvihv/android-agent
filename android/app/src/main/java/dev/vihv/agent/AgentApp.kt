@@ -120,7 +120,7 @@ class AgentApp : Application() {
     /**
      * ⚠️ **这个函数绝不能抛异常。**
      *
-     * 实测教训：在里面调 `startForegroundService()` 抛了
+     * 在里面调 `startForegroundService()` 会抛
      * `ForegroundServiceStartNotAllowedException`（Android 12+ 禁止从
      * Application.onCreate 起前台服务，那时 uid 状态还是 CEM），
      * 结果整个 App 直接 FATAL。
@@ -178,7 +178,6 @@ class AgentApp : Application() {
                     //
                     // 少了 resolv.conf 的后果：apk 解析不了域名，报
                     // "no such package"，看起来像软件源挂了。
-                    // （实测踩过）
                     runCatching { core.setupLinux(androidEnv()) }
                         .onFailure { core.log("warn", "解压后重配沙箱失败: ${it.message}") }
                     core.log("info", "Linux 沙箱就绪")
@@ -276,12 +275,12 @@ class AgentApp : Application() {
      *
      * **必须传**：Alpine minirootfs 里没有 `/etc/resolv.conf`，不写的话
      * `apk add` 会因为解析不了域名而报 "no such package" —— 看起来像
-     * 软件源挂了，其实是 DNS 根本没配。实测踩过这个坑。
+     * 软件源挂了，其实是 DNS 根本没配。
      */
     private fun systemDnsServers(): List<String> = runCatching {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
 
-        // 实测踩过：直接用 activeNetwork 的 DNS 会拿到 VPN（Tailscale）的
+        // 直接用 activeNetwork 的 DNS 会拿到 VPN（Tailscale）的
         // 172.19.0.2 / fdfe:...，而**这个 App 的流量不走 VPN**，
         // 于是沙箱里每条 DNS 查询都超时 → apk 报 "no such package"。
         //

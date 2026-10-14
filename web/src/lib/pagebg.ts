@@ -2,12 +2,12 @@
  * 猜一页 HTML 的底色。
  *
  * 为什么需要：查看器把网页放进 `<iframe sandbox>`，而 Chromium 会把宿主页的
- * `color-scheme: dark` 传下去 —— 内层文档的 canvas 是**透明**的（实测：把
+ * `color-scheme: dark` 传下去 —— 内层文档的 canvas 是**透明**的（把
  * iframe 自己的背景涂成红色，一个完全没写样式的页面也会透出红色）。
  * 所以窗口露出来的就是 iframe 元素自己的背景色。
  *
- * 以前写死白色：深色网页会「先白 → 后黑」闪一下，在深色 App 里很扎眼
- * （用户实测反馈）。现在开之前先把底色探出来，上屏就是对的颜色。
+ * 写死白色的话，深色网页会「先白 → 后黑」闪一下，在深色 App 里很扎眼。
+ * 开之前先把底色探出来，上屏就是对的颜色。
  *
  * 怎么探：这份文档在另一个源上（`sandbox.localhost`，见 `sandboxPageUrl`），
  * 读不到 `contentDocument`，所以只能自己取一份源码、从文本里找。取的是
@@ -147,7 +147,7 @@ const cache = new Map<string, string | null>();
 async function getText(url: string): Promise<string | null> {
   try {
     // 不看状态码：沙箱 404/403 的**响应体就是**查看器里要显示的那个
-    // 错误页（服务端自己生成的深色页），不取就只能按白底处理（踩过）
+    // 错误页（服务端自己生成的深色页），不取就只能按白底处理
     return await (await fetch(url, { credentials: 'omit' })).text();
   } catch {
     return null;

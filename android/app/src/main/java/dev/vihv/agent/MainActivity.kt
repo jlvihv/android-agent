@@ -231,7 +231,7 @@ class MainActivity : Activity() {
         // ⚠️ 必须包起来：`window.insetsController` 在 **decor view 还没建出来**时
         // 会 NPE —— 不是返回 null，而是它内部 `mDecor.getWindowInsetsController()`
         // 直接抛（PhoneWindow.getInsetsController），所以 `?.` 拦不住。
-        // 实测 API 35 模拟器上 onCreate 里调到这行就崩、**整个进程跟着死**
+        // API 35 模拟器上在 `onCreate` 里调到这行就崩、**整个进程跟着死**
         // （真机 API 36 上碰巧没崩，所以一直没发现）。
         // 它只管图标亮不亮，崩掉不值得。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -280,7 +280,7 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT,
         )
-        // 和窗口背景、页面背景同色（@color/ink）。原来是纯黑：启动时先闪一下
+        // 和窗口背景、页面背景同色（@color/ink）。纯黑的话启动时先闪一下
         // 黑，页面画出来再变成 #151515。
         w.setBackgroundColor(getColor(R.color.ink))
 
@@ -371,7 +371,7 @@ class MainActivity : Activity() {
              * WebView 的渲染进程没了（崩溃，或者系统为了省内存把它杀了）。
              *
              * 不接的话系统默认**把整个 App 一起杀掉**；接了但不处理，这只 WebView 就
-             * 再也画不出东西（实测就是一整屏空白）。重建 Activity：新的 WebView、重新加载。
+             * 再也画不出东西（就是一整屏空白）。重建 Activity：新的 WebView、重新加载。
              */
             override fun onRenderProcessGone(
                 view: WebView?,
@@ -766,7 +766,7 @@ class MainActivity : Activity() {
             REQ_FILE -> {
                 fileCallback = null
                 // 不拿可持久化授权（takePersistableUriPermission）：页面在这次回调里
-                // 就把文件读走、传给核心了，用不着跨重启的权限。原来每选一次就攒
+                // 就把文件读走、传给核心了，用不着跨重启的权限。拿它的话每选一次就攒
                 // 一条，系统那边的授权表只增不减。
                 val uris = urisFromChooserResult(resultCode, data)
                 Log.i(TAG, "文件选择返回 resultCode=$resultCode uris=${uris?.joinToString()}")
@@ -778,8 +778,7 @@ class MainActivity : Activity() {
     /**
      * 从系统选择器的结果里抠出选中的 URI。
      *
-     * **不能直接用 `WebChromeClient.FileChooserParams.parseResult`**：实测
-     * Pixel 10 / Android 16 的 Google 相册选择器（它接住了
+     * **不能直接用 `WebChromeClient.FileChooserParams.parseResult`**：Pixel 10 / Android 16 的 Google 相册选择器（它接住了
      * `ACTION_GET_CONTENT`）返回时 `getData()` 和 `getClipData()` **都是 null**，
      * `parseResult` 于是返回 null → WebView 拿不到文件，`<input>` 的 change
      * 事件根本不触发，界面上就像“选了但没加进去”。
@@ -836,7 +835,7 @@ class MainActivity : Activity() {
      *
      * **刻意不用 `FileChooserParams.createIntent()`**：它发的是
      * `ACTION_GET_CONTENT`，在 Android 13+ 上会命中系统 Photo Picker
-     * （`PhotopickerGetContentActivity`）。实测 Pixel 10 / Android 16 上
+     * （`PhotopickerGetContentActivity`）。Pixel 10 / Android 16 上
      * 选完照片点「完成」回来，`WebChromeClient.FileChooserParams.parseResult`
      * 拿不到任何 URI（`uris=0`）→ WebView 的 `<input>` 不触发 change，
      * 界面上就像「选了但没加进去」。（Photo Picker 还有另一个已知坑：

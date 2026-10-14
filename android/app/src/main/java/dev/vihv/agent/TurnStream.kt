@@ -22,8 +22,8 @@ import java.util.concurrent.ConcurrentHashMap
  * {"type":"turn_active","active":…}    → 起/停前台服务
  * ```
  *
- * 以前本地走的是 UniFFI 回调（同进程直接调函数），而「连电脑」那条**根本没有** ——
- * 两条路各自演化（见 docs/06）。现在只有这一条：谁在跑都从同一条流里来。
+ * 谁在跑都从同一条流里来：本地（同进程）和「连电脑」都走它 —— 分成两套的话
+ * 形状不一样、状态语义要维护两遍（见 docs/06）。
  *
  * 为什么不在 WebView 里做这件事：App 切到后台，WebView 的 JS 会被系统挂起，而通知栏
  * 恰恰是「App 不在前台」时才有用。
@@ -148,8 +148,8 @@ object TurnStream {
         try {
             // 先确认对面真的是这条流。**不能只看「连接成功了」**：核心还没升级时，
             // 未知路径会被前端的 SPA fallback 接走 —— 回 200 + 一页 index.html，
-            // 我们读几行 HTML 然后 EOF，看着像「连上又断了」，于是每 2 秒重试一次刷屏
-            // （实测踩到：手机订着旧核心）。所以按 content-type 认人，认不出就当成
+            // 我们读几行 HTML 然后 EOF，看着像「连上又断了」，于是每 2 秒重试一次刷屏。
+            // 所以按 content-type 认人，认不出就当成
             // 「这个核心还没有这个端点」，交给退避慢慢等。
             val code = conn.responseCode
             val type = conn.contentType.orEmpty()
@@ -171,7 +171,7 @@ object TurnStream {
                 if (!sawLine) {
                     // **真读到东西才算连上**，退避这时才归位：核心还没升级、没有这个端点时，
                     // 连接会「成功」然后立刻结束 —— 那时不能让退避归位，否则就是每 2 秒重试
-                    // 一次、日志还刷屏（实测踩到：手机订着旧核心）
+                    // 一次、日志还刷屏
                     sawLine = true
                     s.retry = RETRY_MS
                     s.failed = false

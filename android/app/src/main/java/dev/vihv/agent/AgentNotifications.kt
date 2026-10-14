@@ -19,8 +19,7 @@ import android.util.Log
  * 1. **进行中**（[ID_LIVE]，挂在前台服务上）：内容随回合实时变。两行 ——
  *    第一行是哪个会话，第二行是它此刻在干什么（跑哪条命令 / 在想 / 在写什么）。
  *    没有进度条、没有秒表、没有「停止」按钮：agent 报不出诚实的百分比，而一个
- *    停在半路的计时器比没有计时器更糟（OpenMinis 那边就踩过：任务结束后计时器
- *    还在跳）。
+ *    停在半路的计时器比没有计时器更糟（任务都结束了它还在跳）。
  * 2. **完成**（[ID_DONE]）：跑完那一刻发一条，能点掉（[showDone]）。**总是发**，不只在
  *    切后台的时候 —— 进行中那条会跟着服务一起消失，而「消失了」等于什么都没说。回到 App
  *    看过才清（[clearDone]）；用户正看着 App 时不响，不看着时响。
@@ -180,9 +179,9 @@ object AgentNotifications {
      *     `isColorizedRequested() && hasPromotableStyle()` —— **必须请求上色**；
      *   - Android 17（真机 `framework.jar` 反汇编 `hasPromotableCharacteristics`）：
      *     `… && !isColorizedRequested() && !isBridged()` —— **请求了上色反而不给提升**。
-     *   两边正相反，所以按版本选。不分开写就总有一边永远拿不到芯片 —— 实测踩过：
-     *   我们先按 16 写（请求上色），在 Pixel 10 / Android 17 上就是「逐项全绿、
-     *   但 `hasPromotableCharacteristics()` 仍回 false」。OpenMinis 写的是
+     *   两边正相反，所以按版本选。不分开写就总有一边永远拿不到芯片 —— 按 16 写
+     *   （请求上色）在 Pixel 10 / Android 17 上就是「逐项全绿、但
+     *   `hasPromotableCharacteristics()` 仍回 false」。OpenMinis 写的是
      *   `setColorized(false)`，他们对着 17，所以能出芯片。
      * - `setShortCriticalText` 给芯片那一行**更短**的文本（通知栏那两行比芯片宽），
      * - **不**当分组摘要、**不**用自定义 View —— 这两条也会取消资格。
@@ -367,7 +366,7 @@ object AgentNotifications {
         else -> R.drawable.ic_notif_work
     }
 
-    /** 点一下回到 App（和以前同一条路：不用 deep link，打开的就是刚才那个会话）。 */
+    /** 点一下回到 App（不用 deep link，打开的就是刚才那个会话）。 */
     private fun openIntent(ctx: Context): PendingIntent = openCached ?: PendingIntent.getActivity(
         ctx.applicationContext,
         0,
