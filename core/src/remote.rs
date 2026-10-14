@@ -118,13 +118,9 @@ pub fn start(
     state: Arc<AppState>,
     id: Identity,
     env: Option<RelayAddr>,
-    dir: &Path,
 ) -> anyhow::Result<()> {
     let from_env = env.is_some();
     let db = state.db();
-    if let Some(db) = &db {
-        migrate_relay_file(db, &dir.join("relay.json"));
-    }
     let relay = env.or_else(|| checked(db.as_ref()?.relay().ok()??).ok());
     if let Ok(mut g) = state.remote.write() {
         *g = Some(RemoteInfo {
@@ -148,18 +144,6 @@ pub fn start(
         *g = Some(host);
     }
     Ok(())
-}
-
-/// **一次性搬家**（2026-10-14）：手机交来的中继以前记在 `remote/relay.json`，搬进
-/// `relay` 表、删掉文件。所有电脑都搬完就可以删掉它。
-fn migrate_relay_file(db: &crate::db::Db, path: &Path) {
-    let Ok(raw) = std::fs::read(path) else { return };
-    if let Ok(r) = serde_json::from_slice::<RelayAddr>(&raw) {
-        if db.set_relay(&r).is_err() {
-            return;
-        }
-    }
-    let _ = std::fs::remove_file(path);
 }
 
 /// 挂在中继上的那一头。可以在运行时换中继（`attach`），换的时候把旧的那条连接停掉。
@@ -258,23 +242,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 以前的 `remote/relay.json` 搬进 `relay` 表、文件删掉。
-    #[test]
-    fn the_old_relay_file_moves_into_the_database() {
-        let dir = tmp();
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("relay.json");
-        std::fs::write(&file, r#"{"addr":"1.2.3.4:8790","key":"k"}"#).unwrap();
-        let db = crate::db::Db::in_memory().unwrap();
-        migrate_relay_file(&db, &file);
-        assert!(!file.exists());
-        assert_eq!(
-            db.relay().unwrap().map(|r| r.addr).as_deref(),
-            Some("1.2.3.4:8790")
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn the_relay_peer_is_never_mistaken_for_this_machine() {
         // `trust_loopback` 看的就是这个：经中继来的请求永远要凭据
@@ -326,13 +293,7 @@ mod tests {
             addr: a.into(),
             key: KEY.into(),
         });
-        start(
-            st.clone(),
-            Identity::load_or_create(&dir).unwrap(),
-            relay,
-            &dir,
-        )
-        .unwrap();
+        start(st.clone(), Identity::load_or_create(&dir).unwrap(), relay).unwrap();
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         let (app, st2) = (crate::http::router(st.clone()), st.clone());
@@ -501,13 +462,8 @@ mod tests {
             addr: relay.clone(),
             key: KEY.into(),
         };
-        start(
-            st3.clone(),
-            Identity::load_or_create(&dir).unwrap(),
-            Some(env.clone()),
-            &dir,
-        )
-        .unwrap();
+        start(st3.clone(), Identity::load_or_create(&dir).unwrap(), Some(env.clone()))
+            .unwrap();
         let host3 = st3.relay_host.read().unwrap().clone().unwrap();
         assert!(host3.attach(env).unwrap_err().contains("环境变量"));
         let _ = std::fs::remove_dir_all(&dir);

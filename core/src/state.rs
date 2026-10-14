@@ -454,11 +454,6 @@ impl AppState {
         match Db::open(&path) {
             Ok(db) => {
                 let db = Arc::new(db);
-                if let Err(e) = db.migrate_json_meta() {
-                    tracing::warn!("把旧的 JSON 配置搬进表里失败（下次启动再试）: {e:#}");
-                }
-                // 模型目录的缓存以前是个文件，现在在库里（`http_cache`）
-                let _ = std::fs::remove_file(dir.join("models-dev.json"));
                 self.load_llm(&db);
                 self.load_providers(&db);
                 self.load_auth(&db);
@@ -704,8 +699,8 @@ impl AppState {
         }
     }
 
-    /// 各家的 Key。老版本只有一个 provider（`llm`）：库里还没有 `providers`
-    /// 时，把它记成对应那家（按 Base URL 认）已配置。
+    /// 各家的 Key。库里还没有 `providers` 行时（桌面就是环境变量配的那一个），
+    /// 把它记成对应那家（按 Base URL 认）已配置。
     fn load_providers(&self, db: &Db) {
         let store = db.providers().unwrap_or_else(|e| {
             tracing::warn!("读服务商的 Key 失败: {e:#}");
@@ -1523,56 +1518,29 @@ mod tests {
         assert_eq!(st.system_prompt(), "改过的");
     }
 
-    /// 配置按列存在表里，**不是** `meta` 里的一段 JSON。以前存成 JSON 的那几行在打开库时
-    /// 搬进表里、删掉旧行；之后改模型、改 Key 都落在表里，重开还在，凭据也不变。
+    /// 配置按列存在表里：改模型、改 Key 都落在表里，重开还在，凭据也不变。
     #[test]
-    fn json_settings_move_into_tables_and_survive_a_restart() {
-        let dir = temp_dir("migrate");
-        {
-            let old = Db::open(&dir.join("sessions.db")).unwrap();
-            old.set_meta(
-                "llm",
-                r#"{"name":"go","base_url":"https://x/v1","model":"m1","api_key":"sk-1"}"#,
-            )
-            .unwrap();
-            old.set_meta(
-                "providers",
-                r#"{"custom":{"api_key":"sk-1","base_url":"https://x/v1"}}"#,
-            )
-            .unwrap();
-            old.set_meta("responses_unsupported", r#"["https://x/v1|m1"]"#)
-                .unwrap();
-            old.set_meta("search", r#"{"exaApiKey":"exa-1"}"#).unwrap();
-        }
-
+    fn settings_live_in_tables_and_survive_a_restart() {
+        let dir = temp_dir("settings");
         let st = AppState::new();
         st.open_db(&dir);
-        let p = st.llm().expect("从旧的 JSON 行恢复出 provider");
-        assert_eq!((p.model.as_str(), p.api_key.as_str()), ("m1", "sk-1"));
-        let c = st.provider_creds("custom").expect("服务商的 Key 搬过来了");
-        assert_eq!(c.base_url, "https://x/v1");
-        let db = st.db().unwrap();
-        for k in ["llm", "providers", "responses_unsupported", "search"] {
-            assert!(db.get_meta(k).unwrap().is_none(), "旧的 JSON 行 {k} 该删掉");
-        }
-        assert_eq!(db.responses_unsupported().unwrap(), ["https://x/v1|m1"]);
-        assert_eq!(
-            db.get_meta("exa_api_key").unwrap().as_deref(),
-            Some("exa-1")
-        );
+        st.set_llm(Provider::compatible("go", "https://x/v1", "m1", "sk-1"));
+        assert_eq!(st.llm().unwrap().model, "m1");
+        st.adopt_provider(&st.llm().unwrap());
+        assert!(st.provider_creds("custom").is_some(), "在用的那家记成已配置");
 
         // 改模型 → 存进表；重开之后还在，凭据也不变
-        let mut p2 = p.clone();
+        let mut p2 = st.llm().unwrap();
         p2.model = "m2".into();
         st.set_llm(p2);
         let token = st.auth().token;
         let key = st.auth().sandbox_key;
-        drop(db);
         drop(st);
 
         let st = AppState::new();
         st.open_db(&dir);
         assert_eq!(st.llm().unwrap().model, "m2");
+        assert!(st.provider_creds("custom").is_some());
         assert_eq!(st.auth().token, token, "凭据跨重启不变，调试脚本拿一次就够");
         assert_eq!(st.auth().sandbox_key, key);
         assert!(token.is_some());

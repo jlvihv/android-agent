@@ -100,7 +100,7 @@ pub struct Provider {
     pub supports_images: bool,
     /// 这个模型能不能吃 PDF / 文档输入（OpenAI 的 `file` 内容块）。
     ///
-    /// 由 models.dev 的 `pdf` 模态自动判定，也持久化到 llm.json。
+    /// 由 models.dev 的 `pdf` 模态自动判定，也持久化到库里。
     /// 默认 **false** —— 绝大多数兼容端点不认 `file` 内容块，瞎发就是 400；
     /// 默认关掉只意味着界面上不显示「文件」入口。
     #[serde(default)]

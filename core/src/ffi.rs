@@ -160,9 +160,6 @@ impl AgentCore {
             return Ok(m.clone());
         }
         let db = self.core.state.db().ok_or_else(|| failed("库还没打开"))?;
-        if let Some(dir) = self.core.state.data_dir.read().ok().and_then(|g| g.clone()) {
-            crate::machines::migrate_file(&db, &dir.join("machines.json"));
-        }
         Ok(self
             .machines
             .get_or_init(|| crate::machines::Machines::load(db))

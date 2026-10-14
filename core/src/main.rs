@@ -152,7 +152,7 @@ async fn run() -> anyhow::Result<()> {
             println!("  ⚠️  中继的环境变量不对：{e} —— 忽略它们");
             None
         });
-        agent_core::remote::start(core.state.clone(), identity, env, &remote_dir)?;
+        agent_core::remote::start(core.state.clone(), identity, env)?;
         let relay = core
             .state
             .remote

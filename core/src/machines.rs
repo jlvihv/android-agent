@@ -313,20 +313,6 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// **一次性搬家**（2026-10-14）：配对过的电脑以前记在数据目录的 `machines.json` 里，
-/// 搬进 `machines` 表、删掉文件。所有手机都搬完就可以删掉它。
-pub fn migrate_file(db: &Db, path: &Path) {
-    let Ok(raw) = std::fs::read(path) else { return };
-    let list: Vec<Machine> = serde_json::from_slice(&raw).unwrap_or_default();
-    for m in &list {
-        if let Err(e) = db.put_machine(m) {
-            tracing::warn!("搬「{}」失败（下次启动再试）：{e:#}", m.name);
-            return;
-        }
-    }
-    let _ = std::fs::remove_file(path);
-}
-
 /// 写一个只给自己读的文件（0600）：里面有私钥。
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -337,29 +323,4 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     o.mode(0o600);
     o.open(path)?.write_all(bytes)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 以前的 `machines.json` 搬进表里、文件删掉；之后读出来是同一份。
-    #[test]
-    fn the_old_machines_file_moves_into_the_database() {
-        let dir = std::env::temp_dir().join(format!("agent-machines-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("machines.json");
-        std::fs::write(
-            &file,
-            r#"[{"id":"jl","name":"jl","token":"t","fingerprint":"ab","relay":{"addr":"1.2.3.4:8790","key":"k"},"lan":"192.168.0.2:8787"}]"#,
-        )
-        .unwrap();
-        let db = Arc::new(Db::in_memory().unwrap());
-        migrate_file(&db, &file);
-        assert!(!file.exists(), "搬完删掉");
-        let m = Machines::load(db).get("jl").unwrap();
-        assert_eq!(m.relay.map(|r| r.addr).as_deref(), Some("1.2.3.4:8790"));
-        assert_eq!(m.lan.as_deref(), Some("192.168.0.2:8787"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

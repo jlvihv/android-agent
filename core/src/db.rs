@@ -693,41 +693,6 @@ impl Db {
         })
     }
 
-    /// **一次性搬家**（2026-10-14）：以前有几样配置是 `meta` 里的一段 JSON，搬进上面那几张
-    /// 表，然后删掉旧行。搬过一次之后这里就什么都不做了；所有库都搬完就可以删掉它。
-    pub fn migrate_json_meta(&self) -> Result<()> {
-        if let Some(raw) = self.get_meta("llm")? {
-            if let Ok(l) = serde_json::from_str::<LlmConfig>(&raw) {
-                self.set_llm(Some(&l))?;
-            }
-            self.delete_meta("llm")?;
-        }
-        if let Some(raw) = self.get_meta("providers")? {
-            let store: crate::providers::Store = serde_json::from_str(&raw).unwrap_or_default();
-            for (id, k) in &store {
-                self.set_provider(id, Some(k))?;
-            }
-            self.delete_meta("providers")?;
-        }
-        if let Some(raw) = self.get_meta("responses_unsupported")? {
-            let keys: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
-            for k in &keys {
-                self.add_responses_unsupported(k)?;
-            }
-            self.delete_meta("responses_unsupported")?;
-        }
-        if let Some(raw) = self.get_meta("search")? {
-            let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-            if let Some(k) = v.get("exaApiKey").and_then(|k| k.as_str()) {
-                if !k.trim().is_empty() {
-                    self.set_meta("exa_api_key", k.trim())?;
-                }
-            }
-            self.delete_meta("search")?;
-        }
-        Ok(())
-    }
-
     /// 清空全部会话（`/api/reset` 之外的重置用）
     ///
     /// 只清会话：`meta` 里还有 provider 配置和访问凭据，不能跟着没了。

@@ -528,7 +528,7 @@ impl Core {
     /// 按 id 取已落盘的附件绝对路径。
     ///
     /// `id` 是磁盘文件名，所以**必须**先确认它是个裸文件名 —— 否则一个
-    /// `../../llm.json` 就能把 App 私有目录里的 key 读出去。
+    /// `../../sessions.db` 就能把 App 私有目录里的凭据读出去。
     pub fn attachment_path(&self, id: &str) -> Option<std::path::PathBuf> {
         if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
             return None;
@@ -676,7 +676,7 @@ impl Core {
 
         // 后台把常用工具装上（rg/fd/jq/python3…）。幂等：装过就秒退。
         tokio::spawn(provision_tools(self.state.clone()));
-        // 后台补一次模型能力判定（models.dev）。老 llm.json 里没有 PDF 能力，
+        // 后台补一次模型能力判定（models.dev）。库里老配置里的 PDF 能力可能过期，
         // 界面靠它决定要不要显示「文件」入口；目录有磁盘缓存，大多不联网。
         tokio::spawn(refresh_capabilities(self.state.clone()));
 

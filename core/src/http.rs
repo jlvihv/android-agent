@@ -1139,7 +1139,7 @@ fn hex(c: u8) -> Option<u8> {
 /// `POST /api/llm` → 运行时配置 provider。
 ///
 /// 安卓上没法用环境变量，用户也没别的地方填 key，所以需要这个接口。
-/// 会把配置写到 `<filesDir>/llm.json`。
+/// 会把配置按列写进库里（`llm` / `providers` 表）。
 async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> Response {
     if body.api_key.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "apiKey 不能为空").into_response();
@@ -1719,8 +1719,7 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "sharedStorage": s.has_shared_storage(),
         })),
         "browser": st.browser().map(|b| b.describe()),
-        // 持久化目录（安卓上是 <filesDir>）。调试时要 adb pull 会话库 /
-        // 看 llm.json 就用它，不用猜路径。
+        // 持久化目录（安卓上是 <filesDir>）。调试时要 adb pull 会话库就用它，不用猜路径。
         "dataDir": st
             .data_dir
             .read()
