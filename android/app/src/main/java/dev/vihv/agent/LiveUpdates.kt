@@ -34,6 +34,10 @@ object LiveUpdates {
     @Volatile
     private var cachedAt = 0L
 
+    /** 上一次记过日志的结果（只在变化时记，别每 5 秒刷屏） */
+    @Volatile
+    private var logged: Boolean? = null
+
     /** 现在能不能用 Live Updates 这个展示面。 */
     fun active(ctx: Context): Boolean {
         // pre-36 是编译期就定的，不用问系统
@@ -65,6 +69,14 @@ object LiveUpdates {
         }
         cached = ok
         cachedAt = SystemClock.elapsedRealtime()
+        // 只在结果变化时记一条：真机上「为什么没出芯片」全靠它（每 5 秒刷一条没意义）
+        if (logged != ok) {
+            logged = ok
+            Log.i(
+                TAG,
+                "Live Updates 能力：canPostPromotedNotifications=$ok（SDK=${Build.VERSION.SDK_INT}）",
+            )
+        }
         return ok
     }
 }

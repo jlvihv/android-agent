@@ -65,6 +65,27 @@ object AgentNotifications {
     /** 状态栏芯片那一行只有几个字宽（见 [chipText]）。 */
     private const val CHIP_MAX_UNITS = 9
 
+    /** 上一次画在哪个面上（true = 提升成芯片，false = 普通通知）；只在切换时记日志 */
+    @Volatile
+    private var lastSurface: Boolean? = null
+
+    /**
+     * 记一条「这次画在哪个面上」。
+     *
+     * 真机上「为什么没有 Live Updates 芯片」只有两种可能：能力探针说不行（[LiveUpdates]
+     * 会记一条带 SDK 和 false 的日志），或者我们根本没走那条分支 —— 这两行日志把
+     * 二选一变成确定的。（第三道：走了但系统没提，那会让 [promoted] 里的警告带出每一项前提。）
+     */
+    private fun noteSurface(promoted: Boolean) {
+        if (lastSurface == promoted) return
+        lastSurface = promoted
+        Log.i(
+            TAG,
+            if (promoted) "进行中的通知走 Live Updates（请求提升为常驻芯片）"
+            else "进行中的通知走普通通知（Live Updates 不可用或已被关掉）",
+        )
+    }
+
     fun ensureChannels(ctx: Context) {
         val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
         if (nm.getNotificationChannel(CHANNEL_LIVE) == null) {
@@ -110,7 +131,9 @@ object AgentNotifications {
 
         // Android 16+ 且系统允许：走 Live Updates（状态栏那颗常驻芯片）。内容一样，
         // 只是展示面不一样 —— 不可用就退回普通通知，不是错误。
-        if (LiveUpdates.active(ctx)) return promoted(ctx, title, text, icon, open, whenMs)
+        val chip = LiveUpdates.active(ctx)
+        noteSurface(chip)
+        if (chip) return promoted(ctx, title, text, icon, open, whenMs)
 
         return Notification.Builder(ctx, CHANNEL_LIVE)
             .setSmallIcon(icon)
@@ -134,9 +157,17 @@ object AgentNotifications {
      * Live Updates 那一版（API 36+）。调用方已经用 [LiveUpdates.active] 把门把住了，
      * 这里才敢碰 36 才有的东西：
      *
-     * - 样式用 `BigTextStyle`（支持的样式才够提升资格），
+     * - 样式用 `BigTextStyle`（框架的 `hasPromotableStyle()` 只认 BigText / Call /
+     *   Progress 这几种），
+     * - **必须 `setColorized(true)`**。这是实测拿 AOSP 源码对出来的：
+     *   `Notification.hasPromotableCharacteristics()` 最后一行是
+     *   `isColorizedRequested() && hasPromotableStyle()` —— 也就是
+     *   「**没请求上色就不给提升**」（只有 Ongoing CallStyle 例外）。
+     *   我们一开始是照 OpenMinis 那句注释写的（它说「上色会被取消资格」，正好反了），
+     *   结果真机上永远只能当普通通知。上色显示本身对前台服务的通知是放行的
+     *   （`isColorized()` 里 `isFgsOrUij()` 为真），所以请求它没有副作用。
      * - `setShortCriticalText` 给芯片那一行**更短**的文本（通知栏那两行比芯片宽），
-     * - **不**上色、**不**当分组摘要 —— 两条都会让系统取消提升资格。
+     * - **不**当分组摘要、**不**用自定义 View —— 这两条也会取消资格。
      */
     private fun promoted(
         ctx: Context,
@@ -156,7 +187,8 @@ object AgentNotifications {
             .setOnlyAlertOnce(true)
             .setShowWhen(true)
             .setWhen(whenMs)
-            .setColorized(false)
+            // ↓ 不是笔误：框架要求「请求上色」才肯提升（见上面的说明）
+            .setColorized(true)
         b.setShortCriticalText(chipText(text))
         b.addExtras(Bundle().apply { putBoolean(EXTRA_REQUEST_PROMOTED_ONGOING, true) })
 
