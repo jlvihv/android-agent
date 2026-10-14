@@ -56,6 +56,10 @@ object TurnStream {
         /** 下一次重连等多久。连上过就退回 [RETRY_MS]，一直连不上就翻倍到 [RETRY_MAX_MS]。 */
         @Volatile
         var retry = RETRY_MS
+
+        /** 上一次是**失败**收场（没读到过东西）。回到前台时据此立刻重试一次。 */
+        @Volatile
+        var failed = false
     }
 
     private val subs = ConcurrentHashMap<String, Sub>()
@@ -80,7 +84,13 @@ object TurnStream {
 
     private fun start(base: String, token: String) {
         if (base.isBlank() || token.isBlank()) return
-        subs[base]?.let { if (it.token == token) return else stop(base) }
+        subs[base]?.let { cur ->
+            if (cur.token != token) return stop(base)
+            if (!cur.failed) return
+            // 这个目标还在重试里（可能正等在 30 秒的退避上）。回到前台/切核心时重新算清单
+            // 就是一个「现在再试一次」的机会 —— 不重起的话，用户重启完核心还得干等退避。
+            stop(base)
+        }
         val s = Sub(base, token)
         subs[base] = s
         Thread({ follow(s) }, "turn-stream").apply { isDaemon = true }.start()
@@ -99,6 +109,7 @@ object TurnStream {
     /** 连着重试，直到 [Sub.stop]。 */
     private fun follow(s: Sub) {
         while (!s.stop) {
+            s.failed = true
             try {
                 read(s)
                 if (!s.stop) Log.w(TAG, "订阅断了（服务端关了连接），重连: ${s.base}")
@@ -146,6 +157,7 @@ object TurnStream {
                     // 一次、日志还刷屏（实测踩到：手机订着旧核心）
                     sawLine = true
                     s.retry = RETRY_MS
+                    s.failed = false
                 }
                 // SSE：只认 `data:` 行；空行和 `:` 开头的 keep-alive 注释都不管
                 if (line.startsWith("data:")) handle(s, line.removePrefix("data:").trim())
