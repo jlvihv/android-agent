@@ -646,7 +646,7 @@ impl AppState {
         };
         self.mark_sessions_dirty();
         // 历史清空了，用量里那个「当前上下文」也就不成立了
-        self.forget_usage(&id);
+        self.clear_usage(&id);
         let mut gone = crate::agent::ChatSession::new();
         gone.messages = old;
         self.forget_files(gone).await;
@@ -1086,22 +1086,58 @@ impl AppState {
         }
     }
 
-    /// 记一次 LLM 调用的用量（`agent.rs` 每步结束时调）。
-    pub fn record_usage(&self, sid: &str, u: &crate::openai::Usage) {
+    /// 记一次 LLM 调用的用量（`agent.rs` 每步结束时调）：进库（`usage` 表，一步一行，
+    /// 拿来分析的），也加到内存里那份（输入框那个上下文圆环读它）。
+    pub fn record_usage(&self, row: &crate::db::UsageRow, u: &crate::openai::Usage) {
+        let db = self.db();
         if let Ok(mut g) = self.usage.lock() {
-            g.entry(sid.to_string()).or_default().add(u);
+            // 内存里还没有（重启后头一次）：先从库里接上之前的，**再**写这一行 —— 反过来就算两遍
+            g.entry(row.session_id.clone())
+                .or_insert_with(|| {
+                    Self::usage_in_db(db.as_deref(), &row.session_id).unwrap_or_default()
+                })
+                .add(u);
+        }
+        if let Some(db) = db {
+            if let Err(e) = db.add_usage(row) {
+                tracing::warn!("用量没记进库：{e:#}");
+            }
         }
     }
 
-    /// 这个会话的用量（没跑过就是 `None`）。
+    /// 这个会话的用量（上次清空之后；没跑过就是 `None`）。内存里没有就去库里读 ——
+    /// 核心重启之后圆环接着显示，不用等下一次调用。
     pub fn usage_of(&self, sid: &str) -> Option<UsageStats> {
-        self.usage.lock().ok().and_then(|g| g.get(sid).cloned())
+        let mut g = self.usage.lock().ok()?;
+        if let Some(u) = g.get(sid) {
+            return Some(u.clone());
+        }
+        let u = Self::usage_in_db(self.db().as_deref(), sid)?;
+        g.insert(sid.to_string(), u.clone());
+        Some(u)
     }
 
-    /// 会话没了 / 被清空：它的用量也就不成立了。
+    fn usage_in_db(db: Option<&Db>, sid: &str) -> Option<UsageStats> {
+        db?.session_usage(sid)
+            .map_err(|e| tracing::warn!("读用量失败：{e:#}"))
+            .ok()
+            .flatten()
+    }
+
+    /// 会话没了：内存里那份扔掉。库里的行**留着**（分析用，见 db.rs 的 `usage` 表）。
     pub fn forget_usage(&self, sid: &str) {
         if let Ok(mut g) = self.usage.lock() {
             g.remove(sid);
+        }
+    }
+
+    /// 会话清空了：之前的用量不再算「当前上下文」。库里的行标成清掉了（不删）。
+    pub fn clear_usage(&self, sid: &str) {
+        self.forget_usage(sid);
+        if let Some(db) = self.db() {
+            if let Err(e) = db.clear_usage(sid) {
+                tracing::warn!("标记用量失败：{e:#}");
+            }
         }
     }
 
@@ -1595,7 +1631,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        st.record_usage("a", &u1);
+        st.record_usage(&usage_row("a"), &u1);
         let s = st.usage_of("a").unwrap();
         assert_eq!((s.input, s.output, s.cached, s.calls), (1000, 50, 800, 1));
         assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1000);
@@ -1608,7 +1644,7 @@ mod tests {
             prompt_cache_hit_tokens: Some(1400),
             ..Default::default()
         };
-        st.record_usage("a", &u2);
+        st.record_usage(&usage_row("a"), &u2);
         let s = st.usage_of("a").unwrap();
         assert_eq!((s.input, s.output, s.cached, s.calls), (2500, 70, 2200, 2));
         assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1500);
@@ -1618,6 +1654,69 @@ mod tests {
         // 会话删了 / 被清空 → 它的用量不该留着
         st.forget_usage("a");
         assert!(st.usage_of("a").is_none());
+    }
+
+    fn usage_row(sid: &str) -> crate::db::UsageRow {
+        crate::db::UsageRow {
+            session_id: sid.into(),
+            provider: "p".into(),
+            model: "m".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 用量进库：核心重启（同一个库、新的 AppState）之后圆环接着显示，接着累加时
+    /// 不把库里那几步再算一遍；清空会话之后从零算。
+    #[test]
+    fn usage_survives_a_restart_and_clearing_starts_from_zero() {
+        use crate::openai::Usage;
+        let db = Arc::new(Db::in_memory().unwrap());
+        let with_db = || {
+            let st = AppState::new();
+            *st.db.write().unwrap() = Some(db.clone());
+            st
+        };
+        let step = |input: u32, output: u32| {
+            let u = Usage {
+                prompt_tokens: input,
+                completion_tokens: output,
+                ..Default::default()
+            };
+            let row = crate::db::UsageRow {
+                input,
+                output,
+                ..usage_row("a")
+            };
+            (row, u)
+        };
+
+        let st = with_db();
+        let (r, u) = step(1000, 50);
+        st.record_usage(&r, &u);
+        let (r, u) = step(1500, 20);
+        st.record_usage(&r, &u);
+
+        // 「重启」：内存里什么都没有，从库里接上
+        let st = with_db();
+        let s = st.usage_of("a").expect("库里有");
+        assert_eq!((s.input, s.output, s.calls), (2500, 70, 2));
+        assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1500);
+
+        // 重启后**没先问过** usage_of 就来了一步：也得先接上库里的，再加这一步
+        let st = with_db();
+        let (r, u) = step(2000, 10);
+        st.record_usage(&r, &u);
+        let s = st.usage_of("a").unwrap();
+        assert_eq!((s.input, s.calls), (4500, 3), "不多算、不漏算");
+
+        // 清空会话：圆环从零开始；重启之后也一样
+        st.clear_usage("a");
+        assert!(st.usage_of("a").is_none());
+        assert!(with_db().usage_of("a").is_none());
+        let (r, u) = step(300, 5);
+        st.record_usage(&r, &u);
+        let s = with_db().usage_of("a").unwrap();
+        assert_eq!((s.input, s.calls), (300, 1));
     }
 
     #[test]

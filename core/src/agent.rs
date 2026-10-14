@@ -2045,6 +2045,8 @@ async fn stream_one(
     // 打开流 + 收流，外面套一层重试：限流 / 网关临时出错 / 断网这类临时故障
     // 退避后重来（见 `RETRY_DELAYS`）。只在**还没往前端流出任何内容**时重试 ——
     // 已经流出正文 / 工具调用的话，重来一遍界面上就是两份。
+    // 这一步花了多久（含重试，进 `usage` 表）
+    let step_started = std::time::Instant::now();
     let mut attempt = 0usize;
     'attempt: loop {
         // 等首包也可能很久（长上下文的预填充），这段也要能停
@@ -2220,8 +2222,20 @@ async fn stream_one(
                 ),
             }
             send(tx, sse::data_part("usage", serde_json::to_value(u)?)).await;
-            // 顺手记到这个会话上 —— 输入框那个上下文圆环读的是它
-            core.state.record_usage(sid, u);
+            // 记到这个会话上：输入框那个上下文圆环读它，也进库（`usage` 表）留着分析
+            let row = crate::db::UsageRow {
+                session_id: sid.to_string(),
+                at: now_ms(),
+                provider: provider.name.clone(),
+                model: provider.model.clone(),
+                input: u.prompt_tokens,
+                output: u.completion_tokens,
+                cached: u.cached_tokens(),
+                reasoning: u.reasoning_tokens(),
+                finish: finish.clone(),
+                ms: step_started.elapsed().as_millis() as u64,
+            };
+            core.state.record_usage(&row, u);
         }
 
         let mut calls: Vec<RecordedToolCall> = acc
