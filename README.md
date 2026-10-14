@@ -56,6 +56,8 @@ python3 scripts/agentctl.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"
 **想直接用这台机器**（不套沙箱）：`just dev-host` —— `bash` / `read` / `edit`
 改的就是本机真文件；cwd（`/workspace` 的落点）默认是这个仓库，
 `AGENT_HOST_WORKSPACE="$PWD" just dev-host` 可以换成现在这个目录。
+**这台机器上只跑一个核心**：已经有一个在跑时，新起的那个会直接拒绝并告诉你它的
+pid（同时跑两个会静默地互相干扰），要两个就 `AGENT_MULTI=1`。
 差别、代价和实现见 [docs/11-host-mode.md](docs/11-host-mode.md)。
 
 对**手机上**跑着的那个（不用重装 APK、也不用手点手机屏幕）：

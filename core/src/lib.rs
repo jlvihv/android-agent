@@ -41,6 +41,7 @@ pub mod providers;
 pub mod reader;
 pub mod responses;
 pub mod search;
+pub mod single;
 pub mod sse;
 pub mod state;
 pub mod urls;

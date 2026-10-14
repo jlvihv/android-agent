@@ -446,7 +446,7 @@ just dom-audit --no-panels      # 只看会话区
 | 进程 | 端口 | 干什么 |
 |---|---|---|
 | 假 LLM | 8790 | `scripts/fixture-llm.ts`：给界面提供**受控内容**（先发一个真 `bash` 工具调用，再回一段 Markdown 夹具） |
-| 核心 | 8791 | 独立实例，LLM 走 `AGENT_LLM_*` 环境变量（**只在内存里**，不读不写你的 sessions.db，也不动 8787 那个） |
+| 核心 | 8791 | 独立实例，LLM 走 `AGENT_LLM_*` 环境变量（**只在内存里**，不读不写你的 sessions.db，也不动 8787 那个）。宿主核心在跑也允许它起：`AGENT_MULTI=1`（见 docs/11 的「单实例」） |
 | vite | 5173+ | 代理 `/api` 到核心；**改前端源码不用重编 Rust** |
 | Chrome | 9222 | headless + CDP，被审的就是它这份渲染树 |
 

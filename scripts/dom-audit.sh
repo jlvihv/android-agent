@@ -103,6 +103,9 @@ AGENT_LLM_API_KEY=fixture \
 AGENT_LLM_MODEL=fixture \
 AGENT_LLM_API_STYLE=chat \
 AGENT_LLM_NAME=fixture \
+# 故意起第二个核心（单实例默认会拦住）：审计要在你自己那个核心还开着的时候跑。
+# 它不碰锁，也不会反过来挡住你。（core/src/single.rs）
+AGENT_MULTI=1 \
 AGENT_LINUX_ROOTFS="$SANDBOX_ROOTFS" \
 AGENT_LINUX_PROOT="${AGENT_LINUX_PROOT:-$(command -v proot || echo proot)}" \
   cargo run --quiet --manifest-path core/Cargo.toml --bin agent-dev >/tmp/dom-audit-core.log 2>&1 &

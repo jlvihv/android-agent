@@ -24,6 +24,30 @@ async fn run() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8787);
 
+    // 这台机器（这个用户）上只跑一个核心。两个宿主核心不会有任何报错，但会静默地
+    // 互相干扰（mDNS 同名服务互相挤掉、两边写库时内存态互相覆盖），所以抢不到
+    // 就直接不起，并把现在跑着的那个说清楚。见 `agent_core::single`。
+    let _single = match agent_core::single::acquire(&agent_core::single::default_path(), port) {
+        Ok(g) => g,
+        Err(who) => {
+            eprintln!();
+            eprintln!("  已经有核心在跑了：{}", who.describe());
+            eprintln!("  这台机器上只允许一个 —— 两个会静默地互相干扰：mDNS 广播互相挤掉、");
+            eprintln!("  会话库的内存态互相覆盖（两边都不报错，只是行为怪）。先停掉它再起：");
+            eprintln!(
+                "    {}",
+                who.kill_hint()
+                    .unwrap_or_else(|| "kill <那个核心的 pid>".into())
+            );
+            eprintln!(
+                "  确实要同时跑两个（DOM 审计 / 基准测试）：{}=1",
+                agent_core::single::MULTI_ENV
+            );
+            eprintln!();
+            std::process::exit(2);
+        }
+    };
+
     let core = agent_core::Core::desktop();
 
     // 听在哪：**宿主模式默认对局域网开放**（0.0.0.0）—— 手机 App 的「连接电脑」
