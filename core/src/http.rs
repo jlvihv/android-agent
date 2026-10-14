@@ -22,7 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::llm::Provider;
 use crate::sse;
-use crate::state::{AppState, Command, Event, VERSION};
+use crate::state::{same_secret, AppState, Command, Event, VERSION};
 use crate::Core;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -69,6 +69,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/unqueue", post(unqueue))
         .route("/api/remote", get(remote))
         .route("/api/remote/relay", post(set_relay))
+        // 「选择机器」：这份 API **永远是本机核心**答的 —— 经隧道时隧道也把
+        // `/api/machines*` 转回本机（见 `tunnel.rs`）。问的是「我这台机器能连哪些电脑」，
+        // 答案在本机的库里，不在正连的那台上。
+        .route("/api/machines", get(machines_list))
+        .route("/api/machines/connect", post(machines_connect))
+        .route("/api/machines/pair", post(machines_pair))
+        .route("/api/machines/local", post(machines_local))
+        .route("/api/machines/forget", post(machines_forget))
         .route("/api/reset", post(reset))
         .route("/api/device/log", post(device_log))
         .route("/api/ws", get(ws_upgrade))
@@ -145,15 +153,6 @@ async fn split_origins(req: axum::extract::Request, next: axum::middleware::Next
 
 const AUTH_COOKIE: &str = "agent_token";
 const AUTH_HEADER: &str = "x-agent-token";
-
-/// 两个字符串是否相等，耗时和内容无关（别让比较的快慢泄露 token 的前缀）。
-fn same_secret(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
-}
 
 /// 请求里带的凭据：先看头，再看 cookie。
 fn presented_token(headers: &HeaderMap) -> Option<&str> {
@@ -531,6 +530,161 @@ async fn pairing_info(
         "name": crate::desktop::computer_name(),
     }))
     .into_response()
+}
+
+/// `GET /api/machines` → 「选择机器」面板要的那份（见 docs/05 的 4.5）。
+///
+/// 面板在**哪个页面**上打开都一样：这个接口永远是本机核心答的（经隧道时隧道把
+/// `/api/machines*` 转回本机，见 `tunnel.rs`），所以你会看到「自己这台机器」的
+/// 配对和发现结果，而不是正连的那台的。
+///
+/// 返回里的 `local` 是「回到本机」要的那个地址；`platform` 让页面把第一行写成
+/// 「这台手机」还是「这台电脑」（和界面其它地方同一个依据）。
+async fn machines_list(State(st): State<Arc<AppState>>) -> Response {
+    let Some(m) = st.machines() else {
+        return no_store();
+    };
+    let list: Vec<Value> = m
+        .panel()
+        .into_iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "host": p.host,
+                "port": p.port,
+                "paired": p.paired,
+                "relay": p.relay,
+                "current": p.current,
+            })
+        })
+        .collect();
+    Json(json!({
+        "local": {
+            "url": format!("http://127.0.0.1:{}", st.port.load(std::sync::atomic::Ordering::Relaxed)),
+            "platform": std::env::consts::OS,
+            "name": computer_name(),
+        },
+        "current": m.current_id(),
+        "list": list,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct MachineBody {
+    /// 要连/要配对的那台（面板上那个实例 id）
+    #[serde(default)]
+    id: String,
+    /// 配对码（`/api/machines/pair`）
+    #[serde(default)]
+    code: String,
+    /// 直接给地址（只给电脑用，见 `machines_pair`）
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    port: u16,
+}
+
+/// `POST /api/machines/connect {id}` → `{url}`：起隧道，把**页面**要导航到的地址给它。
+///
+/// 地址里只有一把隧道钥匙，**没有那台电脑的凭据** —— 页面上任何一个 JS（包括查看器里
+/// AI 写的网页）拿着它也只能用界面，拿不到一台电脑的 shell（见 `tunnel.rs`）。
+async fn machines_connect(State(st): State<Arc<AppState>>, Json(b): Json<MachineBody>) -> Response {
+    let Some(m) = st.machines() else {
+        return no_store();
+    };
+    if b.id.trim().is_empty() {
+        return bad_request("没给要连哪台（id）");
+    }
+    match m.clone().connect(b.id.trim()).await {
+        Ok(c) => Json(json!({ "url": c.page_url(), "id": c.id, "name": c.name })).into_response(),
+        Err(e) => bad_request(&format!("{e:#}")),
+    }
+}
+
+/// `POST /api/machines/pair {id, code}` → 和找到的那台配对（输它显示的 6 位码）。
+///
+/// **手机上只认 id**：页面只能点「本机在局域网里真的找到过」的那几台。`AgentHost` 每个
+/// frame 都看得见（包括查看器里 AI 写的网页），能传任意地址的话，一句 JS 就能把这个
+/// 界面带到别人的服务器上（见 docs/11）。电脑上没这层黍（页面就是本机核心自己发的），
+/// 所以多一条「直接给 host/port」的路 —— avahi 没跑、广播工具不在时还能用。
+async fn machines_pair(State(st): State<Arc<AppState>>, Json(b): Json<MachineBody>) -> Response {
+    let Some(m) = st.machines() else {
+        return no_store();
+    };
+    let code = b.code.trim();
+    if code.is_empty() {
+        return bad_request("配对码是空的");
+    }
+    let id = b.id.trim();
+    let (host, port) = if !id.is_empty() {
+        // 地址从**本机自己看到过的**那份里取 —— 页面传进来的字符串不直接用
+        match m
+            .panel()
+            .into_iter()
+            .find(|p| p.id == id && !p.host.is_empty())
+        {
+            Some(p) => (p.host, p.port),
+            None => {
+                return bad_request("局域网里现在看不到这台（等它出现在列表里再配对）");
+            }
+        }
+    } else if cfg!(target_os = "android") {
+        return bad_request("手机上只能连广播找得到的电脑（没有手动输入地址）");
+    } else if !b.host.trim().is_empty() && b.port != 0 {
+        (b.host.trim().to_string(), b.port)
+    } else {
+        return bad_request("没给要配对哪台（id，或者 host + port）");
+    };
+    match m.pair(&host, port, code).await {
+        Ok(m) => {
+            st.log("info", format!("配对成功：{}", m.name));
+            Json(json!({ "id": m.id, "name": m.name })).into_response()
+        }
+        Err(e) => bad_request(&format!("配对失败：{e:#}")),
+    }
+}
+
+/// `POST /api/machines/local` → `{url}`：回到本机自己的核心。
+///
+/// 手机上壳会自己处理这一步（`AgentHost.useLocal`，它还要重新种 cookie）；
+/// 这个接口是给浏览器那条路的 —— 电脑上从一开始就在 `127.0.0.1:<端口>`，
+/// 回去就是导航回那个地址。
+async fn machines_local(State(st): State<Arc<AppState>>) -> Response {
+    if let Some(m) = st.machines() {
+        m.disconnect();
+    }
+    Json(json!({
+        "url": format!("http://127.0.0.1:{}", st.port.load(std::sync::atomic::Ordering::Relaxed)),
+    }))
+    .into_response()
+}
+
+/// `POST /api/machines/forget {id}` → 忘掉一台（它不认我们的凭据了）。
+async fn machines_forget(State(st): State<Arc<AppState>>, Json(b): Json<MachineBody>) -> Response {
+    let Some(m) = st.machines() else {
+        return no_store();
+    };
+    if b.id.trim().is_empty() {
+        return bad_request("没给要忘掉哪台（id）");
+    }
+    m.forget(b.id.trim());
+    st.log("info", "忘掉了一台电脑（下次要重新配对）");
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// 这台机器没有会话库：机器记账（配对、证书指纹）没地方放。
+fn no_store() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "这台机器没有会话库，机器记账没地方放（桌面：AGENT_DATA_DIR / 宿主模式的数据目录）",
+    )
+        .into_response()
+}
+
+fn bad_request(why: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": why }))).into_response()
 }
 
 #[derive(Deserialize)]

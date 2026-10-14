@@ -50,76 +50,57 @@ type BackHost = {
   openBrowser?: () => void;
   /** agent 现在有没有开着的浏览器页面（头部的地球按钮据此显隐）。同步返回 */
   hasBrowser?: () => boolean;
-  /** 回到手机自己的核心 */
+  /**
+   * 换页面（切换机器）：壳加载核心给的那个地址，顺手清掉 WebView 的历史 ——
+   * 返回键不该退回另一台的页面。
+   *
+   * 壳自己问核心那个地址算不算数（它只认核心当前的隧道地址和本机地址），页面传不了
+   * 任意地址：`AgentHost` 每个 frame 都看得见（包括查看器里 AI 写的网页），能传任意
+   * 地址的话，一句 JS 就能把界面带到别人的服务器上（见 docs/11）。
+   */
+  navigate?: (url: string) => void;
+  /** 回到本机自己的核心（壳那边要重新种 cookie，所以不只是一个导航） */
   useLocal?: () => void;
-  /** 开始 / 停止在局域网里找电脑（找到的推给 `window.__coresFound`） */
+  /** 开始 / 停止在局域网里找电脑（电脑上没有壳：核心自己一直在找） */
   startDiscovery?: () => void;
   stopDiscovery?: () => void;
-  /** 点了找到的某台电脑（壳只认找到过的 id；配过对的直接连，没配过的弹原生的配对码框） */
-  connectDiscovered?: (id: string) => void;
 };
 
-/** 壳推过来的一台电脑（见 MainActivity.pushCoresFound） */
-export type FoundCore = {
-  id: string;
-  name: string;
-  host: string;
-  port: number;
-  /** 手机记着它的钥匙（点了直接连，不用再输配对码） */
-  paired: boolean;
-  /** 现在连着的就是它 */
-  current: boolean;
-  /**
-   * 经服务器（中继）连：局域网里找不到它（出门了），但配对时它给过中继。
-   * 局域网里找得到就只有直连那一条，同一台电脑不会出现两次（壳里去重）。
-   */
-  relay: boolean;
-};
-
-/** 现在有谁在「找电脑」（见 `discoverCores`） */
-const listeners = new Set<(cores: FoundCore[]) => void>();
-/** 壳最近推过来的那份列表：后挂上来的订阅者先拿到它，不用等下一次变化 */
-let lastFound: FoundCore[] = [];
-
-/**
- * 在局域网里找电脑：`onFound` 每次拿到完整的列表。返回停止函数 ——
- * 「选择机器」面板挂上时开始找、卸掉时停，不常驻。
- *
- * 壳那边只有一个推口（`window.__coresFound`），这里自己分发给所有订阅者，
- * 最后一个人走了才真停。壳只在开始找和列表变化时推，所以新来的订阅者
- * 先回放一次 `lastFound`。
- */
-export function discoverCores(onFound: (cores: FoundCore[]) => void): () => void {
-  const w = globalThis as { __coresFound?: (c: FoundCore[]) => void };
-  listeners.add(onFound);
-  w.__coresFound = (c) => {
-    lastFound = c;
-    for (const l of listeners) l(c);
-  };
-  if (listeners.size === 1) host()?.startDiscovery?.();
-  else onFound(lastFound);
-  return () => {
-    listeners.delete(onFound);
-    if (listeners.size) return;
-    host()?.stopDiscovery?.();
-    delete w.__coresFound;
-    lastFound = [];
-  };
-}
-
-export function connectDiscoveredCore(id: string): void {
-  host()?.connectDiscovered?.(id);
-}
 const host = (): BackHost | undefined =>
   (globalThis as { AgentHost?: BackHost }).AgentHost;
 
-/** 在 App 里吗（能在手机核心 / 电脑核心之间切）。桌面浏览器、手机浏览器上都没有壳 */
-export function canSwitchCore(): boolean {
-  return typeof host()?.connectDiscovered === 'function';
+/**
+ * 页面上这一份跑在壳里吗（手机 App 的 WebView）。
+ *
+ * 决定两件事：第一行写「这台手机」还是「这台电脑」；换机器时是让壳导航（它还要清
+ * WebView 历史、重新种 cookie）还是页面自己 `location.href`。电脑浏览器、手机浏览器
+ * 里都没有壳。
+ */
+export function hasShell(): boolean {
+  return typeof host()?.useLocal === 'function';
 }
 
-export function useLocalCore(): void {
-  host()?.useLocal?.();
+/** 让壳开始 / 停止在局域网里找电脑（面板开着时才找）。桌面：什么都不做。 */
+export function watchDiscovery(on: boolean): void {
+  const h = host();
+  if (on) h?.startDiscovery?.();
+  else h?.stopDiscovery?.();
+}
+
+/** 回到本机自己的核心（有壳就走壳那条路）。返回 false = 没有壳，调用方自己导航。 */
+export function backToLocalShell(): boolean {
+  const h = host();
+  if (!h?.useLocal) return false;
+  h.useLocal();
+  return true;
+}
+
+/** 让壳换到核心给的那个地址。返回 false = 没有壳，调用方自己 `location.href`。 */
+export function navigateShell(url: string): boolean {
+  const h = host();
+  if (!h?.navigate) return false;
+  h.navigate(url);
+  return true;
 }
 
 /** 头部的地球按钮调它。桌面（没有壳）上什么都不做。 */

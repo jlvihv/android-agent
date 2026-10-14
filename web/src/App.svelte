@@ -35,7 +35,7 @@
   import Viewer from './components/Viewer.svelte';
   import { viewer } from './lib/viewer.svelte.ts';
   import { models } from './lib/models.svelte.ts';
-  import { agentHasBrowser, canSwitchCore, openAgentBrowser } from './lib/overlay';
+  import { agentHasBrowser, openAgentBrowser } from './lib/overlay';
   import { wide } from './lib/wide.svelte.ts';
   import { dismissable } from './lib/drag';
 
@@ -141,7 +141,13 @@
   /** 「选择机器」面板（侧栏底栏那个机器标签点开的，见 MachineSheet） */
   let machineSheet = $state(false);
   /** 壳在不在（能在手机核心 / 电脑核心之间切）。桌面浏览器、手机浏览器里没有壳 */
-  const canSwitch = canSwitchCore();
+  /**
+   * 底栏那个机器标签点开「选择机器」（面板那份数据是本机核心答的，见 docs/05 的 4.5）。
+   *
+   * 这里不再看着有没有壳：电脑浏览器、手机 App、手机浏览器都问得到那份数据 ——
+   * 以前只在 App 里是「页面上没有壳，换不了」，现在换机器整条路都在核心里（docs/12）。
+   */
+  const openMachines = () => (machineSheet = true);
   /** 设置页。可以从抽屉的齿轮进，也可以从模型面板「模型提供商」页的「管理模型提供商」进 ——
    *  后者是叠在模型面板上面的，关掉之后回到模型面板。每层各自在
    *  lib/overlay.ts 里登记，返回键先关最上面那层。 */
@@ -752,7 +758,7 @@
       onrename={renameSession}
       onsettings={() => (settings = true)}
       machine={store.machine}
-      onmachine={canSwitch ? () => (machineSheet = true) : null}
+      onmachine={openMachines}
       pinned
     />
   {/if}
@@ -845,7 +851,7 @@
       onrename={renameSession}
       onsettings={() => (settings = true)}
       machine={store.machine}
-      onmachine={canSwitch ? () => (machineSheet = true) : null}
+      onmachine={openMachines}
     />
   {/if}
 </div>

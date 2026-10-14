@@ -127,15 +127,15 @@ async fn run() -> anyhow::Result<()> {
         _advert = advert;
         match quiet {
             None => println!(
-                "  → 手机 App：侧栏底栏的机器标签 → 选择机器，点「{name}」，配对码 {}",
+                "  → 别的机器：侧栏底栏的机器标签 → 选择机器，点「{name}」，配对码 {}",
                 pairing.code()
             ),
             Some(why) => {
                 println!("  ⚠️  局域网广播没起来：{why}");
                 println!(
-                    "     手机 App 只能连广播找得到的电脑（没有手动输入地址），所以这次连不上；"
+                    "     别的机器就会看不到这台（App 上没有手动输入地址，电脑上的页面上有）；"
                 );
-                println!("     手机浏览器打开下面的地址还能用。");
+                println!("     用浏览器打开下面的地址还能用。");
                 println!(
                     "     起好系统的 mDNS 服务再重启核心（Linux: systemctl enable --now avahi-daemon）；"
                 );
@@ -180,6 +180,37 @@ async fn run() -> anyhow::Result<()> {
         println!("    （明文 HTTP：只在自己信得过的 Wi-Fi 里用；地址里的 t= 就是钥匙。");
         println!("      只想自己用：AGENT_BIND=127.0.0.1）");
     }
+    // 接着连上次那台（手机上是壳调 `resume_machine`，电脑上没人替我们做这件事）。
+    //
+    // 隧道端口尽量复用上次那个：浏览器那个标签停在 `http://localhost:<端口>`，
+    // 核心重启（改了东西重跑）之后刷新一下就能接着用，不用回 `127.0.0.1` 再切一次。
+    // 必须**在 serve 之后**：隧道要把 `/api/machines*` 转回本机核心，那时端口才定下来。
+    if let Some(m) = core.state.machines() {
+        let m = m.clone();
+        tokio::spawn(async move {
+            if let Some(c) = m.resume().await {
+                println!("  → 接着连「{}」：http://localhost:{}", c.name, c.port);
+            }
+        });
+    }
+
+    // 局域网里找别的核心（电脑↔电脑也能在界面上换机器，见 docs/11）。
+    // 找到的报给核心，页面上的「选择机器」问的是核心（`GET /api/machines`）。
+    let mut _browse = core.state.machines().and_then(|m| {
+        agent_core::desktop::browse(&core.state.instance_id(), move |seen| {
+            for s in &seen {
+                m.lan_found(&s.id, &s.name, &s.host, s.port);
+            }
+            // 这一轮里没提到的（广播撤了）就别再列了
+            let ids: Vec<String> = seen.iter().map(|s| s.id.clone()).collect();
+            for p in m.panel() {
+                if !ids.contains(&p.id) && !p.paired {
+                    m.lan_lost(&p.id);
+                }
+            }
+        })
+    });
+
     let device = core.state.device().map(|d| d.name()).unwrap_or_default();
     println!("  （设备：{device}；Ctrl-C 退出）");
     println!();

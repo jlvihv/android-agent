@@ -265,6 +265,255 @@ fn start(cmd: &mut Proc) -> Option<Advert> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 找局域网里的其它核心（电脑↔电脑也能换机器，见 docs/11）
+// ---------------------------------------------------------------------------
+
+/// 局域网里看到的一个核心（别人广播的，配上 `id`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// 正在找（mDNS 浏览）。`Drop` 就停。
+pub struct Browse {
+    child: std::process::Child,
+}
+
+impl Drop for Browse {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 在局域网里找别的核心：`on_change` 每次拿到完整的一份（去掉自己）。
+///
+/// 和广播同一个路子：用系统自带的工具（Linux `avahi-browse`），不要 Rust 的 mDNS 库 ——
+/// 它按网卡回答地址，不会把 Clash TUN / docker 那几张虚拟网卡的地址当成「这台机器在
+/// 局域网的地址」报上来（这台开发机上就同时有 198.18.0.1 和 172.17.0.1）。
+///
+/// `own_id` 是本机核心的实例 id：自己在广播、自己也会被看到，剔掉。
+/// 工具不在就返回 `None`（那就只有配对过的那几台 + 手输地址了）。
+pub fn browse<F>(own_id: &str, on_change: F) -> Option<Browse>
+where
+    F: Fn(Vec<Seen>) + Send + 'static,
+{
+    if cfg!(target_os = "macos") {
+        // macOS 的 `dns-sd` 要两个进程才能问全（`-B` 只给名字，地址和 TXT 得再 `-L`
+        // 一次，还要自己跟进程的输出节奏 —— 这台开发机上没有 macOS 可验，不写没验过的
+        // 代码）。macOS 上先用面板里的「手输地址」（见 docs/11）。
+        tracing::info!(
+            "macOS 上的自动发现还没做（dns-sd 要两句输出）—— 「选择机器」里可以手输地址"
+        );
+        return None;
+    }
+    let mut cmd = {
+        let mut c = Proc::new("avahi-browse");
+        // `-r`：连地址一起解出来（`=` 行）；`-p`：机器好读的那一种格式。
+        // **不加 `-t`**：那是「列完就退」，而我们要一直听着。
+        c.args(["-rp", SERVICE]);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "没法在局域网里找电脑（{:?}: {e}）—— 「选择机器」里只会列出配对过的",
+                cmd.get_program()
+            );
+            return None;
+        }
+    };
+    let stdout = child.stdout.take()?;
+    let own = own_id.to_string();
+    // 读子进程输出得同步做：单独一条线程，核心那边不掺和。
+    std::thread::Builder::new()
+        .name("agent-mdns-browse".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            // 服务实例名（＝广播用的那个名字，一台机器一个）→ 看到它什么
+            let mut seen: std::collections::BTreeMap<String, Seen> = Default::default();
+            let mut last: Vec<Seen> = Vec::new();
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let Some(change) = apply(&mut seen, &line, &own) else {
+                    continue;
+                };
+                let now: Vec<Seen> = seen.values().cloned().collect();
+                if now != last {
+                    last = now.clone();
+                    if !change {
+                        continue;
+                    }
+                    on_change(now);
+                }
+            }
+            // 子进程退了（工具被杀 / 网络接口全没了）：告诉上面「一个也不在」，
+            // 否则面板上会留着几行永远点不动的地址
+            if !last.is_empty() {
+                on_change(Vec::new());
+            }
+            tracing::debug!("找电脑的进程结束了");
+        })
+        .ok()?;
+    Some(Browse { child })
+}
+
+/// 一行浏览输出 → 更新 `seen`。返回值：`None` = 这行不认识；`Some(true)` = 真变了。
+fn apply(
+    seen: &mut std::collections::BTreeMap<String, Seen>,
+    line: &str,
+    own_id: &str,
+) -> Option<bool> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let res = parse_avahi(line)?;
+    let before = seen.clone();
+    match res {
+        Found::Service { name } => {
+            // 还没解出地址：先占个位（名字后面要用，`Lost` 也按名字认）
+            seen.entry(name).or_insert(Seen {
+                id: String::new(),
+                name: String::new(),
+                host: String::new(),
+                port: 0,
+            });
+        }
+        Found::Resolved(entry) => {
+            if entry.id == own_id {
+                seen.remove(&entry.name);
+            } else {
+                seen.insert(entry.name.clone(), entry);
+            }
+        }
+        Found::Lost { name } => {
+            seen.remove(&name);
+        }
+    }
+    // 只有解出地址的才算数（半截的那些不推给上面）
+    seen.retain(|_, s| !s.id.is_empty());
+    Some(*seen != before)
+}
+
+/// 浏览里的一行。
+enum Found {
+    /// 看到了（还没解出地址）
+    Service { name: String },
+    /// 解出来了：地址、端口、TXT
+    Resolved(Seen),
+    /// 不在了
+    Lost { name: String },
+}
+
+/// `avahi-browse -rp _agent-core._tcp` 的一行。格式（分号分隔）：
+///
+/// ```text
+/// +;wlan0;IPv4;jl;_agent-core._tcp;local
+/// =;wlan0;IPv4;jl;_agent-core._tcp;local;jl.local;192.168.0.161;8787;"id=00cb…" "v=0.1.0"
+/// -;wlan0;IPv4;jl;_agent-core._tcp;local
+/// ```
+///
+/// 同一台机器会在**每张网卡上各出一行**（同一台开发机上有 wlan0 / docker0 / utun / lo），
+/// 所以只有名字后面的那个地址是用得上才收（`usable_iface`）；都是虚拟网卡就不收它。
+fn parse_avahi(line: &str) -> Option<Found> {
+    let f: Vec<&str> = line.split(';').collect();
+    let name = unescape_avahi(f.get(3).copied()?);
+    if name.is_empty() {
+        return None;
+    }
+    match f.first().copied()? {
+        "+" => Some(Found::Service { name }),
+        "-" => Some(Found::Lost { name }),
+        "=" => {
+            let iface = f.get(1).copied()?;
+            let proto = f.get(2).copied()?;
+            let addr = f.get(7).copied()?;
+            let port: u16 = f.get(8)?.parse().ok()?;
+            let txt = f.get(9..).map(|t| t.join(";")).unwrap_or_default();
+            let id = txt_id(&txt)?;
+            if proto != "IPv4" || !usable_iface(iface) || !usable_addr(addr) {
+                return None;
+            }
+            Some(Found::Resolved(Seen {
+                id,
+                name,
+                host: addr.to_string(),
+                port,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// avahi 的 `-p` 输出里，非 ASCII 和特殊字符写成 `\ddd`（十进制字节）。
+///
+/// 中文名字就是一堆这种转义：`vihv\231\154\132MacBook\032Air`。
+fn unescape_avahi(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(u8::is_ascii_digit) {
+            let n: u16 = s[i + 1..i + 4].parse().unwrap_or(0);
+            out.push(n as u8);
+            i += 4;
+            continue;
+        }
+        // 剩下的按原字节走：转义外的部分是 ASCII，多字节的没有别的可能
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// TXT 里的 `id=…`。
+fn txt_id(txt: &str) -> Option<String> {
+    txt.split('"')
+        .find_map(|part| part.trim().strip_prefix("id="))
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// 这张网卡上的地址能不能拿去连别人。
+///
+/// 排除的是**虚拟网卡**：VPN / 容器 / 桥 / 回环。它们报的地址是本机自己的，
+/// 别人连不到（这台开发机上就同时有 docker0 的 172.17.0.1 和 Clash TUN 的 198.18.0.1）。
+fn usable_iface(iface: &str) -> bool {
+    const VIRTUAL: [&str; 10] = [
+        "lo",
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "tun",
+        "utun",
+        "tap",
+        "wg",
+        "tailscale",
+    ];
+    let n = iface.to_ascii_lowercase();
+    !VIRTUAL.iter().any(|v| n.starts_with(v))
+}
+
+/// 只有私有网段的 IPv4 是局域网里能用的（IPv6：WebView 拼地址要加方括号，暂不管）。
+fn usable_addr(addr: &str) -> bool {
+    let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    ip.is_private()
+}
+
 /// 这台电脑当设备用。
 pub struct HostDevice;
 
@@ -325,6 +574,83 @@ fn run(cmd: &mut Proc) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 这台开发机上真跑出来的一行（`avahi-browse -rp _agent-core._tcp`）。
+    /// 同一个核心在 wlan0 / docker0 / utun / lo 上各来一遍 —— 只有 wlan0 那条能用。
+    #[test]
+    fn only_the_real_lan_address_of_a_core_is_kept() {
+        let mut seen = Default::default();
+        let lines = [
+            "+;wlan0;IPv4;jl;_agent-core._tcp;local",
+            "=;utun;IPv4;jl;_agent-core._tcp;local;jl.local;198.18.0.1;8787;\"id=core-1\" \"v=0.1.0\"",
+            "=;docker0;IPv4;jl;_agent-core._tcp;local;jl.local;172.17.0.1;8787;\"id=core-1\" \"v=0.1.0\"",
+            "=;lo;IPv4;jl;_agent-core._tcp;local;jl.local;127.0.0.1;8787;\"id=core-1\" \"v=0.1.0\"",
+            "=;wlan0;IPv4;jl;_agent-core._tcp;local;jl.local;192.168.0.161;8787;\"id=core-1\" \"v=0.1.0\"",
+        ];
+        for l in lines {
+            apply(&mut seen, l, "别的核心");
+        }
+        assert_eq!(seen.len(), 1, "一台机器只留一行");
+        assert_eq!(seen["jl"].host, "192.168.0.161");
+        assert_eq!(seen["jl"].port, 8787);
+        assert_eq!(seen["jl"].id, "core-1");
+    }
+
+    #[test]
+    fn our_own_broadcast_is_not_listed() {
+        let mut seen = Default::default();
+        apply(
+            &mut seen,
+            "=;wlan0;IPv4;jl;_agent-core._tcp;local;jl.local;192.168.0.161;8787;\"id=me\" \"v=0.1.0\"",
+            "me",
+        );
+        assert!(seen.is_empty(), "自己不该出现在「选择机器」里");
+    }
+
+    #[test]
+    fn a_core_that_stops_broadcasting_is_dropped_by_name() {
+        let mut seen = Default::default();
+        for l in [
+            "=;wlan0;IPv4;jl;_agent-core._tcp;local;jl.local;192.168.0.161;8787;\"id=core-1\"",
+            "=;wlan0;IPv4;别的;_agent-core._tcp;local;x.local;192.168.0.9;8787;\"id=core-2\"",
+            "-;wlan0;IPv4;jl;_agent-core._tcp;local",
+        ] {
+            apply(&mut seen, l, "me");
+        }
+        let names: Vec<&str> = seen.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["别的"]);
+    }
+
+    #[test]
+    fn a_chinese_service_name_is_unescaped() {
+        // avahi 的 `-p` 把非 ASCII 写成十进制字节：vihv的MacBook Air
+        let raw = "=;wlan0;IPv4;vihv\\231\\154\\132MacBook\\032Air;_agent-core._tcp;local;x.local;192.168.0.16;8787;\"id=mac\"";
+        let mut seen = Default::default();
+        apply(&mut seen, raw, "me");
+        assert_eq!(seen.keys().next().unwrap(), "vihv的MacBook Air");
+    }
+
+    #[test]
+    fn garbage_lines_are_ignored() {
+        let mut seen = Default::default();
+        for l in ["", "随便一句话", "+;wlan0;IPv4;名字;_agent-core._tcp;local"] {
+            apply(&mut seen, l, "me");
+        }
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn virtual_interfaces_and_non_private_addresses_are_not_usable() {
+        for bad in ["lo", "docker0", "br-2ed573d41a5b", "utun", "virbr0", "wg0"] {
+            assert!(!usable_iface(bad), "{bad}");
+        }
+        for good in ["wlan0", "eth0", "en0", "enp4s0"] {
+            assert!(usable_iface(good), "{good}");
+        }
+        // 198.18.0.1 是 Clash 的虚拟网段（不是私有地址），公网地址也不认
+        assert!(!usable_addr("198.18.0.1") && !usable_addr("1.2.3.4"));
+        assert!(usable_addr("192.168.0.161") && usable_addr("10.0.0.5"));
+    }
 
     #[test]
     fn pairing_codes_are_six_digits_and_lock_after_five_misses() {

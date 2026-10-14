@@ -37,7 +37,9 @@ import android.widget.TextView
  *
  * **也能连电脑上的核心**（侧栏底栏的机器标签 →「选择机器」）：电脑上 `just dev-host`，
  * 手机在局域网里找到它，点一下这个 WebView 就改加载那台电脑 —— 界面一样，命令跑在电脑上。
- * 选择记在 SharedPreferences 里（下次启动直接连）；连不上时给原生的错误页，
+ * 那份面板和电脑浏览器上的**是同一份**（问核心的 `GET /api/machines`，见 docs/12）：
+ * 壳只负责 mDNS 发现（`lanFound` 报给核心）和换页面（`AgentHost.navigate`）。
+ * 「上次连的是哪台」记在核心的库里（下次启动接着连）；连不上时给原生的错误页，
  * 能「重试」或「回到手机」。手机自己的核心照常在后台跑着，切回来是瞬间的。
  */
 class MainActivity : Activity() {
@@ -87,7 +89,7 @@ class MainActivity : Activity() {
     private var clearHistoryOnLoad = false
 
     /** 现在连的是哪台电脑（配对、选路、连接都在核心里，见 Remote） */
-    private val remote by lazy { Remote(this) }
+    private val remote by lazy { Remote() }
 
     /**
      * 局域网里找电脑：「选择机器」面板开着时一直找；另外回到前台、网络变了的时候找一小会儿
@@ -96,11 +98,20 @@ class MainActivity : Activity() {
     private val discovery by lazy {
         CoreDiscovery(this) { found ->
             runOnUiThread {
-                for (f in found) runCatching { AgentApp.core.lanSeen(f.id, f.host, f.port.toUShort()) }
-                pushCoresFound()
+                // 配没配对都报给核心：页面上那个「选择机器」面板问的就是核心
+                // （`GET /api/machines`）—— 没配对的也要列出来，点了输一次配对码就能用。
+                for (f in found) {
+                    runCatching { AgentApp.core.lanFound(f.id, f.name, f.host, f.port.toUShort()) }
+                }
+                // 这一轮里没有的（广播撤了、换网了）就别再列了
+                val ids = found.map { it.id }.toSet()
+                for (gone in seenCores - ids) runCatching { AgentApp.core.lanLost(gone) }
+                seenCores = ids
             }
         }
     }
+    /** 上一次发现报上来的那些（用来算出「哪些不见了」） */
+    private var seenCores: Set<String> = emptySet()
     /** 页面想让我们找（面板开着）。App 切后台时停、回来时按它接着找 */
     private var discoveryWanted = false
 
@@ -545,16 +556,6 @@ class MainActivity : Activity() {
     private fun toast(msg: String) =
         android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
 
-    /** 连上这台电脑并切过去 */
-    private fun connectMachine(id: String) {
-        val url = remote.connect(id) ?: return toast("连不上「${remote.name(id)}」（详情见 logcat）")
-        // 刚连上的这台在局域网里的话，地址先报给核心（不等下一次发现）
-        discovery.current().firstOrNull { it.id == id }
-            ?.let { runCatching { AgentApp.core.lanSeen(it.id, it.host, it.port.toUShort()) } }
-        switchTo(url)
-        syncTurnStream()
-    }
-
     /** 连着的电脑哪条路都不通：回到手机自己的核心，说一句为什么 */
     private fun fallBackToPhone(id: String) {
         val name = remote.name(id)
@@ -564,7 +565,7 @@ class MainActivity : Activity() {
     }
 
     private fun useLocalCore() {
-        remote.disconnect()
+        remote.useLocal()
         syncTurnStream()
         Log.i(TAG, "回到手机自己的核心")
         switchTo(localUrl())
@@ -573,7 +574,13 @@ class MainActivity : Activity() {
     // —— 局域网里找电脑 ——
 
     private val main = android.os.Handler(android.os.Looper.getMainLooper())
-    private val stopScan = Runnable { if (!discoveryWanted) discovery.stop() }
+    private val stopScan = Runnable {
+        if (discoveryWanted) return@Runnable
+        discovery.stop()
+        // 一次扫描结束了：没配对过的那些忘掉（配对过的记在库里，不受影响）
+        runCatching { AgentApp.core.lanReset() }
+        seenCores = emptySet()
+    }
 
     /**
      * 找一小会儿（15 秒）：回到前台、网络变了的时候。找到的地址报给核心，连着的那台在家
@@ -605,89 +612,6 @@ class MainActivity : Activity() {
         runCatching { cm.registerDefaultNetworkCallback(cb) }
             .onSuccess { netCallback = cb }
             .onFailure { Log.w(TAG, "监听网络变化失败：${it.message}") }
-    }
-
-    /**
-     * 把可选的电脑推给页面（`window.__coresFound`）。同一台只出现一次：
-     *
-     * - 局域网里找到的：带地址；`paired` = 配对过（点了直接连），没配过点了要输配对码；
-     * - 配对过、局域网里没找到、但配了中继的（出门了）：`relay = true`，「经服务器连」；
-     * - 正连着的那台无论如何都列出来（带勾）。
-     *
-     * 连的时候走哪条路不归这里管（核心在每条连接上自己选），这里只决定列哪几行。
-     */
-    private fun pushCoresFound() {
-        val arr = org.json.JSONArray()
-        val cur = remote.conn?.id
-        val known = remote.machines().associateBy { it.id }
-        val lan = discovery.current()
-        for (f in lan) {
-            arr.put(
-                org.json.JSONObject()
-                    .put("id", f.id)
-                    .put("name", f.name)
-                    .put("host", f.host)
-                    .put("port", f.port)
-                    .put("paired", f.id in known)
-                    .put("relay", false)
-                    .put("current", f.id == cur),
-            )
-        }
-        val here = lan.map { it.id }.toSet()
-        for ((id, m) in known) {
-            if (id in here || !(m.relay || id == cur)) continue
-            arr.put(
-                org.json.JSONObject()
-                    .put("id", id)
-                    .put("name", m.name)
-                    .put("host", "")
-                    .put("port", 0)
-                    .put("paired", true)
-                    .put("relay", m.relay)
-                    .put("current", id == cur),
-            )
-        }
-        web?.evaluateJavascript("window.__coresFound && window.__coresFound($arr)", null)
-    }
-
-    /**
-     * 点了「选择机器」里的某台。配对过的直接连（不再确认）；没配过的（只会是局域网里找到的）
-     * 弹原生对话框输电脑上显示的 6 位配对码，核心经 TLS 去换凭据、记下证书指纹，再连。
-     *
-     * 页面只能给出 id，给不了任意地址：`AgentHost` 每个 frame 都看得见（包括查看器里 AI
-     * 写的网页），而能连的只有「配对过的」和「这台手机自己在局域网里找到的」。
-     */
-    private fun pickDiscovered(id: String) {
-        if (remote.known(id)) return connectMachine(id)
-        val f = discovery.current().firstOrNull { it.id == id } ?: return
-        val input = android.widget.EditText(this).apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            hint = "6 位配对码"
-            filters = arrayOf(android.text.InputFilter.LengthFilter(6))
-        }
-        val box = FrameLayout(this).apply {
-            setPadding(64, 16, 64, 0)
-            addView(input)
-        }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("和「${f.name}」配对")
-            .setMessage("输入电脑上显示的配对码（只要输这一次）。")
-            .setView(box)
-            .setPositiveButton("配对") { _, _ -> pair(f, input.text.toString()) }
-            .setNegativeButton("取消", null)
-            .show()
-        input.requestFocus()
-    }
-
-    /** 配对要联网（核心里 block_on），不能上主线程 */
-    private fun pair(f: CoreDiscovery.Found, code: String) {
-        Thread {
-            val r = runCatching { AgentApp.core.pairMachine(f.host, f.port.toUShort(), code) }
-            runOnUiThread {
-                r.onSuccess { id -> connectMachine(id) }
-                    .onFailure { toast("配对失败：${it.message}") }
-            }
-        }.start()
     }
 
     /** 电脑不认我们了：说清楚，给「回到手机」这条路（不然只能清数据） */
@@ -954,34 +878,42 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun hasBrowser(): Boolean = remote.conn == null && AgentApp.browser?.hasPage() == true
 
-        /** 「选择机器」面板打开了：开始在局域网里找（找到的推给 `window.__coresFound`） */
+        /**
+         * 页面换机器（`AgentHost.navigate(url)`）：加载核心给的那个地址。
+         *
+         * 地址是**页面自己从核心要来的**（`POST /api/machines/connect|local`），壳只核对
+         * 它是不是核心认可的那两个之一 —— 给不了任意地址（见 `Remote.navigate`）。
+         */
+        @JavascriptInterface
+        fun navigate(url: String) {
+            runOnUiThread {
+                if (remote.navigate(url, localUrl())) {
+                    switchTo(url)
+                    syncTurnStream()
+                } else {
+                    toast("核心不认这个地址（不是它给的），没换")
+                }
+            }
+        }
+
+        /** 「选择机器」面板打开了：开始在局域网里找 */
         @JavascriptInterface
         fun startDiscovery() {
             runOnUiThread {
                 discoveryWanted = true
                 discovery.start()
-                pushCoresFound()
             }
         }
 
-        /** 面板关了：不找了 */
+        /** 面板关了：不找了（没配对的那几条也跟着清掉） */
         @JavascriptInterface
         fun stopDiscovery() {
             runOnUiThread {
                 discoveryWanted = false
                 discovery.stop()
+                runCatching { AgentApp.core.lanReset() }
+                seenCores = emptySet()
             }
-        }
-
-        /**
-         * 点了列表里的某台（只认找到过的 id，见 [pickDiscovered]）。
-         *
-         * 外面那个方法**不能也叫 connectDiscovered**：这是内部类，同名的话 lambda 里
-         * 解析到的是它自己 —— 无限递归、栈溢出闪退（真机上点「连接」就是这么崩的）。
-         */
-        @JavascriptInterface
-        fun connectDiscovered(id: String) {
-            runOnUiThread { pickDiscovered(id) }
         }
 
         /** 「选择机器」→ 这台手机。没有风险，不用确认 */

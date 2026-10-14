@@ -92,6 +92,7 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 | Chrome 在哪 | PATH / `/opt/google/chrome` | `.app` 包从不在 PATH 里 | 查 `/Applications`（和 `~/Applications`）下的 Chrome / Chromium / Canary / Edge / Brave |
 | Chrome 钥匙串 | — | 新 profile 存 cookie 时会弹「Chrome Safe Storage」授权框，无头那边一直等 | 加 `--use-mock-keychain` |
 | 孤儿 Chrome 回收 | 扫 `/proc` | 没有 `/proc`（扫不了）；临时 profile 也不在 `/tmp` 而在 `/var/folders/…` | 问 `ps -axww -o pid=,ppid=,command=`；临时 profile 前缀跟着 `temp_dir()` 走 |
+| 找局域网里的核心 | `avahi-browse -rp _agent-core._tcp` | `dns-sd` 要两个进程才问得全（`-B` 只给名字，地址和 TXT 还得再 `-L`），没验过的代码不写 | 这一侧没有自动发现：面板里**手输地址**（`desktop::browse` 直接返回 `None`，日志里说一句为什么） |
 
 数据目录仍是 `~/.local/share/android-agent`（`$XDG_DATA_HOME` 优先），**故意没用**
 `~/Library/Application Support`：截图路径会原样出现在 `read` / `![](sandbox:…)`
@@ -193,10 +194,11 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
   （`scripts/dom-audit.sh` 自己带上了）和基准测试。它**不碰锁**，所以既不会被挡，
   也不会反过来挡住你自己的核心。
 
-## 局域网：用手机上的界面操控这台电脑
+## 局域网：用手机（或另一台电脑）上的界面操控这台电脑
 
 **宿主模式默认就对局域网开放**（听在 `0.0.0.0`）—— 不用另起一个特殊命令：
-`just dev-host` 起来，手机 App 侧栏底栏的「选择机器」就能找到它。只想自己用：
+`just dev-host` 起来，别的机器（手机 App、另一台电脑上的浏览器）侧栏底栏的
+「选择机器」就能找到它。只想自己用：
 
 ```sh
 AGENT_BIND=127.0.0.1 just dev-host
@@ -225,9 +227,9 @@ AGENT_BIND=127.0.0.1 just dev-host
 连时系统挑哪张网卡」那个办法：开着 Clash 之类 TUN 模式的机器上挑中的是虚拟网卡
 （198.18.x.x），手机连不到 —— 这么选过就会打出一个错地址。
 
-### 在 App 里切（不用手机浏览器）
+### 在界面上切机器（App 和电脑浏览器是同一份）
 
-**自动发现 + 一次性配对**（参照安卓「无线调试」）：
+**自动发现 + 一次性配对**（参照安卓「无线调试」），一套实现两个宿主（见 [docs/12](12-relay.md)）：
 
 - 电脑：`just dev-host` 起来就用系统自带的工具广播 mDNS 服务 `_agent-core._tcp`
   （macOS `dns-sd`、Linux `avahi-publish-service`，`desktop::advertise`），终端里
@@ -250,33 +252,48 @@ AGENT_BIND=127.0.0.1 just dev-host
     广播一直是死的，而终端一直在说「手机上点「jl」」。）
   - 前提是系统的 mDNS 服务真在跑：Linux 要 `systemctl enable --now avahi-daemon`
     （Arch 装完 avahi 默认不 enable，这里就撞过）。同名服务在 mDNS 里没法共存
-    —— 先起的那个静默死掉、手机上只剩后起的 —— 同一台机器上跑第二个核心就给它
-    换个名字：`AGENT_ADVERT_NAME="jl 测试" AGENT_PORT=8789 …`（默认取 `computer_name()`）。
-- 手机：侧栏底栏的机器标签点开「选择机器」面板，面板开着时一直找（`CoreDiscovery`，
-  平台的 `NsdManager`）；另外回到前台、网络变化时找 15 秒，找到的地址报给核心（选路用）。
-  找到的电脑列在那儿：
-  - 第一次连：点它 → 原生对话框里输配对码 → 手机核心经 **TLS** `POST /api/pair` 换回
-    token、记下证书指纹，按电脑的实例 id 记在手机核心的库里（`machines` 表；IP 会变，id 不变）；
-  - 配对过的：点它 → 直接连上（不确认）。连接、选路都在手机核心里，见 docs/12。
-  - 页面只能传「找到过的 id」（`connectDiscovered`），给不了任意地址。
-- 配对码输错 5 次就停用到核心重启；`/api/pair` 是唯一不要凭据的 `/api`。
-- 电脑不认手机记着的 token 了（换过库）：`/auth` 回 403，壳忘掉这把钥匙、提示重新配对。
+    —— 先起的那个静默死掉、别的机器上只剩后起的 —— 同一台机器上跑第二个核心就
+    给它换个名字：`AGENT_ADVERT_NAME="jl 测试" AGENT_PORT=8789 …`（默认取 `computer_name()`）。
+- **找别的核心**：一份发现，两个宿主。
+  - 电脑上是核心自己起的 `avahi-browse -rp _agent-core._tcp`（`desktop::browse`，
+    跟着核心一直挂着）：一行一行读，出现／解出／消失分别对应面板上多一行／补上地址／
+    拿掉。**只认真实网卡的私有 IPv4** —— 同一台机器会在 wlan0 / docker0 / utun / lo
+    上各出一行，收错了就得到一个连不上的地址（这台开发机上就有 198.18.0.1 和
+    172.17.0.1，见 `usable_iface` / `usable_addr`）。自己不算（按实例 id 剔掉）。
+  - 手机上是壳的 `CoreDiscovery`（`NsdManager`）：面板开着时一直找，另外回到前台、
+    网络变化时找 15 秒。找到的（配没配对都算）通过 `AgentHost` 之外的**核心接口**报
+    进去（`AgentApp.core.lanFound(id, name, host, port)`），关面板时 `lanReset`。
+  - 两边报的是同一份东西，核心（`machines.rs`）记在同一张表里 —— 页面上那个面板问的
+    就是它（`GET /api/machines`）。
+- **配对**：点没配过的那台 → 页面里输 6 位码（手机上那个原生框没了：面板、配对、
+  连接现在全在核心里一份代码）→ 核心经 **TLS** `POST /api/pair` 换回 token、记下证书
+  指纹，按实例 id 记在库里（`machines` 表；IP 会变，id 不变），接着就把隧道起好、
+  页面导航过去。
+  - **手机上页面只能点「核心在局域网里真的看到过」的那台**：核心直接拒了带
+    `host`/`port` 的配对请求（`machines_pair`），地址一律从「本机自己看到过」的那份里取。
+    理由和以前一样：`AgentHost` 每个 frame 都看得见，包括查看器里 AI 写的网页
+    （见下）。**电脑上**页面就是本机核心自己发的，多一个「手输地址」的口子
+    （广播工具不在、`avahi-daemon` 没跑时还能用）。
+  - 配对码输错 5 次就停用到核心重启；`/api/pair` 是唯一不要凭据的 `/api`。
+- 电脑不认我们记着的 token 了（换过库）：页面拿到 403，App 那边会说出名字并忘掉它，
+  提示重新配对。
 - **出门在外**：经自己的服务器当中继连回来（端到端加密），见 docs/12-relay.md。
-- **没有手动输入地址**：只能连广播找得到的电脑。找不到（广播工具不在、网络隔离多播）
-  就先把广播修好（见上面 avahi 那条）。
+- **macOS 上还没有自动找**：`dns-sd` 要两个进程才问得全（`-B` 只给名字，地址和 TXT
+  还得再 `-L` 一次，还要跟它的输出节奏），这台开发机上没有 macOS 可验，就没写没验过
+  的代码 —— 那一侧用「手输地址」（`dns-sd -B` 找到了也不解地址，所以干脆不列）。
 
-连上之后整个 App 就改连那台电脑（WebView 加载手机核心隧道的 `http://localhost:<端口>`，
-见 docs/12）；面板第一行「这台手机」就是回去的路。「上次连的是哪台」记在壳的
-SharedPreferences 里，下次启动接着连；哪条路都不通时自动回本机并说一句为什么。
-手机自己的核心一直在后台，回去是瞬间的。
+连上之后整个 App 就改连那台电脑（页面加载核心给的那个
+`http://localhost:<端口>/?k=…`，见 docs/12）；下次启动接着连（是哪台记在核心的库里，
+隧道端口尽量复用上次那个 —— 电脑上重启核心后浏览器那个标签刷新一下就能接着用）。
+哪条路都不通时隧道回一页 502 写明原因，App 那边自动回本机并说一句为什么。
 
 几处要知道的：
 
-- **为什么切换不用确认**：`addJavascriptInterface` 注入的 `AgentHost` 在**每个
-  frame** 里都看得见，包括查看器里 AI 写的网页（iframe）。所以绝不能留一个能传
-  任意地址的接口（那种网页一句话就能把 App 带到别人的服务器上）。页面只能传
-  「这台手机自己找到过」的 id，而没配对过的还要输配对码
-  （原生框，网页画不出来）—— 能被切过去的只有你自己配过对的机器。
+- **为什么页面不需要「能传任意地址」的接口**：换机器时页面只是把核心给它的地址交回给
+  壳（`AgentHost.navigate(url)`），壳拿核心算出来的地址（`currentMachineUrl`）对一下
+  `host:port`，只认那两个：本机的、和现在这条隧道的。页面里的 JS（包括查看器里 AI 写的
+  网页）翻自己的 history、`location`，都拿不到任何一台机器的凭据 —— 隧道转发时替它带上
+  （见 docs/12）。
 - **App 连电脑不再走明文**：局域网和中继都是手机核心隧道里的 TLS（docs/12）。电脑的同一个
   端口仍然认明文 HTTP —— 给电脑上自己开的浏览器、局域网里用手机浏览器打开的那种。
   （`network_security_config.xml` 放开明文那条还留着：agent 的浏览器要能开 http 网站。）
@@ -285,13 +302,15 @@ SharedPreferences 里，下次启动接着连；哪条路都不通时自动回�
 - **连着哪一台，侧栏底栏写着**（最右边那个小标签）：电脑上就是那台电脑的名字
   （`/api/health` 的 `computer`，和 mDNS 广播 / 配对码那栏同一个 `desktop::computer_name`），
   手机上自己的核心写「本机」。同一份界面两种归属，不写一句就只能点进设置才知道。
-- **那个标签点开是「选择机器」面板**（`MachineSheet.svelte`，docs/05 的 4.5）：两行
-  一屏就把「这台手机 ↔ 找到的这几台电脑」列完，点一下就地换。这是唯一的入口。
+- **那个标签点开是「选择机器」面板**（`MachineSheet.svelte`，docs/05 的 4.5）：本机 +
+  局域网里／经服务器的那几台，点一下就地换。这是唯一的入口。面板在哪个页面上打开都一样：
+  它问的那份数据（`GET /api/machines`）**永远是本机核心答的** —— 经隧道时隧道把
+  `/api/machines*` 转回本机（见 docs/12）。不这么分的话，连着 A 的时候面板会在 B 的库里
+  查「我能连哪些机器」，永远是空的。
 - 切换后清掉 WebView 的历史，返回键不会退回另一台的页面。
 
-代价：**用浏览器**（不是 App）连电脑时还是明文 HTTP，`t=` 就是钥匙，Wi-Fi 上能抓包的人能
+代价：**用手机浏览器**开电脑上的核心时还是明文 HTTP，`t=` 就是钥匙，Wi-Fi 上能抓包的人能
 拿到它（等于拿到这台电脑的 shell）。只在自己信得过的网络里那样用；App 走的是 TLS（docs/12）。
-
 ## 该知道的代价（是真的）
 
 - **没有审批环节**（铁律 7）：模型的所有命令直接执行，等于把这台机器交出去。

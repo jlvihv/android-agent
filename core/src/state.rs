@@ -257,6 +257,12 @@ pub struct AppState {
     pub alpine: crate::alpine::Upgrader,
     /// 局域网配对码（只有桌面宿主模式对局域网开放时才有，见 `desktop::Pairing`）
     pub pairing: RwLock<Option<Arc<crate::desktop::Pairing>>>,
+    /// 「我这台机器连过哪些电脑、现在连的是哪台」（见 `machines`）。
+    ///
+    /// 打开库时建（`open_db`）：配对过的机器、证书指纹、隧道钥匙都在库里。
+    /// 页面上那个「选择机器」面板和隧道转发 `/api/machines*` 都问它 ——
+    /// 手机上的壳只负责 mDNS 发现（`lan_found`）和导航。
+    pub machines: std::sync::OnceLock<Arc<crate::machines::Machines>>,
     /// 出门在外连这台电脑要用的东西（证书指纹 + 中继地址），配对时和 `/api/remote`
     /// 交给手机。只有桌面宿主模式对局域网开放时才有（见 `remote.rs`）。
     pub remote: RwLock<Option<RemoteInfo>>,
@@ -356,6 +362,7 @@ impl AppState {
             data_dir: RwLock::new(None),
             alpine: Default::default(),
             pairing: RwLock::new(None),
+            machines: std::sync::OnceLock::new(),
             remote: RwLock::new(None),
             relay_host: RwLock::new(None),
             lan_tls: std::sync::OnceLock::new(),
@@ -444,12 +451,17 @@ impl AppState {
         self.db.read().ok().and_then(|g| g.clone())
     }
 
+    /// 机器记账（配对过哪些电脑、现在连的是哪台）。没有库时为 `None`。
+    pub fn machines(&self) -> Option<Arc<crate::machines::Machines>> {
+        self.machines.get().cloned()
+    }
+
     /// 打开会话库，读出 provider 配置和访问凭据。启动时调一次（主线程上）。
     ///
     /// **会话本身不在这里读**：历史一多（每条 bash 输出几十 KB），全读出来
     /// 要几百毫秒，而这是在 `Application.onCreate` 里 —— 卡的是 App 启动。
     /// 会话挪到 `load_sessions`，在后台读。
-    pub fn open_db(&self, dir: &std::path::Path) {
+    pub fn open_db(self: &Arc<Self>, dir: &std::path::Path) {
         let path = dir.join("sessions.db");
         match Db::open(&path) {
             Ok(db) => {
@@ -460,6 +472,11 @@ impl AppState {
                 if let Ok(keys) = db.responses_unsupported() {
                     crate::llm::load_responses_unsupported(keys);
                 }
+                // 机器记账跟着库一起建：在它后面的机器列表、当前那台都落在库里
+                let _ = self.machines.set(crate::machines::Machines::new(
+                    db.clone(),
+                    Arc::downgrade(self),
+                ));
                 if let Ok(mut g) = self.db.write() {
                     *g = Some(db);
                 }
@@ -1382,8 +1399,21 @@ impl AppState {
 }
 
 /// 随机凭据：122 位随机数的十六进制（UUID v4 去掉版本位之外全是随机的）。
-fn random_secret() -> String {
+///
+/// 访问凭据、沙箱钥匙、隧道钥匙都从这来。
+pub(crate) fn random_secret() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// 两个字符串是否相等，耗时和内容无关（别让比较的快慢泄露凭据的前缀）。
+///
+/// 比凭据的地方全用这一个（`http.rs` 的鉴权、`tunnel.rs` 的隧道钥匙）。
+pub(crate) fn same_secret(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// 本地 API 的访问凭据。
@@ -1527,7 +1557,10 @@ mod tests {
         st.set_llm(Provider::compatible("go", "https://x/v1", "m1", "sk-1"));
         assert_eq!(st.llm().unwrap().model, "m1");
         st.adopt_provider(&st.llm().unwrap());
-        assert!(st.provider_creds("custom").is_some(), "在用的那家记成已配置");
+        assert!(
+            st.provider_creds("custom").is_some(),
+            "在用的那家记成已配置"
+        );
 
         // 改模型 → 存进表；重开之后还在，凭据也不变
         let mut p2 = st.llm().unwrap();

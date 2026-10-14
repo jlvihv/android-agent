@@ -52,7 +52,7 @@ android/                          # Gradle 根
         │   ├── AgentForegroundService.kt   回合进行中的前台服务
         │   ├── AgentNotifications.kt / LiveTurnStatus.kt / LiveUpdates.kt
         │   ├── TurnStream.kt               订阅 /api/turns/stream（SSE）
-        │   ├── Remote.kt / CoreDiscovery.kt  连电脑 / mDNS 发现
+        │   ├── Remote.kt / CoreDiscovery.kt  壳这边的「现在连的是哪台」/ mDNS 发现
         │   ├── BrowserController.kt / BrowserPanel.kt / HeadlessCapture.kt
         │   ├── UriLauncher.kt              打开外链 / 系统选择器
         │   └── RootfsInstaller.kt          rootfs 解压（手写 tar）

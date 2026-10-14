@@ -139,8 +139,6 @@ pub struct MachineInfo {
 #[derive(uniffi::Object)]
 pub struct AgentCore {
     core: Core,
-    /// 配对过的电脑（数据目录定下来之后才有，见 `machines()`）
-    machines: std::sync::OnceLock<Arc<crate::machines::Machines>>,
 }
 
 /// 不导出给 Kotlin 的小帮手。
@@ -154,16 +152,15 @@ impl AgentCore {
             .ok_or_else(|| failed("核心还没启动"))
     }
 
-    /// 配对过的电脑。清单在库里，所以要等 `setup_linux` 打开库之后。
+    /// 机器记账（配对过哪些电脑、现在连的是哪台）。
+    ///
+    /// 它跟着库一起建（`AppState::open_db`），所以 `setup_linux` 之后才有 ——
+    /// 在那之前 `None`。
     fn machines_store(&self) -> Result<Arc<crate::machines::Machines>, CoreError> {
-        if let Some(m) = self.machines.get() {
-            return Ok(m.clone());
-        }
-        let db = self.core.state.db().ok_or_else(|| failed("库还没打开"))?;
-        Ok(self
-            .machines
-            .get_or_init(|| crate::machines::Machines::load(db))
-            .clone())
+        self.core
+            .state
+            .machines()
+            .ok_or_else(|| failed("库还没打开"))
     }
 }
 
@@ -172,10 +169,7 @@ impl AgentCore {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         crate::init_tracing();
-        Arc::new(Self {
-            core: Core::new(),
-            machines: Default::default(),
-        })
+        Arc::new(Self { core: Core::new() })
     }
 
     /// 绑定端口并开始服务（后台线程 + 独立 tokio runtime）。
@@ -202,7 +196,8 @@ impl AgentCore {
         self.core.port()
     }
 
-    /// 配对过的电脑（不带凭据）。
+    /// 配对过的电脑（不带凭据）。面板自己不靠它 —— 面板问 `GET /api/machines`；
+    /// 它是壳在「那台电脑不认我们的凭据了」时用的（要说出名字）。
     pub fn machines(&self) -> Vec<MachineInfo> {
         self.machines_store()
             .map(|m| m.list())
@@ -216,25 +211,38 @@ impl AgentCore {
             .collect()
     }
 
-    /// 和局域网里的一台电脑配对（输它显示的 6 位码）。返回它的实例 id。
-    /// **会联网（最多十来秒），别在主线程上调。**
-    pub fn pair_machine(&self, host: String, port: u16, code: String) -> Result<String, CoreError> {
-        let m = self.machines_store()?;
-        let rt = self.rt()?;
-        rt.block_on(m.pair(&host, port, &code))
-            .map(|m| m.id)
-            .map_err(failed)
-    }
-
-    /// 连上这台电脑，返回 WebView 要加载的地址（`http://localhost:<端口>/auth?t=…`）。
-    /// 选路（局域网 / 中继）在核心里，见 `tunnel.rs`。只是在本机绑端口，不联网。
+    /// 连上这台电脑，返回 **WebView 要加载的地址**（`http://localhost:<端口>/auth?t=…&k=…`）。
+    ///
+    /// 选路（局域网 / 中继）在核心里，见 `tunnel.rs`；只是在本机绑端口，不联网。
+    /// 页面自己拿到的是另一个地址（不带凭据，见 `machines::Conn::page_url`）——
+    /// 这一步是壳专用的。
     pub fn connect_machine(&self, id: String) -> Result<String, CoreError> {
         let m = self.machines_store()?;
         let rt = self.rt()?;
-        rt.block_on(m.connect(&id)).map_err(failed)
+        rt.block_on(m.connect(&id))
+            .map(|c| c.shell_url())
+            .map_err(failed)
     }
 
-    /// 断开（回到手机自己的核心）。
+    /// 上次连着的那台，接着连（壳启动时调）。返回 WebView 要加载的地址，没连过就是 `None`。
+    pub fn resume_machine(&self) -> Option<String> {
+        let m = self.machines_store().ok()?;
+        let rt = self.rt().ok()?;
+        rt.block_on(m.resume()).map(|c| c.shell_url())
+    }
+
+    /// 现在连的是哪台（页面让壳导航时，壳要拿它对上账；见 `Remote.navigate`）。
+    pub fn current_machine_id(&self) -> Option<String> {
+        self.machines_store().ok()?.current_id()
+    }
+
+    /// 现在这条隧道的地址（**壳那份**：带那台电脑的凭据）。壳只认这个地址和本机地址
+    /// —— 页面（包括查看器里 AI 写的网页）给不了任意地址，见 docs/11。
+    pub fn current_machine_url(&self) -> Option<String> {
+        self.machines_store().ok()?.current().map(|(_, url, _)| url)
+    }
+
+    /// 断开（回到本机自己的核心）。
     pub fn disconnect_machine(&self) {
         if let Ok(m) = self.machines_store() {
             m.disconnect();
@@ -248,15 +256,26 @@ impl AgentCore {
         }
     }
 
-    /// mDNS 在局域网里看到了这台（`host:port`）。
-    pub fn lan_seen(&self, id: String, host: String, port: u16) {
+    /// mDNS 在局域网里看到了这台（壳的 `CoreDiscovery` 报上来）。
+    ///
+    /// 配没配对都报 —— 面板要把没配对的也列出来（点了输一次配对码就能用）。
+    pub fn lan_found(&self, id: String, name: String, host: String, port: u16) {
         if let Ok(m) = self.machines_store() {
-            let addr = if host.contains(':') {
-                format!("[{host}]:{port}")
-            } else {
-                format!("{host}:{port}")
-            };
-            m.lan_seen(&id, addr);
+            m.lan_found(&id, &name, &host, port);
+        }
+    }
+
+    /// 局域网里看不到它了（广播撤了 / 换了网）。
+    pub fn lan_lost(&self, id: String) {
+        if let Ok(m) = self.machines_store() {
+            m.lan_lost(&id);
+        }
+    }
+
+    /// 一次扫描结束了（面板关掉、[scanBriefly] 那 15 秒到了）：没配对过的那些忘掉。
+    pub fn lan_reset(&self) {
+        if let Ok(m) = self.machines_store() {
+            m.lan_reset();
         }
     }
 

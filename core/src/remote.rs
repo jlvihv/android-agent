@@ -114,11 +114,7 @@ impl Identity {
 ///    那台电脑就不用再手动复制密钥了。
 ///
 /// 中继连不上不是错误：它在后台一直重试，状态往日志里说（只在变化时说一句）。
-pub fn start(
-    state: Arc<AppState>,
-    id: Identity,
-    env: Option<RelayAddr>,
-) -> anyhow::Result<()> {
+pub fn start(state: Arc<AppState>, id: Identity, env: Option<RelayAddr>) -> anyhow::Result<()> {
     let from_env = env.is_some();
     let db = state.db();
     let relay = env.or_else(|| checked(db.as_ref()?.relay().ok()??).ok());
@@ -294,27 +290,108 @@ mod tests {
             key: KEY.into(),
         });
         start(st.clone(), Identity::load_or_create(&dir).unwrap(), relay).unwrap();
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = l.local_addr().unwrap().port();
-        let (app, st2) = (crate::http::router(st.clone()), st.clone());
-        tokio::spawn(async move {
-            while let Ok((s, peer)) = l.accept().await {
-                let tls = st2.lan_tls.get().cloned();
-                tokio::spawn(crate::http::accept_conn(s, peer, app.clone(), tls));
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let port = serve(st.clone()).await;
         (st, port, code, dir)
     }
 
-    /// 从 `connect` 给的地址里取出隧道端口。
-    fn port_of(url: &str) -> u16 {
-        url.trim_start_matches("http://localhost:")
-            .split('/')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap()
+    /// 起一个和 `Core::serve_on` 一样的监听（明文 + TLS 同一个端口），返回端口。
+    ///
+    /// 端口要记进 `state`：隧道把 `/api/machines*` 转回本机时就是找它（`local_upstream`）。
+    async fn serve(st: Arc<AppState>) -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        st.port.store(port, std::sync::atomic::Ordering::Relaxed);
+        let (app, st2) = (crate::http::router(st.clone()), st.clone());
+        tokio::spawn(async move {
+            while let Ok((hn, peer)) = l.accept().await {
+                let tls = st2.lan_tls.get().cloned();
+                tokio::spawn(crate::http::accept_conn(hn, peer, app.clone(), tls));
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        port
+    }
+
+    /// 电脑连电脑（和手机连电脑是同一条路）：本机核心 A 和另一台核心 B 都在这一台机器上
+    /// 跑着 —— 局域网、配对、TLS、隧道全是同一份代码，只是少了两台物理机器。
+    ///
+    /// 要的是两件事：**B 的东西归 B 答**，而「选择机器」那份面板归 **A** 自己答
+    /// （隧道把 `/api/machines*` 转回来，见 `tunnel.rs`）—— 不然后者在 B 的库里查，
+    /// 永远是空的。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_computer_switching_to_another_one_keeps_the_panel_on_itself() {
+        crate::llm::install_crypto_provider();
+        let (st_b, port_b, code_b, dir_b) = computer(None).await;
+
+        let dir_a = tmp();
+        let a = AppState::new();
+        a.open_db(&dir_a); // 机器记账跟着库一起建
+        a.set_token(Some("a-secret".into()));
+        a.trust_loopback
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _port_a = serve(a.clone()).await;
+        let machines = a.machines().unwrap();
+
+        // 局域网里看到了 B（手机上是壳的 NsdManager，电脑上是 avahi-browse，报进来的东西一样）
+        machines.lan_found(&st_b.instance_id(), "B", "127.0.0.1", port_b);
+        let panel = machines.panel();
+        assert_eq!(panel.len(), 1, "看到一台就列一台");
+        assert!(!panel[0].paired, "还没配对");
+
+        // 第一次连：输 B 终端上那个 6 位码
+        let b = machines.pair("127.0.0.1", port_b, &code_b).await.unwrap();
+        assert_eq!(b.id, st_b.instance_id());
+        let c = machines.clone().connect(&b.id).await.unwrap();
+
+        // 页面拿到的地址里只有隧道钥匙：别的机器的凭据不进页面（见 `tunnel::Conn`）
+        assert!(!c.page_url().contains(&c.token), "{}", c.page_url());
+        assert!(c.shell_url().contains("t="), "壳那份才有凭据");
+
+        // ① B 自己的东西归 B 答
+        let r = get(c.port, "/api/health", Some(&c.token)).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("\"ok\":true"),
+            "{r}"
+        );
+
+        // ② 「选择机器」归 A 答：列表里有刚配上的 B，且写着现在连的是它
+        let r = get(c.port, "/api/machines", Some(&c.token)).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(r.contains(&b.id), "{r}");
+        assert!(r.contains("\"current\":\""), "{r}");
+
+        // ③ 隧道自己的门：没带钥匙的请求进不去（手机上有网络权限的任何 App 都能连
+        //    127.0.0.1 扫端口 —— 不挡住的话连上隧道就等于拿到 B 的 shell）
+        let r = get(c.port, "/api/machines", None).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+        let r = get(c.port, "/api/health", None).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+
+        // ④ 页面本来是从 `/?k=…` 进来的：换成一个 HttpOnly cookie，钥匙不再留在地址里
+        let r = get(c.port, &format!("/?k={}", c.key), None).await;
+        assert!(r.starts_with("HTTP/1.1 302"), "{r}");
+        assert!(
+            r.to_lowercase().contains("set-cookie: agent_tunnel="),
+            "{r}"
+        );
+        // 钥匙不对就不认
+        let r = get(c.port, "/?k=瞎写的", None).await;
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+
+        // ⑤ 回到本机：隧道收掉、库里那行「现在连的是哪台」也清掉（下次启动不再自动连）
+        assert_eq!(machines.current_id().as_deref(), Some(b.id.as_str()));
+        machines.disconnect();
+        assert!(machines.current_id().is_none());
+        assert_eq!(a.db().unwrap().get_meta("current_machine").unwrap(), None);
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", c.port))
+                .await
+                .is_err(),
+            "隧道已经收了，那个端口上没人听"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     /// 整条路：手机在局域网里配对（经 TLS）→ 连上（局域网直连）→ 局域网不通了自动走中继；
@@ -329,7 +406,7 @@ mod tests {
         let r = get(port, "/api/health", None).await;
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
 
-        let phone = Machines::load(Arc::new(
+        let phone = Machines::with_db(Arc::new(
             crate::db::Db::open(&dir.join("phone.db")).unwrap(),
         ));
         assert!(
@@ -344,26 +421,35 @@ mod tests {
         );
         assert!(phone.list()[0].relay.is_some(), "说得出能不能出门连");
 
-        // 连上：局域网直连（TLS）。凭据由 /auth 那一步带上
-        let url = phone.connect(&m.id).await.unwrap();
-        assert!(url.ends_with("/auth?t=s3cret"), "{url}");
-        let t = port_of(&url);
+        // 连上：局域网直连（TLS）。壳拿到的地址里带那台电脑的凭据（页面那份不带，见 `Conn`）
+        let c = phone.connect(&m.id).await.unwrap();
+        assert!(
+            c.shell_url().contains("/auth?t=s3cret"),
+            "{}",
+            c.shell_url()
+        );
+        assert!(!c.page_url().contains("s3cret"), "{}", c.page_url());
+        let t = c.port;
         let r = get(t, "/api/health", Some("s3cret")).await;
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
 
         // 出门了：局域网那个地址不通 → 走中继，照样通
-        phone.lan_seen(&m.id, "127.0.0.1:1".into());
+        phone.lan_found(&m.id, "电脑", "127.0.0.1", 1);
         let r = get(t, "/api/health", Some("s3cret")).await;
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         // 经中继来的永远要凭据 —— 哪怕中继、手机、电脑全在这一台机器上（电脑信任本机）
         let r = get(t, "/api/health", None).await;
         assert!(r.starts_with("HTTP/1.1 401"), "{r}");
         // 经中继来的不能配对（配对码只该在局域网里输）
-        let r = get(t, "/api/pair", None).await;
+        let r = get(t, "/api/pair", Some("s3cret")).await;
         assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        // 没有凭据的请求到不了那台电脑：隧道自己就挡住了（手机上有网络权限的
+        // 任何 App 都能连 127.0.0.1，见 `tunnel.rs`）
+        let r = get(t, "/api/linux", None).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
 
         // 记账落盘：重新读回来还在
-        let again = Machines::load(Arc::new(
+        let again = Machines::with_db(Arc::new(
             crate::db::Db::open(&dir.join("phone.db")).unwrap(),
         ));
         assert_eq!(again.get(&m.id).map(|x| x.token), Some("s3cret".into()));
@@ -375,7 +461,7 @@ mod tests {
     async fn unreachable_or_impostor_computers_get_a_page_that_says_why() {
         crate::llm::install_crypto_provider();
         let (_st, port, code, dir) = computer(None).await;
-        let phone = Machines::load(Arc::new(
+        let phone = Machines::with_db(Arc::new(
             crate::db::Db::open(&dir.join("phone.db")).unwrap(),
         ));
         let m = phone.pair("127.0.0.1", port, &code).await.unwrap();
@@ -385,14 +471,14 @@ mod tests {
         fake.id = "fake".into();
         fake.fingerprint = "0".repeat(64);
         phone.upsert(fake);
-        let t = port_of(&phone.connect("fake").await.unwrap());
+        let t = phone.connect("fake").await.unwrap().port;
         let r = get(t, "/api/health", Some("s3cret")).await;
         assert!(r.starts_with("HTTP/1.1 502") && r.contains("指纹"), "{r}");
 
         // 不在同一个网络、也没配中继
-        let t = port_of(&phone.connect(&m.id).await.unwrap());
-        phone.lan_seen(&m.id, "127.0.0.1:1".into());
-        let r = get(t, "/", None).await;
+        let t = phone.connect(&m.id).await.unwrap().port;
+        phone.lan_found(&m.id, "电脑", "127.0.0.1", 1);
+        let r = get(t, "/", Some("s3cret")).await;
         assert!(
             r.starts_with("HTTP/1.1 502") && r.contains("没配中继"),
             "{r}"
@@ -407,7 +493,7 @@ mod tests {
         crate::llm::install_crypto_provider();
         let relay = relay().await;
         let (st, port, code, dir) = computer(None).await;
-        let phone = Machines::load(Arc::new(
+        let phone = Machines::with_db(Arc::new(
             crate::db::Db::open(&dir.join("phone.db")).unwrap(),
         ));
         // 手机从别的电脑那里知道了这个中继
@@ -462,8 +548,12 @@ mod tests {
             addr: relay.clone(),
             key: KEY.into(),
         };
-        start(st3.clone(), Identity::load_or_create(&dir).unwrap(), Some(env.clone()))
-            .unwrap();
+        start(
+            st3.clone(),
+            Identity::load_or_create(&dir).unwrap(),
+            Some(env.clone()),
+        )
+        .unwrap();
         let host3 = st3.relay_host.read().unwrap().clone().unwrap();
         assert!(host3.attach(env).unwrap_err().contains("环境变量"));
         let _ = std::fs::remove_dir_all(&dir);
