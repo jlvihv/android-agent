@@ -231,10 +231,25 @@ Rust status::Reporter ──TurnHost.status(JSON)──▶ 壳 LiveTurnStatus（
    本来就不需要保活；我们这边前台服务同时承担保活（见下面「深度后台」：离开焦点 60~75 秒
    整个进程会被 freezer 冻住），收起来等于每切一次前后台都要重新 promote 一次。宁可多一条
    安静的状态行，也不要一个可能收不回来的服务。
-2. **没有浮动胶囊 / 没有 Android 16 的 Live Updates 开关**。前者是 OpenMinis 那套
-   overlay（要 `SYSTEM_ALERT_WINDOW`）；后者（`LiveUpdates.kt`）照抄了能力探针和「请求提升」
-   的 extras key，**能用就用**（API 36+ 且系统允许时，那条进行中的通知会自动变成状态栏芯片
-   上的 Live Update），但不做设置项开关。
+2. **没有浮动胶囊**，但 **Live Updates（Android 16+ 的常驻芯片）做了**。前者是 OpenMinis
+   那套 overlay（要 `SYSTEM_ALERT_WINDOW`）；后者是真的接上了，靠两件事：
+
+   - **`POST_PROMOTED_NOTIFICATIONS` 权限**（`AndroidManifest.xml`）。Android 17 新加的
+     `normal|appop` 权限 —— 安装时自动授予，但**必须声明**：没声明的话
+     `canPostPromotedNotifications()` 一律回 false（实测：同一台 Pixel 10 上，OpenMinis
+     声明了它就有芯片，我们没声明就一直只能当普通通知）。AOSP 16 的框架里还没这个权限，
+     那时只看 rich-ongoing 特性开关。
+   - **上色按版本分开写**：16 源码（`android16-release` 的 `Notification.java`）里
+     `hasPromotableCharacteristics()` 最后一行是 `isColorizedRequested() &&
+     hasPromotableStyle()` —— **必须请求上色**；而 17 真机 `framework.jar` 反汇编出来是
+     `… && !isColorizedRequested() && !isBridged()` —— **请求了上色反而不给提升**。
+     两边正相反（Google 改了），所以 `setColorized(SDK_INT < 37)`。
+
+   真机上把两道都对完（权限 + 上色）之后：`dumpsys notification` 里那条的 flags 变成
+   `ONGOING_EVENT|ONLY_ALERT_ONCE|NO_CLEAR|FOREGROUND_SERVICE|**PROMOTED_ONGOING**`，
+   状态栏/锁屏上出现芯片，通知栏里图标换成 App 图标（系统对提升过的通知就是这么画的）。
+   不提升时 logcat 里（tag `AgentNotif`）会把每一项前提都列出来 —— 包括上色、样式
+   （`android.template`）和那条 `hasPromotableCharacteristics()=false`，不靠猜。
 
 一个实测踩到的坑（改了两处才收干净）：**更新前台服务的通知要用 `startForeground()`，不要用
 `NotificationManager.notify()`**。`notify()` 能把同 id 的通知换掉，但会把记录上的

@@ -157,15 +157,17 @@ object AgentNotifications {
      * Live Updates 那一版（API 36+）。调用方已经用 [LiveUpdates.active] 把门把住了，
      * 这里才敢碰 36 才有的东西：
      *
-     * - 样式用 `BigTextStyle`（框架的 `hasPromotableStyle()` 只认 BigText / Call /
-     *   Progress 这几种），
-     * - **必须 `setColorized(true)`**。这是实测拿 AOSP 源码对出来的：
-     *   `Notification.hasPromotableCharacteristics()` 最后一行是
-     *   `isColorizedRequested() && hasPromotableStyle()` —— 也就是
-     *   「**没请求上色就不给提升**」（只有 Ongoing CallStyle 例外）。
-     *   我们一开始是照 OpenMinis 那句注释写的（它说「上色会被取消资格」，正好反了），
-     *   结果真机上永远只能当普通通知。上色显示本身对前台服务的通知是放行的
-     *   （`isColorized()` 里 `isFgsOrUij()` 为真），所以请求它没有副作用。
+     * - 样式用 `BigTextStyle`（16 和 17 的 `hasPromotableStyle()` 都认它 —— 17 里是
+     *   BigText / Call / Metric / Progress 四种），
+     * - **上色按系统版本分开写**：
+     *   - Android 16（`android16-release` 的 `Notification.java`）：最后一行是
+     *     `isColorizedRequested() && hasPromotableStyle()` —— **必须请求上色**；
+     *   - Android 17（真机 `framework.jar` 反汇编 `hasPromotableCharacteristics`）：
+     *     `… && !isColorizedRequested() && !isBridged()` —— **请求了上色反而不给提升**。
+     *   两边正相反，所以按版本选。不分开写就总有一边永远拿不到芯片 —— 实测踩过：
+     *   我们先按 16 写（请求上色），在 Pixel 10 / Android 17 上就是「逐项全绿、
+     *   但 `hasPromotableCharacteristics()` 仍回 false」。OpenMinis 写的是
+     *   `setColorized(false)`，他们对着 17，所以能出芯片。
      * - `setShortCriticalText` 给芯片那一行**更短**的文本（通知栏那两行比芯片宽），
      * - **不**当分组摘要、**不**用自定义 View —— 这两条也会取消资格。
      */
@@ -177,6 +179,7 @@ object AgentNotifications {
         open: PendingIntent,
         whenMs: Long,
     ): Notification {
+        val colorize = Build.VERSION.SDK_INT < 37
         val b = Notification.Builder(ctx, CHANNEL_LIVE)
             .setSmallIcon(icon)
             .setContentTitle(title)
@@ -187,8 +190,7 @@ object AgentNotifications {
             .setOnlyAlertOnce(true)
             .setShowWhen(true)
             .setWhen(whenMs)
-            // ↓ 不是笔误：框架要求「请求上色」才肯提升（见上面的说明）
-            .setColorized(true)
+            .setColorized(colorize)
         b.setShortCriticalText(chipText(text))
         b.addExtras(Bundle().apply { putBoolean(EXTRA_REQUEST_PROMOTED_ONGOING, true) })
 
@@ -196,17 +198,36 @@ object AgentNotifications {
         // 提升不成功不是错误：退化成普通常驻通知，只是不上芯片。把每一项前提都打出来，
         // 真机上不提升时才知道是哪一条不满足。
         if (!n.hasPromotableCharacteristics()) {
-            Log.w(
-                TAG,
-                "Live Update 没拿到提升资格 —— 逐项拆开看: " +
-                    "requested=${n.extras.getBoolean(EXTRA_REQUEST_PROMOTED_ONGOING)} " +
-                    "ongoing=${(n.flags and Notification.FLAG_ONGOING_EVENT) != 0} " +
-                    "title=${!n.extras.getCharSequence(Notification.EXTRA_TITLE).isNullOrEmpty()} " +
-                    "smallIcon=${n.smallIcon != null} " +
-                    "summary=${(n.flags and Notification.FLAG_GROUP_SUMMARY) != 0}",
-            )
+            Log.w(TAG, "Live Update 没拿到提升资格 —— 逐项拆开看: ${promotableDetail(n)}")
         }
         return n
+    }
+
+    /**
+     * 「提升资格」的每一项，摊开写成一行日志。
+     *
+     * 前三项能用公开 API 读；`isRequestPromotedOngoing` 也能；而 `containsCustomViews` /
+     * `hasPromotableStyle` 在 17 上是 **hiddenapi BLOCKED**，反射会被拒 → 那一项就是 `null`
+     * （不是 bug，看到了不必惊）。反射挂了也绝不让它把一条通知带崩（诊断日志不值这个代价）。
+     *
+     * 为什么要这么细：真机上「为什么没有芯片」只可能卡在某一条上，而
+     * `hasPromotableCharacteristics()` 只回一个布尔 —— 不把它拆开就只能靠猜。（实踩：
+     * 这台 Pixel 10 / Android 17 上我们逐项全绿却仍然 false，就是靠这行发现还差东西。）
+     */
+    private fun promotableDetail(n: Notification): String {
+        fun hidden(name: String): Any? = runCatching {
+            Notification::class.java.getMethod(name).apply { isAccessible = true }.invoke(n)
+        }.getOrNull()
+
+        return "ongoing=${(n.flags and Notification.FLAG_ONGOING_EVENT) != 0}" +
+            " title=${!n.extras.getCharSequence(Notification.EXTRA_TITLE).isNullOrEmpty()}" +
+            " summary=${(n.flags and Notification.FLAG_GROUP_SUMMARY) != 0}" +
+            " colorized=${n.extras.getBoolean("android.colorized")}" +
+            " requested=${n.extras.getBoolean(EXTRA_REQUEST_PROMOTED_ONGOING)}" +
+            " template=${n.extras.getString(Notification.EXTRA_TEMPLATE)}" +
+            " promotableStyle=${hidden("hasPromotableStyle")}" +
+            " customViews=${hidden("containsCustomViews")}" +
+            " isRequested=${hidden("isRequestPromotedOngoing")}"
     }
 
     /**

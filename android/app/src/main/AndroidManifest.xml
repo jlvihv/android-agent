@@ -23,6 +23,16 @@
     <!-- 通知权限。没有它 Android 13+ 不显示那个通知（服务照样跑，只是用户看不见）。
          只在真的起回合时问一次，不在启动时问。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 提升为 Live Updates（状态栏那颗常驻芯片）的权限。
+
+         Android 17 新加的，保护级别是 `normal|appop` —— 安装时自动授予，但**必须声明**：
+         没声明的话 `NotificationManager.canPostPromotedNotifications()` 一律回 false，
+         于是我们永远只走普通通知那条路。实测：同一台机器（Pixel 10 / Android 17）上，
+         OpenMinis 的 manifest 里有这行，它就有芯片；我们没有，就一直只能当通知栏一条。
+         参考实现对得上：AOSP 16 的框架里还没有这个权限（那边只看 rich-ongoing 特性开关），
+         17 才加上它。
+         16 及更早的系统上这是未知权限，声明了无害（会被忽略）。 -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
 
     <application
         android:name=".AgentApp"
