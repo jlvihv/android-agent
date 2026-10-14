@@ -86,7 +86,7 @@
    * 上下文在长）。累计值在这里往上加；下一次 `/api/session` 回来整份换成
    * 服务端的（两边数的是同一批步骤，对得上）。
    */
-  $effect(() => {
+  $effect(() =>
     onUsage((u) => {
       const t = usage?.total ?? { input: 0, output: 0, cached: 0, calls: 0 };
       usage = {
@@ -98,9 +98,8 @@
           calls: t.calls + 1,
         },
       };
-    });
-    return () => onUsage(null);
-  });
+    }),
+  );
 
   /**
    * 本地正连着的那条流。**只属于当前看着的会话**。
@@ -218,6 +217,10 @@
         replaceFrom?: number;
         /** 服务端队列里等着交给模型的那几条（`Message` 的形状，`done: false`） */
         queued?: Message[];
+        /** 这份是哪个会话的 */
+        session?: string;
+        /** 上一个回合失败的原因（没在跑时才有） */
+        turnError?: string;
         /**
          * 增量且是同一回合的延续：`messages[0]` 接在本地第 `replaceFrom` 条
          * （assistant）的前 `keepParts` 个 part 后面 —— 服务端只重发最后一步，
@@ -233,13 +236,12 @@
       // `rev`（那是消息的版本号），光看 rev 看不出「排队里少了一条」。
       // `pending` 的那几条是刚发出去、还没听到回话的，留着 —— 服务端下一份就会
       // 报上它们（或者它们已经开跑了）。
-      // 会话 id 从 rev 里解（`会话id:消息数:更新时间`）。**不能读 `sessionId`**：
-      // 它要到下面几行才赋值，而排队那几条得按会话过滤 —— 刚刷新进来的那一份
-      // 会话 id 在这里还是空的（那几条就全被滤掉了，实测踩过）。
-      const sid = rev.split(':')[0] || sessionId;
+      const sid = d.session ?? sessionId;
       if (d.queued) {
-        const inflight = queue.filter((q) => q.pending && q.sid === sessionId);
+        // 只换**这个**会话的那几条：别的会话的排队项留着（切回去之前不会再拉它们）
+        const inflight = queue.filter((q) => q.pending && q.sid === sid);
         queue = [
+          ...queue.filter((q) => q.sid !== sid),
           ...d.queued.map((m): Queued => ({ id: m.id, sid, parts: m.parts })),
           ...inflight,
         ];
@@ -280,10 +282,30 @@
       } else {
         messages = same ? reconcile(messages, d.messages ?? []) : (d.messages ?? []);
       }
+      if (d.turnError) showTurnError(d.turnError);
       sessionId = sid;
     } catch {
       /* 拉不到就算了 */
     }
+  }
+
+  /**
+   * 上一个回合失败了：在末尾补一条错误（服务端历史里没有这条，它只给人看）。
+   *
+   * 两种来路：排队消息接着开的回合（没有人连着它的流，错误只能从这里来），以及
+   * 刷新 / 回到前台之后的前台回合（本地那条错误随着整份换掉的历史没了）。
+   * 末尾已经有同一句错误就不再补。
+   */
+  function showTurnError(text: string) {
+    const last = messages.at(-1);
+    if (last?.parts.some((p) => p.type === 'error' && p.text === text)) return;
+    messages.push({
+      id: uid(),
+      role: 'assistant',
+      steps: 0,
+      done: true,
+      parts: [{ type: 'error', text }],
+    });
   }
 
   /**
@@ -442,7 +464,7 @@
    * 的 `onRestart`），和服务端历史的形状一致（`session_view` 里 User 会打断
    * 助手消息的合并）。
    */
-  $effect(() => {
+  $effect(() =>
     onQueuedDelivered((ids) => {
       if (!ids.length) return;
       const moved = queue.filter((q) => ids.includes(q.id));
@@ -450,9 +472,8 @@
       for (const q of moved) {
         messages.push({ id: q.id, role: 'user', parts: q.parts, steps: 0, done: true });
       }
-    });
-    return () => onQueuedDelivered(null);
-  });
+    }),
+  );
 
   // 当前会话里排队的那几条（其它会话的排着队，切回去才看得见）。
   let queued = $derived(queue.filter((q) => q.sid === sessionId));
@@ -618,13 +639,10 @@
     if (isQueued(first)) {
       // 排上了：服务端那边已经有它了，这条流到此为止（读完就扔，别挂着连接）
       queue = queue.map((q) => (q.id === id ? { ...q, pending: false } : q));
-      void (async () => {
-        try {
-          for await (const _ of stream) void _;
-        } catch {
-          /* 一帧就结束的流，读不完也无所谓 */
-        }
-      })();
+      me.controller.abort();
+      // 服务端可能正是因为这条才开了一个回合（上个回合出错 / 被停止后留下的队列，
+      // 见 core 的 `http::chat`）—— 那个回合没有连着我们，拉一次才知道它在跑、开始轮询
+      void loadMessages();
       // 本地这条流结束了 ≠ 服务端那个回合结束了：此刻还在跑的是**另一条**流
       // （或者根本没连着）。所以这里 busy 一点都不动。
       return;

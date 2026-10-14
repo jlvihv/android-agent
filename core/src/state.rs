@@ -282,6 +282,10 @@ pub struct AppState {
     /// 取走的唯一入口是回合循环；没有回合在跑时由 `agent::continue_with_queued`
     /// 立刻开一个 —— 否则它们会一直等在那儿（界面上一直显示「排队中」）。
     pub queued: Mutex<HashMap<String, VecDeque<QueuedMsg>>>,
+    /// 各会话**上一个回合**失败的原因（`/api/session` 的 `turnError`）。下一个回合
+    /// 开始时清掉。为什么要存：排队消息接着开的回合没有人订阅它的流，不存的话
+    /// 它的错误只进日志，界面上就是「发了没回音」。
+    pub turn_errors: Mutex<HashMap<String, String>>,
     /// 本地 API 的访问凭据。见 `Auth`。
     pub auth: RwLock<Auth>,
     /// 会话有改动，等着落盘。定时器每 2s 检查一次。
@@ -338,6 +342,7 @@ impl AppState {
             sessions_loaded: AtomicBool::new(false),
             turns: Mutex::new(HashMap::new()),
             queued: Mutex::new(HashMap::new()),
+            turn_errors: Mutex::new(HashMap::new()),
             auth: RwLock::new(Auth {
                 token: None,
                 sandbox_key: random_secret(),
@@ -571,7 +576,8 @@ impl AppState {
         self.request_abort(id);
         self.forget_usage(id);
         // 排队等着的那些也跟着走 —— 会话都没了，没人会去取它们
-        self.drop_queued(id);
+        self.drop_queued(id).await;
+        self.clear_turn_error(id);
         let gone = self.chat.write().await.delete(id);
         self.mark_sessions_dirty();
         if let Some(s) = gone {
@@ -850,6 +856,7 @@ impl AppState {
         let t = Arc::new(Turn::default());
         g.insert(sid.to_string(), t.clone());
         drop(g);
+        self.clear_turn_error(sid);
         self.notify_turn();
         Some(t)
     }
@@ -960,26 +967,75 @@ impl AppState {
     }
 
     /// 撤掉一条**还在排队**的（界面上面那个 ×）。已经交给模型的撤不掉 ——
-    /// 那时它是历史了。
-    pub fn unqueue(&self, sid: &str, id: &str) -> bool {
-        let Ok(mut g) = self.queued.lock() else {
-            return false;
+    /// 那时它是历史了。它带的附件文件一起删（没人会再引用它们）。
+    pub async fn unqueue(&self, sid: &str, id: &str) -> bool {
+        let removed = {
+            let Ok(mut g) = self.queued.lock() else {
+                return false;
+            };
+            let Some(q) = g.get_mut(sid) else {
+                return false;
+            };
+            let Some(i) = q.iter().position(|m| m.id == id) else {
+                return false;
+            };
+            let m = q.remove(i);
+            if q.is_empty() {
+                g.remove(sid);
+            }
+            m
         };
-        let Some(q) = g.get_mut(sid) else {
-            return false;
-        };
-        let n = q.len();
-        q.retain(|m| m.id != id);
-        let removed = q.len() != n;
-        if q.is_empty() {
-            g.remove(sid);
-        }
-        removed
+        self.forget_queued_files(removed.into_iter().collect())
+            .await;
+        true
     }
 
-    /// 整个会话的队列丢掉（删会话时用；不然那些消息永远没人取了）。
-    pub fn drop_queued(&self, sid: &str) {
-        if let Ok(mut g) = self.queued.lock() {
+    /// 整个会话的队列丢掉（删会话时用；不然那些消息永远没人取了），附件文件一起删。
+    async fn drop_queued(&self, sid: &str) {
+        let gone = self
+            .queued
+            .lock()
+            .ok()
+            .and_then(|mut g| g.remove(sid))
+            .map(Vec::from)
+            .unwrap_or_default();
+        self.forget_queued_files(gone).await;
+    }
+
+    /// 排队消息带的附件文件。它们已经从 `pending_attachments` 里取出来了，又还没进
+    /// 历史 —— 删会话时的 `forget_files` 和上传过期的清理都管不到。
+    async fn forget_queued_files(&self, msgs: Vec<QueuedMsg>) {
+        let msgs: Vec<crate::agent::ChatMessage> = msgs
+            .into_iter()
+            .filter(|m| !m.attachments.is_empty())
+            .map(|m| crate::agent::ChatMessage::UserFiles {
+                text: m.text,
+                attachments: m.attachments,
+            })
+            .collect();
+        if msgs.is_empty() {
+            return;
+        }
+        let dirs = self.side_dirs();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::gc::remove_all(&crate::gc::owned_files(&msgs, &dirs))
+        })
+        .await;
+    }
+
+    /// 记下这个会话的回合是怎么失败的（见 `turn_errors`）。
+    pub fn set_turn_error(&self, sid: &str, msg: String) {
+        if let Ok(mut g) = self.turn_errors.lock() {
+            g.insert(sid.to_string(), msg);
+        }
+    }
+
+    pub fn turn_error(&self, sid: &str) -> Option<String> {
+        self.turn_errors.lock().ok()?.get(sid).cloned()
+    }
+
+    fn clear_turn_error(&self, sid: &str) {
+        if let Ok(mut g) = self.turn_errors.lock() {
             g.remove(sid);
         }
     }

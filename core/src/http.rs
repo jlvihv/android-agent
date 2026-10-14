@@ -816,8 +816,16 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     // 为什么不接着让前端自己排队（老做法）：前端那个队列活在 WebView 里，
     // App 切到后台、WebView 被冻住或回收，那条消息就永远发不出去了 —— 而
     // 「等一会儿再发同一个请求」本来就是核心该保证的事。
+    //
+    // 队列里**已经有**等着的（上个回合出错或被停止后留下的）也排进去：不然这条会
+    // 插到它们前面先跑。排进去之后由这里开回合（`continue_with_queued`），按原来的
+    // 顺序走。
     let turn = match &provider {
-        Some(_) => match st.begin_turn(&sid) {
+        Some(p) => match if st.has_queued(&sid) {
+            None
+        } else {
+            st.begin_turn(&sid)
+        } {
             Some(t) => Some(t),
             None => {
                 let id = body.id.clone().unwrap_or_else(new_id);
@@ -830,6 +838,10 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
                     },
                 );
                 st.log("info", format!("这个会话在跑，消息先排队（{}）", sid));
+                // 回合可能就在上面 `begin_turn` 失败之后、`enqueue` 之前收了尾 ——
+                // 它收尾时看队列还是空的，这条就没人取了。所以排完再试着开一次：
+                // 回合还在跑的话这是空操作（`begin_turn` 拿不到），由它在步边界取。
+                crate::agent::continue_with_queued(&Core { state: st.clone() }, p, &sid);
                 return queued_response(&id);
             }
         },
@@ -1451,45 +1463,58 @@ async fn get_session(
     let Some(id) = id else {
         return Json(json!({ "messages": [], "queued": [], "rev": "", "busy": false }));
     };
+    let mut v = session_body(&st, &id, &q.rev).await;
+    // 哪个会话：前端按它过滤排队那几条（以前从 `rev` 的格式里解，太脆）
+    v["session"] = json!(id);
+    // 上一个回合是怎么失败的（没在跑时才报）。排队消息接着开的回合没有人订阅它的流，
+    // 错误只有这一条路能让界面看见；前台回合的错误刷新之后也还在
+    if !st.is_busy(&id) {
+        if let Some(e) = st.turn_error(&id) {
+            v["turnError"] = json!(e);
+        }
+    }
+    Json(v)
+}
+
+/// `get_session` 的正文（不含 `session` / `turnError` 这两个每条路都要带的字段）。
+async fn session_body(st: &AppState, id: &str, client_rev: &str) -> Value {
     // 「进行中」看的是**这个**会话：别的会话在跑不影响这里发消息
-    let busy = st.is_busy(&id);
+    let busy = st.is_busy(id);
     // 不活跃的会话消息不在内存里，先读回来
-    if let Err(e) = st.ensure_loaded(&id).await {
-        return Json(
-            json!({ "messages": [], "queued": [], "rev": "", "busy": busy, "error": format!("{e:#}") }),
-        );
+    if let Err(e) = st.ensure_loaded(id).await {
+        return json!({ "messages": [], "queued": [], "rev": "", "busy": busy, "error": format!("{e:#}") });
     }
 
     // 读锁一直持到拼完 —— rev 和它对应的那份 messages 必须来自同一个瞬间，
     // 不然客户端会存下一个「对不上的 rev」，之后就永远以为自己是最新的。
     // 排队等着交给模型的那些（界面上的「排队中」）。**每次都要带**：它们的变化
     // 不进 `rev`（那是消息的版本号），光看 rev 是看不出「这条交出去了」的。
-    let queued = crate::agent::queued_view(&st.queued_list(&id));
+    let queued = crate::agent::queued_view(&st.queued_list(id));
 
     let store = st.chat.read().await;
-    let Some(sess) = store.get(&id) else {
-        return Json(json!({ "messages": [], "queued": queued, "rev": "", "busy": false }));
+    let Some(sess) = store.get(id) else {
+        return json!({ "messages": [], "queued": queued, "rev": "", "busy": false });
     };
     if !sess.resident() {
         // 读进来之后、拿锁之前又被放掉了（极少见）：让客户端下次再来
-        return Json(json!({ "unchanged": true, "queued": queued, "rev": q.rev, "busy": busy }));
+        return json!({ "unchanged": true, "queued": queued, "rev": client_rev, "busy": busy });
     }
     let rev = session_rev(sess);
-    if !q.rev.is_empty() && q.rev == rev {
-        return Json(json!({ "unchanged": true, "queued": queued, "rev": rev, "busy": busy }));
+    if !client_rev.is_empty() && client_rev == rev {
+        return json!({ "unchanged": true, "queued": queued, "rev": rev, "busy": busy });
     }
 
     // token 用量（输入框那个上下文圆环）。它只在有 LLM 调用时才变，
     // 而那种时候 rev 也一定变了 —— 所以 `unchanged` 那条路不用带它。
-    let usage = st.usage_of(&id);
+    let usage = st.usage_of(id);
 
     // 增量：客户端上次的 rev 里有 (会话 id, 已存消息数)。同一个会话、且它手上的
     // 消息数没超过当前（没被重置）→ 只补差的那段，见 `session_patch`。
-    if let Some((cid, client_len)) = parse_rev(&q.rev) {
+    if let Some((cid, client_len)) = parse_rev(client_rev) {
         if cid == sess.id && client_len <= sess.messages.len() {
             let p = crate::agent::session_patch(sess, client_len);
             drop(store);
-            return Json(json!({
+            return json!({
                 "messages": p.messages,
                 "queued": queued,
                 "rev": rev,
@@ -1498,7 +1523,7 @@ async fn get_session(
                 "replaceFrom": p.replace_from,
                 "keepParts": p.keep_parts,
                 "usage": usage,
-            }));
+            });
         }
     }
 
@@ -1507,7 +1532,7 @@ async fn get_session(
 
     // busy 让前端知道「服务端还在跑」—— App 切到后台时 agent 不会停，
     // 切回来要能看出还在进行中，而不是以为卡住了。
-    Json(json!({ "messages": msgs, "queued": queued, "rev": rev, "busy": busy, "usage": usage }))
+    json!({ "messages": msgs, "queued": queued, "rev": rev, "busy": busy, "usage": usage })
 }
 
 /// 从 rev 里解出 (会话 id, 已存消息数)。格式见 `session_rev`。
@@ -1827,7 +1852,7 @@ struct UnqueueBody {
 /// 界面上「排队中」那条气泡左边那个 ×。已经交给模型的撤不掉（那时它是历史了），
 /// 这时回 `removed: false` —— 不是什么错误，界面刷新一下就看到它已经落进正文了。
 async fn unqueue(State(st): State<Arc<AppState>>, Json(body): Json<UnqueueBody>) -> Response {
-    let removed = st.unqueue(&body.session, &body.id);
+    let removed = st.unqueue(&body.session, &body.id).await;
     Json(json!({ "ok": true, "removed": removed })).into_response()
 }
 

@@ -205,9 +205,13 @@ export function cacheHitRatio(u: Usage): number | null {
  * 每来一个字都扫一遍太贵（这一块踩过坑，见 `summarize` 的注释）。
  * 由 `applyChunk` 直接报一声是 O(1) 的。
  */
-let usageSink: ((u: Usage) => void) | null = null;
-export function onUsage(fn: ((u: Usage) => void) | null): void {
-  usageSink = fn;
+const usageSinks = new Set<(u: Usage) => void>();
+/** 返回退订函数（放进 `$effect` 的清理里正好） */
+export function onUsage(fn: (u: Usage) => void): () => void {
+  usageSinks.add(fn);
+  return () => {
+    usageSinks.delete(fn);
+  };
 }
 
 /**
@@ -219,9 +223,13 @@ export function onUsage(fn: ((u: Usage) => void) | null): void {
  * 和 `onUsage` 同一个理由放在这里：一个个 delta 都往 UI 里推太吵，由 reducer
  * 直接报一声。
  */
-let queuedSink: ((ids: string[]) => void) | null = null;
-export function onQueuedDelivered(fn: ((ids: string[]) => void) | null): void {
-  queuedSink = fn;
+const queuedSinks = new Set<(ids: string[]) => void>();
+/** 返回退订函数（放进 `$effect` 的清理里正好） */
+export function onQueuedDelivered(fn: (ids: string[]) => void): () => void {
+  queuedSinks.add(fn);
+  return () => {
+    queuedSinks.delete(fn);
+  };
 }
 
 /** 这条消息排进服务端的队列了（`POST /api/chat` 的全部回应就这一帧）。 */
@@ -410,10 +418,11 @@ export function applyChunk(msg: Message, c: UiChunk): void {
           data: (c as { data: unknown }).data,
         });
         // 用量单独报一声（圆环要实时的，不想让 UI 去扫 parts）
-        if (c.type === 'data-usage') usageSink?.(c.data as Usage);
+        if (c.type === 'data-usage') for (const f of usageSinks) f(c.data as Usage);
         // 排队的消息交出去了：界面把那几条从「排队中」挪进正文
         if (c.type === 'data-queued-delivered') {
-          queuedSink?.((c.data as { ids: string[] }).ids ?? []);
+          const ids = (c.data as { ids: string[] }).ids ?? [];
+          for (const f of queuedSinks) f(ids);
         }
       }
       break;

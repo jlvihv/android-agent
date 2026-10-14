@@ -1379,12 +1379,20 @@ pub async fn run_turn(
     turn: std::sync::Arc<crate::state::Turn>,
     tx: mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
+    let stop = turn.clone();
     let res = turn_once(core, provider, user_text, attachments, sid, turn, tx).await;
-    // 这个回合收尾了，但队列里还有等着交给模型的用户消息：**立刻**用第一条开
-    // 下一回合。取队列的唯一入口是回合循环，没有回合在跑，那几条就永远等在那儿
-    // （界面上一直显示「排队中」）。两种典型：用户按了停止（那一轮直接返回，队列
-    // 一动没动），以及刚好卡在「查完队列、决定结束这个回合」那一瞬间进来的消息。
-    continue_with_queued(core, provider, sid);
+    if let Err(e) = &res {
+        core.state.set_turn_error(sid, format!("{e:#}"));
+    }
+    // 正常收尾、队列里还有等着的：**立刻**用第一条开下一回合（典型是刚好卡在
+    // 「交完队列、决定结束」那一瞬间进来的消息）。
+    //
+    // 出错或按了停止就**不**接着跑：排队的留在那儿（界面上还是「排队中」，能撤）。
+    // 出错时接着跑只会把队列一条条烧掉（key 失效、限流都一样）；按停止的人要的是
+    // 「先别动」。下一次发消息时它们按原来的顺序先走（见 `http::chat`）。
+    if res.is_ok() && !stop.abort_requested() {
+        continue_with_queued(core, provider, sid);
+    }
     res
 }
 
@@ -1589,13 +1597,14 @@ async fn drive(
         let calls = step.calls;
         if calls.is_empty() {
             // 模型不再要求工具 → 除非**还有排队的用户消息**，本回合就结束了。
-            // 有的话接着跑：下一轮开头会把它交给模型（这就是「只要模型空下来就
-            // 立刻给它」那条路 —— 不用等这个回合彻底结束）。
-            if !core.state.has_queued(sid) {
-                send(tx, sse::finish()).await;
-                return Ok(());
+            // 有的话当场交给它、接着跑（「只要模型空下来就立刻给它」那条路）。
+            // 交付和判断是同一步：先查后取的话，中间被撤掉（×）就会白打一次请求，
+            // 而且那次请求的历史停在 assistant 上。
+            if deliver_queued(core, sid, tx, status).await {
+                continue;
             }
-            continue;
+            send(tx, sse::finish()).await;
+            return Ok(());
         }
 
         for (n, call) in calls.iter().enumerate() {
@@ -1688,7 +1697,7 @@ async fn deliver_queued(
 /// 它要么已经从上面那个 `data-queued` 知道这条排上了，要么靠 `/api/sessions`
 /// 的 `busy` + 轮询 `/api/session` 看结果。推给没人收的通道是浪费，`send` 也
 /// 本来就是尽力而为。
-fn continue_with_queued(core: &Core, provider: &Provider, sid: &str) {
+pub fn continue_with_queued(core: &Core, provider: &Provider, sid: &str) {
     if !core.state.has_queued(sid) {
         return;
     }
@@ -4547,5 +4556,94 @@ mod tests {
         // 清空过（/api/reset）又回到「不算数」
         store.get_mut(&id).unwrap().clear();
         assert!(store.list().is_empty());
+    }
+
+    /// 测排队用：一个假端点 + 一个会话 + 排着一条 `q1`。
+    async fn queue_fixture(
+        script: Vec<Result<Vec<&'static str>, u16>>,
+    ) -> (
+        Core,
+        Provider,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        crate::llm::install_crypto_provider();
+        let (base, hits) = scripted_provider(script).await;
+        let mut p = Provider::compatible("fake", &base, "m", "k");
+        p.api_style = crate::llm::ApiStyle::Chat;
+        let core = Core::new();
+        let sid = core.state.chat.write().await.create();
+        *core.state.vision.write().unwrap() = Some((format!("{base}|m"), false));
+        *core.state.files.write().unwrap() = Some((format!("{base}|m"), false));
+        core.state.enqueue(
+            &sid,
+            crate::state::QueuedMsg {
+                id: "q1".into(),
+                text: "排着的".into(),
+                attachments: vec![],
+            },
+        );
+        (core, p, sid, hits)
+    }
+
+    /// 出错的回合：排队的**留着**（不接着烧掉），错误记下来给界面看。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_turn_keeps_the_queue_and_records_why() {
+        let (core, p, sid, hits) = queue_fixture(vec![Err(400)]).await;
+        let t = core.state.begin_turn(&sid).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let r = run_turn(&core, &p, "你好", vec![], &sid, t, tx).await;
+        assert!(r.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "不该接着跑"
+        );
+        assert!(!core.state.is_busy(&sid));
+        assert_eq!(core.state.queued_list(&sid).len(), 1, "排队的要留着");
+        assert!(core.state.turn_error(&sid).is_some(), "错误要记下来");
+        // 下一个回合一开始，上次的错误就不算数了
+        let t = core.state.begin_turn(&sid).unwrap();
+        assert!(core.state.turn_error(&sid).is_none());
+        drop(t);
+        core.state.end_turn(&sid);
+    }
+
+    /// 按了停止的回合：排队的也留着（停止 = 「先别动」）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_turn_keeps_the_queue() {
+        let (core, p, sid, hits) = queue_fixture(vec![Ok(OK_REPLY.to_vec())]).await;
+        let t = core.state.begin_turn(&sid).unwrap();
+        t.request_abort();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_turn(&core, &p, "你好", vec![], &sid, t, tx)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!core.state.is_busy(&sid));
+        assert_eq!(core.state.queued_list(&sid).len(), 1);
+        assert!(core.state.turn_error(&sid).is_none(), "停止不是错误");
+    }
+
+    /// 模型说完（不调工具）那一刻排队里有消息：当场交给它，同一个回合接着跑。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_message_is_handed_over_when_the_model_finishes_talking() {
+        let (core, p, sid, hits) =
+            queue_fixture(vec![Ok(OK_REPLY.to_vec()), Ok(OK_REPLY.to_vec())]).await;
+        let t = core.state.begin_turn(&sid).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_turn(&core, &p, "你好", vec![], &sid, t, tx)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(core.state.queued_list(&sid).is_empty());
+        let store = core.state.chat.read().await;
+        let msgs = &store.get(&sid).unwrap().messages;
+        assert!(
+            matches!(msgs.last(), Some(ChatMessage::Assistant { content, .. }) if content == "好了"),
+            "{msgs:?}"
+        );
     }
 }
