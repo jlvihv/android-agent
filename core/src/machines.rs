@@ -615,8 +615,8 @@ mod tests {
 
         let panel = m.panel();
         let ids: Vec<&str> = panel.iter().map(|p| p.id.as_str()).collect();
-        // 局域网里那两行在前（有地址），只能经中继的那台在后
-        assert_eq!(ids, vec!["new-1", "lan-1", "relay-1"]);
+        // 按名字排（书 < 客 < 家，按码点），不管谁先被看到、走局域网还是中继
+        assert_eq!(ids, vec!["lan-1", "new-1", "relay-1"]);
         let by = |id: &str| panel.iter().find(|p| p.id == id).unwrap().clone();
         assert!(!by("new-1").paired && by("new-1").host == "192.168.0.9");
         assert!(by("lan-1").paired && by("lan-1").port == 8787);
@@ -626,6 +626,27 @@ mod tests {
             m.get("lan-1").unwrap().lan.as_deref(),
             Some("192.168.0.5:8787")
         );
+    }
+
+    /// 面板顺序不跟着发现顺序跳：同样几台，先看到谁都一样；一台从「经中继」变成
+    /// 「局域网里看到了」也不挪位置。
+    #[test]
+    fn the_panel_order_does_not_depend_on_what_was_seen_first() {
+        let order = |found: &[(&str, &str)]| {
+            let m = store();
+            m.upsert(machine("relay-1", "a-家里的", true));
+            for (id, name) in found {
+                m.lan_found(id, name, "192.168.0.9", 8787);
+            }
+            m.panel().into_iter().map(|p| p.id).collect::<Vec<_>>()
+        };
+        let one = order(&[("x", "c-客厅"), ("y", "b-书房")]);
+        let two = order(&[("y", "b-书房"), ("x", "c-客厅")]);
+        assert_eq!(one, vec!["relay-1", "y", "x"]);
+        assert_eq!(one, two);
+        // 经中继那台回到局域网里：还是第一个
+        let three = order(&[("x", "c-客厅"), ("relay-1", "a-家里的"), ("y", "b-书房")]);
+        assert_eq!(three, one);
     }
 
     #[test]
