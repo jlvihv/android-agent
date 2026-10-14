@@ -177,6 +177,7 @@ App 随时被杀都没关系。
 | `just android-debug` | 完整 Android 构建 → APK |
 | `just android-install` | 构建 + 装到连着的手机 |
 | `python3 scripts/agentctl.py "…"` | 给 agent 一句话并打印转录；不带参数进交互模式（`--json` 机器可读） |
+| `scripts/restart-core.sh` | **重启电脑上那个核心**（改完核心代码要生效时）。先编译、等回合答完、才杀；从 agent 里跑会自己脱离会话，之后顺手把手机 App 叫起来 |
 
 对着**手机上**跑着的核心（无线调试就够，不用插线、也不用手点手机屏幕）：
 
