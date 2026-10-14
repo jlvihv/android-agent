@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标：三层 —— 底色纯色、前景是矢量（见 drawable/ic_launcher_foreground.xml）、
+     单色层给 Android 13+ 的主题图标用。
+
+     **目录名不能改**：就叫 `mipmap-anydpi-v26`，不要按 lint 的建议（ObsoleteSdkInt：
+     「v26 多余，合并进 mipmap-anydpi」）改名 —— 改完这份 XML 就进不了 APK，图标会退回
+     传统位图那种。见 app/lint.xml 里那条。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+</adaptive-icon>

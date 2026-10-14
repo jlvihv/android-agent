@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 圆形启动器的自适应图标。内容和 ic_launcher.xml 完全一样 ——
      形状由启动器的遮罩决定，这里不用（也不该）自己裁一个圆。
-     原注释：自适应图标（API 26+，本 App 的 minSdk 就是 26，所以实际生效的一直是这份）。
-     三层：底色纯色、前景是矢量（见 drawable/ic_launcher_foreground.xml）、
-     单色层给 Android 13+ 的主题图标用。 -->
+     目录名同样不能改（`mipmap-anydpi-v26`，理由见 ic_launcher.xml 与 app/lint.xml）。 -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />
     <foreground android:drawable="@drawable/ic_launcher_foreground" />

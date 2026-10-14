@@ -33,6 +33,19 @@
     <issue id="NewerVersionAvailable" severity="ignore" />
     <issue id="ChromeOsAbiSupport" severity="ignore" />
 
+    <!-- **自适应图标必须留在 `mipmap-anydpi-v26` 里。**  lint 会拦一句
+         「v26 多余，minSdkVersion 就是 26，把这目录合并进 mipmap-anydpi」——
+         照着改过一次，结果是那份 XML **一个字节都进不了 APK**（AGP 的合并/打包会
+         把它丢掉：包内 `mipmap/ic_launcher` 只剩 5 张 PNG），启动器拿不到
+         AdaptiveIconDrawable 就退回传统位图图标（缩小塞进底衷那种），Android 13+
+         的主题图标（`<monochrome>` 那层）也一起没。Android 官方文档也要求自适应
+         图标放在带 `-v26` 的目录里。 -->
+    <issue id="ObsoleteSdkInt">
+        <!-- 只放行这一个目录级发现（它没有 file 路径，`path=` 匹配不上）。
+             这条 issue 还有别一半 —— 「代码里多余的 SDK_INT 判断」—— 那半边继续报。 -->
+        <ignore regexp="Merge all the resources in this folder into .mipmap-anydpi" />
+    </issue>
+
     <!-- 生成物：uniffi 的 Kotlin 绑定（`just android-bindings` 生成，不进 git）。
          它那句 `java.lang.ref.Cleaner` 外面有 `Class.forName` 守卫（旧系统自动退回 JNA
          cleaner），lint 看不穿。手改生成物没意义 —— 下次 bindgen 就冲掉了。 -->
