@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command as Proc, Stdio};
+use std::time::Duration;
 
 use crate::state::{Command, DeviceApi};
 
@@ -134,13 +135,80 @@ pub fn computer_name() -> String {
     "电脑".into()
 }
 
+/// 广播用哪个名字：默认是这台电脑的名字（`computer_name`），`AGENT_ADVERT_NAME` 可以换。
+///
+/// 为什么需要这个开关：同一台机器上跑**两个**核心时（比如在另一个端口上验新构建），
+/// 两个同名服务在 mDNS 里没法共存 —— 先起的那个报「本地名称冲突」静默死掉，
+/// 手机上只剩下后起的那个（实测踩过）。给第二个实例换个名字：
+///
+/// ```sh
+/// AGENT_ADVERT_NAME="jl 测试" AGENT_PORT=8789 ./core/target/release/agent-dev
+/// ```
+pub fn advert_name() -> String {
+    std::env::var("AGENT_ADVERT_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(computer_name)
+}
+
+/// 广播进程起来之后，隔多久去确认它还活着（见 `Advert::failure`）。
+///
+/// `avahi-publish-service` 跟 daemon 说上话要几十毫秒；这个值取得比它宽裕，
+/// 又短到人感觉不到（启动时只多这么一下）。
+pub const ADVERT_SETTLE: Duration = Duration::from_millis(300);
+
 /// 正在广播的 mDNS 服务。`Drop` 就停（核心退出时不留一条指向死端口的广播）。
-pub struct Advert(std::process::Child);
+///
+/// **只看 `spawn` 成不成功是不够的**：`avahi-publish-service` 起来之后立刻退出是
+/// 常态，而且退得很安静 —— 只往 stderr 说一句，退出码还是 0：
+///
+/// - `avahi-daemon` 没跑：`创建客户端对象失败：Daemon 不在运行`（这台开发机上
+///   默认就是没跑，于是「手机上点「jl」」一直是句空头支票）；
+/// - 这个名字已经有另一个核心在广播：`添加服务失败：本地名称冲突`（同名服务在
+///   mDNS 里没法共存，后起的赢，先起的悄悄死掉）。
+///
+/// 所以 stderr 收进管道不丢，`failure()` 隔 `ADVERT_SETTLE` 去问一句：还活着 =
+/// 真在广播；退了 = 把 stderr 那句原因原样带回去，`main` 打给人和日志看。
+pub struct Advert {
+    child: std::process::Child,
+    /// 已经问出来的原因（问过就不再问）；还活着的时候是 `None`
+    error: Option<String>,
+}
+
+impl Advert {
+    /// 还在广播吗？不在了就把原因带回来（stderr 第一行非空内容）。
+    ///
+    /// 调用点要在 `ADVERT_SETTLE` 之后：刚 spawn 出来的那几十毫秒里它还没把注册
+    /// 请求发给 daemon，这时候问必然「还活着」。
+    pub fn failure(&mut self) -> Option<String> {
+        if let Some(e) = &self.error {
+            return Some(e.clone());
+        }
+        // 还活着 = 在广播（`?`：`try_wait` 还没退就是 None）。
+        // 收尸失败（`.ok()` 摊平掉）也当还活着 —— 报错的该是「它在退」，不是这里。
+        self.child.try_wait().ok().flatten()?;
+        let mut raw = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut raw);
+        }
+        // 它那一句话（daemon 不在、名字冲突）就是全部线索，只取第一行非空的
+        let why = raw
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+            // 没话说也得说一句：静默死掉正是这个函数要消灭的东西
+            .unwrap_or_else(|| "广播进程退出了，但没说什么".into());
+        self.error = Some(why.clone());
+        Some(why)
+    }
+}
 
 impl Drop for Advert {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -152,7 +220,8 @@ impl Drop for Advert {
 /// 广播出去，手机解析到它就连不上（打印地址时已经踩过一次同样的坑）。
 ///
 /// TXT 里只有实例 id 和版本 —— **没有凭据**（见 `Pairing`）。
-/// 工具不在就返回 None（手动输入地址那条路照样能用）。
+/// 工具不在就返回 None（手动输入地址那条路照样能用）；工具在、但起不来（daemon
+/// 没跑、名字撞了）是另一回事，由 `Advert::failure` 负责说出来。
 pub fn advertise(name: &str, port: u16, id: &str) -> Option<Advert> {
     let port = port.to_string();
     let txt = [format!("id={id}"), format!("v={}", crate::VERSION)];
@@ -165,12 +234,19 @@ pub fn advertise(name: &str, port: u16, id: &str) -> Option<Advert> {
         c.args([name, SERVICE, &port]);
         c
     };
-    cmd.args(&txt)
-        .stdin(Stdio::null())
+    cmd.args(&txt);
+    start(&mut cmd)
+}
+
+/// 起广播进程。单独一层是为了能测「起不来时能不能把原因说清楚」—— 测试里塞一个
+/// 立刻退出的假工具就行，不依赖这台机器上真的装了 avahi / dns-sd（见 tests）。
+fn start(cmd: &mut Proc) -> Option<Advert> {
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // **stderr 不丢**：它那一句是唯一的失败线索（见 `Advert`）
+        .stderr(Stdio::piped());
     match cmd.spawn() {
-        Ok(child) => Some(Advert(child)),
+        Ok(child) => Some(Advert { child, error: None }),
         Err(e) => {
             tracing::warn!(
                 "没法在局域网里广播（{:?}: {e}）—— 手机上搜不到这台电脑，只能手动输地址",
@@ -266,6 +342,47 @@ mod tests {
             "输错太多次后对的也不行"
         );
         assert_eq!(p.remaining(), 0, "停用之后还是 0（设置页靠它显示状态）");
+    }
+
+    /// 广播进程得会「说实话」：起不来（daemon 没跑、名字撞了）时，stderr 里那句
+    /// 原因要能原样带回给 main —— 不然终端会照着「手机上点它」往下打，而手机上
+    /// 什么都搜不到（这台机器上就这么空转了很久：avahi-daemon 根本没装）。
+    #[test]
+    fn a_dead_broadcaster_reports_why() {
+        let mut c = Proc::new("sh");
+        c.args(["-c", "echo '添加服务失败：本地名称冲突' >&2; exit 0"]);
+        let mut a = start(&mut c).expect("spawn 不该失败");
+        // 真机上这里是 main 等 ADVERT_SETTLE 之后再问；测试里直接等它收尸
+        let _ = a.child.wait();
+        assert_eq!(a.failure().as_deref(), Some("添加服务失败：本地名称冲突"));
+        // 问过一次就不再问（留着那份原因）
+        assert_eq!(a.failure().as_deref(), Some("添加服务失败：本地名称冲突"));
+    }
+
+    /// 还在跑的不能被当成失败 —— 判定看的是「退没退」，不是「stderr 里有没有东西」
+    /// （avahi 真在广播时也可能往 stderr 说话）。
+    #[test]
+    fn a_live_broadcaster_is_not_a_failure() {
+        let mut c = Proc::new("sh");
+        c.args(["-c", "echo 噪声 >&2; sleep 30"]);
+        let mut a = start(&mut c).expect("spawn 不该失败");
+        assert!(a.failure().is_none(), "还活着就是没问题");
+        drop(a); // Drop 会把它收掉
+    }
+
+    /// 「两个核心同时跑」那条路的开关：给了 `AGENT_ADVERT_NAME` 就用它，
+    /// 全是空白当没给（不然会广播出一个空名字，手机上是个空行）。
+    #[test]
+    fn advert_name_can_be_overridden() {
+        let before = std::env::var("AGENT_ADVERT_NAME").ok();
+        std::env::set_var("AGENT_ADVERT_NAME", "  jl 测试  ");
+        assert_eq!(advert_name(), "jl 测试", "两头空格去掉");
+        std::env::set_var("AGENT_ADVERT_NAME", "   ");
+        assert_eq!(advert_name(), computer_name(), "全空白 = 没给");
+        match before {
+            Some(v) => std::env::set_var("AGENT_ADVERT_NAME", v),
+            None => std::env::remove_var("AGENT_ADVERT_NAME"),
+        }
     }
 
     #[test]

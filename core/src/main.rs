@@ -85,17 +85,37 @@ async fn run() -> anyhow::Result<()> {
         if let Ok(mut g) = core.state.pairing.write() {
             *g = Some(pairing.clone());
         }
-        let name = agent_core::desktop::computer_name();
-        _advert = agent_core::desktop::advertise(&name, actual, &core.state.instance_id());
-        println!(
-            "  → 手机 App：设置 → 连接电脑，点「{name}」，配对码 {}{}",
-            pairing.code(),
-            if _advert.is_some() {
-                ""
-            } else {
-                "（广播没起来，只能用下面的地址）"
+        let name = agent_core::desktop::advert_name();
+        let mut advert = agent_core::desktop::advertise(&name, actual, &core.state.instance_id());
+        // 广播进程起来后**立刻退出**是常事（avahi-daemon 没跑、这个名字已经被这台
+        // 机器上另一个核心占了），而它只往 stderr 说一句就不再出声 —— 不确认一下
+        // 的话，下面那句「手机上点「{name}」」就是空头支票（这台机器上就这么空转了
+        // 很久）。隔一下问一句，不在就把原因原样打出来。见 `desktop::Advert`。
+        let quiet = match advert.as_mut() {
+            Some(a) => {
+                tokio::time::sleep(agent_core::desktop::ADVERT_SETTLE).await;
+                a.failure()
             }
-        );
+            None => {
+                Some("系统里没有广播工具（Linux: avahi-publish-service，macOS: dns-sd）".into())
+            }
+        };
+        _advert = advert;
+        match quiet {
+            None => println!(
+                "  → 手机 App：设置 → 连接电脑，点「{name}」，配对码 {}",
+                pairing.code()
+            ),
+            Some(why) => {
+                println!("  → 配对码 {}（手机手动输地址时用）", pairing.code());
+                println!("    ⚠️  局域网广播没起来：{why}");
+                println!("       手机上搜不到这台电脑，只能用下面的地址。");
+                println!(
+                    "       起好系统的 mDNS 服务再重启核心（Linux: systemctl enable --now avahi-daemon）；"
+                );
+                println!("       这台机器上已经有另一个核心在广播的话，给新的换个名字：AGENT_ADVERT_NAME=…");
+            }
+        }
         let ips: Vec<std::net::IpAddr> = if bind.is_unspecified() {
             lan_ips().into_iter().map(Into::into).collect()
         } else {

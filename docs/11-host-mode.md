@@ -216,6 +216,17 @@ AGENT_BIND=127.0.0.1 just dev-host
   - `/api/pairing` **只回给 loopback**（对端地址）：码的意义就是「证明你人在
     电脑前」，从局域网里也能读到的话这一步就白做了。所以手机上（不管 App 还是
     浏览器）打开设置页，拿到的是 `available: false`，这一栏不显示。
+  - **广播到底起没起来，会被确认**（`desktop::Advert::failure`）。这两个工具失败
+    时只往 stderr 说一句、退出码还是 0，只看 `spawn` 成不成功是看不出来的：核心
+    spawn 完等 `ADVERT_SETTLE`（300ms）再问一句「还在吗」，退了就把那句话原样打
+    到终端和日志里 —— `avahi-daemon` 没跑（`创建客户端对象失败：Daemon 不在运行`）、
+    或者这个名字已经被另一个核心占了（`添加服务失败：本地名称冲突`），都看得见，
+    不再照着「手机上点它」往下打。踩过：这台开发机上 avahi 一直是 disabled，
+    广播一直是死的，而终端一直在说「手机上点「jl」」。
+  - 前提是系统的 mDNS 服务真在跑：Linux 要 `systemctl enable --now avahi-daemon`
+    （Arch 装完 avahi 默认不 enable，这里就撞过）。同名服务在 mDNS 里没法共存
+    —— 先起的那个静默死掉、手机上只剩后起的 —— 同一台机器上跑第二个核心就给它
+    换个名字：`AGENT_ADVERT_NAME="jl 测试" AGENT_PORT=8789 …`（默认取 `computer_name()`）。
 - 手机：**设置 → 连接电脑** 那一栏**开着时才找**（`CoreDiscovery`，平台的
   `NsdManager`），关掉设置页、App 切到后台都停。找到的电脑列在那儿：
   - 第一次连：点它 → 原生对话框里输配对码 → `POST /api/pair` 换回 token，
