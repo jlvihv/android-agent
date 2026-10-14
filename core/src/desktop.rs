@@ -292,7 +292,8 @@ impl Drop for Browse {
 
 /// 在局域网里找别的核心：`on_change` 每次拿到完整的一份（去掉自己）。
 ///
-/// 和广播同一个路子：用系统自带的工具（Linux `avahi-browse`），不要 Rust 的 mDNS 库 ——
+/// 和广播同一个路子：用系统自带的工具（Linux `avahi-browse`、macOS `dns-sd`），不要
+/// Rust 的 mDNS 库 ——
 /// 它按网卡回答地址，不会把 Clash TUN / docker 那几张虚拟网卡的地址当成「这台机器在
 /// 局域网的地址」报上来（这台开发机上就同时有 198.18.0.1 和 172.17.0.1）。
 ///
@@ -303,13 +304,7 @@ where
     F: Fn(Vec<Seen>) + Send + 'static,
 {
     if cfg!(target_os = "macos") {
-        // macOS 的 `dns-sd` 要两个进程才能问全（`-B` 只给名字，地址和 TXT 得再 `-L`
-        // 一次，还要自己跟进程的输出节奏 —— 这台开发机上没有 macOS 可验，不写没验过的
-        // 代码）。macOS 上先用面板里的「手输地址」（见 docs/11）。
-        tracing::info!(
-            "macOS 上的自动发现还没做（dns-sd 要两句输出）—— 「选择机器」里可以手输地址"
-        );
-        return None;
+        return browse_dnssd(own_id, on_change);
     }
     let mut cmd = {
         let mut c = Proc::new("avahi-browse");
@@ -366,6 +361,243 @@ where
         })
         .ok()?;
     Some(Browse { child })
+}
+
+/// macOS：`dns-sd` 一个进程问不全，分三步（都是系统自带的 mDNSResponder 在答）：
+///
+/// 1. `dns-sd -B` 常驻：谁上线（`Add`）、谁下线（`Rmv`）—— 只有名字；
+/// 2. 新看到一台就 `dns-sd -L <名字>`：端口和 TXT 里的 `id`（还有它的 `.local` 主机名）；
+/// 3. 再 `dns-sd -G v4 <主机名>`：局域网里的 IPv4。不用系统的 getaddrinfo —— 开着 Clash 的
+///    fake-ip 时它可能答一个 198.18.x 的假地址。
+///
+/// `dns-sd -Z` 倒是一次给全名字、端口、TXT，但它**不报下线**：关掉的电脑会一直挂在面板上。
+///
+/// 同一台在每张网卡上各 `Add` 一次（本机的还会在 lo0 上来一遍），所以按「名字 → 在哪些
+/// 网卡上看得到」记账，一张都不剩了才算下线。
+fn browse_dnssd<F>(own_id: &str, on_change: F) -> Option<Browse>
+where
+    F: Fn(Vec<Seen>) + Send + 'static,
+{
+    let mut cmd = Proc::new("dns-sd");
+    cmd.args(["-B", SERVICE, "local"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("没法在局域网里找电脑（dns-sd: {e}）—— 「选择机器」里只会列出配对过的");
+            return None;
+        }
+    };
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel::<DnssdEvent>();
+
+    // 读 `-B` 的输出；进程没了（`Browse` 被 drop）就告诉记账那边收工
+    let reader = tx.clone();
+    std::thread::Builder::new()
+        .name("agent-mdns-browse".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if let Some(ev) = parse_dnssd_browse(&line) {
+                    let _ = reader.send(ev);
+                }
+            }
+            let _ = reader.send(DnssdEvent::End);
+        })
+        .ok()?;
+
+    // 记账：只有这一条线程碰 `seen`，解析各开一条短命线程、结果发回来
+    let own = own_id.to_string();
+    std::thread::Builder::new()
+        .name("agent-mdns-resolve".into())
+        .spawn(move || {
+            struct Entry {
+                ifaces: std::collections::BTreeSet<String>,
+                seen: Option<Seen>,
+                resolving: bool,
+            }
+            let mut all: std::collections::BTreeMap<String, Entry> = Default::default();
+            let mut last: Vec<Seen> = Vec::new();
+            for ev in rx.iter() {
+                match ev {
+                    DnssdEvent::Add { name, iface } => {
+                        let e = all.entry(name.clone()).or_insert(Entry {
+                            ifaces: Default::default(),
+                            seen: None,
+                            resolving: false,
+                        });
+                        e.ifaces.insert(iface);
+                        if e.seen.is_none() && !e.resolving {
+                            e.resolving = true;
+                            let tx = tx.clone();
+                            let _ = std::thread::Builder::new()
+                                .name("agent-mdns-lookup".into())
+                                .spawn(move || {
+                                    let seen = resolve_dnssd(&name);
+                                    let _ = tx.send(DnssdEvent::Resolved { name, seen });
+                                });
+                        }
+                    }
+                    DnssdEvent::Rmv { name, iface } => {
+                        if let Some(e) = all.get_mut(&name) {
+                            e.ifaces.remove(&iface);
+                            if e.ifaces.is_empty() {
+                                all.remove(&name);
+                            }
+                        }
+                    }
+                    DnssdEvent::Resolved { name, seen } => {
+                        // 解析回来时它可能已经下线了：那就不记
+                        if let Some(e) = all.get_mut(&name) {
+                            e.resolving = false;
+                            e.seen = seen.filter(|s| s.id != own);
+                        }
+                    }
+                    DnssdEvent::End => break,
+                }
+                let now: Vec<Seen> = all.values().filter_map(|e| e.seen.clone()).collect();
+                if now != last {
+                    last = now.clone();
+                    on_change(now);
+                }
+            }
+            if !last.is_empty() {
+                on_change(Vec::new());
+            }
+            tracing::debug!("找电脑的进程结束了");
+        })
+        .ok()?;
+    Some(Browse { child })
+}
+
+enum DnssdEvent {
+    Add { name: String, iface: String },
+    Rmv { name: String, iface: String },
+    Resolved { name: String, seen: Option<Seen> },
+    End,
+}
+
+/// `dns-sd -B _agent-core._tcp local` 的一行：
+///
+/// ```text
+/// Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
+/// 23:08:00.080  Add        2  11 local.               _agent-core._tcp.    jl
+/// ```
+///
+/// 名字是最后一列、可能带空格（`vihv的MacBook Air`），所以取服务类型后面的整段。
+fn parse_dnssd_browse(line: &str) -> Option<DnssdEvent> {
+    let mut cols = line.split_whitespace();
+    let _time = cols.next()?;
+    let ar = cols.next()?;
+    let _flags = cols.next()?;
+    let iface = cols.next()?.to_string();
+    let ty = format!("{SERVICE}.");
+    let name = line.split_once(&ty)?.1.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    match ar {
+        "Add" => Some(DnssdEvent::Add { name, iface }),
+        "Rmv" => Some(DnssdEvent::Rmv { name, iface }),
+        _ => None,
+    }
+}
+
+/// 问出一台的地址、端口、id（`dns-sd -L` + `dns-sd -G v4`）。问不出来是 `None`。
+fn resolve_dnssd(name: &str) -> Option<Seen> {
+    // `-L`：
+    //   23:07:58.070  jl._agent-core._tcp.local. can be reached at jl.local.:8787 (interface 11)
+    //    id=00cbd8d0a5ed4de0aa777289ee4a3dfc v=0.1.0
+    let mut target: Option<(String, u16)> = None;
+    let mut id: Option<String> = None;
+    dnssd_lines(&["-L", name, SERVICE, "local"], |line| {
+        if let Some(rest) = line.split_once(" can be reached at ").map(|(_, r)| r) {
+            let hp = rest.split(" (interface").next().unwrap_or(rest).trim();
+            if let Some((h, p)) = hp.rsplit_once(':') {
+                target = p.parse().ok().map(|p| (h.to_string(), p));
+            }
+        } else if target.is_some() {
+            id = line
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("id="))
+                .map(str::to_string)
+                .filter(|s| !s.is_empty());
+        }
+        id.is_some()
+    });
+    let (host, port) = target?;
+    let id = id?;
+    // `-G v4`：
+    //   Timestamp     A/R  Flags         IF  Hostname          Address         TTL
+    //   23:08:10.539  Add  40000002      11  jl.local.         192.168.0.161   120
+    // 本机的还会在 lo0 上答一个 127.0.0.1 —— `usable_addr` 只收私有网段，正好剔掉
+    let mut addr: Option<String> = None;
+    dnssd_lines(&["-G", "v4", &host], |line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.get(1) == Some(&"Add") {
+            if let Some(a) = cols.get(5).filter(|a| usable_addr(a)) {
+                addr = Some(a.to_string());
+            }
+        }
+        addr.is_some()
+    });
+    Some(Seen {
+        id,
+        name: name.to_string(),
+        host: addr?,
+        port,
+    })
+}
+
+/// 跑一个 `dns-sd`，一行一行交给 `done`，它说够了（或者等满 3 秒）就杀掉。
+///
+/// `dns-sd` 自己从不退出（一直等更新），所以超时得我们来：读输出放在另一条线程里，
+/// 这边按截止时间收。
+fn dnssd_lines(args: &[&str], mut done: impl FnMut(&str) -> bool) {
+    let Ok(mut child) = Proc::new("dns-sd")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let _ = std::thread::Builder::new()
+        .name("agent-mdns-read".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) if done(&line) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// 一行浏览输出 → 更新 `seen`。返回值：`None` = 这行不认识；`Some(true)` = 真变了。
@@ -594,6 +826,26 @@ mod tests {
         assert_eq!(seen["jl"].host, "192.168.0.161");
         assert_eq!(seen["jl"].port, 8787);
         assert_eq!(seen["jl"].id, "core-1");
+    }
+
+    /// macOS `dns-sd -B` 真跑出来的几行：名字带中文和空格，同一台在两张网卡上各一次。
+    #[test]
+    fn dnssd_browse_lines_give_the_full_name_and_the_interface() {
+        let add = "23:08:00.080  Add        3  11 local.               _agent-core._tcp.    vihv的MacBook Air";
+        match parse_dnssd_browse(add) {
+            Some(DnssdEvent::Add { name, iface }) => {
+                assert_eq!(name, "vihv的MacBook Air");
+                assert_eq!(iface, "11");
+            }
+            _ => panic!("应该认出 Add"),
+        }
+        let rmv = "23:09:00.000  Rmv        0  11 local.               _agent-core._tcp.    jl";
+        assert!(
+            matches!(parse_dnssd_browse(rmv), Some(DnssdEvent::Rmv { name, .. }) if name == "jl")
+        );
+        // 表头、STARTING 那几行不认
+        assert!(parse_dnssd_browse("Timestamp     A/R    Flags  if Domain               Service Type         Instance Name").is_none());
+        assert!(parse_dnssd_browse("23:08:00.079  ...STARTING...").is_none());
     }
 
     #[test]

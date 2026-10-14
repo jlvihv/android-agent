@@ -14,6 +14,7 @@
  * 一份代码负责到底。
  */
 import { backToLocalShell, hasShell, navigateShell, watchDiscovery } from './overlay';
+import { store } from './store.svelte.ts';
 
 /** 面板里的一行（`GET /api/machines` 的 `list`）。 */
 export type Machine = {
@@ -32,6 +33,8 @@ export type Machine = {
 
 /** 本机核心自己（面板第一行「这台手机 / 这台电脑」）。 */
 export type LocalCore = {
+  /** 本机核心的实例 id（和 `/api/health` 的 `id` 比，就知道这页是不是本机给的） */
+  id?: string;
   /** 回到它要导航到的地址 */
   url: string;
   platform: string;
@@ -41,7 +44,11 @@ export type LocalCore = {
 class Machines {
   list = $state<Machine[]>([]);
   local = $state<LocalCore | null>(null);
-  /** 现在连着的那台（null = 本机） */
+  /**
+   * 本机核心记着的「正连着的那台」（null = 没连）。**不拿它打勾**：核心记的是隧道开着
+   * 没有，不是你眼前这页是谁给的 —— 比如在电脑浏览器里连过别的电脑、又直接打开了本机
+   * 的地址，隧道还开着，勾就会落在别人头上。打勾看 [here]。
+   */
   current = $state<string | null>(null);
   err = $state('');
   /** 正在配对 / 正在连（按钮转圈，顺便防重复点） */
@@ -50,6 +57,25 @@ class Machines {
   loaded = $state(false);
 
   #timer: ReturnType<typeof setInterval> | undefined;
+
+  /**
+   * 眼前这页是哪台给的：`/api/health` 的 `id`（经隧道时是那台电脑答的，见 `store.instance`）。
+   * 和本机核心的 id 一样 = 这页就是本机给的（null，勾第一行）。
+   *
+   * 两个 id 有一个还没拿到（页面刚起来、老核心不给）就退回核心记的 `current` —— 只有一边
+   * 的话判断不了：拿 S 的 id 去列表里找，本机那一行不在列表里，就一行都勾不上。
+   */
+  get here(): string | null {
+    const me = store.instance;
+    const local = this.local?.id;
+    if (!me || !local) return this.current;
+    return me === local ? null : me;
+  }
+
+  /** 这一行是不是眼前这页（勾在它上面） */
+  isHere(id: string): boolean {
+    return this.here === id;
+  }
 
   /** 问一次核心。 */
   async load(): Promise<void> {

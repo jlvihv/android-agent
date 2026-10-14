@@ -320,6 +320,9 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         // 这个核心跑在哪台机器上：界面（侧栏底栏那个小标签）靠它显示
         // 「现在连的是哪台电脑」。手机上给 `null`（本机就是这台手机，见函数注释）。
         "computer": computer_name(),
+        // 这个核心的实例 id：页面据此知道「我是哪台给的」（「选择机器」里勾哪一行，
+        // 见前端 `lib/machines.svelte.ts`）。经隧道时这个接口是那台电脑答的。
+        "id": st.instance_id(),
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
             "host": s.is_host(),
@@ -564,6 +567,7 @@ async fn machines_list(State(st): State<Arc<AppState>>) -> Response {
             "url": format!("http://127.0.0.1:{}", st.port.load(std::sync::atomic::Ordering::Relaxed)),
             "platform": std::env::consts::OS,
             "name": computer_name(),
+            "id": st.instance_id(),
         },
         "current": m.current_id(),
         "list": list,

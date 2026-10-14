@@ -108,10 +108,10 @@
       {@render row(
         hasShell() ? 'phone' : 'computer',
         hasShell() ? '这台手机' : '这台电脑',
-        machines.current
+        machines.here
           ? '回到自己的核心（界面、命令、文件都在这台上）'
           : '界面、命令、文件都在这台上',
-        machines.current === null,
+        machines.here === null,
         () => machines.useLocal(),
       )}
 
@@ -121,10 +121,10 @@
           m.name,
           m.relay
             ? '经服务器连（不在同一个 Wi-Fi 里）'
-            : m.current
+            : machines.isHere(m.id)
               ? `${m.host}:${m.port}`
               : `${m.host}:${m.port} · ${m.paired ? '已配对' : '第一次连要输配对码'}`,
-          m.current,
+          machines.isHere(m.id),
           () => (m.paired ? machines.connect(m.id) : ask(m)),
         )}
       {/each}
@@ -154,16 +154,12 @@
     <p class="px-3.5 py-3 text-meta text-faint">
       {machines.list.length ? '还在找…' : '正在局域网里找电脑…'}
     </p>
-    <p class="px-1 text-meta leading-relaxed text-faint">
-      {#if hasShell()}
+    {#if hasShell()}
+      <p class="px-1 text-meta leading-relaxed text-faint">
         电脑上跑 <code class="font-mono">just dev-host</code>，它会出现在上面；第一次要在同一个
         Wi-Fi 里配对。电脑配了中继的话，出门在外它也在这里（经服务器，端到端加密）。
-      {:else}
-        别的电脑上跑 <code class="font-mono">just dev-host</code>，它会出现在上面；第一次要在同一个
-        Wi-Fi 里、输一次它终端里那个 6 位码。找不到（<code class="font-mono">avahi-daemon</code
-        > 没跑？）就手输地址。
-      {/if}
-    </p>
+      </p>
+    {/if}
   {:else if page === 'pair'}
     <div class="rounded-2xl bg-surface p-3.5">
       <p class="text-meta leading-relaxed text-muted">

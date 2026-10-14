@@ -43,6 +43,11 @@ class AgentStore {
   computer = $state<string | null>(null);
   /** 跑这个核心的系统（`/api/health` 的 `platform`）：`android` = 手机自己的核心 */
   platform = $state('');
+  /**
+   * 给这个页面的核心的实例 id（`/api/health` 的 `id`）。经隧道时是那台电脑的 ——
+   * 「选择机器」靠它勾「现在这页是哪台」（见 `lib/machines.svelte.ts`）。
+   */
+  instance = $state<string | null>(null);
 
   /**
    * 侧栏底栏那个小标签上写什么 —— 现在连的是哪台机器。
@@ -158,12 +163,14 @@ class AgentStore {
         sandboxKey?: string;
         platform?: string;
         computer?: string | null;
+        id?: string;
       };
       this.llm = h.llm ?? null;
       if (h.sandboxKey) this.sandboxKey = h.sandboxKey;
       this.capabilities = h.capabilities ?? { vision: true, pdf: false };
       if (h.platform) this.platform = h.platform;
       this.computer = h.computer ?? null;
+      if (h.id) this.instance = h.id;
     } catch {
       // health 失败不影响主流程
     }

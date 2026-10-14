@@ -261,9 +261,10 @@ impl Machines {
     }
 
     /// 「选择机器」面板要的那份：局域网里看到的 ∪ 配对过的，按实例 id 去重。
+    /// 局域网里找得到的那台**只出一行直连的**。
     ///
-    /// 看到的（有地址）在前、只在库里、局域网里找不到的（经中继）在后 —— 和界面上的
-    /// 顺序一致（见 docs/05 的 4.5）。局域网里找得到的那台**只出一行直连的**。
+    /// **按名字排**（同名再按 id），不按「先看到的在前」：发现结果陆续到、一台在
+    /// 「局域网 / 经服务器」之间换来换去时，它在面板上的位置不跟着跳。
     pub fn panel(&self) -> Vec<Panel> {
         let cur = self.current_id();
         let found = self.found.lock().map(|g| g.clone()).unwrap_or_default();
@@ -307,6 +308,12 @@ impl Machines {
                 current,
             });
         }
+        out.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
         out
     }
 
