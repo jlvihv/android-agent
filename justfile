@@ -86,7 +86,10 @@ dev:
 # 局域网来的都要凭据，这台电脑自己（127.0.0.1）照旧免登录。只想自己用：
 #
 #   AGENT_BIND=127.0.0.1 just dev-host
-dev-host:
+# 依赖 web-build：前端是**编译时**嵌进核心的（rust-embed）。不先构建的话，拉了新代码的
+# 机器会把旧的 web/dist 编进去 —— 手机连过来看到的就是旧界面（实测踩到：jl 上的核心是新的，
+# 页面却还是旧的，「选择机器」里手机和电脑同时打勾）。
+dev-host: web-build
     #!/usr/bin/env bash
     set -a; [ -f .env.local ] && . ./.env.local; set +a
     export AGENT_LLM_API_KEY="${AGENT_LLM_API_KEY:-${OPENCODE_API_KEY:-}}"

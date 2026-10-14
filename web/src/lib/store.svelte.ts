@@ -15,7 +15,6 @@ import type {
 } from './types';
 import type { Message } from './sse';
 import { uid } from './uid';
-import { isLoopbackHost } from './host';
 
 export type LogItem = { id: number; ts: number; level: string; msg: string };
 
@@ -51,15 +50,16 @@ class AgentStore {
    *   - 手机自己的核心 →「本机」
    *   - 电脑上的核心 → 那台电脑的名字（`/api/health` 的 `computer`）
    *
-   * 两个来源都还没到（页面刚起来那一两帧）就退到地址上：不是 loopback 就是
-   * 连着电脑，先拿它报的主机号撑着 —— 总比空着强，而且**不会说错**（写
-   * 「本机」才是错的，那是另一台机器）。
+   * 两个来源都还没到（页面刚起来那一两帧）就退到地址上：`127.0.0.1` 是手机
+   * 自己的核心，别的都当成电脑，先拿地址撑着 —— 总比空着强，而且**不会说错**。
    */
   machine = $derived.by((): { name: string; phone: boolean } => {
     const os = this.platform || this.hello?.platform || '';
     if (os === 'android') return { name: '本机', phone: true };
     if (os) return { name: this.computer ?? location.hostname, phone: false };
-    return isLoopbackHost(location.hostname)
+    // 只认 127.0.0.1：手机自己的核心就在那儿。经中继连电脑时页面来自 `localhost`
+    // （壳的隧道，见 docs/12）—— 那是另一台机器，说「本机」就错了
+    return location.hostname === '127.0.0.1'
       ? { name: '本机', phone: true }
       : { name: location.hostname, phone: false };
   });

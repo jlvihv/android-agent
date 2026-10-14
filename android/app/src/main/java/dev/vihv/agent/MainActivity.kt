@@ -134,6 +134,9 @@ class MainActivity : Activity() {
         // 两个设置页只能一个一个来：先存储（沙箱干活的地方），下次启动再无障碍
         if (!maybeAskAllFilesAccess()) maybeOpenAccessibilitySettings()
 
+        // 网络变了（出门断了家里的 Wi-Fi）：连着的电脑可能连不上了
+        watchNetwork()
+
         // 冷启动也认这个 extra（见 onNewIntent）
         if (intent?.getBooleanExtra("browser", false) == true) {
             window.decorView.post { panel?.show() }
@@ -151,6 +154,8 @@ class MainActivity : Activity() {
         AgentNotifications.clearDone(this)
         // 回到前台顺手把订阅对齐一次：连着电脑时切来切去、或者进程刚起，都靠它收口
         syncTurnStream()
+        // 回到前台时可能已经换了网络（出门 / 回家）：连着的电脑还在吗
+        recheckRemote()
         // Android 16 的 Live Updates 授权可能在系统设置里刚被改过，回到前台重新问一次
         // （能力探针有 5 秒缓存，见 LiveUpdates）
         LiveUpdates.invalidate()
@@ -359,6 +364,26 @@ class MainActivity : Activity() {
                 setContentView(remoteErrorView(remote, "这台电脑不认手机记着的钥匙了（电脑上换过库？）—— 回到手机，在侧栏底栏的「选择机器」里点它重新配对。"))
             }
 
+            /**
+             * WebView 的渲染进程没了（崩溃，或者系统为了省内存把它杀了）。
+             *
+             * 不接的话系统默认**把整个 App 一起杀掉**；接了但不处理，这只 WebView 就
+             * 再也画不出东西（实测就是一整屏空白）。重建 Activity：新的 WebView、重新加载。
+             */
+            override fun onRenderProcessGone(
+                view: WebView?,
+                detail: android.webkit.RenderProcessGoneDetail?,
+            ): Boolean {
+                Log.w(TAG, "WebView 渲染进程没了（crash=${detail?.didCrash()}），重建页面")
+                if (view === web) {
+                    (view?.parent as? android.view.ViewGroup)?.removeView(view)
+                    view?.destroy()
+                    web = null
+                    recreate()
+                }
+                return true
+            }
+
             override fun onReceivedError(
                 view: WebView?,
                 request: android.webkit.WebResourceRequest?,
@@ -369,12 +394,9 @@ class MainActivity : Activity() {
                     Log.e(TAG, "主文档加载失败: ${error?.description}")
                     val remote = remoteUrl()
                     if (remote != null) {
-                        // 局域网直连不上（多半是出门了）：这台配过中继的话自动改走中继
-                        val id = remoteId()
-                        if (!viaRelay() && id != null && relayInfo(id) != null && startRelay(id)) {
-                            Log.i(TAG, "局域网连不上 ${Uri.parse(remote).host}，改走中继")
-                            remoteUrl()?.let { switchTo(it) }
-                            syncTurnStream()
+                        // 局域网直连不上（多半是出门了）：换路 —— 配过中继走中继，没配回本机
+                        if (!viaRelay()) {
+                            rerouteAndReload()
                             return
                         }
                         setContentView(remoteErrorView(remote, error?.description?.toString()))
@@ -476,7 +498,9 @@ class MainActivity : Activity() {
         }
 
         web = w
-        w.loadUrl(remoteUrl() ?: localUrl())
+        // 上次连着电脑：先确认它还连得上（出了门就连不上了），连不上就换路再加载 ——
+        // 不然 WebView 会对着一个局域网地址一直等到超时，那段时间是一整屏空白
+        checkRemote { w.loadUrl(remoteUrl() ?: localUrl()) }
         return w
     }
 
@@ -561,6 +585,108 @@ class MainActivity : Activity() {
         // 回合状态也要订上那台电脑（本地的订阅不动）—— 不然在电脑上跑的回合，
         // 手机上什么都不显示
         syncTurnStream()
+    }
+
+    /** 网络变化的回调（见 [watchNetwork]）。Activity 销毁时注销 */
+    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
+
+    /** 上一次探测还没回来时别再发一次（网络变化一来就是好几个回调） */
+    @Volatile
+    private var probing = false
+
+    /**
+     * 连着的那台电脑（局域网直连）还连得上吗：TCP 连一下，1.5 秒为限。在家里连上
+     * 只要几毫秒；连不上（出门了、电脑关了）最多等 1.5 秒，而不是让 WebView 等到超时。
+     * **网络线程上调**。
+     */
+    private fun reachable(url: String): Boolean = runCatching {
+        val u = Uri.parse(url)
+        java.net.Socket().use { it.connect(java.net.InetSocketAddress(u.host, portOf(u)), 1500) }
+        true
+    }.getOrDefault(false)
+
+    /**
+     * 确认连着的电脑还在，然后（在主线程上）调 [then]，参数是「换没换路」。
+     *
+     * 只管局域网直连：经中继时隧道自己会把「拨不通」写成一页说明（见 core 的 `tunnel.rs`）。
+     */
+    private fun checkRemote(then: (Boolean) -> Unit) {
+        val remote = remoteUrl()
+        if (remote == null || viaRelay()) return then(false)
+        probing = true
+        Thread {
+            val ok = reachable(remote)
+            runOnUiThread {
+                probing = false
+                // 探测期间用户可能已经自己换了机器：只在还是同一台时才动
+                if (!ok && remoteUrl() == remote) {
+                    reroute()
+                    then(true)
+                } else {
+                    then(false)
+                }
+            }
+        }.start()
+    }
+
+    /** 已经加载着页面时再确认一次（回到前台、网络变了）；换了路就重新加载 */
+    private fun recheckRemote() {
+        if (probing || web == null) return
+        checkRemote { changed ->
+            if (changed) {
+                switchTo(remoteUrl() ?: localUrl())
+                syncTurnStream()
+            }
+        }
+    }
+
+    /**
+     * 连着的电脑连不上了：换路（只改记录、起隧道，不加载）。配过中继就经中继连同一台，
+     * 没配就回到手机自己的核心。弹一句说明 —— 界面突然换了个样，得让人知道为什么。
+     */
+    private fun reroute() {
+        val remote = remoteUrl() ?: return
+        val id = remoteId()
+        val name = id?.let { prefs().getString(REMOTE_PREFIX + it, null) }
+            ?.let { runCatching { org.json.JSONObject(it).optString("name") }.getOrNull() }
+            ?.takeIf { it.isNotBlank() }
+            ?: Uri.parse(remote).host
+        if (id != null && startRelay(id)) {
+            Log.i(TAG, "局域网连不上 $name，改走中继")
+            toast("连不上家里的「$name」，改经服务器连")
+            return
+        }
+        Log.i(TAG, "连不上 $name，回到本机")
+        AgentApp.core.stopTunnel()
+        forgetRemote()
+        toast("连不上「$name」（不在同一个网络里？），已切回本机")
+    }
+
+    /** 主文档加载失败时：换路并重新加载 */
+    private fun rerouteAndReload() {
+        reroute()
+        switchTo(remoteUrl() ?: localUrl())
+        syncTurnStream()
+    }
+
+    private fun toast(msg: String) =
+        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
+
+    /** 网络变化（换 Wi-Fi、断开、切到蜂窝）时重新确认连着的电脑 */
+    private fun watchNetwork() {
+        val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                runOnUiThread { recheckRemote() }
+            }
+
+            override fun onLost(network: android.net.Network) {
+                runOnUiThread { recheckRemote() }
+            }
+        }
+        runCatching { cm.registerDefaultNetworkCallback(cb) }
+            .onSuccess { netCallback = cb }
+            .onFailure { Log.w(TAG, "监听网络变化失败：${it.message}") }
     }
 
     private fun viaRelay(): Boolean = prefs().getString(KEY_REMOTE_VIA, null) == "relay"
@@ -1034,6 +1160,17 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun hasBrowser(): Boolean = remoteUrl() == null && AgentApp.browser?.hasPage() == true
 
+        /**
+         * **兼容旧页面**：页面来自连着的那台电脑，电脑上的核心可能比手机上的壳旧。旧版
+         * 前端靠「有没有 `connectRemote`」判断自己在不在 App 里 —— 删掉它，旧页面就把
+         * 「选择机器」那个标签画成不能点的字（实测踩到：手机连着家里旧核心，点了没反应）。
+         * 所以接口留着，但**不再接受任意地址**（手动输入地址已经去掉了）：只提示一句。
+         */
+        @JavascriptInterface
+        fun connectRemote(url: String) {
+            runOnUiThread { toast("手动输入地址已经去掉了：在「选择机器」里点局域网里找到的电脑") }
+        }
+
         /** 「选择机器」面板打开了：开始在局域网里找（找到的推给 `window.__coresFound`） */
         @JavascriptInterface
         fun startDiscovery() {
@@ -1126,6 +1263,8 @@ class MainActivity : Activity() {
         fileCallback = null
         unregisterBackCallback()
         discovery.stop()
+        netCallback?.let { cb -> runCatching { getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } }
+        netCallback = null
         // 看板：把 agent 那只 WebView 摘下来，别让它挂在一个马上要销毁的容器上。
         // **不销毁它** —— 它属于应用进程，回合可能还在跑（见 BrowserController）。
         panel?.destroy()
