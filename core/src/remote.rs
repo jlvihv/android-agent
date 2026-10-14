@@ -20,7 +20,9 @@ use std::sync::Arc;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpStream;
 
-use crate::state::{AppState, RelayAddr, RemoteInfo};
+use std::sync::Mutex;
+
+use crate::state::{AppState, RelayAddr, RelayControl, RemoteInfo};
 
 /// 经中继进来的请求的「对端地址」。**不能是 loopback**（见模块说明）。
 pub const RELAY_PEER: SocketAddr =
@@ -39,21 +41,25 @@ pub fn relay_from_env() -> Result<Option<RelayAddr>, String> {
         (None, None) => Ok(None),
         (Some(_), None) => Err("设了 AGENT_RELAY 但没设 AGENT_RELAY_KEY".into()),
         (None, Some(_)) => Err("设了 AGENT_RELAY_KEY 但没设 AGENT_RELAY".into()),
-        (Some(a), Some(k)) => {
-            agent_relay::parse_key(&k)?;
-            let a = a.trim().to_string();
-            // 只给了 IP：补默认端口
-            let a = if a.parse::<std::net::IpAddr>().is_ok() {
-                format!("{a}:{}", agent_relay::DEFAULT_PORT)
-            } else {
-                a
-            };
-            Ok(Some(RelayAddr {
-                addr: a,
-                key: k.trim().to_string(),
-            }))
-        }
+        (Some(a), Some(k)) => checked(RelayAddr { addr: a, key: k }).map(Some),
     }
+}
+
+/// 核对并规范化一份中继配置：密钥格式对、地址是 `主机:端口`（只给了 IP 就补默认端口）。
+fn checked(r: RelayAddr) -> Result<RelayAddr, String> {
+    let key = r.key.trim().to_string();
+    agent_relay::parse_key(&key)?;
+    let addr = r.addr.trim().to_string();
+    let addr = if addr.parse::<std::net::IpAddr>().is_ok() {
+        format!("{addr}:{}", agent_relay::DEFAULT_PORT)
+    } else {
+        addr
+    };
+    match addr.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+        _ => return Err(format!("中继地址应当是 IP:端口，拿到的是「{addr}」")),
+    }
+    Ok(RelayAddr { addr, key })
 }
 
 /// 这台电脑的 TLS 身份（证书 + 私钥）。
@@ -110,33 +116,126 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     o.open(path)?.write_all(bytes)
 }
 
-/// 记下「出门在外怎么连这台」（配对和 `/api/remote` 交给手机），配了中继就挂上去。
+/// 中继配置记在哪（数据目录里，和证书放在一起）。
+const RELAY_FILE: &str = "relay.json";
+
+/// 记下「出门在外怎么连这台」（配对和 `/api/remote` 交给手机），有中继就挂上去。
+///
+/// 中继配置从哪来，按顺序：
+/// 1. 环境变量 `AGENT_RELAY` / `AGENT_RELAY_KEY`（`env`）—— 设了就以它为准，手机改不了；
+/// 2. `dir/relay.json` —— **手机交过来的**（`POST /api/remote/relay`，见 `Host::attach`）。
+///    手机连过一台配了中继的电脑，就记得那个中继；在家连上别的电脑时顺手把它交过去，
+///    那台电脑就不用再手动复制密钥了。
 ///
 /// 中继连不上不是错误：它在后台一直重试，状态往日志里说（只在变化时说一句）。
-pub fn start(state: Arc<AppState>, id: Identity, relay: Option<RelayAddr>) -> anyhow::Result<()> {
+pub fn start(
+    state: Arc<AppState>,
+    id: Identity,
+    env: Option<RelayAddr>,
+    dir: &Path,
+) -> anyhow::Result<()> {
+    let from_env = env.is_some();
+    let file = dir.join(RELAY_FILE);
+    let relay = env.or_else(|| {
+        let raw = std::fs::read(&file).ok()?;
+        let r: RelayAddr = serde_json::from_slice(&raw).ok()?;
+        checked(r).ok()
+    });
     if let Ok(mut g) = state.remote.write() {
         *g = Some(RemoteInfo {
             fingerprint: id.fingerprint.clone(),
-            relay: relay.clone(),
+            relay: None,
         });
     }
-    let Some(relay) = relay else {
-        return Ok(());
-    };
-    let key = agent_relay::parse_key(&relay.key).map_err(anyhow::Error::msg)?;
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(id.server_config()?));
-    let router = crate::http::router(state.clone());
-    let log_state = state.clone();
-    tokio::spawn(agent_relay::run_host(
-        relay.addr,
-        key,
-        state.instance_id(),
-        move |s| {
-            tokio::spawn(serve_one(s, acceptor.clone(), router.clone()));
-        },
-        move |msg| log_state.log("info", msg),
-    ));
+    let host = Arc::new(Host {
+        state: state.clone(),
+        acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(id.server_config()?)),
+        from_env,
+        file,
+        task: Mutex::new(None),
+    });
+    if let Some(r) = relay {
+        host.connect(r)?;
+    }
+    if let Ok(mut g) = state.relay_host.write() {
+        *g = Some(host);
+    }
     Ok(())
+}
+
+/// 挂在中继上的那一头。可以在运行时换中继（`attach`），换的时候把旧的那条连接停掉。
+struct Host {
+    state: Arc<AppState>,
+    acceptor: tokio_rustls::TlsAcceptor,
+    /// 中继是环境变量配的：以它为准，手机改不了
+    from_env: bool,
+    /// 手机交过来的中继记在这儿
+    file: std::path::PathBuf,
+    /// 正挂着的那条（`run_host` 永不返回，换中继时 abort 掉）
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Host {
+    fn connect(&self, relay: RelayAddr) -> anyhow::Result<()> {
+        let key = agent_relay::parse_key(&relay.key).map_err(anyhow::Error::msg)?;
+        let acceptor = self.acceptor.clone();
+        let router = crate::http::router(self.state.clone());
+        let log_state = self.state.clone();
+        let task = tokio::spawn(agent_relay::run_host(
+            relay.addr.clone(),
+            key,
+            self.state.instance_id(),
+            move |s| {
+                tokio::spawn(serve_one(s, acceptor.clone(), router.clone()));
+            },
+            move |msg| log_state.log("info", msg),
+        ));
+        if let Ok(mut g) = self.task.lock() {
+            if let Some(old) = g.replace(task) {
+                old.abort();
+            }
+        }
+        if let Ok(mut g) = self.state.remote.write() {
+            if let Some(info) = g.as_mut() {
+                info.relay = Some(relay);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RelayControl for Host {
+    fn attach(&self, relay: RelayAddr) -> Result<(), String> {
+        if self.from_env {
+            return Err("这台电脑的中继是用环境变量配的（AGENT_RELAY），要换请改环境变量".into());
+        }
+        let relay = checked(relay)?;
+        // 已经挂着同一个就什么都不做（手机每次在家连上都会来对一遍）
+        let same = self
+            .state
+            .remote
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|i| i.relay.clone()))
+            .is_some_and(|r| r.addr == relay.addr && r.key == relay.key);
+        if same {
+            return Ok(());
+        }
+        let json = serde_json::to_vec_pretty(&relay).map_err(|e| e.to_string())?;
+        if let Some(dir) = self.file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("记不下中继配置：{e}"))?;
+        }
+        // 里面有中继密钥：只给自己读
+        write_private(&self.file, &json).map_err(|e| format!("记不下中继配置：{e}"))?;
+        self.state.log(
+            "info",
+            format!(
+                "手机交来了中继 {}，挂上去（已记下，下次启动照样挂）",
+                relay.addr
+            ),
+        );
+        self.connect(relay).map_err(|e| format!("{e:#}"))
+    }
 }
 
 /// 一条经中继来的连接：TLS 握手，然后把路由挂上去（HTTP/1.1，带 WebSocket 升级）。
@@ -223,7 +322,7 @@ mod tests {
             addr: relay_addr.clone(),
             key: KEY.into(),
         };
-        start(st.clone(), id, Some(relay)).unwrap();
+        start(st.clone(), id, Some(relay), &dir).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let target = |fingerprint: &str| crate::tunnel::Target {
@@ -259,6 +358,80 @@ mod tests {
         let gone = crate::tunnel::start(gone).await.unwrap();
         let r = get(gone.port, "/", None).await;
         assert!(r.starts_with("HTTP/1.1 502") && r.contains("不在线"), "{r}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手机把中继交给一台还没配的电脑：立刻挂上（经中继能连）、记下来（下次启动照样挂）。
+    /// 环境变量配的那台不让改。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_handed_over_by_the_phone_is_attached_and_remembered() {
+        const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(agent_relay::Relay::new(agent_relay::parse_key(KEY).unwrap()).serve(l));
+
+        let st = AppState::new();
+        st.set_token(Some("s3cret".into()));
+        let dir = std::env::temp_dir().join(format!("agent-remote-{}", uuid::Uuid::new_v4()));
+        let id = Identity::load_or_create(&dir).unwrap();
+        let fp = id.fingerprint.clone();
+        start(st.clone(), id, None, &dir).unwrap();
+        assert!(st.remote.read().unwrap().as_ref().unwrap().relay.is_none());
+
+        // 手机交过来（`POST /api/remote/relay` 调的就是它）
+        let host = st.relay_host.read().unwrap().clone().unwrap();
+        let bad = RelayAddr {
+            addr: relay_addr.clone(),
+            key: "短".into(),
+        };
+        assert!(host.attach(bad).is_err(), "坏密钥不收");
+        host.attach(RelayAddr {
+            addr: relay_addr.clone(),
+            key: KEY.into(),
+        })
+        .unwrap();
+        assert!(dir.join(RELAY_FILE).exists(), "要记下来");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let t = crate::tunnel::start(crate::tunnel::Target {
+            relay: relay_addr.clone(),
+            key: KEY.into(),
+            host_id: st.instance_id(),
+            fingerprint: fp.clone(),
+        })
+        .await
+        .unwrap();
+        let r = get(t.port, "/api/health", Some("s3cret")).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "交过来就立刻能用：{r}");
+
+        // 重启：没有环境变量，从记下的那份挂
+        let st2 = AppState::new();
+        start(
+            st2.clone(),
+            Identity::load_or_create(&dir).unwrap(),
+            None,
+            &dir,
+        )
+        .unwrap();
+        let relay = st2.remote.read().unwrap().as_ref().unwrap().relay.clone();
+        assert_eq!(relay.map(|r| r.addr), Some(relay_addr.clone()));
+
+        // 环境变量配的：以它为准，手机改不了
+        let st3 = AppState::new();
+        let env = RelayAddr {
+            addr: relay_addr.clone(),
+            key: KEY.into(),
+        };
+        start(
+            st3.clone(),
+            Identity::load_or_create(&dir).unwrap(),
+            Some(env.clone()),
+            &dir,
+        )
+        .unwrap();
+        let host3 = st3.relay_host.read().unwrap().clone().unwrap();
+        assert!(host3.attach(env).unwrap_err().contains("环境变量"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

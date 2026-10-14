@@ -68,6 +68,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/delete", post(delete_session))
         .route("/api/sessions/unqueue", post(unqueue))
         .route("/api/remote", get(remote))
+        .route("/api/remote/relay", post(set_relay))
         .route("/api/reset", post(reset))
         .route("/api/device/log", post(device_log))
         .route("/api/ws", get(ws_upgrade))
@@ -403,6 +404,28 @@ async fn pair(State(st): State<Arc<AppState>>, Json(b): Json<PairBody>) -> Respo
 
 fn remote_info(st: &AppState) -> Option<crate::state::RemoteInfo> {
     st.remote.read().ok().and_then(|g| g.clone())
+}
+
+/// `POST /api/remote/relay {addr, key}` → 让这台电脑挂到这个中继上（要凭据）。
+///
+/// 手机连过一台配了中继的电脑，就知道中继在哪、密钥是什么；在家连上另一台**还没配**的
+/// 电脑时，把它交过来 —— 那台电脑立刻挂上去、记下来，人不用去复制密钥（见 `remote.rs`）。
+/// 能调这个接口的本来就拿着这台电脑的凭据（= 能在上面跑命令），没有多给出什么。
+async fn set_relay(
+    State(st): State<Arc<AppState>>,
+    Json(b): Json<crate::state::RelayAddr>,
+) -> Response {
+    let Some(host) = st.relay_host.read().ok().and_then(|g| g.clone()) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "这个核心不挂中继（只有电脑上、对局域网开放时才有）",
+        )
+            .into_response();
+    };
+    match host.attach(b) {
+        Ok(()) => Json(json!({ "remote": remote_info(&st) })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
 }
 
 /// `GET /api/remote` → 出门在外怎么连这台电脑（要凭据）。

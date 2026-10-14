@@ -207,7 +207,13 @@ pub struct RemoteInfo {
     pub relay: Option<RelayAddr>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// 换这台电脑挂的中继（实现在 `remote.rs`，手机上没有 —— 所以这里只是个接口）。
+pub trait RelayControl: Send + Sync {
+    /// 挂到这个中继上（立刻生效，并记下来，下次启动照样挂）。`Err` 是给人看的原因。
+    fn attach(&self, relay: RelayAddr) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelayAddr {
     /// `IP:端口`
     pub addr: String,
@@ -276,6 +282,9 @@ pub struct AppState {
     /// 出门在外连这台电脑要用的东西（证书指纹 + 中继地址），配对时和 `/api/remote`
     /// 交给手机。只有桌面宿主模式对局域网开放时才有（见 `remote.rs`）。
     pub remote: RwLock<Option<RemoteInfo>>,
+    /// 运行时换中继（`POST /api/remote/relay`：手机把它知道的中继交给这台电脑）。
+    /// 只有桌面宿主模式对局域网开放时才有（见 `remote.rs`）。
+    pub relay_host: RwLock<Option<Arc<dyn RelayControl>>>,
     /// 核心跑在哪个 tokio runtime 上。手机的壳从 Kotlin 线程起中继隧道时要用
     /// （`ffi::AgentCore::start_tunnel`）—— runtime 本身归 `serve_in_background` 那个线程。
     pub rt: std::sync::OnceLock<tokio::runtime::Handle>,
@@ -367,6 +376,7 @@ impl AppState {
             alpine: Default::default(),
             pairing: RwLock::new(None),
             remote: RwLock::new(None),
+            relay_host: RwLock::new(None),
             rt: std::sync::OnceLock::new(),
             trust_loopback: AtomicBool::new(false),
             sessions_loaded: AtomicBool::new(false),

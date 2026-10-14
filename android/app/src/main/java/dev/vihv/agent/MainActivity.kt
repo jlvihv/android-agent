@@ -500,7 +500,13 @@ class MainActivity : Activity() {
         web = w
         // 上次连着电脑：先确认它还连得上（出了门就连不上了），连不上就换路再加载 ——
         // 不然 WebView 会对着一个局域网地址一直等到超时，那段时间是一整屏空白
-        checkRemote { w.loadUrl(remoteUrl() ?: localUrl()) }
+        checkRemote {
+            w.loadUrl(remoteUrl() ?: localUrl())
+            // 启动时直接连回了局域网里那台：也对一遍中继（没配的话把手机知道的交给它）
+            val r = remoteUrl()
+            val id = remoteId()
+            if (r != null && id != null && !viaRelay()) refreshRelayInfo(r, id)
+        }
         return w
     }
 
@@ -724,23 +730,54 @@ class MainActivity : Activity() {
      * 局域网直连上之后问那台电脑一句「出门在外怎么连」（`GET /api/remote`）。
      *
      * 中继常常是配对之后才配上的（或者换了服务器）—— 每次在家连上都对一遍，就不用
-     * 重新配对。网络不能上主线程，失败就算了（下次连上再问）。
+     * 重新配对。**它还没有中继、而手机知道一个**（连过别的配了中继的电脑）：顺手交给它
+     * （`POST /api/remote/relay`），那台电脑立刻挂上并记下来 —— 人不用去复制密钥。
+     * 网络不能上主线程，失败就算了（下次连上再问）。
      */
     private fun refreshRelayInfo(url: String, id: String) {
         val u = Uri.parse(url)
         val token = pairedToken(id) ?: u.getQueryParameter("t") ?: return
         val base = "http://${u.host}:${portOf(u)}"
+        // 手机知道的中继（连过的其他电脑那里记下的）。在主线程上读好再带进网络线程
+        val known = relayMachines().filterKeys { it != id }.values.firstNotNullOfOrNull { it.optJSONObject("relay") }
         Thread {
             runCatching {
-                val c = java.net.URL("$base/api/remote").openConnection() as java.net.HttpURLConnection
-                c.connectTimeout = 5000
-                c.readTimeout = 5000
-                c.setRequestProperty("Cookie", "agent_token=$token")
-                if (c.responseCode != 200) return@runCatching
-                val j = org.json.JSONObject(c.inputStream.bufferedReader().use { it.readText() })
-                runOnUiThread { saveRelayInfo(id, j.optString("name", "电脑"), j.optJSONObject("remote")) }
-            }.onFailure { Log.w(TAG, "取「出门在外怎么连」失败：${it.message}") }
+                var j = call("$base/api/remote", token, null) ?: return@runCatching
+                var handed = false
+                val remote = j.optJSONObject("remote")
+                if (remote != null && remote.optJSONObject("relay") == null && known != null) {
+                    val body = org.json.JSONObject().put("addr", known.getString("addr")).put("key", known.getString("key"))
+                    call("$base/api/remote/relay", token, body)?.let { r ->
+                        j = org.json.JSONObject(j.toString()).put("remote", r.optJSONObject("remote"))
+                        handed = true
+                    }
+                }
+                runOnUiThread {
+                    val name = j.optString("name", "电脑")
+                    saveRelayInfo(id, name, j.optJSONObject("remote"))
+                    if (handed) toast("已把中继交给「$name」：出门在外也能连它了")
+                }
+            }.onFailure { Log.w(TAG, "取 / 交中继信息失败：${it.message}") }
         }.start()
+    }
+
+    /** 带凭据请求一次核心（`body` 非空就是 POST JSON）。不是 200 就是 null。**网络线程上调** */
+    private fun call(url: String, token: String, body: org.json.JSONObject?): org.json.JSONObject? {
+        val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 5000
+        c.readTimeout = 5000
+        c.setRequestProperty("Cookie", "agent_token=$token")
+        if (body != null) {
+            c.requestMethod = "POST"
+            c.doOutput = true
+            c.setRequestProperty("content-type", "application/json")
+            c.outputStream.use { it.write(body.toString().toByteArray()) }
+        }
+        if (c.responseCode != 200) {
+            Log.w(TAG, "$url → HTTP ${c.responseCode}")
+            return null
+        }
+        return org.json.JSONObject(c.inputStream.bufferedReader().use { it.readText() })
     }
 
     /**
