@@ -82,6 +82,11 @@ impl Pairing {
         &self.code
     }
 
+    /// 还能输错几次；`0` = 已经停用（重启核心换新码）。设置页要显示这个状态。
+    pub fn remaining(&self) -> u32 {
+        PAIR_MAX_FAILS.saturating_sub(self.fails.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// 核对配对码。输错 `PAIR_MAX_FAILS` 次之后一律拒绝（防猜）。
     pub fn check(&self, code: &str) -> Result<(), String> {
         use std::sync::atomic::Ordering;
@@ -251,13 +256,16 @@ mod tests {
         } else {
             "000000"
         };
-        for _ in 0..PAIR_MAX_FAILS {
+        assert_eq!(p.remaining(), PAIR_MAX_FAILS, "一次没错时是满的");
+        for i in 0..PAIR_MAX_FAILS {
             assert!(p.check(wrong).is_err());
+            assert_eq!(p.remaining(), PAIR_MAX_FAILS - i - 1, "错一次少一次");
         }
         assert!(
             p.check(p.code()).unwrap_err().contains("停用"),
             "输错太多次后对的也不行"
         );
+        assert_eq!(p.remaining(), 0, "停用之后还是 0（设置页靠它显示状态）");
     }
 
     #[test]

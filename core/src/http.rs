@@ -3,12 +3,13 @@
 //! 前端与 API **同源**（决策 D3），所以不需要 CORS，且 `http://127.0.0.1`
 //! 是 secure context —— `crypto.subtle`、Service Worker 都能用。
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::extract::{ConnectInfo, Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -30,6 +31,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/linux", post(bash_run))
         .route("/api/procs", get(list_procs))
         .route("/api/pair", post(pair))
+        .route("/api/pairing", get(pairing_info))
         .route("/api/alpine", get(alpine_status))
         .route("/api/alpine/upgrade", post(alpine_upgrade))
         .route("/api/browser", post(browser_action))
@@ -363,6 +365,41 @@ async fn pair(State(st): State<Arc<AppState>>, Json(b): Json<PairBody>) -> Respo
     Json(json!({
         "token": token,
         "id": st.instance_id(),
+        "name": crate::desktop::computer_name(),
+    }))
+    .into_response()
+}
+
+/// `GET /api/pairing` → 手机上「连接电脑」要输的那个 6 位码（设置页展示，见前端
+/// `PairingSection.svelte`）。
+///
+/// 以前这个码只在核心启动时往终端打一行 —— 后台跑的核心（`setsid` / 日志重定向到
+/// 文件）就等于没地方看，而后台跑恰恰是常态。
+///
+/// **只回给这台电脑自己（loopback）**：配对码的全部意义是「证明你人在电脑前」，
+/// 从局域网里也能读到的话这一步就白做了。手机上看到的界面正好在局域网那头，
+/// 拿到的就是 `available: false`，那一栏自然不显示。（局域网来的请求本来就要
+/// 凭据，凭据比码更大 —— 但没必要把码也散出去。）
+///
+/// `available: false` 的三种情况：不是 loopback、不是宿主模式对局域网开放
+/// （手机上、`AGENT_BIND=127.0.0.1`）、以及非桌面的核心 —— 设置页据此整栏不显示。
+async fn pairing_info(
+    State(st): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    let pairing = if addr.ip().is_loopback() {
+        st.pairing.read().ok().and_then(|g| g.clone())
+    } else {
+        None
+    };
+    let Some(p) = pairing else {
+        return Json(json!({ "available": false })).into_response();
+    };
+    Json(json!({
+        "available": true,
+        "code": p.code(),
+        // 0 = 输错太多次，停用了（重启电脑上的核心换新码）
+        "failsLeft": p.remaining(),
         "name": crate::desktop::computer_name(),
     }))
     .into_response()
