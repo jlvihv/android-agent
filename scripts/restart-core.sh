@@ -138,7 +138,7 @@ if [ "$DRY" = 1 ]; then
     else
         echo "空闲等待:  现在空闲，编译完就动手"
     fi
-    [ "$BUILD" = 1 ] && echo "会先编译:  cargo build --release --bin agent-dev（编不动就什么都不做）"
+    [ "$BUILD" = 1 ] && echo "会先编译:  cargo build --release --bin agent-dev --manifest-path core/Cargo.toml（编不动就什么都不做）"
     echo "（--dry-run：什么都没动）"
     exit 0
 fi
@@ -153,8 +153,10 @@ flock -n 9 || {
 # --- 1. 备份 + 编译（先编译，失败什么都不动） -------------------------------
 cp -f "$BIN" "$BACKUP" 2>/dev/null || true
 if [ "$BUILD" = 1 ]; then
-    log "编译中：cargo build --release --bin agent-dev"
-    if ! cargo build --release --bin agent-dev >>"$LOG" 2>&1; then
+    log "编译中：cargo build --release --bin agent-dev（core/Cargo.toml）"
+    # --manifest-path 不能少：仓库根没有 Cargo.toml（那个在 core/ 下），
+    # 输出照样落在 core/target/release/，和 $BIN 对得上
+    if ! cargo build --release --bin agent-dev --manifest-path core/Cargo.toml >>"$LOG" 2>&1; then
         log "❌ 编译失败 —— 什么都不动，老核心（pid=$PID）照旧跑着"
         exit 1
     fi
@@ -224,17 +226,30 @@ healthy() {
     return 1
 }
 
-start_core "$BIN"
-if healthy; then
-    log "✅ 新核心起来了（$BASE）"
-else
-    log "❌ 新核心没起来 —— 用备份的旧二进制兜回去（$BACKUP）"
-    pkill -f 'release/agent-[d]ev' 2>/dev/null || true
-    start_core "$BACKUP"
-    if healthy; then
-        log "⚠️ 退回到旧二进制了（现在是能用的状态，但跑的是老代码）"
+# 起一把不行就再试：老核心刚死时那个端口可能还没放干净（TIME_WAIT 之类），
+# 一次失败就退到备份二进制太急了。
+try_start() { # $1 = 二进制，$2 = 叫什么（日志里用）
+    local bin="$1" what="$2" attempt
+    for attempt in 1 2 3; do
+        start_core "$bin"
+        if healthy; then
+            log "✅ $what 起来了（$BASE，第 $attempt 次尝试）"
+            return 0
+        fi
+        log "⚠️ $what 第 $attempt 次没起来（端口没放干净？）—— 清一下、5 秒后再试"
+        pkill -f 'release/agent-[d]ev' 2>/dev/null || true
+        pkill -f 'agent-dev[.]prev' 2>/dev/null || true
+        sleep 5
+    done
+    return 1
+}
+
+if ! try_start "$BIN" "新核心"; then
+    log "❌ 新核心三次都没起来 —— 用备份的旧二进制兜回去（$BACKUP）"
+    if try_start "$BACKUP" "旧的（备份）"; then
+        log "⚠️ 退回到旧二进制了：现在是能用的状态，但跑的是老代码"
     else
-        log "❌❌ 旧的也没起来 —— 到终端里手动跑：just dev-host"
+        log "❌❌ 都起不来 —— 到终端里手动跑：just dev-host"
         exit 1
     fi
 fi
