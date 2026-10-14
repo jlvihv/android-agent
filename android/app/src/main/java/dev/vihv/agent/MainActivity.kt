@@ -138,6 +138,8 @@ class MainActivity : Activity() {
         // 人都打开 App 了：后台跑完留下的那条「任务完成」通知没用了（结果就在眼前）。
         // 和 OpenMinis 一样在这儿清 —— 否则用户会在通知栏里找到一条自己刚看过的结果。
         AgentNotifications.clearDone(this)
+        // 回到前台顺手把订阅对齐一次：连着电脑时切来切去、或者进程刚起，都靠它收口
+        syncTurnStream()
         // Android 16 的 Live Updates 授权可能在系统设置里刚被改过，回到前台重新问一次
         // （能力探针有 5 秒缓存，见 LiveUpdates）
         LiveUpdates.invalidate()
@@ -469,6 +471,30 @@ class MainActivity : Activity() {
     private fun remoteUrl(): String? =
         getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_REMOTE, null)?.takeIf { it.isNotBlank() }
 
+    /**
+     * 把「回合状态订阅」对齐到当前的核心：手机自己的（一直在跑）+（连着电脑时）那台电脑的。
+     *
+     * 幂等，所以连着 / 切回手机 / 回到前台三处都直接调它，不用维护状态机。
+     */
+    private fun syncTurnStream() {
+        val targets = buildMap {
+            AgentApp.token?.let { t ->
+                if (localPort > 0) put("http://127.0.0.1:$localPort", t)
+            }
+            remoteTurnTarget()?.let { (base, token) -> put(base, token) }
+        }
+        runCatching { TurnStream.sync(this, targets) }
+            .onFailure { Log.w(TAG, "订阅回合状态失败", it) }
+    }
+
+    /** 连着的那台电脑的订阅目标：base URL + token（token 优先用配对时存下的）。 */
+    private fun remoteTurnTarget(): Pair<String, String>? {
+        val u = remoteUrl()?.let { Uri.parse(it) } ?: return null
+        val host = u.host ?: return null
+        val token = remoteId()?.let { pairedToken(it) } ?: u.getQueryParameter("t") ?: return null
+        return "http://$host:${portOf(u)}" to token
+    }
+
     /** 这个地址是不是连着的那台电脑（同 scheme / host / port 的都留在 WebView 里） */
     private fun isRemoteCore(uri: Uri): Boolean {
         val r = remoteUrl()?.let(Uri::parse) ?: return false
@@ -504,6 +530,9 @@ class MainActivity : Activity() {
         e.apply()
         Log.i(TAG, "连接电脑上的核心：${Uri.parse(url).host}")
         switchTo(url)
+        // 回合状态也要订上那台电脑（本地的订阅不动）—— 不然在电脑上跑的回合，
+        // 手机上什么都不显示
+        syncTurnStream()
     }
 
     /** 把找到的电脑推给页面（`window.__coresFound`）：带上「配对过没有」「是不是正连着的」 */
@@ -595,6 +624,7 @@ class MainActivity : Activity() {
 
     private fun useLocalCore() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_REMOTE).remove(KEY_REMOTE_ID).apply()
+        syncTurnStream()
         Log.i(TAG, "回到手机自己的核心")
         switchTo(localUrl())
     }

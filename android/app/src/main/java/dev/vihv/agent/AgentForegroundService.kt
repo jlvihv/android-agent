@@ -10,7 +10,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
-import uniffi.agent_core.TurnHost
 
 /**
  * 回合进行中挂着的前台服务 —— 通知栏上那条**实时更新**的通知就是它挂的。
@@ -25,7 +24,7 @@ import uniffi.agent_core.TurnHost
  *
  * 这个类只管**活**（起、停、什么时候把通知改一遍），通知长什么样全在
  * [AgentNotifications] 里；内容从 [LiveTurnStatus]（唯一事实来源）读，而它是
- * Rust 的 agent loop 推过来的（`TurnHost.status`）。形状照抄 OpenMinis 那边：
+ * Rust 的 agent loop 推过来的（`/api/turns/stream`，见 [TurnStream]）。形状照抄 OpenMinis 那边：
  * 前台服务订阅 tracker、每变一次就把通知就地改一遍 —— 我们订阅的是同一个东西，
  * 只是它的事实来源在 Rust 里。
  *
@@ -51,7 +50,7 @@ class AgentForegroundService : Service() {
         private const val TAG = "AgentFgs"
 
         /**
-         * 起服务。**已经起了就是空操作** —— [TurnHost] 那边会话数一变就会调一次，
+         * 起服务。**已经起了就是空操作** —— [TurnStream] 那边回合起/停时会调，
          * 重复调很正常。
          */
         fun start(ctx: Context) {
@@ -160,33 +159,5 @@ class AgentForegroundService : Service() {
             getSystemService(NotificationManager::class.java)?.cancel(AgentNotifications.ID_LIVE)
         }
         super.onDestroy()
-    }
-}
-
-/**
- * 把 Rust 那边「有回合在跑吗 / 此刻在跑什么」翻译成两件事：前台服务的起停、
- * 通知栏那一行的内容。
- *
- * 从 agent 的 tokio 线程上被调用，所以这里只做两件很轻的事：写一份内存里的
- * 状态（[LiveTurnStatus]）、起/停服务，顺带（可能）问一次通知权限。
- * **不要在这里做重的活。**
- */
-class TurnHostImpl(private val app: Context) : TurnHost {
-
-    override fun turn(active: Boolean) {
-        if (active) {
-            // 通知权限只能在 Activity 里问，而这是唯一一次"人就在看着"的时机
-            MainActivity.current?.maybeAskNotificationPermission()
-            AgentForegroundService.start(app)
-        } else {
-            // 没有回合在跑了：服务停掉，进行中那条通知跟着消失；刚完事那条（如果
-            // 有）是另一个 id，留着等人回来看
-            LiveTurnStatus.turn(false)
-            AgentForegroundService.stop(app)
-        }
-    }
-
-    override fun status(statusJson: String) {
-        LiveTurnStatus.update(app, statusJson)
     }
 }

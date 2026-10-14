@@ -138,8 +138,10 @@ g.saved.clear();                                  // 借用结束才动可变字
 - 文案说的是实话：「agent 正在处理 · 点开回到对话」；
 - `START_NOT_STICKY`：被杀后不重建 —— 回合已经跟着没了，重建个空服务没意义。
 
-通路是 `TurnHost`（uniffi callback）—— 和 `BrowserHost` / `DeviceHost` 同一形状。
-Rust 侧的 `begin_turn`/`end_turn` 在会话数变化时调一次（幂等，重复收到同样的值很正常）。
+通路是核心总线上的一个事件：`Event::TurnActive { active }`（`begin_turn`/`end_turn` 里发，
+会话数一变就发一次；订阅者收到重复值也无所谓）。手机壳订阅 `/api/turns/stream`（SSE）拿到它，
+起/停前台服务。（**以前**这条走的是 UniFFI 回调 `TurnHost`，而「连着的那台电脑」那条**没有** ——
+2026-10-14 统一成一条路，见下面「一条路：本地和远程」。）
 
 两个平台限制决定了它的边界：
 
@@ -177,14 +179,17 @@ Rust 侧的 `begin_turn`/`end_turn` 在会话数变化时调一次（幂等，�
 `AgentForegroundService` + `AgentNotificationContent` + `BackgroundTaskNotifier`）：
 
 ```
-Rust status::Reporter ──TurnHost.status(JSON)──▶ 壳 LiveTurnStatus（唯一事实来源）
+Rust status::Reporter ──Event::Turn(JSON)──▶ 总线（/api/ws、/api/turns/stream）
+                                                        │ SSE
+                        壳 TurnStream ─▶ LiveTurnStatus（唯一事实来源）
                                                         │ 变化
                         AgentForegroundService ◀────────┘  就地把进行中那条改一遍
                         AgentNotifications.showDone ◀─────── 刚完事那一条（独立于服务）
 ```
 
 关键的一点：OpenMinis 的事实来源在 Kotlin（agent loop 也在 Kotlin），**我们的在 Rust**
-（loop 在 Rust）—— 所以是他们订阅 tracker，我们是**同一个形状、状态在边界另一侧**。
+（loop 在 Rust）—— 所以是他们订阅 tracker，我们是**同一个形状、状态在边界另一侧**；
+「订阅」那条线在他们那儿是进程内的 StateFlow，在我们这儿是核心总线上的一个事件流。
 划分：Rust 负责「什么算一个阶段、细节取哪一行」（`core/src/status.rs`，有测试），
 壳负责「长什么样」（`AgentNotifications.kt`，文案在 `strings.xml`）。
 
@@ -279,6 +284,66 @@ Rust status::Reporter ──TurnHost.status(JSON)──▶ 壳 LiveTurnStatus（
 
 **没验到的**：Live Updates（API 36+）那条分支只有真机（Pixel 10 / Android 17）才走得到，
 模拟器是 35，只验了「不满足条件时干净退回普通通知」。
+
+### 一条路：本地和远程（2026-10-14）
+
+问得对：既然本地核心也是 HTTP 服务，「连到电脑上」那条为什么收不到状态？
+
+**因为本地那条根本没走 HTTP**：同一个进程里，agent loop 用一个 UniFFI 回调
+（`TurnHost.status`）直接把 JSON 递给壳 —— 最短路径，当初就这么写的。而「手机连到电脑上的
+核心」那条，**什么通道都没有**：电脑上的核心只把事件发给它的 HTTP 客户端（前端 SSE、`/api/ws`），
+而 WebView 的 JS 在 App 切到后台时会被系统挂起 —— 而通知栏恰恰是「App 不在前台」时才有用。
+
+于是两份形状、同一份状态语义要各维护一遍。现在合成一条：
+
+```
+Rust  status::Reporter ──▶ Event::Turn{status} / Event::TurnActive{active}   （总线）
+                              ├─ /api/ws              前端（原来就有）
+                              └─ /api/turns/stream    手机壳（SSE，带补发）
+
+壳    TurnStream(base, token) ──▶ LiveTurnStatus ──▶ 前台服务 + 通知（一行没改）
+
+base = http://127.0.0.1:<本地端口>  或  http://<电脑>:<端口>
+token = 本地那本凭据（`files/token`）或配对时存下的 token
+```
+
+为什么用 SSE 而不是 `/api/ws`：壳那边**只收不发**，而 Kotlin 写一个 WebSocket 客户端要自己
+做握手和帧解析；SSE 就是「HTTP 长连接 + 几行 `data:`」，`HttpURLConnection` 读一行处理一行
+就完了。两边发的是**同一个 `Event` 的 JSON**。
+
+删掉的东西比加的多：`TurnApi`（Rust 里的 trait）、`TurnAdapter`、`TurnHost`（uniffi callback
+interface）、壳里的 `TurnHostImpl`。跨语言边界现在只剩 `DeviceHost` 和 `BrowserHost` 两条 ——
+都是「非它不可」的平台能力，而回合状态本来就不需要一条专用回调。
+
+几个实现上的选择：
+
+- **连上先补一帧**（`AppState::turn_snapshot`）：订阅者可能在回合跑了一半才连上（壳刚起、刚从
+  系统冻结里醒来、网刚恢复），而一条 `bash` 可能几分钟不产生变化 —— 不补的话它的通知栏就一直空着。
+- **断线重连带退避**：连上了退回 2 秒，一直连不上就翻倍到 30 秒（旧核心没这个端点时不要每 2 秒刷日志），
+  所以核心重启、网抖动都能自己接回来。
+- **前台服务的起停 = 所有源的总和**：连着电脑时手机自己的核心也还跑着（`just phone` 那种从电脑驱动
+  手机的回合走的就是它），两边都可能各自开一个回合。
+- **URL 和 token 的来处**：本地是 `AgentApp.port` + `core.token()`；远程是 SharedPreferences 里的
+  `remote_core` + `paired_<id>`（配对时存下的）。切核心/回到前台都只是重新算一遍目标清单（幂等）。
+
+边界（和以前一样，只是现在说清了）：
+
+- **手机 App 切后台 60~75 秒会被系统冻住**（下面那节），那段收不到东西；回到前台重连再补一帧。
+- 回合由**电脑上的脚本**发起、而手机 App 在后台时：起不了前台服务（Android 12+ 的限制），
+  所以只能等回到 App 补一条。
+
+实测（模拟器当客户端 + 本机另起一个临时核心当「电脑」，独立数据目录，互不干扰）：
+
+```
+本机临时核心（8799）：回合跑在电脑上
+模拟器（当手机）：    TurnStream: 订阅回合状态: http://127.0.0.1:47817
+                                   http://10.0.2.2:8799      ← 两个源同时订着
+运行中：              前台服务自己起来，通知文本跟着变
+                      「运行 sleep 8 && echo "done after 8s"」 → 「正在思考…」 → 「正在处理…」
+跑完：                id=1002「已完成 先用 bash 跑 sleep 8…」 + 回复正文那一行
+```
+
+同一天在本机（127.0.0.1 那条）也回归验了一遍：订阅日志、进行中那条、完成那条都在。
 
 ### 深度后台：整个进程会被冻住（2026-10-13）
 

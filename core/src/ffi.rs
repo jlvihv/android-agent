@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use crate::linux::SandboxConfig;
-use crate::state::{BrowserApi, DeviceApi, TurnApi};
+use crate::state::{BrowserApi, DeviceApi};
 use crate::Core;
 
 /// 统一的错误类型。`flat_error` 让 Kotlin 侧只拿到一个异常类 + 消息字符串，
@@ -120,34 +120,6 @@ impl BrowserApi for BrowserAdapter {
     }
 }
 
-/// 回合状态的接收方，**由 Kotlin 实现**（拉前台服务、刷通知栏那一行）。
-///
-/// 实现方不能阻塞：它是从 agent 的 tokio 线程上直接调的，做重的活请自己转手
-/// （壳那边只做「改一份内存里的状态 + `NotificationManager.notify`」）。
-#[uniffi::export(callback_interface)]
-pub trait TurnHost: Send + Sync {
-    /// 还有回合在跑吗。会重复收到同样的值（幂等）。
-    fn turn(&self, active: bool);
-
-    /// 一份实时状态（`status::Snapshot` 的 JSON）：这一刻在跑什么。
-    ///
-    /// 频度由 Rust 侧控（见 `status::Reporter`）：流式正文半秒一次，阶段切换
-    /// 立刻。空转的重复值不会发过来。
-    fn status(&self, status_json: String);
-}
-
-struct TurnAdapter(Box<dyn TurnHost>);
-
-impl TurnApi for TurnAdapter {
-    fn turn(&self, active: bool) {
-        self.0.turn(active);
-    }
-
-    fn status(&self, status_json: &str) {
-        self.0.status(status_json.to_string());
-    }
-}
-
 /// 核心句柄。Kotlin 持有它，生命周期跟 Application 一致。
 #[derive(uniffi::Object)]
 pub struct AgentCore {
@@ -217,13 +189,6 @@ impl AgentCore {
         self.core
             .state
             .set_browser(std::sync::Arc::new(BrowserAdapter(host)));
-    }
-
-    /// 注入回合状态的接收方。`AgentApp.onCreate` 里调。
-    pub fn set_turn_host(&self, host: Box<dyn TurnHost>) {
-        self.core
-            .state
-            .set_turn_host(std::sync::Arc::new(TurnAdapter(host)));
     }
 
     /// 配置 Linux 沙箱。

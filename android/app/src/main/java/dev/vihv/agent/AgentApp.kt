@@ -152,10 +152,6 @@ class AgentApp : Application() {
             core.setBrowser(b)
         }.onFailure { Log.w(TAG, "浏览器注入失败", it) }
 
-        // 1c. 回合开始/结束的通知方 —— 拉/收前台服务（见 AgentForegroundService）。
-        //     同样不依赖无障碍：切后台保活跟读屏是两件事。
-        runCatching { core.setTurnHost(TurnHostImpl(this)) }
-            .onFailure { Log.w(TAG, "回合通知方注入失败", it) }
 
         // 2. 配 Linux 沙箱。
         //    安卓上 proot 必须住在 nativeLibraryDir（那里才允许 exec），
@@ -230,6 +226,15 @@ class AgentApp : Application() {
 
         // 4. 如果无障碍服务已经连上了（进程重启的情况），补一次注入
         runCatching { AgentAccessibilityService.instance?.let { onDeviceReady(it) } }
+
+        // 4b. 订阅回合状态（通知栏那一行 + 前台服务的起停）。
+        //     和「连着的那台电脑」是同一条流、同一个实现，只差 base URL —— 见 TurnStream。
+        runCatching {
+            val t = token
+            if (port > 0 && !t.isNullOrBlank()) {
+                TurnStream.sync(this, mapOf("http://127.0.0.1:$port" to t))
+            }
+        }.onFailure { Log.w(TAG, "订阅回合状态失败", it) }
 
         // 注意：前台服务**不在这里起**。
         // Android 12+ 会抛 ForegroundServiceStartNotAllowedException ——

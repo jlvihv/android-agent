@@ -66,10 +66,11 @@ data class TurnStatus(
  * 形状照抄 OpenMinis 的 `SessionActivityTracker`：一个对象存着「现在谁在跑、跑到哪
  * 一步了」，前台服务订阅它、每次变化就把通知就地改一遍。区别只在事实从哪儿来 ——
  * 他们的状态在 Kotlin 里（agent loop 也在 Kotlin 里），我们的状态在 Rust 里
- * （agent loop 在 Rust 里），所以要有人把 `TurnHost.status` 推过来的 JSON 写进来：
+ * （agent loop 在 Rust 里），所以要有人把核心推过来的 JSON 写进来 —— 那个人是 [TurnStream]
+ * （本地核心和「连着的那台电脑」订阅的是同一条 SSE，见它）：
  *
  * ```
- * Rust status::Reporter ──TurnHost.status()──▶ LiveTurnStatus.update()
+ * Rust status::Reporter ──Event::Turn──▶ TurnStream ──▶ LiveTurnStatus.update()
  *                                                     │ 变化
  *                        AgentForegroundService ◀─────┘（订阅者，重画进行中的通知）
  *                        AgentNotifications.showDone ◀─（完事那一条，独立于服务）
@@ -126,7 +127,7 @@ object LiveTurnStatus {
     }
 
     /**
-     * `TurnHost.turn`：还有回合在跑吗（前台服务的起/停跟它走）。
+     * [TurnStream] 收到 `turn_active=false` 时调：还有回合在跑吗（前台服务的起/停跟它走）。
      *
      * 全部停下来之后清理一遍地图：**刚完事那几条留着**（它们可能正被画成最后一帧，
      * 见 [view]），更早的那些扔掉 —— 它们该做的都做完了（完成通知已经发出去），

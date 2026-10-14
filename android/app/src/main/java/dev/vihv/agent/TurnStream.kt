@@ -1,0 +1,169 @@
+package dev.vihv.agent
+
+import android.content.Context
+import android.os.SystemClock
+import android.util.Log
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * 订阅核心的回合状态（SSE：`GET /api/turns/stream`），喂给 [LiveTurnStatus]。
+ *
+ * **手机自己的核心和「连着的那台电脑」是同一个实现** —— 两边都只是「HTTP + 一个 token」，
+ * 只差 base URL：
+ *
+ * ```
+ * http://127.0.0.1:<本地端口>    或    http://192.168.x.x:<端口>
+ *
+ * {"type":"turn","status":{…}}         → LiveTurnStatus.update（通知栏那一行）
+ * {"type":"turn_active","active":…}    → 起/停前台服务
+ * ```
+ *
+ * 以前本地走的是 UniFFI 回调（同进程直接调函数），而「连电脑」那条**根本没有** ——
+ * 两条路各自演化（见 docs/06）。现在只有这一条：谁在跑都从同一条流里来。
+ *
+ * 为什么不在 WebView 里做这件事：App 切到后台，WebView 的 JS 会被系统挂起，而通知栏
+ * 恰恰是「App 不在前台」时才有用。
+ *
+ * 断线重连：2 秒一次，直到 [stop]。核心重启、手机刚从系统冻结里醒来、Wi-Fi 抖一下，
+ * 都靠它自己接上；接上时服务端会先补一帧当前状态（`AppState::turn_snapshot`）。
+ */
+object TurnStream {
+
+    private const val TAG = "TurnStream"
+    private const val RETRY_MS = 2_000L
+
+    /** 重连退避的上限。连不上（核心还没起、老核心没这个端点）时别每 2 秒刷一条日志。 */
+    private const val RETRY_MAX_MS = 30_000L
+
+    /**
+     * 读超时。**不能设 0**：SEV 长连接靠服务端每 15 秒一条 keep-alive 注释心跳，
+     * 设一个比它大的超时（而且不是无限等）才能发现「网断了但对端没关连接」。
+     */
+    private const val READ_TIMEOUT_MS = 45_000
+
+    /** 一个订阅目标。同一个 base 只留一个。 */
+    private class Sub(val base: String, val token: String) {
+        @Volatile
+        var stop = false
+
+        /** 这个源上现在有没有回合在跑。前台服务的起停看**所有源的总和**。 */
+        @Volatile
+        var active = false
+
+        /** 下一次重连等多久。连上过就退回 [RETRY_MS]，一直连不上就翻倍到 [RETRY_MAX_MS]。 */
+        @Volatile
+        var retry = RETRY_MS
+    }
+
+    private val subs = ConcurrentHashMap<String, Sub>()
+
+    /** App 级 Context：只用来发通知/起服务，不持有 Activity。 */
+    @Volatile
+    private var app: Context? = null
+
+    /**
+     * 把订阅对齐到「应该订哪些目标」：多退少补，幂等。
+     *
+     * 调用方每次把想要的清单整个算出来就行（连着/切回/回到前台都算一次），不用自己维护
+     * 「上一次订了什么」那套状态。同一个 base 的 token 变了（重新配对）也会换掉重连。
+     */
+    fun sync(ctx: Context, targets: Map<String, String>) {
+        app = ctx.applicationContext
+        for (base in subs.keys.toList()) {
+            if (base !in targets) stop(base)
+        }
+        for ((base, token) in targets) start(base, token)
+    }
+
+    private fun start(base: String, token: String) {
+        if (base.isBlank() || token.isBlank()) return
+        subs[base]?.let { if (it.token == token) return else stop(base) }
+        val s = Sub(base, token)
+        subs[base] = s
+        Thread({ follow(s) }, "turn-stream").apply { isDaemon = true }.start()
+        Log.i(TAG, "订阅回合状态: $base")
+    }
+
+    private fun stop(base: String) {
+        val s = subs.remove(base) ?: return
+        s.stop = true
+        s.active = false
+        Log.i(TAG, "退订: $base")
+        // 可能刚才是它在撑着前台服务
+        refreshForeground()
+    }
+
+    /** 连着重试，直到 [Sub.stop]。 */
+    private fun follow(s: Sub) {
+        while (!s.stop) {
+            try {
+                read(s)
+                if (!s.stop) Log.w(TAG, "订阅断了（服务端关了连接），重连: ${s.base}")
+            } catch (t: Throwable) {
+                if (!s.stop) {
+                    Log.w(TAG, "订阅断了（${t.javaClass.simpleName}: ${t.message}），${s.retry}ms 后重连: ${s.base}")
+                }
+            }
+            if (s.stop) break
+            SystemClock.sleep(s.retry)
+            s.retry = (s.retry * 2).coerceAtMost(RETRY_MAX_MS)
+        }
+    }
+
+    /** 一条 SSE 连接，读到断为止。 */
+    private fun read(s: Sub) {
+        val conn = (URL("${s.base}/api/turns/stream").openConnection() as HttpURLConnection).apply {
+            connectTimeout = 10_000
+            readTimeout = READ_TIMEOUT_MS
+            setRequestProperty("Cookie", "agent_token=${s.token}")
+            setRequestProperty("Accept", "text/event-stream")
+        }
+        try {
+            val reader = conn.inputStream.bufferedReader()
+            // 连上了：退避归位（下次真断了要快点接回来）
+            s.retry = RETRY_MS
+            while (!s.stop) {
+                // 返回 null = 对端关了（或者读超时）—— 交给 follow() 重连
+                val line = reader.readLine() ?: return
+                // SSE：只认 `data:` 行；空行和 `:` 开头的 keep-alive 注释都不管
+                if (line.startsWith("data:")) handle(s, line.removePrefix("data:").trim())
+            }
+        } finally {
+            runCatching { conn.disconnect() }
+        }
+    }
+
+    private fun handle(s: Sub, json: String) {
+        val o = runCatching { JSONObject(json) }.getOrNull() ?: return
+        when (o.optString("type")) {
+            "turn" -> o.optJSONObject("status")?.let { status ->
+                app?.let { LiveTurnStatus.update(it, status.toString()) }
+            }
+            "turn_active" -> {
+                s.active = o.optBoolean("active", false)
+                refreshForeground()
+            }
+        }
+    }
+
+    /**
+     * 起停前台服务：**只要有一个源在跑就得挂着**，全停下来才停。
+     *
+     * 两个源同时存在是正常的：连着电脑时手机自己的核心也还跑着（`just phone` 那种从
+     * 电脑驱动手机的回合走的就是它），两边都可能各自开一个回合。
+     */
+    private fun refreshForeground() {
+        val ctx = app ?: return
+        if (subs.values.any { it.active }) {
+            // 通知权限只能在 Activity 里问，而这是唯一一次「人就在看着」的时机
+            MainActivity.current?.maybeAskNotificationPermission()
+            AgentForegroundService.start(ctx)
+        } else {
+            LiveTurnStatus.turn(false)
+            AgentForegroundService.stop(ctx)
+        }
+    }
+}

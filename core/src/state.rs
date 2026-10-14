@@ -87,29 +87,6 @@ pub trait DeviceApi: Send + Sync + 'static {
     }
 }
 
-/// 平回开始/结束的通知方（由 Kotlin 实现）。
-///
-/// 两件事：**回合进行中把前台服务挂上**（让进程别被系统回收），以及**把回合
-/// 此刻在干什么告诉通知栏**。以前是常驻服务 + 常驻通知，那个通知没有任何信息量；
-/// 现在回合开始起、结束停，通知只在真有东西在跑的时候出现，而且内容是活的
-/// （在跑哪条命令 / 在想 / 在写什么 —— 形状见 `status::Snapshot`）。
-///
-/// 为什么需要它：切到后台的回合一旦进程被杀，浏览器那只 WebView（页面、
-/// 登录态）就没了，正在跑的 bash 也死。会话历史能告诉你“做到哪一步”。
-///
-/// 实现方**不能阻塞** —— 这是从 agent 的 tokio 线程上直接调的。
-pub trait TurnApi: Send + Sync + 'static {
-    /// `true` = 有回合在跑（可能不止一个会话）。实现应当幂等。
-    fn turn(&self, active: bool);
-
-    /// 一份实时状态快照（`status::Snapshot` 的 JSON）。
-    ///
-    /// 频度由 Rust 侧控：一个回合几步、每个工具两次、流式正文半秒一次
-    /// （见 `status::Reporter`）。壳那边把它当成「把刚才那条通知改一遍」的信号，
-    /// 不要在这儿做重活。
-    fn status(&self, status_json: &str);
-}
-
 // ---------------------------------------------------------------------------
 // 浏览器能力（同样是决策 D2 的落点，但刻意和 DeviceApi 分开）
 // ---------------------------------------------------------------------------
@@ -175,6 +152,15 @@ pub enum Event {
         ok: bool,
         detail: String,
     },
+    /// 一个回合此刻在干什么（`status::Snapshot` 的 JSON）。
+    ///
+    /// 它和其他事件走**同一条总线**（`/api/ws`，外加一条给壳用的 SSE：`/api/turns/stream`）。
+    /// 以前这里不是总线：同进程的壳走 UniFFI 回调直接拿（`TurnApi::status`），而
+    /// 「手机连到电脑上的核心」那条就什么都拿不到 —— 两套形状、同一份状态语义要维护两遍。
+    /// 现在所有订阅者（手机壳、前端、脚本）拿的是同一份 JSON（见 docs/06）。
+    Turn { status: serde_json::Value },
+    /// 有没有回合在跑（壳的前台服务起/停、界面上的「运行中」都跟它走）
+    TurnActive { active: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -209,8 +195,11 @@ pub struct AppState {
     /// 浏览器实现。和 `device` 分开：它的可用条件是无障碍无关的
     /// （见 `BrowserApi` 的说明）。
     pub browser: RwLock<Option<Arc<dyn BrowserApi>>>,
-    /// 回合开始/结束的接收方（前台服务用）。见 `TurnApi`。
-    pub turn: RwLock<Option<Arc<dyn TurnApi>>>,
+    /// 各会话**最后一次**的实时状态（`status::Snapshot` 的 JSON），key = sid。
+    ///
+    /// 只为一件事：有人刚订阅上来时补一帧「现在在跑什么」（见 `turn_snapshot`）。
+    /// 不落盘、不清理：一个会话一行，下一次回合覆盖它自己那一行。
+    pub turn_status: Mutex<HashMap<String, serde_json::Value>>,
     pub port: AtomicU16,
     pub mock: AtomicBool,
     /// 会话历史。用 tokio 的 RwLock，因为 agent loop 会跨 await 持有。
@@ -305,7 +294,7 @@ impl AppState {
             tx,
             device: RwLock::new(None),
             browser: RwLock::new(None),
-            turn: RwLock::new(None),
+            turn_status: Mutex::new(HashMap::new()),
             port: AtomicU16::new(0),
             mock: AtomicBool::new(false),
             chat: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
@@ -374,12 +363,6 @@ impl AppState {
     pub fn set_browser(&self, b: Arc<dyn BrowserApi>) {
         if let Ok(mut g) = self.browser.write() {
             *g = Some(b);
-        }
-    }
-
-    pub fn set_turn_host(&self, t: Arc<dyn TurnApi>) {
-        if let Ok(mut g) = self.turn.write() {
-            *g = Some(t);
         }
     }
 
@@ -848,19 +831,41 @@ impl AppState {
 
     /// 把“还有没有回合在跑”告诉壳（前台服务跟这个走）。
     fn notify_turn(&self) {
-        let Some(h) = self.turn.read().ok().and_then(|g| g.clone()) else {
-            return;
-        };
-        h.turn(!self.busy_sessions().is_empty());
+        self.emit(Event::TurnActive {
+            active: !self.busy_sessions().is_empty(),
+        });
     }
 
-    /// 把一份实时状态交给壳（通知栏那一行）。没人听就丢掉 —— 桌面上、或者脚本
-    /// 在后面跑的时候，这条通路本来就是空的，不是错误。
+    /// 把一份实时状态发到总线上（手机壳的通知栏、前端、脚本都在那儿听）。
+    ///
+    /// 没人听就是广播没人收，不是错误 —— 桌面上单独跑、没有订阅者时也一样发。
     pub fn push_turn_status(&self, status_json: &str) {
-        let Some(h) = self.turn.read().ok().and_then(|g| g.clone()) else {
+        let Ok(status) = serde_json::from_str::<serde_json::Value>(status_json) else {
+            // 这是**我们自己**序列化的东西（`status::Snapshot`），解析不了就是 bug；
+            // 但通知栏少一帧远比 panic 强，所以只记一笔
+            self.log("warn", format!("回合状态不是合法 JSON: {status_json}"));
             return;
         };
-        h.status(status_json);
+        if let Some(sid) = status.get("sid").and_then(|v| v.as_str()) {
+            if let Ok(mut g) = self.turn_status.lock() {
+                g.insert(sid.to_string(), status.clone());
+            }
+        }
+        self.emit(Event::Turn { status });
+    }
+
+    /// 给刚订阅上来的客户端补一帧「现在在跑什么」：先一句有没有回合在跑，再逐条状态。
+    ///
+    /// 为什么要补：订阅者可能在回合跑了一半才连上（手机壳刚起、刚从冻住里醒来、
+    /// 网络刚回来），不补的话它得等下一次变化 —— 而一条 `bash` 可能几分钟不产生变化。
+    pub fn turn_snapshot(&self) -> Vec<Event> {
+        let mut out = vec![Event::TurnActive {
+            active: !self.busy_sessions().is_empty(),
+        }];
+        if let Ok(g) = self.turn_status.lock() {
+            out.extend(g.values().cloned().map(|status| Event::Turn { status }));
+        }
+        out
     }
 
     pub fn is_busy(&self, sid: &str) -> bool {
@@ -1650,5 +1655,63 @@ mod tests {
         assert!(!dir.join("old.pdf").exists() && dir.join("new.pdf").exists());
         drop(pending);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回合状态现在是**总线上的事件**（以前那条 UniFFI 回调只服务本地壳）。
+    /// 这里钉两件事：实时广播 + 晚连上来的订阅者能补到当前状态。
+    #[test]
+    fn turn_status_is_broadcast_and_replayed_to_late_subscribers() {
+        let st = AppState::new();
+        let mut rx = st.tx.subscribe();
+        let turn = st.begin_turn("s1").unwrap();
+
+        st.push_turn_status(r#"{"sid":"s1","phase":"thinking","active":true}"#);
+        // 注意 `begin_turn` 自己也会发一条 `TurnActive`（起前台服务用），所以要挑出来看
+        let mut told = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, Event::Turn { .. }) {
+                told = true;
+            }
+        }
+        assert!(told, "状态要发到总线上");
+
+        // 晚连上来的（手机壳刚起、刚从冻住里醒来）能补到「在跑 + 跑到哪一步」
+        let snap = st.turn_snapshot();
+        assert!(
+            snap.iter()
+                .any(|e| matches!(e, Event::TurnActive { active: true })),
+            "{snap:?}"
+        );
+        assert_eq!(
+            snap.iter().filter(|e| matches!(e, Event::Turn { .. })).count(),
+            1
+        );
+
+        // 回合结束：订阅者要收到「没了」
+        st.end_turn("s1");
+        let mut idle = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, Event::TurnActive { active: false }) {
+                idle = true;
+            }
+        }
+        assert!(idle, "回合结束要告诉订阅者");
+        drop(turn);
+    }
+
+    /// 状态是我们自己序列化的，真解析不了也不能把 agent loop 带崩 —— 只记一笔、丢掉。
+    #[test]
+    fn garbage_turn_status_is_dropped_not_fatal() {
+        let st = AppState::new();
+        let mut rx = st.tx.subscribe();
+        st.push_turn_status("这不是 JSON");
+        // 会发一条 `Log`（它自己也走总线），但**不能**发出一条状态
+        let mut turns = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, Event::Turn { .. }) {
+                turns += 1;
+            }
+        }
+        assert_eq!(turns, 0, "坏的一帧不该发出去");
     }
 }

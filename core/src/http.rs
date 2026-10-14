@@ -3,6 +3,7 @@
 //! 前端与 API **同源**（决策 D3），所以不需要 CORS，且 `http://127.0.0.1`
 //! 是 secure context —— `crypto.subtle`、Service Worker 都能用。
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +69,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/reset", post(reset))
         .route("/api/device/log", post(device_log))
         .route("/api/ws", get(ws_upgrade))
+        // 回合状态的 SSE 流。手机壳订阅它来刷通知栏 / 起停前台服务；它和 `/api/ws`
+        // 是同一份东西（`Event` 的 JSON），只是换一个壳好读的传输（见 `turns_stream`）。
+        .route("/api/turns/stream", get(turns_stream))
         .route("/auth", get(auth_login))
         .route("/sandbox/{key}", get(sandbox_root))
         .route("/sandbox/{key}/", get(sandbox_root))
@@ -2223,9 +2227,64 @@ async fn dir_listing(guest: &str, host: &std::path::Path) -> Response {
     res
 }
 
+/// 回合状态的 SSE 流（手机壳订阅它：刷通知栏那一行、起停前台服务）。
+///
+/// 为什么不直接用 `/api/ws`：壳那边（Kotlin）不想为一个「只收不发」的小用途引一个
+/// WebSocket 客户端（握手 + 帧解析得自己写）；SSE 就是「HTTP 长连接 + 几行 `data:`」，
+/// `HttpURLConnection` 读一行处理一行就完了。两边发的是**同一个 `Event` 的 JSON**。
+///
+/// 连上先补一帧当前状态（`AppState::turn_snapshot`）：订阅者可能在回合跑了一半才连上
+/// （壳刚起、刚从系统冻住里醒来、网络刚回来），而一条 `bash` 可能几分钟不产生变化 ——
+/// 不补的话它的通知栏就一直空着。
+///
+/// 鉴权走和其他 `/api/*` 一样的中间件（token cookie / 配对凭据），所以「手机连电脑上的
+/// 核心」那条也能用同一个客户端订阅。
+async fn turns_stream(State(st): State<Arc<AppState>>) -> Response {
+    let mut rx = st.tx.subscribe();
+    let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
+
+    tokio::spawn(async move {
+        for ev in st.turn_snapshot() {
+            if send_turn(&tx, &ev).await.is_err() {
+                return;
+            }
+        }
+        loop {
+            match rx.recv().await {
+                // 只转发回合状态。这条流不是事件总线，日志/设备事件不捎带
+                Ok(ev @ (Event::Turn { .. } | Event::TurnActive { .. })) => {
+                    if send_turn(&tx, &ev).await.is_err() {
+                        break; // 客户端断开
+                    }
+                }
+                Ok(_) => {}
+                // 慢了：状态本来就是「最新一份覆盖旧的」，丢了就丢了
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream::new(out_rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// 把一条事件塞进 SSE 流。
+async fn send_turn(
+    tx: &tokio::sync::mpsc::Sender<Result<SseEvent, Infallible>>,
+    ev: &Event,
+) -> Result<(), ()> {
+    let Ok(json) = serde_json::to_string(ev) else {
+        return Ok(()); // 序列化不了就丢这一帧，不值得把整条流掐了
+    };
+    tx.send(Ok(SseEvent::default().data(json)))
+        .await
+        .map_err(|_| ())
+}
+
 async fn ws_loop(mut socket: WebSocket, st: Arc<AppState>) {
     let mut rx = st.tx.subscribe();
-
     // 握手：先告诉前端自己在哪、有没有设备
     let hello = Event::Hello {
         port: st.port.load(std::sync::atomic::Ordering::Relaxed),

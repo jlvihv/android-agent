@@ -8,8 +8,9 @@
 //! 形状照抄 OpenMinis（`SessionActivityTracker` + `AgentNotificationContent`）：
 //! 那边有一个 tracker 对象当**唯一事实来源**，前台服务订阅它、就地把通知改一遍。
 //! 我们的状态在 Rust 里，所以事实来源留在这边：agent loop 在值得看一眼的时刻推一
-//! 份 JSON 快照给壳（`TurnApi::status`），壳只管画。这样「什么算一个阶段」「细节取
-//! 哪一行」这些判断都留在能写测试的地方（见文件末尾）。
+//! 份 JSON 快照到**总线**上（`Event::Turn`，见 `state.rs`：前端走 `/api/ws`，手机壳
+//! 走 `/api/turns/stream`），订阅者只管画。这样「什么算一个阶段」「细节取哪一行」这些
+//! 判断都留在能写测试的地方（见文件末尾）。
 //!
 //! **频度是这里最要紧的一件事**：正文是逐块流过来的（一条长回复几千块），每块都过
 //! 一遍 FFI + 刷一次通知是白费 —— 流式的更新按 [STREAM_INTERVAL] 攒着发，阶段切换
@@ -610,9 +611,8 @@ mod tests {
 
     #[test]
     fn reporter_pushes_a_status_for_every_phase_of_a_turn() {
-        // 一条完整回合该在壳那边看到的序列：想 → 写 → 跑工具 → 完事。
-        // 用「有没有接壳」看不出区别（配置靠 `set_turn_host`），所以这里
-        // 直接验阶段名 —— 它们是跨语言约定的一部分。
+        // 阶段名是**跨语言约定**（壳的 `Phase.of()` 按它解析），所以在这里钉住。
+        // 至于「谁在听」：那是总线的事，跟播报器无关（没有订阅者时发出去就是没人收）。
         assert_eq!(Phase::Thinking.as_str(), "thinking");
         assert_eq!(Phase::Streaming.as_str(), "streaming");
         assert_eq!(Phase::Tool.as_str(), "tool");
