@@ -181,26 +181,66 @@ if [ "$NOW" = 0 ]; then
     sleep 5
 fi
 
-# --- 3. 杀老核心（连它的子进程：mDNS 广播、无头 Chrome） ---------------------
-log "杀掉核心 pid=$PID"
-kill "$PID" 2>/dev/null || true
-for _ in $(seq 1 50); do
-    kill -0 "$PID" 2>/dev/null || break
-    sleep 0.2
-done
-kill -9 "$PID" 2>/dev/null || true
-# 旧广播留着会和新核心发的那条撞名；旧 Chrome 不解掉会让新核心起不了它自己那只
-# （CDP 那只共用同一个 user-data-dir，有单实例锁）
-pkill -f 'avahi-publish-service' 2>/dev/null || true
-pkill -f "user-data-dir=$DATA_DIR/chrome" 2>/dev/null || true
-sleep 1
+# 健康检查：两条路（systemd / 手动）都要用，所以放前面
+healthy() {
+    for _ in $(seq 1 "$HEALTH_TRIES"); do
+        if [ "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/api/health" 2>/dev/null)" = "200" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
 
-# --- 4. 原样起新的 ----------------------------------------------------------
-start_core() { # $1 = 用哪个二进制
-    local bin="$1"
-    log "启动 $bin"
-    AGENT_RESTART_BIN="$bin" AGENT_RESTART_CWD="$CWD" AGENT_RESTART_ENV="$ENVFILE" \
-        setsid python3 - <<'PY' >>"$LOG" 2>&1 &
+# 这个核心归 systemd 用户服务管吗？（`android-agent.service`，开机自启那套）
+#
+# 归它管就**只**用 systemctl 重启：手动 kill + 手动起会和它抢端口、抢单实例锁 ——
+# 它有 `Restart=always`，会先把旧的核心拉回来，我们手动起的那个死在锁上，脚本
+# 还会以为「新核心没起来」，拿备份的旧二进制兜回去（越兜越乱）。
+# 想让脚本自己起（比如临时试个别的二进制）：先 `systemctl --user stop android-agent`。
+SYSTEMD_UNIT=android-agent.service
+SYSTEMD_MANAGED=0
+if systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null &&
+    [ "$(systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null)" = "$PID" ]; then
+    SYSTEMD_MANAGED=1
+fi
+
+if [ "$SYSTEMD_MANAGED" = 1 ]; then
+    # --- 3/4. 重启：交给 systemd（环境在 unit 里，不抄 /proc） ---------------
+    log "核心归 $SYSTEMD_UNIT 管 —— systemctl --user restart（不手动 kill / 起）"
+    systemctl --user restart "$SYSTEMD_UNIT"
+    if healthy; then
+        log "✅ 新核心起来了（systemctl --user restart，$BASE）"
+    else
+        log "❌ systemctl --user restart 之后健康检查一直不过 —— journalctl --user -u $SYSTEMD_UNIT"
+        exit 1
+    fi
+else
+    # --- 3. 杀老核心（连它的子进程：mDNS 广播、无头 Chrome） -----------------
+    log "杀掉核心 pid=$PID"
+    kill "$PID" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        kill -0 "$PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    kill -9 "$PID" 2>/dev/null || true
+    # 旧广播留着会和新核心发的那条撞名；旧 Chrome 不解掉会让新核心起不了它自己那只
+    # （CDP 那只共用同一个 user-data-dir，有单实例锁）
+    pkill -f 'avahi-publish-service' 2>/dev/null || true
+    pkill -f "user-data-dir=$DATA_DIR/chrome" 2>/dev/null || true
+    sleep 1
+
+    # --- 4. 原样起新的 ------------------------------------------------------
+    start_core() { # $1 = 用哪个二进制
+        local bin="$1"
+        log "启动 $bin"
+        # 末尾的 `9>&-` 不能少：fd 9 是上面那把「一次只跑一个重启」的 flock（`exec 9>…`）。
+        # 子进程会**继承**它，而这个子进程最后 execve 成了新核心 —— 于是锁被跑着的核心
+        # 一直攥着，**下一次**重启走到 `flock -n 9` 就悄悄说一句「已经有一个重启在跑了」
+        # 退出 0：什么都没做，看着却像成功了（实测踩到：核心的 fd 9 指着 core-restart.lock，
+        # 连它拉起来的 avahi 也跟着攥着）。
+        AGENT_RESTART_BIN="$bin" AGENT_RESTART_CWD="$CWD" AGENT_RESTART_ENV="$ENVFILE" \
+            setsid python3 - <<'PY' >>"$LOG" 2>&1 9>&- &
 import os
 bin = os.environ["AGENT_RESTART_BIN"]
 cwd = os.environ["AGENT_RESTART_CWD"]
@@ -214,43 +254,34 @@ env.pop("AGENT_MULTI", None)   # 单实例锁该拿还得拿
 os.chdir(cwd)
 os.execve(bin, [bin], env)
 PY
-}
+    }
 
-healthy() {
-    for _ in $(seq 1 "$HEALTH_TRIES"); do
-        if [ "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/api/health" 2>/dev/null)" = "200" ]; then
-            return 0
+    # 起一把不行就再试：老核心刚死时那个端口可能还没放干净（TIME_WAIT 之类），
+    # 一次失败就退到备份二进制太急了。
+    try_start() { # $1 = 二进制，$2 = 叫什么（日志里用）
+        local bin="$1" what="$2" attempt
+        for attempt in 1 2 3; do
+            start_core "$bin"
+            if healthy; then
+                log "✅ $what 起来了（$BASE，第 $attempt 次尝试）"
+                return 0
+            fi
+            log "⚠️ $what 第 $attempt 次没起来（端口没放干净？）—— 清一下、5 秒后再试"
+            pkill -f 'release/agent-[d]ev' 2>/dev/null || true
+            pkill -f 'agent-dev[.]prev' 2>/dev/null || true
+            sleep 5
+        done
+        return 1
+    }
+
+    if ! try_start "$BIN" "新核心"; then
+        log "❌ 新核心三次都没起来 —— 用备份的旧二进制兜回去（$BACKUP）"
+        if try_start "$BACKUP" "旧的（备份）"; then
+            log "⚠️ 退回到旧二进制了：现在是能用的状态，但跑的是老代码"
+        else
+            log "❌❌ 都起不来 —— 到终端里手动跑：just dev-host"
+            exit 1
         fi
-        sleep 1
-    done
-    return 1
-}
-
-# 起一把不行就再试：老核心刚死时那个端口可能还没放干净（TIME_WAIT 之类），
-# 一次失败就退到备份二进制太急了。
-try_start() { # $1 = 二进制，$2 = 叫什么（日志里用）
-    local bin="$1" what="$2" attempt
-    for attempt in 1 2 3; do
-        start_core "$bin"
-        if healthy; then
-            log "✅ $what 起来了（$BASE，第 $attempt 次尝试）"
-            return 0
-        fi
-        log "⚠️ $what 第 $attempt 次没起来（端口没放干净？）—— 清一下、5 秒后再试"
-        pkill -f 'release/agent-[d]ev' 2>/dev/null || true
-        pkill -f 'agent-dev[.]prev' 2>/dev/null || true
-        sleep 5
-    done
-    return 1
-}
-
-if ! try_start "$BIN" "新核心"; then
-    log "❌ 新核心三次都没起来 —— 用备份的旧二进制兜回去（$BACKUP）"
-    if try_start "$BACKUP" "旧的（备份）"; then
-        log "⚠️ 退回到旧二进制了：现在是能用的状态，但跑的是老代码"
-    else
-        log "❌❌ 都起不来 —— 到终端里手动跑：just dev-host"
-        exit 1
     fi
 fi
 

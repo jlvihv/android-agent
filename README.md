@@ -61,6 +61,33 @@ python3 scripts/agentctl.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"
 pid（同时跑两个会静默地互相干扰），要两个就 `AGENT_MULTI=1`。
 差别、代价和实现见 [docs/11-host-mode.md](docs/11-host-mode.md)。
 
+**让核心常驻**（开机就在，不用手动开终端）：它是普通的 HTTP 服务，扔给 systemd
+用户服务最省事 ——
+
+```ini
+# ~/.config/systemd/user/android-agent.service
+[Service]
+WorkingDirectory=%h/Code/project/android-agent
+EnvironmentFile=-%h/Code/project/android-agent/.env.local   # 模型 / 中继都从这来
+Environment=AGENT_LINUX_HOST=1
+Environment=AGENT_HOST_WORKSPACE=%h/Code/project/android-agent
+Environment=AGENT_PORT=8787
+ExecStart=%h/Code/project/android-agent/core/target/release/agent-dev
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user enable --now android-agent     # 开机自启（配上 loginctl enable-linger）
+```
+
+unit 里**不写模型配置**：核心自己认 `OPENCODE_*`（`AGENT_LLM_*` 优先、回退它，见
+`core/src/llm.rs` 的 `from_env`），真实来源只有 `.env.local` 一个。要跑的是 release
+二进制，所以改完代码先 `scripts/restart-core.sh`（它发现核心归 systemd 管时会用
+`systemctl --user restart`）。
+
 对**手机上**跑着的那个（不用重装 APK、也不用手点手机屏幕）：
 
 ```sh
@@ -179,7 +206,7 @@ App 随时被杀都没关系。
 | `just android-debug` | 完整 Android 构建 → APK |
 | `just android-install` | 构建 + 装到连着的手机 |
 | `python3 scripts/agentctl.py "…"` | 给 agent 一句话并打印转录；不带参数进交互模式（`--json` 机器可读） |
-| `scripts/restart-core.sh` | **重启电脑上那个核心**（改完核心代码要生效时）。先编译、等回合答完、才杀；从 agent 里跑会自己脱离会话，之后顺手把手机 App 叫起来 |
+| `scripts/restart-core.sh` | **重启电脑上那个核心**（改完核心代码要生效时）。先编译、等回合答完、才杀；从 agent 里跑会自己脱离会话，之后顺手把手机 App 叫起来。核心若归 systemd 用户服务管（`android-agent.service`）就改用 `systemctl --user restart` |
 
 对着**手机上**跑着的核心（无线调试就够，不用插线、也不用手点手机屏幕）：
 

@@ -352,6 +352,12 @@ interface）、壳里的 `TurnHostImpl`。跨语言边界现在只剩 `DeviceHos
 自己 `setsid` 脱离会话（agent 的进程树挂在被杀的核心里）。手机**不用重新配对**：配对给手机的
 就是核心自己的 token，它在会话库里、跨重启不变（换的只是新设备用的那个 6 位码）。
 
+这台电脑上核心是**常驻服务**（`android-agent.service`，systemd 用户服务、开机自启，unit 在
+`~/Code/project/config/systemd/user/`，模型 / 中继只写在仓库根目录的 `.env.local` 里）。
+核心归它管时，`restart-core.sh` **只用 `systemctl --user restart`**，不自己 kill / 起 ——
+手动那套会和它抢端口和单实例锁（它有 `Restart=always`，会先把旧的核心拉回来）。
+想让脚本自己起（临时换一个二进制试）先 `systemctl --user stop android-agent`。
+
 ```
 本机临时核心（8799）：回合跑在电脑上
 模拟器（当手机）：    TurnStream: 订阅回合状态: http://127.0.0.1:47817
