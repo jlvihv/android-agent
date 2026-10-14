@@ -1,6 +1,7 @@
 package dev.vihv.agent
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentValues
 import android.content.Intent
@@ -965,6 +966,10 @@ class MainActivity : Activity() {
         }
     }
 
+    // 这里必须用 **lint 的** @SuppressLint，不是 Kotlin 的 @Suppress("NewApi")：
+    // 后者只管编译器，lint 照样报下面那个 `android.window.OnBackInvokedCallback` 的类引用。
+    // 而这条路径只在 API 33+ 才走到（调用方判断过），所以是真安全。
+    @SuppressLint("NewApi")
     private fun registerBackCallback() {
         if (backCallback != null) return
         Log.i(TAG, "注册系统返回回调（页面里有覆盖层，SDK ${Build.VERSION.SDK_INT}）")

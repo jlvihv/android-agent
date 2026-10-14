@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  这个文件**不是**用来把 lint 关掉的 —— 它把「我们明知故犯的那几条」逐条记在这里，
+  好让 `./gradlew :app:lintDebug` 跑完之后**剩下的每一条都值得看**。
+
+  每条都对应一个已经写在代码 / docs 里的决定（注释里指出来了）；哪天决定变了，
+  回来把这行删掉 —— 那时它应该重新报出来提醒我们。
+
+  能就地解决的（比如某一处 API 版本守卫 lint 看不穿）就在代码里加
+  `@android.annotation.SuppressLint`，不要往这里塞：这里只放**项目级**的取舍。
+-->
+<lint>
+    <!-- 自用 App：沙箱要读写整个内部存储（见 AndroidManifest.xml 那段注释、docs/02）。
+         Play 的「别用 MANAGE_EXTERNAL_STORAGE」政策不适用 —— 这个包不进 Play。 -->
+    <issue id="ScopedStorage" severity="ignore" />
+
+    <!-- 明确不引 AndroidX（见 app/build.gradle.kts 里那条注释）：返回键走平台 API，
+         OnBackPressedDispatcher 是 AndroidX 的东西，用不上。 -->
+    <issue id="GestureBackNavigation" severity="ignore" />
+
+    <!-- minSdk 26 只是名义上的（实际跑在 Android 15 / 17 上）。这些「更高版本才用得上」
+         的属性（enableOnBackInvokedCallback）留着是为了新系统上的行为，不是漏写。 -->
+    <issue id="UnusedAttribute" severity="ignore" />
+
+    <!-- allowBackup=false 是有意的（会话库、token 都在私有目录里）。 -->
+    <issue id="DataExtractionRules" severity="ignore" />
+
+    <!-- loopback 明文 HTTP 是本项目的架构（决策 D3，见 network_security_config.xml）。 -->
+    <issue id="InsecureBaseConfiguration" severity="ignore" />
+
+    <!-- 版本 / ABI 的取舍都写在 build.gradle.kts 的注释里（targetSdk 35、只出 arm64）。 -->
+    <issue id="OldTargetApi" severity="ignore" />
+    <issue id="NewerVersionAvailable" severity="ignore" />
+    <issue id="ChromeOsAbiSupport" severity="ignore" />
+
+    <!-- 生成物：uniffi 的 Kotlin 绑定（`just android-bindings` 生成，不进 git）。
+         它那句 `java.lang.ref.Cleaner` 外面有 `Class.forName` 守卫（旧系统自动退回 JNA
+         cleaner），lint 看不穿。手改生成物没意义 —— 下次 bindgen 就冲掉了。 -->
+    <issue id="NewApi">
+        <ignore path="**/uniffi/**" />
+    </issue>
+
+    <!-- 静态字段持有 Context：都是刻意的，代码里各自写了为什么（Application context、
+         或者 onPause 就清）。**按文件列**而不是全局忽略 —— 以后新文件里再出现这种写法
+         仍然会报出来让人看一眼。 -->
+    <issue id="StaticFieldLeak">
+        <ignore path="**/HeadlessCapture.kt" />
+        <ignore path="**/MainActivity.kt" />
+    </issue>
+
+    <!-- DragRow：消息里那种「按住拖」的行，不是按钮，没有 performClick 可言。 -->
+    <issue id="ClickableViewAccessibility">
+        <ignore path="**/BrowserPanel.kt" />
+    </issue>
+</lint>

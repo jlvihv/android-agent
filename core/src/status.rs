@@ -150,7 +150,9 @@ impl Reporter {
     /// 连着调只有第一次有用（阶段没变就直接返回，连 JSON 都不拼）。
     pub fn thinking(&self) {
         {
-            let Ok(mut last) = self.last.lock() else { return };
+            let Ok(mut last) = self.last.lock() else {
+                return;
+            };
             if last.phase == Some(Phase::Thinking.as_str()) {
                 return;
             }
@@ -168,7 +170,9 @@ impl Reporter {
     pub fn streaming(&self, text: &str) {
         let detail = reply_preview(text);
         {
-            let Ok(mut last) = self.last.lock() else { return };
+            let Ok(mut last) = self.last.lock() else {
+                return;
+            };
             // 先记住：结束那一条要用它当回复预览（**不受节流限制**，
             // 否则最后半秒写的东西会在「完成」通知里缺席）
             last.reply = detail.clone();
@@ -225,12 +229,7 @@ impl Reporter {
     }
 
     /// 还在跑的那几个阶段共用的形状（没有结束时刻，`ok` 无意义）。
-    fn running(
-        &self,
-        phase: Phase,
-        tool: Option<String>,
-        detail: Option<String>,
-    ) -> Snapshot {
+    fn running(&self, phase: Phase, tool: Option<String>, detail: Option<String>) -> Snapshot {
         Snapshot {
             sid: self.sid.clone(),
             title: self.title.clone(),
@@ -255,14 +254,16 @@ impl Reporter {
             return false;
         };
         {
-            let Ok(mut last) = self.last.lock() else { return false };
+            let Ok(mut last) = self.last.lock() else {
+                return false;
+            };
             if last.json == json {
                 return false;
             }
             // 节流只管「同一个流式阶段里的重复推送」：阶段切换（想 → 写、
             // 工具 → 想）是「有事发生了」，再快也得让壳看到。
-            let still_streaming =
-                snap.phase == Phase::Streaming.as_str() && last.phase == Some(Phase::Streaming.as_str());
+            let still_streaming = snap.phase == Phase::Streaming.as_str()
+                && last.phase == Some(Phase::Streaming.as_str());
             if !force && still_streaming {
                 if let Some(at) = last.at {
                     if at.elapsed() < STREAM_INTERVAL {
@@ -454,7 +455,7 @@ mod tests {
             Some("ls -la")
         );
         // 键还没出现
-        assert_eq!(string_arg(r#"{"# , "command"), None);
+        assert_eq!(string_arg(r#"{"#, "command"), None);
         assert_eq!(string_arg(r#"{"timeout":30}"#, "command"), None);
     }
 

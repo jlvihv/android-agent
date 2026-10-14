@@ -158,9 +158,13 @@ pub enum Event {
     /// 以前这里不是总线：同进程的壳走 UniFFI 回调直接拿（`TurnApi::status`），而
     /// 「手机连到电脑上的核心」那条就什么都拿不到 —— 两套形状、同一份状态语义要维护两遍。
     /// 现在所有订阅者（手机壳、前端、脚本）拿的是同一份 JSON（见 docs/06）。
-    Turn { status: serde_json::Value },
+    Turn {
+        status: serde_json::Value,
+    },
     /// 有没有回合在跑（壳的前台服务起/停、界面上的「运行中」都跟它走）
-    TurnActive { active: bool },
+    TurnActive {
+        active: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,7 +1687,9 @@ mod tests {
             "{snap:?}"
         );
         assert_eq!(
-            snap.iter().filter(|e| matches!(e, Event::Turn { .. })).count(),
+            snap.iter()
+                .filter(|e| matches!(e, Event::Turn { .. }))
+                .count(),
             1
         );
 

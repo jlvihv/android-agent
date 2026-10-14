@@ -1,5 +1,6 @@
 package dev.vihv.agent
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
@@ -30,6 +31,10 @@ import java.util.concurrent.ConcurrentHashMap
  * 断线重连：2 秒一次，直到 [stop]。核心重启、手机刚从系统冻结里醒来、Wi-Fi 抖一下，
  * 都靠它自己接上；接上时服务端会先补一帧当前状态（`AppState::turn_snapshot`）。
  */
+// lint 会报 「静态字段持有 Context」（StaticFieldLeak）。这里存的是 **Application** context
+// （`sync()` 里取的 `applicationContext`），它本来就与进程同寿命 —— 不是泄漏，是唯一能
+// 给「App 不在前台时」发通知的东西（拿 Activity 才会漏）。
+@SuppressLint("StaticFieldLeak")
 object TurnStream {
 
     private const val TAG = "TurnStream"

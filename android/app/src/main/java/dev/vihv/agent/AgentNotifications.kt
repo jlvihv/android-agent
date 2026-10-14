@@ -1,5 +1,6 @@
 package dev.vihv.agent
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -133,7 +134,11 @@ object AgentNotifications {
         // 只是展示面不一样 —— 不可用就退回普通通知，不是错误。
         val chip = LiveUpdates.active(ctx)
         noteSurface(chip)
-        if (chip) return promoted(ctx, title, text, icon, open, whenMs)
+        // 版本检查在这里再写一遍：`LiveUpdates.active()` 里已经有一次，但**调用点**也写明
+        // 「这条路径只在 Android 16+ 走」对读代码的人和 lint 都更清楚（lint 就是这么判的）
+        if (chip && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
+            return promoted(ctx, title, text, icon, open, whenMs)
+        }
 
         return Notification.Builder(ctx, CHANNEL_LIVE)
             .setSmallIcon(icon)
@@ -171,6 +176,7 @@ object AgentNotifications {
      * - `setShortCriticalText` 给芯片那一行**更短**的文本（通知栏那两行比芯片宽），
      * - **不**当分组摘要、**不**用自定义 View —— 这两条也会取消资格。
      */
+    @SuppressLint("NewApi") // 上面那个版本检查保证只在这里进来；里面用的都是 36+ 的 API
     private fun promoted(
         ctx: Context,
         title: String,
