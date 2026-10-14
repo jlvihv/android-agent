@@ -120,13 +120,20 @@ impl BrowserApi for BrowserAdapter {
     }
 }
 
-/// 回合状态的接收方，**由 Kotlin 实现**（拉前台服务用）。
+/// 回合状态的接收方，**由 Kotlin 实现**（拉前台服务、刷通知栏那一行）。
 ///
-/// 实现方不能阻塞：它是从 agent 的 tokio 线程上直接调的，做重的活请自己转手。
+/// 实现方不能阻塞：它是从 agent 的 tokio 线程上直接调的，做重的活请自己转手
+/// （壳那边只做「改一份内存里的状态 + `NotificationManager.notify`」）。
 #[uniffi::export(callback_interface)]
 pub trait TurnHost: Send + Sync {
     /// 还有回合在跑吗。会重复收到同样的值（幂等）。
     fn turn(&self, active: bool);
+
+    /// 一份实时状态（`status::Snapshot` 的 JSON）：这一刻在跑什么。
+    ///
+    /// 频度由 Rust 侧控（见 `status::Reporter`）：流式正文半秒一次，阶段切换
+    /// 立刻。空转的重复值不会发过来。
+    fn status(&self, status_json: String);
 }
 
 struct TurnAdapter(Box<dyn TurnHost>);
@@ -134,6 +141,10 @@ struct TurnAdapter(Box<dyn TurnHost>);
 impl TurnApi for TurnAdapter {
     fn turn(&self, active: bool) {
         self.0.turn(active);
+    }
+
+    fn status(&self, status_json: &str) {
+        self.0.status(status_json.to_string());
     }
 }
 

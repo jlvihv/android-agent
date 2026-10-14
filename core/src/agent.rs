@@ -1364,7 +1364,7 @@ pub async fn run_turn(
     // 不活跃的会话消息不在内存里，先从库里读回来（回合进行中不会被放掉，
     // 见 `AppState::evict_idle`）
     core.state.ensure_loaded(sid).await?;
-    {
+    let title = {
         let mut store = core.state.chat.write().await;
         let Some(sess) = store.get_mut(sid) else {
             anyhow::bail!("没有这个会话: {sid}");
@@ -1387,9 +1387,21 @@ pub async fn run_turn(
         }
         sess.maybe_title(user_text);
         sess.updated_at = now_ms();
-    }
+        // 通知栏那一行要显示哪个会话在跑（标题刚定下来，顺手取走，
+        // 后面播报的时候不必再回会话里查）
+        sess.title.clone()
+    };
     core.state.mark_sessions_dirty();
-    drive(core, provider, sid, &turn, &tx).await
+    // 这个回合的实时状态播报器（通知栏那一行）。不接壳时它推的东西会被丢掉，
+    // 所以桌面上、测试里都不用管它 —— 见 `status::Reporter`。
+    let status = crate::status::Reporter::new(core.state.clone(), sid, &title);
+    let res = drive(core, provider, sid, &turn, &status, &tx).await;
+    // 结束那一条**最后**推：壳收到它才去发「任务完成」通知（而 `TurnGuard` 那个
+    // Drop 一落，前台服务就停了 —— 两条路谁先谁后都得能收场，见壳里的
+    // `LiveTurnStatus`）。出错也要推：不推的话通知栏会停在最后一个工具上，
+    // 看起来像还在跑。
+    status.finish(res.is_ok(), turn.abort_requested());
+    res
 }
 
 /// 往本回合所属的会话追加一条消息。
@@ -1451,15 +1463,23 @@ impl StepOutput {
 }
 
 /// 真正的 loop：模型 → 工具 → 模型 …
+///
+/// `status` 是通知栏那一行的播报器（壳没接就是空操作）。挂在这里而不是
+/// `stream_one` 里的逐块流上：**阶段切换**（开始想 / 轮到哪个工具 / 工具跑完）
+/// 是 drive 才知道的事，而正文的逐块更新由 `status::Reporter` 自己攒。
 async fn drive(
     core: &Core,
     provider: &Provider,
     sid: &str,
     turn: &crate::state::Turn,
+    status: &crate::status::Reporter,
     tx: &mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<()> {
     let message_id = uuid::Uuid::now_v7().to_string();
     send(tx, sse::start(&message_id)).await;
+    // 回合一开先说「在想」：这会儿在预填充，一个字都还没出来。
+    // 不说的话，通知栏会停在上一回合留下的那一条上。
+    status.thinking();
 
     // 不设轮数上限：任务要多少轮就跑多少轮，"干到一半停下" 不是可接受的
     // 行为。唯一的出口是模型自己不再调工具，或者用户按停止
@@ -1472,7 +1492,7 @@ async fn drive(
         }
         send(tx, sse::start_step()).await;
 
-        let step_out = match stream_one(core, provider, sid, turn, tx).await {
+        let step_out = match stream_one(core, provider, sid, turn, status, tx).await {
             Ok(c) => c,
             Err(e) => {
                 send(tx, sse::error(&format!("{e:#}"))).await;
@@ -1526,6 +1546,10 @@ async fn drive(
             // 跑着的时候按停止要立刻生效：丢掉这个 future，bash 的子进程随之
             // 被杀（`kill_on_drop`）。不这样的话，一条 `timeout: 3600` 的命令
             // 按了停止也要等它自己跑完。
+            //
+            // 通知栏：轮到哪个工具了。放在这儿（参数已经完整）而不是只靠
+            // `stream_one` 里名字刚出现的那一下 —— 那一下只能看到半截参数。
+            status.tool(&call.name, &call.arguments);
             let outcome = tokio::select! {
                 o = execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))) => o,
                 _ = turn.aborted() => {
@@ -1547,6 +1571,9 @@ async fn drive(
                 },
             )
             .await;
+            // 这个工具完事了，但回合还没完（下一轮请求在预填充）。通知栏不能
+            // 继续显示「正在跑 apk add」—— 改成「在想」。
+            status.tool_done();
         }
         // 工具结果回灌，继续下一轮
     }
@@ -1839,6 +1866,7 @@ async fn stream_one(
     provider: &Provider,
     sid: &str,
     turn: &crate::state::Turn,
+    status: &crate::status::Reporter,
     tx: &mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<StepOutput> {
     // 这个模型能不能看图 / 吃 PDF：自动判定（models.dev，带缓存 + 落盘）。
@@ -1949,6 +1977,8 @@ async fn stream_one(
                 if let Some(r) = choice.delta.reasoning_text() {
                     emitted = true;
                     reason_acc.push_str(r);
+                    // 通知栏：从「跑工具」切回「在想」（幂等，一整段思考只推第一次）
+                    status.thinking();
                     for c in blocks.push(BlockKind::Reasoning, r) {
                         send(tx, c).await;
                     }
@@ -1957,6 +1987,8 @@ async fn stream_one(
                     if !c.is_empty() {
                         emitted = true;
                         text_acc.push_str(c);
+                        // 通知栏：正在写的最后一行（内部按半秒攒，不是每块都刷）
+                        status.streaming(&text_acc);
                         for c in blocks.push(BlockKind::Text, c) {
                             send(tx, c).await;
                         }
@@ -1997,6 +2029,10 @@ async fn stream_one(
                                 send(tx, c).await;
                             }
                             send(tx, sse::tool_input_start(id, name)).await;
+                            // 通知栏：名字一到就显示（参数这时候多半还没流完，
+                            // `tool_detail` 抠到哪儿算哪儿）。
+                            // 真正开跑之前 `drive` 会再推一次（那时参数才完整）。
+                            status.tool(name, args);
                             // id/名字到之前就来了的参数一并补上
                             if !args.is_empty() {
                                 send(tx, sse::tool_input_delta(id, args)).await;

@@ -135,6 +135,12 @@ class MainActivity : Activity() {
         if (discoveryWanted) discovery.start()
         // 从设置页回来时权限可能刚打开：重挂沙箱的 /sdcard 和 /workspace
         AgentApp.syncSharedStorage(this)
+        // 人都打开 App 了：后台跑完留下的那条「任务完成」通知没用了（结果就在眼前）。
+        // 和 OpenMinis 一样在这儿清 —— 否则用户会在通知栏里找到一条自己刚看过的结果。
+        AgentNotifications.clearDone(this)
+        // Android 16 的 Live Updates 授权可能在系统设置里刚被改过，回到前台重新问一次
+        // （能力探针有 5 秒缓存，见 LiveUpdates）
+        LiveUpdates.invalidate()
     }
 
     /**

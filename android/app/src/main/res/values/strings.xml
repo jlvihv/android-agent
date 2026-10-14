@@ -1,9 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">agent</string>
+
+    <!-- 通知栏。两条：进行中（内容随回合实时变）和完成（回到前台就清掉）。
+         第一行是会话标题；标题还没起好时用 notif_turn_title 兜底。
+         术语和前端对齐：「运行 / 读取 / 编辑」就是工具面板里那三个动词。 -->
     <string name="notif_channel_turn">agent 正在运行</string>
+    <string name="notif_channel_turn_desc">回合进行中的状态：现在在跑什么，实时更新。安静地待着，不响不弹。</string>
     <string name="notif_turn_title">agent 正在处理</string>
-    <string name="notif_turn_text">点开回到对话（后台跑动时不会被系统回收）</string>
+    <string name="notif_turn_text">正在处理…</string>
+    <string name="notif_phase_thinking">正在思考…</string>
+    <string name="notif_phase_writing">正在写回复…</string>
+    <string name="notif_tool_bash">运行 %1$s</string>
+    <string name="notif_tool_read">读取 %1$s</string>
+    <string name="notif_tool_edit">编辑 %1$s</string>
+    <string name="notif_tool_other">运行 %1$s</string>
+    <string name="notif_more_sessions">（另有 %1$d 个会话在跑）</string>
+    <string name="notif_channel_done">任务完成</string>
+    <string name="notif_channel_done_desc">agent 在后台把活儿干完之后，提醒你一声</string>
+    <string name="notif_done_ok">已完成</string>
+    <string name="notif_done_stopped">已停止</string>
+    <string name="notif_done_failed">出错了</string>
+    <string name="notif_done_text">点开看结果</string>
+
     <string name="accessibility_summary">让 agent 读取屏幕内容并执行点击</string>
     <string name="accessibility_description">开启后，agent 可以读取当前界面的元素并代为点击、输入。数据全部留在本机，不会上传。</string>
 </resources>

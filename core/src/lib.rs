@@ -44,6 +44,7 @@ pub mod search;
 pub mod single;
 pub mod sse;
 pub mod state;
+pub mod status;
 pub mod urls;
 
 use std::sync::atomic::Ordering;

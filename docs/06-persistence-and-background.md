@@ -169,6 +169,94 @@ Rust 侧的 `begin_turn`/`end_turn` 在会话数变化时调一次（幂等，�
 > `setSmallIcon` 的小图标**（小图标只在状态栏出现）。所以改小图标在通知行上看不到
 > 变化 —— 不是没生效。想强制用回小图标要加 `EXTRA_PREFER_SMALL_ICON`。
 
+### 通知栏：那一行实时的内容（2026-10-14）
+
+前面那条通知「agent 正在处理」说了实话，但**没有信息量**：手机撂在桌上时，人唯一能看见的
+就是它，而它不会告诉你现在跑到哪一步了。这一版把它变成**实时更新**的 —— 在跑哪条命令、
+在想、在写什么，一眼看得出。形状**照抄 OpenMinis**（`SessionActivityTracker` +
+`AgentForegroundService` + `AgentNotificationContent` + `BackgroundTaskNotifier`）：
+
+```
+Rust status::Reporter ──TurnHost.status(JSON)──▶ 壳 LiveTurnStatus（唯一事实来源）
+                                                        │ 变化
+                        AgentForegroundService ◀────────┘  就地把进行中那条改一遍
+                        AgentNotifications.showDone ◀─────── 刚完事那一条（独立于服务）
+```
+
+关键的一点：OpenMinis 的事实来源在 Kotlin（agent loop 也在 Kotlin），**我们的在 Rust**
+（loop 在 Rust）—— 所以是他们订阅 tracker，我们是**同一个形状、状态在边界另一侧**。
+划分：Rust 负责「什么算一个阶段、细节取哪一行」（`core/src/status.rs`，有测试），
+壳负责「长什么样」（`AgentNotifications.kt`，文案在 `strings.xml`）。
+
+推什么（`status::Snapshot` 的 JSON）：
+
+| 字段 | 说明 |
+|---|---|
+| `phase` | `thinking` / `streaming` / `tool` / `done` |
+| `tool` `detail` | 工具名 + 一行细节（`bash` 的命令首行、`read`/`edit` 的路径、流式正文的最后一行）|
+| `title` `sid` | 哪个会话（多会话同时跑时通知栏要分得清）|
+| `started_at_ms` | 本回合开始（**wall clock**，不是 elapsedRealtime，见下）|
+| `finished_at_ms` `ok` `stopped` | 结束那一条才有 |
+
+几个刻意的地方：
+
+- **频度在 Rust 侧控**。正文逐块流过来（一条长回复几千块），每块过一遍 FFI + 刷一次通知是
+  白费：流式的更新按 **0.5s** 攒着发，**阶段切换立刻发**（想→写、轮到哪个工具、跑完）。
+  同一个阶段里的重复推送直接丢掉。
+- **参数是边流边抠的**。工具名一到就显示（那时参数 JSON 还没写完），命令/路径用
+  `status::string_arg` 从半截 JSON 里抠 —— 和前端 `MessageList.summarize` 的 `partialArgs`
+  同一条思路（我们只要一个字段，所以手写扫描，不引 regex）。工具**真开跑之前**再推一次
+  （那时参数才完整）。
+- **时间戳是 wall clock**。OpenMinis 那边踩过：`elapsedRealtime` 直接喂给 `setWhen`，计时器
+  原点落在「开机时刻」，一台开了五天的手机显示 `120:00:00`。我们让 Rust 直接给 wall clock，
+  类型上就不给混用留口子。
+- **图标每阶段一个**（`ic_notif_work` / `ic_notif_shell` / `ic_notif_file` / `ic_notif_done`），
+  必须是只有 alpha 的单色掩码（系统按主题染色，实心圆点会被染成一坨）。
+- **没有进度条、没有秒表、没有「停止」按钮** —— 和 OpenMinis 一样。agent 报不出诚实的百分比，
+  而一个停不下来的计时器比没有计时器更糟。
+
+**完事那一条**（独立 id；人在看着时走安静的通道，不在时走会响的）：跑完那一刻发，**总是发** ——
+进行中那条的命跟着前台服务，服务一停它就没了，而「通知自己消失了」等于什么都没说：人回来看到
+空荡荡的通知栏，还是不知道到底跑完没有。所以结果留成一条**能点掉**的通知，回到 App 看过
+（`MainActivity.onResume` → `clearDone`）或自己划掉才没。
+
+响不响看人在不在：正看着 App 时走 `agent-turn`（LOW，不响不弹 —— 他刚看完那件事）；
+不在看着时走 `agent-done`（DEFAULT，响 + 小红点）。平台没有「单条静音」这个能力
+（公开 SDK 里 `setSilent` 已经没了，而通知的 sound 为 null 时会退回**渠道**的声音），
+所以只能靠换渠道。
+
+**和 OpenMinis 刻意不同的两处**（不是漏抄）：
+
+1. **App 在前台时不收起进行中那条**。他们收（眼前已有的东西不必再通知一遍），因为那边前台时
+   本来就不需要保活；我们这边前台服务同时承担保活（见下面「深度后台」：离开焦点 60~75 秒
+   整个进程会被 freezer 冻住），收起来等于每切一次前后台都要重新 promote 一次。宁可多一条
+   安静的状态行，也不要一个可能收不回来的服务。
+2. **没有浮动胶囊 / 没有 Android 16 的 Live Updates 开关**。前者是 OpenMinis 那套
+   overlay（要 `SYSTEM_ALERT_WINDOW`）；后者（`LiveUpdates.kt`）照抄了能力探针和「请求提升」
+   的 extras key，**能用就用**（API 36+ 且系统允许时，那条进行中的通知会自动变成状态栏芯片
+   上的 Live Update），但不做设置项开关。
+
+一个实测踩到的坑（改了两处才收干净）：**更新前台服务的通知要用 `startForeground()`，不要用
+`NotificationManager.notify()`**。`notify()` 能把同 id 的通知换掉，但会把记录上的
+`FLAG_FOREGROUND_SERVICE` 抹掉 —— 于是**服务死掉时系统不再顺手收它**，通知栏里留一条
+「已完成」不走。另外 `onDestroy` 里除了 `stopForeground(REMOVE)` 再按 id `cancel()` 一次。
+
+实测（模拟器 API 35；`dumpsys notification --noredact` 看 `Notification List`）：
+
+```
+进行中： id=1001 channel=agent-turn flags=ONGOING_EVENT|ONLY_ALERT_ONCE|NO_CLEAR|FOREGROUND_SERVICE
+         icon=ic_notif_file  title=「用 read 看一下 /etc/alpine-relea…」 text=「读取 /etc/os-release」
+         （一路看到：正在处理… → 读取 /etc/os-release → 正在思考… → 正文最后一行）
+回合结束：id=1001 消失（服务停 → 通知跟着走），但 id=1002 已经在那儿了：
+         channel=agent-turn（人正看着，所以不响）title=「已完成 用 read 看一下 …」
+切后台跑完：id=1002 channel=agent-done flags=ONLY_ALERT_ONCE|AUTO_CANCEL
+         title=「已完成 用 read 看一下 /etc/alpine-relea…」 text=「（约 330 字）」
+回到前台：id=1002 被 onResume 清掉
+```
+
+**没验到的**：Live Updates（API 36+）那条分支只有真机（Pixel 10 / Android 17）才走得到，
+模拟器是 35，只验了「不满足条件时干净退回普通通知」。
+
 ### 深度后台：整个进程会被冻住（2026-10-13）
 
 **症状**：手机撂下一会儿之后，从电脑发过去的请求**原地挂住** —— 不报错、不超时，

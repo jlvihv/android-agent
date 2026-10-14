@@ -89,9 +89,10 @@ pub trait DeviceApi: Send + Sync + 'static {
 
 /// 平回开始/结束的通知方（由 Kotlin 实现）。
 ///
-/// 只为一件事：**回合进行中把前台服务挂上**，让进程别被系统回收。
-/// 以前是常驻服务 + 常驻通知，那个通知没有任何信息量；现在回合开始起、
-/// 结束停，通知只在真有东西在跑的时候出现。
+/// 两件事：**回合进行中把前台服务挂上**（让进程别被系统回收），以及**把回合
+/// 此刻在干什么告诉通知栏**。以前是常驻服务 + 常驻通知，那个通知没有任何信息量；
+/// 现在回合开始起、结束停，通知只在真有东西在跑的时候出现，而且内容是活的
+/// （在跑哪条命令 / 在想 / 在写什么 —— 形状见 `status::Snapshot`）。
 ///
 /// 为什么需要它：切到后台的回合一旦进程被杀，浏览器那只 WebView（页面、
 /// 登录态）就没了，正在跑的 bash 也死。会话历史能告诉你“做到哪一步”。
@@ -100,6 +101,13 @@ pub trait DeviceApi: Send + Sync + 'static {
 pub trait TurnApi: Send + Sync + 'static {
     /// `true` = 有回合在跑（可能不止一个会话）。实现应当幂等。
     fn turn(&self, active: bool);
+
+    /// 一份实时状态快照（`status::Snapshot` 的 JSON）。
+    ///
+    /// 频度由 Rust 侧控：一个回合几步、每个工具两次、流式正文半秒一次
+    /// （见 `status::Reporter`）。壳那边把它当成「把刚才那条通知改一遍」的信号，
+    /// 不要在这儿做重活。
+    fn status(&self, status_json: &str);
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +852,15 @@ impl AppState {
             return;
         };
         h.turn(!self.busy_sessions().is_empty());
+    }
+
+    /// 把一份实时状态交给壳（通知栏那一行）。没人听就丢掉 —— 桌面上、或者脚本
+    /// 在后面跑的时候，这条通路本来就是空的，不是错误。
+    pub fn push_turn_status(&self, status_json: &str) {
+        let Some(h) = self.turn.read().ok().and_then(|g| g.clone()) else {
+            return;
+        };
+        h.status(status_json);
     }
 
     pub fn is_busy(&self, sid: &str) -> bool {

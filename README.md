@@ -22,7 +22,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
 | 多会话 | ✅ 侧边栏「最近对话」，标题自动生成 |
 | 会话持久化 | ✅ SQLite（增量落盘），force-stop 后能恢复 |
-| 后台运行 | ✅ 前台服务保活，切回来自动同步 |
+| 后台运行 | ✅ 前台服务保活，切回来自动同步；通知栏**实时显示在跑什么**（[docs/06](docs/06-persistence-and-background.md)） |
 
 ## 快速开始（桌面）
 
@@ -157,7 +157,7 @@ App 随时被杀都没关系。
 | [docs/03-prompt-cache.md](docs/03-prompt-cache.md) | 提示词前缀不变式 + 实测命中率 |
 | [docs/04-android-shell.md](docs/04-android-shell.md) | Android 壳：三个架构决策的落点、真机踩到的 11 个坑 |
 | [docs/05-ui.md](docs/05-ui.md) | 界面：设计令牌、edge-to-edge、对话渲染 |
-| [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）与后台运行 |
+| [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）、后台运行与**实时更新的通知** |
 | [docs/07-debugging.md](docs/07-debugging.md) | 无线调试 + agentctl + `/api/debug/*`：不重装 APK 也能调 |
 | [docs/08-browser.md](docs/08-browser.md) | agent 的浏览器：无头 WebView、看板、截图 |
 | [docs/09-search.md](docs/09-search.md) | 联网搜索：Exa 的两条路、为什么不要钱 |

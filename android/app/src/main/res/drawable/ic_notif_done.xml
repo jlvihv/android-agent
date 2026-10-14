@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  通知小图标：**干完了**（只有一个勾）。
+
+  说明见 ic_notif_work.xml（单色掩码的规矩）。勾画得比常见图标粗一点：小图标在
+  状态栏里就 12~16dp，细线会被抗锯齿吃掉。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <path
+        android:pathData="M5,12.8 L10,17.6 L19,6.6"
+        android:strokeColor="#ffffff"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="2.6" />
+</vector>

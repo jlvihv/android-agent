@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  通知小图标：**跑工具中**（`bash`）。一个终端提示符。
+
+  说明见 ic_notif_work.xml（单色掩码的规矩）。线条用 round cap：圆头在 24dp 下
+  比方头稳，缩小之后不糊。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- `>` 提示符 -->
+    <path
+        android:pathData="M5.6,6.8 L11.2,12 L5.6,17.2"
+        android:strokeColor="#ffffff"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="2.1" />
+    <!-- 光标那根横杠 -->
+    <path
+        android:pathData="M13.2,17.2 L18.6,17.2"
+        android:strokeColor="#ffffff"
+        android:strokeLineCap="round"
+        android:strokeWidth="2.1" />
+</vector>
