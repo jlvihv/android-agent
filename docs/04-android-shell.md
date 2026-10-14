@@ -438,8 +438,8 @@ dev_shell 'uname -m'
 ```
 
 安卓上 App **不继承 shell 环境变量**，所以 LLM 配置走运行时接口
-`POST /api/llm`，存进 `sessions.db` 的 `meta` 表（`llm` 那一行；老版本的
-`llm.json` 启动时自动迁进来，然后删掉文件）。
+`POST /api/llm`，存进 `sessions.db` 的 `llm` 表（一行，每个字段一列 —— 配置按列存，
+不往一个值里塞 JSON）。
 
 模型能不能看图不靠人配：`GET /api/models` 拉 provider 的 `/models` 清单，
 再查 models.dev 目录（缓存 48h）里该模型的 `modalities.input`，自动得出。

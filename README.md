@@ -217,8 +217,7 @@ dev_shell 'uname -m'
 安卓上 App 不继承 shell 环境变量，所以 LLM 在 App 的**设置页**里配：内置
 OpenAI / DeepSeek / OpenCode Go / OpenCode Zen，只填 API Key，模型清单自动拉；
 另有「其他（OpenAI 兼容）」可以填 Base URL。几家可以同时配好，在选择模型面板里
-点哪家的模型就用哪家。配置存在 `sessions.db` 的 `meta` 表里（老版本的 `llm.json`
-启动时自动迁进来再删掉）。脚本里还可以直接 `POST /api/llm`。
+点哪家的模型就用哪家。配置按列存在 `sessions.db` 的表里（`llm` / `providers`，不用 JSON）。脚本里还可以直接 `POST /api/llm`。
 
 模型能不能看图**自动判定**，不用配：`GET /api/models` 拉 provider 的模型清单，
 再查 [models.dev](https://models.dev) 目录里该模型的 `modalities.input` 有没有
