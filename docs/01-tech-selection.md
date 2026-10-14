@@ -49,15 +49,14 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 **崩溃策略：`panic = "abort"` —— panic 就崩，不兜。**
 
-一开始写的是「`set_hook` + `catch_unwind`，关键路径不 panic」，那样是错的：兜住的
-panic 会退化成前端一句没头没尾的报错、或者干脆静默断流（实测踩过：`/api/chat`
-只发出 `start`/`start-step` 就没了）。根因在 stderr 里，而**安卓的 stderr 是丢掉的**
-—— 那种失败比崩溃难查得多。
+兜住的 panic 会退化成前端一句没头没尾的报错、或者干脆静默断流（`/api/chat` 只发出
+`start`/`start-step` 就没了）：根因在 stderr 里，而**安卓的 stderr 是丢掉的** ——
+那种失败比崩溃难查得多。所以装 panic hook 把根因写进 logcat，然后让它崩。
 
-中间还试过一版「编译期 `unwind` + hook 里 abort，只给第三方解码器开一个宽容区」，
-后来也去掉了：`image` / `zune_jpeg` / `png` 的**解码 API 本来就是 `Result`**，
-畸形输入走 `Err`；会 panic 是它们的 bug。**对一个 bug 的正确反应是暴露它然后修/换，
-不是盖毯子** —— 盖住之后，这类 bug 永远只在用户那里变成一句看不懂的报错。
+第三方解码器（`image` / `zune_jpeg` / `png`）也不给它开宽容区：它们的**解码 API
+本来就是 `Result`**，畸形输入走 `Err`；会 panic 是它们的 bug。**对一个 bug 的正确
+反应是暴露它然后修/换，不是盖毯子** —— 盖住之后，这类 bug 永远只在用户那里变成
+一句看不懂的报错。
 
 结论：`panic = "abort"`，`catch_unwind` 一律不用。真出现解码器 panic，logcat 里会有
 `RUST PANIC` + 那个 crate 的源码路径（版本号就在路径里），照着去修、去换、或者自己写一个。
@@ -102,56 +101,19 @@ panic 会退化成前端一句没头没尾的报错、或者干脆静默断流�
 
 ## 3. 库级决策
 
-### D4 + D5 — LLM 协议层 & Agent Loop（**这两个绑在一起选**）
+### D4 + D5 — LLM 协议层 & Agent Loop（**都是自研**）
 
-> **修订（后来）：协议层改为自研，不再用 `async-openai`。**
->
-> 实际用下来，SDK 的 `Client::with_config()` 会**先** `reqwest::Client::new()`
-> 建一个默认连接（然后才轮到我们 `with_http_client` 覆盖）；在
-> `rustls-no-provider` 下这个连接没有 crypto provider，**直接 panic** ——
-> 而它建的那个连接我们根本拿不到。加上我们真正用到的只有「一个请求体 +
-> 一条 SSE 流」，于是自己写了：`openai.rs`（Chat Completions）+
-> `responses.rs`（Responses API），**优先 Responses**，端点不支持就自动退回
-> Chat Completions（`llm.rs` 的 `ApiStyle`/`Transport`）。少一个大依赖，
-> 而且每个字节都在我们手里（对 prompt cache 的前缀不变式有好处）。
->
-> 下面的选择过程保留作为当时的记录。
+**协议层自研** —— `openai.rs`（Chat Completions）+ `responses.rs`（Responses API），
+**优先 Responses**，端点不支持就自动退回 Chat Completions 并记住
+（`llm.rs` 的 `ApiStyle`/`Transport`）。不引 SDK 的理由：`async-openai` 的
+`Client::with_config()` 会**先** `reqwest::Client::new()` 建一个默认连接、然后才轮到我们
+`with_http_client` 覆盖；在 `rustls-no-provider` 下那个连接没有 crypto provider，
+**直接 panic** —— 而它建的那个连接我们根本拿不到。而我们真正用到的只有「一个请求体 +
+一条 SSE 流」，自己写少一个大依赖，而且每个字节都在我们手里（prompt cache 的前缀不变式
+就靠这个，见 docs/03）。
 
-不想手写 OpenAI Chat/Responses 协议，所以有两个自洽的组合：
-
-#### 组合 A「薄内核」
-```
-genai (provider 抽象)  +  自研 agent loop (~300-500 行)  +  rmcp (MCP)
-```
-
-- **genai**：多 provider **原生协议**（不是 OpenAI 兼容层套壳），SSE 流式，工具调用、
-  `tool_choice`、内置工具（含 web search 映射到 Anthropic/OpenAI/Gemini）。
-  覆盖 OpenAI / Anthropic / Gemini / xAI / Ollama / Groq / DeepSeek / Bedrock / Vertex / Cohere / Together / Fireworks / Nebius / GitHub Copilot …
-- **自研 loop**：因为本项目的 UI 要**逐事件展示 tool call 并支持人工审批**，需要完全拦截事件流。
-  框架会把 loop 包起来，反而挡路。
-- 代价：重试、并行工具调用、上下文裁剪要自己写。
-
-#### 组合 B「框架优先」
-```
-rig (provider + 类型安全工具 + loop)  +  rmcp (MCP)
-```
-
-- **rig** 0.44+：20+ provider 统一 API、类型安全工具、结构化输出，
-  且**内置 `rmcp` feature** 直接对接官方 MCP SDK。
-- 代价：rig API 迭代快（0.44 说明还很年轻），loop 控制权在框架手里，
-  要把每个 tool call 事件转成前端协议需要绕。
-- 好处：最快看到能跑的东西。
-
-#### 补充件（任一组合都可加）
-**async-openai** — 仅当需要 OpenAI **独有**能力时加：Responses API、Conversations、
-Streaming events、Webhooks、Evals、Fine-tuning、Graders、Audio/Images 全套。
-用 feature gate 隔离，默认不引。
-
-> ❌ 已否决：手写 OpenAI Chat / Responses 协议。
-> ⚠️ **后已推翻**：见本节开头的修订 —— 自研比引 SDK 更可控。
-
-**倾向：组合 A**。理由：审批流 + 事件流推送是这个工具的 UI 核心，loop 必须自己拿；
-genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B 也合理。
+**loop 也自研** —— `agent.rs`。UI 要逐事件展示 tool call，队列、停止、上下文都要自己控；
+框架会把 loop 包起来，反而挡路。代价是重试、并行工具调用、上下文裁剪要自己写。
 
 ---
 
@@ -164,7 +126,8 @@ genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B �
 | 生态/组件 | shadcn/ui、Radix 海量 | 少一些 | — |
 | 体积 | 较大 | 小 | 最小 |
 
-**倾向：A**。手机 WebView 上体积差异不关键，而 assistant-ui 能省掉整个聊天 UI 的工作量。
+**选 B（Svelte 5 + Vite + TS）**。手机 WebView 里体积和启动都值钱，而聊天 UI 就那么几个
+组件，自己写（见 docs/05）比拖进 React + assistant-ui 那一串便宜。
 
 ### D7 — 前端 ↔ Rust 的流式协议
 
@@ -184,11 +147,9 @@ genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B �
   `tool-input-start|delta|available` / `tool-output-available` /
   `error` / `abort` / `data-*`
 
-**倾向：A**。协议公开且语义现成（工具输出、思考、步骤、`data-*` 都现成），
-前端换回官方 `@ai-sdk/svelte` 也不用改 Rust 侧。
-
-> 当初选它的一个理由是协议自带 `tool-approval-request|response`。后来审批环节整个
-> 删掉了（工具一律直接执行），但协议本身仍然值这个价。
+**选 A**。协议公开且语义现成（工具输出、思考、步骤、`data-*` 都现成）。
+（协议里还带 `tool-approval-request|response`，我们用不上 —— 工具一律直接执行 ——
+但那些语义值这个价。）
 
 ### D8 — Rust ↔ Gradle 怎么串
 
@@ -210,13 +171,13 @@ genai 的 provider 覆盖已经足够广。若你想先跑通再重构，选 B �
 | `armeabi-v7a` | 老设备 | ⬜ 可跳过 |
 | `x86` | 老模拟器 | ⬜ 跳过 |
 
-**倾向：arm64-v8a + x86_64**。
+**现在只出 arm64-v8a**（真机）。模拟器要 x86_64 时：
+`AGENT_ABIS=arm64-v8a,x86_64 just emu-install` —— 多带一个 ABI 就是白送几 MB。
 
-### D10 — UI 树快照格式（Kotlin → Rust）
+### D10 — UI 树快照格式（Kotlin → Rust）—— 现在没有这一条
 
-> **已废弃：**这条是实现过的（`UiSnapshot` + `UiTree.kt`），后来随
-> `device_snapshot` / `device_tap` 两个工具一起删掉了。留着作为「以后要做沙箱里
-> 那个设备命令时怎么选格式」的记录。
+读 UI 树的能力目前不在（见 D2 那节：native 侧只做不读界面的设备操作）。以后要做的话
+就是「Kotlin 把无障碍树拍平成扁平 JSON 推给 Rust」，格式选型的结论在下面这张表。
 
 | | A. JSON（serde_json） | B. CBOR（ciborium） | C. Protobuf |
 |---|---|---|---|
@@ -305,8 +266,8 @@ Rust 回传指令（`tap_xy` / `swipe` / `key` / `launch`），Kotlin 执行。
 Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无障碍）
 ```
 
-> 原来还有反方向的一条：Kotlin 把 UI 树拍平成扁平 JSON 推给 Rust（D10）。
-> 那部分随 `device_snapshot` / `device_tap` 一起删了。
+> 反方向那条（Kotlin 把 UI 树拍平成扁平 JSON 推给 Rust，D10）现在没有 ——
+> 要做读 UI 树时再加。
 
 另外：`onAccessibilityEvent` 跑在**主线程**，绝对不能阻塞——native 侧收到立刻入队返回。
 
@@ -337,18 +298,14 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 
 ---
 
-## 6. 风险 / 待验证（动手前要实测的）
+## 6. 曾经的风险项，现在的结论
 
-| # | 风险 | 验证方式 |
-|---|---|---|
-| ~~**R1**~~ ✅ **已验证通过** | NDK r27 的 16KB 对齐 —— `cargo-ndk` 4.x + NDK r27 默认就对齐到 `0x4000`，不需要手动加 flag | 实测见 docs/04-android-shell.md §8 |
-| **R2** | Android 9+ 默认禁明文 HTTP。已加 `network_security_config.xml` 给 loopback 例外，**但真机行为未验证** | 上真机跑 |
-| **R3** | `libc++_shared.so` 不一起打包会 `dlopen` 失败 | 用 `android-shared-stdcxx` 时确认 `jniLibs` 里有它 |
-| ~~**R4**~~ ✅ **已确认** | uniffi 0.32 的 Kotlin 后端**只有 JNA**，没有 JNI 模式，也没有开关。代价：多一个 `net.java.dev.jna:jna:5.17.0@aar` 依赖 | 生成产物里是 `com.sun.jna.*` |
-| **R5** | uniffi callback 从 tokio 异步上下文回调 Kotlin 的线程语义 | 小 demo 验证：Rust task → Kotlin 回调 → 返回，看是否死锁/线程错误 |
-| **R6** | `onAccessibilityEvent` 主线程 + 高频（每秒几十次） | 压测：批量/节流后再过边界 |
-| **R7** | Play 对 `AccessibilityService` 审核极严 | 自用/侧载无影响；上架需准备用途说明 |
-| **R8** | rig 0.44 API 迭代快（仅组合 B） | 锁版本 + 少量封装隔离 |
+| # | 结论 |
+|---|---|
+| R1 | ✅ NDK r27 的 16KB 对齐：`cargo-ndk` 4.x + NDK r27 默认就对齐到 `0x4000`，不用手动加 flag（docs/04 §8） |
+| R2 | ✅ Android 9+ 禁明文 HTTP：`network_security_config.xml` 只给 loopback 开例外，真机验证通过（docs/04） |
+| R4 | ✅ uniffi 0.32 的 Kotlin 后端**只有 JNA**（没 JNI 模式，也没开关）：多一个 `net.java.dev.jna:jna` 依赖 |
+| R7 | ⚠️ Play 对 `AccessibilityService` 审核极严 —— 自用/侧载无影响；要上架得准备用途说明 |
 
 ---
 
@@ -361,14 +318,15 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 | D1 | Rust 运行形式 | **A 进程内 `.so`** |
 | D2 | 反向通道 | **A UniFFI callback** |
 | D3 | WebView 加载 | **A Rust axum + `127.0.0.1`** |
-| D4+D5 | LLM / Agent | **`async-openai` + 自研 loop**（原组合 A 的 genai 也一并替换） |
+| D4+D5 | LLM / Agent | **协议自研（`openai.rs` / `responses.rs`）+ loop 自研（`agent.rs`）** |
 | D6 | 前端 | **B Svelte 5**（不用 React / assistant-ui） |
 | D7 | 流式协议 | **A AI SDK UI Message Stream**（保留规范；客户端见 §10） |
 | D8 | Gradle 集成 | 脚本驱动 |
-| D9 | ABI | arm64-v8a + x86_64 |
-| D10 | UI 快照 | ~~JSON + 剪枝~~ **已删**（代码实现过，随设备工具一起移除） |
+| D9 | ABI | **arm64-v8a**（真机）；模拟器要 x86_64 就 `AGENT_ABIS=arm64-v8a,x86_64 just emu-install` |
+| D10 | UI 快照 | **没有**（读 UI 树那套随设备工具一起移除了） |
 | D11 | 本地推理 | 先不做 |
 | D12 | 其余 | bun / Tailwind v4 / **不用 shadcn** / markdown 后补 |
+| — | `async-openai` | **砍掉**：协议自研（见 D4+D5） |
 | — | `genai` | **砍掉** |
 | — | `rig` | **砍掉** |
 | — | `rmcp` / MCP | **砍掉**，但 `Tool` 做成 trait 留口子（后补 ~200 行 adapter） |
@@ -377,47 +335,38 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 
 ## 8. v1 最终依赖清单（最小化）
 
-### 8.1 Rust core — 14 个直接依赖
+### 8.1 Rust core
+
+只列关键的（完整清单在 `core/Cargo.toml`）：
 
 ```toml
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
-axum = "0.8"
-serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "process", "io-util", "fs"] }
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-async-openai = { version = "0.42", default-features = false,
-                 features = ["rustls", "chat-completion", "responses"] }
-rust-embed = "8"
-mime_guess = "2"
+rust-embed = "8"              # 前端嵌进 .so
 uniffi = { version = "0.30", features = ["tokio"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-android_logger = "0.14"
-thiserror = "2"
-anyhow = "1"
-uuid = { version = "1", features = ["v7"] }
+tracing = { version = "0.1", features = ["log"] }
+# 自己造 reqwest client，绕开 rustls-platform-verifier：
+# Android 上它要求先 init_with_env(env, context)，否则第一次请求就 panic（见 llm.rs）
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+# ring 而不是 aws-lc-rs（后者是个完整 C 库），证书用内嵌的 webpki-roots
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "1"
 ```
 
-关键点（已核实）：
+- **`rustls` 而非 `native-tls`** → 避免 openssl 交叉编译。这是 Android/Rust 上最容易卡死
+  的地方，保持住。
+- `tracing` 要开 `log` feature：安卓上只装了 `android_logger`（log 的 sink），没有这座桥
+  的话我们所有的 `tracing::info!` 在 logcat 里全部看不到。
 
-- `async-openai` 有 **57 个 feature flag，默认只开 `rustls`**。
-  `default-features = false` 关掉全部，再显式加回 3 个。
-- **`rustls` 而非 `native-tls`** → 避免 openssl 交叉编译。
-  这是 Android/Rust 上最容易卡死的地方，务必保持。
-- 不用显式引 `reqwest`：async-openai 的 `rustls` feature 已经带进来。
-- `responses` feature = OpenAI 新一代 Responses API（含 Conversations、streaming events）。
-  用不上就删掉，再省一点编译时间。
-
-### 8.2 Web — Svelte 5，8 个包
+### 8.2 Web — Svelte 5，运行时零依赖
 
 ```jsonc
 {
-  "dependencies": {
-    "svelte": "^5",
-    "ai": "^7",              // 见 §10 W1/W2，可省
-    "@ai-sdk/svelte": "^4"   // 见 §10 W1/W2，可省
-  },
   "devDependencies": {
+    "svelte": "^5",
     "vite": "^7",
     "@sveltejs/vite-plugin-svelte": "^6",
     "typescript": "^5",
@@ -428,14 +377,14 @@ uuid = { version = "1", features = ["v7"] }
 }
 ```
 
-Tailwind v4 比 v3 精简很多：不需要 postcss config、不需要 autoprefixer。
+全部是构建期依赖：`dependencies` 是空的 —— 流式解析器和聊天状态机自己写（见 §10）。
+Tailwind v4 不需要 postcss config、不需要 autoprefixer。
 
 ### 8.3 Android
 
-只有 AGP + Kotlin stdlib。
+只有 AGP + Kotlin stdlib + JNA（uniffi 的 Kotlin 后端只有 JNA，见 R4）。
 
 - **不需要 `androidx.webkit`** —— 不用 WebViewAssetLoader（D3 选了 A）
-- **不需要 JNA** —— uniffi 走 JNI 模式（见 R4）
 
 ---
 
@@ -449,43 +398,23 @@ Tailwind v4 比 v3 精简很多：不需要 postcss config、不需要 autoprefi
 | React + assistant-ui | −10 个以上的包，bundle 小很多 | 聊天 UI 自己写（~400 行 Svelte） | 不需要 |
 | shadcn/ui + Radix | −20 个以上的包 | 组件自己写 | 可随时复制进来 |
 
-### ⚠️ 唯一需要你确认的真实代价
+### 代价：非 OpenAI 兼容的原生协议要自己写
 
-`async-openai` 只讲 **OpenAI 协议**。但它支持 `.with_api_base()`，
-所以凡是提供 **OpenAI 兼容端点**的都能用：
+协议层自研只讲 **OpenAI 协议**（Chat Completions + Responses）加自定义 base URL，
+所以提供 **OpenAI 兼容端点**的都能用：
 
-| ✅ 能用 | ❌ 不能用（原生协议） |
+| ✅ 能用 | ❌ 不能用（要另写一个 transport） |
 |---|---|
 | OpenAI、DeepSeek、Kimi/Moonshot、通义 DashScope、智谱、SiliconFlow、OpenRouter、Groq、xAI、Together、Fireworks、vLLM、LM Studio、Ollama(`/v1`)、以及绝大多数中转站 | **Anthropic Claude**（原生 Messages API）<br>**Google Gemini**（原生 API） |
 
-想用 Claude / Gemini 的两条路：
-
-1. 走 OpenRouter 等中转（OpenAI 兼容）← 最省事
-2. 后期加 provider adapter（`trait LlmBackend`），换回 `genai` 或直连
-
-> **如果你确定要直连 Claude / Gemini 原生协议，`async-openai` 就不够，
-> 得换回 `genai`（用 1 个依赖换 3 家覆盖）。这条需要你明确。**
+想用 Claude / Gemini：走 OpenRouter 等中转（OpenAI 兼容，最省事），或者给 `llm.rs`
+加一个 transport。
 
 ---
 
-## 10. W1 / W2 — 流式客户端要不要装 AI SDK
+## 10. 流式客户端：自己写（W2）
 
-线上协议无论选哪个都是 AI SDK 的 UI Message Stream（公开规范，本质就是 SSE + JSON 形状）。
-
-| | W1. 装 `ai` + `@ai-sdk/svelte` | W2. 自己写解析器 |
-|---|---|---|
-| npm 包数 | +2 | +0 |
-| 代码 | `Chat` 类开箱：消息状态 / 流式 / 中断 / 错误 / 重传 | ~120 行 TS：SSE 解析 + 状态机 |
-| 风险 | 跟随 AI SDK 版本 | 自己维护 |
-
-**倾向 W1**。它管的是"流式状态机"这类最容易写出 bug 的地方，2 个包换它值。
-要极致精简的话 W2 完全可行——协议本身就是 `data: {"type": ...}` 加个 `data: [DONE]` 结尾。
-
----
-
-## 11. 新增验证项
-
-| # | 风险 | 验证方式 |
-|---|---|---|
-| **R9** | async-openai 默认 `rustls` feature → reqwest 0.13 使用 **`rustls-platform-verifier`** 读系统根证书。Android 上它需要 JavaVM | 进程内加载所以可调 `rustls_platform_verifier::android::init_hosted()`，**必须在第一个请求前调用**。嫌麻烦就换成内嵌 `webpki-roots` |
-| **R10** | `@ai-sdk/svelte` 的 `Chat` 类是否依赖 SvelteKit？ | 目标是纯 Vite + Svelte，需实测 |
+线上协议是 AI SDK 的 UI Message Stream（公开规范，本质就是 SSE + JSON 形状），
+但客户端自己写（`web/src/lib/sse.ts`，~120 行 TS：SSE 解析 + 状态机）——
+`dependencies` 因此是空的，也不用跟着 AI SDK 的版本走。协议本身简单得离谱：
+`data: {"type": …}` 加一个 `data: [DONE]` 结尾。

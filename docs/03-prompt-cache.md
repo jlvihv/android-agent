@@ -1,6 +1,6 @@
 # Prompt Cache：为什么提示词前缀一个字都不能变
 
-> 实测日期：2026-10-10
+> 数据日期：2026-10-10
 > provider：OpenCode Go / `deepseek-v4.1-flash`
 
 ---
@@ -24,9 +24,9 @@ agent 场景尤其致命：一个回合可能有 5–8 次 LLM 调用，每次�
 
 ---
 
-## 2. 我们踩过的坑
+## 2. 前缀是怎么被毁掉的
 
-第一版实现是这样的：
+把「当前界面快照」拼进 system prompt 就会这样：
 
 ```rust
 // ❌ 错的
@@ -117,7 +117,7 @@ build_messages(sess, supports_images, supports_files)
 - 新提示词作为一条 `system` 消息落在**新用户输入之前**；它一旦进历史就固化了，
   下一轮开始就在缓存里；
 - 同一条提示词不会重复追加（`ensure_system_prompt` 先查历史里有没有）；
-- 历史里没任何提示词的老会话（比如以前存的）会自动被补上。
+- 历史里没有任何提示词的老会话会自动被补上。
 
 推论：**提示词变了也不能轮换 `provider_session`** —— 那正是要保住的缓存路由。
 
@@ -133,7 +133,7 @@ build_messages(sess, supports_images, supports_files)
 唯一该换的时机是「前缀的语义彻底断了」：历史被清空（`clear()`）、
 provider / model 换了（`/api/llm`）。这两种情况下代码会
 `rotate_provider_session()`，并且会落盘 —— `provider_session` 的 upsert
-原来漏了这一列，换过之后重启又会用回旧 id。
+漏了这一列的话，换过之后重启又会用回旧 id。
 
 ### 3.3 两套缓存字段谁优先
 
@@ -144,7 +144,7 @@ provider / model 换了（`/api/llm`）。这两种情况下代码会
 
 ---
 
-## 4. 实测结果
+## 4. 命中率
 
 4 个连续回合（每回合触发 2 次 LLM 调用），服务端日志：
 
@@ -182,13 +182,13 @@ prompt cache 命中 93.4%（cached=1920 prompt=2056 completion=2  reasoning=0）
 | OpenAI 系 | `prompt_tokens_details.cached_tokens` |
 | DeepSeek 系 | `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` |
 
-实测 OpenCode Go 的 `deepseek-v4.1-flash` 走的是 **OpenAI 系**。
+OpenCode Go 的 `deepseek-v4.1-flash` 走的是 **OpenAI 系**。
 `prompt_cache_hit_tokens` 是 `null` —— 如果只按 DeepSeek 的字段名解析，
 就会误以为"这个 provider 不支持缓存"。
 
 另外 `completion_tokens_details.reasoning_tokens` 也值得看：
 DeepSeek 系的推理 token 按 **output** 计费（$1.20/M），
-实测一次简单问答就能产生 25–136 个推理 token。
+一次简单问答就能产生 25–136 个推理 token。
 
 ### 怎么打开用量上报
 
@@ -230,8 +230,8 @@ req["stream_options"] = json!({ "include_usage": true });
 - `finish_reason == "length"` 时会发 `data-warning`，而且当轮的工具调用**全部作废**
   —— 截断的 `arguments` JSON 很可能是半个对象，拿坏参数去执行比报错危险得多。
 - 环境（沙箱可不可用、手机存储挂没挂）**不进 prompt**：它在 `SYSTEM_PROMPT` 里只有
-  一句“不确定就先 `ls /sdcard`”。早先版本每轮追加一个 `<环境>` 消息，再往前还塞过
-  当前界面的 UI 树 —— 都是几百行文本每轮重发，纯烧 token，全删了。
+  一句“不确定就先 `ls /sdcard`”。每轮追一个 `<环境>` 消息、或者把当前界面的 UI 树
+  拼进去，都是几百行文本每轮重发，纯烧 token。
 
 ---
 
@@ -253,8 +253,8 @@ req["stream_options"] = json!({ "include_usage": true });
 - **Chat Completions**：assistant 消息带上 `reasoning_content`（DeepSeek 系的字段）。
   不返回思考内容的模型历史里本来就是空的，字段自然不出现。
 
-实测（2026-10-13，OpenCode Go / `deepseek-flash`）：网关给的思考条目形状是
+（2026-10-13，OpenCode Go / `deepseek-flash`）网关给的思考条目形状是
 `{type, id, status, summary: [], content: [{type: "reasoning_text", text}], encrypted_content}`；
 原样回传 + `include` 都被接受。验证方法：让模型**只在思考里**随机想一个 6 位数，调一次
 工具，再问它那个数 —— 回传之后它能原样答出来，第二步的输入 token 也多出了思考那一段。
-回传会让老会话的前缀变一次（多了思考条目），之后照常命中缓存（实测 98%+）。
+回传会让老会话的前缀变一次（多了思考条目），之后照常命中缓存（98%+）。

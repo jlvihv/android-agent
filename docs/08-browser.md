@@ -1,6 +1,6 @@
 # 浏览器：agent 自己开一个 WebView
 
-> 实测日期：2026-10-12
+> 数据日期：2026-10-12
 > 参考实现：OpenMinis（`~/Code/lib/OpenMinis` 的 `browser/`，GPL-3.0 —— 只参考机制，没有抄代码）
 
 ---
@@ -45,16 +45,14 @@ POST /api/browser ───────────────────┤  
   find_elements / scroll / screenshot / set_user_agent / back / wait_for_dom_stable /
   js / new_tab / list_tabs / switch_tab / close_tab`。
 
-  这里**曾经还有一个 `browser` 工具**，已经删了 —— 为什么删、以及删完的代价
-  （截图不再自动进上下文）怎么补的，见
-  [docs/10](10-tools-vs-sandbox.md)；CLI 对每个动作的参数个数上下限都校验
-  （少给 / 多给都报错）也是那次一起修的。
+  唯一入口是沙箱里的 `agent browser`（为什么不做成工具、以及截图不进上下文怎么补的，
+  见 [docs/10](10-tools-vs-sandbox.md)）；CLI 对每个动作的参数个数上下限都校验
+  （少给 / 多给都报错）。
 
-  截图是删掉工具后唯一退化的点：以前 `browser` 工具会把图直接挂到工具结果上，
-  现在图落在 `/root/.browser/`，模型得自己 `read` —— 所以 `Core::browser()`
+  截图不在工具结果里：图落在 `/root/.browser/`，模型得自己 `read`。所以 `Core::browser()`
   在截图返回的 `text` 里写了一句「用 read 看它」（写进 JSON 字段而不是另打一行，
-  免得 `| jq` / `| python3 -c json.load` 被打断）。实测模型本来就这么干（6 次截图
-  全是自己 read 回来的），所以这一轮不亏。
+  免得 `| jq` / `| python3 -c json.load` 被打断）。模型本来就这么干（6 次截图
+  全是自己 read 回来的）。
 
 ## 4. 无头 WebView 必须自己做的事
 
@@ -78,7 +76,7 @@ POST /api/browser ───────────────────┤  
 
 **软件绘制**（`View.draw(软件 Canvas)`）不需要窗口、不需要屏幕亮着，DOM / 普通
 图片 / 2D canvas 都在 —— 但 Chromium 收到软件绘制会在 CPU 上重新栅格化，而
-**GPU 才有的层（WebGL、`<video>`）它拿不到**，结果是空白。实测：同一个页面在
+**GPU 才有的层（WebGL、`<video>`）它拿不到**，结果是空白：同一个页面在
 屏幕上有画面，截图里那块是背景色。
 
 **GPU 合成**（`HeadlessCapture`）解决这个：临时给 WebView 搭一个 surface ——
@@ -91,7 +89,7 @@ ImageReader(RGBA) ──surface──> VirtualDisplay ──> Presentation 窗�
 私有虚拟显示（`OWN_CONTENT_ONLY`，不需要权限、用户看不见）；窗口设
 `NOT_FOCUSABLE | NOT_TOUCHABLE`（页面里的输入框绝不能把输入法弹到用户真屏幕上）。
 
-**实测 A/B**（模拟器，往页面里注入一块 WebGL 纯红画布）：
+**A/B**（模拟器，往页面里注入一块 WebGL 纯红画布）：
 
 | 走哪条 | 画布区域的平均 RGB | 结果 |
 |---|---|---|
@@ -122,7 +120,7 @@ ImageReader(RGBA) ──surface──> VirtualDisplay ──> Presentation 窗�
 ## 6. `get_readable`：读文章用这个，别用 `get_text`
 
 `get_text` 给的是整个 body 的 innerText —— 导航、页脚、推荐位、cookie 声明全在
-上面。实测一篇 CNBC 报道拿回 **6597 字，一半是菜单和免责声明**。
+上面。一篇 CNBC 报道能拿回 **6597 字，一半是菜单和免责声明**。
 
 `get_readable` 抽正文（Readability 的简化版，只留真管用的那几条）：
 
@@ -136,10 +134,10 @@ ImageReader(RGBA) ──surface──> VirtualDisplay ──> Presentation 窗�
    `h1-h3 / p / li / blockquote / pre / figcaption`，并跳过导航块；
    块里只有一个链接占主体时把地址附上（搜索页/目录页用）。
 
-**踩过的坑**：第一版把 CNBC 的 cookie 声明当成了正文 —— 它段落又长又多，
-分数比正文还高。两个修正缺一不可：① 周边判断要查**上面 6 层祖先**的类名
+**两个坑**（cookie 声明当正文）：类名像周边的壳会把一堆正常 `<p>` 包在里面 —— 它段落又长又多，
+分数比正文还高。所以两条缺一不可：① 周边判断要查**上面 6 层祖先**的类名
 （cookie 的壳在很上面，`p` 自己的类名毫无异常）；② 前面那套权重。
-修完同一页：**4426 字的干净正文**（标题、导语、段落、无菜单无 cookie）。
+同一页现在是 **4426 字的干净正文**（标题、导语、段落、无菜单无 cookie）。
 
 ## 7. 等页面安定：不要在页面里 `setTimeout`
 
@@ -175,7 +173,7 @@ ImageReader(RGBA) ──surface──> VirtualDisplay ──> Presentation 窗�
 - 从元素往上拼，每加一段就问一次"现在唯一了吗"，唯一就停。
 - 数字开头的 id **不能**写成 `#50051583` —— 那是非法 CSS，`querySelector`
   直接抛 `SyntaxError`。要写成 `[id="50051583"]`。导航站的行 id 全是这种。
-- 早先版本硬截成 3 段，于是 HN 上每个链接的 selector 全都一样，白忙一场。
+- 不能硬截成固定段数：HN 上每行的结构一样，截出来的 selector 全都一样，白忙一场。
 
 锚点还会带上跨域域名（`-> www.cnbc.com /2026/…`），否则模型只看到
 `/2026/…` 以为还在本站。
@@ -205,7 +203,7 @@ backbone 太大、或者只想确认"到底有几个"时用它。
 
 **整页截图**（`screenshot full_page=true`）：`View.draw` 只画自己的矩形，所以把
 View 临时拉高到全文档高度、画完再恢复。高度封顶 **8000px**（1080×8000 的 ARGB
-位图已经 34MB，再高就是拿内存赌），截不全时结果里会写明。实测维基百科一篇
+位图已经 34MB，再高就是拿内存赌），截不全时结果里会写明。维基百科一篇
 1080×7315 完整截下（含信息框），539KB。
 
 ## 11. 多标签
@@ -232,7 +230,7 @@ View 临时拉高到全文档高度、画完再恢复。高度封顶 **8000px**�
 4. **面板正挂着某只标签时把它关掉**：先从容器里摘下来再 `destroy`，然后
    把新当前标签挂上去（`panelHolder` 记着是哪个容器）。
 5. **`list_tabs` / `new_tab` 不要顺手建标签**（`ensureWeb`）—— 模型问"有哪些
-   标签"不该因此多出一只空标签。踩过：列一次多一只。
+   标签"不该因此多出一只空标签（列一次就多一只）。
 
 看板上：多于一只标签时头部下面出现一排胶囊（`1 baidu.com` / `2 127.0.0.1:33925`），
 当前那只高亮，点它切过去。IP 不截断（截了看不出是哪儿），域名只留后两段。
@@ -250,8 +248,7 @@ agent 有一只自己的无头 WebView（第 2 节），而**同一个实例**�
 兄弟，平时 `GONE`，常态零开销）。实现在 `BrowserPanel.kt`。
 
 **长相和手感照抄页面里的查看器**（`Viewer.svelte`）—— 同一个 App 里看沙箱网页
-和看 agent 的浏览器是同一类事。以前它是另一套样子（从底下升上来、右上角「关闭」、
-两行小字头），和外层一眼就不像一家的。现在：顶栏 36dp + 状态栏（`--hdr`）、
+和看 agent 的浏览器是同一类事。所以：顶栏 36dp + 状态栏（`--hdr`）、
 左边返回箭头（`Icon` 的 `back` 路径）+ 16sp 中粗标题（页面标题，没有就用 URL）、
 agent 在动作时右边一行小字「agent 操作中」；内容区上沿一条分隔线；从右滑入
 300ms quintOut，退场从当前位置接着滑；按住顶栏往右拖关闭（`lib/drag.ts`
@@ -259,9 +256,9 @@ agent 在动作时右边一行小字「agent 操作中」；内容区上沿一�
 这些数都是从 web 那边抄的，改那边就要改这边。
 
 **标签条**：药丸样式（`rounded-full bg-control`），多了能横着滑。点了之后标签条
-和标题**立刻**更新、只改高亮不重建 —— 以前要等下一拍 500ms 轮询才重建整排，
-页面已经切过去了标签条还停在原处，看着就是卡。agent 正在动作时点击会被拒绝
-（换掉当前标签它的下一步就落错页），现在会提示一句，不再静默无反应。
+和标题**立刻**更新、只改高亮不重建（等下一拍轮询才重建整排的话，页面已经切过去了
+标签条还停在原处，看着就是卡）。agent 正在动作时点击会被拒绝
+（换掉当前标签它的下一步就落错页），会提示一句，不静默无反应。
 
 两个入口：
 
@@ -271,7 +268,7 @@ agent 在动作时右边一行小字「agent 操作中」；内容区上沿一�
   > 点下去静默无反应，看着像坏的。加/改 `AgentHost` 的方法时对着
   > `web/src/lib/overlay.ts` 的 `BackHost` 声明核一遍。
   >
-  > **这个按钮只在 agent 真开着页面时才出现**（以前常驻，没页面时点它
+  > **这个按钮只在 agent 真开着页面时才出现**（常驻着也没用：没页面时点它
   > 只会弹一句提示）。状态在壳这边（`AgentApp.browser.hasPage()`），所以
   > 两条腿：页面加载时同步拉一次（`AgentHost.hasBrowser()`），之后壳推
   > `window.__browserAvailable` —— `BrowserController.onPagesChanged`
@@ -292,7 +289,7 @@ agent 在动作时右边一行小字「agent 操作中」；内容区上沿一�
   （监听器 → 面板自己的 → Activity 的），因为面板 `GONE` 时 `rootWindowInsets`
   可能是 null。
 - **一个必须知道的副作用**：面板把 WebView 重新布局成"面板里那么大"，
-  页面高度变矮（实测 2024 → 2021px，宽度不变）。所以打开面板会让页面重排，
+  页面高度变矮（2024 → 2021px，宽度不变）。所以打开面板会让页面重排，
   模型**按坐标**点可能对不上（按 selector 点不受影响）。选这个而不是给
   WebView 钉死尺寸：后者用户看不到视口底部，而且页面滚不动。
 - 面板开着时 agent 照常操作（`get_readable` / 截图 / `js` 都验过），
@@ -304,7 +301,7 @@ agent 在动作时右边一行小字「agent 操作中」；内容区上沿一�
   别的页面上。多标签是"多只页 + 当前那只"，不是"并行操作多只页"。
 - **整页截图没有 GPU 层**（虚拟显示单边上限 4096px），视口截图有（见第 5 节）。
 - **后台可能被回收 —— 已经摆平一半**：回合进行中会挂一个前台服务
-（`docs/06`），所以“接个电话回来发现没跑完”已经不发生了 —— 实测切到桌面后
+（`docs/06`），所以“接个电话回来发现没跑完”不发生了：切到桌面后
 浏览器动作照常跑完。但不能保证永远不被杀（用户手动强行停止、系统内存极端紧张），
 所以动作仍尽量幂等，进度靠会话历史恢复。
 - **吞掉的弹窗**只报"页面弹窗已自动关闭"，不做交互。
@@ -320,16 +317,16 @@ WebView，结果里出现的这种 URL 再换回 `sandbox:/…`（端口每次�
 
 ### 为什么是 `sandbox.localhost`，而不是和 App 同一个 `127.0.0.1`
 
-沙箱文件以前和 App 同源，于是必须关进 opaque origin（CSP `sandbox`、iframe 不给
-`allow-same-origin`）—— 否则页面里的任何脚本都能带着 App 的凭据 cookie 调
-`/api/linux`（沙箱挂着整个内部存储）。代价是 **localStorage / sessionStorage /
-IndexedDB 一碰就抛 SecurityError**，生成的网页一存东西就坏。
+沙箱文件名在**独立的源**上，不能和 App 同源：同源的话必须关进 opaque origin
+（CSP `sandbox`、iframe 不给 `allow-same-origin`）—— 否则页面里的任何脚本都能带着
+App 的凭据 cookie 调 `/api/linux`（沙箱挂着整个内部存储），代价是 **localStorage /
+sessionStorage / IndexedDB 一碰就抛 SecurityError**，生成的网页一存东西就坏。
 
-现在网页在**另一个源**上：
+所以网页在 `sandbox.localhost` 上：
 
 - `*.localhost` 由 Chromium 直接解析到 loopback（不走 DNS），而它和 `127.0.0.1`
   是不同的站点：App 的凭据 cookie（种在 `127.0.0.1`、`SameSite=Strict`）这个源上
-  的页面读不到、请求也带不上。所以不再需要 CSP sandbox，存储全能用。
+  的页面读不到、请求也带不上。所以不需要 CSP sandbox，存储全能用。
 - 这个源上**只有沙箱文件**（`split_origins` 中间件）：`/api`、`/auth`、App 页面
   一律 404。WebSocket 的 Origin 检查也不放行它。
 - 同一个文件从 `127.0.0.1` 取照旧是 opaque origin —— 图片 / 音视频 / 文本这些 App

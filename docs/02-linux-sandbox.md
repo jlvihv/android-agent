@@ -304,8 +304,7 @@ Rust core                     ▼
 }
 ```
 
-（早期设计里工具分 `ReadOnly` / `NeedsApproval` 两类，后者要等用户点批准。
-审批环节后来整个删了：工具一律直接执行，`ToolKind` 也随之消失。）
+（工具没有审批环节：一律直接执行，服务端因此不持有「挂起等回复」的状态。）
 
 沙箱里还预置了一个 `agent` 命令（`prepare_rootfs` 写进 `/usr/local/bin/agent`）：
 它是核心自己那个 HTTP 服务的薄包装，让模型能查看自己（`agent state` /
@@ -322,7 +321,7 @@ Rust core                     ▼
 （标记被 `read()` 切两半、修它的 hold-back 缓冲把所有短输出吞了、超时命令
 继续污染下一条命令的 stdout，五个月炸三次）。我们要的只是进程退出码。
 
-**没有 `--kill-on-exit`**（曾经有，已删）。它让 proot 在命令退出的瞬间对整棵
+**没有 `--kill-on-exit`**。它让 proot 在命令退出的瞬间对整棵
 树发 SIGKILL（proot 的 `terminate_tracee` → `kill_all_tracees`），于是
 `nohup` / `setsid` 起的常驻服务**一条也活不过这次调用** —— 而「起一个后台
 服务」是这个工具该有的能力。删掉它之后 proot 会一直等到所有 tracee 退出
@@ -340,10 +339,10 @@ Rust core                     ▼
   当 tracer，proot 一死那些进程就失去 rootfs 翻译（看到的路径全变成宿主机的），
   比直接杀掉更糟。宿主侧 `process_group(0)` 是兜底目标（rootfs 里没有 `setsid`，
   或者 runner 还没写下 pid 就被杀）。
-- **不再有孤儿。** 原来超时 / 停止走 `child.start_kill()` / `kill_on_drop`，
-  都是 SIGKILL **proot 本身**；而 proot 的 `--kill-on-exit` 是 userspace 的
+- **不漏孤儿。** 超时 / 停止要是走 `child.start_kill()` / `kill_on_drop`，
+  就是 SIGKILL **proot 本身**；而 proot 的 `--kill-on-exit` 是 userspace 的
   `atexit` 钩子，SIGKILL 不跑它 —— 被 trace 的整棵 guest 树就留在那里继续吃
-  CPU。现在 future 被丢掉时 `CommandGuard::drop` 杀的是进程组。
+  CPU。所以 future 被丢掉时 `CommandGuard::drop` 杀的是进程组。
 - **超时 `exit_code = 124`**（跟 `timeout(1)` 一致），命令被信号打死时按 shell
   的 128+N 约定给出 `signal`（于是「被 OOM 杀了」这类提示还能给）。
 
@@ -393,7 +392,7 @@ bash curl ca-certificates grep findutils jq git github-cli diffutils patch ripgr
 三个实现上的坑：
 
 - **不能拿 `apk add` 的退出码当准**。proot 下 busybox / ca-certificates 的 trigger
-  常常返回非零 —— 实测装一个全新的小包也会报 `1 error; N packages`，但包确实装上了。
+  常常返回非零 —— 装一个全新的小包也会报 `1 error; N packages`，但包确实装上了。
   所以脚本以「那些命令找不找得到」为准（`missing()`），装完再写标记文件。
 - **标记文件里存清单版本**（工具数）。只判文件在不在的话，以后往 `TOOLSET` 里加工具，
   老设备会永远以为自己装过了。
@@ -460,9 +459,9 @@ gh 的设备码页是它自己 print 出来的（不是所有 CLI 都会去调�
 > browser 的 WebView 是靠注入 JS 把 `_blank` 掰成 `_self` 绕过去的，聊天这个没那套。
 > 现在 `MainActivity` 实现 `onCreateWindow`，和点链接一起走 `UriLauncher`。
 
-> 早期的设计把读界面 / 操作界面做成 `device_snapshot` / `device_tap` 两个工具。
-> 现在它们不作为工具暴露给模型了 —— 以后收进沙箱里的一个命令、由 `linux_run`
-> （现名 `bash`）调用，这样模型只需要理解 shell，工具表也只有两个。
+> 读界面 / 操作界面**不作为工具**暴露给模型，它们是沙箱里的命令（`agent command`
+> 那一路）—— 这样模型只需理解 shell。要读 UI 树（无障碍树拍平成 JSON 推给 Rust）
+> 得重做一遍，见 docs/10 的加能力步骤。
 
 ### 升级 Alpine：设置里点一下，原地升级
 
@@ -485,7 +484,7 @@ APK 里带的 minirootfs 只在**第一次安装**时解压（`RootfsInstaller` 
 | 前置 | proot 沙箱才有；没有回合在跑；剩余空间 ≥ rootfs + 600MB | 宿主模式没有 Alpine；快照要一整份空间 |
 | 快照 | 在**沙箱外面**把 rootfs 复制成 `alpine-rootfs.upgrade-bak`，复制完才写标记 | 在沙箱里 tar 不行：升级把 musl 弄坏的话沙箱里什么都跑不了，tar 也解不回来；换目录不依赖沙箱还能不能用 |
 | 改源 | 只换 `/v<数字>.<数字>/` 这一段，镜像域名、注释不动 | 一行都没换到（`edge` / 自定义源）就拒绝，交给人 |
-| 升级 | `apk update && apk upgrade --available`，输出实时进进度日志 | 实测 3.21 → 3.24：178 个包、3 分 20 秒 |
+| 升级 | `apk update && apk upgrade --available`，输出实时进进度日志 | 3.21 → 3.24：178 个包、3 分 20 秒 |
 | 验收 | `/etc/alpine-release` 到了目标分支且不比目标旧；`sh` / `apk` / `bash` 真能跑 | **不看 apk 的退出码**：proot 下 trigger 常报非零（降级那次就是 `1 error`，包都装好了） |
 | 收尾 | 过了删快照；没过：升坏的先挪开（瞬间）、快照换回去、再删 | |
 

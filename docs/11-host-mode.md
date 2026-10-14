@@ -49,9 +49,9 @@ enum Mode {
    `~/.local/share/android-agent/{exit,browser}` 和系统临时目录，而不是 rootfs 的
    `/.agent-exit`、`/root/.browser`、`/tmp`（那些是用户的目录）。
 
-以前是 `SandboxConfig` 里一个 `host: bool`：宿主模式也得带着 `proot` / `loader` /
-`dns` / `shared` 这些对它毫无意义的字段，十几处分岔全靠 `if`。现在 proot 专属的
-方法（`guest_env`、`proot_command_line`、`prepare_proot`、`resolved_dns`）直接拿
+不能用 `SandboxConfig` 里挂一个 `host: bool`：那样宿主模式也得带着 `proot` / `loader` /
+`dns` / `shared` 这些对它毫无意义的字段，十几处分岔全靠 `if`。proot 专属的方法
+（`guest_env`、`proot_command_line`、`prepare_proot`、`resolved_dns`）直接拿
 `&SandboxConfig` 当参数 —— 类型上就不可能在宿主模式下被调到。
 
 ### 进程模型是**共用**的，不是另写一套
@@ -67,14 +67,14 @@ http.server &` 就得等到超时（默认 60s）才回来。所以宿主模式�
 
 - **`agent ps` 不能只看 `ppid == 1`。** 上游那套孤儿识别（「父进程没了 = 上一次
   App 生命留下的」）在安卓上没问题（/proc 按 uid 过滤），在桌面上是灾难：
-  systemd 的服务、用户会话的 daemon 全都是 ppid 1 —— 实测一次列出 40 个
-  （journald / NetworkManager / sshd…），而输出里写的是「`agent kill <pid>` 可以
-  停掉」。现在多一道闸：**得真的是 proot**（argv[0] 的文件名对得上）才算孤儿，
+  systemd 的服务、用户会话的 daemon 全都是 ppid 1（一次能扫出 40 个：
+  journald / NetworkManager / sshd…），而输出里写的是「`agent kill <pid>` 可以
+  停掉」。所以多一道闸：**得真的是 proot**（argv[0] 的文件名对得上）才算孤儿，
   它名下的 tracee 照旧收；宿主模式则干脆不扫 /proc，`agent ps` 回一句「用真的
   `ps` / `pgrep`」。回归测试在 `linux.rs` 的
   `procs_attributes_survivors_to_the_command_that_left_them`。
-- **`agent` 命令的取数**：那个脚本原来只认 busybox 的 `wget`，桌面上一般只有
-  `curl`，所以 `get` / `post` 现在两条都留（装完 curl 的沙箱也会走 curl）。
+- **`agent` 命令的取数**：`get` / `post` 两个都留（沙箱里只有 busybox 的 `wget`，
+  桌面上一般只有 `curl`）。
 
 ## macOS
 
@@ -91,7 +91,7 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 | 系统提示词 / 工具表 | `ss -ltnp` / `pgrep -af` / `xdg-open` | 这三样 macOS 上都不对 | `Platform::Macos`：`lsof -nP -iTCP -sTCP:LISTEN` / `pgrep -fl` / `agent open`（→ `open`），并点名 BSD 用户态（`sed -i ''` 等） |
 | Chrome 在哪 | PATH / `/opt/google/chrome` | `.app` 包从不在 PATH 里 | 查 `/Applications`（和 `~/Applications`）下的 Chrome / Chromium / Canary / Edge / Brave |
 | Chrome 钥匙串 | — | 新 profile 存 cookie 时会弹「Chrome Safe Storage」授权框，无头那边一直等 | 加 `--use-mock-keychain` |
-| 孤儿 Chrome 回收 | 扫 `/proc` | 没有 `/proc`（原来静默跳过）；临时 profile 也不在 `/tmp` 而在 `/var/folders/…` | 问 `ps -axww -o pid=,ppid=,command=`；临时 profile 前缀跟着 `temp_dir()` 走 |
+| 孤儿 Chrome 回收 | 扫 `/proc` | 没有 `/proc`（扫不了）；临时 profile 也不在 `/tmp` 而在 `/var/folders/…` | 问 `ps -axww -o pid=,ppid=,command=`；临时 profile 前缀跟着 `temp_dir()` 走 |
 
 数据目录仍是 `~/.local/share/android-agent`（`$XDG_DATA_HOME` 优先），**故意没用**
 `~/Library/Application Support`：截图路径会原样出现在 `read` / `![](sandbox:…)`
@@ -99,14 +99,14 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 
 两个平台共用的顺手修复：
 
-- **设备通道在桌面上原来是 mock，对什么都回成功**：`agent open` 打出「已让手机
-  打开」其实什么都没开，`agent command` 的点击回一句假的 `mock: tapped`。现在宿主
+- **设备通道不能拿 mock 顶**：mock 对什么都回成功 —— `agent open` 打出「已让手机
+  打开」其实什么都没开，`agent command` 的点击回一句假的 `mock: tapped`。宿主
   模式的设备就是这台电脑（`core/src/desktop.rs` 的 `HostDevice`）：`open` 交给
   `open` / `xdg-open`，做不到的（点、滑、按键）明说做不到。`agent` 脚本里不需要
   任何宿主模式的特判 —— 走的还是同一条 `/api/command`。mock 只留给 `just dev`
   和测试。
-- **宿主提示词原来说「没有 `agent browser`」**，而桌面上早就有核心自己起的无头
-  Chrome —— 模型会白白放弃浏览器。改成如实写。
+- **提示词要如实写宿主能干什么**：桌面上有核心自己起的无头 Chrome，提示词不能说
+  「没有 `agent browser`」—— 那样模型会白白放弃浏览器。
 
 ## 系统提示词和工具表：按平台拼，不是抄几份
 
@@ -126,10 +126,9 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
   `Platform::proc_tools()` / `kill_tool()`，提示词、工具表、`agent ps` 的回话
   三处都从这里取。
 
-以前是三份整段字面量，工具表只有一份（写死了「Alpine 沙箱 / 已预装 / apk add /
-`agent ps`」）。宿主那两份只好**整句反驳工具表**（「那几句是手机版的写法，不适用」）——
-每轮多花 token，模型同时看着两套互相矛盾的说法。现在工具表本身就是这台机器的，
-那句反驳删掉了。
+工具表只有一份（写死了「Alpine 沙箱 / 已预装 / apk add / `agent ps`」）是不行的：
+宿主那两份只能在提示词里**整句反驳工具表**（「那几句是手机版的写法，不适用」）——
+每轮多花 token，模型同时看着两套互相矛盾的说法。现在工具表本身就是这台机器的。
 
 安卓那份重构前后**逐字节一致**（`cargo run -q --example dump_prompt` 前后 diff 过），
 老会话的缓存不受影响；宿主那两份变了，`ensure_system_prompt` 会把新版本追加进老会话。
@@ -158,8 +157,8 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
 
 宿主模式是拿来**日常用**的，所以会话、模型配置、附件都落盘：默认
 `~/.local/share/android-agent/data/sessions.db`（`$XDG_DATA_HOME` 优先），
-`AGENT_DATA_DIR` 可以换。以前桌面上一律只放内存 —— 关一次核心，你在界面上
-配的模型和所有会话就没了（在 macOS 上实测时撞到的）。
+`AGENT_DATA_DIR` 可以换。**只放内存不行**：关一次核心，你在界面上配的模型和所有
+会话就没了（`just dev` 那种临时用法除外）。
 
 - `just dev`（proot 沙箱，在电脑上复现手机）**照旧只在内存里**，除非显式给了
   `AGENT_DATA_DIR`。
@@ -215,7 +214,7 @@ AGENT_BIND=127.0.0.1 just dev-host
 
 为了这条路改的四处（都是「只给本机用」的假设）：
 
-| | 原来 | 现在 |
+| | 只在手机核心上 | 电脑上的核心 |
 |---|---|---|
 | 听在哪 | 写死 `127.0.0.1` | `AGENT_BIND`（`Core::serve_on`）；手机上照旧只听 loopback |
 | 凭据 | 桌面上默认不设防 | **听在非 loopback 上就必须有**：`AGENT_TOKEN`，没给就用库里那把（宿主模式有库，重启不变，收藏的地址一直能用）；本机来的免（对端地址靠 `into_make_service_with_connect_info`） |
@@ -224,7 +223,7 @@ AGENT_BIND=127.0.0.1 just dev-host
 
 打印的地址是**各网卡上私有网段**（192.168/16、10/8、172.16/12）的 IPv4。不用「往外
 连时系统挑哪张网卡」那个办法：开着 Clash 之类 TUN 模式的机器上挑中的是虚拟网卡
-（198.18.x.x），手机连不到 —— 实测就是这么打出过一个错地址。
+（198.18.x.x），手机连不到 —— 这么选过就会打出一个错地址。
 
 ### 在 App 里切（不用手机浏览器）
 
@@ -247,8 +246,8 @@ AGENT_BIND=127.0.0.1 just dev-host
     spawn 完等 `ADVERT_SETTLE`（300ms）再问一句「还在吗」，退了就把那句话原样打
     到终端和日志里 —— `avahi-daemon` 没跑（`创建客户端对象失败：Daemon 不在运行`）、
     或者这个名字已经被另一个核心占了（`添加服务失败：本地名称冲突`），都看得见，
-    不再照着「手机上点它」往下打。踩过：这台开发机上 avahi 一直是 disabled，
-    广播一直是死的，而终端一直在说「手机上点「jl」」。
+    不会照着「手机上点它」往下打。（这台开发机上就撞过：avahi 一直 disabled、
+    广播一直是死的，而终端一直在说「手机上点「jl」」。）
   - 前提是系统的 mDNS 服务真在跑：Linux 要 `systemctl enable --now avahi-daemon`
     （Arch 装完 avahi 默认不 enable，这里就撞过）。同名服务在 mDNS 里没法共存
     —— 先起的那个静默死掉、手机上只剩后起的 —— 同一台机器上跑第二个核心就给它
@@ -274,9 +273,9 @@ SharedPreferences 里，下次启动接着连；哪条路都不通时自动回�
 几处要知道的：
 
 - **为什么切换不用确认**：`addJavascriptInterface` 注入的 `AgentHost` 在**每个
-  frame** 里都看得见，包括查看器里 AI 写的网页（iframe）。以前有一个能传任意地址的
-  `connectRemote`，所以必须弹原生确认框，不然那种网页一句话就能把 App 带到别人的服务器上。
-  现在那个接口删了，页面只能传「这台手机自己找到过」的 id，而没配对过的还要输配对码
+  frame** 里都看得见，包括查看器里 AI 写的网页（iframe）。所以绝不能留一个能传
+  任意地址的接口（那种网页一句话就能把 App 带到别人的服务器上）。页面只能传
+  「这台手机自己找到过」的 id，而没配对过的还要输配对码
   （原生框，网页画不出来）—— 能被切过去的只有你自己配过对的机器。
 - **App 连电脑不再走明文**：局域网和中继都是手机核心隧道里的 TLS（docs/12）。电脑的同一个
   端口仍然认明文 HTTP —— 给电脑上自己开的浏览器、局域网里用手机浏览器打开的那种。
@@ -303,7 +302,7 @@ SharedPreferences 里，下次启动接着连；哪条路都不通时自动回�
 - 浏览器由**核心自己起**（第一次用到时才拉起无头 Chrome，退出时收掉）——
   不用手动开。想用你自己那个浏览器（能看着它动）就 `AGENT_CDP=…`；
   `AGENT_CDP=off` 就是不要浏览器。
-- **线程数封顶，不看 CPU 核数**：桌面以前走 `#[tokio::main]`，默认按核数开 worker
-  （32 核的机器就是 33 个线程），而核心里几乎全是等 IO 的活。现在桌面和安卓共用
+- **线程数封顶，不看 CPU 核数**：走 `#[tokio::main]` 的话默认按核数开 worker
+  （32 核的机器就是 33 个线程），而核心里几乎全是等 IO 的活。所以桌面和安卓共用
   `agent_core::runtime()`：4 个 worker + 阻塞池上限 4 + 1（跑 runtime 的那个线程）
   ≤ 10（见 `core/src/lib.rs` 的 `RUNTIME_THREAD_BUDGET`，那一行是编译期断言）。

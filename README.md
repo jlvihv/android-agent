@@ -10,16 +10,16 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 
 | 部分 | 状态 |
 |---|---|
-| `core/` Rust | ✅ 228 个测试全过，clippy 干净 |
-| `web/` Svelte | ✅ 构建通过（57 KB JS / 21 KB gzip） |
+| `core/` Rust | ✅ 304 个测试全过，clippy 干净 |
+| `web/` Svelte | ✅ 构建通过（163 KB JS / 59 KB gzip） |
 | `android/` 壳 | ✅ **真机验证通过** |
 | LLM | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通 |
 | Linux 沙箱 | ✅ **Alpine 3.24 aarch64 在真机上跑起来**，`apk add` 可用；设置里能一键原地升级 Alpine |
 | 桌面宿主模式 | ✅ `just dev-host`：不套沙箱，`bash`/`read`/`edit` 直接作用在这台机器上；**Linux 和 macOS** 都行（[docs/11](docs/11-host-mode.md)） |
 | 出门在外连家里电脑 | ✅ 一台有公网 IP 的服务器当中继（`just relay-deploy root@IP`）；端到端 TLS，中继看不到内容（[docs/12](docs/12-relay.md)） |
 | 桌面浏览器 | ✅ 核心**自己起**无头 Chrome（CDP），`agent browser` 在桌面上也能用（[docs/08](docs/08-browser.md) 第 15 节） |
-| 设备操控 | ⚠️ 只剩坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI（读 UI 树那套已删，见下） |
-| Prompt cache | ✅ 实测命中 73–87% |
+| 设备操控 | ⚠️ 只做**不需要读界面**的：坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI |
+| Prompt cache | ✅ 命中 73–87% |
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
 | 多会话 | ✅ 侧边栏「最近对话」，标题自动生成 |
 | 会话持久化 | ✅ SQLite（增量落盘），force-stop 后能恢复 |
@@ -133,9 +133,8 @@ just phone                                   # 交互模式，/help 看命令
 3. **不手写反向 JNI** —— UniFFI callback interface
 4. **native 侧不反调 Java** —— 跨语言边界只有 JSON 字符串，Rust 里没有一行 JNI
 5. **Kotlin 壳不写业务逻辑** —— 只放非它不可的平台能力（WebView、无障碍、
-   Intent、前台服务）。最初的目标是 < 800 行；浏览器（真 WebView + 注入的 JS）
-   落地后壳已经到 ~4300 行，其中 `BrowserController.kt` 一个就 ~2000 行（一半
-   是注入的 JS）。行数不再当硬指标，但**判断该放哪边**的标准不变：能在 Rust
+   Intent、前台服务）。壳现在 ~5600 行，其中 `BrowserController.kt` 一个就 ~1500 行
+   （一半是注入的 JS）。行数不当硬指标，但**判断该放哪边**的标准不变：能在 Rust
    里做的不放 Kotlin
 6. **提示词前缀一个字都不能变** —— 见 [docs/03-prompt-cache.md](docs/03-prompt-cache.md)
 7. **没有审批环节** —— 工具调用一律直接执行，服务端不保存「挂起等回复」的状态
@@ -151,10 +150,10 @@ just phone                                   # 交互模式，/help 看命令
 | `edit` | 改文件：按原文精确替换，返回 unified diff；新建文件：只给 `content` |
 
 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不作为工具**暴露给模型 ——
-它们在沙箱里（`agent command`）。浏览器和联网搜索曾经也是工具，现在归队了：
-唯一入口是 `agent browser` / `agent search`。
+它们在沙箱里（`agent command`）。浏览器和联网搜索也在沙箱里：唯一入口是
+`agent browser` / `agent search`。
 
-**判据、实测数据、代价、以及「为什么只剩这三个」**：
+**判据、代价、以及「为什么只剩这三个」**：
 [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md)。
 
 agent loop **没有轮数上限**：任务要多少轮就跑多少轮，唯一的出口是模型自己不再调工具，
@@ -166,12 +165,12 @@ LLM 请求遇到临时故障（429 / 5xx / 断网 / 连上之后一个字没出�
 `bash` 的 `timeout`（秒）可选，**默认 60s**。下载 / `apk add` / 编译 / `git clone`
 这类长任务由模型显式给足（上限 24h，估大不亏：命令一结束就返回）。超时被杀时结果里
 会写明用了多少秒、默认值的话还会教它怎么给 —— 下一次它就知道要传了。
-（曾经改成必填来逼模型先估时间；实践里绝大多数命令几秒就完，每次都要估反而是噪音。）
+（必填的话每次都要估时间，而绝大多数命令几秒就完 —— 那是噪音。）
 
-内核那条路（`/api/command` → 无障碍服务）现在只剩**不需要读界面**的几条：
-坐标点击、滑动、系统按键、启动应用。读 UI 树那套（无障碍树拍平成 JSON 推上来）
-跟 `device_snapshot` 一起删掉了 —— 它当时只为那两个工具服务。要做沙箱里的设备
-命令时会连同它一起重做（`git log --diff-filter=D --name-only` 找得到）。
+内核那条路（`/api/command` → 无障碍服务）只做**不需要读界面**的几条：
+坐标点击、滑动、系统按键、启动应用。要读 UI 树（把无障碍树拍平成 JSON 推给 Rust）
+得重做一遍 —— 做法还是「native 侧拍平推上来、Rust 回传指令」，加能力的步骤见
+docs/10。
 
 工具调用一律直接执行，没有审批环节 —— 服务端因此不持有「挂起等回复」的状态，
 App 随时被杀都没关系。
@@ -182,14 +181,14 @@ App 随时被杀都没关系。
 |---|---|
 | [docs/01-tech-selection.md](docs/01-tech-selection.md) | 选型决策记录（含被否决的选项和理由） |
 | [docs/02-linux-sandbox.md](docs/02-linux-sandbox.md) | **OpenMinis 怎么在 Android 上跑 Alpine**（W^X 问题与解法） |
-| [docs/03-prompt-cache.md](docs/03-prompt-cache.md) | 提示词前缀不变式 + 实测命中率 |
-| [docs/04-android-shell.md](docs/04-android-shell.md) | Android 壳：三个架构决策的落点、真机踩到的 11 个坑 |
+| [docs/03-prompt-cache.md](docs/03-prompt-cache.md) | 提示词前缀不变式 + 命中率 |
+| [docs/04-android-shell.md](docs/04-android-shell.md) | Android 壳：三个架构决策的落点、真机上的坑 |
 | [docs/05-ui.md](docs/05-ui.md) | 界面：设计令牌、edge-to-edge、对话渲染 |
 | [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）、后台运行与**实时更新的通知** |
 | [docs/07-debugging.md](docs/07-debugging.md) | 无线调试 + agentctl + `/api/debug/*`：不重装 APK 也能调 |
 | [docs/08-browser.md](docs/08-browser.md) | agent 的浏览器：无头 WebView、看板、截图 |
-| [docs/09-search.md](docs/09-search.md) | 联网搜索：Exa 的两条路、为什么不要钱 |
-| [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md) | **工具表为什么只有三个**：判据、实测、加能力的步骤 |
+| [docs/09-search.md](docs/09-search.md) | 联网搜索：Exa 的两种接口、为什么不要钱 |
+| [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md) | **工具表为什么只有三个**：判据、代价、加能力的步骤 |
 | [docs/11-host-mode.md](docs/11-host-mode.md) | **宿主模式**：桌面上不套沙箱，直接用这台机器（怎么做的、代价） |
 | [docs/12-relay.md](docs/12-relay.md) | **中继**：出门在外经自己的服务器连家里的电脑（形状、加密、部署、验证） |
 

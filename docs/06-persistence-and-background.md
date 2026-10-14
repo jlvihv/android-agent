@@ -6,19 +6,16 @@
 
 ## 1. 会话持久化：为什么用 SQLite 而不是 JSON
 
-### 第一版（错）
-
-把整个 `SessionStore` 序列化成一个 JSON，每 2 秒重写一次。
-
-两个问题：
+把整个 `SessionStore` 序列化成一个 JSON、每 2 秒重写一次有**两个问题** —— 这就是不
+这么做的理由：
 
 1. **全量重写。** 一次 agent 会话 100 条消息、每条平均 2KB（`bash` 输出很大）
    就是 200KB；10 个会话 2MB。流式输出时每 2 秒重写 2MB ≈ 持续 ~1MB/s
    的闪存写入。手机闪存会磨损，而且卡。
-2. **崩溃丢全部。** 虽然用了「写 `.tmp` 再 `rename`」保证不产生半截文件，
-   但一次都没写成功的话所有会话一起没。
+2. **崩溃丢全部。** 就是用了「写 `.tmp` 再 `rename`」保证不产生半截文件，
+   一次都没写成功的话所有会话一起没。
 
-### 现在
+### 表结构
 
 ```sql
 CREATE TABLE sessions (
@@ -67,8 +64,8 @@ for (i, m) in s.messages.iter().enumerate().skip(done) { INSERT ... }
 ### 读不出来的消息：整个会话报错，不跳过
 
 `load_messages` 遇到解析不了的 payload（装回旧版本时，新版本写的变体它不认识）
-**整个报错**。以前是 `filter_map(.ok())` 静默跳过：内存比库里少一条，水位线跟着
-变小，下次落盘从那个位置 `INSERT OR REPLACE`，就把库里后面的消息覆盖了。现在这个
+**整个报错**（不能 `filter_map(.ok())` 静默跳过：内存比库里少一条，水位线跟着
+变小，下次落盘从那个位置 `INSERT OR REPLACE`，就把库里后面的消息覆盖了）。这个
 会话保持「不在内存里」，库里的行原样不动，换回能读的版本还看得到。
 
 ### 清空过：`epoch`
@@ -79,21 +76,20 @@ for (i, m) in s.messages.iter().enumerate().skip(done) { INSERT ... }
 ### 磁盘上的副产物（`gc.rs`）
 
 图片副本（`images/`）、附件（`attachments/`）、浏览器截图（`/root/.browser/`）、
-bash 溢出的输出（`/tmp/agent-out-*.log`）以前只增不减。现在删会话 / 清空会话时
+bash 溢出的输出（`/tmp/agent-out-*.log`）不会自己消失，得有引用：删会话 / 清空会话时
 清它引用的那些；启动时再扫一遍，删掉库里没有任何消息引用、又是这次启动之前写的
 （沙箱里那两类再多宽限一天：模型可能还在 bash 里用它们）。上传了没发的附件放
 一小时，下次上传时清掉。
 
 ### `bundled` feature
 
-Android 上没有 `libsqlite3.so` 可链，所以开 `rusqlite` 的 `bundled`
-（把 SQLite 源码一起编进来）。实测只让 `.so` 增加 **53 KB**
-（5.89 MB → 5.94 MB）。
+Android 上没有 `libsqlite3.so` 可链，所以开 `rusqlite` 的 `bundled`（把 SQLite 源码
+一起编进来）—— 代价是 `.so` 大约多 50 KB。
 
 ### 一个坑
 
-`Db::load()` 一开始我锁了两次 `self.inner`（先 `let g = lock()` 查表，
-再 `let mut g = lock()` 写水位线）—— 直接死锁。改成：
+`Db::load()` 里不能锁两次 `self.inner`（先 `let g = lock()` 查表、再 `let mut g = lock()`
+写水位线）—— 那是死锁。一次锁、把借用范围分开：
 
 ```rust
 let mut g = self.inner.lock()?;
@@ -109,7 +105,7 @@ g.saved.clear();                                  // 借用结束才动可变字
 
 ## 2. 后台运行
 
-### 已经工作的部分（我一开始以为要改，其实不用）
+### 已经工作的部分（不用动）
 
 - **前台服务**保着进程：`isForeground=true types=0x40000000`（SPECIAL_USE）
   —— 中间去掉过一阵，现在是**回合范围内**的版本，见下一节
@@ -117,22 +113,17 @@ g.saved.clear();                                  // 借用结束才动可变字
   `let _ = tx.send(...)` —— 失败被忽略，循环照跑、工具照执行、LLM 照调
 - Rust 跑在自己的 tokio runtime 线程上，不受 WebView 挂起影响
 
-实测：在后台期间日志照常出现 `chat → opencode-go` 和 `prompt cache 命中 77.4%`。
+在后台期间日志照常出现 `chat → opencode-go` 和 `prompt cache 命中 77.4%`。
 
-### 前台服务：只在回合进行中挂（2026-10-12）
+### 前台服务：只在回合进行中挂
 
-历史上它是个**常驻**服务，只为「让进程别被系统回收」。它必须挂一个常驻通知
-（Android 规定前台服务不能没有通知，没有「隐形前台服务」这回事），而那个通知
-除了「正在运行 · 127.0.0.1:端口」没有任何信息量 —— 所以连服务一起删掉了。
+**常驻不行**：它必须挂一个常驻通知（Android 规定前台服务不能没有通知，没有「隐形
+前台服务」这回事），而那个通知除了「正在运行 · 127.0.0.1:端口」没有任何信息量。
+但完全不保活也不行：进程被杀 = 正在跑的回合跟着死，而且 agent 那只 WebView 也没了 ——
+页面、滚动位置、**登录态后面的会话状态**全没（cookie 在磁盘上不丢），接个电话回来
+发现 agent 的活儿从一半开始重来。
 
-删除的代价当时就写在这页：切到后台的回合不再有保活，内存紧的时候进程会被杀，
-正在跑的回合跟着死。当时判断可以接受，因为每完成一步都落盘。
-
-**做浏览器之后这个帐算不平了**：进程被杀 = agent 那只 WebView 没了 ——
-页面、滚动位置、**登录态后面的会话状态**全没（cookie 在磁盘上不丢）。
-接个电话回来发现 agent 的活儿从一半开始重来，这是用户能直接感受到的。
-
-所以把服务请回来了，但换了形态：
+所以服务只在真有回合在跑时挂：
 
 - **回合开始起、结束停**（`TurnGuard` 建/毁时发通知），通知只在真有东西在跑时出现；
 - 文案说的是实话：「agent 正在处理 · 点开回到对话」；
@@ -140,8 +131,7 @@ g.saved.clear();                                  // 借用结束才动可变字
 
 通路是核心总线上的一个事件：`Event::TurnActive { active }`（`begin_turn`/`end_turn` 里发，
 会话数一变就发一次；订阅者收到重复值也无所谓）。手机壳订阅 `/api/turns/stream`（SSE）拿到它，
-起/停前台服务。（**以前**这条走的是 UniFFI 回调 `TurnHost`，而「连着的那台电脑」那条**没有** ——
-2026-10-14 统一成一条路，见下面「一条路：本地和远程」。）
+起/停前台服务 —— 本地核心和「连着的那台电脑」都是这一条（见下面「一条路：本地和远程」）。
 
 两个平台限制决定了它的边界：
 
@@ -151,7 +141,7 @@ g.saved.clear();                                  // 借用结束才动可变字
 - **通知权限**（Android 13+）没有也能跑，但通知不显示。所以只在真起回合时问一次，
   不在启动时问。
 
-实测（Pixel 10）：
+（Pixel 10）：
 
 ```
 回合进行中： dumpsys activity services → AgentForegroundService isForeground=true types=0x40000000
@@ -211,7 +201,7 @@ Rust status::Reporter ──Event::Turn(JSON)──▶ 总线（/api/ws、/api/t
 - **推的不是会话记录，是核心里裁好的那一小份**（这条流走的是核心总线 + SSE，很容易
   让人以为把聊天记录也发了）。实际上每一层都有界：细节（命令首行 / 路径 / 回复尾行）
   只取一行、截到 80 字；回复预览只看正文**尾部 2048 字**；会话名本身 ≤29 字。
-  实测量过：一个回合里 **12 秒 11 帧，中位 216 字节、最大 300 字节**。
+  一个回合里大约 **12 秒 11 帧，中位 216 字节、最大 300 字节**。
   内存上也不复制：核心里每个**在跑的**会话留一份 ~200B 的快照（只为给晚连上的订阅者
   补一帧，回合结束就拿掉），壳里每个会话一个几字段的结构体 ——
   **完整正文从来没进过这条路**（它只在 agent loop 自己的局部变量里）。
@@ -221,9 +211,9 @@ Rust status::Reporter ──Event::Turn(JSON)──▶ 总线（/api/ws、/api/t
   `status::string_arg` 从半截 JSON 里抠 —— 和前端 `MessageList.summarize` 的 `partialArgs`
   同一条思路（我们只要一个字段，所以手写扫描，不引 regex）。工具**真开跑之前**再推一次
   （那时参数才完整）。
-- **时间戳是 wall clock**。OpenMinis 那边踩过：`elapsedRealtime` 直接喂给 `setWhen`，计时器
-  原点落在「开机时刻」，一台开了五天的手机显示 `120:00:00`。我们让 Rust 直接给 wall clock，
-  类型上就不给混用留口子。
+- **时间戳是 wall clock**：`elapsedRealtime` 直接喂给 `setWhen` 的话，计时器原点会落在
+  「开机时刻」，一台开了五天的手机就显示 `120:00:00`。Rust 直接给 wall clock，类型上就
+  不给混用留口子。
 - **图标每阶段一个**（`ic_notif_work` / `ic_notif_shell` / `ic_notif_file` / `ic_notif_done`），
   必须是只有 alpha 的单色掩码（系统按主题染色，实心圆点会被染成一坨）。
 - **没有进度条、没有秒表、没有「停止」按钮** —— 和 OpenMinis 一样。agent 报不出诚实的百分比，
@@ -250,8 +240,8 @@ Rust status::Reporter ──Event::Turn(JSON)──▶ 总线（/api/ws、/api/t
 
    - **`POST_PROMOTED_NOTIFICATIONS` 权限**（`AndroidManifest.xml`）。Android 17 新加的
      `normal|appop` 权限 —— 安装时自动授予，但**必须声明**：没声明的话
-     `canPostPromotedNotifications()` 一律回 false（实测：同一台 Pixel 10 上，OpenMinis
-     声明了它就有芯片，我们没声明就一直只能当普通通知）。AOSP 16 的框架里还没这个权限，
+     `canPostPromotedNotifications()` 一律回 false（同一台 Pixel 10 上：声明了才有
+     芯片，不声明就只能当普通通知）。AOSP 16 的框架里还没这个权限，
      那时只看 rich-ongoing 特性开关。
    - **上色按版本分开写**：16 源码（`android16-release` 的 `Notification.java`）里
      `hasPromotableCharacteristics()` 最后一行是 `isColorizedRequested() &&
@@ -273,12 +263,12 @@ Rust status::Reporter ──Event::Turn(JSON)──▶ 总线（/api/ws、/api/t
    `chipContentText` 一样：CJK 算两格、上限 9 格 / 6 个字符，所以四个汉字正好截成
    「写胰岛素…」。
 
-一个实测踩到的坑（改了两处才收干净）：**更新前台服务的通知要用 `startForeground()`，不要用
-`NotificationManager.notify()`**。`notify()` 能把同 id 的通知换掉，但会把记录上的
+**更新前台服务的通知要用 `startForeground()`，不要用 `NotificationManager.notify()`**：
+`notify()` 能把同 id 的通知换掉，但会把记录上的
 `FLAG_FOREGROUND_SERVICE` 抹掉 —— 于是**服务死掉时系统不再顺手收它**，通知栏里留一条
 「已完成」不走。另外 `onDestroy` 里除了 `stopForeground(REMOVE)` 再按 id `cancel()` 一次。
 
-实测（模拟器 API 35；`dumpsys notification --noredact` 看 `Notification List`）：
+（模拟器 API 35；`dumpsys notification --noredact` 看 `Notification List`）：
 
 ```
 进行中： id=1001 channel=agent-turn flags=ONGOING_EVENT|ONLY_ALERT_ONCE|NO_CLEAR|FOREGROUND_SERVICE
@@ -294,43 +284,41 @@ Rust status::Reporter ──Event::Turn(JSON)──▶ 总线（/api/ws、/api/t
 **没验到的**：Live Updates（API 36+）那条分支只有真机（Pixel 10 / Android 17）才走得到，
 模拟器是 35，只验了「不满足条件时干净退回普通通知」。
 
-### 一条路：本地和远程（2026-10-14）
+### 一条路：本地和远程
 
-问得对：既然本地核心也是 HTTP 服务，「连到电脑上」那条为什么收不到状态？
-
-**因为本地那条根本没走 HTTP**：同一个进程里，agent loop 用一个 UniFFI 回调
-（`TurnHost.status`）直接把 JSON 递给壳 —— 最短路径，当初就这么写的。而「手机连到电脑上的
-核心」那条，**什么通道都没有**：电脑上的核心只把事件发给它的 HTTP 客户端（前端 SSE、`/api/ws`），
-而 WebView 的 JS 在 App 切到后台时会被系统挂起 —— 而通知栏恰恰是「App 不在前台」时才有用。
-
-于是两份形状、同一份状态语义要各维护一遍。现在合成一条：
+状态走核心总线上的一类事件，壳订阅它 —— 手机自己的核心、和（连着电脑时）那台电脑的核心，
+**是同一条流、同一个实现**。那台电脑经手机核心里的隧道（docs/12），所以壳看到两个 base
+都是本机地址：
 
 ```
 Rust  status::Reporter ──▶ Event::Turn{status} / Event::TurnActive{active}   （总线）
-                              ├─ /api/ws              前端（原来就有）
+                              ├─ /api/ws              前端
                               └─ /api/turns/stream    手机壳（SSE，带补发）
 
-壳    TurnStream(base, token) ──▶ LiveTurnStatus ──▶ 前台服务 + 通知（一行没改）
+壳    TurnStream(base, token) ──▶ LiveTurnStatus ──▶ 前台服务 + 通知
 
-base = http://127.0.0.1:<本地端口>  或  http://<电脑>:<端口>
+base  = http://127.0.0.1:<手机核心端口>   或   http://localhost:<隧道端口>（那台电脑）
 token = 本地那本凭据（`files/token`）或配对时存下的 token
 ```
+
+壳为什么走 HTTP 而不是同进程直调：**通知栏恰恰是「App 不在前台」时才有用**，而 WebView 的
+JS 在后台会被系统挂起；电脑上的核心更是只能从 HTTP 拿。同一条流，形状和状态语义就只维护
+一份。
 
 为什么用 SSE 而不是 `/api/ws`：壳那边**只收不发**，而 Kotlin 写一个 WebSocket 客户端要自己
 做握手和帧解析；SSE 就是「HTTP 长连接 + 几行 `data:`」，`HttpURLConnection` 读一行处理一行
 就完了。两边发的是**同一个 `Event` 的 JSON**。
 
-删掉的东西比加的多：`TurnApi`（Rust 里的 trait）、`TurnAdapter`、`TurnHost`（uniffi callback
-interface）、壳里的 `TurnHostImpl`。跨语言边界现在只剩 `DeviceHost` 和 `BrowserHost` 两条 ——
-都是「非它不可」的平台能力，而回合状态本来就不需要一条专用回调。
+跨语言边界只剩 `DeviceHost` 和 `BrowserHost` 两条 —— 都是「非它不可」的平台能力；
+回合状态本来就不需要一条专用回调（有一个会就是两份形状、同一份语义各维护一遍）。
 
 几个实现上的选择：
 
 - **连上先补一帧**（`AppState::turn_snapshot`）：订阅者可能在回合跑了一半才连上（壳刚起、刚从
   系统冻结里醒来、网刚恢复），而一条 `bash` 可能几分钟不产生变化 —— 不补的话它的通知栏就一直空着。
-  **只补在跑的回合**：结束那一条是一次性的消息。以前核心把每个会话最后一份状态（包括 `done`）
-  一直留着、每次重连都重放，壳每重连一次就再发一遍「已完成」通知（划掉了还会再响）。现在
-  `end_turn` 时把那一行拿掉；壳那边也按 `sid + finished_at_ms` 记着发过的，旧核心重放也只提醒一次。
+  **只补在跑的回合**：结束那一条是一次性的消息 —— `end_turn` 时核心把那一行拿掉，
+  壳那边按 `sid + finished_at_ms` 记着发过的（不然每次重连都会再发一遍「已完成」，
+  划掉了还会再响）。
 - **断线重连带退避**：连上了退回 2 秒，一直连不上就翻倍到 30 秒（旧核心没这个端点时不要每 2 秒刷日志），
   所以核心重启、网抖动都能自己接回来。
 - **前台服务的起停 = 所有源的总和**：连着电脑时手机自己的核心也还跑着（`just phone` 那种从电脑驱动
@@ -338,13 +326,13 @@ interface）、壳里的 `TurnHostImpl`。跨语言边界现在只剩 `DeviceHos
 - **URL 和 token 的来处**：本地是 `AgentApp.port` + `core.token()`；远程是 SharedPreferences 里的
   `remote_core` + `paired_<id>`（配对时存下的）。切核心/回到前台都只是重新算一遍目标清单（幂等）。
 
-边界（和以前一样，只是现在说清了）：
+边界：
 
 - **手机 App 切后台 60~75 秒会被系统冻住**（下面那节），那段收不到东西；回到前台重连再补一帧。
 - 回合由**电脑上的脚本**发起、而手机 App 在后台时：起不了前台服务（Android 12+ 的限制），
   所以只能等回到 App 补一条。
 
-实测（模拟器当客户端 + 本机另起一个临时核心当「电脑」，独立数据目录，互不干扰）：
+验证（模拟器当客户端 + 本机另起一个临时核心当「电脑」，独立数据目录，互不干扰）：
 
 重启核心时用 `scripts/restart-core.sh`：它按「先编译（编不动就什么都不动）→ 等 `busy=false`
 （等你这句话答完、消息已经发到手机上、并且**落盘**）→ 才杀 → 起新的 → 验健康（起不来就用
@@ -385,7 +373,7 @@ cg=$(adb shell "cat /proc/$pid/cgroup" | sed -n 's|^0::/apps/\(.*\)$|\1|p')
 adb shell cat /sys/fs/cgroup/apps/$cg/cgroup.freeze     # 1 = 冻着
 ```
 
-实测（Pixel 10 / Android 17）：
+（Pixel 10 / Android 17）：
 
 | 状态 | `cgroup.freeze` | `/api/health` |
 |---|---|---|
@@ -410,7 +398,7 @@ adb shell cat /sys/fs/cgroup/apps/$cg/cgroup.freeze     # 1 = 冻着
 
 **落到工具上**：`scripts/phone-wake.sh` 把两招都做了（`just wake on`），
 `phone-forward.sh` 会在每次远程驱动前跑它的 `auto` 版 —— **已经在前台就什么都不做**，
-不在才叫到前台并在 stderr 说一句（`AGENT_NO_WAKE=1` 关掉）。实测：
+不在才叫到前台并在 stderr 说一句（`AGENT_NO_WAKE=1` 关掉）。跑起来是这样：
 
 ```
 冻着（cgroup.freeze=1, adj=900）→ just phone "用 bash 跑 date +%T"
@@ -432,8 +420,7 @@ WebView 切到后台会挂起 JS，SSE 流可能就断了。切回来时本地�
 2. `/api/session` 返回 `busy`（服务端的 `turn_active` 标志）
 3. 如果 `busy`，每 1.5 秒轮询一次直到结束
 
-界面**不再为这个状态单独加一行提示**（原来输入卡片上方有句「agent 正在运行…」
-和一个闪的点，2026-10-13 删掉了）：这时的输入卡片右边就是停止键，发出去的消
+界面**不为这个状态单独加一行提示**：这时的输入卡片右边就是停止键，发出去的消
 息会进队列 —— 该说的都说了，再多一行字只是噪音。
 
 那个队列也在**核心**（`AppState::queued`），不在 WebView 里 —— 前端被冻住的
@@ -470,7 +457,7 @@ impl Drop for TurnGuard {
 if (!busy) messages = d.messages ?? [];   // 流还在跑就别换掉正在流式的对象
 ```
 
-### 实测
+### 验证
 
 1. 在 UI 里发「use bash to time sleep 6 and then report the alpine version」
 2. 立刻按 Home 切到后台

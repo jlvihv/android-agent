@@ -1,7 +1,6 @@
 # Android 壳
 
-> 状态：**✅ 已在真机（Pixel 10 / Android 17 / API 37）完整验证**
-> 验证日期：2026-10-10
+> 状态：**✅ 真机（Pixel 10 / Android 17 / API 37）验证通过**
 
 ---
 
@@ -9,12 +8,11 @@
 
 | 能力 | 结果 |
 |---|---|
-| Rust 交叉编译 arm64-v8a + x86_64 | ✅ |
+| Rust 交叉编译 arm64-v8a（模拟器另加 x86_64） | ✅ |
 | JNA 加载 `libagent_core.so`（D1） | ✅ |
 | UniFFI 正向调用（Kotlin → Rust） | ✅ |
 | UniFFI 反向 callback（Rust → Kotlin，D2） | ✅ |
 | WebView 加载 `http://127.0.0.1:<port>`（D3） | ✅ 明文例外够用（R2 解决） |
-| 无障碍读 UI 树（真实 500 节点） | ✅ **后来删了**（见 §6 的注） |
 | 无障碍坐标点击 / 滑动 / 系统按键 / 启动应用 | ✅ |
 | **Alpine 沙箱跑起来**（proot + W^X 绕过） | ✅ 87ms 启动 |
 | `apk add` 联网装包（jq + python3） | ✅ 32s / 50 MiB |
@@ -23,10 +21,10 @@
 | Prompt cache 命中率 | ✅ 73–87% |
 | 完整 agent 循环（读界面 → 跑命令 → 汇报） | ✅ |
 
-真机实测输出（agent 自己汇报的）：
+真机上 agent 自己汇报的输出：
 
 ```
-Alpine 版本：3.21.0
+Alpine 版本：3.24.2
 架构：aarch64
 CPU 核数：8
 内存：总计 11.3G，可用约 2.6G
@@ -48,24 +46,29 @@ android/                          # Gradle 根
         ├── AndroidManifest.xml
         ├── java/dev/vihv/agent/
         │   ├── AgentApp.kt                 Application + 核心生命周期
-        │   ├── MainActivity.kt             WebView 壳
-        │   ├── AgentAccessibilityService.kt 设备操控
+        │   ├── MainActivity.kt             WebView 壳 + 面板
+        │   ├── AgentAccessibilityService.kt 设备操控（不读界面）
         │   ├── DeviceHostImpl.kt           uniffi callback 实现
-        │   ├── RootfsInstaller.kt          rootfs 解压（手写 tar）
-        │   └── UiTree.kt                   无障碍树 → 扁平 JSON
+        │   ├── AgentForegroundService.kt   回合进行中的前台服务
+        │   ├── AgentNotifications.kt / LiveTurnStatus.kt / LiveUpdates.kt
+        │   ├── TurnStream.kt               订阅 /api/turns/stream（SSE）
+        │   ├── Remote.kt / CoreDiscovery.kt  连电脑 / mDNS 发现
+        │   ├── BrowserController.kt / BrowserPanel.kt / HeadlessCapture.kt
+        │   ├── UriLauncher.kt              打开外链 / 系统选择器
+        │   └── RootfsInstaller.kt          rootfs 解压（手写 tar）
         ├── java/uniffi/agent_core/         生成的绑定（gitignore）
         ├── jniLibs/                        交叉编译产物（gitignore）
         ├── assets/                         Alpine rootfs（gitignore）
         └── res/xml/{accessibility,network_security}_config.xml
 ```
 
-Kotlin 总量 **~1150 行**（不含生成的绑定）。
+Kotlin 总量 **~5600 行**（`android/app/src/main/java/dev/vihv/agent/*.kt`，不含生成的绑定）。
 
 ---
 
-## 3. 真机上踩到的 11 个坑
+## 3. 真机上碰到的 11 个坑
 
-按发现顺序。**每一条都是实测出来的，不是推测。**
+按发现顺序。
 
 ### 坑 1 — `PROOT_LOADER` 不设，proot 直接拒绝执行
 
@@ -135,8 +138,8 @@ Files.setPosixFilePermissions(target.toPath(), toPerms(mode))
 
 ### 坑 4 — AAPT 把 `.tar.gz` 改名成 `.tar`
 
-**实测**：`assets/alpine-minirootfs.tar.gz`（3.85 MB）进 APK 后变成
-**`assets/alpine-minirootfs.tar`（8.47 MB，gzip 已被解掉）**。
+`assets/alpine-minirootfs.tar.gz`（~3.7 MB）进 APK 后变成
+**`assets/alpine-minirootfs.tar`（~8.5 MB，gzip 已被解掉）**。
 
 **解法**：两个名字都试，并且**按 magic bytes 判断**而不是按文件名：
 
@@ -275,7 +278,7 @@ core = AgentCore()                    // System.loadLibrary("agent_core")
 port = core.start(0u.toUShort())      // 后台线程 + 独立 tokio runtime，同步返回端口
 ```
 
-端口传 0 让系统分配 —— 实测每次启动都不同（34155 / 43709 / 41071 …），
+端口传 0 让系统分配 —— 每次启动都不同（34155 / 43709 / 41071 …），
 硬编码在真机上确实会被占。
 
 ### D2（UniFFI callback）
@@ -299,7 +302,7 @@ w.loadUrl("http://127.0.0.1:$port")
 ```
 
 明文流量由 `res/xml/network_security_config.xml` 给 loopback 开例外。
-**实测确认这个例外是必需的** —— 不给的话 WebView 会报 `ERR_CLEARTEXT_NOT_PERMITTED`。
+**这个例外是必需的** —— 不给的话 WebView 会报 `ERR_CLEARTEXT_NOT_PERMITTED`。
 
 ---
 
@@ -329,7 +332,7 @@ if (Build.VERSION.SDK_INT >= 34) {
 
 ### 16KB page size（R1）—— 已自动满足
 
-实测 `cargo-ndk` 4.1.2 + NDK r27 的产物已经对齐到 `0x4000`：
+`cargo-ndk` 4.1.2 + NDK r27 的产物已经对齐到 `0x4000`：
 
 ```
 align: 0x4000
@@ -398,19 +401,12 @@ cancel 那行是用 `input motionevent DOWN/MOVE…/UP` 划出去再退回原处
 `execute` 是从 Rust 的 `spawn_blocking` 线程进来的，而无障碍 API 必须在主线程调。
 `onMain {}` 会 post 到主线程并**阻塞等结果**（8s 超时）。
 
-### 事件节流（已随快照一起删掉）
+### 事件节流（没有）
 
-`onAccessibilityEvent` 每秒可达几十次，原来用 250ms 的 debounce 合并。
-
-> 读 UI 树那整套（`UiTree.kt`、推快照、按节点索引点击/输入）是给
-> `device_snapshot` / `device_tap` 两个工具做地基的；工具删掉之后它跟着删了。
-> 现在无障碍服务只剩不需要读界面的那几条：坐标点击、滑动、系统按键、启动应用。
-> 以后做沙箱里的设备命令时会连同它一起重做。
-
-### 实测效果（当时的记录）
-
-模型读到节点 #14 是「📱 界面」标签页 → 点击 `(540,2259)` → 界面切换 →
-再次快照确认（500 节点）。
+读 UI 树那整套（`UiTree.kt`、推快照、按节点索引点击/输入）现在不在：无障碍服务
+只做**不需要读界面**的那几条 —— 坐标点击、滑动、系统按键、启动应用。所以
+`onAccessibilityEvent` 什么都不做，也就不需要去抖/节流（那是给每秒几十次的事件
+合并快照用的）。以后做沙箱里的设备命令时会连同读树一起重做。
 
 ---
 
@@ -449,17 +445,16 @@ dev_shell 'uname -m'
 
 ## 8. 还欠的债
 
-1. **proot 是从本地 OpenMinis checkout 复制的二进制。**
-   正式发布前必须自己编 —— provenance + 许可证（proot GPL-2.0，OpenMinis fork 也 GPL）。
-   `just android-assets` 里标了警告。
+1. **proot 目前是从本地 OpenMinis checkout 复制的二进制**（`just android-assets`
+   里标了警告）。正式发布前必须自己编 —— provenance + 许可证（proot GPL-2.0，
+   OpenMinis 的 fork 也是 GPL）。
 2. **只出 arm64-v8a。** 要跑模拟器得把 `x86_64` 加回 `abiFilters` 和
    `android-libs` 的 `cargo ndk -t`（加回来真机就白带 4MB）。
-3. ~~**`.so` 5.7 MB，`aws-lc-rs` 是大头。**~~ 已处理：
-   - `aws-lc-rs` → `ring`（reqwest/async-openai 走 `rustls-no-provider`）
-   - `tracing-subscriber` 改成非安卓依赖（它把 `regex` 也带进来了）
-   - `android_logger` 关掉默认的 `regex` feature
-   - `async-openai` 去掉没用的 `responses` feature
-   现在 `.so` **7.06 MB**（比之前大是因为加了 `image` 解码器），release APK **7.1 MB**。
+3. **体积**：`.so` 现在 **7.3 MB**、release APK **7.4 MB**。做过的减重：
+   `aws-lc-rs` → `ring`（reqwest 走 `rustls-no-provider`）；`tracing-subscriber`
+   改成非安卓依赖（它把 `regex` 也带进来）；`android_logger` 关掉默认的 `regex`；
+   `image` 只留 png / jpeg / webp。`image` 解码器本身占几 MB —— 那是换「模型能看图
+   片」的代价。
    再省就得砍 `image` 的 webp/gif/bmp（~0.3MB）或绕过 reqwest 的
    `rustls-platform-verifier`（~0.1MB）。
 4. **API key 明文存在 `sessions.db`（`meta` 表）里。** 受 Android 沙箱保护，
