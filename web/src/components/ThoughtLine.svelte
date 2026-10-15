@@ -13,6 +13,12 @@
    * 节奏：每行至少停留 HOLD 毫秒。快模型一秒能出好几行，每行都切的话
    * 亮起动画还没走完就被打断，看着是在闪。停留期间来的新行只记最新的
    * 一条，到点直接切过去，中间的跳过。
+   *
+   * 两头不等：
+   * - **开头**：还没有写满的行时，正在写的那半行直接显示、原地变长（不重播亮起）。
+   *   不然要等二三十个字写满一行才有东西，看着像模型还没开始想。
+   * - **结尾**：思考一结束（后面接上了正文或工具调用）就立刻换成最终那一行，不等
+   *   停留、不重播亮起 —— 不然工具调用都跑完了，这一行的动画还没收住。
    */
   import { untrack } from 'svelte';
 
@@ -33,24 +39,44 @@
   let seenWidth = 0;
   let lastRow = '';
 
+  /**
+   * 该显示什么，以及怎么换上去：
+   * - `row`：写满的一行 —— 守停留时间、换上去时重播亮起；
+   * - `partial`：第一行还没写满，正在写的那半行 —— 原地更新；
+   * - `final`：思考结束了 —— 立刻换，原地更新。
+   */
+  type Line = { text: string; kind: 'row' | 'partial' | 'final' };
+
   // 留几像素余量：canvas 量的和实际排版有细微出入，宁可早一点换行也别被省略号截掉
-  const latest = $derived(live ? follow(text, width - 4) : finalLine(text));
+  const latest = $derived<Line>(
+    live ? follow(text, width - 4) : { text: finalLine(text), kind: 'final' },
+  );
 
   // 历史消息首帧就是最终内容，直接显示、不播亮起动画
-  let shown = $state(untrack(() => latest));
-  /** 挂载之后真的换过行才播亮起动画 */
-  let changed = $state(false);
+  let shown = $state(untrack(() => latest.text));
+  /**
+   * 换「写满的一行」的次数。元素按它重建（`{#key}`）—— 亮起动画靠重建才重播，
+   * 而原地更新（半行变长、结束时换成最终那行）不重建：重建的话流光也跟着从头来，
+   * 每来一个字跳一下。
+   */
+  let rows = $state(0);
   let since = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   $effect(() => {
     const next = latest;
-    if (next === shown) return;
+    if (next.text === shown) return;
     clearTimeout(timer);
+    if (next.kind !== 'row') {
+      shown = next.text;
+      return;
+    }
     const wait = since + HOLD - performance.now();
     const swap = () => {
-      shown = latest;
-      changed = true;
+      const now = latest; // 等的这一会儿可能又变了（甚至已经结束了）
+      shown = now.text;
+      if (now.kind !== 'row') return;
+      rows++;
       since = performance.now();
     };
     if (wait <= 0) swap();
@@ -58,9 +84,9 @@
   });
   $effect(() => () => clearTimeout(timer));
 
-  /** 流式：返回最近一条写满的行 */
-  function follow(t: string, w: number): string {
-    if (w <= 0) return lastParagraph(t, true);
+  /** 流式：最近一条写满的行；一行都还没写满时是正在写的那半行 */
+  function follow(t: string, w: number): Line {
+    if (w <= 0) return { text: lastParagraph(t, true), kind: 'row' };
     // 文本变短（换了一条消息）或宽度变了：从头折
     if (t.length < seenLen || w !== seenWidth) {
       rowStart = 0;
@@ -90,7 +116,10 @@
       if (r) lastRow = r;
       rowStart = nl + 1;
     }
-    return lastRow;
+    if (lastRow) return { text: lastRow, kind: 'row' };
+    // 一行都还没写满：正在写的那半行（rowStart 之后、下一个换行之前）
+    const nl = t.indexOf('\n', rowStart);
+    return { text: clean(t.slice(rowStart, nl === -1 ? t.length : nl)), kind: 'partial' };
   }
 
   /** 结束后：最后一段，从段首开始 */
@@ -153,12 +182,12 @@
 </script>
 
 <!-- 这里两层 span 不能合：外层是**稳定**的 flex 项（量宽度 clientWidth、
-     取字体），内层被 {#key} 重建 —— 每换一行重建一次元素，
+     取字体），内层被 {#key} 重建 —— 每换一行写满的重建一次元素，
      `.reveal` 那条亮起动画才会重播。合成一个元素就只剩“量得到”或
      “能重播”两者之一。 -->
 <span bind:this={box} bind:clientWidth={width} class="flex min-w-0 flex-1 text-sm">
-  {#key shown}
-    <span class="min-w-0 truncate text-muted" class:live class:reveal={changed}
+  {#key rows}
+    <span class="min-w-0 truncate text-muted" class:live class:reveal={rows > 0}
       >{shown || (live ? '思考中…' : '思考')}</span
     >
   {/key}
