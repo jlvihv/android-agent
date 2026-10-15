@@ -192,6 +192,16 @@ fn subcommands() -> Vec<Sub> {
     });
 
     v.extend([
+        // 提示词里那一句是动态的（接了哪几个服务），不在这张表里：见 `mcp::prompt_line`
+        sub(
+            "mcp",
+            ALL,
+            "",
+            "  agent mcp list [服务]               已接的 MCP 服务和它们的工具\n\
+             \x20   agent mcp <服务> <工具> --help      这个工具的说明和参数\n\
+             \x20   agent mcp <服务> <工具> ['<json参数>']   调用",
+            MCP_BODY,
+        ),
         sub(
             "files",
             PROOT,
@@ -308,6 +318,11 @@ guard() {
     /api/llm*|/api/debug/system-prompt*)
       echo "拒绝：$1 会改掉我自己的身份（模型 / key / 提示词）。" >&2
       echo "那两件事留给人做：在宿主机上跑 scripts/agentctl.py" >&2
+      exit 3
+      ;;
+    # 接哪些 MCP 服务、带什么凭据由人在设置里定：网页里一段话不该能让我把调用转给别人的服务
+    /api/mcp/servers*)
+      echo "拒绝：MCP 服务由人在设置里配。" >&2
       exit 3
       ;;
   esac
@@ -567,6 +582,13 @@ const PHONE_BODY: &str = r##"    _name="$cmd"; shift || true
     # 回了 0 的话它会拿着空输出继续往下跑。
     case "$out" in *'"ok":false'*) exit 1 ;; esac"##;
 
+// 工具回的图片落在当前目录下（`$AGENT_WORKDIR`，核心那边见 `http::mcp_run`）。
+// 出错时核心回的文字以「错误：」开头 —— 变成非 0 退出码，`&&` 链才会断。
+const MCP_BODY: &str = r##"    shift || true
+    out=$(post /api/mcp "{\"argv\":$(json_args "$@"),\"workdir\":\"$(esc "${AGENT_WORKDIR:-}")\"}")
+    printf '%s\n' "$out"
+    case "$out" in 错误：*) exit 1 ;; esac"##;
+
 const FILES_BODY: &str = r##"    shift || true
     post /api/files "{\"path\":\"$(esc "${1:-/workspace}")\"}""##;
 
@@ -647,7 +669,7 @@ mod tests {
         for m in Machine::ALL {
             let (code, help, err) = run(m, &["help"]);
             assert_eq!(code, 0, "{m:?} 的 agent help 失败：{err}");
-            for s in ["agent browser", "agent search", "agent weather", "agent open", "agent debug"] {
+            for s in ["agent browser", "agent search", "agent weather", "agent open", "agent mcp", "agent debug"] {
                 assert!(help.contains(s), "{m:?} 的 help 里少了 {s}");
             }
             // 模型不该看到「手机上 / 电脑上 / 只有…才有」这层区分

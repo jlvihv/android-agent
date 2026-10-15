@@ -194,6 +194,7 @@ App 随时被杀都没关系。
 | [docs/11-host-mode.md](docs/11-host-mode.md) | **宿主模式**：桌面上不套沙箱，直接用这台机器（怎么做的、代价） |
 | [docs/12-relay.md](docs/12-relay.md) | **换机器**：手机/电脑连到另一台机器上的核心（隧道、局域网/中继、页面不拿凭据、部署与验证） |
 | [docs/13-phone.md](docs/13-phone.md) | **手机系统能力**：闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板 / 通知 / 朗读，以及「按机器显示不同子命令」与权限那套阻塞桥 |
+| [docs/14-mcp-and-skills.md](docs/14-mcp-and-skills.md) | **MCP 和 Skill**：只接远程 MCP（`agent mcp`）、skill 目录 + 提示词索引，都不进工具表 |
 
 ## 脚本
 

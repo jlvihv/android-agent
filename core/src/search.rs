@@ -159,7 +159,7 @@ async fn search_mcp(query: &str, num: usize) -> anyhow::Result<Found> {
         );
     }
 
-    let payload = decode_rpc_body(&text)?;
+    let payload = crate::mcp::decode_rpc_body(&text)?;
     if let Some(err) = payload.get("error") {
         anyhow::bail!("Exa MCP 报错：{err}");
     }
@@ -183,30 +183,6 @@ async fn search_mcp(query: &str, num: usize) -> anyhow::Result<Found> {
         hits: parse_mcp_text(content, num),
         provider: "exa-mcp",
     })
-}
-
-/// 把响应体解码成 JSON-RPC 信封。
-///
-/// 这个端点回的是 **SSE**（`event: message` + `data: {…}`），但按 MCP 规范也
-/// 允许直接回 JSON —— 两种都认，先扫 `data:` 行，扫不到就整段当 JSON 解。
-fn decode_rpc_body(body: &str) -> anyhow::Result<Value> {
-    for line in body.lines() {
-        let Some(rest) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let rest = rest.trim();
-        if rest.is_empty() || rest == "[DONE]" {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(rest) {
-            // 一帧可能是通知（没有 result/error），跳过继续找
-            if v.get("result").is_some() || v.get("error").is_some() {
-                return Ok(v);
-            }
-        }
-    }
-    serde_json::from_str::<Value>(body)
-        .map_err(|e| anyhow::anyhow!("Exa MCP 的响应既不是 SSE 也不是 JSON: {e}"))
 }
 
 /// 解析 MCP 给的文本块。形状是：
@@ -412,20 +388,5 @@ mod tests {
         // MCP 那边没标题时写的就是这个
         let na = parse_mcp_text("Title: N/A\nURL: https://a.b/c/d\nHighlights:\nx\n", 5);
         assert_eq!(na[0].title, "a.b");
-    }
-
-    #[test]
-    fn sse_and_plain_json_both_decode() {
-        let sse = "event: message\ndata: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n\n";
-        assert_eq!(
-            decode_rpc_body(sse)
-                .unwrap()
-                .pointer("/result/content/0/text")
-                .unwrap(),
-            "hi"
-        );
-        let plain = "{\"result\":{\"ok\":true}}";
-        assert_eq!(decode_rpc_body(plain).unwrap()["result"]["ok"], true);
-        assert!(decode_rpc_body("not json").is_err());
     }
 }

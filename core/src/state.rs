@@ -251,6 +251,8 @@ pub struct AppState {
     /// `llm` 是「当前在用的那一个」（含模型），这里是「配好了的全部」：
     /// 选择模型面板把这几家的模型都列出来，点哪个就切到哪家。
     pub providers: RwLock<crate::providers::Store>,
+    /// 远程 MCP 服务（配置 + 各自的会话）。见 `mcp` 模块。
+    pub mcp: crate::mcp::Mcp,
     /// 各家的模型清单：服务商 id → (拉的时间, 清单)。
     ///
     /// 打开选择模型面板要拉好几家的 `/models`，每次都等网络太慢；
@@ -363,6 +365,7 @@ impl AppState {
             linux: RwLock::new(None),
             llm: RwLock::new(None),
             providers: RwLock::new(Default::default()),
+            mcp: Default::default(),
             model_lists: Mutex::new(HashMap::new()),
             data_dir: RwLock::new(None),
             alpine: Default::default(),
@@ -483,6 +486,10 @@ impl AppState {
                 let db = Arc::new(db);
                 self.load_llm(&db);
                 self.load_providers(&db);
+                match db.mcp_servers() {
+                    Ok(list) => self.mcp.set_servers(list),
+                    Err(e) => tracing::warn!("读 MCP 服务失败: {e:#}"),
+                }
                 self.load_auth(&db);
                 if let Ok(keys) = db.responses_unsupported() {
                     crate::llm::load_responses_unsupported(keys);
@@ -1163,20 +1170,50 @@ impl AppState {
         self.sessions_dirty.store(true, Ordering::Relaxed);
     }
 
-    /// 当前生效的系统提示词。
+    /// 当前生效的系统提示词 = 基础那份 + 这台机器上装了什么（skill 索引）。
     ///
-    /// 默认是编译进去的那份；被 `/api/debug/system-prompt` 覆盖过就返回那一份。
-    /// `Cow` 是为了没覆盖时**不拷贝**那个常量。
-    ///
-    /// 编译进去的按平台各一份（`platform()`，见 `prompt::system_prompt`）。
-    /// 同一个实例上不会中途换 —— 前缀缓存的一个字节都不能变。
+    /// 基础那份默认是编译进去的（按平台各一份，见 `prompt::system_prompt`），被
+    /// `/api/debug/system-prompt` 覆盖过就是那一份。后面拼的部分是**动态**的，但只随
+    /// 「装了什么」变，不随时间、屏幕、会话变：装的东西不变时，每个会话、每一轮拿到的
+    /// 都是同一串字节，前缀缓存照常命中（见 `skills` 模块）。
+    /// `Cow` 是为了什么都没装、也没覆盖时**不拷贝**那个常量。
     pub fn system_prompt(&self) -> Cow<'static, str> {
-        match self.system_prompt.read() {
+        let base: Cow<'static, str> = match self.system_prompt.read() {
             Ok(g) => match &*g {
                 Some(s) => Cow::Owned(s.clone()),
                 None => Cow::Borrowed(self.builtin_prompt()),
             },
             Err(_) => Cow::Borrowed(self.builtin_prompt()),
+        };
+        let extras = self.installed_prompt();
+        if extras.is_empty() {
+            base
+        } else {
+            Cow::Owned(format!("{base}\n\n{extras}"))
+        }
+    }
+
+    /// 装了什么（拼在系统提示词后面那段：接了哪些 MCP 服务、有哪些 skill）。
+    /// 什么都没装就是空串。
+    fn installed_prompt(&self) -> String {
+        [
+            crate::mcp::prompt_line(&self.mcp.servers()),
+            crate::skills::index(&self.skills()),
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    /// 这台机器上装的 skill（每次现扫：一个目录几十个 `SKILL.md`，比缓存失效的麻烦便宜）。
+    pub fn skills(&self) -> Vec<crate::skills::Skill> {
+        match self.linux() {
+            Some(sb) => {
+                let (host, guest) = sb.skills_dir();
+                crate::skills::scan(&host, &guest)
+            }
+            None => Vec::new(),
         }
     }
 
@@ -1655,6 +1692,44 @@ mod tests {
         assert_eq!(st.auth().sandbox_key, key);
         assert!(token.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 装了 skill，系统提示词就带上它的索引（拼在基础那份后面）；没变时每次拿到的
+    /// 是同一串字节（前缀缓存靠这个）。没有沙箱 / 没装就是基础那份本身。
+    #[test]
+    fn installed_skills_are_indexed_in_the_system_prompt() {
+        let root = std::env::temp_dir().join(format!("agent-skill-state-{}", uuid::Uuid::now_v7()));
+        let st = AppState::new();
+        let bare = st.system_prompt().into_owned();
+        st.set_linux(Arc::new(crate::linux::LinuxSandbox::new(
+            crate::linux::SandboxConfig {
+                proot: "/nonexistent/proot".into(),
+                rootfs: root.clone(),
+                binds: vec![],
+                tmp: None,
+                dns: vec![],
+                tz_offset_minutes: None,
+                loader: None,
+                loader32: None,
+                env: Default::default(),
+                workspace: Some(root.join("ws")),
+                shared: None,
+            },
+        )));
+        assert_eq!(st.system_prompt(), bare, "一个都没装：提示词不变");
+
+        std::fs::create_dir_all(root.join("ws/skills/pdf")).unwrap();
+        std::fs::write(
+            root.join("ws/skills/pdf/SKILL.md"),
+            "---\nname: pdf\ndescription: 处理 PDF\n---\n正文不进提示词\n",
+        )
+        .unwrap();
+        let p = st.system_prompt().into_owned();
+        assert!(p.starts_with(&bare), "基础那份原样在前面");
+        assert!(p.contains("pdf：处理 PDF（/workspace/skills/pdf/SKILL.md）"), "{p}");
+        assert!(!p.contains("正文不进提示词"));
+        assert_eq!(st.system_prompt(), p, "没变就逐字节一样");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

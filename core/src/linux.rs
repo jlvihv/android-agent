@@ -1610,6 +1610,33 @@ impl LinuxSandbox {
         }
     }
 
+    /// 临时产物的目录（bash 溢出的完整输出也在这儿）：(磁盘上的目录, 模型看到的路径)。
+    pub fn spill_dir(&self) -> (PathBuf, String) {
+        self.layout().spills
+    }
+
+    /// skill 放在哪：(磁盘上的目录, 模型看到的同一个目录)。见 `skills` 模块。
+    ///
+    /// 沙箱里是 `/workspace/skills`（挂了存储就是手机内部存储的 Agent 文件夹，用户在
+    /// 文件管理器里看得到）；宿主模式下 workspace 是用户的项目，skill 不该跟着项目走，
+    /// 放我们自己的数据目录（路径就是宿主路径本身）。
+    pub fn skills_dir(&self) -> (PathBuf, String) {
+        match &self.mode {
+            Mode::Proot(cfg) => {
+                let ws = cfg
+                    .workspace
+                    .clone()
+                    .unwrap_or_else(|| cfg.rootfs.join(WORKSPACE.trim_start_matches('/')));
+                (ws.join("skills"), format!("{WORKSPACE}/skills"))
+            }
+            Mode::Host { .. } => {
+                let p = crate::desktop::data_root().join("skills");
+                let g = p.display().to_string();
+                (p, g)
+            }
+        }
+    }
+
     /// 我们自己的副产物落在哪（见 `Layout`）。
     ///
     /// 沙箱里都在 rootfs 里；宿主模式下 rootfs 是 `/`，`/root` / `/tmp` 是**用户的**

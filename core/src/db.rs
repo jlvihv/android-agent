@@ -75,6 +75,13 @@ CREATE TABLE IF NOT EXISTS providers (
   base_url TEXT NOT NULL
 );
 
+-- 远程 MCP 服务（见 mcp.rs）。headers 是 JSON 对象（一般就是 Authorization）
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  name    TEXT PRIMARY KEY,
+  url     TEXT NOT NULL,
+  headers TEXT NOT NULL
+);
+
 -- 这些端点不支持 Responses API（`base_url|model`），直接走 Chat Completions
 CREATE TABLE IF NOT EXISTS responses_unsupported (
   endpoint TEXT PRIMARY KEY
@@ -703,6 +710,40 @@ impl Db {
                 .execute(
                     "INSERT OR REPLACE INTO providers(id, api_key, base_url) VALUES(?1, ?2, ?3)",
                     params![id, k.api_key, k.base_url],
+                )
+                .map(|_| ()),
+        })
+    }
+
+    pub fn mcp_servers(&self) -> Result<Vec<crate::mcp::Server>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT name, url, headers FROM mcp_servers ORDER BY name")?;
+            let rows = st.query_map([], |r| {
+                let headers: String = r.get(2)?;
+                Ok(crate::mcp::Server {
+                    name: r.get(0)?,
+                    url: r.get(1)?,
+                    headers: serde_json::from_str(&headers).unwrap_or_default(),
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// 存 / 删一个 MCP 服务（`None` = 删）。
+    pub fn set_mcp_server(&self, name: &str, srv: Option<&crate::mcp::Server>) -> Result<()> {
+        self.with(|c| match srv {
+            None => c
+                .execute("DELETE FROM mcp_servers WHERE name = ?1", [name])
+                .map(|_| ()),
+            Some(s) => c
+                .execute(
+                    "INSERT OR REPLACE INTO mcp_servers(name, url, headers) VALUES(?1, ?2, ?3)",
+                    params![
+                        s.name,
+                        s.url,
+                        serde_json::to_string(&s.headers).unwrap_or_else(|_| "{}".into())
+                    ],
                 )
                 .map(|_| ()),
         })

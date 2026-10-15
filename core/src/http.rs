@@ -37,6 +37,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alpine/upgrade", post(alpine_upgrade))
         .route("/api/browser", post(browser_action))
         .route("/api/weather", post(weather_run))
+        .route("/api/mcp", post(mcp_run))
+        .route("/api/mcp/servers", get(mcp_servers).post(save_mcp_server))
+        .route("/api/mcp/servers/delete", post(delete_mcp_server))
+        .route("/api/skills", get(list_skills))
         // 看一眼工作目录（`agent files`）—— 只读，不动任何文件
         .route("/api/files", post(list_files))
         // 手机系统能力（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
@@ -953,6 +957,128 @@ async fn weather_run(Json(body): Json<WeatherBody>) -> Response {
 struct WeatherBody {
     #[serde(default)]
     argv: Vec<String>,
+}
+
+/// `POST /api/mcp` → `agent mcp …`（`{argv, workdir?}`）。
+///
+/// 回 `text/plain`：就是给模型看的那段文字，出错时以 `错误：` 开头（CLI 据此以非 0
+/// 退出）。`workdir` 是命令的 cwd（`$AGENT_WORKDIR`）：工具回的图片落在它下面的
+/// `mcp/`，一个会话的东西都在那个会话的目录里。宿主模式没有会话目录（cwd 是用户的
+/// 项目，不往里写），落在临时目录。
+async fn mcp_run(State(st): State<Arc<AppState>>, Json(body): Json<McpBody>) -> Response {
+    let out = mcp_out_dir(&st, body.workdir.as_deref());
+    let text = match crate::mcp::run(&st.mcp, &body.argv, out).await {
+        Ok(t) => t,
+        Err(e) => format!("错误：{e:#}"),
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+}
+
+fn mcp_out_dir(st: &AppState, workdir: Option<&str>) -> Option<crate::mcp::OutDir> {
+    let sb = st.linux()?;
+    if sb.is_host() {
+        let (host, guest) = sb.spill_dir();
+        return Some(crate::mcp::OutDir {
+            host,
+            guest,
+            prefix: "agent-out-mcp-",
+        });
+    }
+    let wd = workdir
+        .filter(|w| !w.trim().is_empty())
+        .unwrap_or(crate::linux::WORKSPACE);
+    let guest = format!("{}/mcp", wd.trim_end_matches('/'));
+    let host = sb.resolve_new_path(&guest).ok()?;
+    Some(crate::mcp::OutDir {
+        host,
+        guest,
+        prefix: "",
+    })
+}
+
+#[derive(Deserialize)]
+struct McpBody {
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    workdir: Option<String>,
+}
+
+/// `GET /api/mcp/servers` → 已接的服务（设置页用）。请求头**只给名字不给值**：
+/// 值多半是 token，不往界面上回。
+async fn mcp_servers(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let list: Vec<Value> = st
+        .mcp
+        .servers()
+        .into_iter()
+        .map(|s| json!({ "name": s.name, "url": s.url, "headers": s.headers.keys().collect::<Vec<_>>() }))
+        .collect();
+    Json(json!({ "servers": list }))
+}
+
+#[derive(Deserialize)]
+struct SaveMcpBody {
+    name: String,
+    url: String,
+    /// `None` = 沿用这个服务原来的请求头（改 URL 时不用再填一遍 token）
+    #[serde(default)]
+    headers: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// `POST /api/mcp/servers` → 加 / 改一个服务，存完试着列一下工具（连得上就回工具数，
+/// 连不上也照样存着，回原因 —— 可能只是这会儿没网）。
+async fn save_mcp_server(State(st): State<Arc<AppState>>, Json(body): Json<SaveMcpBody>) -> Response {
+    let old = st.mcp.servers().into_iter().find(|s| s.name == body.name);
+    let srv = crate::mcp::Server {
+        name: body.name.trim().to_string(),
+        url: body.url.trim().to_string(),
+        headers: body
+            .headers
+            .or_else(|| old.map(|o| o.headers))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, _)| !k.trim().is_empty())
+            .collect(),
+    };
+    if let Err(e) = srv.validate() {
+        return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
+    }
+    if let Some(db) = st.db() {
+        if let Err(e) = db.set_mcp_server(&srv.name, Some(&srv)) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("存不进去：{e:#}")).into_response();
+        }
+    }
+    let mut list: Vec<_> = st.mcp.servers().into_iter().filter(|s| s.name != srv.name).collect();
+    list.push(srv.clone());
+    st.mcp.set_servers(list);
+    st.mcp.forget_session(&srv.name).await;
+    match st.mcp.tools(&srv).await {
+        Ok(tools) => Json(json!({ "ok": true, "tools": tools.len() })).into_response(),
+        Err(e) => Json(json!({ "ok": false, "error": format!("{e:#}") })).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteMcpBody {
+    name: String,
+}
+
+async fn delete_mcp_server(State(st): State<Arc<AppState>>, Json(body): Json<DeleteMcpBody>) -> Response {
+    if let Some(db) = st.db() {
+        if let Err(e) = db.set_mcp_server(&body.name, None) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("删不掉：{e:#}")).into_response();
+        }
+    }
+    let list: Vec<_> = st.mcp.servers().into_iter().filter(|s| s.name != body.name).collect();
+    st.mcp.set_servers(list);
+    st.mcp.forget_session(&body.name).await;
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// `GET /api/skills` → 装了哪些 skill，以及放在哪（设置页用）。
+async fn list_skills(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let dir = st.linux().map(|sb| sb.skills_dir().1);
+    Json(json!({ "dir": dir, "skills": st.skills() }))
 }
 
 /// `POST /api/websearch` → 联网搜索（`{query, num_results?, format?}`）。

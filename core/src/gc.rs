@@ -5,7 +5,7 @@
 //! - `<data>/images/`：内联给模型的图片副本（`read` 读图缩好的那份）
 //! - `<data>/attachments/`：用户在输入卡片里附的图片 / PDF
 //! - `<rootfs>/root/.browser/shot-*.jpg`：浏览器截图的原图（Kotlin 写的）
-//! - `<rootfs>/tmp/agent-out-*.log`：bash 输出被截断时溢出的完整输出
+//! - `<rootfs>/tmp/agent-out-*`：bash 输出被截断时溢出的完整输出；电脑上 MCP 工具回的图片
 //!
 //! 不清的话只增不减，手机存储被慢慢吃掉。两个时机清：
 //!
@@ -111,7 +111,7 @@ pub fn sweep(
     if let Some(spills) = &dirs.spills {
         n += sweep_dir(
             spills,
-            |name| name.starts_with("agent-out-") && name.ends_with(".log"),
+            |name| name.starts_with("agent-out-"),
             referenced,
             loose,
         );
