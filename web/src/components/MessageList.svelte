@@ -31,12 +31,25 @@
      * 里的用户消息永远是 `true`。
      */
     pending = [],
+    /** 把排队的那条从队列里去掉（点那个 ×） */
     ondrop,
+    /**
+     * 「我自己刚发了一条」的次数（App 数）。变了就把视口带回尾部。
+     *
+     * 为什么不能盯 `messages` 自己：服务端往列表里加东西（排队那条被交给模型、
+     * 轮询补历史）也会让 `messages` 变 —— 那都是**别人在动**，用户可能正往上翻着
+     * 看，一拽就回到尾部。只有这一个回调代表用户自己的动作。
+     */
+    follow = 0,
+    /** 当前会话 id：变了（切会话 / 第一次装载）就把视口落在尾部 */
+    session = '',
   }: {
     messages: Message[];
     pending?: Message[];
     /** 把排队的那条从队列里去掉（点那个 ×） */
     ondrop?: (id: string) => void;
+    follow?: number;
+    session?: string;
   } = $props();
 
   let scroller: HTMLDivElement | null = $state(null);
@@ -237,10 +250,30 @@
   // 现在：在底部附近才算"贴着"；内容或容器尺寸一变（流式长高、键盘弹起、
   // 输入框长高），贴着就跟到底。用 ResizeObserver，不用每个 delta 都跑。
   let content: HTMLDivElement | null = $state(null);
-  let pinned = true;
+  let pinned = $state(true);
+  /** 离底部多远（px）。除了 `pinned` 还要它：决定要不要显「回到最新」 */
+  let gap = $state(0);
+
+  /**
+   * 「回到最新」的显示门槛（px）。
+   *
+   * 比 `NEAR_BOTTOM`（48，判贴底）大一截：48 那块是「差不多就在底部」的
+   * 缓冲区，一进去按钮就冒出来会显得毛躁。
+   */
+  const JUMP_GAP = 120;
+  let showJump = $derived(!pinned && gap > JUMP_GAP);
 
   const toBottom = () => {
-    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    if (!scroller) return;
+    scroller.scrollTop = scroller.scrollHeight;
+    // 到底了就是 0：不写的话按钮要等下一个滚动事件才收起来
+    gap = 0;
+  };
+
+  /** 点「回到最新」：跟用户自己滚到底一个效果 */
+  const jumpToLatest = () => {
+    pinned = true;
+    toBottom();
   };
 
   let lastTop = 0;
@@ -274,14 +307,30 @@
   });
 
   async function loadEarlier() {
-    if (loadingEarlier || start === 0 || !scroller) return;
+    if (loadingEarlier || start === 0 || !scroller || !content) return;
     loadingEarlier = true;
-    const before = scroller.scrollHeight;
-    const top = scroller.scrollTop;
+
+    // 锚定当前视口里**最上面那条消息**，补完把它对回原处。
+    //
+    // 为什么不用「补进来多少高度就补多少 scrollTop」（以前就是那么干的）：
+    // 那个写法默认「这期间容器高度只因为补窗变过」—— 锚点法不依赖任何前提，
+    // 只认那一条消息自己的位置（只有**它上面**多出来的东西会移动它）。
+    //
+    // （实测两种写法在夹具里都是 0px：`await tick()` 只跨一个微任务，中间
+    // 几乎长不出东西。留着是为了前提变化时不至于露出来 —— 比如以后把
+    // `tick()` 换成等一帧。）
+    //
+    // 「显示更早的 N 条」按钮要排除（它在消息前面，自己的位置不会变）——
+    // 拿它当锚点就等于不补偿，正在读的那条会被顶下去。
+    const kids = [...content.children].filter((el) => !el.classList.contains('load-earlier'));
+    const edge = scroller.getBoundingClientRect().top;
+    const anchor = kids.find((el) => el.getBoundingClientRect().bottom > edge);
+    const before = anchor?.getBoundingClientRect().top ?? 0;
+
     limit += WINDOW_STEP;
     await tick();
-    // 前面补进来多少高度，scrollTop 就补多少 —— 视口里那条不动
-    scroller.scrollTop = top + (scroller.scrollHeight - before);
+
+    if (anchor) scroller.scrollTop += anchor.getBoundingClientRect().top - before;
     lastTop = scroller.scrollTop;
     loadingEarlier = false;
   }
@@ -295,7 +344,7 @@
    */
   function onscroll() {
     const el = scroller!;
-    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+    gap = el.scrollHeight - el.scrollTop - el.clientHeight;
     if (gap < NEAR_BOTTOM) pinned = true;
     else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
@@ -305,7 +354,12 @@
 
   $effect(() => {
     if (!scroller || !content) return;
-    const ro = new ResizeObserver(() => pinned && toBottom());
+    const ro = new ResizeObserver(() => {
+      // 离底部的距离也跟着内容长：不更新的话，用户在往上翻时
+      // 「回到最新」要靠下一次滚动才冒出来
+      gap = scroller!.scrollHeight - scroller!.scrollTop - scroller!.clientHeight;
+      if (pinned) toBottom();
+    });
     ro.observe(scroller);
     ro.observe(content);
     return () => ro.disconnect();
@@ -327,10 +381,23 @@
   // 每次回复结束都跳一次。省下的那点绘制不值这个 bug —— DOM 本来就只挂
   // 最后 40 条（见下面的窗口化），封顶靠它，不靠 content-visibility。
 
-  // 自己发了消息 / 切了会话 → 无论在哪都回到底部
+  // 自己发了消息 / 切了会话 → 回到尾部。
+  //
+  // **只认这两件事**，不能盯 `messages` 的长度：排队那条被交给模型
+  //（`data-queued-delivered` → App 里 `messages.push`）、轮询把服务端的新历史换上
+  //（`loadMessages`）都会动这个数组，而那是服务端在动 —— 用户正往上翻着看的时候，
+  // 一拽就回到尾部。实测：流式里往上翻着读，紧接着第二句被交给模型的那一刻，
+  // 视口从 top=0 直接被写到最底（调用栈就落在下面这两行上）。
   $effect(() => {
-    void messages.length;
-    void messages[0]?.id;
+    void follow;
+    pinned = true;
+    toBottom();
+  });
+
+  let lastSession = $state('');
+  $effect(() => {
+    if (session === lastSession) return;
+    lastSession = session;
     pinned = true;
     toBottom();
   });
@@ -414,7 +481,7 @@
   {#if start > 0}
     <button
       onclick={loadEarlier}
-      class="self-center rounded-full bg-hairline px-3 py-1 text-xs text-muted"
+      class="load-earlier self-center rounded-full bg-hairline px-3 py-1 text-xs text-muted"
     >
       显示更早的 {Math.min(WINDOW_STEP, start)} 条
     </button>
@@ -478,6 +545,30 @@
   {/each}
 </div>
 </div>
+
+<!-- 「回到最新」：往上翻着看历史时，输出还在往下长 —— 给一个一步回到尾部的
+     入口（没有它就只能一路划回去，或者等下一轮把它顶走）。
+
+     尺寸 / 圆角 / 图标字号跟输入卡片里那两个圆按钮**一模一样**
+     （`size-9` + `rounded-full` + 18px 图标）—— 同一个 App 里同一类控件不该有两种大小。
+     只有图标没有文字（`aria-label` / `title` 顶上），就跟停止键一样。
+
+     `absolute` 挂在 App 的 `main`（`absolute inset-0`）上，所以宽屏有侧边栏
+     时它跟着**对话区**居中，不是整个窗口居中。底部避让用跟滚动容器 padding
+     同一个值（`--composer-h`）—— 输入卡片的高度一变，两边一起动。 -->
+{#if showJump}
+  <button
+    type="button"
+    onclick={jumpToLatest}
+    aria-label="回到最新"
+    title="回到最新"
+    class="absolute bottom-[calc(var(--composer-h,0px)+1.25rem)] left-1/2 z-10 grid
+           size-9 -translate-x-1/2 place-items-center rounded-full bg-control text-fg
+           ring-1 ring-hairline"
+  >
+    <Icon name="down" size={18} />
+  </button>
+{/if}
 
 {#snippet fields(title: string, list: { key: string; text: string; block: boolean }[])}
   <div class="flex flex-col gap-1.5">

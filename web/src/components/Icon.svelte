@@ -15,13 +15,14 @@
    *   gear 16.8 · newchat 16.8 · clock 16.6 · menu 16.2×10.2 · phone 10×16.6
    *   computer 16.2×15.5 · sparkle 15.8
    *   chat 15.0 · pencil 14.9 · trash 14.6 · plus 14.2
-   *   send 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
+   *   send 11.8×13.2 · down 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
    */
   type Name =
     | 'menu'
     | 'newchat'
     | 'plus'
     | 'send'
+    | 'down'
     | 'stop'
     | 'back'
     | 'chevron'
@@ -80,6 +81,18 @@
   <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
     <path
       d="M10 16V4.6M5 9.6 10 4.6l5 5"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </svg>
+{:else if name === 'down'}
+  <!-- `send` 的镜像：同一段箭头竖着翻过来（墨迹一样 11.8×13.2，
+       别单独调，两个要能对得上）。给「回到最新」用。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <path
+      d="M10 4v11.4M5 10.4 10 15.4l5-5"
       stroke="currentColor"
       stroke-width="1.8"
       stroke-linecap="round"

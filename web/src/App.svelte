@@ -335,6 +335,15 @@
   let sent = 0;
 
   /**
+   * 「用户自己发了一条」的次数。与 `sent` 分开：那个只管和服务端的竞态，
+   * 这个只管界面要不要把视口带回尾部（MessageList 的 `follow`）。
+   *
+   * **只有这里会加** —— 排队那条被服务端交给模型（`onQueuedDelivered`）不算：
+   * 那是服务端在动，用户可能正往上翻着看历史。
+   */
+  let ownSend = $state(0);
+
+  /**
    * 当前会话 id（从 rev 里解出来）。切会话时清掉，避免跨会话复用消息对象。
    *
    * `$state`：**队列要跟着它走**（输入框上面那几条「排队中」只看当前会话的，
@@ -657,6 +666,7 @@
     if (!text && attachments.length === 0) return;
     input = '';
     sent++;
+    ownSend++;
 
     const id = uid();
     const parts = userParts(text, attachments);
@@ -807,7 +817,7 @@
       {#if messages.length === 0 && queuedMsgs.length === 0}
         <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
       {:else}
-        <MessageList {messages} pending={queuedMsgs} ondrop={dropQueued} />
+        <MessageList {messages} pending={queuedMsgs} ondrop={dropQueued} follow={ownSend} session={sessionId} />
       {/if}
     </main>
 
