@@ -966,12 +966,49 @@ struct WeatherBody {
 /// `mcp/`，一个会话的东西都在那个会话的目录里。宿主模式没有会话目录（cwd 是用户的
 /// 项目，不往里写），落在临时目录。
 async fn mcp_run(State(st): State<Arc<AppState>>, Json(body): Json<McpBody>) -> Response {
-    let out = mcp_out_dir(&st, body.workdir.as_deref());
-    let text = match crate::mcp::run(&st.mcp, &body.argv, out).await {
+    let r = match body.argv.first().map(String::as_str) {
+        // 接 / 删服务要动配置（库 + 内存），不在 `mcp::run` 里做
+        Some("add") => mcp_add(&st, &body.argv[1..]).await,
+        Some("remove") => mcp_remove(&st, &body.argv[1..]).await,
+        _ => {
+            let out = mcp_out_dir(&st, body.workdir.as_deref());
+            crate::mcp::run(&st.mcp, &body.argv, out).await
+        }
+    };
+    let text = match r {
         Ok(t) => t,
         Err(e) => format!("错误：{e:#}"),
     };
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+}
+
+/// `agent mcp add`：**先试连，连得上才存** —— 模型接错了地址 / token 的话当场知道，
+/// 不会留下一个永远连不上的配置（设置页那条路不一样：人填的照样存，见 `save_mcp_server`）。
+async fn mcp_add(st: &AppState, args: &[String]) -> anyhow::Result<String> {
+    let srv = crate::mcp::parse_add(args)?;
+    let existed = st.mcp.servers().iter().any(|s| s.name == srv.name);
+    // 同名的旧会话不能拿来试新配置
+    st.mcp.forget_session(&srv.name).await;
+    let tools = st
+        .mcp
+        .tools(&srv)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#}（没有保存）"))?;
+    let name = srv.name.clone();
+    st.put_mcp_server(srv).await?;
+    Ok(format!(
+        "已{} {name}（{} 个工具）。agent mcp list {name} 看有哪些。",
+        if existed { "更新" } else { "接上" },
+        tools.len()
+    ))
+}
+
+async fn mcp_remove(st: &AppState, args: &[String]) -> anyhow::Result<String> {
+    let [name] = args else {
+        anyhow::bail!("用法：agent mcp remove <名字>");
+    };
+    anyhow::ensure!(st.remove_mcp_server(name).await?, "没有叫 {name} 的 MCP 服务");
+    Ok(format!("已删掉 {name}。"))
 }
 
 fn mcp_out_dir(st: &AppState, workdir: Option<&str>) -> Option<crate::mcp::OutDir> {
@@ -1043,15 +1080,9 @@ async fn save_mcp_server(State(st): State<Arc<AppState>>, Json(body): Json<SaveM
     if let Err(e) = srv.validate() {
         return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
     }
-    if let Some(db) = st.db() {
-        if let Err(e) = db.set_mcp_server(&srv.name, Some(&srv)) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("存不进去：{e:#}")).into_response();
-        }
+    if let Err(e) = st.put_mcp_server(srv.clone()).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("存不进去：{e:#}")).into_response();
     }
-    let mut list: Vec<_> = st.mcp.servers().into_iter().filter(|s| s.name != srv.name).collect();
-    list.push(srv.clone());
-    st.mcp.set_servers(list);
-    st.mcp.forget_session(&srv.name).await;
     match st.mcp.tools(&srv).await {
         Ok(tools) => Json(json!({ "ok": true, "tools": tools.len() })).into_response(),
         Err(e) => Json(json!({ "ok": false, "error": format!("{e:#}") })).into_response(),
@@ -1064,15 +1095,10 @@ struct DeleteMcpBody {
 }
 
 async fn delete_mcp_server(State(st): State<Arc<AppState>>, Json(body): Json<DeleteMcpBody>) -> Response {
-    if let Some(db) = st.db() {
-        if let Err(e) = db.set_mcp_server(&body.name, None) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("删不掉：{e:#}")).into_response();
-        }
+    match st.remove_mcp_server(&body.name).await {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("删不掉：{e:#}")).into_response(),
     }
-    let list: Vec<_> = st.mcp.servers().into_iter().filter(|s| s.name != body.name).collect();
-    st.mcp.set_servers(list);
-    st.mcp.forget_session(&body.name).await;
-    Json(json!({ "ok": true })).into_response()
 }
 
 /// `GET /api/skills` → 装了哪些 skill，以及放在哪（设置页用）。

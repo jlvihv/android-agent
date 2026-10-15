@@ -1193,17 +1193,41 @@ impl AppState {
         }
     }
 
-    /// 装了什么（拼在系统提示词后面那段：接了哪些 MCP 服务、有哪些 skill）。
-    /// 什么都没装就是空串。
+    /// 拼在系统提示词后面那段：MCP 那句（**没接也在**，说怎么接）+ skill 索引（内置的
+    /// create-skill 一直在，它教模型怎么装别的）。
     fn installed_prompt(&self) -> String {
-        [
-            crate::mcp::prompt_line(&self.mcp.servers()),
-            crate::skills::index(&self.skills()),
-        ]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+        let mut parts = vec![crate::mcp::prompt_line(&self.mcp.servers())];
+        let skills = crate::skills::index(&self.skills());
+        if !skills.is_empty() {
+            parts.push(skills);
+        }
+        parts.join("\n")
+    }
+
+    /// 存一个 MCP 服务（库 + 内存）。同名的就是改：旧会话作废，下次重新握手。
+    pub async fn put_mcp_server(&self, srv: crate::mcp::Server) -> anyhow::Result<()> {
+        if let Some(db) = self.db() {
+            db.set_mcp_server(&srv.name, Some(&srv))?;
+        }
+        let name = srv.name.clone();
+        let mut list: Vec<_> = self.mcp.servers().into_iter().filter(|s| s.name != name).collect();
+        list.push(srv);
+        self.mcp.set_servers(list);
+        self.mcp.forget_session(&name).await;
+        Ok(())
+    }
+
+    /// 删一个 MCP 服务。返回原来有没有。
+    pub async fn remove_mcp_server(&self, name: &str) -> anyhow::Result<bool> {
+        let list = self.mcp.servers();
+        let had = list.iter().any(|s| s.name == name);
+        if let Some(db) = self.db() {
+            db.set_mcp_server(name, None)?;
+        }
+        self.mcp
+            .set_servers(list.into_iter().filter(|s| s.name != name).collect());
+        self.mcp.forget_session(name).await;
+        Ok(had)
     }
 
     /// 这台机器上装的 skill（每次现扫：一个目录几十个 `SKILL.md`，比缓存失效的麻烦便宜）。
@@ -1644,22 +1668,22 @@ mod tests {
     /// 这里只是把「哪份对应哪种形态」钉住。
     #[test]
     fn the_builtin_prompt_follows_the_sandbox_flavour() {
+        // 后面拼的那段（MCP / skill）不在这里比：只比基础那份选得对不对
         let st = AppState::new();
-        assert_eq!(
-            st.system_prompt(),
-            crate::agent::system_prompt(crate::platform::Platform::Android),
+        assert!(
+            st.system_prompt()
+                .starts_with(crate::agent::system_prompt(crate::platform::Platform::Android)),
             "还没有沙箱时（安卓 boot 阶段 / 纯 Rust 环境）用手机那份"
         );
 
         st.set_linux(Arc::new(LinuxSandbox::host(std::env::temp_dir())));
-        assert_eq!(
-            st.system_prompt(),
-            crate::agent::system_prompt(crate::platform::Platform::host())
-        );
+        assert!(st
+            .system_prompt()
+            .starts_with(crate::agent::system_prompt(crate::platform::Platform::host())));
 
         // 运行时覆盖照旧最高优先（`/api/debug/system-prompt` 调提示词那条路）
         st.set_system_prompt(Some("改过的".into()));
-        assert_eq!(st.system_prompt(), "改过的");
+        assert!(st.system_prompt().starts_with("改过的\n\n"));
     }
 
     /// 配置按列存在表里：改模型、改 Key 都落在表里，重开还在，凭据也不变。
@@ -1700,7 +1724,6 @@ mod tests {
     fn installed_skills_are_indexed_in_the_system_prompt() {
         let root = std::env::temp_dir().join(format!("agent-skill-state-{}", uuid::Uuid::now_v7()));
         let st = AppState::new();
-        let bare = st.system_prompt().into_owned();
         st.set_linux(Arc::new(crate::linux::LinuxSandbox::new(
             crate::linux::SandboxConfig {
                 proot: "/nonexistent/proot".into(),
@@ -1716,7 +1739,9 @@ mod tests {
                 shared: None,
             },
         )));
-        assert_eq!(st.system_prompt(), bare, "一个都没装：提示词不变");
+        let bare = st.system_prompt().into_owned();
+        assert!(bare.contains("agent mcp add"), "没接也要说怎么接：{bare}");
+        assert!(!bare.contains("技能（skill）"), "一个 skill 都没有就不列：{bare}");
 
         std::fs::create_dir_all(root.join("ws/skills/pdf")).unwrap();
         std::fs::write(
@@ -1725,7 +1750,8 @@ mod tests {
         )
         .unwrap();
         let p = st.system_prompt().into_owned();
-        assert!(p.starts_with(&bare), "基础那份原样在前面");
+        assert!(p.starts_with(&bare), "装之前那份原样在前面（只在末尾多出索引）");
+        assert!(p.contains("技能（skill）"), "{p}");
         assert!(p.contains("pdf：处理 PDF（/workspace/skills/pdf/SKILL.md）"), "{p}");
         assert!(!p.contains("正文不进提示词"));
         assert_eq!(st.system_prompt(), p, "没变就逐字节一样");

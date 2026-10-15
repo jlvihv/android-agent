@@ -1,8 +1,8 @@
 <script lang="ts">
   /**
-   * 设置页的「技能（Skill）」一栏：装了哪些、放在哪。只读 ——
-   * 装一个 skill 就是往那个目录里放一个带 SKILL.md 的文件夹（让 AI 用 git clone
-   * 装也行）。索引会进系统提示词，AI 遇到对应的事会先读 SKILL.md（见 core/src/skills.rs）。
+   * 设置页的「技能（Skill）」一栏：装了哪些、放在哪。只读 —— 装 skill 一般是让 AI 做
+   * （内置的 create-skill 教它怎么装、怎么写），也可以自己往那个目录里放带 SKILL.md 的
+   * 文件夹。索引会进系统提示词，AI 遇到对应的事会先读 SKILL.md（见 core/src/skills.rs）。
    */
   type Skill = { name: string; description: string; path: string };
 
@@ -38,8 +38,8 @@
     </div>
   {/if}
   <p class="px-1 pt-2 text-meta leading-relaxed text-faint">
-    {skills.length ? '' : '还没有。'}放在 <code class="break-all">{dir}/&lt;名字&gt;/SKILL.md</code>
-    （开头写 name 和 description）就会被 AI 用上。
+    让 AI 装（比如发给它一个 skill 仓库的地址），或者自己放进
+    <code class="break-all">{dir}/&lt;名字&gt;/SKILL.md</code>。
   </p>
   {#if err}<p class="px-1 pt-2 text-xs text-bad">{err}</p>{/if}
 {/if}

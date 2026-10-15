@@ -1511,9 +1511,11 @@ impl LinuxSandbox {
     /// 宿主模式另走一条（见 `prepare_host`）：**绝不往 `/` 里写东西**。
     pub fn prepare_rootfs(&self) -> anyhow::Result<()> {
         match &self.mode {
-            Mode::Proot(cfg) => Self::prepare_proot(cfg),
-            Mode::Host { workspace } => Self::prepare_host(workspace),
+            Mode::Proot(cfg) => Self::prepare_proot(cfg)?,
+            Mode::Host { workspace } => Self::prepare_host(workspace)?,
         }
+        self.install_builtin_skills();
+        Ok(())
     }
 
     fn prepare_proot(cfg: &SandboxConfig) -> anyhow::Result<()> {
@@ -1607,6 +1609,19 @@ impl LinuxSandbox {
         match &self.mode {
             Mode::Proot(cfg) => cfg.workspace.as_deref(),
             Mode::Host { workspace } => Some(workspace),
+        }
+    }
+
+    /// 内置的 skill（`create-skill`：教模型怎么新建 / 安装 skill）写进 skill 目录。
+    /// 内容没变就不动；被删了下次启动补回来。写不进去（存储没挂上之类）只记一笔。
+    fn install_builtin_skills(&self) {
+        let (host, guest) = self.skills_dir();
+        let dir = host.join(crate::skills::CREATE_SKILL);
+        let r = std::fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| {
+            write_if_changed(&dir.join("SKILL.md"), &crate::skills::create_skill_md(&guest), false)
+        });
+        if let Err(e) = r {
+            tracing::warn!("内置 skill 没写进去（{}）：{e:#}", dir.display());
         }
     }
 

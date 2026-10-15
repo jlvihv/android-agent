@@ -10,10 +10,13 @@
 //! agent mcp list [服务]                    # 有哪些服务、哪些工具（一行一个）
 //! agent mcp <服务> <工具> --help           # 这个工具的说明和参数 schema（用到时才看）
 //! agent mcp <服务> <工具> ['<json参数>']    # 调用
+//! agent mcp add <名字> <URL> [--token T]    # 接一个新的（先试连，连得上才存）
+//! agent mcp remove <名字>
 //! ```
 //!
-//! 提示词里只有一句「接了哪几个服务」（见 `AppState::system_prompt`）。凭据（请求头里的
-//! token）存在核心的库里，由核心带着去请求 —— 沙箱里的模型碰不到。
+//! **接服务也是模型的活**：用户一般不自己去设置里填，而是把地址（和 token）丢给 agent
+//! 让它接。所以提示词里那一句（[`prompt_line`]）**一直在**，没接任何服务时也写着怎么接。
+//! 凭据存在核心的库里，之后由核心带着去请求。
 //!
 //! 输出给模型的都是**纯文本**，出错时以 `错误：` 开头（CLI 据此以非 0 退出），和工具
 //! 结果的写法一致。工具回的图片落盘、正文里给路径，模型用 `read` 看：手机上落在**这个
@@ -59,7 +62,11 @@ impl Server {
             "名字只能用小写字母、数字、- 和 _：{}",
             self.name
         );
-        anyhow::ensure!(self.name != "list", "list 是子命令，不能当名字");
+        anyhow::ensure!(
+            !RESERVED.contains(&self.name.as_str()),
+            "{} 是 agent mcp 的子命令，不能当名字",
+            self.name
+        );
         let u = self.url.trim();
         anyhow::ensure!(
             u.starts_with("https://") || u.starts_with("http://"),
@@ -67,6 +74,47 @@ impl Server {
         );
         Ok(())
     }
+}
+
+/// `agent mcp` 自己的子命令，不能拿来当服务名。
+const RESERVED: &[&str] = &["list", "add", "remove", "help"];
+
+/// `agent mcp add <名字> <URL> [--token T] [--header 'K: V']…` 的参数 → 一个服务。
+///
+/// `--token T` 就是 `Authorization: Bearer T`（远程 MCP 绝大多数是这个）；别的鉴权方式用
+/// `--header`。
+pub fn parse_add(args: &[String]) -> anyhow::Result<Server> {
+    const ADD_USAGE: &str = "用法：agent mcp add <名字> <URL> [--token T] [--header 'K: V']";
+    let mut it = args.iter();
+    let name = it.next().ok_or_else(|| anyhow::anyhow!("{ADD_USAGE}"))?;
+    let url = it.next().ok_or_else(|| anyhow::anyhow!("{ADD_USAGE}"))?;
+    let mut headers = BTreeMap::new();
+    while let Some(flag) = it.next() {
+        let value = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{flag} 后面少了值（{ADD_USAGE}）"))?;
+        match flag.as_str() {
+            "--token" => {
+                let t = value.trim();
+                let t = t.strip_prefix("Bearer ").or_else(|| t.strip_prefix("bearer ")).unwrap_or(t);
+                headers.insert("Authorization".to_string(), format!("Bearer {t}"));
+            }
+            "--header" => {
+                let (k, v) = value
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("--header 要写成 'K: V'：{value}"))?;
+                headers.insert(k.trim().to_string(), v.trim().to_string());
+            }
+            other => anyhow::bail!("不认识的参数 {other}（{ADD_USAGE}）"),
+        }
+    }
+    let srv = Server {
+        name: name.trim().to_string(),
+        url: url.trim().to_string(),
+        headers,
+    };
+    srv.validate()?;
+    Ok(srv)
 }
 
 /// 一个工具（`tools/list` 里的一项）。
@@ -308,7 +356,12 @@ pub fn decode_rpc_body(body: &str) -> anyhow::Result<Value> {
 // `agent mcp …`
 // ---------------------------------------------------------------------------
 
-const USAGE: &str = "用法：agent mcp list [服务] | agent mcp <服务> <工具> --help | agent mcp <服务> <工具> ['<json参数>']";
+const USAGE: &str = "用法：
+  agent mcp list [服务]                    已接的服务和它们的工具
+  agent mcp <服务> <工具> --help           这个工具的说明和参数
+  agent mcp <服务> <工具> ['<json参数>']    调用
+  agent mcp add <名字> <URL> [--token T] [--header 'K: V']   接一个远程 MCP 服务（先试连，连得上才存）
+  agent mcp remove <名字>                  删掉一个";
 
 /// `agent mcp` 的参数 → 给模型看的文字。`out` 是工具回的图片落在哪（`None` = 没地方放）。
 pub async fn run(mcp: &Mcp, argv: &[String], out: Option<OutDir>) -> anyhow::Result<String> {
@@ -461,15 +514,20 @@ fn first_line(s: &str, max: usize) -> String {
     }
 }
 
-/// 拼进系统提示词的那一句。一个服务都没有就是空串。
+/// 拼进系统提示词的那一句。**一直在**：没接任何服务时也要告诉模型怎么接（接服务
+/// 一般是用户让它做的）。
 pub fn prompt_line(servers: &[Server]) -> String {
-    if servers.is_empty() {
-        return String::new();
-    }
-    let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+    let have = if servers.is_empty() {
+        "还没接任何服务".to_string()
+    } else {
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        format!(
+            "已接 {}：`agent mcp list` 看有哪些工具，`agent mcp <服务> <工具> --help` 看参数，`agent mcp <服务> <工具> '<json参数>'` 调用",
+            names.join("、")
+        )
+    };
     format!(
-        "- `agent mcp`：已接的 MCP 服务 {}。`agent mcp list` 看有哪些工具，`agent mcp <服务> <工具> --help` 看参数，`agent mcp <服务> <工具> '<json参数>'` 调用。",
-        names.join("、")
+        "- `agent mcp`（远程 MCP 服务）：{have}。用户给你一个 MCP 地址时用 `agent mcp add <名字> <URL> [--token T]` 接上（只接 http(s) 的远程服务），`agent mcp remove <名字>` 删掉。"
     )
 }
 
@@ -544,14 +602,31 @@ mod tests {
     }
 
     #[test]
-    fn prompt_line_lists_servers_or_nothing() {
-        assert_eq!(prompt_line(&[]), "");
+    fn prompt_line_always_says_how_to_add() {
+        let none = prompt_line(&[]);
+        assert!(none.contains("还没接") && none.contains("agent mcp add"), "{none}");
         let s = prompt_line(&[Server {
             name: "gh".into(),
             url: "https://x".into(),
             headers: Default::default(),
         }]);
-        assert!(s.contains("`agent mcp`") && s.contains("gh"), "{s}");
+        assert!(s.contains("已接 gh") && s.contains("agent mcp add"), "{s}");
+    }
+
+    #[test]
+    fn add_arguments() {
+        let a = |v: &[&str]| parse_add(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let s = a(&["gh", "https://x/mcp", "--token", "abc"]).unwrap();
+        assert_eq!(s.headers["Authorization"], "Bearer abc");
+        let s = a(&["gh", "https://x/mcp", "--token", "Bearer abc"]).unwrap();
+        assert_eq!(s.headers["Authorization"], "Bearer abc", "已经带了 Bearer 不重复加");
+        let s = a(&["gh", "https://x/mcp", "--header", "X-Api-Key: k1"]).unwrap();
+        assert_eq!(s.headers["X-Api-Key"], "k1");
+        assert!(a(&["gh"]).is_err());
+        assert!(a(&["gh", "https://x", "--token"]).is_err());
+        assert!(a(&["gh", "https://x", "--what", "1"]).is_err());
+        assert!(a(&["add", "https://x"]).is_err(), "子命令名不能当服务名");
+        assert!(a(&["gh", "npx foo"]).is_err(), "只接远程");
     }
 
     /// 一个假的 Streamable HTTP 服务端：握手发会话 id、核对后续请求都带着它和凭据，

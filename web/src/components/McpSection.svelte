@@ -8,7 +8,8 @@
    * 设置页的「MCP 服务」一栏：已接的远程 MCP 服务 + 添加入口。
    *
    * 只接远程（HTTP）服务，不在本地起进程（见 core/src/mcp.rs）。模型通过沙箱里的
-   * `agent mcp` 用它们；凭据由核心带着去请求，模型碰不到。
+   * `agent mcp` 用它们，一般也是让模型用 `agent mcp add` 接上的（这里给人看 / 手动改）。
+   * 凭据存在核心里，之后由核心带着去请求。
    */
   import Icon from './Icon.svelte';
   import McpPage from './McpPage.svelte';
@@ -63,7 +64,7 @@
   </button>
 </div>
 <p class="px-1 pt-2 text-meta leading-relaxed text-faint">
-  只接远程（HTTP）服务。AI 用 <code>agent mcp</code> 调它们，凭据不会交给 AI。
+  只接远程（HTTP）服务。把地址（和 token）发给 AI，它会用 <code>agent mcp add</code> 接上。
 </p>
 {#if err}<p class="px-1 pt-2 text-xs text-bad">{err}</p>{/if}
 

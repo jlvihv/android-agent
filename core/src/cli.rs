@@ -199,7 +199,8 @@ fn subcommands() -> Vec<Sub> {
             "",
             "  agent mcp list [服务]               已接的 MCP 服务和它们的工具\n\
              \x20   agent mcp <服务> <工具> --help      这个工具的说明和参数\n\
-             \x20   agent mcp <服务> <工具> ['<json参数>']   调用",
+             \x20   agent mcp <服务> <工具> ['<json参数>']   调用\n\
+             \x20   agent mcp add <名字> <URL> [--token T]   接一个远程 MCP 服务（先试连，连得上才存）；agent mcp remove <名字> 删掉",
             MCP_BODY,
         ),
         sub(
@@ -318,11 +319,6 @@ guard() {
     /api/llm*|/api/debug/system-prompt*)
       echo "拒绝：$1 会改掉我自己的身份（模型 / key / 提示词）。" >&2
       echo "那两件事留给人做：在宿主机上跑 scripts/agentctl.py" >&2
-      exit 3
-      ;;
-    # 接哪些 MCP 服务、带什么凭据由人在设置里定：网页里一段话不该能让我把调用转给别人的服务
-    /api/mcp/servers*)
-      echo "拒绝：MCP 服务由人在设置里配。" >&2
       exit 3
       ;;
   esac
