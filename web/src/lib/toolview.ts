@@ -52,6 +52,27 @@ export type ResultView = {
 
 const str = (v: unknown) => (typeof v === 'string' ? v : '');
 
+/**
+ * 这次工具调用是不是**失败**了。
+ *
+ * 只认模型也看得见的那些信号（结果 JSON 里的字段），不另外猜：
+ *   - `error`：核心出错时的唯一表示（read / bash / edit 都这样）
+ *   - `exit_code != 0`：命令跑完了但不是 0
+ *   - `timed_out`：被超时终止（一般也不带 exit_code）
+ *   - `ok: false`：现在的工具不会这么返回，以后可能；认它一下
+ *
+ * 折叠行染红和面板里那几处一起用**同一个**判定 —— 两边不一致的话，
+ * 就会“行是红的但面板里找不着哪错了”。
+ */
+export function failed(t: ToolPart): boolean {
+  const o = t.output;
+  if (typeof o !== 'object' || o === null || Array.isArray(o)) return false;
+  const r = o as Record<string, unknown>;
+  if (typeof r.error === 'string' && r.error !== '') return true;
+  if (r.ok === false || r.timed_out === true) return true;
+  return typeof r.exit_code === 'number' && r.exit_code !== 0;
+}
+
 /** 一个值怎么显示：字符串原样，别的排成 JSON */
 function field(key: string, v: unknown): Field {
   const text = typeof v === 'string' ? v : JSON.stringify(v, null, 2) ?? String(v);
@@ -265,13 +286,12 @@ export function describeResult(t: ToolPart): ResultView | null {
 
   // —— 正文：error > diff > output，只用掉真显示出来的那一个 ——
   let label = '输出';
-  let failed = exit !== undefined && exit !== 0;
+  const failedNow = failed(t);
   let body: string | null = null;
   let diff = false;
   const err = text('error');
   if (err !== undefined) {
     label = '错误';
-    failed = true;
     body = err;
   } else {
     const d = text('diff');
@@ -295,7 +315,7 @@ export function describeResult(t: ToolPart): ResultView | null {
 
   return {
     label,
-    failed,
+    failed: failedNow,
     chips,
     body,
     diff,

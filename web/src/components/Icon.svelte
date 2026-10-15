@@ -13,8 +13,9 @@
    *
    * 各图标墨迹（上面这条规矩下的值，20px 渲染时就是像素）：
    *   gear 16.8 · newchat 16.8 · clock 16.6 · menu 16.2×10.2 · phone 10×16.6
-   *   computer 16.2×15.5 · sparkle 15.8
-   *   chat 15.0 · pencil 14.9 · trash 14.6 · plus 14.2
+   *   computer 16.2×15.5 · terminal 16.4×14.2 · sparkle 15.8
+   *   chat 15.0 · search 14.9 · pencil 14.9 · trash 14.6 · plus 14.2
+   *   file / newfile 12.8×14.6 · camera 16.4×13 · globe 16.8
    *   send 11.8×13.2 · down 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
    */
   type Name =
@@ -28,6 +29,8 @@
     | 'chevron'
     | 'sparkle'
     | 'clock'
+    | 'terminal'
+    | 'search'
     | 'chat'
     | 'pencil'
     | 'trash'
@@ -35,6 +38,7 @@
     | 'camera'
     | 'image'
     | 'file'
+    | 'newfile'
     | 'check'
     | 'globe'
     | 'phone'
@@ -156,9 +160,29 @@
     <circle cx="10" cy="10" r="7.4" stroke="currentColor" stroke-width="1.8" />
     <path d="M10 5.8V10l2.9 1.9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
   </svg>
+{:else if name === 'terminal'}
+  <!-- 终端（跑命令用）：外框和 image 一个尺寸（16.4×14.2），
+       里头一个 `>` 提示符 + 一条光标横线，都在同一基线上（y 12.4）——
+       提示符是「终端」最好认的那一笔，横线补上「等着你敲」的意思。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <rect x="2.8" y="3.8" width="14.4" height="12.4" rx="2" stroke="currentColor" stroke-width="1.8" />
+    <path
+      d="M6.2 8.4 8.4 10.4 6.2 12.4M11 12.4h2.9"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </svg>
+{:else if name === 'search'}
+  <!-- 放大镜（联网搜索用）：镜片 ∅10.6，手柄朝右下，墨迹 14.9。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <circle cx="8.8" cy="8.8" r="5.3" stroke="currentColor" stroke-width="1.8" />
+    <path d="M12.6 12.6 16.6 16.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+  </svg>
 {:else if name === 'sparkle'}
-  <!-- 四角星。用于「思考」那一行，跟工具调用那行的时钟图标并排，
-       所以外框要对齐：老版本只有 12.8，比时钟（16.6）小一圈，
+  <!-- 四角星。用于「思考」那一行，跟工具调用那行的图标并排，
+       所以外框要对齐：老版本只有 12.8，比那一列的图标（16.4–16.8）小一圈，
        同一列里看着一个瘦一个胖。现在按 1.234 倍从中心放大到 15.8。 -->
   <svg width={size} height={size} viewBox="0 0 20 20" fill="currentColor" class={cls}>
     <path d="M10 2.1C10.86 6.79 13.21 9.14 17.9 10 13.21 10.86 10.86 13.21 10 17.9 9.14 13.21 6.79 10.86 2.1 10 6.79 9.14 9.14 6.79 10 2.1Z" />
@@ -208,6 +232,26 @@
       stroke-linejoin="round"
     />
     <path d="M11.6 2.7v4.1h4.1" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+  </svg>
+{:else if name === 'newfile'}
+  <!-- 新建文件：`file` 同一个外形（墨迹一样 12.8×14.6，两行图标排在同一列
+       里才不跳），正面中间加一个 `+`。加号中心 (9.9, 12.4) —— 在折角（y≤6.8）
+       下面、左右留量相等；臂长 2.4，16px 渲染时每边约 1.9px，看得出是个加号
+       而不是一个点（试过 2.2，糊）。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <path
+      d="M11.6 2.7H5.9a1.6 1.6 0 0 0-1.6 1.6v11.4a1.6 1.6 0 0 0 1.6 1.6h8.2a1.6 1.6 0 0 0 1.6-1.6V6.8l-4.1-4.1Z"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linejoin="round"
+    />
+    <path d="M11.6 2.7v4.1h4.1" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+    <path
+      d="M9.9 10v4.8M7.5 12.4h4.8"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+    />
   </svg>
 {:else if name === 'globe'}
   <!-- 地球：外圆 ∅15（墨迹 15 + 1.8 = 16.8，跟 gear/newchat 同档），

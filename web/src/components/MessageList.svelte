@@ -14,7 +14,7 @@
   import { tick } from 'svelte';
   import type { Message, ToolPart } from '../lib/sse';
   import { sandboxPath } from '../lib/markdown';
-  import { BROWSER_ACTION, describeInput, describeResult, type Tone } from '../lib/toolview';
+  import { BROWSER_ACTION, describeInput, describeResult, failed, type Tone } from '../lib/toolview';
   import Icon from './Icon.svelte';
   import { openViewer } from '../lib/viewer.svelte.ts';
   import Markdown from './Markdown.svelte';
@@ -70,7 +70,7 @@
     // 每来一小段参数这里就重算一次：对**整段** inputText 跑正则 + 试
     // JSON.parse —— 模型用 edit 写一个 30KB 的文件，就是几千次 × 30KB 的反复
     // 扫描，手机上肉眼可见地卡。
-    const a = (t.input ?? partialArgs(t.inputText.slice(0, SUMMARY_SCAN))) as Record<string, unknown>;
+    const a = summaryArgs(t);
     const s = (v: unknown) => (typeof v === 'string' ? v : '');
     // 只取第一行，长度交给 CSS 截断 —— 屏幕多宽就显示多少
     const firstLine = (v: string) => v.split('\n')[0].trim();
@@ -81,7 +81,10 @@
       case 'bash':
         return firstLine(s(a.command)) || '执行命令';
       case 'edit':
-        return `编辑 ${s(a.path) || '文件'}`;
+        // 新建还是改写：核心用 `content` / `edits` 两个参数区分（见 core 的
+        // edit_mode），这里认同一个信号 —— 两个都给是报错的用法，认 `content`
+        // 就行（那一行也会是红的）。摘要里也分两种说法，跟图标对得上。
+        return isNewFile(a) ? `新建 ${s(a.path) || '文件'}` : `编辑 ${s(a.path) || '文件'}`;
       case 'browser':
         // 浏览器工具已经删了（唯一入口是沙箱里的 `agent browser`，动作输出长
         // 在 bash 卡片里）。这里留着只为**回放老会话** —— 历史里那些 browser
@@ -98,6 +101,17 @@
 
   /** 折叠行的摘要从流式参数里最多看这么多字符（见 summarize） */
   const SUMMARY_SCAN = 2048;
+
+  /**
+   * 折叠行用的参数。
+   *
+   * **只看开头那一段**（见 `summarize` 里那段注释）：这一行只要命令 / 路径 /
+   * `content` 这种排在前面的短字段，而且每来一小段参数就会重算一次 —— 对整段
+   * inputText 跑，模型用 edit 写一个 30KB 的文件就是几千次 × 30KB。
+   * 新建文件的那个 `content` 就在开头（path 只有几个字符），这一截里照样认得出。
+   */
+  const summaryArgs = (t: ToolPart) =>
+    (t.input ?? partialArgs(t.inputText.slice(0, SUMMARY_SCAN))) as Record<string, unknown>;
 
   /**
    * 浏览器那一行：动作 + 目标。
@@ -145,14 +159,14 @@
   }
 
   /** 面板标题。要短，细节放正文。 */
-  function toolTitle(t: ToolPart): string {
+  function toolTitle(t: ToolPart, args: Record<string, unknown>): string {
     switch (t.toolName) {
       case 'read':
         return '读取文件';
       case 'bash':
         return '执行命令';
       case 'edit':
-        return '编辑文件';
+        return isNewFile(args) ? '新建文件' : '编辑文件';
       case 'browser':
         return '浏览器';
       case 'search':
@@ -161,6 +175,32 @@
       default:
         return t.toolName || '工具调用';
     }
+  }
+
+  /** `edit` 这次是新建文件（`content`）还是改已有文件（`edits`） */
+  const isNewFile = (a: Record<string, unknown>) => a.content !== undefined;
+
+  /** 这几个图标名字得和 Icon.svelte 里的一致（写错了下面会编译报错） */
+  type ToolIcon = 'file' | 'newfile' | 'terminal' | 'pencil' | 'globe' | 'search' | 'clock';
+
+  /**
+   * 工具那一行左边的小图标：一眼能看出这次是在读、在跑命令、还是在改文件。
+   *
+   * 不认识的工具仍然给时钟：以后核心加了新工具，是「多了个没见过的图标」
+   * 而不是「这一行空了」。类型写成 `ToolIcon`（不是 `string`）—— 图标改名的话
+   * 这里会编译报错，不会静静地画不出东西。
+   */
+  const TOOL_ICON: Record<string, ToolIcon> = {
+    read: 'file',
+    bash: 'terminal',
+    edit: 'pencil',
+    // browser / search 这两个工具已删，只剩回放老会话（见 summarize）
+    browser: 'globe',
+    search: 'search',
+  };
+  function toolIcon(t: ToolPart): ToolIcon {
+    if (t.toolName === 'edit') return isNewFile(summaryArgs(t)) ? 'newfile' : 'pencil';
+    return TOOL_ICON[t.toolName] ?? 'clock';
   }
 
   /** 参数还在流式时从半截 JSON 里抠（见 partialArgs） */
@@ -507,12 +547,17 @@
             </button>
           {:else if part.type === 'tool'}
             {@const tool = part}
+            <!-- 失败的行整行染红（图标 + 摘要）：16px 的淡灰图标单独变红，
+                 在一列工具行里扫不出来；面板里失败的标题和正文本来也是红的。
+                 右边的 › 不跟着红 —— 它是“点得开”，跟成功失败无关。
+                 判定走 toolview 的 `failed()`，和面板同一个函数。 -->
+            {@const bad = failed(tool)}
             <button
               onclick={() => openTool(msg, tool)}
               class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
             >
-              <Icon name="clock" size={16} class="shrink-0 text-faint" />
-              <span class="truncate text-sm text-muted">{summarize(tool)}</span>
+              <Icon name={toolIcon(tool)} size={16} class="shrink-0 {bad ? 'text-bad' : 'text-faint'}" />
+              <span class="truncate text-sm {bad ? 'text-bad' : 'text-muted'}">{summarize(tool)}</span>
               {#if tool.state !== 'output' && !msg.done}
                 <span class="shrink-0 text-meta text-faint">运行中</span>
               {/if}
@@ -602,7 +647,7 @@
     {@const t = s.tool}
     {@const res = describeResult(t)}
     {@const inp = describeInput(t, panelArgs)}
-    <Sheet title={toolTitle(t)} onclose={() => (sheet = null)}>
+    <Sheet title={toolTitle(t, panelArgs)} onclose={() => (sheet = null)}>
       <div class="flex flex-col gap-4">
         {#if inp.primary}
           <pre
