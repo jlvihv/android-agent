@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # 把中继装到服务器上（systemd 服务，开机自启、挂了自动重启）。见 docs/12-relay.md。
 #
-#   scripts/deploy-relay.sh root@1.2.3.4          # 或者 just relay-deploy root@1.2.3.4
+#   scripts/deploy-relay.sh vihv@129.211.71.14   # 或直接 `just relay-deploy`（默认就是这台）
 #   RELAY_PORT=9000 scripts/deploy-relay.sh ubuntu@1.2.3.4
 #
-# 要求：ssh 登得上去；不是 root 的话要能 sudo。服务器上不需要装 Rust。
+# 要求：ssh 登得上去；不是 root 的话要能 sudo（自己那台：vihv@ + 公钥 + sudo 免密）。
+# 服务器上不需要装 Rust。
 # 装完打印家里那台电脑要设的 AGENT_RELAY / AGENT_RELAY_KEY。
 # 再跑一遍就是升级：换二进制、重启服务，密钥不变（手机不用重新配）。
 set -euo pipefail

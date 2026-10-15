@@ -102,6 +102,11 @@ dev-host: web-build
 
 # --- 中继（出门在外连家里的电脑，见 docs/12-relay.md） ----------------------
 
+# 中继部署到哪台服务器。默认就是自己那台（ssh 用 vihv 登，sudo 免密）——
+# 上次部署就是它，所以别再满世界找 root@ 了。换服务器：
+#   AGENT_RELAY_HOST=user@1.2.3.4 just relay-deploy
+relay_host := env_var_or_default("AGENT_RELAY_HOST", "vihv@129.211.71.14")
+
 # 编出服务器上跑的中继：Linux x86_64 静态二进制（musl + rust-lld，macOS 上直接出）
 relay-build:
     #!/usr/bin/env bash
@@ -112,8 +117,9 @@ relay-build:
       cargo build --release --target x86_64-unknown-linux-musl
     echo "中继：relay/target/x86_64-unknown-linux-musl/release/agent-relay"
 
-# 部署到服务器（ssh 能登上去的那台，比如 root@1.2.3.4）：装成 systemd 服务，打印家里要设的两行
-relay-deploy target: relay-build
+# 部署到服务器：装成 systemd 服务，打印家里要设的两行。不带参数就是上面那台
+# （升级不会换密钥，`.env.local` 里那两行照旧，手机也不用重新配）
+relay-deploy target=relay_host: relay-build
     scripts/deploy-relay.sh {{target}}
 
 # 在本机跑一个中继（试用 / 调试）

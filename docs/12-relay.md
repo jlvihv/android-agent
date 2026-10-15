@@ -61,7 +61,8 @@
 
 ## 用起来是什么样
 
-1. 服务器上装中继：`just relay-deploy root@<服务器IP>`（交叉编译 + scp + systemd，见下）。
+1. 服务器上装中继：`just relay-deploy`（不带参数 = 自己那台 `vihv@129.211.71.14`；
+   换服务器：`AGENT_RELAY_HOST=user@ip just relay-deploy`。交叉编译 + scp + systemd，见下）。
    最后会打印两行 `AGENT_RELAY=…` / `AGENT_RELAY_KEY=…`。
 2. **只在一台**电脑上配：把这两行写进仓库根目录的 `.env.local`，重启 `just dev-host`。
    终端里会说「出门在外：经中继 …」，日志里有「已连上中继」。
@@ -149,9 +150,15 @@
 ## 部署
 
 ```sh
-just relay-build                 # → relay/target/x86_64-unknown-linux-musl/release/agent-relay
-just relay-deploy root@1.2.3.4   # 或 RELAY_PORT=9000 scripts/deploy-relay.sh ubuntu@1.2.3.4
+just relay-build            # → relay/target/x86_64-unknown-linux-musl/release/agent-relay
+just relay-deploy           # 默认 vihv@129.211.71.14（ssh 用 vihv 登，sudo 免密）
+AGENT_RELAY_HOST=user@1.2.3.4 just relay-deploy   # 换一台服务器
+RELAY_PORT=9000 just relay-deploy                 # 换端口
 ```
+
+服务器只认公钥（root 不能直登），所以 ssh 用 `vihv@` + 本机那把 `~/.ssh/id_ed25519`。
+验证装上去的是不是刚编的那份：md5 对一下 ——
+`sudo md5sum /usr/local/bin/agent-relay` 应该等于本机那个二进制的 md5。
 
 `deploy-relay.sh` 把二进制装到 `/usr/local/bin/agent-relay`，写一个 systemd 服务
 （`DynamicUser`，不用 root 跑；密钥在 `StateDirectory` 里，`/var/lib/agent-relay/key`），
