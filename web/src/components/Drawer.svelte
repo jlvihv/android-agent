@@ -451,11 +451,14 @@
 {#if pinned}
   <!-- 宽屏：并排的一栏。没有遮罩、不能往左拖、也不接返回键 ——
        它本来就不是「盖在上面」的东西，宽度写死。
-       收 / 展是头部那个菜单按钮（`in`/`out` 这里负责动画：宽度收到 0）。 -->
+       收 / 展是头部那个菜单按钮（`in`/`out` 这里负责动画：宽度收到 0）。
+       **`relative` 不能少**：上下两条渐隐（`.drawer-shell::before/::after`）是
+       absolute + inset-inline:0，没有定位祖先就按整个视口铺 —— 会横穿对话区，
+       在滚动条和正文上压出两道暗带（踩过）。窄屏那个是 fixed，不受影响。 -->
   <aside
     in:slide|global={{ axis: 'x', duration: PIN_MS }}
     out:slide|global={{ axis: 'x', duration: PIN_MS }}
-    class="drawer-shell flex h-full w-72 shrink-0 flex-col border-r border-hairline bg-drawer
+    class="drawer-shell relative flex h-full w-72 shrink-0 flex-col border-r border-hairline bg-drawer
            pt-[env(safe-area-inset-top)]"
   >
     {@render body()}
