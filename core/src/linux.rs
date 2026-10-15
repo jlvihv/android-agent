@@ -282,6 +282,12 @@ pub struct ExecResult {
 impl ExecResult {
     /// 给模型看的紧凑文本
     pub fn to_text(&self) -> String {
+        self.to_text_with(None)
+    }
+
+    /// 同 `to_text`，但超时那句换成调用方给的（agent 那边要带上「下次怎么给
+    /// timeout」的建议）—— 超时只说一遍，不叠两句。
+    pub fn to_text_with(&self, timeout_note: Option<String>) -> String {
         let mut s = String::new();
         if !self.stdout.is_empty() {
             s.push_str(&self.stdout);
@@ -300,8 +306,11 @@ impl ExecResult {
             }
         }
         if self.timed_out {
-            // 说清「下面是半截的」，否则模型会当成完整输出，再按它推理
-            s.push_str("\n[超时，已终止：下面是到被终止为止的输出，可能不全]");
+            // 说清「上面是半截的」，否则模型会当成完整输出，再按它推理
+            s.push('\n');
+            s.push_str(timeout_note.as_deref().unwrap_or(
+                "[超时，已终止：上面是到被终止为止的输出，可能不全]",
+            ));
         } else if let Some(sig) = self.signal {
             s.push_str(&format!("\n[被信号 {sig} 终止：{}]", signal_hint(sig)));
         }
@@ -4176,6 +4185,13 @@ mod tests {
         let text = r.to_text();
         assert!(text.contains("被信号 9"), "{text}");
         assert!(text.contains("OOM"), "信号要翻译成人话：{text}");
+
+        // 调用方给了自己的超时说明（带「下次怎么给 timeout」）：只说那一句，
+        // 不和默认那句叠在一起；`[exit N]` 仍在最后
+        r.timed_out = true;
+        let text = r.to_text_with(Some("[60s 超时被终止，上面的输出可能不全。]".into()));
+        assert_eq!(text.matches("超时").count(), 1, "超时只说一遍：{text}");
+        assert!(text.ends_with("[exit -1]"), "{text}");
     }
 
     /// 没 bash 时结果里必须明说，并给出装它的命令。

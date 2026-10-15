@@ -47,7 +47,7 @@ $ agent browser navigate https://example.com && agent browser get_backbone 3 && 
 
 | 工具 | 为什么它必须是工具 |
 |---|---|
-| `read` | 不是「读文件」这么简单：文本要按行截断 + 给续读提示（`offset` / `limit` / `numbered` / `totalLines`），图片要走**缩放 → 落盘 → 作为 image 内容块发给模型**那条管线。做成 shell 命令 = 把这两套规则塞进 shell 让模型每次重新学 |
+| `read` | 不是「读文件」这么简单：文本要按行截断 + 给续读提示（`offset` / `limit` / `numbered`），图片要走**缩放 → 落盘 → 作为 image 内容块发给模型**那条管线。做成 shell 命令 = 把这两套规则塞进 shell 让模型每次重新学 |
 | `bash` | 唯一的入口，其余能力都从它走 |
 | `edit` | 按原文精确替换 + 返回 unified diff + 原子写。用 shell 做就是 `sed` / `python3` 拼字符串，错一次毁一个文件；schema 逼模型把 `oldText` 给全 |
 

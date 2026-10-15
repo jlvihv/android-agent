@@ -989,19 +989,17 @@ pub fn session_view_count_before(sess: &ChatSession, upto: usize) -> usize {
 pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
     let from = from.min(sess.messages.len());
     // 工具结果按 id 索引：只需要切片内的（一个回合的 tool 结果都在它自己后面）
-    let mut results: HashMap<&str, &str> = HashMap::new();
+    let mut results: HashMap<&str, (&str, &[ImagePart])> = HashMap::new();
     for m in &sess.messages[from..] {
         if let ChatMessage::Tool {
             tool_call_id,
             content,
-            ..
+            images,
         } = m
         {
-            results.insert(tool_call_id.as_str(), content.as_str());
+            results.insert(tool_call_id.as_str(), (content.as_str(), images.as_slice()));
         }
     }
-
-    let parse = |s: &str| -> Value { serde_json::from_str(s).unwrap_or_else(|_| json!(s)) };
 
     let mut out: Vec<Value> = Vec::new();
     for (i, m) in sess.messages.iter().enumerate().skip(from) {
@@ -1041,16 +1039,23 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
                     parts.push(json!({ "type": "text", "id": format!("t{i}"), "text": content }));
                 }
                 for tc in tool_calls {
-                    let output = results.get(tc.id.as_str()).map(|c| parse(c));
+                    // 结果就是模型收到的那段文本，原样给
+                    let result = results.get(tc.id.as_str());
+                    let output = result.map(|(c, _)| *c);
+                    let images: Vec<&str> = result
+                        .map(|(_, imgs)| imgs.iter().map(|i| i.source.as_str()).collect())
+                        .unwrap_or_default();
                     parts.push(json!({
                         "type": "tool",
                         "toolCallId": tc.id,
                         "toolName": tc.name,
                         "inputText": "",
-                        "input": parse(&tc.arguments),
+                        "input": serde_json::from_str::<Value>(&tc.arguments)
+                            .unwrap_or_else(|_| json!(tc.arguments)),
                         // 没有输出就是还在跑（服务端此刻正在执行）
                         "state": if output.is_some() { "output" } else { "ready" },
                         "output": output,
+                        "images": images,
                     }));
                 }
                 if parts.is_empty() {
@@ -1467,17 +1472,13 @@ async fn drive(
                     return stop_with_pending(core, sid, tx, &calls[n..]).await;
                 }
             };
-            send(
-                tx,
-                sse::tool_output_available(&call.id, outcome.result.clone()),
-            )
-            .await;
+            send(tx, tool_output_event(&call.id, &outcome.text, &outcome.images)).await;
             append(
                 core,
                 sid,
                 ChatMessage::Tool {
                     tool_call_id: call.id.clone(),
-                    content: outcome.result.to_string(),
+                    content: outcome.text,
                     images: outcome.images,
                 },
             )
@@ -1576,15 +1577,15 @@ async fn stop_with_pending(
     tx: &mpsc::UnboundedSender<Value>,
     pending: &[RecordedToolCall],
 ) -> anyhow::Result<()> {
-    let stopped = json!({ "error": "用户已停止，这个工具没有执行完" });
+    let stopped = ToolOutcome::error("用户已停止，这个工具没有执行完");
     for call in pending {
-        send(tx, sse::tool_output_available(&call.id, stopped.clone())).await;
+        send(tx, tool_output_event(&call.id, &stopped.text, &[])).await;
         append(
             core,
             sid,
             ChatMessage::Tool {
                 tool_call_id: call.id.clone(),
-                content: stopped.to_string(),
+                content: stopped.text.clone(),
                 images: Vec::new(),
             },
         )
@@ -2110,7 +2111,7 @@ async fn stream_one(
             for c in &calls {
                 send(
                     tx,
-                    sse::tool_output_available(&c.id, json!({ "error": "已停止" })),
+                    tool_output_event(&c.id, "错误：已停止", &[]),
                 )
                 .await;
             }
@@ -2134,10 +2135,7 @@ async fn stream_one(
             for c in &calls {
                 send(
                     tx,
-                    sse::tool_output_available(
-                        &c.id,
-                        json!({ "error": "输出被截断，本次工具调用已作废，请重试" }),
-                    ),
+                    tool_output_event(&c.id, "错误：输出被截断，本次工具调用已作废，请重试", &[]),
                 )
                 .await;
             }
@@ -2344,7 +2342,6 @@ async fn pump_live_output(
     const LIVE_EVERY: std::time::Duration = std::time::Duration::from_millis(120);
     const LIVE_TAIL: usize = 32 * 1024;
 
-    let started = std::time::Instant::now();
     let mut text = String::new();
     // UTF-8 可能被切在块中间：不完整的尾巴留到下一块
     let mut pending: Vec<u8> = Vec::new();
@@ -2353,14 +2350,8 @@ async fn pump_live_output(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let flush = |text: &str| {
-        let _ = tx.send(sse::tool_output_preliminary(
-            &id,
-            json!({
-                "output": text,
-                "running": true,
-                "wall_time_seconds": (started.elapsed().as_millis() as f64 / 100.0).round() / 10.0,
-            }),
-        ));
+        // 跑到现在的输出，纯文本（「运行中」看 part 的 state，不用另带标记）
+        let _ = tx.send(sse::tool_output_preliminary(&id, json!(text)));
     };
 
     loop {
@@ -2489,10 +2480,10 @@ fn parse_timeout(args: &Value) -> Result<std::time::Duration, &'static str> {
 fn timeout_hint(timeout: std::time::Duration, explicit: bool) -> String {
     let secs = timeout.as_secs_f64();
     if explicit {
-        format!("[{secs:.0}s 超时被终止。确实需要更久就重跑并给更大的 timeout（上限 86400）]")
+        format!("[{secs:.0}s 超时被终止，上面的输出可能不全。确实需要更久就重跑并给更大的 timeout（上限 86400）]")
     } else {
         format!(
-            "[{secs:.0}s 超时被终止（没给 timeout，用的是默认值）。长任务重跑时显式给 timeout（秒，上限 86400）；\
+            "[{secs:.0}s 超时被终止，上面的输出可能不全（没给 timeout，用的是默认值）。长任务重跑时显式给 timeout（秒，上限 86400）；\
              要一直跑的服务用 `setsid … > /tmp/x.log 2>&1 &` 放后台——注意刚被杀的那条连同它起的东西一起死了，要在改过的写法下重新起]"
         )
     }
@@ -2535,20 +2526,41 @@ fn parse_numbered(args: &Value) -> bool {
 // 工具执行
 // ---------------------------------------------------------------------------
 
-/// 一次工具执行的结果：回给模型/前端的 JSON，外加要内联给模型的图片。
+/// 一次工具执行的结果：模型看到的**纯文本**（进历史、每一步都重发），外加要内联
+/// 给模型的图片（read 读到图）。
+///
+/// 界面上显示的也是**这同一段文本**，不另备一份结构化字段：退出码、截断、超时、
+/// 续读位置这些模型要知道的，本来就写在正文里（`ExecResult::to_text`、`reader` 的
+/// 续读提示）。以前包一层 JSON 再把它们各列一遍，一条 `ls` 的结果七成是重复字段，
+/// 正文还被转义成 `\n` / `\"`；人和模型看到的也不是同一个东西。
 struct ToolOutcome {
-    result: Value,
+    text: String,
     images: Vec<ImagePart>,
 }
 
 impl ToolOutcome {
-    /// 没有图片的普通结果（绝大多数工具）。
-    fn json(result: Value) -> Self {
+    /// 没有图片的普通结果。
+    fn text(text: impl Into<String>) -> Self {
         Self {
-            result,
+            text: text.into(),
             images: Vec::new(),
         }
     }
+
+    /// 出错：`错误：…`。界面也靠这个开头把卡片染红（见前端 `toolview.ts`）。
+    fn error(msg: impl std::fmt::Display) -> Self {
+        Self::text(format!("错误：{msg}"))
+    }
+}
+
+/// 工具结果的 SSE 事件：正文就是模型收到的那段文本；读到的图片给出沙箱里的原图
+/// 路径，界面画缩略图（图也是模型看到的东西）。
+fn tool_output_event(id: &str, text: &str, images: &[ImagePart]) -> Value {
+    let mut ev = sse::tool_output_available(id, json!(text));
+    if !images.is_empty() {
+        ev["images"] = json!(images.iter().map(|i| &i.source).collect::<Vec<_>>());
+    }
+    ev
 }
 
 /// `live`：(推给前端的通道, 工具调用 id)。给了就把 bash 的输出边跑边推过去。
@@ -2575,38 +2587,34 @@ async fn execute_tool(
     if name == "read" {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
         if path.is_empty() {
-            return ToolOutcome::json(json!({ "error": "缺少参数 path" }));
+            return ToolOutcome::error("缺少参数 path");
         }
         let path = &in_cwd(path, &cwd);
         let offset = parse_offset(&args);
         let limit = match parse_limit(&args) {
             Ok(l) => l,
-            Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+            Err(e) => return ToolOutcome::error(format!("{e:#}")),
         };
         let numbered = parse_numbered(&args);
 
         return match core.read_any(path, offset, limit, numbered).await {
-            Ok(linux::ReadResult::Text(view)) => ToolOutcome::json(json!({
-                "output": view.content,
-                "truncated": view.truncated,
-                "totalLines": view.total_lines,
-                "totalBytes": view.total_bytes,
-            })),
+            // 续读提示（还有几行、用 offset= 几继续）已经在正文末尾了
+            Ok(linux::ReadResult::Text(view)) => ToolOutcome::text(view.content),
             Ok(linux::ReadResult::Image(img)) => read_image_outcome(core, path, img).await,
-            Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+            Err(e) => ToolOutcome::error(format!("{e:#}")),
         };
     }
 
     if name == "bash" {
         let script = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if script.trim().is_empty() {
-            return ToolOutcome::json(json!({ "error": "缺少参数 command" }));
+            return ToolOutcome::error("缺少参数 command");
         }
         // timeout 可选，默认 60s（见 `BASH_DEFAULT_TIMEOUT`）
         let explicit = !matches!(args.get("timeout"), None | Some(Value::Null));
         let timeout = match parse_timeout(&args) {
             Ok(t) => t,
-            Err(why) => return ToolOutcome::json(json!({ "error": why })),
+            Err(why) => return ToolOutcome::error(why),
         };
 
         let res = match live {
@@ -2622,37 +2630,20 @@ async fn execute_tool(
         };
         return match res {
             Ok(r) => {
-                let mut text = r.to_text();
-                if r.timed_out {
-                    text.push('\n');
-                    text.push_str(&timeout_hint(timeout, explicit));
-                }
-                let urls = crate::urls::extract(&text);
-                let mut out = json!({
-                    "output": text,
-                    "exit_code": r.code,
-                    "truncated": r.truncated,
-                    "timed_out": r.timed_out,
-                    "signal": r.signal,
-                    "full_output_path": r.full_output_path,
-                    "wall_time_seconds": (r.duration_ms as f64) / 1000.0,
-                });
-                // 输出里的网址（见 `urls` 模块）：要么用 agent-open 打开，要么在
-                // 回复里给用户（用户在聊天里点）。没有就不带这个字段 —— 每条
-                // 结果都会留在历史里、每一步都重发，空数组也是钱
-                if !urls.is_empty() {
-                    out["urls"] = json!(urls);
-                }
-                ToolOutcome::json(out)
+                // 截断 / 完整输出在哪 / 超时 / 信号 / `[exit N]` 都在正文里（`to_text_with`），
+                // 超时那句换成带「下次怎么给 timeout」的版本，只说一遍
+                ToolOutcome::text(
+                    r.to_text_with(r.timed_out.then(|| timeout_hint(timeout, explicit))),
+                )
             }
-            Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+            Err(e) => ToolOutcome::error(format!("{e:#}")),
         };
     }
 
     if name == "edit" {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
         if path.is_empty() {
-            return ToolOutcome::json(json!({ "error": "缺少参数 path" }));
+            return ToolOutcome::error("缺少参数 path");
         }
         let path = &in_cwd(path, &cwd);
 
@@ -2661,31 +2652,27 @@ async fn execute_tool(
         // 要么改到错的地方）。
         let mode = match edit_mode(&args) {
             Ok(m) => m,
-            Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+            Err(e) => return ToolOutcome::error(format!("{e:#}")),
         };
         if let EditMode::Create(content) = mode {
             return match core.create_file(path, content).await {
-                Ok(c) => ToolOutcome::json(json!({
-                    "ok": true,
-                    "message": format!("已创建 {path}（{} 行 / {} 字节）", c.lines, c.bytes),
-                })),
-                Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+                Ok(c) => ToolOutcome::text(format!(
+                    "已创建 {path}（{} 行 / {} 字节）",
+                    c.lines, c.bytes
+                )),
+                Err(e) => ToolOutcome::error(format!("{e:#}")),
             };
         }
 
         let edits = match parse_edits(&args) {
             Ok(e) => e,
-            Err(e) => return ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+            Err(e) => return ToolOutcome::error(format!("{e:#}")),
         };
 
+        // 模型看到的就是 diff（`@@` 里有行号，改了几处它自己知道）
         return match core.edit_file(path, &edits).await {
-            Ok(out) => ToolOutcome::json(json!({
-                "ok": true,
-                "message": format!("已替换 {} 处", edits.len()),
-                "firstChangedLine": out.first_changed_line,
-                "diff": out.patch,
-            })),
-            Err(e) => ToolOutcome::json(json!({ "error": format!("{e:#}") })),
+            Ok(out) => ToolOutcome::text(out.patch),
+            Err(e) => ToolOutcome::error(format!("{e:#}")),
         };
     }
 
@@ -2701,11 +2688,12 @@ async fn execute_tool(
     //
     // 和上面那段设备操作同一个道理：能在 shell 里说清的能力，就别再开一个工具。
 
-    ToolOutcome::json(json!({ "error": format!("未知工具 {name}") }))
+    ToolOutcome::error(format!("未知工具 {name}"))
 }
 
 /// 图片结果：缩好的字节落盘（历史回放时还要重发），回给模型一段能读的说明
-/// 外加原图路径；图片本体作为 `images` 走 `build_messages` 里那条 carrier。
+/// （mime、尺寸、大小、原图路径都在里面）；图片本体作为 `images` 走
+/// `build_messages` 里那条 carrier。
 async fn read_image_outcome(
     core: &Core,
     guest_path: &str,
@@ -2732,26 +2720,12 @@ async fn read_image_outcome(
 
     if !supports_images {
         output.push_str("\n[当前模型不支持图片输入，这张图没有发给模型]");
-        return ToolOutcome::json(json!({
-            "output": output,
-            "imagePath": guest_path,
-            "imageMime": mime,
-            "totalBytes": img.source_bytes,
-            "truncated": false,
-        }));
+        return ToolOutcome::text(output);
     }
 
     match core.save_image(img.bytes, mime.clone()).await {
         Ok(stored) => ToolOutcome {
-            result: json!({
-                "output": output,
-                "imagePath": guest_path,
-                "imageMime": mime.clone(),
-                "imageWidth": img.width,
-                "imageHeight": img.height,
-                "totalBytes": img.source_bytes,
-                "truncated": false,
-            }),
+            text: output,
             images: vec![ImagePart {
                 path: stored.display().to_string(),
                 mime,
@@ -2762,13 +2736,7 @@ async fn read_image_outcome(
         Err(e) => {
             tracing::warn!("图片落盘失败: {e:#}");
             output.push_str(&format!("\n[图片没能保存，本轮没发给模型：{e:#}]"));
-            ToolOutcome::json(json!({
-                "output": output,
-                "imagePath": guest_path,
-                "imageMime": mime,
-                "totalBytes": img.source_bytes,
-                "truncated": false,
-            }))
+            ToolOutcome::text(output)
         }
     }
 }
@@ -4084,6 +4052,49 @@ mod tests {
 
         let e = parse_edits(&json!({ "edits": [] })).unwrap_err();
         assert!(e.to_string().contains("至少"), "{e}");
+    }
+
+    /// 界面上的工具结果就是**模型收到的那段原文**，原样；读到的图片另给沙箱里的
+    /// 原图路径。
+    #[test]
+    fn session_view_shows_tool_results_verbatim() {
+        let call = |id: &str| RecordedToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        };
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::User("问".into()),
+            ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![call("new")],
+                reasoning_items: Vec::new(),
+            },
+            ChatMessage::Tool {
+                tool_call_id: "new".into(),
+                content: "a.txt\n\n[exit 0]".into(),
+                images: vec![ImagePart {
+                    path: "/data/img/1.png".into(),
+                    mime: "image/png".into(),
+                    source: "/workspace/shot.png".into(),
+                    tool: "read".into(),
+                }],
+            },
+        ];
+        let v = session_view(&sess);
+        let parts = v[1]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["output"], json!("a.txt\n\n[exit 0]"));
+        assert_eq!(parts[0]["images"], json!(["/workspace/shot.png"]));
+    }
+
+    /// 工具结果的 SSE 事件：正文是纯文本；有图才带 `images`。
+    #[test]
+    fn tool_output_event_is_the_plain_text() {
+        let ev = tool_output_event("c1", "错误：缺少参数 path", &[]);
+        assert_eq!(ev["output"], json!("错误：缺少参数 path"));
+        assert!(ev.get("images").is_none());
     }
 
     #[test]

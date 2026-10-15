@@ -15,7 +15,7 @@
   import { cubicIn } from 'svelte/easing';
   import type { Message, ToolPart } from '../lib/sse';
   import { sandboxPath } from '../lib/markdown';
-  import { BROWSER_ACTION, describeInput, describeResult, failed, type Tone } from '../lib/toolview';
+  import { BROWSER_ACTION, describeInput, describeResult, failed } from '../lib/toolview';
   import Icon from './Icon.svelte';
   import { openViewer } from '../lib/viewer.svelte.ts';
   import Markdown from './Markdown.svelte';
@@ -274,13 +274,6 @@
     if (l.startsWith('-') && !l.startsWith('---')) return 'text-bad';
     if (l.startsWith('@@') || l.startsWith('+++') || l.startsWith('---')) return 'text-faint';
     return 'text-muted';
-  };
-
-  const CHIP: Record<Tone, string> = {
-    ok: 'bg-ok/15 text-ok',
-    bad: 'bg-bad/15 text-bad',
-    warn: 'bg-warn/15 text-warn',
-    plain: 'bg-control text-muted',
   };
 
   // —— 贴底 ——
@@ -722,77 +715,37 @@
         {/if}
 
         {#if res}
+          <!-- 结果：模型收到的原文，原样（退出码、截断、续读位置都在正文里） -->
           <div class="flex flex-col gap-2">
-            <!-- 元信息药丸：退出码 / 耗时 / 是否截断 / 替换处数 … -->
-            <div class="flex flex-wrap items-center gap-1.5">
-              <span class="text-meta {res.failed ? 'text-bad' : 'text-faint'}">{res.label}</span>
-              {#each res.chips as c}
-                <span class="rounded-full px-2 py-0.5 text-meta {CHIP[c.tone]}">{c.text}</span>
-              {/each}
-            </div>
+            <span class="text-meta {res.failed ? 'text-bad' : 'text-faint'}">
+              {t.state === 'output' ? '模型收到的结果' : '运行中…'}
+            </span>
 
-            {#if res.image}
-              <!-- 工具返回的图：直接展示原图（沙箱路由），模型看的是缩放后的那份 -->
+            {#each res.images as img}
+              <!-- 工具返回的图：展示原图（沙箱路由），模型看的是缩放后的那份 -->
               <img
-                src={sandboxPath(res.image)}
+                src={sandboxPath(img)}
                 alt="工具返回的图片"
                 class="max-h-80 w-auto self-start rounded-xl bg-hairline-soft object-contain"
               />
-              <p class="text-meta text-faint">图片：<code class="font-mono break-all">{res.image}</code></p>
-            {/if}
+            {/each}
 
-            {#if res.body !== null}
-              {#if res.diff}
-                <div
-                  class="overflow-x-auto rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5"
-                >
-                  {#each res.body.split('\n') as line}
-                    <p class="whitespace-pre {diffLine(line)}">{line || ' '}</p>
-                  {/each}
-                </div>
-              {:else}
-                <pre
-                  use:followTail
-                  class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-all {res.failed
-                    ? 'text-bad'
-                    : ''}">{res.body}</pre>
-              {/if}
-            {/if}
-
-            {#if res.path}
-              <p class="text-meta text-faint">
-                完整输出：<code class="font-mono break-all">{res.path}</code>
-              </p>
-            {/if}
-
-            {#if res.urls.length}
-              <!-- 输出里挑出来的网址：模型拿到的是同一份清单 -->
-              <div class="flex flex-col gap-1">
-                <span class="text-meta text-faint">网址</span>
-                {#each res.urls as u}
-                  <a href={u} target="_blank" rel="noreferrer" class="font-mono text-[13px] break-all underline decoration-faint underline-offset-2"
-                    >{u}</a
-                  >
+            {#if res.diff}
+              <div
+                class="overflow-x-auto rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5"
+              >
+                {#each res.text.split('\n') as line}
+                  <p class="whitespace-pre {diffLine(line)}">{line || ' '}</p>
                 {/each}
               </div>
+            {:else}
+              <pre
+                use:followTail
+                class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-all {res.failed
+                  ? 'text-bad'
+                  : ''}">{res.text}</pre>
             {/if}
           </div>
-
-          {#if res.fields.length}
-            <!-- 没有专门样式的字段：一个都不藏（模型看得到的，这里就得看得到） -->
-            {@render fields('其他字段', res.fields)}
-          {/if}
-
-          {#if res.raw !== null}
-            <details class="group">
-              <summary class="cursor-default list-none text-meta text-faint">
-                <span class="inline-block transition-transform group-open:rotate-90">›</span>
-                模型收到的原始结果{res.image ? '（另附上面那张图，缩放后）' : ''}
-              </summary>
-              <pre
-                class="mt-2 rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[12px] leading-5 whitespace-pre-wrap break-all text-muted">{res.raw}</pre>
-            </details>
-          {/if}
         {:else if t.state === 'streaming'}
           <p class="text-sm text-muted">执行中…</p>
         {/if}

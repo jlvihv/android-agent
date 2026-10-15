@@ -147,7 +147,7 @@ just phone                                   # 交互模式，/help 看命令
 
 | 工具 | 作用 |
 |---|---|
-| `read` | 读文件：文本带 `offset` / `limit` / `numbered`（`numbered=true` 加 `cat -n` 同款行号；截断到 2000 行或 50KB），结果里附 `totalLines` / `totalBytes`（整个文件多大）；**图片缩放后直接发给模型看** |
+| `read` | 读文件：文本带 `offset` / `limit` / `numbered`（`numbered=true` 加 `cat -n` 同款行号；截断到 2000 行或 50KB），没读完时末尾写明整个文件多少行、多大、从哪续读；**图片缩放后直接发给模型看** |
 | `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`），cwd 是 `/workspace` |
 | `edit` | 改文件：按原文精确替换，返回 unified diff；新建文件：只给 `content` |
 

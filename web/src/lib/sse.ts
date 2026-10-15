@@ -41,7 +41,9 @@ export type UiChunk =
   | {
       type: 'tool-output-available';
       toolCallId: string;
-      output: unknown;
+      output: string;
+      /** 工具返回的图片（沙箱里的原图路径），只有读到图时才带 */
+      images?: string[];
       /** 工具还在跑，这是阶段性结果（bash 的实时输出）。最终结果不带它 */
       preliminary?: boolean;
     }
@@ -272,7 +274,10 @@ export type ToolPart = {
   inputText: string;
   input: unknown;
   state: 'streaming' | 'ready' | 'output';
-  output?: unknown;
+  /** 模型收到的结果原文（还在跑时是到目前为止的输出） */
+  output?: string;
+  /** 工具返回的图片（read 读到图）：沙箱里的原图路径 */
+  images?: string[];
 };
 
 export type Part =
@@ -400,6 +405,7 @@ export function applyChunk(msg: Message, c: UiChunk): void {
       const p = findTool(c.toolCallId);
       if (p) {
         p.output = c.output;
+        if (c.images) p.images = c.images;
         // 阶段性结果只刷新输出，状态留在"执行中"
         if (!c.preliminary) p.state = 'output';
       }

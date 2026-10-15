@@ -193,7 +193,7 @@ pub fn read_description() -> String {
     // 2000 行 / 50KB 从 `linux.rs` 的常量来，别抄死 —— 两处各写一遍，改常量不会报错，
     // 句子就悄悄跟实际行为不一致了。
     format!(
-        "读取文本或图片。读取文本时，输出会截断到 {lines} 行或 {kb}KB，被截断时末尾会写明用哪个 offset 续读；结果里的 totalLines / totalBytes 是整个文本文件的行数和字节数，据此决定继续读还是改用 bash 的 rg/sed 局部读。读取图片时（png/jpg/gif/webp）可能会缩放（offset/limit 对图片无效），结果里的 totalBytes 是原图片文件大小。",
+        "读取文本或图片。读取文本时，输出会截断到 {lines} 行或 {kb}KB，没读完时末尾会写明整个文件多少行、多大、用哪个 offset 续读，据此决定继续读还是改用 bash 的 rg/sed 局部读。读取图片时（png/jpg/gif/webp）可能会缩放（offset/limit 对图片无效），结果里写明原图尺寸和文件大小。",
         lines = linux::MAX_OUTPUT_LINES,
         kb = linux::MAX_OUTPUT_BYTES / 1024,
     )
@@ -277,7 +277,7 @@ pub fn edit_schema() -> Value {
 ///
 /// 正常情况下停止会把没跑完的调用补上结果（见 `drive`），这里是兜底：
 /// 进程在两步之间被杀留下的会话。
-pub const INTERRUPTED: &str = r#"{"error":"没有结果：回合被中断（用户停止或 App 被关闭）"}"#;
+pub const INTERRUPTED: &str = "错误：没有结果，回合被中断（用户停止或 App 被关闭）";
 
 #[cfg(test)]
 mod tests {

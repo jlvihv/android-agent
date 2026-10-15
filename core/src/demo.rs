@@ -52,7 +52,7 @@ pub fn scripted(prompt: &str) -> Vec<Value> {
     ));
     out.push(sse::tool_output_available(
         "call_bash",
-        json!({ "output": "3.21.0\n", "exit_code": 0, "truncated": false }),
+        json!("3.21.0\n\n[exit 0]"),
     ));
 
     // 工具调用 2：改文件
@@ -67,7 +67,7 @@ pub fn scripted(prompt: &str) -> Vec<Value> {
     ));
     out.push(sse::tool_output_available(
         "call_edit",
-        json!({ "ok": true, "message": "已替换 1 处", "diff": "--- a\n+++ b\n-print('hi')\n+print('你好')\n" }),
+        json!("--- /workspace/hello.py\n+++ /workspace/hello.py\n@@ -1 +1 @@\n-print('hi')\n+print('你好')\n"),
     ));
 
     out.push(sse::finish_step());
