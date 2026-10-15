@@ -269,7 +269,7 @@ mod tests {
         // 真实那份跟着这台机器走
         let p = system_prompt(Platform::Android);
         assert_eq!(p.contains("agent sms"), linux::has_phone_capabilities());
-        for s in ["agent browser", "agent weather"] {
+        for s in ["agent browser", "agent search"] {
             assert!(p.contains(s), "提示词里掉了 {s}");
         }
     }

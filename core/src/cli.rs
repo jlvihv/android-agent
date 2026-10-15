@@ -103,18 +103,27 @@ fn sub(
 /// 全部子命令，**顺序就是 `agent help` 和提示词里的顺序**。
 fn subcommands() -> Vec<Sub> {
     let mut v = vec![
-        sub("browser", ALL, "`agent browser`（{browser}）", BROWSER_HELP, BROWSER_BODY),
+        // 浏览器和搜索在提示词里给出完整签名：这两个最常用，而且不知道参数就没法用 ——
+        // 只给名字的话，模型几乎每次都得先花一轮跑 `agent help`。别的命令只给名字
+        //（提示词越长，升级时追加进老会话的那份也越长，见 `agent::ensure_system_prompt`）。
+        sub(
+            "browser",
+            ALL,
+            "`agent browser <动作> [参数…]`（{browser}；动作：{actions}；一条命令里可以用 && 连做多步）",
+            &browser_help(),
+            BROWSER_BODY,
+        ),
         sub(
             "search",
             ALL,
-            "`agent search`（联网搜索）",
+            "`agent search <检索意图> [条数]`（联网搜索，回标题 + 链接 + 片段）",
             "  agent search <检索意图> [条数]      联网搜索，回标题 + 链接 + 片段（排好版的文字）",
             SEARCH_BODY,
         ),
         sub(
             "weather",
             ALL,
-            "`agent weather`（天气，免 key）",
+            "",
             "  agent weather [current|hourly|daily|report] --lat L --lon N   天气（Open-Meteo）\n\
              \x20   --lat/--lon 是十进制度（纬度 -90..90，经度 -180..180）",
             WEATHER_BODY,
@@ -257,7 +266,11 @@ pub fn prompt_clause(m: Machine) -> String {
     let mut items: Vec<String> = subcommands()
         .into_iter()
         .filter(|s| s.on.contains(&m) && !s.prompt.is_empty())
-        .map(|s| s.prompt.replace("{browser}", m.browser()))
+        .map(|s| {
+            s.prompt
+                .replace("{browser}", m.browser())
+                .replace("{actions}", &BROWSER_ACTIONS.join(" | "))
+        })
         .collect();
     // 系统能力那一组：一项列全名（顺序和 help 一致），放在设备操作后面
     if m == Machine::Phone {
@@ -352,15 +365,43 @@ act() {
 
 "##;
 
-const BROWSER_HELP: &str = "  agent browser <动作> [参数…]        驱动浏览器（agent browser --help 看每个动作）：
-      navigate <url> | get_backbone [深度] | click <选择器> | type <选择器> <文本>
-      get_text [选择器] | get_readable | scroll [up|down] [像素]
-      screenshot [true=整页] | press Enter | find_elements <选择器> | user_agent mobile|desktop
-      back | wait_for_dom_stable [秒] | js '<代码>'
-      new_tab [url] | list_tabs | switch_tab <编号> | close_tab [编号]
-    一条命令里可以连做多步：agent browser navigate <url> && agent browser get_backbone 3
-    截图路径在 screenshot 的返回里，要 read 它才看得见。
-    复杂参数直接给 JSON：agent browser '{\"action\":\"click\",\"x\":100,\"y\":200}'";
+/// `agent browser` 的动作和参数（help 和提示词共用这一份）。
+const BROWSER_ACTIONS: &[&str] = &[
+    "navigate <url>",
+    "get_backbone [深度]",
+    "click <选择器>",
+    "type <选择器> <文本>",
+    "get_text [选择器]",
+    "get_readable",
+    "scroll [up|down] [像素]",
+    "screenshot [true=整页]",
+    "press <键名>",
+    "find_elements <选择器>",
+    "user_agent mobile|desktop",
+    "back",
+    "wait_for_dom_stable [秒]",
+    "js '<代码>'",
+    "new_tab [url]",
+    "list_tabs",
+    "switch_tab <编号>",
+    "close_tab [编号]",
+];
+
+fn browser_help() -> String {
+    let mut lines =
+        vec!["  agent browser <动作> [参数…]        驱动浏览器（agent browser --help 看每个动作）：".to_string()];
+    lines.extend(
+        BROWSER_ACTIONS
+            .chunks(4)
+            .map(|c| format!("      {}", c.join(" | "))),
+    );
+    lines.extend([
+        "    一条命令里可以连做多步：agent browser navigate <url> && agent browser get_backbone 3".into(),
+        "    截图路径在 screenshot 的返回里，要 read 它才看得见。".into(),
+        "    复杂参数直接给 JSON：agent browser '{\"action\":\"click\",\"x\":100,\"y\":200}'".into(),
+    ]);
+    lines.join("\n")
+}
 
 const BROWSER_BODY: &str = r##"    shift || true
     act_="${1:-}"; shift || true
@@ -701,6 +742,20 @@ mod tests {
         }
         let sandbox = prompt_clause(Machine::Sandbox);
         assert!(sandbox.contains("`agent ps`") && !sandbox.contains("agent key"), "{sandbox}");
+    }
+
+    /// 浏览器的动作清单 help 和提示词里都有，而且是同一份。
+    #[test]
+    fn browser_actions_are_in_help_and_prompt() {
+        for m in Machine::ALL {
+            let (_, help, _) = run(m, &["help"]);
+            let prompt = prompt_clause(m);
+            for a in BROWSER_ACTIONS {
+                assert!(help.contains(a), "{m:?} 的 help 里少了 {a}");
+                assert!(prompt.contains(a), "{m:?} 的提示词里少了 {a}");
+            }
+            assert!(prompt.contains("`agent search <检索意图> [条数]`"), "{prompt}");
+        }
     }
 
     /// `$var` 后面**不能**紧跟中文标点，必须写 `${var}`（见模块说明）。
