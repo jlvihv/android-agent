@@ -264,6 +264,10 @@ pub struct Mapper {
     /// 已经通过 `.delta` 收过参数的 `output_index` —— 对应的 `.done` 就别
     /// 再整体补一遍，否则参数会翻倍。
     saw_args_delta: HashSet<u32>,
+    /// 这条流里出现过工具调用没有。`response.completed` 只说「这一轮结束了」，
+    /// 不带「是正常说完还是要去调工具」——只能自己记着：见了 function_call
+    /// 就报 `tool_calls`，否则报 `stop`，`usage` 表那列才有意义。
+    saw_function_call: bool,
 }
 
 impl Mapper {
@@ -312,13 +316,20 @@ impl Mapper {
                     ..Delta::default()
                 })
             }
-            Event::ItemAdded { output_index, item } if item.kind == "function_call" => one(
-                tool_delta(output_index, item.call_id, item.name, item.arguments),
-            ),
+            Event::ItemAdded { output_index, item } if item.kind == "function_call" => {
+                self.saw_function_call = true;
+                one(tool_delta(
+                    output_index,
+                    item.call_id,
+                    item.name,
+                    item.arguments,
+                ))
+            }
             Event::ArgsDelta {
                 output_index,
                 delta,
             } => {
+                self.saw_function_call = true;
                 self.saw_args_delta.insert(output_index);
                 one(tool_delta(output_index, None, None, Some(delta)))
             }
@@ -326,6 +337,7 @@ impl Mapper {
                 output_index,
                 arguments,
             } => {
+                self.saw_function_call = true;
                 // `insert` 返回 false = 之前已经有过参数（delta 或这一次）。
                 // 记下来，后面的 `output_item.done` 就不会把整段参数再拼一遍 ——
                 // 只发 done、不发 delta 的实现，不记这一笔就会拼出 `{…}{…}` 这种坏 JSON。
@@ -336,6 +348,7 @@ impl Mapper {
                 }
             }
             Event::ItemDone { output_index, item } if item.kind == "function_call" => {
+                self.saw_function_call = true;
                 // 只有整段参数随 item 一起给的实现（没有 delta）才补
                 if self.saw_args_delta.contains(&output_index) {
                     None
@@ -350,7 +363,16 @@ impl Mapper {
             }
             // 给一个 finish_reason：`pump_frames` 靠它认出「流是正常结束的」
             //（Responses 没有 `[DONE]`），没带用量的实现也不会被当成断流。
-            Event::Completed { response } => finish_chunk(response, Some("stop".to_string())),
+            // 终止原因：这轮出过工具调用就是 `tool_calls`，否则 `stop`
+            //（Responses 的 `completed` 不区分这两者，看上面的 `saw_function_call`）。
+            Event::Completed { response } => {
+                let fr = if self.saw_function_call {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
+                finish_chunk(response, Some(fr.to_string()))
+            }
             Event::Incomplete { response } => {
                 let reason = response
                     .incomplete_details
@@ -567,6 +589,38 @@ mod tests {
             .unwrap()
             .expect("completed 必须产出一帧，pump_frames 靠它认出正常结束");
         assert!(c.choices[0].finish_reason.is_some());
+    }
+
+    /// `response.completed` 不区分「说完了」和「要去调工具」：这轮出过
+    /// function_call 就要报 `tool_calls`（`usage` 表那列靠它）。
+    #[test]
+    fn completed_reports_tool_calls_when_the_turn_called_a_tool() {
+        let mut m = Mapper::default();
+        m.map(
+            &json!({ "type": "response.output_item.added", "output_index": 0,
+                     "item": { "type": "function_call", "call_id": "c1",
+                               "name": "bash", "arguments": "" } })
+            .to_string(),
+        )
+        .unwrap();
+        let c = m
+            .map(&json!({ "type": "response.completed", "response": {} }).to_string())
+            .unwrap()
+            .expect("completed 要出一帧");
+        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    /// 只有正文、没调工具的一轮：`stop`。
+    #[test]
+    fn completed_reports_stop_when_the_turn_only_talked() {
+        let mut m = Mapper::default();
+        m.map(&json!({ "type": "response.output_text.delta", "delta": "好了" }).to_string())
+            .unwrap();
+        let c = m
+            .map(&json!({ "type": "response.completed", "response": {} }).to_string())
+            .unwrap()
+            .expect("completed 要出一帧");
+        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]

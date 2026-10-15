@@ -2010,6 +2010,16 @@ fn inline_files(sess: &ChatSession, images: bool, pdfs: bool) -> Vec<(String, St
     out
 }
 
+/// 记下 provider 报的结束原因（`stop` / `tool_calls` / `length`……），进 `usage` 表。
+///
+/// 只在非空时覆盖：有些分片会带 `"finish_reason": ""`，别拿它把已经拿到的真原因
+/// 冲掉。（`length` 另外还是「被截断」的信号，见 `stream_one` 末尾那处判断。）
+fn note_finish(slot: &mut Option<String>, fr: Option<&str>) {
+    if let Some(fr) = fr.filter(|s| !s.is_empty()) {
+        *slot = Some(fr.to_string());
+    }
+}
+
 /// 调一次 LLM，把 delta 转成 chunk 推出去，返回本轮产出。
 async fn stream_one(
     core: &Core,
@@ -2146,11 +2156,7 @@ async fn stream_one(
                         }
                     }
                 }
-                if let Some(fr) = choice.finish_reason.as_deref() {
-                    if fr == "length" {
-                        finish = Some("length".to_string());
-                    }
-                }
+                note_finish(&mut finish, choice.finish_reason.as_deref());
                 if let Some(tcs) = choice.delta.tool_calls {
                     for tc in tcs {
                         let i = tc.index as usize;
@@ -4565,6 +4571,21 @@ mod tests {
         let snip = hit_snippet(&text, "NEEDLE").unwrap();
         assert!(snip.contains("needle"), "{snip}");
         assert!(snip.ends_with("xxxxxxxxxx"), "{snip}");
+    }
+
+    /// 结束原因只要非空就记。以前只在 `length` 时写值，于是 `usage` 表的 `finish`
+    /// 那一列对 `stop` / `tool_calls` 一直是 NULL；空串 / None 不覆盖已拿到的真原因。
+    #[test]
+    fn the_providers_finish_reason_is_recorded_unless_empty() {
+        let mut f = None;
+        note_finish(&mut f, Some("tool_calls"));
+        assert_eq!(f.as_deref(), Some("tool_calls"));
+        note_finish(&mut f, Some(""));
+        assert_eq!(f.as_deref(), Some("tool_calls"), "空串不能覆盖");
+        note_finish(&mut f, None);
+        assert_eq!(f.as_deref(), Some("tool_calls"), "None 不能覆盖");
+        note_finish(&mut f, Some("length"));
+        assert_eq!(f.as_deref(), Some("length"), "后来的非空值覆盖");
     }
 
     /// 消息不在内存里的会话：搜索时临时从库里读（`load`），读不出来就跳过。
