@@ -157,11 +157,11 @@
            缓存命中 / 未缓存输入 / 缓存读取 / 缓存写入（没写就不占行）/ 输出。
            数字仍然用 k / M 这种给人看的格式（DSH 那边是精确值）。 -->
       <div class="overflow-hidden rounded-2xl bg-surface">
-        {#if total.cache_read > 0}
+        {#if total.cache_hit_ratio != null}
           <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
             <span class="text-[15px]">缓存命中</span>
             <span class="ml-auto text-[15px] text-muted">
-              {fmtPct(total.cache_read / total.input)}
+              {fmtPct(total.cache_hit_ratio)}
             </span>
           </div>
         {/if}

@@ -164,6 +164,11 @@ export type Usage = {
   total: number;
   /** 命中率 0..1；provider 没报缓存字段是 null（和「报了 0」不是一回事） */
   cache_hit_ratio: number | null;
+  /**
+   * 记上这一次之后的**会话累计**（流里的 `data-usage` 才带；核心算好的，
+   * 前端直接换上，不自己往上加）。形状同 `/api/session` 的 `usage`。
+   */
+  session?: (UsageTotals & { last?: Usage | null }) | null;
 };
 
 /** 本会话累计的用量（同一个互斥桶口径）。 */
@@ -175,7 +180,29 @@ export type UsageTotals = {
   output: number;
   reasoning: number;
   calls: number;
+  /** 报了缓存字段的那些调用的输入 —— 累计命中率的分母（核心那边用） */
+  cache_reported_input: number;
+  /** 累计命中率 0..1（核心算好）；一次都没报过缓存是 null */
+  cache_hit_ratio: number | null;
 };
+
+/**
+ * 核心给的会话累计（`/api/session` 的 `usage`、`data-usage` 的 `session`）→
+ * `UsageTotals`。只是补缺省值、去掉 `last`，**不算任何东西**。
+ */
+export function totalsOf(u: Partial<UsageTotals>): UsageTotals {
+  return {
+    input: u.input ?? 0,
+    uncached_input: u.uncached_input ?? 0,
+    cache_read: u.cache_read ?? 0,
+    cache_write: u.cache_write ?? 0,
+    output: u.output ?? 0,
+    reasoning: u.reasoning ?? 0,
+    calls: u.calls ?? 0,
+    cache_reported_input: u.cache_reported_input ?? 0,
+    cache_hit_ratio: u.cache_hit_ratio ?? null,
+  };
+}
 
 /**
  * 一个会话的用量：最近一次调用 + 累计。输入框上那个圆环读它，

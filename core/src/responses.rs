@@ -231,14 +231,17 @@ struct IncompleteDetails {
     reason: Option<String>,
 }
 
+/// 字段全是 `Option`：网关会把没有的数报成 `null`（不是省略）。写成 `u32` 的话
+/// 一个 `null` 就让整条 `response.completed` 解析失败、被当成未知事件跳过 ——
+/// 这一步的用量和 `incomplete`（截断）信号一起丢掉，而且没有任何报错。
 #[derive(Debug, Deserialize)]
 struct ResponsesUsage {
     #[serde(default)]
-    input_tokens: u32,
+    input_tokens: Option<u32>,
     #[serde(default)]
-    output_tokens: u32,
+    output_tokens: Option<u32>,
     #[serde(default)]
-    total_tokens: u32,
+    total_tokens: Option<u32>,
     #[serde(default)]
     input_tokens_details: Option<InputTokensDetails>,
     #[serde(default)]
@@ -248,13 +251,13 @@ struct ResponsesUsage {
 #[derive(Debug, Deserialize)]
 struct InputTokensDetails {
     #[serde(default)]
-    cached_tokens: u32,
+    cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OutputTokensDetails {
     #[serde(default)]
-    reasoning_tokens: u32,
+    reasoning_tokens: Option<u32>,
 }
 
 /// 事件 → `StreamChunk`。要跨事件记状态（某个工具调用是不是已经收过增量
@@ -486,15 +489,15 @@ fn finish_chunk(response: ResponsePayload, finish_reason: Option<String>) -> Opt
 /// Responses 的用量字段名和 Chat 不同，统一成我们内部的 `Usage`。
 fn convert_usage(u: ResponsesUsage) -> Usage {
     Usage {
-        prompt_tokens: u.input_tokens,
-        completion_tokens: u.output_tokens,
-        total_tokens: u.total_tokens,
+        prompt_tokens: u.input_tokens.unwrap_or(0),
+        completion_tokens: u.output_tokens.unwrap_or(0),
+        total_tokens: u.total_tokens.unwrap_or(0),
         // 没报就是 None（不是 0）—— 命中率那里「没报」和「报了 0%」是两回事。
         prompt_tokens_details: Some(PromptTokensDetails {
-            cached_tokens: u.input_tokens_details.map(|d| d.cached_tokens),
+            cached_tokens: u.input_tokens_details.and_then(|d| d.cached_tokens),
         }),
         completion_tokens_details: Some(CompletionTokensDetails {
-            reasoning_tokens: u.output_tokens_details.map(|d| d.reasoning_tokens),
+            reasoning_tokens: u.output_tokens_details.and_then(|d| d.reasoning_tokens),
         }),
         prompt_cache_hit_tokens: None,
         prompt_cache_miss_tokens: None,
@@ -790,6 +793,21 @@ mod tests {
         assert_eq!(u.cached_tokens(), Some(80));
         assert_eq!(u.reasoning_tokens(), Some(5));
         assert_eq!(u.cache_hit_ratio(), Some(0.8));
+
+        // 网关把没有的数报成 null：事件照样认出来，「没报」就是 None（不是 0%）
+        let c = m
+            .map(
+                r#"{"type":"response.completed","response":{"usage":{
+                    "input_tokens":100,"output_tokens":20,"total_tokens":null,
+                    "input_tokens_details":{"cached_tokens":null},
+                    "output_tokens_details":{"reasoning_tokens":null}}}}"#,
+            )
+            .unwrap()
+            .expect("带 null 的用量不能让整条 completed 被跳过");
+        let u = c.usage.unwrap();
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.cached_tokens(), None);
+        assert_eq!(u.cache_hit_ratio(), None);
 
         let c = m
             .map(

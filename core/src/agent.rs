@@ -2066,7 +2066,6 @@ async fn stream_one(
                     view.output
                 ),
             }
-            send(tx, sse::data_part("usage", serde_json::to_value(&view)?)).await;
             // 记到这个会话上：输入框那个上下文圆环读它，也进库（`usage` 表）留着分析
             let row = crate::db::UsageRow {
                 session_id: sid.to_string(),
@@ -2081,7 +2080,12 @@ async fn stream_one(
                 finish: finish.clone(),
                 ms: step_started.elapsed().as_millis() as u64,
             };
-            core.state.record_usage(&row, &view).await;
+            let session = core.state.record_usage(&row, &view).await;
+            // 这一次的桶 + 记上之后的会话累计（含累计命中率）一起推给前端 ——
+            // 前端直接换上，不再自己往上加、也不再自己除
+            let mut part = serde_json::to_value(&view)?;
+            part["session"] = serde_json::to_value(&session)?;
+            send(tx, sse::data_part("usage", part)).await;
         }
 
         let mut calls: Vec<RecordedToolCall> = acc

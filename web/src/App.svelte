@@ -20,21 +20,12 @@
     type UiChunk,
     type Upload,
     type Usage,
-    type UsageTotals,
     type SessionUsage,
+    type UsageTotals,
+    totalsOf,
   } from './lib/sse';
   import { uid } from './lib/uid';
 
-  /** 累计用量的零值（桶的字段名只有一处定义，见 `lib/sse.ts` 的 `UsageTotals`）。 */
-  const emptyTotals = (): UsageTotals => ({
-    input: 0,
-    uncached_input: 0,
-    cache_read: 0,
-    cache_write: 0,
-    output: 0,
-    reasoning: 0,
-    calls: 0,
-  });
   import Icon from './components/Icon.svelte';
   import Composer from './components/Composer.svelte';
   import MessageList from './components/MessageList.svelte';
@@ -94,26 +85,13 @@
 
   /**
    * 流里每跑完一步就报一次用量 —— 圆环实时跟着涨（一轮多步时也能看出来
-   * 上下文在长）。累计值在这里往上加；下一次 `/api/session` 回来整份换成
-   * 服务端的（两边数的是同一批步骤，对得上）。
+   * 上下文在长）。事件里带着核心记上这一步之后的会话累计（`session`），
+   * 直接换上：前端不自己往上加、也不自己算命中率。
    */
   $effect(() =>
     onUsage((u) => {
-      // 核心已经把用量归一成互斥桶了（`UsageView`），这里只把这一步的桶加上去 ——
-      // 不再解析 provider 字段，也不自己算命中率。
-      const t = usage?.total ?? emptyTotals();
-      usage = {
-        last: u,
-        total: {
-          input: t.input + u.input,
-          uncached_input: t.uncached_input + u.uncached_input,
-          cache_read: t.cache_read + u.cache_read,
-          cache_write: t.cache_write + u.cache_write,
-          output: t.output + u.output,
-          reasoning: t.reasoning + u.reasoning,
-          calls: t.calls + 1,
-        },
-      };
+      const { session, ...last } = u;
+      if (session) usage = { last, total: totalsOf(session) };
     }),
   );
 
@@ -277,20 +255,7 @@
       if (d.unchanged) return;
       // 用量整份换成服务端的：它数的是这个会话的**全部**调用，而我们手上
       // 那份只从页面加载后开始算。`last` 没有 = 这个会话还没跑过
-      usage = d.usage?.last
-        ? {
-            last: d.usage.last,
-            total: {
-              input: d.usage.input ?? 0,
-              uncached_input: d.usage.uncached_input ?? 0,
-              cache_read: d.usage.cache_read ?? 0,
-              cache_write: d.usage.cache_write ?? 0,
-              output: d.usage.output ?? 0,
-              reasoning: d.usage.reasoning ?? 0,
-              calls: d.usage.calls ?? 0,
-            },
-          }
-        : null;
+      usage = d.usage?.last ? { last: d.usage.last, total: totalsOf(d.usage) } : null;
       // 会话 id 变了（切会话 / 重置）就不能按 id 复用旧消息 ——
       // `u1` 这种 id 每条会话都会有。`sid` 在上面算过了。
       const same = sid === sessionId;

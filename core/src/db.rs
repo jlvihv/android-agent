@@ -853,7 +853,9 @@ impl Db {
     /// 这个会话（上次清空之后）的用量：累计 + 最近那一次。一次都没有是 `None`。
     pub fn session_usage(&self, sid: &str) -> Result<Option<crate::state::UsageStats>> {
         self.with(|c| {
-            let (calls, input, uncached, output, cache_read, cache_write, reasoning): (
+            #[allow(clippy::type_complexity)]
+            let (calls, input, uncached, output, cache_read, cache_write, reasoning, reported): (
+                i64,
                 i64,
                 i64,
                 i64,
@@ -862,10 +864,13 @@ impl Db {
                 i64,
                 i64,
             ) = c.query_row(
+                // 最后一列：报了缓存字段（`cached` 不是 NULL）的那些调用的输入 ——
+                // 累计命中率的分母，见 `openai::cache_hit_ratio`
                 "SELECT COUNT(*), COALESCE(SUM(input), 0),
                         COALESCE(SUM(input - COALESCE(cached, 0) - COALESCE(cache_write, 0)), 0),
                         COALESCE(SUM(output), 0), COALESCE(SUM(cached), 0),
-                        COALESCE(SUM(cache_write), 0), COALESCE(SUM(reasoning), 0)
+                        COALESCE(SUM(cache_write), 0), COALESCE(SUM(reasoning), 0),
+                        COALESCE(SUM(CASE WHEN cached IS NOT NULL THEN input END), 0)
                  FROM usage WHERE session_id = ?1 AND cleared = 0",
                 [sid],
                 |r| {
@@ -877,6 +882,7 @@ impl Db {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )?;
@@ -913,6 +919,11 @@ impl Db {
                 output: output as u64,
                 reasoning: reasoning as u64,
                 calls: calls as u64,
+                cache_reported_input: reported as u64,
+                cache_hit_ratio: crate::openai::cache_hit_ratio(
+                    cache_read as u64,
+                    reported as u64,
+                ),
             }))
         })
     }

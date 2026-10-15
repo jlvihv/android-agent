@@ -320,8 +320,10 @@ impl UsageView {
         // 还小，兜一下别算出负数。
         let input = input.max(cache_read + cache_write);
         let uncached_input = input - cache_read - cache_write;
-        let cache_hit_ratio = (cache_reported && input > 0)
-            .then(|| (cache_read as f64 / input as f64).clamp(0.0, 1.0));
+        let cache_hit_ratio = cache_hit_ratio(
+            cache_read as u64,
+            if cache_reported { input as u64 } else { 0 },
+        );
         Self {
             input,
             uncached_input,
@@ -333,6 +335,16 @@ impl UsageView {
             cache_hit_ratio,
         }
     }
+}
+
+/// 命中率 = 缓存读取 / **报了缓存字段的那些调用**的输入，夹在 0..1。
+///
+/// 单次调用（`UsageView`）和会话累计（`state::UsageStats`、`db::session_usage`）
+/// 都走这一个函数。分母不能用全部输入：provider 没报缓存字段的调用，它的输入
+/// 进了分母、命中却是 0，会把累计命中率白白压低。`reported_input == 0`
+/// （一次都没报过）是 `None` —— 「没报」和「命中 0%」不是一回事。
+pub fn cache_hit_ratio(cache_read: u64, reported_input: u64) -> Option<f64> {
+    (reported_input > 0).then(|| (cache_read as f64 / reported_input as f64).clamp(0.0, 1.0))
 }
 
 impl Usage {

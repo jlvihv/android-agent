@@ -1091,16 +1091,24 @@ impl AppState {
     ///
     /// 库的读写都丢给阻塞池：库锁和定时落盘是同一把，落盘在写大事务时，
     /// 直接在这里等会占住一个 worker。
-    pub async fn record_usage(&self, row: &crate::db::UsageRow, v: &crate::openai::UsageView) {
+    ///
+    /// 返回记上这一次之后的会话累计（`data-usage` 事件带给前端，前端不再自己累加）。
+    pub async fn record_usage(
+        &self,
+        row: &crate::db::UsageRow,
+        v: &crate::openai::UsageView,
+    ) -> Option<UsageStats> {
         // 内存里还没有（重启后头一次）：先从库里接上之前的，**再**写这一行 —— 反过来就算两遍
         let base = self.usage_of(&row.session_id).await;
-        if let Ok(mut g) = self.usage.lock() {
-            g.entry(row.session_id.clone())
+        let stats = self.usage.lock().ok().map(|mut g| {
+            let s = g
+                .entry(row.session_id.clone())
                 .or_insert(base)
-                .get_or_insert_with(UsageStats::default)
-                .add(v);
-        }
-        let Some(db) = self.db() else { return };
+                .get_or_insert_with(UsageStats::default);
+            s.add(v);
+            s.clone()
+        });
+        let Some(db) = self.db() else { return stats };
         let row = row.clone();
         let r = tokio::task::spawn_blocking(move || db.add_usage(&row)).await;
         match r {
@@ -1108,6 +1116,7 @@ impl AppState {
             Ok(Err(e)) => tracing::warn!("用量没记进库：{e:#}"),
             Err(e) => tracing::warn!("用量没记进库：{e}"),
         }
+        stats
     }
 
     /// 这个会话的用量（上次清空之后；没跑过就是 `None`）。内存里没有就去库里读 ——
@@ -1509,11 +1518,19 @@ pub struct UsageStats {
     pub output: u64,
     pub reasoning: u64,
     pub calls: u64,
+    /// 报了缓存字段的那些调用的输入之和 —— 累计命中率的分母（见
+    /// `openai::cache_hit_ratio`）。provider 没报缓存的调用不进这里。
+    pub cache_reported_input: u64,
+    /// 本会话累计命中率（核心算好，前端只读）。一次都没报过缓存是 `None`
+    pub cache_hit_ratio: Option<f64>,
 }
 
 impl UsageStats {
     fn add(&mut self, v: &crate::openai::UsageView) {
         self.last = Some(v.clone());
+        if v.cache_hit_ratio.is_some() {
+            self.cache_reported_input += v.input as u64;
+        }
         self.input += v.input as u64;
         self.uncached_input += v.uncached_input as u64;
         self.cache_read += v.cache_read as u64;
@@ -1521,6 +1538,8 @@ impl UsageStats {
         self.output += v.output as u64;
         self.reasoning += v.reasoning as u64;
         self.calls += 1;
+        self.cache_hit_ratio =
+            crate::openai::cache_hit_ratio(self.cache_read, self.cache_reported_input);
     }
 }
 
@@ -1759,6 +1778,55 @@ mod tests {
         st.record_usage(&r, &u.view()).await;
         let s = with_db().usage_of("a").await.unwrap();
         assert_eq!((s.input, s.calls), (300, 1));
+    }
+
+    /// 累计命中率的分母只算**报了缓存字段**的调用：没报的那次输入进了分母、命中却是 0，
+    /// 会把命中率白白压低。内存累加和从库里重建（重启后）两条路得到同一个数。
+    #[tokio::test]
+    async fn cumulative_hit_ratio_ignores_calls_that_did_not_report_cache() {
+        use crate::openai::{PromptTokensDetails, Usage};
+        let db = Arc::new(Db::in_memory().unwrap());
+        let with_db = || {
+            let st = AppState::new();
+            *st.db.write().unwrap() = Some(db.clone());
+            st
+        };
+        let st = with_db();
+        assert_eq!(UsageStats::default().cache_hit_ratio, None);
+
+        // 报了：1000 里命中 900
+        let reported = Usage {
+            prompt_tokens: 1000,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(900),
+            }),
+            ..Default::default()
+        };
+        let row = crate::db::UsageRow {
+            input: 1000,
+            cached: Some(900),
+            ..usage_row("a")
+        };
+        let s = st.record_usage(&row, &reported.view()).await.unwrap();
+        assert_eq!(s.cache_hit_ratio, Some(0.9));
+
+        // 没报：3000 的输入不该把命中率拉到 900 / 4000
+        let silent = Usage {
+            prompt_tokens: 3000,
+            ..Default::default()
+        };
+        let row = crate::db::UsageRow {
+            input: 3000,
+            ..usage_row("a")
+        };
+        let s = st.record_usage(&row, &silent.view()).await.unwrap();
+        assert_eq!((s.input, s.cache_reported_input), (4000, 1000));
+        assert_eq!(s.cache_hit_ratio, Some(0.9));
+
+        // 重启之后从库里重建：同一个数
+        let s = with_db().usage_of("a").await.unwrap();
+        assert_eq!((s.input, s.cache_reported_input), (4000, 1000));
+        assert_eq!(s.cache_hit_ratio, Some(0.9));
     }
 
     #[test]
