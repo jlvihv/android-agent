@@ -17,8 +17,8 @@ import android.util.Log
  *    `DeviceHostImpl`（用无障碍服务的 context，后台也能拉起页面）；没开时走
  *    `BrowserController` 的 `__open_uri`（[openFromApp]，只在 App 在前台时行）。
  *
- * 两边都**不做 scheme 白名单**：agent 操作的是用户自己的手机，跟 `agent command`
- * 那条路一个立场 —— 调用直接执行，没有审批环节。剩下的只是"系统能不能接"。
+ * 两边都**不做 scheme 白名单**：agent 操作的是用户自己的手机，跟 `agent tap` / `agent key`
+ * 那些设备操作一个立场 —— 调用直接执行，没有审批环节。剩下的只是"系统能不能接"。
  */
 object UriLauncher {
     private const val TAG = "AgentUriLauncher"

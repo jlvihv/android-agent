@@ -40,7 +40,7 @@ POST /api/browser ───────────────────┤  
   ① `agent browser` 走它，于是 bash 能脚本化驱动浏览器；
   ② 走到一次工具调用要花一整轮 LLM，调试时不现实 —— 有个能直接打的入口，
   改一行 JS 就能立刻验。
-- **模型只有一个门：沙箱里的 `agent browser`**（`core/src/linux.rs` 的 `AGENT_CLI`）。
+- **模型只有一个门：沙箱里的 `agent browser`**（`core/src/cli.rs`）。
   动作是 `navigate / get_backbone / get_readable / get_text / click / type / press /
   find_elements / scroll / screenshot / set_user_agent / back / wait_for_dom_stable /
   js / new_tab / list_tabs / switch_tab / close_tab`。
@@ -427,7 +427,7 @@ agent browser navigate https://example.com
 
 `kind` 一共 12 个（`browser_js::KINDS`），参数从 JSON 里取（两边都不用记顺序）。
 动作**名字**那一层也有测试盯着：`cdp::ACTIONS` 和沙箱 CLI 的 case 表
-（`agent_cli_and_cdp_agree_on_the_action_list`）。
+（`cli::browser_actions_match_the_core`）。
 
 **还留在 Kotlin 的**是宿主私事，不是共享逻辑：`js` 那个动作的「踢一脚 + 轮询」
 （`evaluateJavascript` 不会等 Promise，而 CDP 有 `awaitPromise`）、以及截图那套

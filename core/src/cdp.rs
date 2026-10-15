@@ -38,7 +38,7 @@
 //! 页面信息 / `target=_blank` 修正）在 `crate::browser_js`，手机上的 WebView
 //! 也是从那儿取（uniffi 的 `AgentCore.browserJs`）—— 见 docs/08 第 15 节。
 //! 动作**名字**这一层也有测试盯着：`ACTIONS` 和沙箱里 `agent browser` 的 case 表
-//! （`agent_cli_and_cdp_agree_on_the_action_list`）。
+//! （`cli::browser_actions_match_the_core`）。
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -91,7 +91,7 @@ const MOBILE_UA: &str = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/53
 
 /// 支持的动作。**和沙箱里 `agent browser` 的 case 表必须一致** ——
 /// 漂了就会出现「CLI 发得出去、后端不认」的静默失败（`new_tab` 那次把 URL
-/// 吃掉就是这个类别）。测试 `agent_cli_and_cdp_agree_on_the_action_list` 盯着。
+/// 吃掉就是这个类别）。测试 `cli::browser_actions_match_the_core` 盯着。
 pub const ACTIONS: &[&str] = &[
     "navigate",
     "get_backbone",

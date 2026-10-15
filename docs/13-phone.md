@@ -22,36 +22,21 @@ echo "要发给 $tel"
 
 ## 3. 按机器显示不同的子命令（这次的重点）
 
-同一个 `agent` 脚本，手机和电脑上**显示的东西不一样**：
+`agent` 脚本是**按机器生成**的（`core/src/cli.rs`）：手机上那份有这一段，电脑上那份
+**根本没有这些子命令** —— 不是运行时判断后拒绝，模型在电脑上压根看不到它们，也就看不到
+「这台机器上没有」这层区分。
 
 ```sh
 $ agent help          # 手机上
   …
-  agent device [info|battery|storage]          设备信息（不带子命令 = info）
+  agent device [info|battery|storage]     设备信息（不带子命令 = info）
   agent clipboard get | set --text T | clear | status
   agent volume [get|set|up|down|max|mute|unmute] [--stream music|ring|…]
-  agent brightness [get|set|auto|grant]          屏幕亮度
-  agent torch on|off|toggle                     手电筒
-  agent vibrate [--duration 200]                振动
-  agent screenshot [--path 名字.png]             截屏（要无障碍服务在跑）
-  agent radios [wifi|bluetooth|airplane]        网络状态 / 打开对应设置页
-  agent alarm set --time HH:MM …
   …
-
-$ agent help          # 电脑上：这一整段不出现
-  …
-  agent weather [current|hourly|daily|report] --lat L --lon N
-  agent open <uri>
-  agent browser <动作> [参数…]
 ```
 
-三处一起变，缺一处就会「说了做不到」：
-
-| 位置 | 谁在管 | 电脑上的样子 |
-|---|---|---|
-| `agent help` | `AGENT_DEVICE` 环境变量（核心注入）+ 脚本里 `sed` 掉 `# @phone`…`# @end` 之间那段 | 整段不打印 |
-| `agent <设备命令>` | 同一个变量，脚本里**当场拒绝**（exit 2），不去问核心 | 「设备命令只在这台手机上有」 |
-| 系统提示词 | `prompt::phone_clause()`，按 `linux::has_phone_capabilities()` | 不提这一句 |
+help、`case` 分发、系统提示词里那份清单都从同一张表（`cli::subcommands()`，系统能力
+那一项的名字和用法从 `phone::COMMANDS` 来）按机器取，不会一处有、一处没有。
 
 **判据是编译目标（`cfg!(target_os = "android")`），不是 `Platform`。** 桌面上的
 `just dev`（proot 沙箱）也是 `Platform::Android` —— 形态和手机一模一样，但它没有
@@ -109,17 +94,15 @@ $ agent location current
 
 ## 7. 加一个新能力要动哪几处
 
-1. `core/src/phone.rs` 的 `COMMANDS` 加名字（这一份是唯一的清单）；
-2. `linux.rs` 的 `AGENT_CLI`：case 表那一行 + `agent help` 里加一行（**必须在
-   `# @phone` … `# @end` 之间**，否则电脑上也会显示）；
-3. `DeviceApisImpl.kt` 加一个分支；
-4. `prompt.rs` 的 `phone_clause()` 里补一句（可选，清单太长就不列了）。
+1. `core/src/phone.rs` 的 `COMMANDS` 加一项（名字 + `agent help` 里的用法）——
+   这一份是唯一的清单，脚本的分发、help、提示词都从它生成；
+2. `DeviceApisImpl.kt` 加一个分支。
 
-漂了不会报错、只会静默失败，所以有测试盯着（`linux.rs`）：
+有测试盯着（`cli.rs`）：
 
-- `agent_cli_and_phone_commands_agree`：CLI 的 case 表和 `phone::COMMANDS` **逐个对账**；
-- `agent_help_hides_device_commands_off_the_phone`：真跑一遍 `sh agent help`，
-  手机上有 9 条、电脑上一条都没有，哨兵行不许漏出来；
+- `phone_commands_come_from_the_phone_table`：脚本里那个 case 分支和 `phone::COMMANDS` 一字不差；
+- `help_lists_only_what_this_machine_has`：真跑每台机器的 `sh agent help`，
+  手机上全有、电脑上一条都没有，也不许出现「手机上 / 电脑上」这种字眼；
 - `prompt::device_commands_are_only_promised_where_they_exist`：提示词同规则。
 
 ## 8. 验证记录（2026-10-15）
@@ -136,7 +119,7 @@ $ agent location current
 | `radios` | ✅ 真机上：WiFi 开着 / 走的是 WiFi / 飞行模式关。**撞出一个漏声明的权限**：读 `isWifiEnabled()` 要 `ACCESS_WIFI_STATE`，不加直接抛 SecurityException（已补上） |
 | `brightness get` | ✅ 真机 auto=true, level=6；`set` 没授权时回 `no_write_settings` + 去哪开 |
 | `screenshot` | ✅ 真机实测：1080×2424 / 314KB PNG 落到 `/workspace`，内容就是当时的屏幕（打开无障碍服务之后） |
-| `agent command`（点按/滑动/按键） | ✅ 无障碍一开就跟着能用（实测 `home` 键）—— 这两件事本来就是同一只服务 |
+| `agent tap` / `swipe` / `key` | ✅ 无障碍一开就跟着能用（实测 `home` 键）—— 这两件事本来就是同一只服务 |
 | `alarm set --repeat weekdays` / `timer` | ✅ 交给系统时钟（`SKIP_UI` 只是请求）；`cancel --id` 明确说不支持 |
 | `location current` | ✅ `adb emu geo fix` 之后拿到 `source:fresh` 的坐标（模拟器）；真机室内定不上，优雅降级到 `last_known_stale` + note（见下） |
 | `location forward` | ✅ 真机（有 Google 服务）：“上海外滩” → 31.2402,121.4906；⚠️ 模拟器无 GMS 时回 `gcaa: UNAVAILABLE`（已翻成人话） |
@@ -166,6 +149,6 @@ $ agent location current
 |---|---|---|
 | 开/关 WiFi、蓝牙 | Android 10+ 起 `setWifiEnabled` 对普通 App 返回 false 且无效，`BluetoothAdapter.enable` 在 33+ 直接废弃 | `agent radios wifi` / `bluetooth` **打开设置页**，回报里写清「得人在这一页手动切」 |
 | 改屏幕亮度 | 要 `WRITE_SETTINGS`，那是**特殊权限** —— 不是运行时弹框，只能用户手开 | `agent brightness set` 没授权时回结构化错误 + `agent brightness grant` 直接跳到那一页 |
-| 截屏 | 普通 App 只能拉 MediaProjection，而它**每次**都要用户点一个“开始投屏”弹框 | 走已有的无障碍服务（`takeScreenshot`，API 30+，配置里声明 `canTakeScreenshot`）—— 也是 `agent command` 同一只服务 |
+| 截屏 | 普通 App 只能拉 MediaProjection，而它**每次**都要用户点一个“开始投屏”弹框 | 走已有的无障碍服务（`takeScreenshot`，API 30+，配置里声明 `canTakeScreenshot`）—— 也是 `agent tap` / `key` 同一只服务 |
 | 控制其他 App 的音乐播放 | `AudioManager.dispatchMediaKeyEvent` 要 `MEDIA_CONTENT_CONTROL`（系统权限）；正道是拿**通知使用权**再走 `MediaSessionManager.getActiveSessions` | **没做**。多一个高频弹框 + 一个常驻监听服务，性价比不对（而且二维码广告类应用就是靠这个搞事情，用户很可能不想给） |
 | 静音某个流 | —— | `agent volume mute --stream ring`（这个做得到） |

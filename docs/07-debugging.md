@@ -348,23 +348,24 @@ exit=0 0.31s
 ## 8. 沙箱里的 `agent` 命令：让模型查看 / 操作自己
 
 模型平时只看得到自己的上下文和历史，看不到「自己现在什么状态」。所以沙箱里放了
-一个 `agent` 命令（`core/src/linux.rs` 的 `AGENT_CLI`，`prepare_rootfs` 写进
-`/usr/local/bin/agent`），它就是核心那个 HTTP 服务的薄包装 —— 只用 busybox 的
-`wget`，没有别的依赖：
+一个 `agent` 命令（`core/src/cli.rs` 按机器生成，`prepare_rootfs` 写进
+`/usr/local/bin/agent`；宿主模式写进 PATH 里那个目录），它就是核心那个 HTTP 服务的
+薄包装 —— 只用 busybox 的 `wget`，没有别的依赖。调试用的那几个收在 `agent debug` 下面
+（提示词里不提，`agent help` 里占一行）：
 
 ```sh
-agent help               # 看全部
-agent state              # 我现在的状态
-agent request            # 我下一次会收到的完整上下文（提示词 + 工具表 + 历史）
-agent tools              # 我有哪些工具
-agent sessions / session # 会话列表 / 当前这条会话的消息
-agent doctor             # 各部件体检
-agent setup [--force|--list|包…]   # 装/看常用工具
-agent command '{"type":"key","name":"back"}'   # 操作这台手机
-agent ps                 # 沙箱里还有什么在跑（含命令结束后刻意留下的常驻进程）
-agent kill <pid>         # 停掉一个（pid 从 agent ps 来）
-agent get /api/…         # 直接 GET 自己的任意接口（逃生口）
-agent post /api/… '{…}'
+agent help                  # 看这台机器上有什么
+agent debug state           # 我现在的状态
+agent debug request         # 我下一次会收到的完整上下文（提示词 + 工具表 + 历史）
+agent debug tools           # 我有哪些工具
+agent debug sessions        # 会话列表；agent debug session = 当前这条会话的消息
+agent debug doctor          # 各部件体检
+agent debug get /api/…      # 直接 GET 自己的任意接口（逃生口）
+agent debug post /api/… '{…}'
+agent setup [--force|--list|包…]   # 装/看常用工具（沙箱里）
+agent key back              # 操作这台手机（还有 tap / swipe / launch）
+agent ps                    # 沙箱里还有什么在跑（含命令结束后刻意留下的常驻进程）
+agent kill <pid>            # 停掉一个（pid 从 agent ps 来）
 ```
 
 三件设计上的事：
@@ -377,8 +378,8 @@ agent post /api/… '{…}'
    理由：模型会把网页、文件、命令输出读进上下文，一条提示注入就能让它顺手把
    自己换成别人的模型。读自己随便读，改自己得人来。
 3. **`prepare_rootfs` 里写这个文件是幂等的**（内容没变就不碰），所以每次启动都会
-   存在、也不会磨文件系统。`just test` 里有两条测试守着：文件在不在 + 可执行 +
-   `sh -n` 语法 + `AGENT_PORT` 注入与否。
+   存在、也不会磨文件系统。测试守着：文件在不在 + 可执行 + `AGENT_PORT` 注入与否，
+   以及 `cli.rs` 里真跑每台机器的 `sh agent help` / 参数校验。
 
 系统提示词里有一行告诉模型这个命令存在（`dump_prompt` 能看到）—— 否则等于没有。
 

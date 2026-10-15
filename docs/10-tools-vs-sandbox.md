@@ -62,12 +62,13 @@ $ agent browser navigate https://example.com && agent browser get_backbone 3 && 
 |---|---|
 | `tool_schema_order_and_names_are_fixed` | 工具表的顺序与名单钉死（`read` / `bash` / `edit`） |
 | `browser_and_search_are_only_reachable_through_the_sandbox_cli` | 表里不能有 `browser` / `search`，也不能有 `full_page` / `num_results` 这些只属于它们的参数；提示词里必须有 `agent browser` / `agent search` |
-| `agent_cli_braces_variables_before_multibyte` | CLI 的写法陷阱：`$cmd（` 在 busybox ash 里会被当成变量名（见下） |
+| `cli::variables_are_braced_before_multibyte` | CLI 的写法陷阱：`$cmd（` 在 busybox ash 里会被当成变量名（见下） |
 
 ## 6. 再加一个能力时怎么做
 
-1. **沙箱命令**：`core/src/linux.rs` 的 `AGENT_CLI` —— 加 `case` 分支 + 参数个数
-   校验 + `usage()`（用法要写进脚本头部的注释，`agent help` 就是打印它）。
+1. **沙箱命令**：`core/src/cli.rs` 的 `subcommands()` 加一项 —— 名字、`agent help`
+   里那几行、提示词里那一项（可空）、在哪些机器上有（`Machine`）、`case` 分支体
+   （含参数个数校验）。help、分发、提示词清单都从这张表按机器生成。
    ⚠️ 变量后面紧跟中文标点必须写 `${var}`：沙箱里是 busybox ash，它不认 UTF-8，
    会把全角字节当成变量名的一部分，`set -u` 下直接「unbound variable」退出 1。
 2. **核心那层**：能直连的接口（`/api/xxx`），并且**把「给模型看的文字」在核心侧
@@ -85,6 +86,6 @@ $ agent browser navigate https://example.com && agent browser get_backbone 3 && 
 ## 7. 设备操作为什么一直在沙箱里
 
 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不是工具**，在沙箱里
-（`agent command`，见 [docs/02](02-linux-sandbox.md)）。浏览器和搜索后来也是这么归队的。
+（`agent key` / `tap` / `swipe` / `launch`，见 [docs/02](02-linux-sandbox.md)）。浏览器和搜索后来也是这么归队的。
 
 以后要重做「读 UI 树」也是加 `agent` 子命令，不是加工具。

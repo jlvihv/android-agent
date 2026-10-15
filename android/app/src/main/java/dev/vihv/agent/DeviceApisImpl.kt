@@ -609,7 +609,7 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
             ?: return fail(
                 "no_accessibility",
                 "截屏能力挂在无障碍服务上（系统只把这个能力给无障碍）—— " +
-                    "去 设置 → 无障碍 → 本 App 打开，完了再试。（`agent command` 那套也是同一个服务）"
+                    "去 设置 → 无障碍 → 本 App 打开，完了再试。（`agent tap` / `agent swipe` / `agent key` 也是同一个服务）"
             )
         val (bmp, err) = svc.captureScreenBitmap()
         if (bmp == null) return fail("capture_failed", err ?: "截屏没拿到图")

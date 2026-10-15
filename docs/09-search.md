@@ -98,6 +98,6 @@ just phone
 - `format: "text"`：直接回 `text/plain`（一段抬头 `3 条 · exa-mcp` + 正文）。
   **`agent search` 用这个**：JSON 里的换行是 `\n` 转义，模型和界面上看到的就是
   一长串带转义的字符串（“网址后面怎么都有个 `\n`”），而且 CLI 还得靠 `jq`
-  才能把它拆开。要原始 JSON 就直接 `agent post /api/websearch '{…}'`。
+  才能把它拆开。要原始 JSON 就直接 `agent debug post /api/websearch '{…}'`。
 
 日志：失败会带原始响应片段；成功的搜索结果不进日志（那是模型上下文的事）。

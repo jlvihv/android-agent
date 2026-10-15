@@ -307,9 +307,9 @@ Rust core                     ▼
 （工具没有审批环节：一律直接执行，服务端因此不持有「挂起等回复」的状态。）
 
 沙箱里还预置了一个 `agent` 命令（`prepare_rootfs` 写进 `/usr/local/bin/agent`）：
-它是核心自己那个 HTTP 服务的薄包装，让模型能查看自己（`agent state` /
-`agent request` / `agent tools`）、操作这台手机（`agent command`）、看/停沙箱里
-还在跑的进程（`agent ps` / `agent kill <pid>`，见上面「进程模型」）。
+它是核心自己那个 HTTP 服务的薄包装，按机器生成（`core/src/cli.rs`）：操作这台手机
+（`agent key` / `tap` / `swipe` / `launch`）、浏览器、搜索、看/停沙箱里还在跑的进程
+（`agent ps` / `agent kill <pid>`，见上面「进程模型」），调试时看自己（`agent debug …`）。
 见 [docs/07-debugging.md](07-debugging.md) §8。
 
 ### 进程模型：一条命令一个 proot、一个进程组
@@ -428,7 +428,7 @@ action/extras，没 App 接时退到 `S.browser_fallback_url`）。`http(s)` 找
 > 文件**，写不了 `agent open`（不同调用方拆参数的方式还不一样，python 的
 > webbrowser 还会拿 `%s` 去替换）。逻辑只留一份，在 `agent open` 里。
 
-**不做 scheme 白名单**，跟 `agent command` 那条路一个立场：这是 agent 自己的手机，
+**不做 scheme 白名单**，跟 `agent tap` / `agent key` 那些设备操作一个立场：这是 agent 自己的手机，
 工具调用一律直接执行、没有审批环节；真打不开（没装那个 App、系统没有 handler）
 由系统报错回来，agent 看得到。用户点聊天里的链接走的是同一个 `UriLauncher`
 （那条路本来就是用户的明确动作）。
@@ -459,7 +459,7 @@ gh 的设备码页是它自己 print 出来的（不是所有 CLI 都会去调�
 > browser 的 WebView 是靠注入 JS 把 `_blank` 掰成 `_self` 绕过去的，聊天这个没那套。
 > 现在 `MainActivity` 实现 `onCreateWindow`，和点链接一起走 `UriLauncher`。
 
-> 读界面 / 操作界面**不作为工具**暴露给模型，它们是沙箱里的命令（`agent command`
+> 读界面 / 操作界面**不作为工具**暴露给模型，它们是沙箱里的命令（`agent key` / `tap` / `swipe` / `launch`
 > 那一路）—— 这样模型只需理解 shell。要读 UI 树（无障碍树拍平成 JSON 推给 Rust）
 > 得重做一遍，见 docs/10 的加能力步骤。
 

@@ -17,7 +17,7 @@
 | 进程模型 | runner + 状态文件 + `CommandGuard` | **同一套**（只是不套 proot） |
 | `agent ps` | 列常驻进程（靠 proot 的 `TracerPid` 归因） | 只回一句「用真的 `ps` / `pgrep`」 |
 | `agent kill <pid>` | ✅ | ✅ |
-| 设备（`agent open` / `agent command`） | mock | **这台电脑**（`desktop::HostDevice`）：`open` 用默认程序打开，macOS 上 `launch` = `open -a`；点 / 滑 / 按键明说没有 |
+| 设备（`agent open`） | mock | **这台电脑**（`desktop::HostDevice`）：`open` 用默认程序打开，macOS 上 `launch` = `open -a`；点 / 滑 / 按键明说没有 |
 | `agent browser` | ✅ 核心自己起的无头 Chrome + CDP（[docs/08](08-browser.md) 第 15 节） | ✅ 同一个后端 |
 | `agent search` | ✅ | ✅ |
 
@@ -101,7 +101,7 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 两个平台共用的顺手修复：
 
 - **设备通道不能拿 mock 顶**：mock 对什么都回成功 —— `agent open` 打出「已让手机
-  打开」其实什么都没开，`agent command` 的点击回一句假的 `mock: tapped`。宿主
+  打开」其实什么都没开，点击回一句假的 `mock: tapped`。宿主
   模式的设备就是这台电脑（`core/src/desktop.rs` 的 `HostDevice`）：`open` 交给
   `open` / `xdg-open`，做不到的（点、滑、按键）明说做不到。`agent` 脚本里不需要
   任何宿主模式的特判 —— 走的还是同一条 `/api/command`。mock 只留给 `just dev`

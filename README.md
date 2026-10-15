@@ -152,7 +152,7 @@ just phone                                   # 交互模式，/help 看命令
 | `edit` | 改文件：按原文精确替换，返回 unified diff；新建文件：只给 `content` |
 
 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不作为工具**暴露给模型 ——
-它们在沙箱里（`agent command`）。浏览器和联网搜索也在沙箱里：唯一入口是
+它们在沙箱里（`agent key` / `agent tap` / `agent swipe` / `agent launch`）。浏览器和联网搜索也在沙箱里：唯一入口是
 `agent browser` / `agent search`。
 
 **判据、代价、以及「为什么只剩这三个」**：

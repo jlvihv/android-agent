@@ -23,6 +23,7 @@ pub mod browser_js;
 /// （`BrowserController.kt`），用不到这个模块 —— 别把它编进 .so。
 #[cfg(not(target_os = "android"))]
 pub mod cdp;
+pub mod cli;
 pub mod db;
 pub mod demo;
 pub mod desktop;
@@ -504,7 +505,7 @@ impl Core {
         if !crate::phone::is_command(name) {
             anyhow::bail!(
                 "不认识的设备命令「{name}」（可用的是：{}）",
-                crate::phone::COMMANDS.join(" / ")
+                crate::phone::names().join(" / ")
             );
         }
         let host = self.state.phone().ok_or_else(|| {
@@ -733,7 +734,7 @@ impl Core {
         // 它先占住会话的写锁，读完之前进来的请求排队等，而不是看到空列表。
         self.state.load_sessions();
 
-        // 沙箱里的 `agent` 命令要靠端口找到核心（见 linux.rs 的 AGENT_CLI）
+        // 沙箱里的 `agent` 命令要靠端口找到核心（见 `cli.rs`）
         if let Some(sb) = self.state.linux() {
             sb.set_agent_port(actual);
             sb.set_agent_token(self.state.auth().token);

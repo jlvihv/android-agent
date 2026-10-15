@@ -2613,12 +2613,12 @@ async fn execute_tool(
         };
     }
 
-    // 联网搜索不是一个工具：唯一入口是沙箱里的 `agent search`（见 `linux.rs`
-    // 的 AGENT_CLI）。同一个道理 —— 能在一行 shell 里说清的能力，不必再开一个
+    // 联网搜索不是一个工具：唯一入口是沙箱里的 `agent search`（见
+    // `cli.rs`）。同一个道理 —— 能在一行 shell 里说清的能力，不必再开一个
     // 工具；而且这样它能和 `curl` / `jq` / 循环凑在一起用。
 
     // 浏览器也不是一个工具：唯一入口是沙箱里的 `agent browser`（见
-    // `linux.rs` 的 AGENT_CLI）。一条 bash 能连做多个动作
+    // `cli.rs`）。一条 bash 能连做多个动作
     //（`navigate && get_backbone && click`），省的是**整轮 LLM 请求**，工具那条
     // 一次只做一个动作；留着两条路的代价是实打实的：前缀里多 2400 字（工具表的
     // 54%），两处动作表还各自演化（`new_tab URL` 被 CLI 静默吃掉、开出一只空白标签）。
@@ -3383,7 +3383,7 @@ mod tests {
                     "Alpine",
                     "apk add",
                     "agent ps",
-                    "agent command",
+                    "agent tap",
                     "/root/",
                     "/sdcard",
                 ] {
@@ -3398,7 +3398,7 @@ mod tests {
                 );
             } else {
                 assert!(bash.contains("Alpine") && bash.contains("apk add"));
-                assert!(prompt.contains("agent command"));
+                assert!(prompt.contains("agent ps"), "{p:?}: 沙箱里的进程用 agent ps 看");
             }
         }
         let mac = &tools(Platform::Macos)[1].description;

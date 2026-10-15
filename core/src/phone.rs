@@ -4,43 +4,63 @@
 //! 服务**，却需要普通 Android API 和运行时权限。和 `DeviceApi`（点按/滑动/按键，
 //! 靠无障碍）的可用条件完全不同 —— 照 `BrowserApi` 的先例，各走各的门。
 //!
-//! 命令清单就在这里一份：沙箱 CLI（`agent help` 里那一段）、`/api/device` 的校验、
-//! 提示词都从 [`COMMANDS`] 取。三处各写一份的话，加一个能力必然漏掉一处。
+//! 命令清单就在这里一份（[`COMMANDS`]）：`agent` 命令里那一段（`cli.rs` 按它生成
+//! 分发和 `agent help`）、`/api/device` 的校验、提示词都从这里取。几处各写一份的话，
+//! 加一个能力必然漏掉一处。
 //!
-//! ## 为什么这些命令**只在手机上**
+//! 这些命令**只在手机上**：电脑上没有闹钟、短信、联系人。分割在生成 `agent` 脚本
+//! 时就做完了（见 `cli.rs`）—— 电脑上的 `agent` 里根本没有这些子命令，模型也就看不到
+//! 「这台机器上没有」这层区分。
 //!
-//! 桌面上没有闹钟、没有短信、没有联系人 —— 硬做只会得到一个 `unknown command`。
-//! 所以：
-//!
-//! - 沙箱里 `agent <设备命令>` 在电脑上直接报「这台机器上没有」，**连核心都不问**
-//!   （`linux.rs` 的 `AGENT_CLI`：`$AGENT_DEVICE` 由核心按平台注入）；
-//! - `agent help` 里那一段在电脑上不打印（同一个开关）；
-//! - 提示词里（`prompt.rs` 的 `cli_phone`）也只有手机上才写。
-//!
-//! `agent weather` 不在这张表里：它只是查网络，电脑上同样能用。
+//! `agent weather` 不在这张表里：它只是查网络，哪台机器上都能用。
 
-/// 手机专有的命令名。**顺序就是 `agent help` 里的顺序。**
-pub const COMMANDS: &[&str] = &[
-    "device",
-    "clipboard",
-    "volume",
-    "brightness",
-    "torch",
-    "vibrate",
-    "screenshot",
-    "radios",
-    "alarm",
-    "location",
-    "contacts",
-    "calendar",
-    "sms",
-    "notify",
-    "speak",
+/// 一个手机专有命令。
+pub struct Command {
+    /// 子命令名（`agent <name>`）
+    pub name: &'static str,
+    /// `agent help` 里的用法（不含开头的 `agent `；续行自带缩进）
+    pub usage: &'static str,
+}
+
+/// 手机专有的命令。**顺序就是 `agent help` 里的顺序。**
+pub const COMMANDS: &[Command] = &[
+    Command { name: "device", usage: "device [info|battery|storage]     设备信息（不带子命令 = info）" },
+    Command { name: "clipboard", usage: "clipboard get | set --text T | clear | status" },
+    Command {
+        name: "volume",
+        usage: "volume [get|set|up|down|max|mute|unmute] [--stream music|ring|alarm|call|notification|system]\n    set --level 7 或 --percent 50；调完会回实际值（勿扰模式会把一些流按下去）",
+    },
+    Command { name: "brightness", usage: "brightness [get|set --percent 50|--level 0..255] [--auto]   屏幕亮度" },
+    Command { name: "torch", usage: "torch on|off|toggle               手电筒" },
+    Command { name: "vibrate", usage: "vibrate [--duration 200] [--pattern tap|long]   振动" },
+    Command { name: "screenshot", usage: "screenshot [--path 路径.png]      截屏（默认落到当前目录的 screenshots/）" },
+    Command {
+        name: "radios",
+        usage: "radios [wifi|bluetooth|airplane]  网络状态；给参数就是打开对应的设置页\n    （Android 10+ 不允许 App 自己开关 WiFi/蓝牙，只能把人送到设置页）",
+    },
+    Command {
+        name: "alarm",
+        usage: "alarm set --time HH:MM|ISO [--label L] [--repeat once|daily|weekdays]\n    | timer --duration 5m | list | cancel --id X | cancel --all",
+    },
+    Command { name: "location", usage: "location [current] [--timeout 8] | geocode --lat L --lon N | forward --query Q" },
+    Command { name: "contacts", usage: "contacts list [--max N] | search <词> | get <id>" },
+    Command {
+        name: "calendar",
+        usage: "calendar list [--today|--days N] | create --title T --start ISO | update --id ID …\n    | delete --id ID | calendars",
+    },
+    Command { name: "sms", usage: "sms list [--limit N] | search <词> | get <id> | stats" },
+    Command { name: "notify", usage: "notify --title T [--body B]       发一条系统通知" },
+    Command { name: "speak", usage: "speak <文本> [--voice zh-CN]      朗读" },
 ];
 
 /// 这是不是一个手机专有命令。
 pub fn is_command(name: &str) -> bool {
-    COMMANDS.contains(&name)
+    COMMANDS.iter().any(|c| c.name == name)
+}
+
+/// 全部命令名（按 [`COMMANDS`] 的顺序）。
+pub fn names() -> Vec<&'static str> {
+    COMMANDS.iter().map(|c| c.name).collect()
 }
 
 /// 由 Kotlin 实现：跑一条手机命令。
@@ -105,8 +125,8 @@ mod tests {
     #[test]
     fn names_are_distinct_and_shell_safe() {
         let mut seen = std::collections::HashSet::new();
-        for name in COMMANDS {
-            assert!(seen.insert(*name), "{name} 出现了两次");
+        for name in names() {
+            assert!(seen.insert(name), "{name} 出现了两次");
             assert!(
                 name.chars().all(|c| c.is_ascii_lowercase()),
                 "{name} 得是全小写字母"
