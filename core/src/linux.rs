@@ -288,45 +288,45 @@ impl ExecResult {
     /// 同 `to_text`，但超时那句换成调用方给的（agent 那边要带上「下次怎么给
     /// timeout」的建议）—— 超时只说一遍，不叠两句。
     pub fn to_text_with(&self, timeout_note: Option<String>) -> String {
-        let mut s = String::new();
-        if !self.stdout.is_empty() {
-            s.push_str(&self.stdout);
+        // 一段一行地拼，最后用换行连起来：输出自带的结尾换行先去掉，免得段与段
+        // 之间多出空行；没有输出时也不会以空行开头
+        let mut out: Vec<String> = Vec::new();
+        let stdout = self.stdout.trim_end_matches('\n');
+        let stderr = self.stderr.trim_end_matches('\n');
+        if !stdout.is_empty() {
+            out.push(stdout.to_string());
         }
-        if !self.stderr.is_empty() {
-            if !s.is_empty() {
-                s.push('\n');
-            }
-            s.push_str("--- stderr ---\n");
-            s.push_str(&self.stderr);
+        if !stderr.is_empty() {
+            out.push(format!("--- stderr ---\n{stderr}"));
+        }
+        if out.is_empty() {
+            out.push("(无输出)".into());
         }
         if self.truncated {
-            s.push_str("\n[输出已截断]");
+            out.push("[输出已截断]".into());
             if let Some(p) = &self.full_output_path {
-                s.push_str(&format!("\n[完整输出在 {p}]"));
+                out.push(format!("[完整输出在 {p}]"));
             }
         }
         if self.timed_out {
             // 说清「上面是半截的」，否则模型会当成完整输出，再按它推理
-            s.push('\n');
-            s.push_str(timeout_note.as_deref().unwrap_or(
-                "[超时，已终止：上面是到被终止为止的输出，可能不全]",
-            ));
+            out.push(timeout_note.unwrap_or_else(|| {
+                "[超时，已终止：上面是到被终止为止的输出，可能不全]".into()
+            }));
         } else if let Some(sig) = self.signal {
-            s.push_str(&format!("\n[被信号 {sig} 终止：{}]", signal_hint(sig)));
+            out.push(format!("[被信号 {sig} 终止：{}]", signal_hint(sig)));
         }
         // 没 bash 就直说，并给出装它的命令。藏在提示词里没用 —— 模型只会在
         // 碰到 `syntax error` 时一头雾水。
         if !self.using_bash {
-            s.push_str(
-                "\n[沙箱里还没有 bash：这条是 /bin/sh（busybox ash）跑的，[[ ]] / 数组 / \
-                 <<< / 进程替换这类 bash 语法会报 syntax error。装上：agent-setup --force]",
+            out.push(
+                "[沙箱里还没有 bash：这条是 /bin/sh（busybox ash）跑的，[[ ]] / 数组 / \
+                 <<< / 进程替换这类 bash 语法会报 syntax error。装上：agent-setup --force]"
+                    .into(),
             );
         }
-        if s.is_empty() {
-            s.push_str("(无输出)");
-        }
-        s.push_str(&format!("\n[exit {}]", self.code));
-        s
+        out.push(format!("[exit {}]", self.code));
+        out.join("\n")
     }
 }
 
@@ -4192,6 +4192,30 @@ mod tests {
         let text = r.to_text_with(Some("[60s 超时被终止，上面的输出可能不全。]".into()));
         assert_eq!(text.matches("超时").count(), 1, "超时只说一遍：{text}");
         assert!(text.ends_with("[exit -1]"), "{text}");
+        // 排版：段与段之间正好一个换行，不以空行开头
+        let r = ExecResult {
+            code: 0,
+            stdout: "out\n".into(),
+            stderr: "err\n".into(),
+            duration_ms: 0,
+            truncated: false,
+            timed_out: false,
+            full_output_path: None,
+            using_bash: true,
+            signal: None,
+        };
+        assert_eq!(r.to_text(), "out\n--- stderr ---\nerr\n[exit 0]");
+        let quiet = ExecResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: 124,
+            timed_out: true,
+            ..r
+        };
+        assert_eq!(
+            quiet.to_text_with(Some("[2s 超时被终止]".into())),
+            "(无输出)\n[2s 超时被终止]\n[exit 124]"
+        );
     }
 
     /// 没 bash 时结果里必须明说，并给出装它的命令。

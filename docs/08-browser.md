@@ -313,7 +313,7 @@ AI 写了个静态网页，自己想看一眼：`agent browser navigate` 的 url
 `preview:相对路径`、`file:///…` 和绝对路径 `/workspace/…`。`Core::browser` 把它换成
 `http://sandbox.localhost:<端口>/sandbox/<钥匙>/workspace/site/index.html` 交给
 WebView，结果里出现的这种 URL 再换回 `preview:/…`（端口每次启动可能不同、钥匙
-不该进历史，模型记住稳定的写法）。`agent browser navigate preview:/…` 同样能用（老的 `sandbox:` 也认）。
+不该进历史，模型记住稳定的写法）。`agent browser navigate preview:/…` 同样能用。
 
 ### 为什么是 `sandbox.localhost`，而不是和 App 同一个 `127.0.0.1`
 

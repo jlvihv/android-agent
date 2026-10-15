@@ -77,8 +77,6 @@ $ agent browser navigate https://example.com && agent browser get_backbone 3 && 
    `agent help` 才发现，白花两轮。
 4. **量一下体量**：`cd core && cargo run -q --example dump_prompt`；
    线上那份看 `GET /api/debug/tools`（见 [docs/07](07-debugging.md)）。
-5. **老会话回放**：web 里给老工具名留个 `case`（`MessageList.svelte` /
-   `toolview.ts` 里的 `browser` / `search` 就是干这个的），历史得照旧显示成人话。
 
 **手机上的系统能力**（闹钟 / 短信 / 日历 / 联系人 / 定位…）走的是同一条路，但多一层
 「哪台机器上有」：`agent help`、命令本身的守门、提示词三处都得按机器变，否则电脑上

@@ -146,22 +146,13 @@ object TurnStream {
         }
         s.conn = conn
         try {
-            // 先确认对面真的是这条流。**不能只看「连接成功了」**：核心还没升级时，
-            // 未知路径会被前端的 SPA fallback 接走 —— 回 200 + 一页 index.html，
-            // 我们读几行 HTML 然后 EOF，看着像「连上又断了」，于是每 2 秒重试一次刷屏。
-            // 所以按 content-type 认人，认不出就当成
-            // 「这个核心还没有这个端点」，交给退避慢慢等。
             val code = conn.responseCode
-            val type = conn.contentType.orEmpty()
             // 502 是手机核心的隧道说「那台电脑哪条路都不通」（原因在隧道的日志里，见 tunnel.rs）
             if (code == HttpURLConnection.HTTP_BAD_GATEWAY) {
                 throw IllegalStateException("连不上那台电脑（隧道回 502）")
             }
-            if (code != HttpURLConnection.HTTP_OK || !type.startsWith("text/event-stream")) {
-                throw IllegalStateException(
-                    "不是回合状态流（HTTP $code, ${type.ifBlank { "无 content-type" }}）" +
-                        " —— 核心可能还是旧版本，还没这个端点",
-                )
+            if (code != HttpURLConnection.HTTP_OK) {
+                throw IllegalStateException("回合状态流连不上（HTTP $code）")
             }
             val reader = conn.inputStream.bufferedReader()
             var sawLine = false

@@ -104,14 +104,6 @@ object LiveTurnStatus {
     data class View(val status: TurnStatus, val activeCount: Int)
 
     /**
-     * 「已完成」通知发过的回合：sid → 它的结束时刻。
-     *
-     * 同一个回合的结束只该提醒一次。新核心不会重放完事的回合，但旧版本的核心
-     * （手机连着的电脑可能还没升级）每次重连都会把它们再推一遍。
-     */
-    private val doneShown = HashMap<String, Long>()
-
-    /**
      * 核心推过来的一份状态（`status::Snapshot` 的 JSON）。
      *
      * 从 [TurnStream] 的读线程调用，而且**可能不止一条**（手机自己的核心 + 连着的电脑），
@@ -127,16 +119,13 @@ object LiveTurnStatus {
             Log.w(TAG, "状态解析失败: ${t.message}（$json）")
             return
         }
-        val firstDone = synchronized(this) {
-            bySession = bySession + (s.sid to s)
-            !s.active && doneShown.put(s.sid, s.finishedAtMs ?: 0L) != (s.finishedAtMs ?: 0L)
-        }
+        synchronized(this) { bySession = bySession + (s.sid to s) }
         for (l in listeners) {
             runCatching { l() }.onFailure { Log.w(TAG, "刷新通知失败: ${it.message}") }
         }
         // 完事那一条：留一条通知等人回来看。放在这里而不是前台服务里：服务在这之后
         // 马上就被停掉了（`turn(false)`），而这条通知得留下来。
-        if (firstDone) AgentNotifications.showDone(app, s)
+        if (!s.active) AgentNotifications.showDone(app, s)
     }
 
     /**

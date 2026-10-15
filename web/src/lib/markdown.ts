@@ -15,7 +15,7 @@
  *   - 有序列表项之间空一行仍是同一个列表，编号接着数。LLM 很爱这样写，
  *     按严格 CommonMark 拆开的话每一项都是"1."。
  *   - `snake_case` 里的下划线不算斜体。
- *   - 链接只放行 http/https/mailto/sandbox，其余（javascript: 之类）当普通文字。
+ *   - 链接只放行 http/https/mailto/preview，其余（javascript: 之类）当普通文字。
  *   - `preview:/root/x.html` 指向沙箱里的文件，渲染时改写成 `/sandbox/root/x.html`
  *     （漏写 `preview:` 的裸绝对路径 `/root/x.png` 也按它算，见 `safeHref`）
  *     （服务端按路径直接映射），图片同理。
@@ -344,10 +344,9 @@ export function sandboxPageUrl(url: string): string {
  *
  * 宽松接受几种写法：`preview:/root/a.html`、`preview:///root/a.html`、
  * `preview:a.html`（相对路径按 /workspace 算，和沙箱里的 cwd 一致）。
- * 旧的 `sandbox:` 也认：历史里存的、模型偶尔还这么写的，都还在。
  */
 export function sandboxUrl(href: string): string | null {
-  const m = /^(?:preview|sandbox):(.*)$/i.exec(href.trim());
+  const m = /^preview:(.*)$/i.exec(href.trim());
   if (!m) return null;
   let rest = m[1].replace(/^\/\/+/, '/');
   if (!rest.startsWith('/')) rest = '/workspace/' + rest;

@@ -14,7 +14,7 @@
    * 各图标墨迹（上面这条规矩下的值，20px 渲染时就是像素）：
    *   gear 16.8 · newchat 16.8 · clock 16.6 · menu 16.2×10.2 · phone 10×16.6
    *   computer 16.2×15.5 · terminal 16.4×14.2 · sparkle 15.8
-   *   chat 15.0 · search 14.9 · pencil 14.9 · trash 14.6 · plus 14.2
+   *   chat 15.0 · pencil 14.9 · trash 14.6 · plus 14.2
    *   file / newfile 12.8×14.6 · camera 16.4×13 · globe 16.8
    *   send 11.8×13.2 · down 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
    */
@@ -30,7 +30,6 @@
     | 'sparkle'
     | 'clock'
     | 'terminal'
-    | 'search'
     | 'chat'
     | 'pencil'
     | 'trash'
@@ -173,12 +172,6 @@
       stroke-linecap="round"
       stroke-linejoin="round"
     />
-  </svg>
-{:else if name === 'search'}
-  <!-- 放大镜（联网搜索用）：镜片 ∅10.6，手柄朝右下，墨迹 14.9。 -->
-  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
-    <circle cx="8.8" cy="8.8" r="5.3" stroke="currentColor" stroke-width="1.8" />
-    <path d="M12.6 12.6 16.6 16.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
   </svg>
 {:else if name === 'sparkle'}
   <!-- 四角星。用于「思考」那一行，跟工具调用那行的图标并排，

@@ -15,7 +15,7 @@
   import { cubicIn } from 'svelte/easing';
   import type { Message, ToolPart } from '../lib/sse';
   import { sandboxPath } from '../lib/markdown';
-  import { BROWSER_ACTION, describeInput, describeResult, failed } from '../lib/toolview';
+  import { describeInput, describeResult, failed } from '../lib/toolview';
   import Icon from './Icon.svelte';
   import { openViewer } from '../lib/viewer.svelte.ts';
   import Markdown from './Markdown.svelte';
@@ -86,15 +86,6 @@
         // edit_mode），这里认同一个信号 —— 两个都给是报错的用法，认 `content`
         // 就行（那一行也会是红的）。摘要里也分两种说法，跟图标对得上。
         return isNewFile(a) ? `新建 ${s(a.path) || '文件'}` : `编辑 ${s(a.path) || '文件'}`;
-      case 'browser':
-        // 浏览器工具已经删了（唯一入口是沙箱里的 `agent browser`，动作输出长
-        // 在 bash 卡片里）。这里留着只为**回放老会话** —— 历史里那些 browser
-        // 工具调用得照旧显示成人话。
-        return `浏览器 ${browserSummary(a)}`;
-      case 'search':
-        // 同 browser：`search` 工具也删了（唯一入口是沙箱里的 `agent search`，
-        // 结果长在 bash 卡片里）。这里只为回放老会话。
-        return `搜索 ${firstLine(s(a.query))}`.trim();
       default:
         return t.toolName || '工具调用';
     }
@@ -113,23 +104,6 @@
    */
   const summaryArgs = (t: ToolPart) =>
     (t.input ?? partialArgs(t.inputText.slice(0, SUMMARY_SCAN))) as Record<string, unknown>;
-
-  /**
-   * 浏览器那一行：动作 + 目标。
-   *
-   * 目标按动作取一个（url / selector / x,y）—— 这一行是折叠状态下**唯一**
-   * 能看到的东西，把 action 和它的对象放在一起才有信息量。
-   */
-  function browserSummary(a: Record<string, unknown>): string {
-    const s = (v: unknown) => (typeof v === 'string' ? v : '');
-    const action = s(a.action) || '?';
-    const label = BROWSER_ACTION;
-    const target = s(a.url) || s(a.selector) || (a.x !== undefined ? `${a.x},${a.y}` : '');
-    const one = target.split('\n')[0].trim();
-    // 多标签时把"对哪只标签"带上 —— 同一行里 action 和对象要够判断
-    const tab = a.tab !== undefined ? `#${a.tab} ` : '';
-    return `${tab}${label[action] ?? action} ${one}`.trim();
-  }
 
   /**
    * 从还没写完的参数 JSON 里抠出已经出现的字段。
@@ -168,11 +142,6 @@
         return '执行命令';
       case 'edit':
         return isNewFile(args) ? '新建文件' : '编辑文件';
-      case 'browser':
-        return '浏览器';
-      case 'search':
-        // 同 browser：老会话回放用（`search` 工具已删）
-        return '联网搜索';
       default:
         return t.toolName || '工具调用';
     }
@@ -182,7 +151,7 @@
   const isNewFile = (a: Record<string, unknown>) => a.content !== undefined;
 
   /** 这几个图标名字得和 Icon.svelte 里的一致（写错了下面会编译报错） */
-  type ToolIcon = 'file' | 'newfile' | 'terminal' | 'pencil' | 'globe' | 'search' | 'clock';
+  type ToolIcon = 'file' | 'newfile' | 'terminal' | 'pencil' | 'clock';
 
   /**
    * 工具那一行左边的小图标：一眼能看出这次是在读、在跑命令、还是在改文件。
@@ -195,9 +164,6 @@
     read: 'file',
     bash: 'terminal',
     edit: 'pencil',
-    // browser / search 这两个工具已删，只剩回放老会话（见 summarize）
-    browser: 'globe',
-    search: 'search',
   };
   function toolIcon(t: ToolPart): ToolIcon {
     if (t.toolName === 'edit') return isNewFile(summaryArgs(t)) ? 'newfile' : 'pencil';

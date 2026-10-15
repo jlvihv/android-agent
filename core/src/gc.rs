@@ -2,7 +2,7 @@
 //!
 //! 会话会在磁盘上留下几类文件，都是**只有我们知道它们什么时候没用了**的：
 //!
-//! - `<data>/images/`：内联给模型的图片副本（`read` 读图、浏览器截图缩好的那份）
+//! - `<data>/images/`：内联给模型的图片副本（`read` 读图缩好的那份）
 //! - `<data>/attachments/`：用户在输入卡片里附的图片 / PDF
 //! - `<rootfs>/root/.browser/shot-*.jpg`：浏览器截图的原图（Kotlin 写的）
 //! - `<rootfs>/tmp/agent-out-*.log`：bash 输出被截断时溢出的完整输出
@@ -14,7 +14,7 @@
 //!    上传了没发、`agent browser screenshot` 这类不进历史的。
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::agent::ChatMessage;
@@ -49,46 +49,22 @@ pub struct SideDirs {
 /// 输出），启动时只清这么久以前的。
 const LOOSE_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// 一段历史引用的、**归我们管**的文件（绝对路径）。
-///
-/// 只认我们自己写出来的：图片副本、附件、浏览器截图原图。`read` 读图时的
-/// 原图是用户自己的文件，**绝不能**算进来。
-pub fn owned_files(msgs: &[ChatMessage], dirs: &SideDirs) -> Vec<PathBuf> {
+/// 一段历史引用的、**归我们管**的文件（绝对路径）：附件、内联给模型的图片副本。
+/// `read` 读图时的原图（`ImagePart::source`）是用户自己的文件，**绝不能**算进来。
+pub fn owned_files(msgs: &[ChatMessage]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for m in msgs {
         match m {
-            ChatMessage::UserFiles { attachments, .. } => {
+            ChatMessage::User { attachments, .. } => {
                 out.extend(attachments.iter().map(|a| PathBuf::from(&a.path)));
             }
             ChatMessage::Tool { images, .. } => {
-                for img in images {
-                    out.push(PathBuf::from(&img.path));
-                    if img.tool == "browser" {
-                        if let Some(p) = dirs
-                            .shots
-                            .as_ref()
-                            .and_then(|s| browser_shot(s, &img.source))
-                        {
-                            out.push(p);
-                        }
-                    }
-                }
+                out.extend(images.iter().map(|img| PathBuf::from(&img.path)));
             }
             _ => {}
         }
     }
     out
-}
-
-/// 截图的历史路径（`<shots.guest>/<文件名>`）→ 磁盘上的路径。别的形状一律不认
-/// （不让一条历史记录指挥我们去删机器上随便哪个文件）。
-fn browser_shot(shots: &ShotDir, guest: &str) -> Option<PathBuf> {
-    let rest = Path::new(guest).strip_prefix(&shots.guest).ok()?;
-    let mut parts = rest.components();
-    match (parts.next(), parts.next()) {
-        (Some(Component::Normal(name)), None) => Some(shots.host.join(name)),
-        _ => None,
-    }
 }
 
 /// 删掉这些文件，返回删了几个。不存在的不算错。
@@ -183,25 +159,11 @@ mod tests {
         d
     }
 
-    fn tool_with(path: &str, source: &str, tool: &str) -> ChatMessage {
-        ChatMessage::Tool {
-            tool_call_id: "c".into(),
-            content: "{}".into(),
-            images: vec![ImagePart {
-                path: path.into(),
-                mime: "image/jpeg".into(),
-                source: source.into(),
-                tool: tool.into(),
-            }],
-        }
-    }
-
-    /// 我们写出来的算，用户自己的原图不算；浏览器截图的路径只认 `/root/.browser/<名字>`。
+    /// 我们写出来的算（附件、图片副本），用户自己的原图不算。
     #[test]
     fn only_files_we_wrote_are_owned() {
-        let root = Path::new("/rootfs");
         let msgs = vec![
-            ChatMessage::UserFiles {
+            ChatMessage::User {
                 text: String::new(),
                 attachments: vec![Attachment {
                     id: "a.png".into(),
@@ -211,28 +173,21 @@ mod tests {
                     kind: AttachmentKind::Image,
                 }],
             },
-            tool_with("/data/images/1.jpg", "/workspace/我的照片.jpg", "read"),
-            tool_with("/data/images/2.jpg", "/root/.browser/shot-1.jpg", "browser"),
-            tool_with(
-                "/data/images/3.jpg",
-                "/root/.browser/../../etc/passwd",
-                "browser",
-            ),
-            tool_with("/data/images/4.jpg", "/etc/passwd", "browser"),
+            ChatMessage::Tool {
+                tool_call_id: "c".into(),
+                content: String::new(),
+                images: vec![ImagePart {
+                    path: "/data/images/1.jpg".into(),
+                    mime: "image/jpeg".into(),
+                    source: "/workspace/我的照片.jpg".into(),
+                }],
+            },
         ];
-        let got = owned_files(&msgs, &side_dirs_for(root));
-        let want: Vec<PathBuf> = [
-            "/data/attachments/a.png",
-            "/data/images/1.jpg",
-            "/data/images/2.jpg",
-            "/rootfs/root/.browser/shot-1.jpg",
-            "/data/images/3.jpg",
-            "/data/images/4.jpg",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-        assert_eq!(got, want);
+        let want: Vec<PathBuf> = ["/data/attachments/a.png", "/data/images/1.jpg"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(owned_files(&msgs), want);
     }
 
     /// 沙箱形态的副产物目录（截图 / 溢出输出都在 rootfs 里）。

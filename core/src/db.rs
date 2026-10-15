@@ -232,27 +232,6 @@ struct PlannedMessages {
     rows: Vec<String>,
 }
 
-/// 老库补列。`SCHEMA` 只做 `CREATE TABLE IF NOT EXISTS`，已经建过的表不会自动加列 ——
-/// 新增的列（目前只有 `usage.cache_write`）得在这里显式补。幂等，重复跑没事。
-fn migrate(conn: &Connection) -> Result<()> {
-    let mut has_cache_write = false;
-    {
-        let mut stmt = conn.prepare("PRAGMA table_info(usage)")?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let name: String = r.get(1)?;
-            if name == "cache_write" {
-                has_cache_write = true;
-                break;
-            }
-        }
-    }
-    if !has_cache_write {
-        conn.execute_batch("ALTER TABLE usage ADD COLUMN cache_write INTEGER")?;
-    }
-    Ok(())
-}
-
 pub struct Db {
     inner: Mutex<Inner>,
 }
@@ -264,7 +243,6 @@ impl Db {
         }
         let conn = Connection::open(path).with_context(|| format!("打开 {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("建表")?;
-        migrate(&conn)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
@@ -279,7 +257,6 @@ impl Db {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        migrate(&conn)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
@@ -323,7 +300,7 @@ impl Db {
             };
 
             // 用户消息条数靠 payload 的开头认：`ChatMessage` 是外部标签的枚举，
-            // 用户消息序列化出来是 `{"User":…` 或 `{"UserFiles":…`（有测试盯着）。
+            // 用户消息序列化出来是 `{"User":…`（有测试盯着）。
             let mut stmt = g.conn.prepare(
                 r#"SELECT s.id, s.title, s.created_at, s.updated_at, s.provider_session,
                           COUNT(m.seq), COALESCE(SUM(m.payload LIKE '{"User%'), 0)
@@ -414,9 +391,9 @@ impl Db {
     /// 库里所有**带文件**的消息（附件、工具返回的图片），给启动清扫算「哪些
     /// 文件还有人引用」（见 `gc`）。
     ///
-    /// 只挑可能带文件的那几行来解析，不把整个库读一遍：`UserFiles`，以及
-    /// `images` 非空的 `Tool`（`Tool` 的字段按 `tool_call_id, content, images`
-    /// 的顺序序列化，没图的那行一定以 `"images":[]}}` 结尾，有测试盯着）。
+    /// 只挑可能带文件的那几行来解析，不把整个库读一遍：`attachments` 非空的
+    /// `User`、`images` 非空的 `Tool`（字段按声明顺序序列化，没附件 / 没图的那行
+    /// 一定以 `"attachments":[]}}` / `"images":[]}}` 结尾，有测试盯着）。
     /// 任何一行解析不了就整个报错 —— 调用方据此**不清扫**，宁可留着。
     pub fn messages_with_files(&self) -> Result<Vec<ChatMessage>> {
         let g = self
@@ -425,7 +402,7 @@ impl Db {
             .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
         let mut stmt = g.conn.prepare(
             r#"SELECT payload FROM messages
-               WHERE payload LIKE '{"UserFiles"%'
+               WHERE (payload LIKE '{"User"%' AND payload NOT LIKE '%"attachments":[]}}')
                   OR (payload LIKE '{"Tool"%' AND payload NOT LIKE '%"images":[]}}')"#,
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -1071,7 +1048,7 @@ mod tests {
     }
 
     fn msg_user(t: &str) -> ChatMessage {
-        ChatMessage::User(t.into())
+        ChatMessage::user(t)
     }
 
     fn store_with(n_sessions: usize, msgs: usize) -> SessionStore {
@@ -1138,7 +1115,7 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let mut st = store_with(2, 3);
         // 用户消息计数要把带附件的也算上
-        st.sessions[0].messages.push(ChatMessage::UserFiles {
+        st.sessions[0].messages.push(ChatMessage::User {
             text: "看图".into(),
             attachments: vec![],
         });
@@ -1251,7 +1228,7 @@ mod tests {
         let s = st.get_mut(&id).unwrap();
         s.messages = vec![
             msg_user("hi"),
-            ChatMessage::UserFiles {
+            ChatMessage::User {
                 text: String::new(),
                 attachments: vec![Attachment {
                     id: "a.pdf".into(),
@@ -1274,7 +1251,6 @@ mod tests {
                     path: "/d/images/1.jpg".into(),
                     mime: "image/jpeg".into(),
                     source: "/root/.browser/shot-1.jpg".into(),
-                    tool: "browser".into(),
                 }],
             },
         ];
@@ -1282,7 +1258,7 @@ mod tests {
 
         let got = db.messages_with_files().unwrap();
         assert_eq!(got.len(), 2);
-        assert!(matches!(got[0], ChatMessage::UserFiles { .. }));
+        assert!(matches!(got[0], ChatMessage::User { .. }));
         assert!(matches!(&got[1], ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "c2"));
     }
 
@@ -1318,7 +1294,7 @@ mod tests {
         let msgs = &back.sessions[0].messages;
         for (i, m) in msgs.iter().enumerate() {
             match m {
-                ChatMessage::User(t) => assert_eq!(t, &format!("m{i}")),
+                ChatMessage::User { text: t, .. } => assert_eq!(t, &format!("m{i}")),
                 _ => panic!("类型不对"),
             }
         }
@@ -1338,7 +1314,7 @@ mod tests {
         let msgs = &back.sessions[0].messages;
         assert_eq!(msgs.len(), 1, "旧消息不该回来");
         match &msgs[0] {
-            ChatMessage::User(t) => assert_eq!(t, "清空后第一条"),
+            ChatMessage::User { text: t, .. } => assert_eq!(t, "清空后第一条"),
             _ => panic!("类型不对"),
         }
     }
@@ -1356,7 +1332,7 @@ mod tests {
         let back = db.load().unwrap();
         assert_eq!(back.sessions[0].messages.len(), 3);
         match &back.sessions[0].messages[2] {
-            ChatMessage::User(t) => assert_eq!(t, "新增"),
+            ChatMessage::User { text: t, .. } => assert_eq!(t, "新增"),
             _ => panic!(),
         }
     }
@@ -1369,7 +1345,7 @@ mod tests {
         let s = st.sessions.iter_mut().find(|s| s.id == id).unwrap();
         s.messages = vec![
             ChatMessage::System("上下文".into()),
-            ChatMessage::User("问题".into()),
+            ChatMessage::user("问题"),
             ChatMessage::Assistant {
                 content: "回答".into(),
                 reasoning: "思考".into(),

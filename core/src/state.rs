@@ -545,7 +545,7 @@ impl AppState {
         let dirs = self.side_dirs();
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let msgs = db.messages_with_files()?;
-            let referenced = crate::gc::owned_files(&msgs, &dirs).into_iter().collect();
+            let referenced = crate::gc::owned_files(&msgs).into_iter().collect();
             Ok(crate::gc::sweep(
                 data.as_deref(),
                 &dirs,
@@ -677,7 +677,6 @@ impl AppState {
     /// 清掉一个（已经从 store 里拿出来的）会话引用的文件。消息不在内存里的
     /// 从库里读（赶在落盘把那些行删掉之前；没赶上就留给启动清扫）。
     async fn forget_files(&self, s: crate::agent::ChatSession) {
-        let dirs = self.side_dirs();
         let db = self.db();
         let _ = tokio::task::spawn_blocking(move || {
             let msgs = if s.resident() {
@@ -686,7 +685,7 @@ impl AppState {
                 db.and_then(|d| d.load_messages(&s.id).ok())
                     .unwrap_or_default()
             };
-            let files = crate::gc::owned_files(&msgs, &dirs);
+            let files = crate::gc::owned_files(&msgs);
             let n = crate::gc::remove_all(&files);
             if n > 0 {
                 tracing::debug!("会话 {} 的 {n} 个文件已清掉", s.id);
@@ -1035,7 +1034,7 @@ impl AppState {
         let msgs: Vec<crate::agent::ChatMessage> = msgs
             .into_iter()
             .filter(|m| !m.attachments.is_empty())
-            .map(|m| crate::agent::ChatMessage::UserFiles {
+            .map(|m| crate::agent::ChatMessage::User {
                 text: m.text,
                 attachments: m.attachments,
             })
@@ -1043,9 +1042,8 @@ impl AppState {
         if msgs.is_empty() {
             return;
         }
-        let dirs = self.side_dirs();
         let _ = tokio::task::spawn_blocking(move || {
-            crate::gc::remove_all(&crate::gc::owned_files(&msgs, &dirs))
+            crate::gc::remove_all(&crate::gc::owned_files(&msgs))
         })
         .await;
     }
@@ -1861,7 +1859,7 @@ mod tests {
                 .get_mut(&id)
                 .unwrap()
                 .messages
-                .push(crate::agent::ChatMessage::User("留着".into()));
+                .push(crate::agent::ChatMessage::user("留着"));
             drop(store);
             st.save_sessions().unwrap();
         }
@@ -1897,7 +1895,7 @@ mod tests {
                     .get_mut(&id)
                     .unwrap()
                     .messages
-                    .push(crate::agent::ChatMessage::User(format!("第{i}个")));
+                    .push(crate::agent::ChatMessage::user(format!("第{i}个")));
                 ids.push(id);
             }
         }
@@ -1919,7 +1917,7 @@ mod tests {
             .get_mut(a)
             .unwrap()
             .messages
-            .push(crate::agent::ChatMessage::User("没落盘".into()));
+            .push(crate::agent::ChatMessage::user("没落盘"));
         assert_eq!(st.evict_idle(), 0);
 
         st.save_sessions().unwrap();
@@ -1951,7 +1949,7 @@ mod tests {
         let att = dir.join("a.png");
         std::fs::write(&att, b"x").unwrap();
         st.chat.write().await.get_mut(id).unwrap().messages.push(
-            crate::agent::ChatMessage::UserFiles {
+            crate::agent::ChatMessage::User {
                 text: String::new(),
                 attachments: vec![crate::agent::Attachment {
                     id: "a.png".into(),

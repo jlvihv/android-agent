@@ -66,47 +66,6 @@ function rest(o: Record<string, unknown>, used: Set<string>): Field[] {
 // 参数
 // ---------------------------------------------------------------------------
 
-/** 浏览器动作的中文名（折叠行和面板主行共用） */
-export const BROWSER_ACTION: Record<string, string> = {
-  navigate: '打开',
-  get_backbone: '读结构',
-  get_readable: '抽正文',
-  get_text: '读文本',
-  click: '点击',
-  type: '输入',
-  press: '按键',
-  find_elements: '找元素',
-  scroll: '滚动',
-  screenshot: '截图',
-  set_user_agent: '切UA',
-  back: '后退',
-  wait_for_dom_stable: '等页面安定',
-  js: '执行 JS',
-  new_tab: '开新标签',
-  list_tabs: '列出标签',
-  switch_tab: '切标签',
-  close_tab: '关标签',
-};
-
-/** 浏览器面板主行：动作 + 它最主要的那个对象。返回用掉的参数名 */
-function browserPrimary(a: Record<string, unknown>): { text: string; used: string[] } {
-  const action = str(a.action);
-  const label = BROWSER_ACTION[action] ?? action;
-  const pick = (...keys: string[]) => {
-    const k = keys.find((k) => a[k] !== undefined && a[k] !== '');
-    return k ? { text: `${label} ${str(a[k]) || String(a[k])}`, used: ['action', k] } : null;
-  };
-  if (action === 'click' && a.selector === undefined && a.x !== undefined) {
-    return { text: `${label} (${a.x}, ${a.y})`, used: ['action', 'x', 'y'] };
-  }
-  if (action === 'type') {
-    return { text: `${label} ${str(a.selector)} ← ${str(a.text)}`, used: ['action', 'selector', 'text'] };
-  }
-  return (
-    pick('url', 'script', 'selector', 'key', 'user_agent') ?? { text: label, used: ['action'] }
-  );
-}
-
 /** edit 的 edits：每处一段，旧文 `-`、新文 `+`（比转义过的 JSON 好读得多） */
 function formatEdits(edits: unknown): string {
   if (!Array.isArray(edits)) return JSON.stringify(edits, null, 2);
@@ -143,16 +102,6 @@ export function describeInput(t: ToolPart, args: Record<string, unknown>): Input
       primary = take('path');
       // 改成功了，结果里的 diff 就是同一份改动，不必再列一遍旧文 / 新文
       if (t.output !== undefined && isDiff(t.output)) used.add('edits');
-      break;
-    }
-    case 'search':
-      // 老会话回放用：`search` 工具已删（唯一入口是沙箱里的 `agent search`）
-      primary = take('query');
-      break;
-    case 'browser': {
-      const b = browserPrimary(a);
-      primary = b.text;
-      b.used.forEach((k) => used.add(k));
       break;
     }
   }

@@ -1113,12 +1113,6 @@ struct ChatBody {
     /// 调试端会指定一条专用会话，免得把测试消息混进用户正在聊的那条。
     #[serde(default)]
     session: Option<String>,
-    /// 这一轮开一个新会话。
-    ///
-    /// 前端点「新对话」**不建会话**（只是本地把视图清空）—— 所以
-    /// 「新建」这件事拖到第一句话才发生：点了不发就不会攒出空会话。
-    #[serde(default)]
-    fresh: bool,
     /// 已经在 `/api/attachment` 上传好、随这条消息发出去的附件 id。
     /// 服务端从 `pending_attachments` 取出完整描述后跟着用户消息进历史。
     #[serde(default)]
@@ -1126,7 +1120,7 @@ struct ChatBody {
     /// 这条消息在界面上的 id。
     ///
     /// 排队时用得上：界面拿它把「排队中」那个气泡和 `data-queued` 对上，
-    /// `/api/sessions/unqueue` 也拿它撤。不给就现生成一个（老客户端 / 脚本）。
+    /// `/api/sessions/unqueue` 也拿它撤。不给就现生成一个（脚本 / agentctl）。
     #[serde(default)]
     id: Option<String>,
 }
@@ -1143,10 +1137,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
         st.llm().or_else(Provider::from_env)
     };
 
-    // 写进哪个会话：指定的 > 新开一个 > 当前活动的。
-    //
-    // 「新对话」的第一句：会话到这一刻才建（前端点按钮时只清空了视图）。
-    // 前端现在会先 `POST /api/sessions` 拿到 id 再发，`fresh` 留给老客户端。
+    // 写进哪个会话：指定的 > 当前活动的（脚本 / agentctl 不指定）。
     let sid = {
         let mut store = st.chat.write().await;
         match &body.session {
@@ -1154,7 +1145,6 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
             Some(id) => {
                 return (StatusCode::NOT_FOUND, format!("没有这个会话: {id}")).into_response()
             }
-            None if body.fresh => store.create(),
             None => store.active_mut().id.clone(),
         }
     };
@@ -1322,24 +1312,20 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 文件链接的前缀。**模型看到的是 `preview:`**；`sandbox:` 是它以前的名字，
-/// 老会话的历史里存的是它，自己以前也这么写，所以解析一律两个都认（只有新生成的
-/// 文字用 `preview:`，见 `sandbox_url_to_guest`）。
-const SCHEME_PREFIXES: [&str; 2] = ["preview:", "sandbox:"];
+/// 文件链接的前缀（模型在回复里给用户的链接就是这么写的）。
+const SCHEME_PREFIX: &str = "preview:";
 
 /// agent 的浏览器要打开的地址：沙箱里的文件 → `sandbox.localhost` 上的 URL。
 ///
 /// 认这几种写法（模型最可能写的）：`preview:/workspace/a.html`（和回复里给
 /// 用户的链接同一个写法）、`preview:a.html`（相对 /workspace）、
 /// `file:///workspace/a.html`、直接写绝对路径 `/workspace/a.html`。
-/// 前缀以前叫 `sandbox:`，老会话的历史里存的是它，所以两个都认。
 /// 别的（网址）返回 `None`，原样交给浏览器。
 pub fn sandbox_page_url(raw: &str, port: u16, key: &str) -> Option<String> {
     let raw = raw.trim();
     let lower = raw.to_ascii_lowercase();
-    let scheme = SCHEME_PREFIXES.into_iter().find(|p| lower.starts_with(p));
-    let rest = if let Some(p) = scheme {
-        let after = &raw[p.len()..];
+    let rest = if lower.starts_with(SCHEME_PREFIX) {
+        let after = &raw[SCHEME_PREFIX.len()..];
         let r = after.trim_start_matches('/');
         if after.starts_with('/') {
             format!("/{r}")
@@ -1453,7 +1439,7 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
 /// agent loop 没有轮数上限，前端那个「停止」按钮必须真的把服务端循环停下来，
 /// 而不只是断开 SSE（循环看不到断连，会继续跑、继续烧 token）。
 async fn stop_turn(State(st): State<Arc<AppState>>, body: Option<Json<StopBody>>) -> Response {
-    // 不指定会话 = 当前活动会话（老客户端 / 调试脚本）
+    // 不指定会话 = 当前活动会话（调试脚本 / agentctl）
     let sid = match body.and_then(|Json(b)| b.session) {
         Some(id) => id,
         None => match st.chat.read().await.active_ref() {
@@ -1482,7 +1468,7 @@ struct StopBody {
 /// 注意：面板前端**自己还有一层 10 分钟的缓存**（`web/src/lib/models.svelte.ts`），
 /// 正常打开面板根本不会发这个请求 —— 后端这层省的是「打扰上游」，
 /// 前端那层省的是「面板第一帧没数据 → 先渲染载入中再长高」的布局跳动。
-/// `models` 还是当前这家的清单（老客户端 / agentctl 用）。
+/// `models` 还是当前这家的清单（agentctl 用）。
 async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery>) -> Response {
     let current = st.llm().or_else(Provider::from_env);
     let current_id = current.as_ref().map(crate::providers::identify);
@@ -2253,7 +2239,7 @@ async fn reset(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 
-/// 一个现生成的 id（客户端没给 `id` 时用：脚本、老客户端）。
+/// 一个现生成的 id（客户端没给 `id` 时用：脚本 / agentctl）。
 fn new_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
@@ -3074,11 +3060,6 @@ mod tests {
             format!("{base}/workspace/%E6%8A%A5.html"),
             "已经编码过的不再编一次"
         );
-        assert_eq!(
-            map("sandbox:/workspace/a.html").unwrap(),
-            format!("{base}/workspace/a.html"),
-            "老前缀（老会话的历史里）照样认"
-        );
         for web in [
             "https://example.com",
             "example.com/a",
@@ -3487,7 +3468,7 @@ mod tests {
         let r0 = session_rev(&a);
 
         // 新消息 → 变
-        a.messages.push(ChatMessage::User("问".into()));
+        a.messages.push(ChatMessage::user("问"));
         let r1 = session_rev(&a);
         assert_ne!(r0, r1);
 
@@ -3496,7 +3477,7 @@ mod tests {
 
         // 换个会话，即使消息数一样也不能相同（否则会卡在别的会话的内容上）
         let mut b = ChatSession::new();
-        b.messages.push(ChatMessage::User("问".into()));
+        b.messages.push(ChatMessage::user("问"));
         b.updated_at = a.updated_at;
         assert_ne!(session_rev(&b), session_rev(&a));
     }

@@ -7,7 +7,6 @@
 //! 工具调用**一律直接执行**，没有审批环节 —— 服务端因此没有「挂起等回复」
 //! 的状态，回合结束就是结束，手机 App 随时被杀都没关系。
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -77,15 +76,9 @@ fn build_tools(p: Platform) -> Vec<ToolSpec> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatMessage {
     System(String),
-    User(String),
-    /// 用户在输入卡片里附了文件的用户消息（图片 / PDF）。
-    ///
-    /// 单独一个变体是为了**向后兼容**：老会话里存的是 `User(String)`，
-    /// 照样能读；带附件的才有这个形状。不能把 `User` 改成带字段的结构体
-    /// 变体 —— 那样老 SQLite 里的 `{"User":"..."}` 就解析不了了。
-    UserFiles {
+    /// 用户消息。`attachments` 是在输入卡片里附的图片 / PDF（没附就是空的）。
+    User {
         text: String,
-        #[serde(default)]
         attachments: Vec<Attachment>,
     },
     Assistant {
@@ -97,8 +90,6 @@ pub enum ChatMessage {
         /// 下一次请求要原样放回 input —— 不放的话模型每一步都看不到自己上一步
         /// 想了什么（不报错，只是更容易前后不连贯、每步重想一遍）。`reasoning`
         /// 是给人看的文字，这个是给服务端的；Chat Completions 那边没有它。
-        /// `#[serde(default)]`：老会话照样能读。
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reasoning_items: Vec<Value>,
     },
     Tool {
@@ -108,8 +99,7 @@ pub enum ChatMessage {
         ///
         /// 不放进 `content` 里：OpenAI 的 tool 消息只能是字符串，图片必须
         /// 作为紧随其后的一条 `user` 消息发（多个 tool 调用要等全部发完）。
-        /// 见 `build_messages`。`#[serde(default)]` 让老会话不受影响。
-        #[serde(default)]
+        /// 见 `build_messages`。
         images: Vec<ImagePart>,
     },
 }
@@ -123,8 +113,6 @@ pub struct ImagePart {
     pub mime: String,
     /// 沙箱里原图的路径，给模型看（裁剪/看元数据用）和界面展示用。
     pub source: String,
-    /// 哪个工具返回的（目前只有 read）
-    pub tool: String,
 }
 
 /// 用户从界面上附的一个文件。
@@ -158,32 +146,35 @@ pub struct RecordedToolCall {
 }
 
 impl ChatMessage {
-    /// 是不是一条用户消息（带不带附件都算）。回合边界、标题、计数都靠它 ——
-    /// 别在各处直接 `matches!(ChatMessage::User(_))`，会把 `UserFiles` 漏掉。
+    /// 一条不带附件的用户消息。
+    pub fn user(text: impl Into<String>) -> Self {
+        ChatMessage::User {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// 是不是一条用户消息。回合边界、标题、计数都靠它。
     pub fn is_user(&self) -> bool {
-        matches!(self, ChatMessage::User(_) | ChatMessage::UserFiles { .. })
+        matches!(self, ChatMessage::User { .. })
     }
 
     /// 用户消息的正文（非用户消息返回 None）。
     pub fn user_text(&self) -> Option<&str> {
         match self {
-            ChatMessage::User(t) => Some(t),
-            ChatMessage::UserFiles { text, .. } => Some(text),
+            ChatMessage::User { text, .. } => Some(text),
             _ => None,
         }
     }
 
     /// 转成 Chat Completions 的一条消息。
     ///
-    /// 带附件的 `UserFiles` 正常路径由 `build_messages` 处理（它知道模型
+    /// 带附件的用户消息正常路径由 `build_messages` 处理（它知道模型
     /// 支不支持图片/PDF）；这里只保证单独调用时也不炸，正文里点名有哪些附件。
     fn to_openai(&self) -> Message {
         match self {
             ChatMessage::System(s) => Message::System { content: s.clone() },
-            ChatMessage::User(s) => Message::User {
-                content: UserContent::Text(s.clone()),
-            },
-            ChatMessage::UserFiles { text, attachments } => {
+            ChatMessage::User { text, attachments } => {
                 let mut body = text.clone();
                 for a in attachments {
                     body.push_str(&format!("\n[附件：{}（{}）]", a.name, a.mime));
@@ -533,8 +524,7 @@ impl SessionStore {
             let mut in_this = 0;
             for m in messages {
                 let (role, text) = match m {
-                    ChatMessage::User(t) => ("user", t.as_str()),
-                    ChatMessage::UserFiles { text, .. } => ("user", text.as_str()),
+                    ChatMessage::User { text, .. } => ("user", text.as_str()),
                     ChatMessage::Assistant { content, .. } => ("assistant", content.as_str()),
                     // 系统提示词和工具结果不参与搜索：前者不是对话，后者是噪音
                     _ => continue,
@@ -568,46 +558,12 @@ impl SessionStore {
 // `agent::system_prompt`，没必要为了搬家把它们全改一遍。
 pub use crate::prompt::system_prompt;
 
-/// 历史 + 给没有结果的工具调用补上「被中断」。
-///
-/// 两家协议都要求每个 tool call 后面跟着它的结果，缺一个整个请求就 400 ——
-/// 那条会话从此再也发不出消息。补的内容由历史推导、字节确定，不影响前缀缓存。
-/// 绝大多数时候没有缺口，直接借用原历史，不拷贝。
-fn with_tool_results(msgs: &[ChatMessage]) -> Vec<Cow<'_, ChatMessage>> {
-    let mut out: Vec<Cow<'_, ChatMessage>> = Vec::with_capacity(msgs.len());
-    let mut i = 0;
-    while i < msgs.len() {
-        out.push(Cow::Borrowed(&msgs[i]));
-        let ChatMessage::Assistant { tool_calls, .. } = &msgs[i] else {
-            i += 1;
-            continue;
-        };
-        i += 1;
-        let mut answered: HashSet<&str> = HashSet::new();
-        while let Some(ChatMessage::Tool { tool_call_id, .. }) = msgs.get(i) {
-            answered.insert(tool_call_id);
-            out.push(Cow::Borrowed(&msgs[i]));
-            i += 1;
-        }
-        for tc in tool_calls
-            .iter()
-            .filter(|tc| !answered.contains(tc.id.as_str()))
-        {
-            out.push(Cow::Owned(ChatMessage::Tool {
-                tool_call_id: tc.id.clone(),
-                content: prompt::INTERRUPTED.to_string(),
-                images: Vec::new(),
-            }));
-        }
-    }
-    out
-}
-
 /// 历史末尾那步如果有没结果的工具调用，就地补上（回合开始前调）。
 ///
-/// 只补**末尾**：会话是只追加落盘的（`db.rs` 的水位线），往中间插会让库和
-/// 内存对不上。中间的缺口（老会话）交给 `with_tool_results` 在组请求时补。
-/// 落进历史而不只是组请求时补，是为了界面上那几个工具不再一直转圈。
+/// 两家协议都要求每个 tool call 后面跟着它的结果，缺一个整个请求就 400 ——
+/// 那条会话从此再也发不出消息。缺口只可能出在**末尾**（进程在两步之间被杀），
+/// 中间的工具调用都在下一步开始前收齐了结果（停止也会补，见 `stop_with_pending`）。
+/// 落进历史而不只是组请求时补，界面上那几个工具也就不再一直转圈。
 fn close_dangling_tail(sess: &mut ChatSession) {
     let Some(at) = sess
         .messages
@@ -651,12 +607,12 @@ fn build_messages(
     supports_images: bool,
     supports_files: bool,
 ) -> anyhow::Result<Vec<Message>> {
-    let msgs = with_tool_results(&sess.messages);
+    let msgs = &sess.messages;
     let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
     let mut i = 0;
     while i < msgs.len() {
         // 带附件的用户消息：正文 + 图片 / PDF 内容块拼在一条消息里。
-        if let ChatMessage::UserFiles { text, attachments } = &*msgs[i] {
+        if let ChatMessage::User { text, attachments } = &msgs[i] {
             out.push(user_message(
                 text,
                 attachments,
@@ -666,7 +622,7 @@ fn build_messages(
             i += 1;
             continue;
         }
-        if !matches!(*msgs[i], ChatMessage::Tool { .. }) {
+        if !matches!(msgs[i], ChatMessage::Tool { .. }) {
             out.push(msgs[i].to_openai());
             i += 1;
             continue;
@@ -679,7 +635,7 @@ fn build_messages(
         // 图绝不能插在第 1、2 个 tool 之间。
         let mut carriers: Vec<(String, ImagePart)> = Vec::new();
         while i < msgs.len() {
-            match &*msgs[i] {
+            match &msgs[i] {
                 ChatMessage::Tool {
                     tool_call_id,
                     content,
@@ -711,8 +667,8 @@ fn build_messages(
 /// 直接放在 `function_call_output` 里，见 `build_responses_input`）。
 fn image_carrier(tool_call_id: &str, img: &ImagePart, supports_images: bool) -> Message {
     let label = format!(
-        "[{} 返回的图片（tool_call_id: {tool_call_id}）；原文件：{}]",
-        img.tool, img.source
+        "[read 返回的图片（tool_call_id: {tool_call_id}）；原文件：{}]",
+        img.source
     );
 
     let mut parts: Vec<Part> = vec![text_part(label)];
@@ -954,7 +910,7 @@ pub fn session_view_count_before(sess: &ChatSession, upto: usize) -> usize {
     for m in &sess.messages[..upto] {
         match m {
             ChatMessage::System(_) => {}
-            ChatMessage::User(_) | ChatMessage::UserFiles { .. } => {
+            ChatMessage::User { .. } => {
                 n += 1;
                 last_assistant = false;
             }
@@ -1007,15 +963,7 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
             // 系统提示词（第一条，以及后续的“提示词升级”）是给模型看的，不给用户看
             ChatMessage::System(_) => {}
 
-            ChatMessage::User(text) => out.push(json!({
-                "id": format!("u{i}"),
-                "role": "user",
-                "steps": 0,
-                "done": true,
-                "parts": [{ "type": "text", "id": "u", "text": text }],
-            })),
-
-            ChatMessage::UserFiles { text, attachments } => out.push(json!({
+            ChatMessage::User { text, attachments } => out.push(json!({
                 "id": format!("u{i}"),
                 "role": "user",
                 "steps": 0,
@@ -1269,15 +1217,9 @@ async fn turn_once(
         if let Some((text, _)) = msgs.first() {
             sess.maybe_title(text);
         }
-        // 一条消息装下正文和附件（有附件时才用 `UserFiles`，空附件保持老形状，
-        // 前缀不变）。整批一起进历史 —— 模型一次就看到全部。
+        // 一条消息装下正文和附件。整批一起进历史 —— 模型一次就看到全部。
         for (text, attachments) in msgs {
-            if attachments.is_empty() {
-                sess.messages.push(ChatMessage::User(text));
-            } else {
-                sess.messages
-                    .push(ChatMessage::UserFiles { text, attachments });
-            }
+            sess.messages.push(ChatMessage::User { text, attachments });
         }
         sess.updated_at = now_ms();
         // 通知栏那一行要显示哪个会话在跑（标题刚定下来，顺手取走，
@@ -1511,13 +1453,9 @@ async fn deliver_queued(
     }
     let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
     for m in msgs {
-        let msg = if m.attachments.is_empty() {
-            ChatMessage::User(m.text)
-        } else {
-            ChatMessage::UserFiles {
-                text: m.text,
-                attachments: m.attachments,
-            }
+        let msg = ChatMessage::User {
+            text: m.text,
+            attachments: m.attachments,
         };
         append(core, sid, msg).await;
     }
@@ -1657,13 +1595,12 @@ fn build_responses_input(
     supports_files: bool,
 ) -> Vec<InputItem> {
     let mut out: Vec<InputItem> = Vec::new();
-    for m in with_tool_results(&sess.messages) {
-        match &*m {
+    for m in &sess.messages {
+        match m {
             ChatMessage::System(s) => {
                 out.push(message_item("system", MessageContent::Text(s.clone())))
             }
-            ChatMessage::User(s) => out.push(message_item("user", MessageContent::Text(s.clone()))),
-            ChatMessage::UserFiles { text, attachments } => out.push(message_item(
+            ChatMessage::User { text, attachments } => out.push(message_item(
                 "user",
                 user_message_content(text, attachments, supports_images, supports_files),
             )),
@@ -1828,7 +1765,7 @@ fn inline_files(sess: &ChatSession, images: bool, pdfs: bool) -> Vec<(String, St
     let mut out = Vec::new();
     for m in &sess.messages {
         match m {
-            ChatMessage::UserFiles { attachments, .. } => {
+            ChatMessage::User { attachments, .. } => {
                 for a in attachments {
                     let want = match a.kind {
                         AttachmentKind::Image => images,
@@ -2730,7 +2667,6 @@ async fn read_image_outcome(
                 path: stored.display().to_string(),
                 mime,
                 source: guest_path.to_string(),
-                tool: "read".to_string(),
             }],
         },
         Err(e) => {
@@ -3185,7 +3121,7 @@ mod tests {
         let bare = json!({ "type": "reasoning", "id": "rs_0", "summary": [] });
         let mut sess = ChatSession::new();
         sess.messages = vec![
-            ChatMessage::User("U".into()),
+            ChatMessage::user("U"),
             ChatMessage::Assistant {
                 content: "我去看看".into(),
                 reasoning: "先看看目录".into(),
@@ -3230,7 +3166,7 @@ mod tests {
         let mut sess = ChatSession::new();
         sess.messages = vec![
             ChatMessage::System("sys".into()),
-            ChatMessage::User("U".into()),
+            ChatMessage::user("U"),
             ChatMessage::Assistant {
                 content: String::new(),
                 reasoning: "先看看目录".into(),
@@ -3244,7 +3180,7 @@ mod tests {
                 tool_calls: vec![],
                 reasoning_items: Vec::new(),
             },
-            ChatMessage::User("再来".into()),
+            ChatMessage::user("再来"),
             ChatMessage::Assistant {
                 content: "嗯".into(),
                 reasoning: String::new(),
@@ -3287,53 +3223,10 @@ mod tests {
         }
     }
 
-    /// 停在一批工具中间（或进程被杀）之后，下一轮请求里每个 tool call
-    /// 都必须有结果 —— 缺一个，provider 就 400，这条会话再也发不出去。
-    #[test]
-    fn every_tool_call_has_a_result_even_after_an_interrupted_turn() {
-        let mut sess = ChatSession::default();
-        ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
-        sess.messages.push(ChatMessage::User("跑三个".into()));
-        sess.messages.push(ChatMessage::Assistant {
-            content: String::new(),
-            reasoning: String::new(),
-            tool_calls: vec![call("c1"), call("c2"), call("c3")],
-            reasoning_items: Vec::new(),
-        });
-        sess.messages.push(tool("c1"));
-        // c2、c3 没有结果；后面已经又来了一句（老会话的形状）
-        sess.messages.push(ChatMessage::User("继续".into()));
-
-        let w = wire(&sess);
-        let ids: Vec<&str> = w
-            .iter()
-            .filter(|m| m["role"] == "tool")
-            .map(|m| m["tool_call_id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, ["c1", "c2", "c3"]);
-        assert_eq!(
-            w.last().unwrap()["role"],
-            "user",
-            "补的结果要紧跟在那批调用后面"
-        );
-
-        let r = serde_json::to_value(
-            build_responses_request(&sess, Platform::Android, "m", true, true, None).unwrap(),
-        )
-        .unwrap();
-        let outs = r["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|i| i["type"] == "function_call_output")
-            .count();
-        assert_eq!(outs, 3);
-    }
-
     #[test]
     fn a_dangling_tail_is_closed_in_the_history_itself() {
         let mut sess = ChatSession::default();
-        sess.messages.push(ChatMessage::User("跑".into()));
+        sess.messages.push(ChatMessage::user("跑"));
         sess.messages.push(ChatMessage::Assistant {
             content: String::new(),
             reasoning: String::new(),
@@ -3371,7 +3264,7 @@ mod tests {
 
         // 第 1 轮：run_turn 干的事
         ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
-        sess.messages.push(ChatMessage::User("第一问".into()));
+        sess.messages.push(ChatMessage::user("第一问"));
         let turn1 = wire(&sess);
 
         // 第 2 轮：追加 assistant / tool / 新用户输入
@@ -3391,7 +3284,7 @@ mod tests {
             images: vec![],
         });
         ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
-        sess.messages.push(ChatMessage::User("第二问".into()));
+        sess.messages.push(ChatMessage::user("第二问"));
         let turn2 = wire(&sess);
 
         assert!(turn2.len() > turn1.len());
@@ -3411,7 +3304,7 @@ mod tests {
     fn a_prompt_change_is_appended_and_keeps_the_prefix() {
         let mut sess = ChatSession::default();
         ensure_system_prompt(&mut sess, "旧提示词");
-        sess.messages.push(ChatMessage::User("第一问".into()));
+        sess.messages.push(ChatMessage::user("第一问"));
         sess.messages.push(ChatMessage::Assistant {
             content: "答".into(),
             reasoning: String::new(),
@@ -3436,7 +3329,7 @@ mod tests {
         assert_eq!(wire(&sess).len(), n, "重复追加了同一条提示词");
 
         // 再发一轮，前缀继续单调增长
-        sess.messages.push(ChatMessage::User("第二问".into()));
+        sess.messages.push(ChatMessage::user("第二问"));
         let next = wire(&sess);
         assert_eq!(&next[..n], &after[..]);
     }
@@ -3523,14 +3416,14 @@ mod tests {
         // 所以 请求体长度 == 历史长度，一条不多一条不少。
         let mut sess = ChatSession::default();
         ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
-        sess.messages.push(ChatMessage::User("问".into()));
+        sess.messages.push(ChatMessage::user("问"));
         sess.messages.push(ChatMessage::Assistant {
             content: "答".into(),
             reasoning: String::new(),
             tool_calls: vec![],
             reasoning_items: Vec::new(),
         });
-        sess.messages.push(ChatMessage::User("再问".into()));
+        sess.messages.push(ChatMessage::user("再问"));
 
         let w = wire(&sess);
         assert_eq!(w.len(), sess.messages.len(), "请求体里多出了别的东西");
@@ -3549,7 +3442,7 @@ mod tests {
     fn full_request_body_is_prefix_stable_across_turns() {
         let mut sess = ChatSession::default();
         ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
-        sess.messages.push(ChatMessage::User("第一问".into()));
+        sess.messages.push(ChatMessage::user("第一问"));
         // 转成 Value 是为了断言请求体本身；线上路径不经过这一步
         let req1 = serde_json::to_value(
             build_request(
@@ -3579,7 +3472,7 @@ mod tests {
             content: "ok".into(),
             images: vec![],
         });
-        sess.messages.push(ChatMessage::User("第二问".into()));
+        sess.messages.push(ChatMessage::user("第二问"));
         let req2 = serde_json::to_value(
             build_request(
                 &sess,
@@ -3612,7 +3505,7 @@ mod tests {
     fn reasoning_effort_is_tagged_per_protocol_and_omitted_when_unset() {
         let mut sess = ChatSession::default();
         ensure_system_prompt(&mut sess, system_prompt(Platform::Android));
-        sess.messages.push(ChatMessage::User("嗨".into()));
+        sess.messages.push(ChatMessage::user("嗨"));
 
         let chat = serde_json::to_value(
             build_request(&sess, Platform::Android, "m", true, true, None).unwrap(),
@@ -3657,7 +3550,7 @@ mod tests {
 
         let mut sess = ChatSession::new();
         sess.messages = vec![
-            ChatMessage::User("看图".into()),
+            ChatMessage::user("看图"),
             ChatMessage::Assistant {
                 content: String::new(),
                 reasoning: String::new(),
@@ -3671,7 +3564,6 @@ mod tests {
                     path: img.display().to_string(),
                     mime: "image/png".into(),
                     source: "/workspace/a.png".into(),
-                    tool: "read".into(),
                 }],
             },
             ChatMessage::Tool {
@@ -3738,7 +3630,7 @@ mod tests {
             kind,
         };
         let mut sess = ChatSession::new();
-        sess.messages = vec![ChatMessage::UserFiles {
+        sess.messages = vec![ChatMessage::User {
             text: "看看这两个".into(),
             attachments: vec![
                 att("a.png", &png, "image/png", AttachmentKind::Image),
@@ -3796,14 +3688,14 @@ mod tests {
         let mut sess = ChatSession::new();
         sess.messages = vec![
             ChatMessage::System("sys".into()),
-            ChatMessage::User("U1".into()),
+            ChatMessage::user("U1"),
             ChatMessage::Assistant {
                 content: "答1".into(),
                 reasoning: String::new(),
                 tool_calls: vec![],
                 reasoning_items: Vec::new(),
             },
-            ChatMessage::UserFiles {
+            ChatMessage::User {
                 text: "U2".into(),
                 attachments: vec![Attachment {
                     id: "x.pdf".into(),
@@ -4065,7 +3957,7 @@ mod tests {
         };
         let mut sess = ChatSession::new();
         sess.messages = vec![
-            ChatMessage::User("问".into()),
+            ChatMessage::user("问"),
             ChatMessage::Assistant {
                 content: String::new(),
                 reasoning: String::new(),
@@ -4079,7 +3971,6 @@ mod tests {
                     path: "/data/img/1.png".into(),
                     mime: "image/png".into(),
                     source: "/workspace/shot.png".into(),
-                    tool: "read".into(),
                 }],
             },
         ];
@@ -4107,7 +3998,7 @@ mod tests {
         let mut sess = ChatSession::new();
         sess.messages = vec![
             ChatMessage::System("ctx".into()),
-            ChatMessage::User("问".into()),
+            ChatMessage::user("问"),
             ChatMessage::Assistant {
                 content: "先看看".into(),
                 reasoning: "想1".into(),
@@ -4125,7 +4016,7 @@ mod tests {
                 tool_calls: vec![],
                 reasoning_items: Vec::new(),
             },
-            ChatMessage::User("再问".into()),
+            ChatMessage::user("再问"),
             ChatMessage::Assistant {
                 content: "再答".into(),
                 reasoning: String::new(),
@@ -4185,7 +4076,7 @@ mod tests {
         let mut sess = ChatSession::new();
         sess.messages = vec![
             ChatMessage::System("sys".into()),
-            ChatMessage::User("U1".into()),
+            ChatMessage::user("U1"),
             ChatMessage::Assistant {
                 content: "先看看".into(),
                 reasoning: "想".into(),
@@ -4203,7 +4094,7 @@ mod tests {
                 tool_calls: vec![],
                 reasoning_items: Vec::new(),
             },
-            ChatMessage::User("U2".into()),
+            ChatMessage::user("U2"),
             ChatMessage::Assistant {
                 content: "答2".into(),
                 reasoning: String::new(),
@@ -4250,7 +4141,7 @@ mod tests {
         let mut sess = ChatSession::new();
         sess.messages = vec![
             ChatMessage::System("sys".into()),
-            ChatMessage::User("U1".into()),
+            ChatMessage::user("U1"),
             asst("先看看", "想", vec![call("c1"), call("c2")]),
             tool("c1"),
             tool("c2"),
@@ -4260,7 +4151,7 @@ mod tests {
             tool("c3"),
             asst("答1", "", vec![]),
             ChatMessage::System("新提示词".into()),
-            ChatMessage::User("U2".into()),
+            ChatMessage::user("U2"),
             asst("", "", vec![call("c4")]),
             tool("c4"),
             asst("答2", "", vec![]),
@@ -4364,7 +4255,7 @@ mod tests {
         a.updated_at = 200;
         a.messages = vec![
             ChatMessage::System("系统提示词里有 apk 这个词，不该被搜到".into()),
-            ChatMessage::User("看一下 apk 版本".into()),
+            ChatMessage::user("看一下 apk 版本"),
             ChatMessage::Assistant {
                 content: "Alpine 3.21\n第二行".into(),
                 reasoning: String::new(),
@@ -4381,7 +4272,7 @@ mod tests {
         let mut b = ChatSession::new();
         b.title = "FizzBuzz".into();
         b.updated_at = 100;
-        b.messages = vec![ChatMessage::User("写个 fizzbuzz".into())];
+        b.messages = vec![ChatMessage::user("写个 fizzbuzz")];
 
         SessionStore {
             sessions: vec![a, b],
@@ -4414,7 +4305,7 @@ mod tests {
         // 每个会话最多 3 条
         let mut many = ChatSession::new();
         many.messages = (0..10)
-            .map(|i| ChatMessage::User(format!("命中 {i}")))
+            .map(|i| ChatMessage::user(format!("命中 {i}")))
             .collect();
         let store = SessionStore {
             sessions: vec![many],
@@ -4433,7 +4324,7 @@ mod tests {
 
         // 中文按字符切，不能切出半截 UTF-8
         let mut s = ChatSession::new();
-        s.messages = vec![ChatMessage::User(format!(
+        s.messages = vec![ChatMessage::user(format!(
             "{}测试{}",
             "开头".repeat(100),
             "尾巴".repeat(100)
@@ -4501,15 +4392,15 @@ mod tests {
         let mut s = ChatSession::new();
         s.messages = vec![
             ChatMessage::System("p".into()),
-            ChatMessage::User("一".into()),
-            ChatMessage::User("二".into()),
+            ChatMessage::user("一"),
+            ChatMessage::user("二"),
         ];
         s.evict();
         assert!(!s.resident());
         assert_eq!((s.message_count(), s.user_count()), (3, 2));
         assert!(s.has_content());
 
-        s.install(vec![ChatMessage::User("一".into())]);
+        s.install(vec![ChatMessage::user("一")]);
         assert!(s.resident());
         assert_eq!(s.message_count(), 1);
     }
@@ -4530,7 +4421,7 @@ mod tests {
             .get_mut(&id)
             .unwrap()
             .messages
-            .push(ChatMessage::User("问了".into()));
+            .push(ChatMessage::user("问了"));
         let listed = store.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["id"], id.as_str());

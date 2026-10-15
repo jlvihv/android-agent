@@ -473,8 +473,8 @@ mod tests {
             tool_detail("edit", r#"{"path":"/workspace/a.md","content":"…"}"#).as_deref(),
             Some("/workspace/a.md")
         );
-        // 别的工具（老会话里可能有）没有细节，不算错
-        assert_eq!(tool_detail("browser", r#"{"action":"navigate"}"#), None);
+        // 不认识的工具没有细节，不算错
+        assert_eq!(tool_detail("nope", r#"{"x":1}"#), None);
     }
 
     #[test]

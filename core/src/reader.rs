@@ -190,12 +190,19 @@ pub fn read(
     numbered: bool,
 ) -> anyhow::Result<ReadView> {
     let lines: Vec<&str> = text.split('\n').collect();
+    // 真正的行数：文本以 `\n` 结尾时 `split` 末尾多切出的那个空串不是一行
+    //（`wc -l` / `cat -n` 都不数它）。续读提示里的「共几行 / 还有几行」都按它算 ——
+    // 按 `lines.len()` 的话，30 行的文件报「共 31 行」，读到最后一行还提示「还有 1 行」。
+    let total = if text.is_empty() || text.ends_with('\n') {
+        lines.len() - 1
+    } else {
+        lines.len()
+    };
     // offset 从 1 开始；0 或负数会落到第 1 行（跟参考实现一致）
     let start = offset.saturating_sub(1);
     anyhow::ensure!(
-        start < lines.len(),
-        "offset {offset} 超出文件末尾（共 {} 行）",
-        lines.len()
+        start < lines.len().min(total.max(1)),
+        "offset {offset} 超出文件末尾（共 {total} 行）",
     );
 
     let selected: Vec<&str> = match limit {
@@ -223,14 +230,14 @@ pub fn read(
             ),
             truncated: true,
             shown_lines: 0,
-            total_lines: lines.len(),
+            total_lines: total,
             total_bytes: text.len(),
         });
     }
 
     // 后续还有没有内容：给了 limit 就看 limit，没给就看实际截断到哪
     let consumed = match limit {
-        Some(l) => start + l.min(lines.len() - start),
+        Some(l) => start + l.min(total.saturating_sub(start)),
         None => start + t.output_lines,
     };
 
@@ -248,15 +255,14 @@ pub fn read(
             t.content,
             start + 1,
             start + t.output_lines,
-            lines.len(),
+            total,
             start + t.output_lines + 1,
         )
-    } else if consumed < lines.len() {
+    } else if consumed < total {
         format!(
-            "{}\n\n[文件还有 {} 行（共 {} 行 / {size}）。用 offset={} 继续。]",
+            "{}\n\n[文件还有 {} 行（共 {total} 行 / {size}）。用 offset={} 继续。]",
             t.content,
-            lines.len() - consumed,
-            lines.len(),
+            total - consumed,
             consumed + 1,
         )
     } else {
@@ -267,7 +273,7 @@ pub fn read(
         content,
         truncated: t.truncated,
         shown_lines: t.output_lines,
-        total_lines: lines.len(),
+        total_lines: total,
         total_bytes: text.len(),
     })
 }
@@ -338,11 +344,28 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_reads_as_one_empty_line() {
+    fn empty_file_reads_as_empty() {
         let v = read("", "/root/x.txt", 1, None).unwrap();
         assert_eq!(v.content, "");
-        assert_eq!(v.total_lines, 1);
+        assert_eq!(v.total_lines, 0);
         assert_eq!(v.total_bytes, 0);
+    }
+
+    /// 以换行结尾的文件：末尾那个空串不算一行。读到最后一行就是读完了，不能再提示
+    /// 「还有 1 行」；越过最后一行的 offset 报错。
+    #[test]
+    fn a_trailing_newline_is_not_a_line() {
+        let text = format!("{}\n", lines(30, "l"));
+        let v = read(&text, "/root/x.txt", 5, Some(3)).unwrap();
+        assert!(v.content.contains("文件还有 23 行（共 30 行"), "{}", v.content);
+        assert!(v.content.contains("offset=8"), "{}", v.content);
+        assert_eq!(v.total_lines, 30);
+
+        let v = read(&text, "/root/x.txt", 28, Some(3)).unwrap();
+        assert_eq!(v.content, "l27\nl28\nl29", "读到最后一行就没有续读提示");
+
+        let err = read(&text, "/root/x.txt", 31, None).unwrap_err().to_string();
+        assert!(err.contains("共 30 行"), "{err}");
     }
 
     #[test]

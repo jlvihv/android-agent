@@ -116,8 +116,7 @@ build_messages(sess, supports_images, supports_files)
 - 老前缀 `[旧提示词, U1, A1, …]` **原封不动** → 缓存照命中；
 - 新提示词作为一条 `system` 消息落在**新用户输入之前**；它一旦进历史就固化了，
   下一轮开始就在缓存里；
-- 同一条提示词不会重复追加（`ensure_system_prompt` 先查历史里有没有）；
-- 历史里没有任何提示词的老会话会自动被补上。
+- 同一条提示词不会重复追加（`ensure_system_prompt` 先查历史里有没有）。
 
 推论：**提示词变了也不能轮换 `provider_session`** —— 那正是要保住的缓存路由。
 
