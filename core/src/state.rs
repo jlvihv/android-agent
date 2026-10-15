@@ -940,21 +940,6 @@ impl AppState {
 
     // ---- 排队等着交给模型的用户消息（见 `queued` 字段） --------------------
 
-    /// 把这个会话的第一条排队的消息取走（`None` = 没排队的）。
-    ///
-    /// 一次只取一条 —— 取走的那条要开一个新回合，剩下的留在这个回合的
-    /// 第一个步边界一起交给模型（否则一个回合得带多条用户消息，历史形上也
-    /// 不好看）。
-    pub fn pop_queued(&self, sid: &str) -> Option<QueuedMsg> {
-        let mut g = self.queued.lock().ok()?;
-        let q = g.get_mut(sid)?;
-        let m = q.pop_front();
-        if q.is_empty() {
-            g.remove(sid);
-        }
-        m
-    }
-
     /// 排队等着交给模型的那些消息（`/api/session` 报给界面看）。
     pub fn queued_list(&self, sid: &str) -> Vec<QueuedMsg> {
         self.queued

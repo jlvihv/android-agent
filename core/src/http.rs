@@ -1096,7 +1096,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     // 或回收，那条消息就永远发不出去了 —— 而「等一会儿再发同一个请求」本来就是
     // 核心该保证的事。
     //
-    // 队列里**已经有**等着的（上个回合出错或被停止后留下的）也排进去：不然这条会
+    // 队列里**已经有**等着的（上个回合出错后留下的）也排进去：不然这条会
     // 插到它们前面先跑。排进去之后由这里开回合（`continue_with_queued`），按原来的
     // 顺序走。
     let turn = match &provider {
