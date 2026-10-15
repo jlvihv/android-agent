@@ -318,7 +318,8 @@ mod tests {
         st.port.store(port, std::sync::atomic::Ordering::Relaxed);
         let (app, st2) = (crate::http::router(st.clone()), st.clone());
         tokio::spawn(async move {
-            while let Ok((hn, peer)) = l.accept().await {
+            loop {
+                let (hn, peer) = crate::accept(&l).await;
                 let tls = st2.lan_tls.get().cloned();
                 tokio::spawn(crate::http::accept_conn(hn, peer, app.clone(), tls));
             }
@@ -468,6 +469,126 @@ mod tests {
             crate::db::Db::open(&dir.join("phone.db")).unwrap(),
         ));
         assert_eq!(again.get(&m.id).map(|x| x.token), Some("s3cret".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一个只搬字节的转发（放在「电脑」前面），记着接了几条连接。
+    async fn counting_proxy(to: u16) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut a, _) = crate::accept(&l).await;
+                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if let Ok(mut b) = TcpStream::connect(("127.0.0.1", to)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+                    }
+                });
+            }
+        });
+        (port, n)
+    }
+
+    /// 隧道复用上游连接：经中继时一条新连接是好几个往返，而页面每 1.5 秒就轮询一次。
+    /// 页面那头 keep-alive 也认；WebSocket 照样穿得过去；隧道收掉之后，页面那头挂着的
+    /// 空闲连接也断开（不然旧隧道和它的连接池一直挂着）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tunnel_reuses_upstream_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::llm::install_crypto_provider();
+        let (_st, port, code, dir) = computer(None).await;
+        let (front, dialed) = counting_proxy(port).await;
+        let phone = Machines::with_db(Arc::new(
+            crate::db::Db::open(&dir.join("phone.db")).unwrap(),
+        ));
+        let m = phone.pair("127.0.0.1", port, &code).await.unwrap();
+        phone.lan_found(&m.id, "电脑", "127.0.0.1", front);
+        let c = phone.connect(&m.id).await.unwrap();
+
+        // ① 连上之后再来的请求（页面那头各开各的连接）：不再新建上游连接。
+        //    先等一下：`connect` 在后台经隧道对一次账（`Machines::sync`），它和第一个请求
+        //    同时在路上的话，池子会正当地多开一条
+        let r = get(c.port, "/api/health", Some("s3cret")).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let before = dialed.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(before >= 1);
+        for _ in 0..3 {
+            let r = get(c.port, "/api/health", Some("s3cret")).await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        }
+        assert_eq!(
+            dialed.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "上游连接要复用"
+        );
+
+        // ② 页面那头 keep-alive：一条连接上两个请求
+        let mut s = TcpStream::connect(("127.0.0.1", c.port)).await.unwrap();
+        s.write_all(
+            b"GET /api/health HTTP/1.1\r\nhost: localhost\r\ncookie: agent_token=s3cret\r\n\r\n\
+              GET /api/health HTTP/1.1\r\nhost: localhost\r\ncookie: agent_token=s3cret\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        let out = String::from_utf8_lossy(&out);
+        assert_eq!(out.matches("HTTP/1.1 200").count(), 2, "{out}");
+
+        // ③ WebSocket：升级穿过隧道，那台电脑先说的那句（hello）传得回来
+        let mut ws = TcpStream::connect(("127.0.0.1", c.port)).await.unwrap();
+        ws.write_all(
+            b"GET /api/ws HTTP/1.1\r\nhost: localhost\r\ncookie: agent_token=s3cret\r\n\
+              connection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\n\
+              sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), ws.read(&mut chunk))
+                .await
+                .expect("升级没有回音")
+                .unwrap();
+            assert!(n > 0, "升级时断了：{}", String::from_utf8_lossy(&buf));
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        if buf.len() == head_end {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), ws.read(&mut chunk))
+                .await
+                .expect("升级之后那台电脑什么都没说")
+                .unwrap();
+            assert!(n > 0, "升级之后就断了");
+        }
+
+        // ④ 隧道收掉：页面那头挂着的空闲 keep-alive 连接也断
+        let mut idle = TcpStream::connect(("127.0.0.1", c.port)).await.unwrap();
+        idle.write_all(
+            b"GET /api/health HTTP/1.1\r\nhost: localhost\r\ncookie: agent_token=s3cret\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let n = idle.read(&mut chunk).await.unwrap();
+        assert!(String::from_utf8_lossy(&chunk[..n]).starts_with("HTTP/1.1 200"));
+        phone.disconnect();
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            idle.read_to_end(&mut rest),
+        )
+        .await
+        .expect("隧道收了，空闲连接还挂着")
+        .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

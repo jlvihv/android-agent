@@ -29,22 +29,30 @@
 //! 不设防的话它连上隧道就等于拿到那台电脑的 shell。`/api/*` 只认隧道钥匙
 //! （或者那台电脑自己的 token —— 壳的回合状态订阅就是这么连的，见 docs/06）。
 //!
-//! ## 一条请求一条连接
+//! ## 连接复用
 //!
-//! 每条请求都要重新选上游（`/api/machines*` 归本机，其余归那台电脑），所以隧道**不复用**
-//! 连接：转给上游时补一句 `connection: close`，上游答完就断，同一个连接上不会出现
-//! 「一半请求问本机、一半问那台电脑」。代价是每个请求多一次连接建立 —— 局域网感觉不到，
-//! 经中继时每次多一个往返（页面上那十来个请求；长连接 SSE / WebSocket 不受影响）。
+//! 隧道是个按**请求**选路的 HTTP/1 代理（hyper）：页面那头 keep-alive，每个请求自己选
+//! 上游（`/api/machines*` 归本机，其余归那台电脑）；上游连接进池复用。经中继时一条新连接
+//! 是「连中继 + 中继配对 + TLS 握手」好几个往返，而页面每 1.5 秒轮询一次 —— 不复用的话
+//! 每个请求都要付一遍。
+//!
+//! 池子里的连接可能已经死了却没人知道（手机换了网络）：网络一变（`Routes::reset`）或者
+//! 该换路了（`Routes::set_lan`），池子的键就换一个（路由代号），新请求不再用旧连接。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use http::{header, HeaderMap, HeaderValue, StatusCode};
+use hyper::body::Incoming;
+use hyper_util::client::legacy::connect::{Connected, Connection};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::state::same_secret;
@@ -70,6 +78,9 @@ pub struct Routes {
     relay: Option<(String, Vec<u8>)>,
     /// 局域网在这个时刻之前别试了（刚刚不通过）
     lan_down_until: Mutex<Option<Instant>>,
+    /// 路由代号：该换路了（网络变了、回到家）就加一。上游连接池按它分开（见
+    /// `generation`），换路之后新请求不会再用池子里走旧路的连接。
+    generation: AtomicU64,
 }
 
 impl Routes {
@@ -78,22 +89,42 @@ impl Routes {
             lan: Mutex::new(lan),
             relay,
             lan_down_until: Mutex::new(None),
+            generation: AtomicU64::new(0),
         }
     }
 
     /// 发现服务刚在局域网里看到它：记下地址，下一条连接就先试它。
+    ///
+    /// 发现服务会反复报同一个地址：地址没变、也没在走中继的话，池子里的连接照用
+    /// （不然每报一次池子就清一次，复用就白做了）。
     pub fn set_lan(&self, addr: String) {
-        if let Ok(mut g) = self.lan.lock() {
-            *g = Some(addr);
+        let changed = self
+            .lan
+            .lock()
+            .map(|mut g| g.replace(addr.clone()).as_deref() != Some(addr.as_str()))
+            .unwrap_or(true);
+        let was_down = self
+            .lan_down_until
+            .lock()
+            .map(|mut g| g.take().is_some_and(|t| Instant::now() < t))
+            .unwrap_or(false);
+        if changed || was_down {
+            self.generation.fetch_add(1, Ordering::Relaxed);
         }
-        self.reset();
     }
 
-    /// 网络变了（换 Wi-Fi、出门、回家）：之前「局域网不通」的判断作废。
+    /// 网络变了（换 Wi-Fi、出门、回家）：之前「局域网不通」的判断作废，池子里的连接
+    /// 也不用了（它们走的是旧网络，可能已经死了，只是还没人发现）。
     pub fn reset(&self) {
         if let Ok(mut g) = self.lan_down_until.lock() {
             *g = None;
         }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 现在的路由代号（上游连接池的键里带着它）。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// 现在该不该先试局域网，试哪个地址。
@@ -143,22 +174,26 @@ pub struct Local {
     pub token: Option<String>,
 }
 
-/// 一条开着的隧道。drop 就关（新连接不再进来；已经接上的那几条让它把话说完）。
+/// 一条开着的隧道。drop 就关：新连接不再进来，已经接上的那几条答完手上这个请求就断
+/// （不能当场掐：切换机器的那条请求正跑在这样一条连接上，它得把「新地址是什么」送回页面）。
 pub struct Tunnel {
     pub port: u16,
     /// 页面的钥匙（`http://localhost:<端口>/?k=<它>` 换成 cookie 之后就不再露面）
     pub key: String,
     task: tokio::task::JoinHandle<()>,
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        // 只收掉 accept 循环。**不能连已接上的连接一起 abort**：切换机器的那条请求
-        // 正跑在这样一条连接的 `bridge` 里，它得把「新地址是什么」送回页面
-        // （`machines::connect` 换掉 current 时就发生在这条请求的处理过程里）。
         self.task.abort();
+        let _ = self.stop.send(true);
     }
 }
+
+/// 上游空闲连接留多久。不能太久：手机换了网络，池子里那条可能已经死了却还没人知道
+/// （网络一变的情况由 `Routes::reset` 换掉整个池子的键，见 `Routes::generation`）。
+const POOL_IDLE: Duration = Duration::from_secs(30);
 
 /// 起一条隧道：本机监听一个端口（`want_port` 是上次那个，占了就换一个），返回它。
 pub async fn start(t: Target, local: Local, want_port: Option<u16>) -> anyhow::Result<Tunnel> {
@@ -172,286 +207,372 @@ pub async fn start(t: Target, local: Local, want_port: Option<u16>) -> anyhow::R
     };
     let port = listener.local_addr()?.port();
     let key = crate::state::random_secret();
-    let connector =
-        tokio_rustls::TlsConnector::from(Arc::new(pinned_config(Some(&t.fingerprint)).0));
     tracing::info!("隧道：127.0.0.1:{port} →「{}」", t.name);
     let t = Arc::new(t);
     let local = Arc::new(local);
-    let task = tokio::spawn({
-        let key = key.clone();
-        async move {
-            loop {
-                let Ok((sock, _)) = listener.accept().await else {
-                    continue;
-                };
-                let _ = sock.set_nodelay(true);
-                tokio::spawn(bridge(
-                    sock,
-                    t.clone(),
-                    local.clone(),
-                    connector.clone(),
-                    key.clone(),
-                ));
-            }
+    let dial = Dial {
+        t: t.clone(),
+        local: local.clone(),
+        tls: tokio_rustls::TlsConnector::from(Arc::new(pinned_config(Some(&t.fingerprint)).0)),
+    };
+    let client = Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(POOL_IDLE)
+        .pool_timer(TokioTimer::new())
+        .build(dial);
+    let shared = Arc::new(Shared {
+        t,
+        local,
+        key: key.clone(),
+        client,
+    });
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            let (sock, _) = crate::accept(&listener).await;
+            let _ = sock.set_nodelay(true);
+            tokio::spawn(serve(sock, shared.clone(), stopped.clone()));
         }
     });
-    Ok(Tunnel { port, key, task })
+    Ok(Tunnel {
+        port,
+        key,
+        task,
+        stop,
+    })
 }
 
 type Tls = tokio_rustls::client::TlsStream<TcpStream>;
+type Body = axum::body::Body;
 
-/// 上游：本机核心（明文 loopback）还是那台电脑（TLS）。
-enum Up {
-    Local(String),
-    Machine,
-}
-
-/// 一条本机连接：读一次请求头 → 决定上游 → 转发。见模块说明。
-async fn bridge(
-    mut sock: TcpStream,
+/// 一条隧道里大家共用的东西。
+struct Shared {
     t: Arc<Target>,
     local: Arc<Local>,
-    connector: tokio_rustls::TlsConnector,
     key: String,
-) {
-    let head = match read_head(&mut sock).await {
-        Ok(h) => h,
-        Err(why) => {
-            tracing::debug!("隧道：{why}");
-            reply(&mut sock, 400, "接收请求失败", &why, false).await;
-            return;
-        }
-    };
-    let Some(req) = Request::parse(&head.head) else {
-        reply(&mut sock, 400, "接收请求失败", "看不懂这个请求", false).await;
-        return;
-    };
+    /// 上游连接池：键是 URI 的 authority（`local` / `machine-<代号>`，见 `handle`）
+    client: Client<Dial, Body>,
+}
 
+/// 一条本机连接（页面那头）。HTTP/1 keep-alive：一条连接上可以来很多个请求，
+/// 每个请求自己选上游（`handle`）。
+async fn serve(sock: TcpStream, sh: Arc<Shared>, mut stopped: tokio::sync::watch::Receiver<bool>) {
+    let svc = hyper::service::service_fn(move |req| {
+        let sh = sh.clone();
+        async move { Ok::<_, std::convert::Infallible>(handle(&sh, req).await) }
+    });
+    let conn = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(sock), svc)
+        .with_upgrades();
+    tokio::pin!(conn);
+    tokio::select! {
+        r = conn.as_mut() => {
+            if let Err(e) = r {
+                tracing::debug!("隧道：{e}");
+            }
+        }
+        // 隧道收了（切到别的机器）：手上这个请求答完就断
+        _ = async { drop(stopped.wait_for(|s| *s).await) } => {
+            conn.as_mut().graceful_shutdown();
+            let _ = conn.await;
+        }
+    }
+}
+
+/// 一个请求：钥匙换 cookie / 查凭据 / 选上游转发。
+async fn handle(sh: &Shared, req: hyper::Request<Incoming>) -> hyper::Response<Body> {
     // 1. 持钥匙那一步：`/?k=<钥匙>` → 换成 cookie 再回首页。地址里的钥匙因此只出现一次
     //    （不落进 history 深处，也不进 JS 能读的地方）。
-    if let Some(k) = req.query("k") {
-        if !same_secret(k, &key) {
-            reply(
-                &mut sock,
-                403,
+    if let Some(k) = query(req.uri(), "k") {
+        if !same_secret(k, &sh.key) {
+            return page(
+                StatusCode::FORBIDDEN,
                 "钥匙不对",
                 "这个地址的钥匙不对（隧道每次连接都不一样）。",
-                false,
+                req,
             )
             .await;
-            return;
         }
-        let res = format!(
-            "HTTP/1.1 302 Found\r\nlocation: /\r\nset-cookie: {COOKIE}={key}; Path=/; HttpOnly; SameSite=Strict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-        );
-        let _ = sock.write_all(res.as_bytes()).await;
-        let _ = sock.flush().await;
-        let _ = sock.shutdown().await;
-        return;
+        return hyper::Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, "/")
+            .header(
+                header::SET_COOKIE,
+                format!("{COOKIE}={}; Path=/; HttpOnly; SameSite=Strict", sh.key),
+            )
+            .body(Body::empty())
+            .expect("固定的合法响应");
     }
 
     // 2. `/api/*` 要凭据（和本机核心一个规矩）。页面、js/css、沙箱文件不设防 ——
     //    它们本来就是公开的代码，沙箱文件另有一把路径上的钥匙。
-    if req.path().starts_with("/api/") && !req.credential_ok(&key, &t.token) {
-        reply(
-            &mut sock,
-            401,
+    let path = req.uri().path();
+    if path.starts_with("/api/") && !credential_ok(req.headers(), &sh.key, &sh.t.token) {
+        return page(
+            StatusCode::UNAUTHORIZED,
             "需要凭据",
             "这个隧道的钥匙不在请求里（从本机核心给的地址进来才有）。",
-            true,
+            req,
         )
         .await;
-        return;
     }
 
     // 3. 选上游：问「能连哪些机器」的那些归本机，其余的归那台电脑。
-    let (up, token) = if req.path().starts_with("/api/machines") {
-        (Up::Local(local.addr.clone()), local.token.clone())
+    //    那台电脑的键里带着路由代号：网络一变（`Routes::reset`）就换一批新连接，
+    //    池子里走旧路的那些不再用（它们可能已经死了，只是还没人发现）。
+    let (authority, token, down) = if path.starts_with("/api/machines") {
+        (
+            "local".to_string(),
+            sh.local.token.clone(),
+            "连不上本机核心",
+        )
     } else {
-        (Up::Machine, Some(t.token.clone()))
+        (
+            format!("machine-{}", sh.t.routes.generation()),
+            Some(sh.t.token.clone()),
+            "连不上那台电脑",
+        )
     };
-    let forwarded = rewrite_head(&req, token.as_deref());
-    match up {
-        Up::Local(addr) => match TcpStream::connect(&addr).await {
-            Ok(up) => forward(&mut sock, up, &head.rest, &forwarded).await,
-            Err(e) => {
-                let why = format!("本机核心连不上（{addr}）：{e}");
-                tracing::warn!("隧道：{why}");
-                reply(&mut sock, 502, "连不上本机核心", &why, true).await;
-            }
-        },
-        Up::Machine => match open(&t, &connector).await {
-            Ok(up) => forward(&mut sock, up, &head.rest, &forwarded).await,
-            Err(why) => {
-                tracing::warn!("隧道：{why}");
-                reply(&mut sock, 502, "连不上那台电脑", &why, true).await;
-            }
-        },
+    match forward(sh, req, &authority, token.as_deref()).await {
+        Ok(res) => res,
+        Err(why) => {
+            tracing::warn!("隧道：{why}");
+            text_page(StatusCode::BAD_GATEWAY, down, &why)
+        }
     }
 }
 
-/// 把已经读掉的那段请求头（改写过的）和剩下读到的东西送去上游，然后对搬字节。
-async fn forward<U>(sock: &mut TcpStream, mut up: U, rest: &[u8], head: &[u8])
-where
-    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    if up.write_all(head).await.is_err() || up.write_all(rest).await.is_err() {
-        return;
+/// 逐跳的头：只管这一跳（页面 ↔ 隧道、隧道 ↔ 上游各是各的），不往下传。
+const HOP_BY_HOP: [&str; 7] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// 转给上游：换掉凭据、去掉逐跳的头；WebSocket 升级的话两头各自升级，然后对搬字节。
+async fn forward(
+    sh: &Shared,
+    mut req: hyper::Request<Incoming>,
+    authority: &str,
+    token: Option<&str>,
+) -> Result<hyper::Response<Body>, String> {
+    let upgrade = req.headers().contains_key(header::UPGRADE);
+    let page_side = upgrade.then(|| hyper::upgrade::on(&mut req));
+
+    let (mut parts, body) = req.into_parts();
+    let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+    parts.uri = format!("http://{authority}{pq}")
+        .parse()
+        .map_err(|e| format!("请求地址不对：{e}"))?;
+    let h = &mut parts.headers;
+    // 浏览器带来的凭据不往上游带：上游只该看到我们给它准备的那一个
+    // （两个来源的凭据混在一起，谁都说不清最后认的是谁）
+    h.remove(header::COOKIE);
+    h.remove("x-agent-token");
+    if !upgrade {
+        for k in HOP_BY_HOP {
+            h.remove(k);
+        }
     }
-    let _ = up.flush().await;
-    let _ = tokio::io::copy_bidirectional(sock, &mut up).await;
+    if let Some(t) = token {
+        h.insert(
+            "x-agent-token",
+            HeaderValue::from_str(t).map_err(|e| format!("凭据不是合法的头：{e}"))?,
+        );
+    }
+
+    let mut res = sh
+        .client
+        .request(hyper::Request::from_parts(parts, Body::new(body)))
+        .await
+        .map_err(|e| innermost(&e))?;
+
+    if let (Some(page_side), StatusCode::SWITCHING_PROTOCOLS) = (page_side, res.status()) {
+        let up_side = hyper::upgrade::on(&mut res);
+        tokio::spawn(async move {
+            match tokio::try_join!(page_side, up_side) {
+                Ok((a, b)) => {
+                    let _ =
+                        tokio::io::copy_bidirectional(&mut TokioIo::new(a), &mut TokioIo::new(b))
+                            .await;
+                }
+                Err(e) => tracing::debug!("隧道：升级没成：{e}"),
+            }
+        });
+        return Ok(res.map(|_| Body::empty()));
+    }
+
+    for k in ["connection", "keep-alive", "proxy-connection"] {
+        res.headers_mut().remove(k);
+    }
+    Ok(res.map(Body::new))
+}
+
+/// 连不上时的原因在错误链的最里面（我们自己的那句话），外面那几层是 hyper 的套话。
+fn innermost(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut cur = e;
+    while let Some(next) = cur.source() {
+        cur = next;
+    }
+    cur.to_string()
 }
 
 /// 隧道自己的 cookie 名（钥匙换成它，之后每个请求自动带上）。
 const COOKIE: &str = "agent_tunnel";
 
-/// 一次请求的头：`\r\n\r\n` 为止（含空行），以及同一次读里多出来的字节（body 的开头）。
-struct Head {
-    head: Vec<u8>,
-    rest: Vec<u8>,
+/// 查询串里的一个参数（不解码：我们只拿来做等值比较）。
+fn query<'a>(uri: &'a http::Uri, name: &str) -> Option<&'a str> {
+    uri.query()?
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v)
 }
 
-/// 请求头最多这么大。正常就几百字节；超过说明对面不是浏览器。
-const HEAD_MAX: usize = 64 * 1024;
+/// 一个 cookie 的值（可能有好几行 `cookie` 头）。
+fn cookie<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    h.get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v)
+}
 
-/// 读一次请求头（含空行）。剩下的（body 的开头）原样留着，转发时一起送出去。
-async fn read_head(sock: &mut TcpStream) -> Result<Head, String> {
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 4096];
-    loop {
-        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let rest = buf.split_off(i + 4);
-            return Ok(Head { head: buf, rest });
-        }
-        if buf.len() > HEAD_MAX {
-            return Err("请求头太大".into());
-        }
-        match tokio::time::timeout(Duration::from_secs(10), sock.read(&mut chunk)).await {
-            Ok(Ok(0)) if buf.is_empty() => return Err("对面什么都没说就断了".into()),
-            Ok(Ok(0)) => return Err("请求头没读完就断了".into()),
-            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-            Ok(Err(e)) => return Err(format!("读请求失败：{e}")),
-            Err(_) => return Err("等请求头超时".into()),
-        }
+/// 这条请求带没带「能过隧道」的凭据：隧道自己的钥匙，或者那台电脑的 token
+/// （壳的回合状态订阅、核心里「出门在外怎么连」那次对账都走后者，见 docs/06）。
+fn credential_ok(h: &HeaderMap, key: &str, machine_token: &str) -> bool {
+    let ok = |v: &str| same_secret(v, key) || same_secret(v, machine_token);
+    h.get("x-agent-token")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(ok)
+        || cookie(h, COOKIE).is_some_and(ok)
+        || cookie(h, "agent_token").is_some_and(ok)
+}
+
+/// 连不上 / 不认凭据：给页面回一页说清楚为什么（不然它只会显示一个笼统的「无法访问」）。
+///
+/// 先把请求的 body 读掉（最多 64KB）：带着没读的数据关连接，系统会发 RST，浏览器只看到
+/// 「连接被重置」，这页说明就白写了。
+async fn page(
+    status: StatusCode,
+    title: &str,
+    why: &str,
+    req: hyper::Request<Incoming>,
+) -> hyper::Response<Body> {
+    let _ = axum::body::to_bytes(Body::new(req.into_body()), 64 * 1024).await;
+    text_page(status, title, why)
+}
+
+fn text_page(status: StatusCode, title: &str, why: &str) -> hyper::Response<Body> {
+    hyper::Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(format!("{title}\n\n{why}\n")))
+        .expect("固定的合法响应")
+}
+
+/// 上游连接从哪来：`local` → 本机核心（明文 loopback），其余 → 那台电脑（TLS，先局域网
+/// 再中继，见 `open`）。连接池（`Shared::client`）建新连接时调它。
+#[derive(Clone)]
+struct Dial {
+    t: Arc<Target>,
+    local: Arc<Local>,
+    tls: tokio_rustls::TlsConnector,
+}
+
+impl tower::Service<http::Uri> for Dial {
+    type Response = TokioIo<Upstream>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
     }
-}
 
-/// 请求行 + 头。只解我们需要的那几样，别的一律原样留着转发。
-struct Request<'a> {
-    /// 整个头（转发时按行重排，所以留着原文）
-    raw: &'a [u8],
-    /// 请求行去掉结尾 `\r\n`
-    line: &'a str,
-    /// 请求目标（`/api/x?y=1`）
-    target: &'a str,
-    /// 头字段（原名，小写比较）
-    headers: Vec<(&'a str, &'a str)>,
-}
-
-impl<'a> Request<'a> {
-    fn parse(raw: &'a [u8]) -> Option<Self> {
-        let text = std::str::from_utf8(raw).ok()?;
-        let (first, rest) = text.split_once("\r\n")?;
-        let mut parts = first.split(' ');
-        let method = parts.next()?;
-        let target = parts.next()?;
-        let version = parts.next()?;
-        if method.is_empty() || !version.starts_with("HTTP/1.") {
-            return None;
-        }
-        let mut headers = Vec::new();
-        for line in rest.split("\r\n") {
-            if line.is_empty() {
-                break;
-            }
-            let (k, v) = line.split_once(':')?;
-            headers.push((k.trim(), v.trim()));
-        }
-        Some(Self {
-            raw,
-            line: first,
-            target,
-            headers,
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let me = self.clone();
+        Box::pin(async move {
+            let up = if uri.host() == Some("local") {
+                let addr = &me.local.addr;
+                let s = TcpStream::connect(addr)
+                    .await
+                    .map_err(|e| format!("本机核心连不上（{addr}）：{e}"))?;
+                let _ = s.set_nodelay(true);
+                Upstream::Plain(s)
+            } else {
+                Upstream::Tls(Box::new(open(&me.t, &me.tls).await?))
+            };
+            Ok(TokioIo::new(up))
         })
     }
+}
 
-    /// 路径（不含查询串）。
-    fn path(&self) -> &str {
-        self.target.split('?').next().unwrap_or(self.target)
-    }
+/// 一条上游连接：本机核心是明文，那台电脑是 TLS。
+enum Upstream {
+    Plain(TcpStream),
+    Tls(Box<Tls>),
+}
 
-    /// 查询串里的一个参数（不解码：我们只拿来做等值比较）。
-    fn query(&self, name: &str) -> Option<&str> {
-        self.target
-            .split_once('?')?
-            .1
-            .split('&')
-            .filter_map(|kv| kv.split_once('='))
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| v)
-    }
-
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| *v)
-    }
-
-    /// 一个 cookie 的值。
-    fn cookie(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
-            .flat_map(|(_, v)| v.split(';'))
-            .filter_map(|kv| kv.trim().split_once('='))
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| v)
-    }
-
-    /// 这条请求带没带「能过隧道」的凭据：隧道自己的钥匙，或者那台电脑的 token
-    /// （壳的回合状态订阅、核心里「出门在外怎么连」那次对账都走后者，见 docs/06）。
-    fn credential_ok(&self, key: &str, machine_token: &str) -> bool {
-        let ok = |v: &str| same_secret(v, key) || same_secret(v, machine_token);
-        self.header("x-agent-token").is_some_and(ok)
-            || self.cookie(COOKIE).is_some_and(ok)
-            || self.cookie("agent_token").is_some_and(ok)
+impl Connection for Upstream {
+    fn connected(&self) -> Connected {
+        Connected::new()
     }
 }
 
-/// 改写要转出去的那份头：
-///
-/// - 抹掉浏览器带来的 `cookie` 和 `x-agent-token`：上游只该看到我们给它准备的那一个凭据
-///   （两个来源的凭据混在一起，谁都说不清最后认的是谁）；
-/// - 注入上游的 `x-agent-token`（没有就不注入）；
-/// - 补 `connection: close`（一次请求一条连接，见模块说明）。**升级请求**（WebSocket）不碰
-///   `connection`：那句 `Upgrade` 就靠它，动了升级就没了。
-fn rewrite_head(req: &Request, token: Option<&str>) -> Vec<u8> {
-    let upgrade = req.header("upgrade").is_some();
-    let mut out = String::with_capacity(req.raw.len() + 96);
-    out.push_str(req.line);
-    out.push_str("\r\n");
-    for (k, v) in &req.headers {
-        let lower = k.to_ascii_lowercase();
-        if lower == "x-agent-token" || lower == "cookie" {
-            continue;
+impl tokio::io::AsyncRead for Upstream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Upstream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
         }
-        if lower == "connection" && !upgrade {
-            continue;
+    }
+}
+
+impl tokio::io::AsyncWrite for Upstream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Upstream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Upstream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
         }
-        out.push_str(k);
-        out.push_str(": ");
-        out.push_str(v);
-        out.push_str("\r\n");
     }
-    if let Some(t) = token {
-        out.push_str(&format!("x-agent-token: {t}\r\n"));
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Upstream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+        }
     }
-    if !upgrade {
-        out.push_str("connection: close\r\n");
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Upstream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
     }
-    out.push_str("\r\n");
-    out.into_bytes()
 }
 
 /// 先局域网、再中继，拿到一条和那台电脑之间的 TLS。`Err` 是给人看的原因。
@@ -495,32 +616,6 @@ async fn handshake(connector: &tokio_rustls::TlsConnector, s: TcpStream) -> Resu
         .await
         // rustls 会在我们自己的说明前面加一句 "unexpected error: "，对人没用
         .map_err(|e| e.to_string().replace("unexpected error: ", ""))
-}
-
-/// 连不上 / 不认凭据：给页面回一页说清楚为什么（不然它只会显示一个笼统的「无法访问」）。
-///
-/// `drain`：请求那头还有没读掉的数据（body）时，先把它读掉再回 —— 带着没读的数据关连接，
-/// 系统会发 RST，浏览器只看到「连接被重置」，这页说明就白写了。
-async fn reply(sock: &mut TcpStream, status: u16, title: &str, why: &str, drain: bool) {
-    if drain {
-        let mut buf = [0u8; 4096];
-        let mut seen = 0usize;
-        while seen < 64 * 1024 {
-            match tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => seen += n,
-                _ => break,
-            }
-        }
-    }
-    let body = format!("{title}\n\n{why}\n");
-    let head = format!(
-        "HTTP/1.1 {status} {title}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = sock.write_all(head.as_bytes()).await;
-    let _ = sock.write_all(body.as_bytes()).await;
-    let _ = sock.flush().await;
-    let _ = sock.shutdown().await;
 }
 
 /// 只认一张证书的 TLS 配置。`expect = None` 是**配对**用的：那时还不知道指纹，先收下
@@ -599,85 +694,51 @@ impl ServerCertVerifier for Pinned {
 mod tests {
     use super::*;
 
-    fn head(text: &str) -> Vec<u8> {
-        text.as_bytes().to_vec()
-    }
-
-    const GET: &str =
-        "GET /api/health HTTP/1.1\r\nhost: localhost:5555\r\ncookie: agent_tunnel=K\r\n\r\n";
-
-    #[test]
-    fn a_request_head_is_read_up_to_the_blank_line() {
-        let raw = head(GET);
-        let req = Request::parse(&raw).expect("正常请求");
-        assert_eq!(req.path(), "/api/health");
-        assert_eq!(req.header("Host"), Some("localhost:5555"));
-        assert_eq!(req.cookie("agent_tunnel"), Some("K"));
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, HeaderValue::from_bytes(v.as_bytes()).unwrap());
+        }
+        h
     }
 
     #[test]
     fn the_query_string_is_there_for_reading_the_tunnel_key() {
-        let raw = head("GET /?k=abc&x=1 HTTP/1.1\r\nhost: x\r\n\r\n");
-        let req = Request::parse(&raw).unwrap();
-        assert_eq!(req.query("k"), Some("abc"));
-        assert_eq!(req.query("nope"), None);
+        let uri: http::Uri = "/?k=abc&x=1".parse().unwrap();
+        assert_eq!(query(&uri, "k"), Some("abc"));
+        assert_eq!(query(&uri, "nope"), None);
         // 路径不带查询串：`/api/machines` 那一条据此认出来
-        assert_eq!(req.path(), "/");
+        assert_eq!(uri.path(), "/");
     }
 
     #[test]
     fn a_tunnel_credential_can_be_the_key_or_the_machines_own_token() {
-        let key = "K";
-        let token = "T";
-        let ok = |text: &str| {
-            let raw = head(text);
-            Request::parse(&raw).unwrap().credential_ok(key, token)
-        };
-        assert!(ok(GET));
-        assert!(ok(
-            "GET /api/health HTTP/1.1\r\ncookie: agent_token=T\r\n\r\n"
-        ));
-        assert!(ok("GET /api/health HTTP/1.1\r\nx-agent-token: K\r\n\r\n"));
+        let ok = |h: &[(&'static str, &'static str)]| credential_ok(&headers(h), "K", "T");
+        assert!(ok(&[("cookie", "agent_tunnel=K")]));
+        assert!(ok(&[("cookie", "x=1; agent_token=T")]));
+        // 浏览器可能把 cookie 拆成好几行
+        assert!(ok(&[("cookie", "x=1"), ("cookie", "agent_tunnel=K")]));
+        assert!(ok(&[("x-agent-token", "K")]));
         // 什么都没带、带了别的：不放行
-        assert!(!ok("GET /api/health HTTP/1.1\r\nhost: x\r\n\r\n"));
-        assert!(!ok(
-            "GET /api/health HTTP/1.1\r\nx-agent-token: 别的\r\n\r\n"
-        ));
+        assert!(!ok(&[("host", "x")]));
+        assert!(!ok(&[("x-agent-token", "别的")]));
     }
 
     #[test]
-    fn forwarding_replaces_the_credential_and_makes_the_connection_one_shot() {
-        let raw = head(GET);
-        let req = Request::parse(&raw).unwrap();
-        let out = String::from_utf8(rewrite_head(&req, Some("T"))).unwrap();
-        // 浏览器的 cookie 不再往上游带，换成我们的那一个
-        assert!(!out.contains("agent_tunnel"), "{out}");
-        assert!(out.contains("x-agent-token: T\r\n"), "{out}");
-        assert!(out.contains("connection: close\r\n"), "{out}");
-        assert!(out.starts_with("GET /api/health HTTP/1.1\r\n"), "{out}");
-        assert!(out.ends_with("\r\n\r\n"), "{out}");
-        // 本机核心不设防时（没有凭据）就不注入 —— 但一样是一次性的
-        let out = String::from_utf8(rewrite_head(&req, None)).unwrap();
-        assert!(!out.contains("x-agent-token"), "{out}");
-        assert!(out.contains("connection: close\r\n"), "{out}");
-    }
-
-    #[test]
-    fn an_upgrade_keeps_its_connection_header() {
-        let raw = head(
-            "GET /api/ws HTTP/1.1\r\nhost: localhost:5555\r\nconnection: Upgrade\r\nupgrade: websocket\r\n\r\n",
-        );
-        let req = Request::parse(&raw).unwrap();
-        let out = String::from_utf8(rewrite_head(&req, Some("T"))).unwrap();
-        // `connection: upgrade` 是升级的一部分，动了 WebSocket 就建立不起来
-        assert!(out.to_lowercase().contains("connection: upgrade"));
-        assert!(!out.contains("connection: close"), "{out}");
-        assert!(out.contains("x-agent-token: T\r\n"), "{out}");
-    }
-
-    #[test]
-    fn a_head_that_is_not_http_is_not_a_request() {
-        assert!(Request::parse(b"ding dong\r\n\r\n").is_none());
-        assert!(Request::parse(b"GET / HTTP/1.1\r\nno-colon-here\r\n\r\n").is_none());
+    fn the_reason_for_a_failed_connection_is_the_innermost_error() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("client error (Connect)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = Outer(std::io::Error::other("连不上「电脑」：它没配中继"));
+        assert_eq!(innermost(&e), "连不上「电脑」：它没配中继");
     }
 }

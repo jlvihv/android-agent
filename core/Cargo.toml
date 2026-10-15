@@ -100,8 +100,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 sha2 = "0.10"
 # 每条连接自己服务（`http::serve_conn`）：明文 / 局域网 TLS / 中继三种连接走同一个
 # 函数。这几个本来就经 axum 编进来了（axum::serve 底下就是它们），这里只是变成直接依赖。
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
+# 隧道（`tunnel.rs`）也用它们：按请求选路的 HTTP/1 代理，上游连接进池复用（`client`、
+# `client-legacy`）。reqwest 底下就是这套 client，不多编新东西。
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service", "client-legacy", "http1"] }
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]

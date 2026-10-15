@@ -150,6 +150,22 @@ impl Default for Core {
     }
 }
 
+/// 接一条连接。出错（文件描述符用光这类）就歇一下再接：不能空转把一个核跑满，
+/// 也不能就此不接了 —— 那个口会悄悄地死掉。
+pub(crate) async fn accept(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, std::net::SocketAddr) {
+    loop {
+        match listener.accept().await {
+            Ok(c) => return c,
+            Err(e) => {
+                tracing::warn!("accept: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 /// 将附件字节写到 `<dir>/<id>`（阻塞 I/O 包一层 `spawn_blocking`）。
 async fn write_attachment(
     dir: std::path::PathBuf,
@@ -685,15 +701,7 @@ impl Core {
         tokio::spawn(async move {
             st.log("info", format!("http://127.0.0.1:{actual}"));
             loop {
-                let (s, peer) = match listener.accept().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // 文件描述符用光这类：歇一下再接，别空转
-                        tracing::warn!("accept: {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
+                let (s, peer) = accept(&listener).await;
                 // 对端地址跟着每个请求走：桌面上「本机来的不要凭据」要靠它
                 // （`AppState::trust_loopback`）。有 TLS 身份（电脑对局域网开放）就认 TLS
                 let tls = st.lan_tls.get().cloned();

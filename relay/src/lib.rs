@@ -323,7 +323,15 @@ impl Relay {
     /// 接客，直到进程结束。
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
         loop {
-            let (s, peer) = listener.accept().await?;
+            // 出错（文件描述符用光这类）就歇一下再接：返回的话整个中继进程就退出了
+            let (s, peer) = match listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("accept: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let _ = s.set_nodelay(true);
             let me = self.clone();
             tokio::spawn(async move {
