@@ -38,6 +38,7 @@ pub mod mock;
 pub mod models;
 pub mod openai;
 pub mod platform;
+pub mod prompt;
 pub mod providers;
 pub mod reader;
 #[cfg(not(target_os = "android"))]
@@ -427,8 +428,8 @@ impl Core {
             }
         })?;
         let mut cancel = CancelBrowserOnDrop(Some(host.clone()));
-        // 沙箱里的文件（`sandbox:/…`、绝对路径）→ `sandbox.localhost` 上的 URL：
-        // AI 写完网页能自己开来看。回来的结果再改写回 `sandbox:`
+        // 沙箱里的文件（`preview:/…`、绝对路径）→ `sandbox.localhost` 上的 URL：
+        // AI 写完网页能自己开来看。回来的结果再改写回 `preview:`
         let port = self.port();
         let key = self.state.auth().sandbox_key;
         let action = match serde_json::from_str::<serde_json::Value>(action_json) {
@@ -905,8 +906,8 @@ async fn provision_tools(st: Arc<AppState>) {
 mod tests {
     use super::*;
 
-    /// agent 的浏览器打开沙箱文件：`sandbox:` 进去换成独立源上的 URL，
-    /// 结果里的 URL 再换回 `sandbox:`（端口和钥匙不进历史）。网址原样。
+    /// agent 的浏览器打开沙箱文件：`preview:` 进去换成独立源上的 URL，
+    /// 结果里的 URL 再换回 `preview:`（端口和钥匙不进历史）。网址原样。
     #[tokio::test]
     async fn the_browser_opens_sandbox_files_by_their_sandbox_path() {
         struct Echo(std::sync::Mutex<Vec<String>>);
@@ -931,15 +932,15 @@ mod tests {
         core.state.set_browser(host.clone());
 
         let v = core
-            .browser(r#"{"action":"navigate","url":"sandbox:/workspace/site/index.html"}"#)
+            .browser(r#"{"action":"navigate","url":"preview:/workspace/site/index.html"}"#)
             .await
             .unwrap();
         assert_eq!(
             host.0.lock().unwrap()[0],
             format!("http://sandbox.localhost:4321/sandbox/{key}/workspace/site/index.html")
         );
-        assert_eq!(v["url"], "sandbox:/workspace/site/index.html");
-        assert_eq!(v["text"], "已打开 sandbox:/workspace/site/index.html");
+        assert_eq!(v["url"], "preview:/workspace/site/index.html");
+        assert_eq!(v["text"], "已打开 preview:/workspace/site/index.html");
 
         core.browser(r#"{"action":"navigate","url":"example.com"}"#)
             .await

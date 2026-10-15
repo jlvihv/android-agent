@@ -319,7 +319,7 @@ pub struct AppState {
     pub sessions_dirty: AtomicBool,
     /// 运行时覆盖的系统提示词（`POST /api/debug/system-prompt`）。
     ///
-    /// `None` = 用编译进二进制的那份（`agent::system_prompt`）。存在的理由就一个：
+    /// `None` = 用编译进二进制的那份（`prompt::system_prompt`）。存在的理由就一个：
     /// **不重装 APK 就能对着真机调提示词** —— 改 Rust 常量要重编 .so、
     /// 重新打包安装，而提示词是迭代最频繁的东西。只改内存，重启即失效。
     pub system_prompt: RwLock<Option<String>>,
@@ -1160,7 +1160,7 @@ impl AppState {
     /// 默认是编译进去的那份；被 `/api/debug/system-prompt` 覆盖过就返回那一份。
     /// `Cow` 是为了没覆盖时**不拷贝**那个常量。
     ///
-    /// 编译进去的按平台各一份（`platform()`，见 `agent::system_prompt`）。
+    /// 编译进去的按平台各一份（`platform()`，见 `prompt::system_prompt`）。
     /// 同一个实例上不会中途换 —— 前缀缓存的一个字节都不能变。
     pub fn system_prompt(&self) -> Cow<'static, str> {
         match self.system_prompt.read() {

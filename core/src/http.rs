@@ -1222,18 +1222,26 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 文件链接的前缀。**模型看到的是 `preview:`**；`sandbox:` 是它以前的名字，
+/// 老会话的历史里存的是它，自己以前也这么写，所以解析一律两个都认（只有新生成的
+/// 文字用 `preview:`，见 `sandbox_url_to_guest`）。
+const SCHEME_PREFIXES: [&str; 2] = ["preview:", "sandbox:"];
+
 /// agent 的浏览器要打开的地址：沙箱里的文件 → `sandbox.localhost` 上的 URL。
 ///
-/// 认这几种写法（模型最可能写的）：`sandbox:/workspace/a.html`（和回复里给
-/// 用户的链接同一个写法）、`sandbox:a.html`（相对 /workspace）、
+/// 认这几种写法（模型最可能写的）：`preview:/workspace/a.html`（和回复里给
+/// 用户的链接同一个写法）、`preview:a.html`（相对 /workspace）、
 /// `file:///workspace/a.html`、直接写绝对路径 `/workspace/a.html`。
+/// 前缀以前叫 `sandbox:`，老会话的历史里存的是它，所以两个都认。
 /// 别的（网址）返回 `None`，原样交给浏览器。
 pub fn sandbox_page_url(raw: &str, port: u16, key: &str) -> Option<String> {
     let raw = raw.trim();
     let lower = raw.to_ascii_lowercase();
-    let rest = if lower.starts_with("sandbox:") {
-        let r = raw["sandbox:".len()..].trim_start_matches('/');
-        if raw["sandbox:".len()..].starts_with('/') {
+    let scheme = SCHEME_PREFIXES.into_iter().find(|p| lower.starts_with(p));
+    let rest = if let Some(p) = scheme {
+        let after = &raw[p.len()..];
+        let r = after.trim_start_matches('/');
+        if after.starts_with('/') {
             format!("/{r}")
         } else {
             format!("/workspace/{r}")
@@ -1262,9 +1270,9 @@ pub fn sandbox_page_url(raw: &str, port: u16, key: &str) -> Option<String> {
 }
 
 /// 反过来：结果里出现的 `http://sandbox.localhost:<端口>/sandbox/<钥匙>/…`
-/// 改写回 `sandbox:/…`（解码过的路径）。
+/// 改写回 `preview:/…`（解码过的路径）。
 ///
-/// 端口每次启动可能不同、钥匙也不该进历史 —— 模型记住的应该是 `sandbox:`
+/// 端口每次启动可能不同、钥匙也不该进历史 —— 模型记住的应该是 `preview:`
 /// 这个稳定的写法，下次照样能打开，也能原样写进回复给用户点。
 pub fn sandbox_url_to_guest(text: &str, port: u16, key: &str) -> String {
     let prefix = format!("{}/sandbox/{key}", sandbox_origin(port));
@@ -1285,7 +1293,7 @@ pub fn sandbox_url_to_guest(text: &str, port: u16, key: &str) -> String {
         } else {
             percent_decode(path)
         };
-        out.push_str("sandbox:");
+        out.push_str("preview:");
         out.push_str(&path);
         rest = &after[end..];
     }
@@ -1983,7 +1991,7 @@ struct SystemPromptBody {
 
 /// `POST /api/debug/system-prompt` → 运行时换一份系统提示词。
 ///
-/// 不重装 APK 就能调提示词，只改内存（重启回到编译进去的那份，`agent::system_prompt`）。
+/// 不重装 APK 就能调提示词，只改内存（重启回到编译进去的那份，`prompt::system_prompt`）。
 ///
 /// 换提示词**不会动老会话的前缀**：`ensure_system_prompt` 会把新的作为一条
 /// system 消息追加在历史末尾，老前缀原样保留、缓存照命中
@@ -2281,11 +2289,11 @@ fn is_loopback_origin(origin: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 沙箱文件：`sandbox:` 协议的落点
+// 沙箱文件：`preview:` 协议的落点
 // ---------------------------------------------------------------------------
 //
-// AI 在回复里写 `[报告](sandbox:/root/report.html)` 或
-// `![图](sandbox:/root/chart.png)`，前端把它改写成 `/sandbox/root/…`
+// AI 在回复里写 `[报告](preview:/root/report.html)` 或
+// `![图](preview:/root/chart.png)`，前端把它改写成 `/sandbox/root/…`
 // 打到这里。按 URL 路径直接映射，所以 HTML 里的相对路径（css/js/图片）
 // 天然能用。
 //
@@ -2938,15 +2946,15 @@ mod tests {
         let base = "http://sandbox.localhost:4000/sandbox/k";
         let map = |s: &str| sandbox_page_url(s, 4000, "k");
         assert_eq!(
-            map("sandbox:/workspace/a.html").unwrap(),
+            map("preview:/workspace/a.html").unwrap(),
             format!("{base}/workspace/a.html")
         );
         assert_eq!(
-            map("sandbox:///workspace/a.html").unwrap(),
+            map("preview:///workspace/a.html").unwrap(),
             format!("{base}/workspace/a.html")
         );
         assert_eq!(
-            map("sandbox:site/a.html").unwrap(),
+            map("preview:site/a.html").unwrap(),
             format!("{base}/workspace/site/a.html")
         );
         assert_eq!(
@@ -2958,13 +2966,18 @@ mod tests {
             format!("{base}/workspace/a.html?q=1#top")
         );
         assert_eq!(
-            map("sandbox:/workspace/报告 1/index.html").unwrap(),
+            map("preview:/workspace/报告 1/index.html").unwrap(),
             format!("{base}/workspace/%E6%8A%A5%E5%91%8A%201/index.html")
         );
         assert_eq!(
-            map("sandbox:/workspace/%E6%8A%A5.html").unwrap(),
+            map("preview:/workspace/%E6%8A%A5.html").unwrap(),
             format!("{base}/workspace/%E6%8A%A5.html"),
             "已经编码过的不再编一次"
+        );
+        assert_eq!(
+            map("sandbox:/workspace/a.html").unwrap(),
+            format!("{base}/workspace/a.html"),
+            "老前缀（老会话的历史里）照样认"
         );
         for web in [
             "https://example.com",
@@ -2975,15 +2988,15 @@ mod tests {
             assert!(map(web).is_none(), "{web}");
         }
 
-        // 回来的结果改写回 `sandbox:`（端口和钥匙不进历史）
+        // 回来的结果改写回 `preview:`（端口和钥匙不进历史）
         let back = |s: &str| sandbox_url_to_guest(s, 4000, "k");
         assert_eq!(
             back(&format!(
                 "已打开 {base}/workspace/%E6%8A%A5%E5%91%8A%201/index.html\n标题：x"
             )),
-            "已打开 sandbox:/workspace/报告 1/index.html\n标题：x"
+            "已打开 preview:/workspace/报告 1/index.html\n标题：x"
         );
-        assert_eq!(back(&format!("{base}/")), "sandbox:/workspace/");
+        assert_eq!(back(&format!("{base}/")), "preview:/workspace/");
         assert_eq!(back("https://example.com/"), "https://example.com/");
         assert_eq!(
             back(&format!("{base}/workspace/a.html")),

@@ -73,7 +73,7 @@ $ agent browser navigate https://example.com && agent browser get_backbone 3 && 
 2. **核心那层**：能直连的接口（`/api/xxx`），并且**把「给模型看的文字」在核心侧
    格式化好**（响应里的 `output` 字段），别让 CLI 和工具各写一份 ——
    各写一份就会漂（`format_hits` 就是这么搬到 `search.rs` 的）。
-3. **提示词**：`compose_prompt`（`core/src/agent.rs`）里那行 `agent` 命令补一句。不补的话模型得自己跑
+3. **提示词**：`compose_prompt`（`core/src/prompt.rs`）里那行 `agent` 命令补一句。不补的话模型得自己跑
    `agent help` 才发现，白花两轮。
 4. **量一下体量**：`cd core && cargo run -q --example dump_prompt`；
    线上那份看 `GET /api/debug/tools`（见 [docs/07](07-debugging.md)）。

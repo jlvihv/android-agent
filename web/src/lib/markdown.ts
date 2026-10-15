@@ -16,8 +16,8 @@
  *     按严格 CommonMark 拆开的话每一项都是"1."。
  *   - `snake_case` 里的下划线不算斜体。
  *   - 链接只放行 http/https/mailto/sandbox，其余（javascript: 之类）当普通文字。
- *   - `sandbox:/root/x.html` 指向沙箱里的文件，渲染时改写成 `/sandbox/root/x.html`
- *     （漏写 `sandbox:` 的裸绝对路径 `/root/x.png` 也按它算，见 `safeHref`）
+ *   - `preview:/root/x.html` 指向沙箱里的文件，渲染时改写成 `/sandbox/root/x.html`
+ *     （漏写 `preview:` 的裸绝对路径 `/root/x.png` 也按它算，见 `safeHref`）
  *     （服务端按路径直接映射），图片同理。
  */
 
@@ -289,10 +289,10 @@ export function safeHref(href: string): string | null {
   // 这几个不是「打开一个地址」，是拿页面的权限执行/读东西 —— 一律不渲染成链接
   if (/^(javascript|data|file|content|blob|about):/i.test(h)) return null;
   // 裸的绝对路径（`![](/Users/x/shot.jpg)`）就是沙箱里的文件：模型常漏写
-  // `sandbox:`，尤其是桌面宿主模式下截图不在 /workspace 里的时候 —— 不兜的话
+  // `preview:`，尤其是桌面宿主模式下截图不在 /workspace 里的时候 —— 不兜的话
   // 图片直接消失，只剩 alt。这个 App 里没有别的「站内相对路径」会出现在回复里。
   // `//host/…` 是协议相对的网址，不算。
-  if (/^\/(?!\/)/.test(h)) return `sandbox:${h}`;
+  if (/^\/(?!\/)/.test(h)) return `preview:${h}`;
   // 其余都放行：**用户点一个链接是明确的动作**，App 自定义 scheme
   // （`weixin://`、`androidamap://`、`tel:`…）就该交给系统去挑对应的 App。
   // 这条也是「模型把网址转述在回复里、用户自己点开」的前提 ——
@@ -340,13 +340,14 @@ export function sandboxPageUrl(url: string): string {
 }
 
 /**
- * `sandbox:` → 服务端的 `/sandbox/<钥匙>/…` 路径。不是 sandbox 链接返回 null。
+ * `preview:` → 服务端的 `/sandbox/<钥匙>/…` 路径。不是这种链接返回 null。
  *
- * 宽松接受几种写法：`sandbox:/root/a.html`、`sandbox:///root/a.html`、
- * `sandbox:a.html`（相对路径按 /workspace 算，和沙箱里的 cwd 一致）。
+ * 宽松接受几种写法：`preview:/root/a.html`、`preview:///root/a.html`、
+ * `preview:a.html`（相对路径按 /workspace 算，和沙箱里的 cwd 一致）。
+ * 旧的 `sandbox:` 也认：历史里存的、模型偶尔还这么写的，都还在。
  */
 export function sandboxUrl(href: string): string | null {
-  const m = /^sandbox:(.*)$/i.exec(href.trim());
+  const m = /^(?:preview|sandbox):(.*)$/i.exec(href.trim());
   if (!m) return null;
   let rest = m[1].replace(/^\/\/+/, '/');
   if (!rest.startsWith('/')) rest = '/workspace/' + rest;

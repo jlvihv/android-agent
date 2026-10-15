@@ -309,11 +309,11 @@ agent 在动作时右边一行小字「agent 操作中」；内容区上沿一�
 ## 13. 打开沙箱里的网页（以及它们的存储）
 
 AI 写了个静态网页，自己想看一眼：`agent browser navigate` 的 url 直接给沙箱路径 ——
-`sandbox:/workspace/site/index.html`（和回复里给用户的链接同一个写法），也认
-`sandbox:相对路径`、`file:///…` 和绝对路径 `/workspace/…`。`Core::browser` 把它换成
+`preview:/workspace/site/index.html`（和回复里给用户的链接同一个写法），也认
+`preview:相对路径`、`file:///…` 和绝对路径 `/workspace/…`。`Core::browser` 把它换成
 `http://sandbox.localhost:<端口>/sandbox/<钥匙>/workspace/site/index.html` 交给
-WebView，结果里出现的这种 URL 再换回 `sandbox:/…`（端口每次启动可能不同、钥匙
-不该进历史，模型记住稳定的写法）。`agent browser navigate sandbox:/…` 同样能用。
+WebView，结果里出现的这种 URL 再换回 `preview:/…`（端口每次启动可能不同、钥匙
+不该进历史，模型记住稳定的写法）。`agent browser navigate preview:/…` 同样能用（老的 `sandbox:` 也认）。
 
 ### 为什么是 `sandbox.localhost`，而不是和 App 同一个 `127.0.0.1`
 

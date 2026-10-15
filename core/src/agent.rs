@@ -21,6 +21,7 @@ use crate::openai::{
     ToolCall, Usage, UserContent,
 };
 use crate::platform::Platform;
+use crate::prompt;
 use crate::responses::{
     AssistantItem, FunctionCallItem, FunctionCallOutputItem, InputItem, InputPart, MessageContent,
     MessageItem, OutputPart, Reasoning, ResponsesRequest, ToolOutput,
@@ -49,62 +50,22 @@ pub fn tools(p: Platform) -> &'static [ToolSpec] {
 }
 
 fn build_tools(p: Platform) -> Vec<ToolSpec> {
+    // 文案和 schema 都在 `prompt` 里（改提示词不用翻这个文件）
     vec![
         ToolSpec {
             name: "read",
-            description: "读取文本或图片。读取文本时，输出截断到 2000 行或 50KB，被截断时末尾会写明用哪个 offset 续读；结果里的 totalLines / totalBytes 是整个文本文件的行数和字节数，据此决定继续读还是改用 bash 的 rg/sed 局部读。读取图片时（png/jpg/gif/webp/bmp）可能会缩放（offset/limit 对图片无效），结果里的 totalBytes 是原图片文件大小。".into(),
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "文件路径（相对或绝对；相对路径基于 /workspace）" },
-                        "offset": { "type": "integer", "description": "起始行号，从 1 开始（可选，默认 1）" },
-                        "limit": { "type": "integer", "description": "最多读取的行数（可选，默认读到截断上限）" },
-                        "numbered": { "type": "boolean", "description": "给每行加 cat -n 同款行号（可选，默认关）" }
-                    },
-                    "required": ["path"]
-                })
-            },
+            description: prompt::read_description(),
+            schema: prompt::read_schema,
         },
         ToolSpec {
             name: "bash",
-            description: bash_description(p),
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "command": { "type": "string", "description": "要执行的 shell 命令" },
-                        "timeout": { "type": "number", "description": "超时秒数（可选，默认 60，上限 86400）。" }
-                    },
-                    "required": ["command"]
-                })
-            },
+            description: prompt::bash_description(p),
+            schema: prompt::bash_schema,
         },
         ToolSpec {
             name: "edit",
-            description: "改文件：edits 做精确替换（一个或多个；相邻改动合并成一条，不要为了够到远处的改动而在 oldText 里塞大段没变的内容）。新建文件：只给 content（全文），文件已存在会报错。edits 与 content 互斥。".into(),
-            schema: || {
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "文件路径（相对或绝对；相对路径基于 /workspace）" },
-                        "edits": {
-                            "type": "array",
-                            "description": "一条或多条替换（改已有文件时用）",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "oldText": { "type": "string", "description": "要替换的原文；必须在原文件中唯一，且不能与其他 edits[].oldText 重叠" },
-                                    "newText": { "type": "string", "description": "替换成的内容" }
-                                },
-                                "required": ["oldText", "newText"]
-                            }
-                        },
-                        "content": { "type": "string", "description": "新文件的全文（新建时用；父目录会按需创建，文件已存在则报错）" }
-                    },
-                    "required": ["path"]
-                })
-            },
+            description: prompt::edit_description(),
+            schema: prompt::edit_schema,
         },
     ]
 }
@@ -602,166 +563,10 @@ impl SessionStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 提示词：缓存友好性
-// ---------------------------------------------------------------------------
-//
-// ⚠️ **系统提示词（`system_prompt(平台)`）必须是常量，任何时候都不能变。**
-// 它按平台由 `'static` 片段拼一次就冻结（见下面 `system_prompt`）——「常量」说的是
-// 同一个部署里字节不变，不是「源码里只能是一个字面量」。
-//
-// 原因：它是消息数组的第一个元素，而 prompt cache 是**按前缀**命中的。
-// 只要第一个字节变了，整个对话的缓存全部失效。
-// 按 OpenCode Go 的定价，DeepSeek V4.1 Flash 的输入 $0.30/M，
-// 缓存读取 $0.006/M —— 差 50 倍。把界面快照塞进 system prompt
-// 意味着屏幕每次一变就重算整个上下文。
-//
-// 所以：
-//   - 系统提示词：每个平台一份冻结的字符串，零运行时数据
-//   - 动态内容（界面快照、设备信息）：作为一个**独立消息**插在
-//     用户输入前面，只生成一次然后冻结进历史
-//   - 工具表：顺序固定，序列化字节完全确定
-//   - 会话 ID：开一次就不变（provider 靠它做缓存路由）
-//
-// 最终消息形状（前缀单调增长，每轮都能命中上一轮的前缀）：
-//
-//   [system: 系统提示词]              ← 永远不变
-//   [system: 上下文#1]                ← 第一轮生成后冻结
-//   [user:   U1]
-//   [assistant: ...]
-//   [tool: ...]
-//   [system: 上下文#2]                ← 第二轮才追加
-//   [user:   U2]
-//   ...
-
-/// 这个平台的系统提示词（每个平台拼一次，之后一直是同一个 `&'static str`）。
-///
-/// 为什么拼而不是写三个字面量：三份里绝大多数句子一字不差，只有「在哪跑、
-/// 有哪些门」那几处不同 —— 抄三遍的话，改一句共用规则得记着改三处，漏一处
-/// 几个平台干活的方式就开始漂。拼的输入全是 `'static` 片段，**没有运行时
-/// 数据**，所以同一个平台每次拼出来都是同一串字节，缓存前缀不受影响。
-pub fn system_prompt(p: Platform) -> &'static str {
-    static PROMPTS: [OnceLock<String>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    PROMPTS[p as usize].get_or_init(|| compose_prompt(Phrasing::of(p)))
-}
-
-/// 提示词和工具描述里**随平台变**的那几句。共用的句子只在 `compose_prompt` /
-/// `bash_description` 里写一份。
-struct Phrasing {
-    /// 第一句：你是谁、跑在哪
-    who: &'static str,
-    /// cwd / 文件放哪 / 能动用户的什么
-    files: &'static str,
-    /// `sandbox:` 链接那句的补充（手机上点外链能跳 App）
-    link_extra: &'static str,
-    /// `agent` 命令从哪来
-    cli_intro: &'static str,
-    /// 设备那一门：手机上是 `agent command`，电脑上是 `agent open`
-    cli_device: &'static str,
-    /// `agent browser` 背后是什么
-    browser: &'static str,
-    /// 截图去哪找
-    shots: &'static str,
-    /// 进程那一门（宿主模式写在 bash 描述里，这里空）
-    cli_procs: &'static str,
-    /// bash 工具描述的开头：在哪跑
-    bash_where: &'static str,
-    /// bash 工具描述：这台机器上有什么、怎么装东西
-    bash_env: &'static str,
-}
-
-const ANDROID: Phrasing = Phrasing {
-    who: "你是运行在安卓手机上的 Agent。",
-    files: "cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。成品放这里，按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。",
-    link_extra: "，也支持外部网页或 App 深链，用户点击时能用对应 App 打开",
-    cli_intro: "沙箱里的 `agent` 命令可查看/操作自己",
-    cli_device: "`agent command`（按键/点击/滑动/启动应用/打开 URI）",
-    browser: "真 WebView",
-    shots: "截图落 /root/.browser/，用 read 看",
-    cli_procs: "、`agent ps` / `agent kill <pid>`（看/停沙箱里还在跑的进程 —— 包括你自己用 `setsid` 放后台的常驻服务）",
-    bash_where: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。",
-    bash_env: "已预装 bash/curl/git/gh/jq/rg/fd/tree/unzip/python3/diff/patch。Python 包优先 `apk add py3-*`。",
-};
-
-/// Linux / macOS 宿主模式共用的部分（各自再盖掉不同的那几句）。
-const HOST: Phrasing = Phrasing {
-    who: "",
-    files: "cwd 是启动核心时的那个目录（`pwd` 就是它）；`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或真实路径。动用户的东西之前先说明，删除或覆盖先确认。",
-    // 不说这句它会以为只能链 /workspace 里的，先把截图拷进来再给链接
-    link_extra: "（`sandbox:` 后面任何绝对路径都行，截图不用先拷进来）",
-    cli_intro: "`agent` 命令（已在 PATH 里）可查看/操作自己",
-    cli_device: "`agent open <uri>`（用这台电脑的默认程序打开网页/文件）",
-    browser: "核心自己起的无头 Chrome",
-    shots: "截图路径在返回里，用 read 看",
-    cli_procs: "",
-    bash_where: "直接在这台电脑上跑 bash 命令（cwd=启动核心时的目录；每次新进程，shell 状态不持久）。",
-    bash_env: "",
-};
-
-const LINUX: Phrasing = Phrasing {
-    who: "你是运行在一台 Linux 电脑上的 Agent。",
-    bash_env: "用这台机器上已有的工具，装东西用它的包管理器（pacman/apt/dnf…）或 venv。",
-    ..HOST
-};
-
-/// `setsid` 在 macOS 上不是系统自带的 —— 是宿主模式垫在 PATH 里的
-/// （`linux::SETSID_SHIM`），所以后台服务的写法跟别处一样，不用另说。
-const MACOS: Phrasing = Phrasing {
-    who: "你是运行在一台 Mac（macOS）上的 Agent。",
-    // 不点这一句的话，模型几乎一定按 GNU 写，白白报错一轮
-    bash_env: "这是 BSD 用户态：`sed -i ''`、`date`、`stat`、`readlink -f`、`xargs` 的参数跟 GNU 不一样，拿不准先看 `man` 或用 python3；装东西用 brew 或 venv。",
-    ..HOST
-};
-
-impl Phrasing {
-    const fn of(p: Platform) -> &'static Phrasing {
-        match p {
-            Platform::Android => &ANDROID,
-            Platform::Linux => &LINUX,
-            Platform::Macos => &MACOS,
-        }
-    }
-}
-
-fn compose_prompt(t: &Phrasing) -> String {
-    format!(
-        "{who}\n\
-         \n\
-         - {files}\n\
-         - 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`{link_extra}；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
-         - {cli_intro}：`agent state|request|tools`、{cli_device}、`agent browser`（{browser}：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；{shots}）、`agent search`（联网搜索）{cli_procs}，`agent help` 看全部。\n\
-         - 一次回复里可以带多个工具调用：互不依赖的操作（比如一次新建好几个文件、跑几条互不相干的命令）合并到同一条回复里一起发，有依赖关系的才分成多轮。\n\
-         \n\
-         回答要言简意赅。",
-        who = t.who,
-        files = t.files,
-        link_extra = t.link_extra,
-        cli_intro = t.cli_intro,
-        cli_device = t.cli_device,
-        browser = t.browser,
-        shots = t.shots,
-        cli_procs = t.cli_procs,
-    )
-}
-
-/// `bash` 工具的描述：在哪跑 + 共用的输出规则 + 这台机器上有什么 +
-/// 后台服务怎么放、怎么收。
-fn bash_description(p: Platform) -> String {
-    let t = Phrasing::of(p);
-    format!(
-        "{where_}输出超过 2000 行或 50KB 时，给**首 100 行 + [省略 N 行] + 尾 100 行**，完整输出存临时文件并返回路径，要看中间那段就去 read 它。{env}后台常驻服务用 `setsid <命令> > /tmp/x.log 2>&1 &`（能活过这次调用；裸 `&` 起的会在超时/停止时被一起杀掉），之后 {procs} 看还剩什么、{kill} 停掉。",
-        where_ = t.bash_where,
-        env = t.bash_env,
-        procs = p.proc_tools(),
-        kill = p.kill_tool(),
-    )
-}
-
-/// 回合被打断时留下的工具调用结果。
-///
-/// 正常情况下停止会把没跑完的调用补上结果（见 `drive`），这里是兜底：
-/// 进程在两步之间被杀留下的会话。
-const INTERRUPTED: &str = r#"{"error":"没有结果：回合被中断（用户停止或 App 被关闭）"}"#;
+// 提示词（系统提示词 + 工具描述 + schema）都在 `prompt` 模块里，见那里的模块说明。
+// `system_prompt` 从这里再导出一次：`state.rs` / `http.rs` / dump_prompt 一直用的是
+// `agent::system_prompt`，没必要为了搬家把它们全改一遍。
+pub use crate::prompt::system_prompt;
 
 /// 历史 + 给没有结果的工具调用补上「被中断」。
 ///
@@ -790,7 +595,7 @@ fn with_tool_results(msgs: &[ChatMessage]) -> Vec<Cow<'_, ChatMessage>> {
         {
             out.push(Cow::Owned(ChatMessage::Tool {
                 tool_call_id: tc.id.clone(),
-                content: INTERRUPTED.to_string(),
+                content: prompt::INTERRUPTED.to_string(),
                 images: Vec::new(),
             }));
         }
@@ -829,7 +634,7 @@ fn close_dangling_tail(sess: &mut ChatSession) {
     for id in missing {
         sess.messages.push(ChatMessage::Tool {
             tool_call_id: id,
-            content: INTERRUPTED.to_string(),
+            content: prompt::INTERRUPTED.to_string(),
             images: Vec::new(),
         });
     }

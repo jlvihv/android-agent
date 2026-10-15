@@ -41,7 +41,7 @@ enum Mode {
    白名单正好相反：在家里电脑上，PATH / 代理 / `CARGO_HOME` 都得是用户自己的）。
    宿主模式不登记命令（`agent ps` 那套靠 proot 归因）。
 3. `resolve_path()`：`rootfs()` 是 `/`，于是沙箱内的绝对路径就是本机路径 ——
-   `read` / `edit` / `sandbox:` 链接那条路**一行都没改**；
+   `read` / `edit` / `preview:` 链接那条路**一行都没改**；
    `/workspace` 仍是 workspace 目录的别名。
 4. `prepare_rootfs()` / `is_ready()` / `is_provisioned()` / `has_bash()`：不往 `/`
    里写东西，不跑 `apk`；bash 用 PATH 里的。
@@ -95,7 +95,7 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 | 找局域网里的核心 | `avahi-browse -rp _agent-core._tcp` | `dns-sd` 要两个进程才问得全（`-B` 只给名字，地址和 TXT 还得再 `-L`），没验过的代码不写 | 这一侧没有自动发现：面板里**手输地址**（`desktop::browse` 直接返回 `None`，日志里说一句为什么） |
 
 数据目录仍是 `~/.local/share/android-agent`（`$XDG_DATA_HOME` 优先），**故意没用**
-`~/Library/Application Support`：截图路径会原样出现在 `read` / `![](sandbox:…)`
+`~/Library/Application Support`：截图路径会原样出现在 `read` / `![](preview:…)`
 里，路径带空格的话 Markdown 链接直接断。
 
 两个平台共用的顺手修复：
@@ -118,10 +118,10 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 - `Platform`（`core/src/platform.rs`）：`Android` / `Linux` / `Macos`。
   `AppState::platform()` 看沙箱形态定：宿主模式是这个二进制的桌面系统
   （`Platform::host()`，按编译目标），proot 沙箱或还没有沙箱都按手机算。
-- `agent::Phrasing`：提示词和 `bash` 工具描述里**随平台变**的那几句（你是谁、
+- `prompt::Phrasing`：提示词和 `bash` 工具描述里**随平台变**的那几句（你是谁、
   cwd 规则、设备那一门、浏览器背后是谁、这台机器上有什么）。三份是三个
   `const`，Linux / macOS 共用 `HOST` 再各盖几个字段。
-- `compose_prompt` / `bash_description`：共用的句子**只写一份**，按平台把片段
+- `prompt::compose_prompt` / `prompt::bash_description`：共用的句子**只写一份**，按平台把片段
   填进去；`system_prompt(p)` / `tools(p)` 每个平台拼一次就冻结在 `OnceLock` 里。
 - 「每个系统的事实」（看进程用 `pgrep -af` 还是 `pgrep -fl`、有没有 `ss`）在
   `Platform::proc_tools()` / `kill_tool()`，提示词、工具表、`agent ps` 的回话
@@ -318,7 +318,7 @@ AGENT_BIND=127.0.0.1 just dev-host
 
 - **没有审批环节**（铁律 7）：模型的所有命令直接执行，等于把这台机器交出去。
   要试大改动就用 `just dev`，那里坏了删 rootfs 就行。
-- `sandbox:` 链接这时映射的是**整台机器**的文件，只看那把随机的
+- `preview:` 链接这时映射的是**整台机器**的文件，只看那把随机的
   `sandbox_key`（同源拆分仍然挡着「AI 写的网页读 App 凭据」那条路）。
 - 点击 / 滑动 / 按键只有手机上有（无障碍那条路）；电脑上的设备只会打开东西、起应用。
 - 浏览器由**核心自己起**（第一次用到时才拉起无头 Chrome，退出时收掉）——

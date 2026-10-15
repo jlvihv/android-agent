@@ -22,7 +22,7 @@ use crate::state::{Command, DeviceApi};
 ///
 /// `$XDG_DATA_HOME/android-agent`，默认 `~/.local/share/android-agent` ——
 /// macOS 上也是这个，**故意不用** `~/Library/Application Support`：截图路径会原样
-/// 出现在 `read` / `![](sandbox:…)` 里，带空格的路径会让 Markdown 链接断掉。
+/// 出现在 `read` / `![](preview:…)` 里，带空格的路径会让 Markdown 链接断掉。
 /// 也故意不放进 `~/.local/bin` 那一类用户目录：这是我们自己的东西，不往用户的
 /// PATH 配置里塞。
 pub fn data_root() -> PathBuf {
