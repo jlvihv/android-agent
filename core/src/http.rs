@@ -1761,6 +1761,10 @@ async fn session_body(st: &AppState, id: &str, client_rev: &str) -> Value {
     // 排队等着交给模型的那些（界面上的「排队中」）。**每次都要带**：它们的变化
     // 不进 `rev`（那是消息的版本号），光看 rev 是看不出「这条交出去了」的。
     let queued = crate::agent::queued_view(&st.queued_list(id));
+    // token 用量（输入框那个上下文圆环）。`unchanged` 那条路不带它（它只在有 LLM
+    // 调用时才变，那时 rev 也一定变了）。在拿会话读锁**之前**取：缓存没命中时
+    // 要去阻塞池读库，别拿着锁等。
+    let usage = st.usage_of(id).await;
 
     let store = st.chat.read().await;
     let Some(sess) = store.get(id) else {
@@ -1774,10 +1778,6 @@ async fn session_body(st: &AppState, id: &str, client_rev: &str) -> Value {
     if !client_rev.is_empty() && client_rev == rev {
         return json!({ "unchanged": true, "queued": queued, "rev": rev, "busy": busy });
     }
-
-    // token 用量（输入框那个上下文圆环）。它只在有 LLM 调用时才变，
-    // 而那种时候 rev 也一定变了 —— 所以 `unchanged` 那条路不用带它。
-    let usage = st.usage_of(id);
 
     // 增量：客户端上次的 rev 里有 (会话 id, 已存消息数)。同一个会话、且它手上的
     // 消息数没超过当前（没被重置）→ 只补差的那段，见 `session_patch`。

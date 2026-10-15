@@ -2235,7 +2235,7 @@ async fn stream_one(
                 finish: finish.clone(),
                 ms: step_started.elapsed().as_millis() as u64,
             };
-            core.state.record_usage(&row, u);
+            core.state.record_usage(&row, u).await;
         }
 
         let mut calls: Vec<RecordedToolCall> = acc

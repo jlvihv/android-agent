@@ -168,6 +168,9 @@ struct Inner {
     saved: HashMap<String, Saved>,
     /// 上次落盘时的活动会话
     saved_active: Option<String>,
+    /// 水位线被整个换掉的次数（`load_sessions` / `wipe`）。`plan` 记下它，`write`
+    /// 时对不上就放弃这一份：那是对着旧水位线算出来的。
+    generation: u64,
 }
 
 /// 一个会话上次落盘时的状态。和内存里一样就整条跳过（不发任何 SQL）。
@@ -194,6 +197,35 @@ impl Saved {
     }
 }
 
+/// 一次落盘要写的东西（`Db::plan` 算、`Db::write` 写）。
+pub struct SyncPlan {
+    generation: u64,
+    sessions: Vec<PlannedSession>,
+    gone: Vec<String>,
+    /// 活动会话变了才有
+    active: Option<String>,
+}
+
+struct PlannedSession {
+    id: String,
+    title: String,
+    created_at: u64,
+    updated_at: u64,
+    provider_session: String,
+    /// 消息不在内存里的会话只更新会话头：`None`
+    messages: Option<PlannedMessages>,
+    /// 写成之后的水位线
+    saved: Saved,
+}
+
+struct PlannedMessages {
+    /// 先把这个会话库里的消息全删了（清空过）
+    rewrite: bool,
+    /// `rows[0]` 的 seq
+    from: usize,
+    rows: Vec<String>,
+}
+
 pub struct Db {
     inner: Mutex<Inner>,
 }
@@ -210,6 +242,7 @@ impl Db {
                 conn,
                 saved: HashMap::new(),
                 saved_active: None,
+                generation: 0,
             }),
         })
     }
@@ -223,6 +256,7 @@ impl Db {
                 conn,
                 saved: HashMap::new(),
                 saved_active: None,
+                generation: 0,
             }),
         })
     }
@@ -310,6 +344,7 @@ impl Db {
         };
 
         // 水位线 = 刚读出来的样子，这样下次 sync 只写新增的
+        g.generation += 1;
         g.saved.clear();
         for s in &store.sessions {
             g.saved.insert(s.id.clone(), Saved::of(s));
@@ -386,8 +421,20 @@ impl Db {
     /// `messages[水位线..]` —— 这是用 SQLite 而不是 JSON 的全部意义所在。
     /// 给**每个**会话都发一条 UPSERT、再拼一条 `NOT IN (全部 id)` 的话，
     /// 会话一多就是每 2 秒白写一遍。
+    ///
+    /// 分两步（`plan` + `write`）：调用方拿着会话的读锁时只做 `plan`（比对 + 序列化），
+    /// 放开锁再 `write`。写盘（事务 + fsync，手机闪存上可能几十毫秒）期间回合照样能
+    /// 往会话里追加 —— 不然每 2 秒回合就要等一次盘。
     pub fn sync(&self, store: &SessionStore) -> Result<()> {
-        let mut g = self
+        match self.plan(store)? {
+            Some(p) => self.write(p),
+            None => Ok(()),
+        }
+    }
+
+    /// 算出这一次要写什么（不碰盘）。没什么要写的是 `None`。
+    pub fn plan(&self, store: &SessionStore) -> Result<Option<SyncPlan>> {
+        let g = self
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
@@ -395,25 +442,81 @@ impl Db {
         // 空会话不落盘（也把它上次可能写进去的旧行清掉，见下面的 gone）：
         // 「新对话」点了没说话、或 `/api/reset` 清空过，重启后不该又冒出来。
         let keep: Vec<&ChatSession> = store.sessions.iter().filter(|s| s.has_content()).collect();
-        let changed: Vec<&ChatSession> = keep
-            .iter()
-            .copied()
-            .filter(|s| g.saved.get(&s.id) != Some(&Saved::of(s)))
-            .collect();
         let gone: Vec<String> = g
             .saved
             .keys()
             .filter(|id| !keep.iter().any(|s| &s.id == *id))
             .cloned()
             .collect();
-        let active_changed = g.saved_active.as_deref() != Some(store.active.as_str());
-        if changed.is_empty() && gone.is_empty() && !active_changed {
-            return Ok(());
+        let active = (g.saved_active.as_deref() != Some(store.active.as_str()))
+            .then(|| store.active.clone());
+
+        let mut sessions = Vec::new();
+        for s in keep {
+            let now = Saved::of(s);
+            let prev = g.saved.get(&s.id);
+            if prev == Some(&now) {
+                continue;
+            }
+            // 会话被清空过（/api/reset）：消息变少了。不处理的话水位线还停在
+            // 旧长度，新消息的 seq 从 0 开始会被跳过不落盘，而库里的旧消息还在 ——
+            // 重启后清掉的对话又回来了。变少只可能是整个清空过，前缀也不可信，整段重写。
+            //
+            // 消息不在内存里的会话只可能改了会话头（改名、换 provider session），
+            // 消息一条都不能动 —— 空的 `messages` 在这里会被当成「清空过」。
+            let messages = if s.resident() {
+                let mut from = prev.map(|x| x.len).unwrap_or(0);
+                let rewrite = s.messages.len() < from || prev.is_some_and(|x| x.epoch != s.epoch);
+                if rewrite {
+                    from = 0;
+                }
+                let rows = s.messages[from.min(s.messages.len())..]
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<serde_json::Result<Vec<_>>>()?;
+                Some(PlannedMessages {
+                    rewrite,
+                    from,
+                    rows,
+                })
+            } else {
+                None
+            };
+            sessions.push(PlannedSession {
+                id: s.id.clone(),
+                title: s.title.clone(),
+                created_at: s.created_at,
+                updated_at: s.updated_at,
+                provider_session: s.provider_session.clone(),
+                messages,
+                saved: now,
+            });
         }
 
-        let saved = g.saved.clone();
+        if sessions.is_empty() && gone.is_empty() && active.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(SyncPlan {
+            generation: g.generation,
+            sessions,
+            gone,
+            active,
+        }))
+    }
+
+    /// 把 `plan` 算好的写进库，水位线记成**算计划那一刻**的样子（不是现在内存里的）。
+    pub fn write(&self, plan: SyncPlan) -> Result<()> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        anyhow::ensure!(
+            g.generation == plan.generation,
+            "算计划之后库被重置过，这一份作废（下次重来）"
+        );
+
         let tx = g.conn.transaction()?;
-        for s in &changed {
+        for s in &plan.sessions {
             tx.execute(
                 "INSERT INTO sessions(id, title, created_at, updated_at, provider_session)
                  VALUES(?1, ?2, ?3, ?4, ?5)
@@ -429,55 +532,44 @@ impl Db {
                     s.provider_session
                 ],
             )?;
-
-            let prev = saved.get(&s.id);
-            let mut done = prev.map(|x| x.len).unwrap_or(0);
-            // 会话被清空过（/api/reset）：消息变少了。不处理的话 done 还停在
-            // 旧长度，新消息的 seq 从 0 开始会被 skip(done) 全部跳过不落盘，
-            // 而库里的旧消息还在 —— 重启后清掉的对话又回来了。
-            // 变少只可能是整个清空过，前缀也不可信，整段重写。
-            //
-            // 消息不在内存里的会话只可能改了会话头（改名、换 provider session），
-            // 消息一条都不能动 —— 空的 `messages` 在这里会被当成「清空过」。
-            if !s.resident() {
-                continue;
-            }
-            if s.messages.len() < done || prev.is_some_and(|x| x.epoch != s.epoch) {
+            let Some(m) = &s.messages else { continue };
+            if m.rewrite {
                 tx.execute("DELETE FROM messages WHERE session_id = ?1", [&s.id])?;
-                done = 0;
             }
-            if s.messages.len() > done {
+            if !m.rows.is_empty() {
                 let mut ins = tx.prepare(
                     "INSERT OR REPLACE INTO messages(session_id, seq, payload) VALUES(?1, ?2, ?3)",
                 )?;
-                for (i, m) in s.messages.iter().enumerate().skip(done) {
-                    ins.execute(params![s.id, i as i64, serde_json::to_string(m)?])?;
+                for (i, row) in m.rows.iter().enumerate() {
+                    ins.execute(params![s.id, (m.from + i) as i64, row])?;
                 }
             }
         }
 
         // 删掉的会话（以及变空的会话），连带消息一起清
-        for id in &gone {
+        for id in &plan.gone {
             tx.execute("DELETE FROM messages WHERE session_id = ?1", [id])?;
             tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         }
 
-        if active_changed {
+        if let Some(active) = &plan.active {
             tx.execute(
                 "INSERT INTO meta(k, v) VALUES('active', ?1)
                  ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                [&store.active],
+                [active],
             )?;
         }
         tx.commit()?;
 
-        for s in &changed {
-            g.saved.insert(s.id.clone(), Saved::of(s));
+        for s in plan.sessions {
+            g.saved.insert(s.id, s.saved);
         }
-        for id in &gone {
+        for id in &plan.gone {
             g.saved.remove(id);
         }
-        g.saved_active = Some(store.active.clone());
+        if let Some(active) = plan.active {
+            g.saved_active = Some(active);
+        }
         Ok(())
     }
 
@@ -823,6 +915,7 @@ impl Db {
         g.conn.execute_batch(
             "DELETE FROM sessions; DELETE FROM messages; DELETE FROM meta WHERE k = 'active';",
         )?;
+        g.generation += 1;
         g.saved.clear();
         g.saved_active = None;
         Ok(())
@@ -917,6 +1010,37 @@ mod tests {
             }
         }
         st
+    }
+
+    /// 落盘分两步（算计划时拿着会话锁，写盘时不拿）：计划之后又追加的消息不能丢，
+    /// 也不能被当成「已经落盘了」—— 不然放掉内存（`is_synced`）时就真丢了。
+    #[test]
+    fn messages_added_after_planning_are_written_next_time() {
+        let db = Db::in_memory().unwrap();
+        let mut st = store_with(1, 2);
+        let plan = db.plan(&st).unwrap().unwrap();
+        st.sessions[0].messages.push(msg_user("计划之后来的"));
+        db.write(plan).unwrap();
+        assert!(
+            !db.is_synced(&st.sessions[0]),
+            "水位线是计划那一刻的，不是现在的"
+        );
+
+        db.sync(&st).unwrap();
+        assert!(db.is_synced(&st.sessions[0]));
+        let id = st.sessions[0].id.clone();
+        assert_eq!(db.load_messages(&id).unwrap().len(), 3);
+    }
+
+    /// 计划和写盘之间库被清空过：那份计划是对着旧水位线算的，写进去就把清掉的又写回来了。
+    #[test]
+    fn a_plan_made_before_a_wipe_is_discarded() {
+        let db = Db::in_memory().unwrap();
+        let st = store_with(1, 2);
+        let plan = db.plan(&st).unwrap().unwrap();
+        db.wipe().unwrap();
+        assert!(db.write(plan).is_err());
+        assert!(db.load().unwrap().sessions.is_empty());
     }
 
     #[test]

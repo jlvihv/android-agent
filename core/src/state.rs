@@ -337,11 +337,10 @@ pub struct AppState {
     /// 不靠这个 map 了。
     /// 值里带上传时刻：放太久没发的会被清掉（`add_pending_attachment`）。
     pub pending_attachments: Mutex<HashMap<String, (std::time::Instant, crate::agent::Attachment)>>,
-    /// 每个会话的 token 用量（输入框上那个上下文圆环）。**只在内存里**。
+    /// 每个会话的 token 用量（输入框上那个上下文圆环）：库里 `usage` 表的内存缓存。
     ///
-    /// 不落盘：它是「现在这个上下文用了多少」的仪表盘，重启后从下一次
-    /// LLM 调用重新数就行 —— 为它去动会话的存储格式不值当。
-    pub usage: Mutex<HashMap<String, UsageStats>>,
+    /// `None` 也缓存（「这个会话一次都没调用过」）：不然没跑过的会话每次轮询都要查一次库。
+    pub usage: Mutex<HashMap<String, Option<UsageStats>>>,
 }
 
 impl AppState {
@@ -1088,40 +1087,50 @@ impl AppState {
 
     /// 记一次 LLM 调用的用量（`agent.rs` 每步结束时调）：进库（`usage` 表，一步一行，
     /// 拿来分析的），也加到内存里那份（输入框那个上下文圆环读它）。
-    pub fn record_usage(&self, row: &crate::db::UsageRow, u: &crate::openai::Usage) {
-        let db = self.db();
+    ///
+    /// 库的读写都丢给阻塞池：库锁和定时落盘是同一把，落盘在写大事务时，
+    /// 直接在这里等会占住一个 worker。
+    pub async fn record_usage(&self, row: &crate::db::UsageRow, u: &crate::openai::Usage) {
+        // 内存里还没有（重启后头一次）：先从库里接上之前的，**再**写这一行 —— 反过来就算两遍
+        let base = self.usage_of(&row.session_id).await;
         if let Ok(mut g) = self.usage.lock() {
-            // 内存里还没有（重启后头一次）：先从库里接上之前的，**再**写这一行 —— 反过来就算两遍
             g.entry(row.session_id.clone())
-                .or_insert_with(|| {
-                    Self::usage_in_db(db.as_deref(), &row.session_id).unwrap_or_default()
-                })
+                .or_insert(base)
+                .get_or_insert_with(UsageStats::default)
                 .add(u);
         }
-        if let Some(db) = db {
-            if let Err(e) = db.add_usage(row) {
-                tracing::warn!("用量没记进库：{e:#}");
-            }
+        let Some(db) = self.db() else { return };
+        let row = row.clone();
+        let r = tokio::task::spawn_blocking(move || db.add_usage(&row)).await;
+        match r {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("用量没记进库：{e:#}"),
+            Err(e) => tracing::warn!("用量没记进库：{e}"),
         }
     }
 
     /// 这个会话的用量（上次清空之后；没跑过就是 `None`）。内存里没有就去库里读 ——
     /// 核心重启之后圆环接着显示，不用等下一次调用。
-    pub fn usage_of(&self, sid: &str) -> Option<UsageStats> {
-        let mut g = self.usage.lock().ok()?;
-        if let Some(u) = g.get(sid) {
-            return Some(u.clone());
+    pub async fn usage_of(&self, sid: &str) -> Option<UsageStats> {
+        if let Some(u) = self.usage.lock().ok()?.get(sid) {
+            return u.clone();
         }
-        let u = Self::usage_in_db(self.db().as_deref(), sid)?;
-        g.insert(sid.to_string(), u.clone());
-        Some(u)
-    }
-
-    fn usage_in_db(db: Option<&Db>, sid: &str) -> Option<UsageStats> {
-        db?.session_usage(sid)
-            .map_err(|e| tracing::warn!("读用量失败：{e:#}"))
-            .ok()
-            .flatten()
+        let u = match self.db() {
+            Some(db) => {
+                let sid = sid.to_string();
+                tokio::task::spawn_blocking(move || db.session_usage(&sid))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r)
+                    .map_err(|e| tracing::warn!("读用量失败：{e:#}"))
+                    .ok()
+                    .flatten()
+            }
+            None => None,
+        };
+        // 读库那会儿 `record_usage` 可能已经记上了：以内存里的为准
+        let mut g = self.usage.lock().ok()?;
+        g.entry(sid.to_string()).or_insert(u).clone()
     }
 
     /// 会话没了：内存里那份扔掉。库里的行**留着**（分析用，见 db.rs 的 `usage` 表）。
@@ -1133,12 +1142,13 @@ impl AppState {
 
     /// 会话清空了：之前的用量不再算「当前上下文」。库里的行标成清掉了（不删）。
     pub fn clear_usage(&self, sid: &str) {
-        self.forget_usage(sid);
+        // 先改库再清内存：反过来的话，中间插进来的 `usage_of` 会把库里的旧值缓存回去
         if let Some(db) = self.db() {
             if let Err(e) = db.clear_usage(sid) {
                 tracing::warn!("标记用量失败：{e:#}");
             }
         }
+        self.forget_usage(sid);
     }
 
     pub fn mark_sessions_dirty(&self) {
@@ -1208,11 +1218,18 @@ impl AppState {
         if !self.sessions_loaded.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let store = self
-            .chat
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("会话被占用，跳过本次落盘"))?;
-        db.sync(&store)
+        // 读锁只拿到算完计划（比对 + 序列化）：写盘的时候回合照样能往会话里追加
+        let plan = {
+            let store = self
+                .chat
+                .try_read()
+                .map_err(|_| anyhow::anyhow!("会话被占用，跳过本次落盘"))?;
+            db.plan(&store)?
+        };
+        match plan {
+            Some(p) => db.write(p),
+            None => Ok(()),
+        }
     }
 
     pub fn llm(&self) -> Option<Provider> {
@@ -1616,11 +1633,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn usage_is_per_session_and_accumulates() {
+    #[tokio::test]
+    async fn usage_is_per_session_and_accumulates() {
         use crate::openai::{PromptTokensDetails, Usage};
         let st = AppState::new();
-        assert!(st.usage_of("a").is_none(), "没跑过就是 None");
+        assert!(st.usage_of("a").await.is_none(), "没跑过就是 None");
 
         let u1 = Usage {
             prompt_tokens: 1000,
@@ -1631,8 +1648,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        st.record_usage(&usage_row("a"), &u1);
-        let s = st.usage_of("a").unwrap();
+        st.record_usage(&usage_row("a"), &u1).await;
+        let s = st.usage_of("a").await.unwrap();
         assert_eq!((s.input, s.output, s.cached, s.calls), (1000, 50, 800, 1));
         assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1000);
 
@@ -1644,16 +1661,16 @@ mod tests {
             prompt_cache_hit_tokens: Some(1400),
             ..Default::default()
         };
-        st.record_usage(&usage_row("a"), &u2);
-        let s = st.usage_of("a").unwrap();
+        st.record_usage(&usage_row("a"), &u2).await;
+        let s = st.usage_of("a").await.unwrap();
         assert_eq!((s.input, s.output, s.cached, s.calls), (2500, 70, 2200, 2));
         assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1500);
 
-        assert!(st.usage_of("b").is_none(), "另外那个会话不受影响");
+        assert!(st.usage_of("b").await.is_none(), "另外那个会话不受影响");
 
         // 会话删了 / 被清空 → 它的用量不该留着
         st.forget_usage("a");
-        assert!(st.usage_of("a").is_none());
+        assert!(st.usage_of("a").await.is_none());
     }
 
     fn usage_row(sid: &str) -> crate::db::UsageRow {
@@ -1667,8 +1684,8 @@ mod tests {
 
     /// 用量进库：核心重启（同一个库、新的 AppState）之后圆环接着显示，接着累加时
     /// 不把库里那几步再算一遍；清空会话之后从零算。
-    #[test]
-    fn usage_survives_a_restart_and_clearing_starts_from_zero() {
+    #[tokio::test]
+    async fn usage_survives_a_restart_and_clearing_starts_from_zero() {
         use crate::openai::Usage;
         let db = Arc::new(Db::in_memory().unwrap());
         let with_db = || {
@@ -1692,30 +1709,30 @@ mod tests {
 
         let st = with_db();
         let (r, u) = step(1000, 50);
-        st.record_usage(&r, &u);
+        st.record_usage(&r, &u).await;
         let (r, u) = step(1500, 20);
-        st.record_usage(&r, &u);
+        st.record_usage(&r, &u).await;
 
         // 「重启」：内存里什么都没有，从库里接上
         let st = with_db();
-        let s = st.usage_of("a").expect("库里有");
+        let s = st.usage_of("a").await.expect("库里有");
         assert_eq!((s.input, s.output, s.calls), (2500, 70, 2));
         assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1500);
 
         // 重启后**没先问过** usage_of 就来了一步：也得先接上库里的，再加这一步
         let st = with_db();
         let (r, u) = step(2000, 10);
-        st.record_usage(&r, &u);
-        let s = st.usage_of("a").unwrap();
+        st.record_usage(&r, &u).await;
+        let s = st.usage_of("a").await.unwrap();
         assert_eq!((s.input, s.calls), (4500, 3), "不多算、不漏算");
 
         // 清空会话：圆环从零开始；重启之后也一样
         st.clear_usage("a");
-        assert!(st.usage_of("a").is_none());
-        assert!(with_db().usage_of("a").is_none());
+        assert!(st.usage_of("a").await.is_none());
+        assert!(with_db().usage_of("a").await.is_none());
         let (r, u) = step(300, 5);
-        st.record_usage(&r, &u);
-        let s = with_db().usage_of("a").unwrap();
+        st.record_usage(&r, &u).await;
+        let s = with_db().usage_of("a").await.unwrap();
         assert_eq!((s.input, s.calls), (300, 1));
     }
 
