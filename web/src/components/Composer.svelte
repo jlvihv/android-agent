@@ -74,6 +74,11 @@
 
   function onkeydown(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
+      // 中文 / 日文输入法：拼音打完按回车是**选词**，不是「发送」。
+      // 那一下浏览器照样发 keydown（合成期间 isComposing=true，
+      // 部分输入法走 keyCode 229）—— 不拦的话半截话就被发出去了。
+      // 桌面浏览器用拼音输入时必现，安卓 WebView 上部分输入法（Gboard 等）也是。
+      if (e.isComposing || e.keyCode === 229) return;
       e.preventDefault();
       if (canSend) send();
     }
