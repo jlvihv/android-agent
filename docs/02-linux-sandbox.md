@@ -522,8 +522,9 @@ APK 里带的 minirootfs 只在**第一次安装**时解压（`RootfsInstaller` 
 
 ## 每个会话一个自己的工作目录
 
-命令的 cwd 不是 `/workspace` 根，而是 **`/workspace/<6 位短名>`**
-（`linux::session_guest_dir`）—— 会话之间天生互不干扰，新会话从空目录开始。
+沙箱里（手机，以及桌面上模拟手机的 `just dev`）命令的 cwd 不是 `/workspace` 根，
+而是 **`/workspace/<6 位短名>`**（`linux::session_guest_dir`）—— 会话之间天生互不
+干扰，新会话从空目录开始。**宿主模式（电脑上）不分**，见下表。
 
 为什么不是「提示词里写规矩」：规矩是软的，模型忙着干活时不会记得；试过一版提示词
 （「一个任务一个子目录、根目录别堆散文件」），而真机上 `/workspace` 根目录还是攒了
@@ -536,11 +537,11 @@ APK 里带的 minirootfs 只在**第一次安装**时解压（`RootfsInstaller` 
 |---|---|
 | 名字怎么来 | 会话 id 走一遍 FNV-1a + splitmix64 收尾，取 6 个字符（字母表去掉 `i l o 0 1`）。**不是** `DefaultHasher` —— 它的算法 Rust 不保证跳版本还是同一套，而这个目录名必须跳重启、跳升级都是同一个 |
 | 什么时候建 | 每次跑命令前 `create_dir_all`（已经在了就是一次 stat）。proot 的 `-w` 指向不存在的目录会**直接失败** |
-| 两个门得一致 | `bash` 的 cwd 和 `read` / `edit` 的相对路径基准都是它（`agent.rs::in_cwd`）。不一样就是最难查的那种坑：同一个相对路径、两个工具两个结果 |
+| 两个门得一致 | `bash` 的 cwd 和 `read` / `edit` 的相对路径基准都走 `LinuxSandbox::session_cwd`（`agent.rs::in_cwd`）。不一样就是最难查的那种坑：同一个相对路径、两个工具两个结果 |
 | 没挂存储时 | 退回 `/workspace` 根 —— 那时会话目录根本建不出来 |
-| `AGENT_WORKDIR` | 每次跑命令注入（guest 路径，宿主模式下就是宿主路径）。`agent screenshot` 靠它把图落到本会话目录的 `screenshots/` 下 |
+| `AGENT_WORKDIR` | 每次跑命令注入（沙箱里是会话目录的 guest 路径，宿主模式下是 workspace 的真路径）。`agent screenshot` 靠它把图落到本会话目录的 `screenshots/` 下 |
 | 终端页 | `/api/linux` 没有会话概念，传 `None` → 还是 `/workspace` 根 |
-| 宿主模式 | 一视同仁：`<AGENT_HOST_WORKSPACE>/<短名>`（`.gitignore` 里有 `/??????/`） |
+| 宿主模式 | **不分会话目录**，cwd 就是 `AGENT_HOST_WORKSPACE`（启动核心的那个目录，提示词里也是这么说的）。那里通常是用户的项目，模型要改的就是它：以前一视同仁套一层 `<短名>/`，`read core/src/x.rs` 就落到 `<项目>/ph7ah4/core/src/x.rs` 去 —— 找不到，还在项目里建出空目录 |
 | **提示词里不写具体目录名** | 每个会话的目录都不一样，写进提示词就等于给每个会话一份不同的 system prompt —— 前缀缓存全废（[docs/03](03-prompt-cache.md)）。所以只说「cwd 是你这个会话自己的目录（`pwd` 看名字）」 |
 
 旧的 `/workspace` 根目录里那些东西不会动（用户的文件）—— 新会话只是不再往那儿堆了。

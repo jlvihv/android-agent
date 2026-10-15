@@ -169,15 +169,6 @@ pub fn session_guest_dir(sid: &str) -> String {
     format!("{WORKSPACE}/{}", session_dir_name(sid))
 }
 
-/// 注入给命令的 `AGENT_WORKDIR` 值（`host` = 宿主模式下它就是宿主路径本身）。
-fn session_workdir(session: Option<&str>, host: bool) -> String {
-    match session {
-        Some(sid) if host => session_dir_name(sid),
-        Some(sid) => session_guest_dir(sid),
-        None => WORKSPACE.to_string(),
-    }
-}
-
 /// 手机内部存储整个挂在这里（`/storage/emulated/0`）
 pub const SHARED: &str = "/sdcard";
 
@@ -2386,19 +2377,14 @@ impl LinuxSandbox {
         let (exit_dir, exit_guest) = self.layout().exit;
         let status = StatusFile::new(&exit_dir, &exit_guest);
 
-        // cwd：会话自己的目录（手机/桌面都一样）。目录得**先建好** —— proot 的
-        // `-w` 指向一个不存在的目录时会直接失败，而 `mkdir` 每次跑一遍也就是一次
-        // stat（已经在了就什么都不做）。
+        // cwd：沙箱里是会话自己的目录，宿主模式是 workspace 本身（见 `session_cwd`）。
+        // 会话目录得**先建好** —— proot 的 `-w` 指向一个不存在的目录时会直接失败，
+        // 而 `mkdir` 每次跑一遍也就是一次 stat（已经在了就什么都不做）。
         let host_cwd = session.and_then(|sid| self.session_host_dir(sid));
         if let Some(d) = &host_cwd {
             let _ = std::fs::create_dir_all(d);
         }
-        // 没挂共享存储（没给「所有文件访问权限」）时退回去：那时会话目录根本建不出来，
-        // 而 proot 的 `-w` 指向一个不存在的目录会**直接失败**。
-        let cwd = match session {
-            Some(sid) if host_cwd.is_some() => session_guest_dir(sid),
-            _ => WORKSPACE.to_string(),
-        };
+        let cwd = self.session_cwd(session);
         let argv = self.command_line(script, &status.guest, &cwd);
         let using_bash = self.has_bash();
         let (bin, args) = argv.split_first().expect("command_line 至少有一个元素");
@@ -2407,13 +2393,13 @@ impl LinuxSandbox {
         cmd.args(args);
         match &self.mode {
             Mode::Host { workspace } => {
-                // cwd 是 workspace（宿主模式没有沙箱，会话目录就是它下面的 sessions/…），
+                // cwd 就是 workspace（宿主模式不分会话目录，见 `session_cwd`），
                 // 环境是**宿主的**（见 `host_env`）
-                cmd.current_dir(host_cwd.unwrap_or_else(|| workspace.clone()));
+                cmd.current_dir(workspace);
                 cmd.envs(self.host_env());
                 // 命令自己看「我在哪个目录」：设备命令（比如 `agent screenshot`）
-                // 靠它决定东西往哪落
-                cmd.env("AGENT_WORKDIR", session_workdir(session, true));
+                // 靠它决定东西往哪落。宿主模式下给的是真路径
+                cmd.env("AGENT_WORKDIR", workspace);
             }
             Mode::Proot(cfg) => {
                 cmd.env_clear();
@@ -2607,12 +2593,29 @@ impl LinuxSandbox {
     // 文件访问
     // -----------------------------------------------------------------------
 
-    /// 某个会话的工作目录在**宿主**上对应哪里（不存在就返回 None）。
+    /// 某个会话的工作目录在**宿主**上对应哪里。`None` = 这个会话没有自己的目录：
+    ///
+    /// - **宿主模式**（电脑上直接跑）：从来不分。workspace 就是用户启动核心的那个
+    ///   目录（通常是一个项目），模型要改的就是它；再套一层 `ph7ah4/` 只会让
+    ///   `read core/src/x.rs` 落到 `<项目>/ph7ah4/core/src/x.rs` 去 —— 找不到，
+    ///   还在用户的项目里建出一个空目录。
+    /// - 沙箱没挂 workspace（安卓上没给「所有文件访问权限」）：会话目录建不出来。
     pub fn session_host_dir(&self, sid: &str) -> Option<PathBuf> {
-        let name = session_dir_name(sid);
         match &self.mode {
-            Mode::Proot(cfg) => cfg.workspace.as_ref().map(|w| w.join(&name)),
-            Mode::Host { workspace } => Some(workspace.join(name)),
+            Mode::Proot(cfg) => cfg.workspace.as_ref().map(|w| w.join(session_dir_name(sid))),
+            Mode::Host { .. } => None,
+        }
+    }
+
+    /// 命令和 `read` / `edit` 的 cwd（沙箱里的路径）。**两个门都走这里**：模型在 bash
+    /// 里 `pwd` 看到哪，`read x.txt` 就得去哪找 —— 不然同一个相对路径两个工具两个结果。
+    ///
+    /// 有会话目录（见 `session_host_dir`）就是它，否则是 `/workspace` 根
+    /// （宿主模式下 `/workspace` 是 workspace 的别名）。
+    pub fn session_cwd(&self, session: Option<&str>) -> String {
+        match session {
+            Some(sid) if self.session_host_dir(sid).is_some() => session_guest_dir(sid),
+            _ => WORKSPACE.to_string(),
         }
     }
 
@@ -4799,13 +4802,13 @@ mod tests {
         assert_eq!(guest, format!("/workspace/{}", session_dir_name(sid)), "{guest}");
     }
 
-    /// 宿主模式下真跑一遍：`pwd` 是会话目录，文件也真的落在那里。
+    /// 宿主模式（电脑上）**不分会话目录**：`pwd` 就是 workspace，文件落在它下面，
+    /// 不会在用户的项目里建出 `ph7ah4/` 这种目录；`read` / `edit` 的 cwd 也是根。
     #[tokio::test]
-    async fn running_a_command_lands_in_the_session_dir() {
+    async fn host_mode_runs_in_the_workspace_itself() {
         let t = TempRoot::new("sessioncwd");
         let sb = LinuxSandbox::host(t.dir.clone());
         let sid = "0199e1f0-aaaa-7000-8000-000000000001";
-        let name = session_dir_name(sid);
 
         let r = sb
             .run(
@@ -4815,22 +4818,43 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(r.stdout.contains(&name), "pwd 没落在会话目录里：{}", r.stdout);
-        // 设备命令（截图那些）靠它决定东西往哪落
-        assert!(r.stdout.contains("WORKDIR="), "{}", r.stdout);
-
-        let dir = t.dir.join(&name);
+        let mut lines = r.stdout.lines();
+        let pwd = std::fs::canonicalize(lines.next().unwrap().trim()).unwrap();
+        let root = std::fs::canonicalize(&t.dir).unwrap();
+        assert_eq!(pwd, root, "宿主模式的 cwd 应该就是 workspace");
+        // 设备命令（截图那些）靠它决定东西往哪落：宿主模式给真路径
+        let workdir = lines.next().unwrap().trim_start_matches("WORKDIR=");
+        assert_eq!(std::fs::canonicalize(workdir).unwrap(), root);
+        assert!(t.dir.join("落在这里.txt").is_file());
         assert!(
-            dir.join("落在这里.txt").is_file(),
-            "文件没落在 {}",
-            dir.display()
+            !t.dir.join(session_dir_name(sid)).exists(),
+            "宿主模式不该建会话目录"
         );
+        assert_eq!(sb.session_cwd(Some(sid)), WORKSPACE);
 
-        // 不带会话（终端页那种调用）就退回工作目录本身（宿主模式没有 /workspace
-        // 这个概念，那是沙箱里的挂载点）
-        let r2 = sb.run("pwd", Duration::from_secs(10), None).await.unwrap();
-        let got = std::fs::canonicalize(r2.stdout.trim()).unwrap();
-        assert_eq!(got, std::fs::canonicalize(&t.dir).unwrap());
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    /// 沙箱（手机）挂了 workspace：每个会话一个自己的目录，bash 和 read/edit 一致。
+    #[test]
+    fn sandbox_sessions_get_their_own_dir() {
+        let t = TempRoot::new("sandboxcwd");
+        let mut sb = t.sandbox();
+        let sid = "0199e1f0-aaaa-7000-8000-000000000001";
+        let Mode::Proot(cfg) = &mut sb.mode else {
+            panic!("t.sandbox() 应该是 proot")
+        };
+        cfg.workspace = None;
+        assert_eq!(sb.session_cwd(Some(sid)), WORKSPACE, "没挂 workspace 就退回根");
+
+        let Mode::Proot(cfg) = &mut sb.mode else { unreachable!() };
+        cfg.workspace = Some(t.dir.join("ws"));
+        assert_eq!(sb.session_cwd(Some(sid)), session_guest_dir(sid));
+        assert_eq!(sb.session_cwd(None), WORKSPACE);
+        assert_eq!(
+            sb.session_host_dir(sid),
+            Some(t.dir.join("ws").join(session_dir_name(sid)))
+        );
 
         let _ = std::fs::remove_dir_all(&t.dir);
     }

@@ -2561,10 +2561,14 @@ async fn execute_tool(
 ) -> ToolOutcome {
     let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
 
-    // 工具的 cwd = **这个会话自己的目录**（和 bash 一致，见 `session_guest_dir`）。
-    // 两个门必须一致：模型在 bash 里 `pwd` 看到的是会话目录，那 `read x.txt`
-    // 也得去那儿找 —— 不然就是最难查的那种坑（同一个相对路径，两个工具两个结果）。
-    let cwd = linux::session_guest_dir(sid);
+    // 工具的 cwd 和 bash 走同一个函数（`LinuxSandbox::session_cwd`）：手机沙箱里是
+    // 这个会话自己的目录，电脑上（宿主模式）是 workspace 本身。两个门必须一致 ——
+    // 模型在 bash 里 `pwd` 看到哪，`read x.txt` 就得去哪找。
+    let cwd = core
+        .state
+        .linux()
+        .map(|sb| sb.session_cwd(Some(sid)))
+        .unwrap_or_else(|| linux::WORKSPACE.to_string());
 
     // read / bash / edit 都不走设备（`DeviceApi`）：read 和 edit 直接
     // 读写 rootfs 里的文件，bash 起 proot 子进程。
