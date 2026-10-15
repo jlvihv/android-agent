@@ -36,6 +36,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alpine", get(alpine_status))
         .route("/api/alpine/upgrade", post(alpine_upgrade))
         .route("/api/browser", post(browser_action))
+        .route("/api/weather", post(weather_run))
+        // 看一眼工作目录（`agent files`）—— 只读，不动任何文件
+        .route("/api/files", post(list_files))
+        // 手机系统能力（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
+        // 沙箱里的 `agent <设备命令>` 走它（见 `phone` 模块）。
+        .route("/api/device", post(device_command))
         .route("/api/websearch", post(web_search))
         .route("/api/websearch/config", post(set_search_config))
         .route("/api/edit", post(edit_file))
@@ -331,6 +337,8 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         })),
         // 浏览器后端是谁（手机上=壳里的 WebView，桌面上=CDP + 调试端口）
         "browser": st.browser().map(|b| b.describe()),
+        // 设备命令后端（只有手机上才是 Some —— 见 `phone` 模块）
+        "phone": st.phone().map(|p| p.describe()),
         // 只报“配没配”，不泄 key
         "llm": provider.map(|p| json!({
             "name": p.name,
@@ -404,7 +412,7 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
         .unwrap_or(crate::linux::DEFAULT_TIMEOUT)
         .min(crate::linux::MAX_TIMEOUT);
 
-    match core.run_linux(&body.command, timeout).await {
+    match core.run_linux(&body.command, timeout, None).await {
         Ok(r) => Json(json!({
             "ok": r.code == 0,
             "output": r.to_text(),
@@ -853,6 +861,98 @@ async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
     }
+}
+
+/// `POST /api/device` → 跑一条**手机系统能力**命令（`{cmd, argv}`）。
+///
+/// 沙箱里的 `agent <设备命令>` 走这里（`agent clipboard get`、`agent sms list`…）。
+/// 为什么单独开一条而不是挤进 `/api/command`：那条是**无障碍指令**（点按/滑动/按键，
+/// 需要服务连着），而这些只需要普通权限；两者的可用条件不同（见 `phone` 模块）。
+///
+/// **恒用 200 回**，成不成看 body 里的 `ok`：沙箱里的 `wget` 对 5xx 会**重试**，
+/// 于是一次“没有这台设备”会被放成三次请求、还打了三条日志；`curl` 不带 `-f`
+/// 又不认 4xx。一句话：状态码这条路不要用，让 `ok` 说话。
+async fn device_command(State(st): State<Arc<AppState>>, Json(body): Json<DeviceBody>) -> Response {
+    let core = Core { state: st.clone() };
+    
+    match core.phone(&body.cmd, &body.argv).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => Json(json!({
+            "ok": false,
+            "error": {
+                // 这个码是给模型分辨用的：
+                //   unknown_command —— 名字写错了（可用的是 phone::COMMANDS）
+                //   unavailable     —— 这台机器上没这个能力（桌面；别重试）
+                //   failed          —— 真的执行失败了（权限被拒、API 报错…）
+                "code": if !crate::phone::is_command(&body.cmd) {
+                    "unknown_command"
+                } else if st.phone().is_none() {
+                    "unavailable"
+                } else {
+                    "failed"
+                },
+                "message": format!("{e:#}"),
+            },
+        }))
+        .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceBody {
+    cmd: String,
+    #[serde(default)]
+    argv: Vec<String>,
+}
+
+/// `POST /api/files` → 看一眼工作目录（`{"path":"/workspace"}`，可省）。
+///
+/// 回的是**排好版的纯文本**（不是 JSON）：它就是给模型和人看的一屏，像 `agent ps`
+/// 那样。格式在 `workspace::render` 里只有一份 —— CLI 那边不再拼一遍。
+///
+/// 为什么要有它：模型只看得见自己敲过的路径，看不见「这个目录整体乱了」。
+async fn list_files(State(st): State<Arc<AppState>>, Json(body): Json<FilesBody>) -> Response {
+    let Some(sb) = st.linux() else {
+        return "沙箱还没起来（首次启动要解压 rootfs，看设置页的进度）".into_response();
+    };
+    let guest = body
+        .path
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "/workspace".to_string());
+    match sb.resolve_path(&guest) {
+        Ok(host) => match crate::workspace::render(&guest, &host) {
+            Ok(text) => text.into_response(),
+            Err(e) => format!("{e:#}\n").into_response(),
+        },
+        Err(e) => format!("{e:#}\n").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FilesBody {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// `POST /api/weather` → 天气（`{argv:["current","--lat","31.2","--lon","121.4"]}`）。
+///
+/// 沙箱里的 `agent weather` 走它。解析在 Rust 侧（`weather` 模块）：
+/// 与设备命令不同，这个只是查网络，**手机和电脑上都能用**。
+async fn weather_run(Json(body): Json<WeatherBody>) -> Response {
+    match crate::weather::run(&body.argv).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => Json(json!({
+            "ok": false,
+            "error": { "code": "weather_failed", "message": format!("{e:#}") },
+        }))
+        .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct WeatherBody {
+    #[serde(default)]
+    argv: Vec<String>,
 }
 
 /// `POST /api/websearch` → 联网搜索（`{query, num_results?, format?}`）。

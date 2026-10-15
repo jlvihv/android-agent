@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use crate::linux::SandboxConfig;
+use crate::phone::PhoneApi;
 use crate::state::{BrowserApi, DeviceApi};
 use crate::Core;
 
@@ -116,6 +117,33 @@ impl BrowserApi for BrowserAdapter {
     fn execute(&self, action_json: &str) -> Result<String, String> {
         self.0
             .execute(action_json.to_string())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// 手机系统能力接口，**由 Kotlin 实现**（`DeviceApisImpl`）。
+///
+/// 第三条独立的路：不靠无障碍（`DeviceHost`）、不靠 WebView（`BrowserHost`），
+/// 但要普通 Android API 和运行时权限 —— 而权限弹窗只有 Activity 能弹，
+/// 所以实现方必须自己把结果**等**出来（`AgentPermissions`）。
+///
+/// 边界用 `(名字, argv)` 而不是 JSON：参数本来就来自 shell，原样传过去，
+/// 加一个子命令不用动这里的定义（见 `phone::PhoneApi`）。
+///
+/// 实现方**会阻塞**（权限要等人点、定位要等定位到），调用方走 `spawn_blocking`，
+/// 见 `Core::phone`。
+#[uniffi::export(callback_interface)]
+pub trait PhoneHost: Send + Sync {
+    /// 跑一条手机命令，返回 `{"ok":…}` 形状的 JSON 字符串。
+    fn call(&self, name: String, argv: Vec<String>) -> Result<String, CoreError>;
+}
+
+struct PhoneAdapter(Box<dyn PhoneHost>);
+
+impl PhoneApi for PhoneAdapter {
+    fn call(&self, name: &str, argv: &[String]) -> Result<String, String> {
+        self.0
+            .call(name.to_string(), argv.to_vec())
             .map_err(|e| e.to_string())
     }
 }
@@ -317,6 +345,16 @@ impl AgentCore {
         self.core
             .state
             .set_browser(std::sync::Arc::new(BrowserAdapter(host)));
+    }
+
+    /// 注入手机系统能力实现。`AgentApp.onCreate` 里调（不依赖无障碍）。
+    ///
+    /// 桌面上没人调这个，于是 `state.phone()` 一直是 `None`，
+    /// 设备命令在那儿会得到一句「这台机器上没有」。
+    pub fn set_phone(&self, host: Box<dyn PhoneHost>) {
+        self.core
+            .state
+            .set_phone(std::sync::Arc::new(PhoneAdapter(host)));
     }
 
     /// 配置 Linux 沙箱。

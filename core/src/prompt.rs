@@ -45,8 +45,28 @@ use crate::platform::Platform;
 /// 几个平台干活的方式就开始漂。拼的输入全是 `'static` 片段，**没有运行时
 /// 数据**，所以同一个平台每次拼出来都是同一串字节，缓存前缀不受影响。
 pub fn system_prompt(p: Platform) -> &'static str {
-    static PROMPTS: [OnceLock<String>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    PROMPTS[p as usize].get_or_init(|| compose_prompt(Phrasing::of(p)))
+    system_prompt_with(p, linux::has_phone_capabilities())
+}
+
+/// 平台 + **这台机器上有没有设备能力** → 提示词。
+///
+/// 为什么要显式传 `phone` 而不是在里面 `cfg!`：那一段（`agent device|clipboard|…`）
+/// 只有**真手机**上才有 —— 桌面上的 proot 沙箱也是 `Platform::Android` 形态，
+/// 但它没有闹钟和短信。判据本身是编译目标（`linux::has_phone_capabilities`），
+/// 但如果把它埋在函数里，`dump_prompt` 在电脑上就渲染不出手机那份 ——
+/// **渲染工具渲染不出真实产物，"看提示词"这件事就不成立了**。
+pub fn system_prompt_with(p: Platform, phone: bool) -> &'static str {
+    // 3 个平台 × 有没有设备能力
+    static PROMPTS: [OnceLock<String>; 6] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    PROMPTS[p as usize * 2 + usize::from(phone)]
+        .get_or_init(|| compose_prompt(Phrasing::of(p), phone))
 }
 
 /// 提示词和工具描述里**随平台变**的那几句。共用的句子只在 `compose_prompt` /
@@ -92,13 +112,13 @@ const HOST: Phrasing = Phrasing {
 
 const ANDROID: Phrasing = Phrasing {
     who: "你是运行在安卓手机上的 Agent。",
-    files: "cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。你可按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。",
+    files: "你在 Alpine Linux 沙盒的当前目录里工作（可用 `pwd` 查看），它在 /workspace 里面 —— 那对应手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）；临时产物放 /tmp，依赖和解压的东西放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。",
     link_example: "/workspace/报告/index.html",
     link_bullet: "\n- 网址和 App 深链（`https://…`、`weixin://…`、`androidamap://…`）直接写地址，不要加 `preview:` —— 它只给文件用。",
     cli_device: "`agent command`（按键/点击/滑动/启动应用/打开 URI）",
     browser: "真 WebView",
     cli_procs: "、`agent ps` / `agent kill <pid>`（看/停沙箱里还在跑的进程 —— 包括你自己用 `setsid` 放后台的常驻服务）",
-    bash_where: "在 Alpine Linux 沙箱里跑 bash 命令（cwd=/workspace；每次新进程，文件系统持久、shell 状态不持久）。",
+    bash_where: "在 Alpine Linux 沙箱里跑 bash 命令（每次新进程，文件系统持久、shell 状态不持久；`pwd` 看当前在哪）。",
     bash_env: "优先用已预装的 curl/git/gh/jq/rg/fd/tree/unzip/python3 等高性能工具，效率更高。安装 Python 包时优先 `apk add py3-*`。",
     ..HOST
 };
@@ -127,13 +147,13 @@ impl Phrasing {
     }
 }
 
-fn compose_prompt(t: &Phrasing) -> String {
+fn compose_prompt(t: &Phrasing, phone: bool) -> String {
     format!(
         "{who}\n\
          \n\
          - {files}\n\
          - 想让用户看链接时：写 `preview:` 链接，如 `[打开](preview:{link_example})`，图片/音频/视频都用图片语法，能渲染 `![说明](preview:…)`。{link_bullet}\n\
-         - {cli_intro}：`agent state|request|tools`、{cli_device}、`agent browser`（{browser}）、`agent search`（联网搜索）{cli_procs}，`agent help` 看全部。\n\
+         - {cli_intro}：`agent state|request|tools`、{cli_device}、`agent browser`（{browser}）、`agent search`（联网搜索）、`agent weather`（天气，免 key）{phone}{cli_procs}，`agent help` 看全部。\n\
          - 一次回复里可以带多个工具调用：互不依赖的操作（比如一次新建好几个文件、跑几条互不相干的命令）合并到同一条回复里一起发，有依赖关系的才分成多轮。\n\
          \n\
          回答要言简意赅。",
@@ -144,8 +164,28 @@ fn compose_prompt(t: &Phrasing) -> String {
         cli_intro = t.cli_intro,
         cli_device = t.cli_device,
         browser = t.browser,
+        phone = phone_clause(phone),
         cli_procs = t.cli_procs,
     )
+}
+
+/// 手机系统能力那一句（设备命令清单）。
+///
+/// **按 `phone` 判，不按 `Platform`**：桌面上的 `just dev`（proot 沙箱）也是
+/// `Platform::Android` —— 形态和手机一模一样，但它没有闹钟、没有短信。
+/// 提示词里写了而实际做不到，模型会连着撞墙。没有时返回空串（句子里那一处
+/// 于是自然消失）。具体那一位由 `system_prompt` 从
+/// `linux::has_phone_capabilities()` 取，`dump_prompt` 可以显式给。
+///
+/// 清单**从 `phone::COMMANDS` 生成**，不手写：手写过一版，加了 volume /
+/// brightness / torch / vibrate / screenshot / radios / speak 之后它就悄悄过时了
+/// —— 两处各写一份清单，必然会漂，而漂了不报错（只是模型不知道有那个命令）。
+fn phone_clause(phone: bool) -> String {
+    if !phone {
+        return String::new();
+    }
+    let list = crate::phone::COMMANDS.join("|");
+    format!("、`agent {list}`（这台手机的系统能力）")
 }
 
 /// `read` 工具的描述：截断规则 + 图片那条管线。
@@ -238,3 +278,69 @@ pub fn edit_schema() -> Value {
 /// 正常情况下停止会把没跑完的调用补上结果（见 `drive`），这里是兜底：
 /// 进程在两步之间被杀留下的会话。
 pub const INTERRUPTED: &str = r#"{"error":"没有结果：回合被中断（用户停止或 App 被关闭）"}"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linux;
+
+    /// 设备命令只在**真有**的那台机器上讲。
+    ///
+    /// 提示词里写了而实际做不到是最贵的一种错：模型会拿它当确定的事实用，
+    /// 撞墙之后反复换参数重试（它不怀疑命令存不存在）。
+    #[test]
+    fn device_commands_are_only_promised_where_they_exist() {
+        // 手机形态：清单必须是 `phone::COMMANDS` 一字不差的投影
+        // （生成用的就是它，所以这条守的是「以后有人改回手写」）
+        let phone = system_prompt_with(Platform::Android, true);
+        let want = format!("`agent {}`", crate::phone::COMMANDS.join("|"));
+        assert!(phone.contains(&want), "手机形态的清单不对，应该是 {want}：\n{phone}");
+
+        // 三个平台的「没有设备能力」形态（手机之外的任何机器）：一个字都不该提
+        for plat in Platform::ALL {
+            let p = system_prompt_with(plat, false);
+            assert!(
+                !p.contains("agent sms") && !p.contains("agent calendar"),
+                "{plat:?} 上没有闹钟/短信这些，提示词里不该提：\n{p}"
+            );
+        }
+
+        // 真实那份跟着这台机器走
+        let p = system_prompt(Platform::Android);
+        assert_eq!(p.contains("agent sms"), linux::has_phone_capabilities());
+        // 两端都有的：不能因为平台不同就没掉
+        for s in ["agent browser", "agent weather"] {
+            assert!(p.contains(s), "提示词里掉了 {s}");
+        }
+    }
+
+    /// **提示词里不能出现具体的工作目录名**。
+    ///
+    /// 每个会话的目录都不一样，写进提示词就等于给每个会话一份不同的
+    /// system prompt —— 前缀缓存全废（见 docs/03）。这条只能靠测试守：
+    /// 文案里手滑写一个例子路径，功能上完全看不出来，钱却在悄悄烧。
+    #[test]
+    fn prompt_never_mentions_a_concrete_working_dir() {
+        let dir = crate::linux::session_guest_dir("0199e1f0-aaaa-7000-8000-000000000001");
+        for p in Platform::ALL {
+            for phone in [false, true] {
+            let s = system_prompt_with(p, phone);
+            assert!(!s.contains(&dir), "{p:?} 的提示词里出现了会话目录：{dir}");
+            assert!(
+                !s.contains("sessions/"),
+                "{p:?} 的提示词里出现了 sessions/ 这种具体路径"
+            );
+            }
+        }
+    }
+
+    /// 电脑版的提示词不能多出一个空的顿号（`phone_clause` 为空时的拼接）。
+    #[test]
+    fn the_sentence_stays_clean_without_the_phone_clause() {
+        for p in [Platform::Android, Platform::Linux, Platform::Macos] {
+            let s = system_prompt(p);
+            assert!(!s.contains("、、"), "拼出双顿号了：\n{s}");
+            assert!(!s.contains("（）"), "拼出空括号了：\n{s}");
+        }
+    }
+}

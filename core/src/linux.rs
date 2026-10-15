@@ -126,6 +126,58 @@ const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbi
 /// 退回 rootfs 里的同名目录。
 pub const WORKSPACE: &str = "/workspace";
 
+/// 会话 id → 目录名：**短**（6 个字符）、好念、不含容易看混的字符。
+///
+/// 不用会话 id 本身（uuid 又长又难念）；也不用 `DefaultHasher` —— 它的算法
+/// Rust 不保证跨版本稳定，而这个名字必须**跨重启、跨升级**都是同一个
+/// （否则会话下次打开就找不到自己上次的文件了）。所以自己拿 FNV-1a + 雪崩混合，
+/// 写死在源码里。
+pub fn session_dir_name(sid: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in sid.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // splitmix64 的收尾：把高位搅下来，不然 uuid（高 8 位是时间戳、彼此很像）
+    // 的前 6 位会撞得一塌糊涂
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+
+    // 排除 i l o 0 1：模型和人都会念错、写错
+    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    let mut out = String::with_capacity(6);
+    for _ in 0..6 {
+        out.push(ALPHABET[(h % ALPHABET.len() as u64) as usize] as char);
+        h /= ALPHABET.len() as u64;
+    }
+    out
+}
+
+/// 会话的工作目录（沙箱里的路径）：直接挂在 `/workspace` 下面，不再套一层。
+///
+/// 为什么要给每个会话一个自己的目录：模型只看得见自己敲过的路径，看不见
+/// 「这个目录整体乱了」—— 几十轮下来，产物、临时文件、截图全堆在同一个
+/// `/workspace` 根目录里，下一个会话还得在里面翻（真机上攒了 13 个任务目录
+/// + 6 个散文件）。给它一个**自己的空目录**最省事：会话之间天生互不干扰。
+///
+/// 为什么不是「提示词里写规矩」：规矩是软的，模型忙着干活时不会记得；目录结构
+/// 是硬的，它想乱也乱不到别人头上。而且**提示词里不能出现具体目录名** ——
+/// 每个会话的目录都不同，写进去就等于给每个会话一份不同的 system prompt，
+/// 前缀缓存全废（见 docs/03）。
+pub fn session_guest_dir(sid: &str) -> String {
+    format!("{WORKSPACE}/{}", session_dir_name(sid))
+}
+
+/// 注入给命令的 `AGENT_WORKDIR` 值（`host` = 宿主模式下它就是宿主路径本身）。
+fn session_workdir(session: Option<&str>, host: bool) -> String {
+    match session {
+        Some(sid) if host => session_dir_name(sid),
+        Some(sid) => session_guest_dir(sid),
+        None => WORKSPACE.to_string(),
+    }
+}
+
 /// 手机内部存储整个挂在这里（`/storage/emulated/0`）
 pub const SHARED: &str = "/sdcard";
 
@@ -920,6 +972,16 @@ pub struct LinuxSandbox {
     maintenance: std::sync::atomic::AtomicBool,
 }
 
+/// 这台机器上有没有「手机系统能力」（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
+///
+/// 判据是**编译目标**，不是运行时有没有注入：`agent help`、沙箱里 `agent <设备命令>`
+/// 的守门、提示词都要一个**当下就能答**的答案，而它们面对的是同一个二进制。
+/// 桌面哪怕在跑 proot 沙箱（`just dev`，形态上和手机一模一样），也没有这些能力 ——
+/// 它的"手机"不是设备（见 `phone` 模块）。
+pub const fn has_phone_capabilities() -> bool {
+    cfg!(target_os = "android")
+}
+
 /// 沙箱里的 `agent` 命令。
 ///
 /// 为什么要有它：模型平时只看得见自己的上下文和历史，看不见「自己现在什么状态」。
@@ -946,6 +1008,34 @@ const AGENT_CLI: &str = r##"#!/bin/sh
 #   agent doctor             各部件体检
 #   agent setup [--force|--list|包…]   装/看常用工具（rg fd jq git python3…）
 #   agent command <json>     操作这台手机（只有手机上有），例如 '{"type":"key","name":"back"}'
+#   agent files [路径]       看一眼工作目录（默认 /workspace）成什么样了：
+#                            哪些是项目目录、哪些文件散在根目录下（只报告，不动文件）
+#   agent weather [current|hourly|daily|report] --lat L --lon N   天气（Open-Meteo；两端都能用）
+#                              --lat/--lon 就是十进制度（纬度 -90..90，经度 -180..180）
+# @phone
+# 下面这些**只有手机上有**（这台电脑上没有它们 —— 跑在电脑上时这一段不显示）：
+#   agent device [info|battery|storage]          设备信息（不带子命令 = info）
+#   agent clipboard get | set --text T | clear | status
+#   agent volume [get|set|up|down|max|mute|unmute] [--stream music|ring|alarm|call|notification|system]
+#      set --level 7 或 --percent 50；调完会回实际值（勿扰模式会把一些流按下去）
+#   agent brightness [get|set --percent 50|--level 0..255] [--auto]   屏幕亮度
+#   agent torch on|off|toggle                     手电筒
+#   agent vibrate [--duration 200] [--pattern tap|long]   振动
+#   agent screenshot [--path 路径.png]            截屏（默认落到本会话目录的 screenshots/）
+#   agent radios [wifi|bluetooth|airplane]        网络状态；给参数就是打开对应的设置页
+#      （Android 10+ 不允许 App 自己开关 WiFi/蓝牙，只能把人送到设置页）
+#   agent alarm set --time HH:MM|ISO [--label L] [--repeat once|daily|weekdays]
+#               timer --duration 5m | list | cancel --id X | cancel --all
+#   agent location [current] [--timeout 8] | geocode --lat L --lon N | forward --query Q
+#   agent contacts list [--max N] | search <词> | get <id>
+#   agent calendar list [--today|--days N] | create --title T --start ISO | update --id ID …
+#                  delete --id ID | calendars
+#   agent sms list [--limit N] | search <词> | get <id> | stats
+#   agent notify --title T [--body B]            发一条系统通知
+#   agent speak <文本> [--voice zh-CN]           朗读
+#   每个子命令的用法：agent <命令> --help（不用猜参数；参数错了会报错，不会静默忽略）
+#   权限：第一次用会弹系统权限框（联系人 / 日历 / 短信 / 定位），人在旁边才点得动
+# @end
 #   agent open <uri>         打开它。手机上：http(s) / App 深链（weixin://、
 #                            androidamap://）/ intent:// / tel: …（沙箱里的
 #                            $BROWSER / xdg-open 最后也走到它）；电脑上交给本机
@@ -1016,6 +1106,17 @@ fmt() { tr ',' '\n' | tr -d '{}"' | sed 's/^[[:space:]]*//; /^[[:space:]]*$/d'; 
 # 参数里的反斜杠和引号要先转义，否则拼出来的 JSON 是坏的（browser / search 都用）
 esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
+# 把参数变成一个 JSON 数组（argv 形状，设备命令用）。
+# 不用 for 累加的话就把中文参数往一个字符串里拼 —— 那才是真的要命的写法。
+json_args() {
+  _out=""
+  for _a in "$@"; do
+    [ -z "$_out" ] || _out="$_out,"
+    _out="$_out\"$(esc "$_a")\""
+  done
+  printf '[%s]' "$_out"
+}
+
 cmd="${1:-help}"
 case "$cmd" in
   state)    get /api/debug/state | fmt ;;
@@ -1067,6 +1168,10 @@ case "$cmd" in
     exit 0
     ;;
   command)
+    if [ "${AGENT_DEVICE:-}" != "1" ]; then
+      echo "agent command：设备指令只在这台手机上有（现在跑在电脑上）。电脑上要开东西用 agent open" >&2
+      exit 2
+    fi
     if [ $# -lt 2 ]; then
       cat >&2 <<'EOT'
 用法：agent command '{"type":"key","name":"back"}'
@@ -1222,10 +1327,48 @@ EOT
     if [ -n "${2:-}" ]; then body="{\"query\":\"$q\",\"num_results\":$2,\"format\":\"text\"}"; else body="{\"query\":\"$q\",\"format\":\"text\"}"; fi
     post /api/websearch "$body"
     ;;
+  # 看一眼工作目录乱没乱（只读；手机和电脑上都能用）
+  files)
+    shift || true
+    post /api/files "{\"path\":\"$(esc "${1:-/workspace}")\"}"
+    ;;
+  # 天气：查网络，手机和电脑上都能用（所以不放在下面的设备那段里）
+  weather)
+    shift || true
+    post /api/weather "{\"argv\":$(json_args "$@")}"
+    ;;
+  # 手机系统能力。这一段的名字必须和 `phone::COMMANDS` 一致（有测试对账）。
+  device|clipboard|volume|brightness|torch|vibrate|screenshot|radios|alarm|location|contacts|calendar|sms|notify|speak)
+    # 电脑上没有这些：当场拦下来，不去问核心 —— 核心也会拒，但那是"远水"，
+    # 模型看到的是「要去连手机」这种没法执行的话；这里直接告诉它这台机器上没有。
+    if [ "${AGENT_DEVICE:-}" != "1" ]; then
+      echo "agent ${cmd}：设备命令只在这台手机上有（现在跑在电脑上）。agent help 看这台机器上有什么" >&2
+      exit 2
+    fi
+    _name="$cmd"; shift || true
+    # 截屏默认落到**本会话自己的目录**下面的 screenshots/（核心把那个目录注在
+    # ${AGENT_WORKDIR} 里）。显式给了 --path 就按给的来。
+    if [ "$_name" = "screenshot" ] && [ $# -eq 0 ] && [ -n "${AGENT_WORKDIR:-}" ]; then
+      set -- --path "${AGENT_WORKDIR}/screenshots/shot-$(date +%Y%m%d-%H%M%S).png"
+    fi
+    out=$(post /api/device "{\"cmd\":\"$_name\",\"argv\":$(json_args "$@")}")
+    printf '%s\n' "$out"
+    # 失败要变成退出码：模型常写 `agent sms list && …` 这种链，
+    # 回了 0 的话它会拿着空输出继续往下跑。
+    case "$out" in *'"ok":false'*) exit 1 ;; esac
+    ;;
   help|-h|--help)
     # 从第 2 行打到「端口从…」那行为止（那行是表头的结尾）。用哨兵行而不是
     # 写死行号：以前是 '2,31p'，表头一改 help 就悄悄少印或多印几行。
-    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,/端口从/p'
+    #
+    # 手机专有那一段（`@phone` … `@end`）按 $AGENT_DEVICE 显示：电脑上把它**整段
+    # 删掉** —— 列出一堆这台机器上做不了的事，只会诱导模型一个个去试。
+    # 哨兵行本身从不打印。
+    if [ "${AGENT_DEVICE:-}" = "1" ]; then
+      sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,/端口从/p' | sed '/^@phone$/d; /^@end$/d'
+    else
+      sed -n 's/^# \{0,1\}//p' "$0" | sed -n '2,/端口从/p' | sed '/^@phone$/,/^@end$/d'
+    fi
     ;;
   *)
     # ⚠️ 变量后面紧跟中文标点时**必须**写 ${var}：沙箱里是 busybox ash，它不认
@@ -1671,7 +1814,7 @@ impl LinuxSandbox {
     ///
     /// 超时给得很大：手机上首次要下 ~75MB。
     pub async fn provision(&self) -> anyhow::Result<ExecResult> {
-        self.run("/usr/local/bin/agent-setup", Duration::from_secs(900))
+        self.run("/usr/local/bin/agent-setup", Duration::from_secs(900), None)
             .await
     }
 
@@ -1940,6 +2083,11 @@ impl LinuxSandbox {
         if let Some(t) = self.agent_token.read().ok().and_then(|g| g.clone()) {
             env.insert("AGENT_TOKEN".into(), t);
         }
+        // 宿主模式永远是电脑（手机上的核心不走这条路），所以这里恒不注入
+        // —— 但写出来，免得以后有人把这段拷到别处。
+        if has_phone_capabilities() {
+            env.insert("AGENT_DEVICE".into(), "1".into());
+        }
 
         env.into_iter().collect()
     }
@@ -2012,7 +2160,7 @@ impl LinuxSandbox {
     ///         [/usr/bin/setsid] /bin/sh -c <runner> sh <script> <status>
     /// ```
     /// `status` 是沙箱内的状态文件路径（宿主侧在 `<rootfs>/<EXIT_DIR>/`）。
-    pub fn command_line(&self, script: &str, status: &str) -> Vec<String> {
+    pub fn command_line(&self, script: &str, status: &str, cwd: &str) -> Vec<String> {
         let cfg = match &self.mode {
             Mode::Proot(cfg) => cfg,
             // 宿主模式：命令行里没有 proot，**但进程模型是同一套** —— 照样跑
@@ -2020,7 +2168,7 @@ impl LinuxSandbox {
             // （见 `CommandGuard`）。差异只有：状态文件落在我们自己的数据目录里。
             Mode::Host { .. } => return Self::host_command_line(script, status),
         };
-        self.proot_command_line(cfg, script, status)
+        self.proot_command_line(cfg, script, status, cwd)
     }
 
     fn host_command_line(script: &str, status: &str) -> Vec<String> {
@@ -2042,7 +2190,13 @@ impl LinuxSandbox {
         }
     }
 
-    fn proot_command_line(&self, cfg: &SandboxConfig, script: &str, status: &str) -> Vec<String> {
+    fn proot_command_line(
+        &self,
+        cfg: &SandboxConfig,
+        script: &str,
+        status: &str,
+        cwd: &str,
+    ) -> Vec<String> {
         let mut cmd: Vec<String> = Vec::with_capacity(24);
 
         macro_rules! arg {
@@ -2076,7 +2230,7 @@ impl LinuxSandbox {
             arg!("-b", format!("{}:{WORKSPACE}", h.display()));
         }
 
-        arg!("-w", WORKSPACE);
+        arg!("-w", cwd);
 
         // 装过 bash 就用 bash：模型写的命令常带 bash 语法（`[[ ]]`、数组、
         // 进程替换、`<<<`），拿 ash 跑会报 "syntax error"。首次预装之前
@@ -2150,6 +2304,11 @@ impl LinuxSandbox {
         if let Some(t) = self.agent_token.read().ok().and_then(|g| g.clone()) {
             env.insert("AGENT_TOKEN".into(), t);
         }
+        // 手机上才有设备命令：`agent help` 靠它决定要不要打印那一段，
+        // `agent sms …` 靠它决定是转发还是当场拒绝（见 `has_phone_capabilities`）。
+        if has_phone_capabilities() {
+            env.insert("AGENT_DEVICE".into(), "1".into());
+        }
 
         // 给 guest 程序用的临时目录
         if let Some(tmp) = &cfg.tmp {
@@ -2173,8 +2332,16 @@ impl LinuxSandbox {
     }
 
     /// 在沙箱里跑一段 shell 脚本。
-    pub async fn run(&self, script: &str, timeout: Duration) -> anyhow::Result<ExecResult> {
-        self.run_live(script, timeout, None).await
+    ///
+    /// `session` 给了就把 cwd 放在**那个会话自己的目录**里（见 `session_guest_dir`）；
+    /// 不给就是 `/workspace` 根（终端页那种没有会话概念的调用）。
+    pub async fn run(
+        &self,
+        script: &str,
+        timeout: Duration,
+        session: Option<&str>,
+    ) -> anyhow::Result<ExecResult> {
+        self.run_live(script, timeout, None, session).await
     }
 
     /// 同 `run`，但把输出**边跑边**交给 `live`（stdout/stderr 按到达顺序混在一起）。
@@ -2184,12 +2351,13 @@ impl LinuxSandbox {
         script: &str,
         timeout: Duration,
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+        session: Option<&str>,
     ) -> anyhow::Result<ExecResult> {
         anyhow::ensure!(
             !self.maintenance.load(Ordering::Relaxed),
             "沙箱正在升级 Alpine（设置 → Linux 沙箱），这期间不能跑命令；几分钟后再试"
         );
-        self.exec(script, timeout, live).await
+        self.exec(script, timeout, live, session).await
     }
 
     /// 进入 / 退出维护状态（见 `maintenance` 字段）。
@@ -2204,7 +2372,7 @@ impl LinuxSandbox {
         timeout: Duration,
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     ) -> anyhow::Result<ExecResult> {
-        self.exec(script, timeout, live).await
+        self.exec(script, timeout, live, None).await
     }
 
     async fn exec(
@@ -2212,11 +2380,26 @@ impl LinuxSandbox {
         script: &str,
         timeout: Duration,
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+        session: Option<&str>,
     ) -> anyhow::Result<ExecResult> {
         let started = Instant::now();
         let (exit_dir, exit_guest) = self.layout().exit;
         let status = StatusFile::new(&exit_dir, &exit_guest);
-        let argv = self.command_line(script, &status.guest);
+
+        // cwd：会话自己的目录（手机/桌面都一样）。目录得**先建好** —— proot 的
+        // `-w` 指向一个不存在的目录时会直接失败，而 `mkdir` 每次跑一遍也就是一次
+        // stat（已经在了就什么都不做）。
+        let host_cwd = session.and_then(|sid| self.session_host_dir(sid));
+        if let Some(d) = &host_cwd {
+            let _ = std::fs::create_dir_all(d);
+        }
+        // 没挂共享存储（没给「所有文件访问权限」）时退回去：那时会话目录根本建不出来，
+        // 而 proot 的 `-w` 指向一个不存在的目录会**直接失败**。
+        let cwd = match session {
+            Some(sid) if host_cwd.is_some() => session_guest_dir(sid),
+            _ => WORKSPACE.to_string(),
+        };
+        let argv = self.command_line(script, &status.guest, &cwd);
         let using_bash = self.has_bash();
         let (bin, args) = argv.split_first().expect("command_line 至少有一个元素");
 
@@ -2224,13 +2407,18 @@ impl LinuxSandbox {
         cmd.args(args);
         match &self.mode {
             Mode::Host { workspace } => {
-                // cwd 是 workspace，环境是**宿主的**（见 `host_env`）
-                cmd.current_dir(workspace);
+                // cwd 是 workspace（宿主模式没有沙箱，会话目录就是它下面的 sessions/…），
+                // 环境是**宿主的**（见 `host_env`）
+                cmd.current_dir(host_cwd.unwrap_or_else(|| workspace.clone()));
                 cmd.envs(self.host_env());
+                // 命令自己看「我在哪个目录」：设备命令（比如 `agent screenshot`）
+                // 靠它决定东西往哪落
+                cmd.env("AGENT_WORKDIR", session_workdir(session, true));
             }
             Mode::Proot(cfg) => {
                 cmd.env_clear();
                 cmd.envs(self.guest_env(cfg));
+                cmd.env("AGENT_WORKDIR", &cwd);
                 if let Some(tmp) = &cfg.tmp {
                     let _ = std::fs::create_dir_all(tmp);
                 }
@@ -2418,6 +2606,15 @@ impl LinuxSandbox {
     // -----------------------------------------------------------------------
     // 文件访问
     // -----------------------------------------------------------------------
+
+    /// 某个会话的工作目录在**宿主**上对应哪里（不存在就返回 None）。
+    pub fn session_host_dir(&self, sid: &str) -> Option<PathBuf> {
+        let name = session_dir_name(sid);
+        match &self.mode {
+            Mode::Proot(cfg) => cfg.workspace.as_ref().map(|w| w.join(&name)),
+            Mode::Host { workspace } => Some(workspace.join(name)),
+        }
+    }
 
     /// 是否挂了手机存储
     pub fn has_shared_storage(&self) -> bool {
@@ -3160,7 +3357,7 @@ mod tests {
     #[test]
     fn command_line_matches_the_documented_shape() {
         // 这个假 rootfs 里没有 setsid，所以走的是「不分组」的退化形态
-        let argv = sandbox().command_line("echo hi", "/.agent-exit/x");
+        let argv = sandbox().command_line("echo hi", "/.agent-exit/x", WORKSPACE);
         assert_eq!(argv[0], "/native/libproot.so");
         assert_eq!(argv[1], "-0");
         assert_eq!(argv[2], "--link2symlink");
@@ -3183,7 +3380,7 @@ mod tests {
     fn command_line_runs_the_command_in_its_own_process_group() {
         let t = TempRoot::new("setsid");
         std::fs::write(t.dir.join("bin/setsid"), b"").unwrap();
-        let argv = t.sandbox().command_line("echo hi", "/.agent-exit/x");
+        let argv = t.sandbox().command_line("echo hi", "/.agent-exit/x", WORKSPACE);
         let setsid_at = argv
             .iter()
             .position(|a| a == "/bin/setsid")
@@ -3212,7 +3409,7 @@ mod tests {
     #[test]
     fn command_line_degrades_without_setsid() {
         let t = TempRoot::new("nosetsid");
-        let argv = t.sandbox().command_line("true", "/.agent-exit/x");
+        let argv = t.sandbox().command_line("true", "/.agent-exit/x", WORKSPACE);
         assert!(!argv.iter().any(|a| a.ends_with("setsid")), "{argv:?}");
         let runner = argv.iter().find(|a| a.contains("rc=$?")).unwrap();
         assert!(
@@ -3226,7 +3423,7 @@ mod tests {
         // 关键：脚本原样作为单个参数传，不做任何转义 —— 因为我们是
         // 直接 execve，没有中间 shell 会二次解析它（runner 拿它当 `$1`）
         let nasty = "echo \"a b\"; ls | grep x; echo '$(whoami)'";
-        let argv = sandbox().command_line(nasty, "/.agent-exit/x");
+        let argv = sandbox().command_line(nasty, "/.agent-exit/x", WORKSPACE);
         assert_eq!(argv[argv.len() - 2], nasty);
     }
 
@@ -3241,12 +3438,12 @@ mod tests {
             argv[i + 1].clone()
         };
         assert!(
-            runner_of(sb.command_line("true", "/.agent-exit/x")).starts_with("/bin/sh -c"),
+            runner_of(sb.command_line("true", "/.agent-exit/x", WORKSPACE)).starts_with("/bin/sh -c"),
             "没装就退回 ash"
         );
         std::fs::write(t.dir.join("bin/bash"), b"").unwrap();
         assert!(
-            runner_of(sb.command_line("true", "/.agent-exit/x")).starts_with("/bin/bash -c"),
+            runner_of(sb.command_line("true", "/.agent-exit/x", WORKSPACE)).starts_with("/bin/bash -c"),
             "装了就该用 bash，不然模型写的 bash 语法白写"
         );
     }
@@ -3452,7 +3649,7 @@ mod tests {
         std::fs::create_dir_all(t.dir.join("usr/bin")).unwrap();
         std::os::unix::fs::symlink("/bin/busybox", t.dir.join("usr/bin/setsid")).unwrap();
 
-        let argv = t.sandbox().command_line("true", "/.agent-exit/x");
+        let argv = t.sandbox().command_line("true", "/.agent-exit/x", WORKSPACE);
         assert!(
             argv.iter().any(|a| a == "/usr/bin/setsid"),
             "绝对符号链接也算在：{argv:?}"
@@ -3784,7 +3981,7 @@ mod tests {
             "/bin/sh"
         };
         let status = "/home/u/.local/share/android-agent/exit/x";
-        let argv = sb.command_line("echo hi", status);
+        let argv = sb.command_line("echo hi", status, WORKSPACE);
         assert_eq!(&argv[..2], &["/bin/sh", "-c"], "runner 跑在 POSIX sh 里");
         let runner = &argv[2];
         assert!(
@@ -3844,6 +4041,7 @@ mod tests {
             .run(
                 "pwd; echo PATH_HAS_BIN=$([ -x /bin/sh ] && echo yes || echo no); touch made-by-host-mode",
                 Duration::from_secs(10),
+                None,
             )
             .await
             .unwrap();
@@ -3868,6 +4066,7 @@ mod tests {
             .run(
                 "setsid sleep 30 > /dev/null 2>&1 & echo started",
                 Duration::from_secs(30),
+                None,
             )
             .await
             .unwrap();
@@ -3892,6 +4091,7 @@ mod tests {
             .run(
                 "sh -c 'echo $$ > alive.pid; sleep 120' & sleep 120",
                 Duration::from_millis(600),
+                None,
             )
             .await
             .unwrap();
@@ -4308,7 +4508,7 @@ mod tests {
             t.dir.join("x")
         );
 
-        let argv = sb.command_line("true", "/.agent-exit/x");
+        let argv = sb.command_line("true", "/.agent-exit/x", WORKSPACE);
         let joined = argv.join(" ");
         assert!(joined.contains(&format!("-b {}:/sdcard", phone.display())));
         assert!(joined.contains(&format!("-b {}:/workspace", ws.display())));
@@ -4569,6 +4769,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 每个会话一个自己的目录：名字是派生的（跨重启一样）、cwd 落在里面、
+    /// 目录自己会建出来。
+    #[test]
+    fn session_dir_names_are_short_stable_and_distinct() {
+        // 同一个会话永远是同一个目录（否则下次打开就找不到自己上次的文件了）
+        assert_eq!(session_dir_name("s-1"), session_dir_name("s-1"));
+        assert_ne!(session_dir_name("s-1"), session_dir_name("s-2"));
+
+        let n = session_dir_name("abc");
+        assert_eq!(n.chars().count(), 6, "要短：{n}");
+        for bad in ['i', 'l', 'o', '0', '1'] {
+            assert!(!n.contains(bad), "别用容易看混的字符：{n}");
+        }
+        assert!(n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+
+        // 真会话 id 是 uuid（前 8 位是时间戳，彼此很像）—— 这种输入最容易撞
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..5000 {
+            let sid = format!("0199e1f0-1a2b-7c3d-8e4f-{i:012}");
+            assert!(seen.insert(session_dir_name(&sid)), "撞名了：{sid}");
+        }
+    }
+
+    #[test]
+    fn session_dir_is_under_the_workspace() {
+        let sid = "0199e1f0-aaaa-7000-8000-000000000001";
+        let guest = session_guest_dir(sid);
+        assert_eq!(guest, format!("/workspace/{}", session_dir_name(sid)), "{guest}");
+    }
+
+    /// 宿主模式下真跑一遍：`pwd` 是会话目录，文件也真的落在那里。
+    #[tokio::test]
+    async fn running_a_command_lands_in_the_session_dir() {
+        let t = TempRoot::new("sessioncwd");
+        let sb = LinuxSandbox::host(t.dir.clone());
+        let sid = "0199e1f0-aaaa-7000-8000-000000000001";
+        let name = session_dir_name(sid);
+
+        let r = sb
+            .run(
+                "pwd; echo WORKDIR=$AGENT_WORKDIR; touch 落在这里.txt",
+                Duration::from_secs(10),
+                Some(sid),
+            )
+            .await
+            .unwrap();
+        assert!(r.stdout.contains(&name), "pwd 没落在会话目录里：{}", r.stdout);
+        // 设备命令（截图那些）靠它决定东西往哪落
+        assert!(r.stdout.contains("WORKDIR="), "{}", r.stdout);
+
+        let dir = t.dir.join(&name);
+        assert!(
+            dir.join("落在这里.txt").is_file(),
+            "文件没落在 {}",
+            dir.display()
+        );
+
+        // 不带会话（终端页那种调用）就退回工作目录本身（宿主模式没有 /workspace
+        // 这个概念，那是沙箱里的挂载点）
+        let r2 = sb.run("pwd", Duration::from_secs(10), None).await.unwrap();
+        let got = std::fs::canonicalize(r2.stdout.trim()).unwrap();
+        assert_eq!(got, std::fs::canonicalize(&t.dir).unwrap());
+
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
     /// 沙箱里那个 `agent` 命令是 `prepare_rootfs` 写进去的。
     ///
     /// 它是模型「查看 / 操作自己」的唯一入口（`agent state` / `agent request` /
@@ -4657,6 +4923,99 @@ mod tests {
                 "CLI 的 case 表里没有 {action}（找的是 `{name})`）—— 两边漂了"
             );
         }
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    /// CLI 里那段设备命令（`device|clipboard|…`）和 `phone::COMMANDS` **必须对得上**。
+    ///
+    /// 和浏览器那张表同理（上面那个测试）：漂了就是「`agent sms` 发得出去、
+    /// 核心回一个没这个命令」，或者反方向 —— 新加了一个能力而 CLI 没有入口
+    /// （模型永远发现不了它，而且不会报错）。
+    #[test]
+    fn agent_cli_and_phone_commands_agree() {
+        let t = TempRoot::new("phonecmds");
+        t.sandbox().prepare_rootfs().unwrap();
+        let cli = std::fs::read_to_string(t.dir.join("usr/local/bin/agent")).unwrap();
+
+        let table = cli
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("device|"))
+            .expect("CLI 里找不到设备命令那张 case 表（`device|clipboard|…`)）");
+        let names: Vec<&str> = table.trim_end_matches(')').split('|').collect();
+        assert_eq!(names, crate::phone::COMMANDS, "两边的清单不一样了");
+
+        // help 里每个都要列出来（不列的话模型得自己猜名字）
+        for name in crate::phone::COMMANDS {
+            assert!(
+                cli.contains(&format!("agent {name}")),
+                "`agent help` 里没列 {name}"
+            );
+        }
+
+        // 天气不在这组里：它只是查网络，电脑上也能用
+        assert!(cli.contains("agent weather"), "天气是两端都有的");
+
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    /// `agent help` 在手机上列设备命令，在电脑上**整段不列**，且哨兵行从不打印。
+    ///
+    /// 这个测试真跑那个脚本（`sh agent help`）—— 只检查常量里有没有字符串是
+    /// 不够的：真正会错的是 sed 那两条删除规则（哨兵行包不包得住、去没去掉 `#`），
+    /// 而那个只有跑一遍才知道。
+    #[test]
+    fn agent_help_hides_device_commands_off_the_phone() {
+        let t = TempRoot::new("helpdevice");
+        t.sandbox().prepare_rootfs().unwrap();
+        let cli = t.dir.join("usr/local/bin/agent");
+
+        let run = |device: Option<&str>| -> String {
+            let mut c = std::process::Command::new("sh");
+            c.arg(&cli).arg("help").env("AGENT_PORT", "1");
+            match device {
+                Some(v) => c.env("AGENT_DEVICE", v),
+                // 不设 = 电脑上
+                None => c.env_remove("AGENT_DEVICE"),
+            };
+            let out = c.output().expect("跑不了 agent help");
+            assert!(
+                out.status.success(),
+                "agent help 失败：{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+
+        let phone = run(Some("1"));
+        let desktop = run(None);
+
+        // 手机上：设备命令在
+        for name in crate::phone::COMMANDS {
+            assert!(
+                phone.contains(&format!("agent {name}")),
+                "手机上 help 里少了 agent {name}"
+            );
+        }
+        // 电脑上：一条都不该出现
+        for name in crate::phone::COMMANDS {
+            assert!(
+                !desktop.contains(&format!("agent {name}")),
+                "电脑上的 help 不该列 agent {name}（这台机器没有它）"
+            );
+        }
+        // 两端都有的：weather / browser / open 都在
+        for s in ["agent weather", "agent browser", "agent open"] {
+            assert!(phone.contains(s) && desktop.contains(s), "{s} 应该两端都列");
+        }
+        // 哨兵行是给 sed 看的，不能露出来
+        for text in [&phone, &desktop] {
+            assert!(!text.contains("@phone"), "哨兵行漏出来了");
+            assert!(!text.contains("@end"), "哨兵行漏出来了");
+        }
+        // 电脑上的 help 不能因为删了一段就变成空的
+        assert!(desktop.lines().count() > 20, "电脑上的 help 太短了");
+
         let _ = std::fs::remove_dir_all(&t.dir);
     }
 

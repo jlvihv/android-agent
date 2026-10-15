@@ -1462,7 +1462,7 @@ async fn drive(
             // `stream_one` 里名字刚出现的那一下 —— 那一下只能看到半截参数。
             status.tool(&call.name, &call.arguments);
             let outcome = tokio::select! {
-                o = execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id))) => o,
+                o = execute_tool(core, &call.name, &call.arguments, Some((tx, &call.id)), sid) => o,
                 _ = turn.aborted() => {
                     return stop_with_pending(core, sid, tx, &calls[n..]).await;
                 }
@@ -2494,6 +2494,17 @@ fn timeout_hint(timeout: std::time::Duration, explicit: bool) -> String {
     }
 }
 
+/// 相对路径按会话目录展开（`bash` 的 cwd 就是它）。
+///
+/// 绝对路径原样返回 —— `resolve_path` 认得 `/workspace/…`、`/sdcard/…`、`/root/…`。
+fn in_cwd(path: &str, cwd: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{}", cwd.trim_end_matches('/'), path)
+    }
+}
+
 /// `read` 的 limit：缺失或 null = None，负数/非整数报错。
 fn parse_limit(args: &Value) -> anyhow::Result<Option<usize>> {
     match args.get("limit") {
@@ -2542,8 +2553,14 @@ async fn execute_tool(
     name: &str,
     arguments: &str,
     live: Option<(&mpsc::UnboundedSender<Value>, &str)>,
+    sid: &str,
 ) -> ToolOutcome {
     let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+
+    // 工具的 cwd = **这个会话自己的目录**（和 bash 一致，见 `session_guest_dir`）。
+    // 两个门必须一致：模型在 bash 里 `pwd` 看到的是会话目录，那 `read x.txt`
+    // 也得去那儿找 —— 不然就是最难查的那种坑（同一个相对路径，两个工具两个结果）。
+    let cwd = linux::session_guest_dir(sid);
 
     // read / bash / edit 都不走设备（`DeviceApi`）：read 和 edit 直接
     // 读写 rootfs 里的文件，bash 起 proot 子进程。
@@ -2552,6 +2569,7 @@ async fn execute_tool(
         if path.is_empty() {
             return ToolOutcome::json(json!({ "error": "缺少参数 path" }));
         }
+        let path = &in_cwd(path, &cwd);
         let offset = parse_offset(&args);
         let limit = match parse_limit(&args) {
             Ok(l) => l,
@@ -2587,12 +2605,12 @@ async fn execute_tool(
             Some((tx, id)) => {
                 let (btx, brx) = mpsc::unbounded_channel();
                 let pump = tokio::spawn(pump_live_output(brx, tx.clone(), id.to_string()));
-                let r = core.run_linux_live(script, timeout, btx).await;
+                let r = core.run_linux_live(script, timeout, btx, Some(sid)).await;
                 // 等最后一批推完，再发最终结果，保证顺序
                 let _ = pump.await;
                 r
             }
-            None => core.run_linux(script, timeout).await,
+            None => core.run_linux(script, timeout, Some(sid)).await,
         };
         return match res {
             Ok(r) => {
@@ -2628,6 +2646,7 @@ async fn execute_tool(
         if path.is_empty() {
             return ToolOutcome::json(json!({ "error": "缺少参数 path" }));
         }
+        let path = &in_cwd(path, &cwd);
 
         // 两个模式：`edits` 改已有文件，`content` 新建文件。只能给一个 ——
         // 两个都给 / 都不给都报错，不做“聪明”的猜测（猜错了要么盖掉原文、

@@ -16,6 +16,7 @@ use crate::agent::SessionStore;
 use crate::db::Db;
 use crate::linux::LinuxSandbox;
 use crate::llm::Provider;
+use crate::phone::PhoneApi;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -218,6 +219,10 @@ pub struct AppState {
     /// 浏览器实现。和 `device` 分开：它的可用条件是无障碍无关的
     /// （见 `BrowserApi` 的说明）。
     pub browser: RwLock<Option<Arc<dyn BrowserApi>>>,
+    /// 手机系统能力（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
+    /// 和上面两个都分开：它不依赖无障碍（`device`），也不依赖 WebView（`browser`），
+    /// 但**只有手机上才有**（见 `phone` 模块）。桌面上一直是 `None`。
+    pub phone: RwLock<Option<Arc<dyn PhoneApi>>>,
     /// **正在跑的**各会话最后一次的实时状态，key = sid。
     ///
     /// 只为一件事：有人刚订阅上来时补一帧「现在在跑什么」（见 `turn_snapshot`）。
@@ -350,6 +355,7 @@ impl AppState {
             tx,
             device: RwLock::new(None),
             browser: RwLock::new(None),
+            phone: RwLock::new(None),
             turn_status: Mutex::new(HashMap::new()),
             port: AtomicU16::new(0),
             mock: AtomicBool::new(false),
@@ -426,6 +432,16 @@ impl AppState {
     pub fn set_browser(&self, b: Arc<dyn BrowserApi>) {
         if let Ok(mut g) = self.browser.write() {
             *g = Some(b);
+        }
+    }
+
+    pub fn phone(&self) -> Option<Arc<dyn PhoneApi>> {
+        self.phone.read().ok().and_then(|g| g.clone())
+    }
+
+    pub fn set_phone(&self, p: Arc<dyn PhoneApi>) {
+        if let Ok(mut g) = self.phone.write() {
+            *g = Some(p);
         }
     }
 

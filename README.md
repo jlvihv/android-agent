@@ -20,6 +20,7 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 | 换机器（谁连谁都行） | ✅ 侧栏底栏那个标签点开就是「选择机器」：**手机和电脑浏览器是同一份面板**，电脑也能连另一台电脑（手机连、电脑连都走核心里同一条隧道；页面拿不到任何机器的凭据；[docs/12](docs/12-relay.md)） |
 | 桌面浏览器 | ✅ 核心**自己起**无头 Chrome（CDP），`agent browser` 在桌面上也能用（[docs/08](docs/08-browser.md) 第 15 节） |
 | 设备操控 | ⚠️ 只做**不需要读界面**的：坐标点击 / 滑动 / 系统按键 / 启动应用 / 打开 URI |
+| 手机系统能力 | ✅ 沙箱里的 `agent device\|clipboard\|volume\|brightness\|torch\|vibrate\|screenshot\|radios\|alarm\|location\|contacts\|calendar\|sms\|notify\|speak`（另加两段都能用的 `agent weather`）；**电脑上不列也不让跑**（[docs/13](docs/13-phone.md)） |
 | Prompt cache | ✅ 命中 73–87% |
 | 界面 | ✅ 对齐 Claude 移动端（神似，非像素级） |
 | 多会话 | ✅ 侧边栏「最近对话」，标题自动生成 |
@@ -192,6 +193,7 @@ App 随时被杀都没关系。
 | [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md) | **工具表为什么只有三个**：判据、代价、加能力的步骤 |
 | [docs/11-host-mode.md](docs/11-host-mode.md) | **宿主模式**：桌面上不套沙箱，直接用这台机器（怎么做的、代价） |
 | [docs/12-relay.md](docs/12-relay.md) | **换机器**：手机/电脑连到另一台机器上的核心（隧道、局域网/中继、页面不拿凭据、部署与验证） |
+| [docs/13-phone.md](docs/13-phone.md) | **手机系统能力**：闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板 / 通知 / 朗读，以及「按机器显示不同子命令」与权限那套阻塞桥 |
 
 ## 脚本
 

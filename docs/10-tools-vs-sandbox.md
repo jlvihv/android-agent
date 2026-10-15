@@ -80,6 +80,10 @@ $ agent browser navigate https://example.com && agent browser get_backbone 3 && 
 5. **老会话回放**：web 里给老工具名留个 `case`（`MessageList.svelte` /
    `toolview.ts` 里的 `browser` / `search` 就是干这个的），历史得照旧显示成人话。
 
+**手机上的系统能力**（闹钟 / 短信 / 日历 / 联系人 / 定位…）走的是同一条路，但多一层
+「哪台机器上有」：`agent help`、命令本身的守门、提示词三处都得按机器变，否则电脑上
+会列出一堆做不到的事。完整做法和清单见 [docs/13](13-phone.md)。
+
 ## 7. 设备操作为什么一直在沙箱里
 
 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不是工具**，在沙箱里

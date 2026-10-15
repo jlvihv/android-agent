@@ -4,6 +4,9 @@
     <!-- 前端走 loopback，仍然需要 INTERNET 权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 读 WiFi 开没开（`agent radios`）。和 NETWORK_STATE 一样是 normal，
+         但漏了它 `isWifiEnabled()` 会直接抛 SecurityException —— 真机上撞到过。 -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- 沙箱里的 apk/curl 要联网 -->
     <!-- 沙箱的 /sdcard = 整个手机内部存储，/workspace = 其中的 Agent 文件夹。
          自用 App，直接要「所有文件访问权限」（Android 11+）；更老的系统用旧权限。 -->
@@ -23,6 +26,26 @@
     <!-- 通知权限。没有它 Android 13+ 不显示那个通知（服务照样跑，只是用户看不见）。
          只在真的起回合时问一次，不在启动时问。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 设备命令（`agent contacts|calendar|sms|location|alarm`）要的权限。
+         都是**运行时**权限：第一次用到那个命令时才会弹框（见 AgentPermissions ——
+         它把「弹窗 + 等人点」包成一次阻塞调用，因为命令跑在后台线程上）。
+         列在这里只是“声明”，不等于已经拿到 —— 不声明的权限在系统设置里也开不了。 -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <!-- 调音量（`agent volume`）。normal 权限，安装即得 —— 但**必须声明**，
+         有些 ROM 不声明就直接把 setStreamVolume 当无效操作。 -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- 振动（`agent vibrate`）。同样是 normal 权限，但没声明的话
+         `vibrate()` 会被系统默默丢掉（不报错，也不振）。 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- 闹钟：交给系统时钟 App。SET_ALARM 是普通权限（安装即给），但**必须声明**，
+         否则 AlarmClock 那几个 Intent 会被系统挡掉。 -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <!-- 提升为 Live Updates（状态栏那颗常驻芯片）的权限。
 
          Android 17 新加的，保护级别是 `normal|appop` —— 安装时自动授予，但**必须声明**：
@@ -33,6 +56,22 @@
          17 才加上它。
          16 及更早的系统上这是未知权限，声明了无害（会被忽略）。 -->
     <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+
+    <!-- Android 11+ 的包可见性：不声明这些，`queryIntentActivities` /
+         `resolveActivity` 一律返回空，TextToSpeech 会以为"这台机器上没有语音引擎"。
+         我们自己不查时钟 App（直接 startActivity + 捉 ActivityNotFoundException），
+         但这两条声明几乎没代价，且能防住以后加“先判断能不能做”时的静默失败。 -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.tts.engine.TTS_SERVICE" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_ALARM" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_TIMER" />
+        </intent>
+    </queries>
 
     <application
         android:name=".AgentApp"

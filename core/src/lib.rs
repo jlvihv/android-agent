@@ -37,6 +37,7 @@ pub mod machines;
 pub mod mock;
 pub mod models;
 pub mod openai;
+pub mod phone;
 pub mod platform;
 pub mod prompt;
 pub mod providers;
@@ -51,6 +52,8 @@ pub mod state;
 pub mod status;
 pub mod tunnel;
 pub mod urls;
+pub mod weather;
+pub mod workspace;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -363,12 +366,13 @@ impl Core {
         &self,
         script: &str,
         timeout: std::time::Duration,
+        session: Option<&str>,
     ) -> anyhow::Result<linux::ExecResult> {
         let sb = self
             .state
             .linux()
             .ok_or_else(|| anyhow::anyhow!("Linux 沙箱未初始化"))?;
-        sb.run(script, timeout).await
+        sb.run(script, timeout, session).await
     }
 
     /// 同 `run_linux`，输出边跑边送进 `live`
@@ -377,12 +381,13 @@ impl Core {
         script: &str,
         timeout: std::time::Duration,
         live: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        session: Option<&str>,
     ) -> anyhow::Result<linux::ExecResult> {
         let sb = self
             .state
             .linux()
             .ok_or_else(|| anyhow::anyhow!("Linux 沙箱未初始化"))?;
-        sb.run_live(script, timeout, Some(live)).await
+        sb.run_live(script, timeout, Some(live), session).await
     }
 
     /// 读沙箱里的文件（`read` 工具）。
@@ -482,6 +487,49 @@ impl Core {
             }
         }
         Ok(v)
+    }
+
+    /// 手机系统能力（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
+    ///
+    /// `name` 必须是 `phone::COMMANDS` 里的一个，`argv` 是它后面的参数。
+    ///
+    /// 三层保护照抄 `browser`（同一条路：Kotlin 那边会阻塞）：
+    ///
+    /// 1. `spawn_blocking` —— Kotlin 侧要申请权限（等人点）、要等定位，
+    ///    直接在 tokio worker 上等会把 worker 占死。
+    /// 2. 180s 的超时 —— 权限弹窗只能等人，但人不在的时候不能永远等下去。
+    /// 3. 返回值一律过一遍 `phone::normalize_reply`：壳是另一个语言写的，
+    ///    它回什么都不能直接透给模型。
+    pub async fn phone(&self, name: &str, argv: &[String]) -> anyhow::Result<serde_json::Value> {
+        if !crate::phone::is_command(name) {
+            anyhow::bail!(
+                "不认识的设备命令「{name}」（可用的是：{}）",
+                crate::phone::COMMANDS.join(" / ")
+            );
+        }
+        let host = self.state.phone().ok_or_else(|| {
+            // 这句要告诉模型**为什么**：它不是参数错，是这台机器上没有这回事。
+            // 不然它会一遍遍换参数重试（沙箱里的 CLI 也拦一层，这里是兜底）。
+            anyhow::anyhow!(
+                "这台机器上没有设备命令（只有手机上才有）—— {name} 在这儿用不了。\
+                 要在手机上做得连回手机上的核心（侧栏底栏「选择机器」）"
+            )
+        })?;
+
+        let name = name.to_string();
+        let argv = argv.to_vec();
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            tokio::task::spawn_blocking(move || host.call(&name, &argv)),
+        )
+        .await;
+        let raw = match joined {
+            Ok(join) => join
+                .map_err(|e| anyhow::anyhow!("设备调用没能跑起来: {e}"))?
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            Err(_) => anyhow::bail!("设备命令超时（180s 没回来）"),
+        };
+        Ok(crate::phone::normalize_reply(&raw))
     }
 
     /// 联网搜索。key 有就直连 Exa API，没有就走他们那个免 key 的公开 MCP

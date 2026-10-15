@@ -152,6 +152,16 @@ class AgentApp : Application() {
             core.setBrowser(b)
         }.onFailure { Log.w(TAG, "浏览器注入失败", it) }
 
+        // 1c. 接上手机系统能力（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
+        //
+        //     和浏览器同理，**刻意不和「设备」（无障碍）绑在一起**：这些 API
+        //     不需要无障碍服务，关掉它也当然该能用。只有手机上才有 ——
+        //     桌面上没人调这一步，于是沙箱里的 `agent sms` 会直接报
+        //     「这台机器上没有设备命令」（见 Rust 侧 `phone` 模块）。
+        runCatching {
+            core.setPhone(DeviceApisImpl(this))
+        }.onFailure { Log.w(TAG, "设备能力注入失败", it) }
+
 
         // 2. 配 Linux 沙箱。
         //    安卓上 proot 必须住在 nativeLibraryDir（那里才允许 exec），

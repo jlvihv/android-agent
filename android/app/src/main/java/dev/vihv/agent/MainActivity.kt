@@ -68,6 +68,18 @@ class MainActivity : Activity() {
         @Volatile
         var current: MainActivity? = null
             private set
+
+        /**
+         * **活着的** Activity（`onCreate` 起、`onDestroy` 清）。
+         *
+         * 和 [current] 必须分开：那个是「现在人在看着」（`onPause` 就清），
+         * 权限弹窗只能挑那个时机发；而这个只要实例还在就行 —— 设备命令拉起
+         * 系统界面（设闹钟、开时钟列表、发通知）之后我们只是 paused，
+         * 紧接着就该能再拉起第二个（`agent alarm set` 连着 `agent alarm timer`）。
+         */
+        @Volatile
+        var alive: MainActivity? = null
+            private set
     }
 
     private var web: WebView? = null
@@ -118,6 +130,9 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         edgeToEdge()
+        // 设备命令靠它起系统界面（闹钟/计时器/时钟列表）：只要实例在就够，
+        // 不要求"人在看着"（那个是 `current`）
+        alive = this
 
         WebView.setWebContentsDebuggingEnabled(isDebuggable())
 
@@ -973,6 +988,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        if (alive === this) alive = null
         // 页面已经没了，别把一个永远等不到结果的文件选择请求留着
         fileCallback?.onReceiveValue(null)
         fileCallback = null
@@ -1036,6 +1052,9 @@ class MainActivity : Activity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_STORAGE) AgentApp.syncSharedStorage(this)
+        // 设备命令（`agent contacts list` 这类）的权限：弹窗是它发的，但它在那边的
+        // 后台线程上等着。这里把结果转给那把闩（其他请求码它自己会略过）。
+        AgentPermissions.onResult(requestCode, grantResults)
     }
 
     /**

@@ -3,13 +3,17 @@ package dev.vihv.agent
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Path
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
 
 /**
@@ -97,6 +101,60 @@ class AgentAccessibilityService : AccessibilityService() {
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         startActivity(intent)
         "launched $pkg"
+    }
+
+    /**
+     * 截一张全屏图（`agent screenshot` 的那只手）。
+     *
+     * 为什么得在无障碍服务上：**系统只把这个能力给无障碍应用**
+     * （`AccessibilityService.takeScreenshot`，API 30+；要在
+     * `accessibility_service_config.xml` 里声明 `canTakeScreenshot`）。
+     * 普通应用要截屏只能拉 MediaProjection，那要让用户每次点一个"开始投屏"弹框。
+     *
+     * 返回值：`(图, 失败原因)` —— 两个只会有一个非空。
+     * 调用方（`DeviceApisImpl`）跑在后台线程上，所以这里自己阻塞等回调。
+     */
+    fun captureScreenBitmap(): Pair<Bitmap?, String?> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return null to "无障碍截屏是 Android 11（API 30）才有的接口，这台系统太旧"
+        }
+
+        val latch = CountDownLatch(1)
+        var shot: Bitmap? = null
+        var why: String? = null
+        // 回调要求一个 Executor；`main` 是个 Handler（它就是个 Executor）。
+        // 不管用哪个线程，下面都在等这个闩，所以只影响拷贝发生在哪。
+        val exec = Executor { r -> main.post(r) }
+
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            exec,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(result: ScreenshotResult) {
+                    // 硬件缓冲得**拷出来再关** —— 直接 wrap 出来的 Bitmap 在 close 之后就废了
+                    shot = runCatching {
+                        Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
+                            ?.copy(Bitmap.Config.ARGB_8888, false)
+                    }.getOrNull()
+                    result.hardwareBuffer.close()
+                    latch.countDown()
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    why = when (errorCode) {
+                        ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT -> "截得太频了（系统有最短间隔），等一下再试"
+                        ERROR_TAKE_SCREENSHOT_INVALID_DISPLAY -> "这个屏幕 id 系统不认"
+                        ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS -> "无障碍服务没拿到截屏能力（重新开关一下本 App 的无障碍）"
+                        else -> "系统拒绝了这次截图（errorCode=$errorCode）"
+                    }
+                    latch.countDown()
+                }
+            }
+        )
+
+        if (!latch.await(10, TimeUnit.SECONDS)) return null to "截屏超时（10s 没回调）"
+        if (shot == null) return null to (why ?: "系统回了成功，但图是空的")
+        return shot to null
     }
 
     // -----------------------------------------------------------------------
