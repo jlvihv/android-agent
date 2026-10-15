@@ -58,8 +58,9 @@ struct Phrasing {
     files: &'static str,
     /// 那句里示例用的路径（沙箱里就是 /workspace，宿主模式给一个真实的绝对路径）
     link_example: &'static str,
-    /// 那句话**句尾**的补充（只有手机那份有：点外链能跳 App；宿主模式空着）
-    link_extra: &'static str,
+    /// 紧跟那一句后面的**独立一行**（手机上：网址 / App 深链不加前缀；宿主模式空着
+    /// —— 空串等于没这一行，不会留出空行）
+    link_bullet: &'static str,
     /// `agent` 命令从哪来
     cli_intro: &'static str,
     /// 设备那一门：手机上是 `agent command`，电脑上是 `agent open`
@@ -80,7 +81,7 @@ const HOST: Phrasing = Phrasing {
     files: "相对路径基于 cwd，用户不指定目录时，你就尽量在 /tmp 下工作，不污染用户家目录，动用户的东西之前先说明，删除或覆盖先确认。",
     // 不说这句它会以为只能链 /workspace 里的，先把截图拷进来再给链接
     link_example: "/tmp/报告/index.html",
-    link_extra: "",
+    link_bullet: "",
     cli_intro: "`agent` 命令（已在 PATH 里）可查看/操作自己",
     cli_device: "`agent open <uri>`（用这台电脑的默认程序打开网页/文件）",
     browser: "无头 Chrome",
@@ -93,7 +94,7 @@ const ANDROID: Phrasing = Phrasing {
     who: "你是运行在安卓手机上的 Agent。",
     files: "cwd 固定 /workspace，就是手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）。你可按任务建子目录；虚拟环境/依赖/编译产物放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。",
     link_example: "/workspace/报告/index.html",
-    link_extra: "；链接格式也支持外部网页或 App 深链，用户点击时能用对应 App 打开",
+    link_bullet: "\n- 网址和 App 深链（`https://…`、`weixin://…`、`androidamap://…`）直接写地址，不要加 `preview:` —— 它只给文件用。",
     cli_device: "`agent command`（按键/点击/滑动/启动应用/打开 URI）",
     browser: "真 WebView",
     cli_procs: "、`agent ps` / `agent kill <pid>`（看/停沙箱里还在跑的进程 —— 包括你自己用 `setsid` 放后台的常驻服务）",
@@ -131,7 +132,7 @@ fn compose_prompt(t: &Phrasing) -> String {
         "{who}\n\
          \n\
          - {files}\n\
-         - 想让用户看链接时：写 `preview:` 链接，如 `[打开](preview:{link_example})`，图片/音频/视频都用图片语法，能渲染 `![说明](preview:…)`{link_extra}。\n\
+         - 想让用户看链接时：写 `preview:` 链接，如 `[打开](preview:{link_example})`，图片/音频/视频都用图片语法，能渲染 `![说明](preview:…)`。{link_bullet}\n\
          - {cli_intro}：`agent state|request|tools`、{cli_device}、`agent browser`（{browser}）、`agent search`（联网搜索）{cli_procs}，`agent help` 看全部。\n\
          - 一次回复里可以带多个工具调用：互不依赖的操作（比如一次新建好几个文件、跑几条互不相干的命令）合并到同一条回复里一起发，有依赖关系的才分成多轮。\n\
          \n\
@@ -139,7 +140,7 @@ fn compose_prompt(t: &Phrasing) -> String {
         who = t.who,
         files = t.files,
         link_example = t.link_example,
-        link_extra = t.link_extra,
+        link_bullet = t.link_bullet,
         cli_intro = t.cli_intro,
         cli_device = t.cli_device,
         browser = t.browser,
