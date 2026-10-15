@@ -38,6 +38,10 @@ pub struct Skill {
     pub description: String,
     /// `SKILL.md` 在模型视角里的路径（它 `read` 的就是这个）
     pub path: String,
+    /// 目录名：启用 / 停用按它记（`name` 是 frontmatter 里写的，可能和别的撞）
+    pub dir: String,
+    /// 停用的不进提示词（文件留着）。`scan` 出来都是 `true`，`AppState::skills` 按停用名单改
+    pub enabled: bool,
 }
 
 /// 扫一遍 skill 目录。`host` 是磁盘上的目录，`guest` 是模型看到的同一个目录。
@@ -73,6 +77,8 @@ pub fn scan(host: &Path, guest: &str) -> Vec<Skill> {
             name: meta.name.filter(|n| !n.is_empty()).unwrap_or_else(|| dir.clone()),
             description: clip(&description, MAX_DESCRIPTION),
             path: format!("{}/{dir}/SKILL.md", guest.trim_end_matches('/')),
+            dir,
+            enabled: true,
         });
         if out.len() >= MAX_SKILLS {
             break;
@@ -81,14 +87,15 @@ pub fn scan(host: &Path, guest: &str) -> Vec<Skill> {
     out
 }
 
-/// 拼进系统提示词的那一段。一个都没有就是空串。
+/// 拼进系统提示词的那一段（只列启用着的）。一个都没有就是空串。
 pub fn index(skills: &[Skill]) -> String {
-    if skills.is_empty() {
+    let on: Vec<&Skill> = skills.iter().filter(|k| k.enabled).collect();
+    if on.is_empty() {
         return String::new();
     }
     let mut s =
         String::from("- 技能（skill）：遇到下面这些事，先用 read 读对应的 SKILL.md，按里面的做法来：");
-    for k in skills {
+    for k in on {
         s.push_str(&format!("\n  - {}：{}（{}）", k.name, k.description, k.path));
     }
     s
@@ -275,11 +282,15 @@ mod tests {
                     name: "a-pdf".into(),
                     description: "处理 PDF".into(),
                     path: "/workspace/skills/a-pdf/SKILL.md".into(),
+                    dir: "a-pdf".into(),
+                    enabled: true,
                 },
                 Skill {
                     name: "web".into(),
                     description: "做网页".into(),
                     path: "/workspace/skills/b-web/SKILL.md".into(),
+                    dir: "b-web".into(),
+                    enabled: true,
                 },
             ]
         );
@@ -290,13 +301,18 @@ mod tests {
     #[test]
     fn index_is_empty_without_skills_and_lists_them_otherwise() {
         assert_eq!(index(&[]), "");
-        let s = index(&[Skill {
+        let mut pdf = Skill {
             name: "pdf".into(),
             description: "处理 PDF".into(),
             path: "/workspace/skills/pdf/SKILL.md".into(),
-        }]);
+            dir: "pdf".into(),
+            enabled: true,
+        };
+        let s = index(std::slice::from_ref(&pdf));
         assert!(s.starts_with("- 技能（skill）"), "{s}");
         assert!(s.contains("\n  - pdf：处理 PDF（/workspace/skills/pdf/SKILL.md）"), "{s}");
+        pdf.enabled = false;
+        assert_eq!(index(&[pdf]), "", "停用的不列");
     }
 
     /// 内置的 create-skill 自己就是一个合格的 skill：扫得出来、描述说清什么时候用、

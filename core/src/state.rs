@@ -251,8 +251,10 @@ pub struct AppState {
     /// `llm` 是「当前在用的那一个」（含模型），这里是「配好了的全部」：
     /// 选择模型面板把这几家的模型都列出来，点哪个就切到哪家。
     pub providers: RwLock<crate::providers::Store>,
-    /// 远程 MCP 服务（配置 + 各自的会话）。见 `mcp` 模块。
+    /// 远程 MCP 服务（配置 + 各自的会话 + 停用名单）。见 `mcp` 模块。
     pub mcp: crate::mcp::Mcp,
+    /// 停用的 skill（目录名）。库里 `disabled` 表 kind = 'skill' 那几行
+    disabled_skills: RwLock<std::collections::HashSet<String>>,
     /// 各家的模型清单：服务商 id → (拉的时间, 清单)。
     ///
     /// 打开选择模型面板要拉好几家的 `/models`，每次都等网络太慢；
@@ -366,6 +368,7 @@ impl AppState {
             llm: RwLock::new(None),
             providers: RwLock::new(Default::default()),
             mcp: Default::default(),
+            disabled_skills: Default::default(),
             model_lists: Mutex::new(HashMap::new()),
             data_dir: RwLock::new(None),
             alpine: Default::default(),
@@ -489,6 +492,22 @@ impl AppState {
                 match db.mcp_servers() {
                     Ok(list) => self.mcp.set_servers(list),
                     Err(e) => tracing::warn!("读 MCP 服务失败: {e:#}"),
+                }
+                match db.disabled() {
+                    Ok(rows) => {
+                        for (kind, name) in rows {
+                            match kind.as_str() {
+                                "mcp" => self.mcp.set_enabled(&name, false),
+                                "skill" => {
+                                    if let Ok(mut g) = self.disabled_skills.write() {
+                                        g.insert(name);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("读停用名单失败: {e:#}"),
                 }
                 self.load_auth(&db);
                 if let Ok(keys) = db.responses_unsupported() {
@@ -1196,7 +1215,7 @@ impl AppState {
     /// 拼在系统提示词后面那段：MCP 那句（**没接也在**，说怎么接）+ skill 索引（内置的
     /// create-skill 一直在，它教模型怎么装别的）。
     fn installed_prompt(&self) -> String {
-        let mut parts = vec![crate::mcp::prompt_line(&self.mcp.servers())];
+        let mut parts = vec![crate::mcp::prompt_line(&self.mcp.enabled_servers())];
         let skills = crate::skills::index(&self.skills());
         if !skills.is_empty() {
             parts.push(skills);
@@ -1205,6 +1224,7 @@ impl AppState {
     }
 
     /// 存一个 MCP 服务（库 + 内存）。同名的就是改：旧会话作废，下次重新握手。
+    /// **不动启用状态**：开关是用户的，改配置不该顺手把它打开（新的默认启用）。
     pub async fn put_mcp_server(&self, srv: crate::mcp::Server) -> anyhow::Result<()> {
         if let Some(db) = self.db() {
             db.set_mcp_server(&srv.name, Some(&srv))?;
@@ -1223,22 +1243,63 @@ impl AppState {
         let had = list.iter().any(|s| s.name == name);
         if let Some(db) = self.db() {
             db.set_mcp_server(name, None)?;
+            db.set_disabled("mcp", name, false)?;
         }
+        self.mcp.set_enabled(name, true);
         self.mcp
             .set_servers(list.into_iter().filter(|s| s.name != name).collect());
         self.mcp.forget_session(name).await;
         Ok(had)
     }
 
-    /// 这台机器上装的 skill（每次现扫：一个目录几十个 `SKILL.md`，比缓存失效的麻烦便宜）。
-    pub fn skills(&self) -> Vec<crate::skills::Skill> {
-        match self.linux() {
-            Some(sb) => {
-                let (host, guest) = sb.skills_dir();
-                crate::skills::scan(&host, &guest)
-            }
-            None => Vec::new(),
+    /// 启用 / 停用一个 MCP 服务（停用的不进提示词，模型调它会被拒）。
+    pub async fn set_mcp_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.mcp.servers().iter().any(|s| s.name == name),
+            "没有叫 {name} 的 MCP 服务"
+        );
+        if let Some(db) = self.db() {
+            db.set_disabled("mcp", name, !enabled)?;
         }
+        self.mcp.set_enabled(name, enabled);
+        self.mcp.forget_session(name).await;
+        Ok(())
+    }
+
+    /// 启用 / 停用一个 skill（按目录名）。停用的文件留着，只是不进提示词的索引。
+    pub fn set_skill_enabled(&self, dir: &str, enabled: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.skills().iter().any(|s| s.dir == dir),
+            "没有叫 {dir} 的 skill"
+        );
+        if let Some(db) = self.db() {
+            db.set_disabled("skill", dir, !enabled)?;
+        }
+        if let Ok(mut g) = self.disabled_skills.write() {
+            if enabled {
+                g.remove(dir);
+            } else {
+                g.insert(dir.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// 这台机器上装的 skill，带上启用状态（每次现扫：一个目录几十个 `SKILL.md`，
+    /// 比缓存失效的麻烦便宜）。
+    pub fn skills(&self) -> Vec<crate::skills::Skill> {
+        let Some(sb) = self.linux() else {
+            return Vec::new();
+        };
+        let (host, guest) = sb.skills_dir();
+        let off = self.disabled_skills.read().map(|g| g.clone()).unwrap_or_default();
+        crate::skills::scan(&host, &guest)
+            .into_iter()
+            .map(|mut s| {
+                s.enabled = !off.contains(&s.dir);
+                s
+            })
+            .collect()
     }
 
     /// 编译进去的那份提示词（没被运行时覆盖时用）。
@@ -1755,6 +1816,14 @@ mod tests {
         assert!(p.contains("pdf：处理 PDF（/workspace/skills/pdf/SKILL.md）"), "{p}");
         assert!(!p.contains("正文不进提示词"));
         assert_eq!(st.system_prompt(), p, "没变就逐字节一样");
+
+        // 停用：文件留着、设置页看得到，但不进提示词；再打开就回来
+        st.set_skill_enabled("pdf", false).unwrap();
+        assert!(!st.skills()[0].enabled);
+        assert_eq!(st.system_prompt(), bare, "停用了就和没装一样");
+        st.set_skill_enabled("pdf", true).unwrap();
+        assert_eq!(st.system_prompt(), p);
+        assert!(st.set_skill_enabled("nope", false).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -144,6 +144,8 @@ pub struct Mcp {
     servers: std::sync::RwLock<Vec<Server>>,
     /// 服务名 → 握过手了（`Some(会话 id)` / `None` = 服务端没给会话 id，无状态）
     sessions: tokio::sync::Mutex<HashMap<String, Option<String>>>,
+    /// 停用的服务名（配置留着，模型用不了、提示词里也不提）
+    disabled: std::sync::RwLock<std::collections::HashSet<String>>,
     next_id: AtomicU64,
 }
 
@@ -155,23 +157,52 @@ impl Mcp {
         }
     }
 
-    /// 全部服务（按名字排序）。
+    /// 全部服务（按名字排序，含停用的）。
     pub fn servers(&self) -> Vec<Server> {
         self.servers.read().map(|g| g.clone()).unwrap_or_default()
     }
 
-    fn server(&self, name: &str) -> anyhow::Result<Server> {
+    /// 启用着的服务（提示词里列的就是这些）。
+    pub fn enabled_servers(&self) -> Vec<Server> {
         self.servers()
+            .into_iter()
+            .filter(|s| self.is_enabled(&s.name))
+            .collect()
+    }
+
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.disabled.read().map(|g| !g.contains(name)).unwrap_or(true)
+    }
+
+    pub fn set_enabled(&self, name: &str, enabled: bool) {
+        if let Ok(mut g) = self.disabled.write() {
+            if enabled {
+                g.remove(name);
+            } else {
+                g.insert(name.to_string());
+            }
+        }
+    }
+
+    /// 能用的那个服务：不存在、停用了都是错（说清楚是哪种）。
+    fn server(&self, name: &str) -> anyhow::Result<Server> {
+        let srv = self
+            .servers()
             .into_iter()
             .find(|s| s.name == name)
             .ok_or_else(|| {
-                let names: Vec<String> = self.servers().into_iter().map(|s| s.name).collect();
+                let names: Vec<String> = self.enabled_servers().into_iter().map(|s| s.name).collect();
                 if names.is_empty() {
                     anyhow::anyhow!("没有叫 {name} 的 MCP 服务（还没接任何服务）")
                 } else {
                     anyhow::anyhow!("没有叫 {name} 的 MCP 服务（有的是：{}）", names.join("、"))
                 }
-            })
+            })?;
+        anyhow::ensure!(
+            self.is_enabled(name),
+            "MCP 服务 {name} 已停用（用户在 设置 → MCP 服务 里关掉的），要用得让用户打开"
+        );
+        Ok(srv)
     }
 
     /// 换了配置（改 URL / 请求头 / 删掉）：旧会话作废，下次重新握手。
@@ -388,6 +419,10 @@ async fn list(mcp: &Mcp, only: Option<&str>) -> anyhow::Result<String> {
     }
     let mut out = Vec::new();
     for srv in &servers {
+        if !mcp.is_enabled(&srv.name) {
+            out.push(format!("{}（已停用）", srv.name));
+            continue;
+        }
         match mcp.tools(srv).await {
             Ok(tools) => {
                 out.push(format!("{}（{} 个工具）", srv.name, tools.len()));
@@ -514,11 +549,12 @@ fn first_line(s: &str, max: usize) -> String {
     }
 }
 
-/// 拼进系统提示词的那一句。**一直在**：没接任何服务时也要告诉模型怎么接（接服务
-/// 一般是用户让它做的）。
+/// 拼进系统提示词的那一句（传进来的是**启用着的**服务）。**一直在**：没接任何服务时
+/// 也要告诉模型怎么接（接服务一般是用户让它做的）。
 pub fn prompt_line(servers: &[Server]) -> String {
     let have = if servers.is_empty() {
-        "还没接任何服务".to_string()
+        // 不说「还没接」：可能是接了但被用户停用了 —— 那种不该让模型再去接一遍
+        "现在没有可用的服务".to_string()
     } else {
         let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
         format!(
@@ -604,7 +640,7 @@ mod tests {
     #[test]
     fn prompt_line_always_says_how_to_add() {
         let none = prompt_line(&[]);
-        assert!(none.contains("还没接") && none.contains("agent mcp add"), "{none}");
+        assert!(none.contains("没有可用的服务") && none.contains("agent mcp add"), "{none}");
         let s = prompt_line(&[Server {
             name: "gh".into(),
             url: "https://x".into(),
@@ -740,6 +776,15 @@ mod tests {
         assert!(format!("{e:#}").contains("有的是：fake"), "{e:#}");
         let e = run(&mcp, &argv(&["fake", "zzz", "--help"]), None).await.unwrap_err();
         assert!(format!("{e:#}").contains("没有工具 zzz"), "{e:#}");
+
+        // 停用：list 里标出来、不去连；调用直接拒（说清是用户关的）
+        mcp.set_enabled("fake", false);
+        let listed = run(&mcp, &argv(&["list"]), None).await.unwrap();
+        assert!(listed.starts_with("fake（已停用）"), "{listed}");
+        let e = run(&mcp, &argv(&["fake", "echo", "{}"]), None).await.unwrap_err();
+        assert!(format!("{e:#}").contains("已停用"), "{e:#}");
+        assert!(mcp.enabled_servers().is_empty());
+        mcp.set_enabled("fake", true);
 
         // 凭据错：说清楚是凭据的事
         mcp.set_servers(vec![Server {

@@ -82,6 +82,14 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   headers TEXT NOT NULL
 );
 
+-- 停用的东西：kind = 'mcp'（服务名）| 'skill'（skill 的目录名）。不在表里 = 启用。
+-- skill 是磁盘上的文件，开关只能记在这儿；MCP 跟着用同一张表
+CREATE TABLE IF NOT EXISTS disabled (
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  PRIMARY KEY (kind, name)
+);
+
 -- 这些端点不支持 Responses API（`base_url|model`），直接走 Chat Completions
 CREATE TABLE IF NOT EXISTS responses_unsupported (
   endpoint TEXT PRIMARY KEY
@@ -727,6 +735,29 @@ impl Db {
                 })
             })?;
             rows.collect()
+        })
+    }
+
+    /// 停用名单：(kind, name)。
+    pub fn disabled(&self) -> Result<Vec<(String, String)>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT kind, name FROM disabled")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })
+    }
+
+    pub fn set_disabled(&self, kind: &str, name: &str, disabled: bool) -> Result<()> {
+        self.with(|c| {
+            if disabled {
+                c.execute(
+                    "INSERT OR IGNORE INTO disabled(kind, name) VALUES(?1, ?2)",
+                    [kind, name],
+                )
+            } else {
+                c.execute("DELETE FROM disabled WHERE kind = ?1 AND name = ?2", [kind, name])
+            }
+            .map(|_| ())
         })
     }
 

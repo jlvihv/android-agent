@@ -40,7 +40,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/mcp", post(mcp_run))
         .route("/api/mcp/servers", get(mcp_servers).post(save_mcp_server))
         .route("/api/mcp/servers/delete", post(delete_mcp_server))
+        .route("/api/mcp/servers/enabled", post(set_mcp_enabled))
         .route("/api/skills", get(list_skills))
+        .route("/api/skills/enabled", post(set_skill_enabled))
         // 看一眼工作目录（`agent files`）—— 只读，不动任何文件
         .route("/api/files", post(list_files))
         // 手机系统能力（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
@@ -987,6 +989,12 @@ async fn mcp_run(State(st): State<Arc<AppState>>, Json(body): Json<McpBody>) -> 
 async fn mcp_add(st: &AppState, args: &[String]) -> anyhow::Result<String> {
     let srv = crate::mcp::parse_add(args)?;
     let existed = st.mcp.servers().iter().any(|s| s.name == srv.name);
+    // 用户停用的：agent 不能靠「重新接一次」把它打开（开关是用户的）
+    anyhow::ensure!(
+        !existed || st.mcp.is_enabled(&srv.name),
+        "MCP 服务 {} 已经接过、被用户停用了（设置 → MCP 服务）。要用得让用户打开，别重新接",
+        srv.name
+    );
     // 同名的旧会话不能拿来试新配置
     st.mcp.forget_session(&srv.name).await;
     let tools = st
@@ -1048,7 +1056,14 @@ async fn mcp_servers(State(st): State<Arc<AppState>>) -> Json<Value> {
         .mcp
         .servers()
         .into_iter()
-        .map(|s| json!({ "name": s.name, "url": s.url, "headers": s.headers.keys().collect::<Vec<_>>() }))
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "url": s.url,
+                "headers": s.headers.keys().collect::<Vec<_>>(),
+                "enabled": st.mcp.is_enabled(&s.name),
+            })
+        })
         .collect();
     Json(json!({ "servers": list }))
 }
@@ -1101,7 +1116,30 @@ async fn delete_mcp_server(State(st): State<Arc<AppState>>, Json(body): Json<Del
     }
 }
 
-/// `GET /api/skills` → 装了哪些 skill，以及放在哪（设置页用）。
+#[derive(Deserialize)]
+struct EnabledBody {
+    /// MCP：服务名；skill：目录名
+    name: String,
+    enabled: bool,
+}
+
+/// `POST /api/mcp/servers/enabled` → 启用 / 停用一个 MCP 服务（`{name, enabled}`）。
+async fn set_mcp_enabled(State(st): State<Arc<AppState>>, Json(b): Json<EnabledBody>) -> Response {
+    match st.set_mcp_enabled(&b.name, b.enabled).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `POST /api/skills/enabled` → 启用 / 停用一个 skill（`{name: 目录名, enabled}`）。
+async fn set_skill_enabled(State(st): State<Arc<AppState>>, Json(b): Json<EnabledBody>) -> Response {
+    match st.set_skill_enabled(&b.name, b.enabled) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `GET /api/skills` → 装了哪些 skill（带启用状态），以及放在哪（设置页用）。
 async fn list_skills(State(st): State<Arc<AppState>>) -> Json<Value> {
     let dir = st.linux().map(|sb| sb.skills_dir().1);
     Json(json!({ "dir": dir, "skills": st.skills() }))
@@ -3079,6 +3117,25 @@ mod tests {
             },
         )));
         (st, root)
+    }
+
+    /// 用户停用的 MCP 服务，agent 不能靠 `agent mcp add` 重新接一次把它打开（开关是用户的）。
+    /// 在连网之前就拒，配置和开关都不动。
+    #[tokio::test]
+    async fn agent_cannot_reenable_a_disabled_mcp_server_by_adding_it_again() {
+        let st = crate::state::AppState::new();
+        st.mcp.set_servers(vec![crate::mcp::Server {
+            name: "gh".into(),
+            url: "https://example.invalid/mcp".into(),
+            headers: Default::default(),
+        }]);
+        st.mcp.set_enabled("gh", false);
+        let e = crate::http::mcp_add(&st, &["gh".into(), "https://other.invalid/mcp".into()])
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("停用"), "{e:#}");
+        assert!(!st.mcp.is_enabled("gh"));
+        assert_eq!(st.mcp.servers()[0].url, "https://example.invalid/mcp", "配置不动");
     }
 
     /// `agent ps` 的后端：`/api/procs` 跟别的 `/api` 一样要凭据，`?format=text`
