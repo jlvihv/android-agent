@@ -9,9 +9,10 @@
    *
    * 数字口径（面板里都写清楚，不让人猜）：
    *   上下文   = 最近一次请求的 `input`（整段历史 + 系统提示词 + 工具）
-   *   输入/输出 = 最近一次调用的 `input` / `output`
-   *   缓存命中 = `cache_read` ÷ `input` —— 归一和命中率都在核心算好了
-   *              （见 `core/src/openai.rs` 的 `UsageView`），前端只读不重算。
+   *   面板里的桶 = 本会话累计 —— 未缓存输入 / 缓存读取 / 缓存写入 / 输出，
+   *              字段集和 DeepSeek Harness 的会话用量面板一致；命中率在核心
+   *              算好（见 `core/src/openai.rs` 的 `UsageView`），前端只读不重算。
+   *              数字用 k / M 这种给人看的格式。
    */
   import { type SessionUsage } from '../lib/sse';
   import Sheet from './Sheet.svelte';
@@ -142,7 +143,7 @@
 {/if}
 
 {#if open && usage}
-  {@const u = usage.last}
+  {@const total = usage.total}
   <!-- 高度贴合内容：这里就几行数字，别撑到半屏 -->
   <Sheet title="上下文用量" hug onclose={() => (open = false)}>
     <div class="flex flex-col gap-3 pb-2">
@@ -160,54 +161,35 @@
         </div>
       </div>
 
+      <!-- 本会话累计。字段对齐 DeepSeek Harness 的会话用量面板：
+           缓存命中 / 未缓存输入 / 缓存读取 / 缓存写入（没写就不占行）/ 输出。
+           数字仍然用 k / M 这种给人看的格式（DSH 那边是精确值）。 -->
       <div class="overflow-hidden rounded-2xl bg-surface">
-        <div class="flex items-baseline gap-3 border-b-2 border-ink px-3.5 py-3">
-          <span class="text-[15px]">最近一次调用</span>
-          <span class="ml-auto text-[15px] text-muted">
-            输入 {fmt(u.input)} · 输出 {fmt(u.output)}
-          </span>
-        </div>
-        <div class="flex items-baseline gap-3 border-b-2 border-ink px-3.5 py-3">
+        {#if total.cache_read > 0}
+          <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
+            <span class="text-[15px]">缓存命中</span>
+            <span class="ml-auto text-[15px] text-muted">
+              {fmtPct(total.cache_read / total.input)}
+            </span>
+          </div>
+        {/if}
+        <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
           <span class="text-[15px]">未缓存输入</span>
-          <span class="ml-auto text-[15px] text-muted">{fmt(u.uncached_input)} token</span>
+          <span class="ml-auto text-[15px] text-muted">{fmt(total.uncached_input)} token</span>
         </div>
-        {#if u.cache_write > 0}
-          <div class="flex items-baseline gap-3 border-b-2 border-ink px-3.5 py-3">
+        <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
+          <span class="text-[15px]">缓存读取</span>
+          <span class="ml-auto text-[15px] text-muted">{fmt(total.cache_read)} token</span>
+        </div>
+        {#if total.cache_write > 0}
+          <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
             <span class="text-[15px]">缓存写入</span>
-            <span class="ml-auto text-[15px] text-muted">{fmt(u.cache_write)} token</span>
+            <span class="ml-auto text-[15px] text-muted">{fmt(total.cache_write)} token</span>
           </div>
         {/if}
-        {#if u.reasoning > 0}
-          <div class="flex items-baseline gap-3 border-b-2 border-ink px-3.5 py-3">
-            <span class="text-[15px]">其中思考</span>
-            <span class="ml-auto text-[15px] text-muted">{fmt(u.reasoning)} token</span>
-          </div>
-        {/if}
-        <div class="flex items-baseline gap-3 px-3.5 py-3">
-          <span class="text-[15px]">缓存命中</span>
-          <span class="ml-auto text-[15px] text-muted">
-            {#if u.cache_hit_ratio == null}
-              provider 没报（这个端点不支持）
-            {:else}
-              {fmt(u.cache_read)} / {fmt(u.input)} · {fmtPct(u.cache_hit_ratio)}
-            {/if}
-          </span>
-        </div>
-      </div>
-
-      <div class="overflow-hidden rounded-2xl bg-surface">
-        <div class="flex items-baseline gap-3 px-3.5 py-3">
-          <span class="text-[15px]">本会话累计</span>
-          <span class="ml-auto text-[15px] text-muted">
-            输入 {fmt(usage.total.input)} · 输出 {fmt(usage.total.output)}
-          </span>
-        </div>
-        <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3">
-          <span class="text-[15px]">调用次数</span>
-          <span class="ml-auto text-[15px] text-muted">
-            {usage.total.calls} 次{#if usage.total.input > 0 && usage.total.cache_read > 0}
-              · 命中 {fmtPct(usage.total.cache_read / usage.total.input)}{/if}
-          </span>
+        <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
+          <span class="text-[15px]">输出</span>
+          <span class="ml-auto text-[15px] text-muted">{fmt(total.output)} token</span>
         </div>
       </div>
     </div>
