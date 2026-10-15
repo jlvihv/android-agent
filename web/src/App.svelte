@@ -210,6 +210,7 @@
     // 刚点了「新对话」还没发第一句：服务端那边还是旧会话（新的根本还没建），
     // 拉回来会把刚清空的界面又填满旧内容。
     if (fresh) return;
+    const at = sent;
     try {
       const r = await fetch(`/api/session?rev=${encodeURIComponent(rev)}`);
       if (!r.ok) return;
@@ -237,6 +238,10 @@
         /** token 用量（输入框那个圆环）。服务端那份是权威 */
         usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
       };
+      // 请求在路上的时候本地发了一条（`send`）：这份是发之前的样子，拿它整份
+      // 覆盖会把刚推进去的用户消息和正在流的那条助手消息冲掉 —— 流接着往一个
+      // 已经不在列表里的对象里写，界面上就是「没回复」。丢掉，下一次再拉。
+      if (busy || at !== sent) return;
       serverBusy = !!d.busy;
       rev = d.rev ?? '';
       // 排队那几条按服务端**整份重来**（`unchanged` 时也要）：它们的变化不进
@@ -322,6 +327,12 @@
    * 服务端一旦碰巧返回 unchanged，界面就卡在上一个会话的内容上。
    */
   let rev = '';
+
+  /**
+   * 本地往消息列表里加过东西的次数（`send` / 开跑）。`loadMessages` 发请求前记一下，
+   * 回来时对不上就说明这份是旧的（见那里的注释）。
+   */
+  let sent = 0;
 
   /**
    * 当前会话 id（从 rev 里解出来）。切会话时清掉，避免跨会话复用消息对象。
@@ -420,10 +431,15 @@
     await Promise.all([loadSessions(), loadMessages()]);
   }
 
-  $effect(() => {
-    void loadMessages();
-    void loadSessions();
-  });
+  // 只在挂载时跑一次。`untrack` 不能省：`loadMessages` 在第一个 await 之前同步读了
+  // `busy` / `fresh`，不包的话它们都成了这个 effect 的依赖 —— 发第一句时 `fresh`
+  // 一变就多拉一次，和 `/api/chat` 赛跑。
+  $effect(() =>
+    untrack(() => {
+      void loadMessages();
+      void loadSessions();
+    }),
+  );
 
   // 切回前台 / 重新聚焦 → 同步一次。
   //
@@ -590,6 +606,8 @@
       if (live === me) {
         live = null;
         busy = false;
+        // 流收完了：换成服务端那份（id、合并方式以它为准；流里断了的也补回来）
+        void loadMessages();
       }
       void loadSessions();
     }
@@ -629,6 +647,7 @@
     const text = input.trim();
     if (!text && attachments.length === 0) return;
     input = '';
+    sent++;
 
     const id = uid();
     const parts = userParts(text, attachments);
@@ -701,6 +720,7 @@
 
     // 开跑了：那条虚线气泡翻进正文（换了个 id 的影子都没有 —— 就是同一个 id）
     queue = queue.filter((q) => q.id !== id);
+    sent++;
     messages.push({ id, role: 'user', parts, steps: 0, done: true });
     const msg = store.beginStreaming();
     messages.push(msg);
@@ -775,7 +795,7 @@
          弹出面板的 z-50 困住，压不过同级 z-20 的输入框（踩过）。
          z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
     <main class="absolute inset-0">
-      {#if messages.length === 0}
+      {#if messages.length === 0 && queuedMsgs.length === 0}
         <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
       {:else}
         <MessageList {messages} pending={queuedMsgs} ondrop={dropQueued} />
