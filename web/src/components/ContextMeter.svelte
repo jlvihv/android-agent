@@ -38,8 +38,6 @@
   const RING_BIG = { size: 56, r: 22, sw: 5.2, fs: 18 };
   /** 环里那个数低于这个百分比就写 `<1`（0 看着像坏了） */
   const TINY_PCT = 0.5;
-  /** 百分比低于这个（0.01 = 1%）时给一位小数 */
-  const ONE_DECIMAL_BELOW = 0.01;
   /** `fmt` 的进位门槛 */
   const KILO = 1_000;
   const MEGA = 1_000_000;
@@ -58,14 +56,8 @@
         ? '<1'
         : String(Math.round(ratio * 100)),
   );
-  /** 面板和 tooltip 用的百分比：不到 1% 时给一位小数（0.1% 比 0% 诚实） */
-  const pctLabel = $derived(
-    ratio == null
-      ? null
-      : ratio >= ONE_DECIMAL_BELOW
-        ? `${Math.round(ratio * 100)}%`
-        : `${(ratio * 100).toFixed(1)}%`,
-  );
+  /** 面板和 tooltip 用的百分比：一位小数（环里那个数是整数 —— 那地方小，塞不下） */
+  const pctLabel = $derived(ratio == null ? null : `${(ratio * 100).toFixed(1)}%`);
 
 
 
