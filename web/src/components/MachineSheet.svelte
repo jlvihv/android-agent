@@ -18,11 +18,19 @@
    * （广播工具不在、`avahi-daemon` 没跑时用）—— 手机上不给：页面能传任意地址的话，
    * 查看器里 AI 写的网页就能把界面带到别人的服务器上（见 docs/11）。
    */
+  import { slide } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
   import Icon from './Icon.svelte';
   import Sheet from './Sheet.svelte';
   import { hasShell, machines, type Machine } from '../lib/machines.svelte.ts';
 
   let { onclose }: { onclose: () => void } = $props();
+
+  /** 后来出现 / 消失的那几行（局域网里刚找到、刚不见的）展开 / 收起的时长（ms） */
+  const ROW_MS = 200;
+  /** 机器那几行展开 / 收起；「本机」那行不要（它一直在，没有「冒出来」这回事） */
+  const rowIn = (node: Element, on: boolean) =>
+    on ? slide(node, { duration: ROW_MS, easing: cubicOut }) : { duration: 0 };
 
   type Page = 'list' | 'pair' | 'manual';
   let page = $state<Page>('list');
@@ -75,7 +83,11 @@
 </script>
 
 <!-- 一行机器。当前那台不画成按钮（点它等于什么也不做），勾在右边，和「选择模型」一致。
-     不在线的（`off`）也不是按钮：点了只会等来一个「连不上」，灰着放在那儿说清楚就行。 -->
+     不在线的（`off`）也不是按钮：点了只会等来一个「连不上」，灰着放在那儿说清楚就行。
+
+     `transition:slide` 是本地的（Svelte 5 默认）：面板挂上时已经在的那几行不动，只有
+     后来冒出来 / 不见了的（局域网里刚找到一台）展开 / 收起 —— 面板高度跟着平滑地变，
+     而不是一下子跳一截。 -->
 {#snippet row(
   icon: 'phone' | 'computer' | 'globe',
   name: string,
@@ -83,6 +95,7 @@
   current: boolean,
   onpick: () => void,
   off = false,
+  anim = false,
 )}
   {@const still = current || off}
   <svelte:element
@@ -91,7 +104,10 @@
     role={still ? 'group' : undefined}
     aria-disabled={off || undefined}
     onclick={still ? undefined : onpick}
-    class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left {off ? 'opacity-50' : ''}"
+    transition:rowIn={anim}
+    class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left transition-opacity {off
+      ? 'opacity-50'
+      : ''}"
   >
     <Icon name={icon} size={18} class="shrink-0 text-muted" />
     <span class="min-w-0 flex-1">
@@ -136,6 +152,7 @@
           machines.isHere(m.id),
           () => (m.paired ? machines.connect(m.id) : ask(m)),
           offline(m),
+          true,
         )}
       {/each}
 

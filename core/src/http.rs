@@ -547,8 +547,13 @@ async fn machines_list(State(st): State<Arc<AppState>>) -> Response {
     let Some(m) = st.machines() else {
         return no_store();
     };
-    // 经中继的那几台在不在线（有缓存，十秒内不重问）
-    m.refresh_presence().await;
+    // 经中继的那几台在不在线：后台去问（有缓存，十秒内不重问），这次先用手上的。
+    // 不在这里等：面板第一帧要的就是这份列表，等中继（最多 1.5 秒）就是让它晚出来
+    // 那么久 —— 面板 1.5 秒轮询一次，下一次就带上了
+    tokio::spawn({
+        let m = m.clone();
+        async move { m.refresh_presence().await }
+    });
     let list: Vec<Value> = m
         .panel()
         .into_iter()

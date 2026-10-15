@@ -177,10 +177,14 @@
   };
 </script>
 
-<!-- 遮罩。点它即关；拖到哪淡到哪。 -->
+<!-- 遮罩。点它即关；拖到哪淡到哪。
+
+     层级：遮罩 55、面板 56 —— 都在侧栏（50）**上面**。「选择机器」是从侧栏底栏点开的，
+     侧栏还开着；遮罩要是在侧栏下面，点面板上方那块想关面板，点中的是侧栏里的会话记录。
+     整页的覆盖层（设置页 60、查看器 70）照旧在面板上面：模型面板里能进设置页。 -->
 <button
   use:portal
-  class="fixed inset-0 z-40 bg-scrim"
+  class="fixed inset-0 z-[55] bg-scrim"
   style:opacity={1 - p}
   style:transition={dragging ? 'none' : `opacity ${CLOSE_MS}ms ease-out`}
   aria-label="关闭"
@@ -197,7 +201,7 @@
   tabindex="-1"
   style:transform="translateY({p * 100}%)"
   style:transition={dragging ? 'none' : RELEASE}
-  class="fixed inset-x-0 bottom-[var(--kb,0px)] z-50 flex max-h-[var(--sheet-max-h)] {hug
+  class="fixed inset-x-0 bottom-[var(--kb,0px)] z-[56] flex max-h-[var(--sheet-max-h)] {hug
          ? 'min-h-0'
          : 'min-h-[var(--sheet-min-h)]'} flex-col
          rounded-t-4xl bg-ink pt-1 will-change-transform"

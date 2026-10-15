@@ -34,6 +34,8 @@
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
   import Icon from './Icon.svelte';
+  import { untrack } from 'svelte';
+  import { machines } from '../lib/machines.svelte.ts';
 
   export type Session = {
     id: string;
@@ -78,6 +80,15 @@
      *  （电脑浏览器 / 手机浏览器里只有一个核心，没得换）——那就只显示，不可点。 */
     onmachine: (() => void) | null;
   } = $props();
+
+  /**
+   * 侧栏一出来就把「选择机器」的数据拉好：面板是从底栏那个标签点开的，等点开再拉的话，
+   * 第一帧只有「本机」一行，其余几行随后跳出来（`machines` 的数据活在组件外面，
+   * 面板挂上时直接用这份）。点不了的时候（没有 `onmachine`）不拉。
+   */
+  $effect(() => {
+    if (onmachine) void untrack(() => machines.load());
+  });
 
   /** 搜索防抖（ms）：输入停顿这么久再打后端。一边打字一边发请求纯属浪费；
    *  effect 的清理函数会把上一个计时器干掉，所以快速输入不会堆积请求。 */
