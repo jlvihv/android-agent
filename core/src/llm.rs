@@ -27,10 +27,12 @@ use crate::responses::ResponsesRequest;
 /// 而不是通用 SDK / HTTP 库名"。
 pub const USER_AGENT: &str = concat!("android-agent/", env!("CARGO_PKG_VERSION"));
 
-/// Responses 流开了之后，第一个事件最多等多久（见 `StreamError::Silent`）。
+/// 从发出 Responses 请求起，第一个事件最多等多久（见 `StreamError::Silent`）。
 ///
 /// `response.created` 是服务端收下请求就发的，不等模型，正常是亚秒级；
 /// 给宽一点是为了手机网络上的抖动。
+/// 响应头到的时候 `RESPONSES_FIRST_EVENT` 已经用完了：再等这么久看有没有事件。
+const RESPONSES_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const RESPONSES_FIRST_EVENT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(1)
 } else {
@@ -340,9 +342,16 @@ impl Provider {
         req: &ResponsesRequest,
         session_id: &str,
     ) -> Result<mpsc::UnboundedReceiver<anyhow::Result<StreamChunk>>, StreamError> {
+        // 第一个事件的期限从**发请求**算起：有的端点连响应头都要拖十几秒才回（实测
+        // OpenCode Go 的 deepseek 系：14 秒才回 200，之后一个事件都没有），只从响应头算
+        // 的话要白等「十几秒 + 15 秒」。但响应头没到之前不下结论 —— 那也可能只是网络慢，
+        // 判错了会把这个模型的 Responses 永久关掉。
+        let deadline = tokio::time::Instant::now() + RESPONSES_FIRST_EVENT;
         let resp = self
             .post_stream(&self.responses_url(), req, session_id)
             .await?;
+        // 响应头来得晚、期限已经用完：再给一小段宽限看有没有事件
+        let deadline = deadline.max(tokio::time::Instant::now() + RESPONSES_GRACE);
         let (tx, rx) = mpsc::unbounded_channel();
         // 第一个事件（不管是什么）到了就喊一声。不能等第一个 chunk：
         // `response.created` 这类事件不产出 chunk，而第一个 chunk 要等模型预填充完。
@@ -362,10 +371,7 @@ impl Provider {
             }
         });
         // 收到事件，或者流已经结束（`seen` 被丢掉 —— 错误 / 断开都在 rx 里）都算数
-        if tokio::time::timeout(RESPONSES_FIRST_EVENT, seen_rx)
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout_at(deadline, seen_rx).await.is_err() {
             pump.abort(); // 连接随之关掉
             return Err(StreamError::Silent(RESPONSES_FIRST_EVENT.as_secs()));
         }
@@ -458,9 +464,12 @@ pub enum StreamError {
 impl StreamError {
     /// 是不是「端点不支持这个 API」。
     ///
-    /// 400 只在报错**说的是路由/端点本身**时才算 —— 只要带 "unknown" 就算的话，
-    /// 「unknown parameter」「unknown model」这种跟协议无关的 400 会让这次
+    /// 400 只在报错**说的是路由/端点本身、或者协议**时才算 —— 只要带 "unknown" 就算
+    /// 的话，「unknown parameter」「unknown model」这种跟协议无关的 400 会让这次
     /// 运行剩下的时间全切到 Chat Completions。
+    ///
+    /// 「这个模型不支持这个协议」也算（OpenCode Go：GPT 系走得了 Responses，别的模型回
+    /// `ModelProtocolUnsupported`）—— 它说到了 model，但说的是协议，按模型记下就对了。
     pub fn is_unsupported_endpoint(&self) -> bool {
         match self {
             StreamError::Http { status, body } => {
@@ -486,7 +495,8 @@ impl StreamError {
                 let about_other = ["parameter", "model", "field", "argument"]
                     .iter()
                     .any(|k| b.contains(k));
-                negative && about_route && !about_other
+                let about_protocol = b.contains("protocol");
+                negative && (about_protocol || (about_route && !about_other))
             }
             StreamError::Silent(_) => true,
             StreamError::Other(_) => false,
@@ -638,6 +648,12 @@ mod tests {
         assert!(!http(400, "Unknown parameter: 'reasoning.effort'").is_unsupported_endpoint());
         assert!(!http(400, "unknown model: gpt-9").is_unsupported_endpoint());
         assert!(!http(400, "context length exceeded").is_unsupported_endpoint());
+        // OpenCode Go：这个模型不走 Responses（GPT 系走得了）
+        assert!(http(
+            400,
+            r#"{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}"#
+        )
+        .is_unsupported_endpoint());
     }
 
     #[test]
