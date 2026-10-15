@@ -686,7 +686,7 @@ const ANDROID: Phrasing = Phrasing {
 /// Linux / macOS 宿主模式共用的部分（各自再盖掉不同的那几句）。
 const HOST: Phrasing = Phrasing {
     who: "",
-    files: "cwd 是启动核心时的那个目录（`pwd` 就是它）。`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或者真实路径。你在真机器上：命令改的是真文件、装的是真软件。动用户的东西之前先说明，删除或覆盖先确认。",
+    files: "cwd 是启动核心时的那个目录（`pwd` 就是它）；`/workspace` 只是 `read` / `edit` / `sandbox:` 链接里那个目录的**别名**，shell 里没有这个路径 —— 命令里用相对路径或真实路径。动用户的东西之前先说明，删除或覆盖先确认。",
     // 不说这句它会以为只能链 /workspace 里的，先把截图拷进来再给链接
     link_extra: "（`sandbox:` 后面任何绝对路径都行，截图不用先拷进来）",
     cli_intro: "`agent` 命令（已在 PATH 里）可查看/操作自己",
@@ -694,12 +694,12 @@ const HOST: Phrasing = Phrasing {
     browser: "核心自己起的无头 Chrome",
     shots: "截图路径在返回里，用 read 看",
     cli_procs: "",
-    bash_where: "直接在这台电脑上跑 bash 命令（没有沙箱；cwd=启动核心时的目录；每次新进程，shell 状态不持久）。",
+    bash_where: "直接在这台电脑上跑 bash 命令（cwd=启动核心时的目录；每次新进程，shell 状态不持久）。",
     bash_env: "",
 };
 
 const LINUX: Phrasing = Phrasing {
-    who: "你是运行在一台 Linux 电脑上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。",
+    who: "你是运行在一台 Linux 电脑上的 Agent。",
     bash_env: "用这台机器上已有的工具，装东西用它的包管理器（pacman/apt/dnf…）或 venv。",
     ..HOST
 };
@@ -707,7 +707,7 @@ const LINUX: Phrasing = Phrasing {
 /// `setsid` 在 macOS 上不是系统自带的 —— 是宿主模式垫在 PATH 里的
 /// （`linux::SETSID_SHIM`），所以后台服务的写法跟别处一样，不用另说。
 const MACOS: Phrasing = Phrasing {
-    who: "你是运行在一台 Mac（macOS）上的 Agent（宿主模式：没有沙箱，bash 直接在这台机器上跑）。",
+    who: "你是运行在一台 Mac（macOS）上的 Agent。",
     // 不点这一句的话，模型几乎一定按 GNU 写，白白报错一轮
     bash_env: "这是 BSD 用户态：`sed -i ''`、`date`、`stat`、`readlink -f`、`xargs` 的参数跟 GNU 不一样，拿不准先看 `man` 或用 python3；装东西用 brew 或 venv。",
     ..HOST
@@ -730,6 +730,7 @@ fn compose_prompt(t: &Phrasing) -> String {
          - {files}\n\
          - 给用户看成品时：写 `sandbox:` 链接，如 `[打开](sandbox:/workspace/报告/index.html)`{link_extra}；图片/音频/视频都用图片语法，能渲染 `![说明](sandbox:…)`。做完主动给链接，别只写路径。\n\
          - {cli_intro}：`agent state|request|tools`、{cli_device}、`agent browser`（{browser}：navigate / get_backbone 读结构 / click / type / screenshot，一条命令能连做多步；{shots}）、`agent search`（联网搜索）{cli_procs}，`agent help` 看全部。\n\
+         - 一次回复里可以带多个工具调用：互不依赖的操作（比如一次新建好几个文件、跑几条互不相干的命令）合并到同一条回复里一起发，有依赖关系的才分成多轮。\n\
          \n\
          回答要言简意赅。",
         who = t.who,
