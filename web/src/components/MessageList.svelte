@@ -12,6 +12,7 @@
    * 每个思考、每次工具调用**各开各的面板**，面板里只有它自己。
    */
   import { tick } from 'svelte';
+  import { cubicIn } from 'svelte/easing';
   import type { Message, ToolPart } from '../lib/sse';
   import { sandboxPath } from '../lib/markdown';
   import { BROWSER_ACTION, describeInput, describeResult, failed, type Tone } from '../lib/toolview';
@@ -316,6 +317,43 @@
     toBottom();
   };
 
+  /**
+   * 「回到最新」那个光圈按钮的收放：200ms、`cubicIn`（**先慢后快**）。
+   *
+   * 缓动用的是 `1-(1-t)³` 的镜像 `t³`：前 1/5 时间只走 0.8%、最后 1/5 走 48.8% ——
+   * 圈先摆在那儿几乎不动，最后一下阖进那个点（跟面板/抽屉那条“松手回位”
+   * 的曲线刚好反向）。想回到先快后慢：`cubicIn` 换 `cubicOut`。
+   *
+   * 为什么不用 `svelte/transition` 的 `scale`：它把整个按钮（连里头的箭头）
+   * 一起缩，圈变小的时候箭头也在变小。这里要的是**圈变小、箭头大小不变** ——
+   * 所以外层圈照常缩，里面的箭头**反着缩**（`1/t`）：
+   *
+   *   - 箭头是圈的子元素，它自己的 transform 在圈的局部坐标里；
+   *   - 两条动画同一个 duration / easing，且在**同一批**里创建（Svelte 对同一批
+   *     过渡按同样的时间点采样、连缓动值都一样），逐帧乘积恰好是 1 ——
+   *     屏幕上箭头一直是 18px，不会一屏一帧地抖；
+   *   - 圈上有 `overflow-hidden`，所以箭头最后是被**圈裁掉**的（像光圈阖上），
+   *     而不是自己缩没；
+   *   - **只有箭头淡出**（`opacity: t`），外圈不淡（默认就是 1）：不然收到最后一帧
+   *     是箭头中心剩下一个雪亮的白点，比圈本身还显眼（实测就是这个问题）。
+   *     外圈全程不透明也刚好让人看清“圈一直在阖”，最后它自己缩没了。
+   *     两边都写就是平方（箭头会比圈暗得快），所以只能写一边 —— 写箭头这一边。
+   *
+   * `1/t` 封顶到 50：t 已经小到圈不足 1px 时，箭头再大也是被裁得什么都不剩，
+   * 但没必要让浏览器去摆弄一个几万像素的元素。
+   */
+  const APERTURE_MS = 200;
+  function aperture(node: HTMLElement, { inverse = false }: { inverse?: boolean } = {}) {
+    return {
+      duration: APERTURE_MS,
+      easing: cubicIn,
+      css: (t: number) =>
+        inverse
+          ? `transform: scale(${1 / Math.max(t, 1 / 50)}); opacity: ${t}`
+          : `transform: scale(${t})`,
+    };
+  }
+
   let lastTop = 0;
 
   // —— 窗口化 ——
@@ -596,7 +634,21 @@
 
      尺寸 / 圆角 / 图标字号跟输入卡片里那两个圆按钮**一模一样**
      （`size-9` + `rounded-full` + 18px 图标）—— 同一个 App 里同一类控件不该有两种大小。
+     底色和边框则跟**输入卡片本身**一致（`bg-surface/92` + `border-control`）：
+     它是浮在正文上的，底下有字经过时透出一点点才看得出是个浮层；
+     但透太多就变成“糊了一层”的脏块（试过 /85：正文直接读过圆钮，像没盖住），
+     92% 是刚刚好那档。
+     （卡片里那两个圆按钮是 `bg-control`、没有边 —— 照抄它们就只能是个实心疙瘩。）
      只有图标没有文字（`aria-label` / `title` 顶上），就跟停止键一样。
+
+     出现 / 消失走 `aperture`（见上面那段）：圈从**一个点**长出来、收回去也小到那个点
+     再没，而里头的箭头**一直 18px** —— 圈阖到比箭头还小时把它裁掉。
+     **外圈全程不透明，只有箭头淡出**：否则最后一帧是箭头中心一个雪亮的白点，
+     比圈还显眼（实测）。
+     200ms / `cubicIn`（先慢后快：前 1/5 时间只走 0.8%，最后 1/5 走 48.8%），
+     圈先摆在那儿几乎不动，最后一下阖进那个点。
+     缩放中心是元素自己的中心（`transform-origin` 默认 50% 50%），左右两边等速往中间收。
+     圈要 `overflow-hidden` 才能把箭头裁掉；而它和箭头是两层，各管各的缩放。
 
      `absolute` 挂在 App 的 `main`（`absolute inset-0`）上，所以宽屏有侧边栏
      时它跟着**对话区**居中，不是整个窗口居中。底部避让用跟滚动容器 padding
@@ -607,11 +659,22 @@
     onclick={jumpToLatest}
     aria-label="回到最新"
     title="回到最新"
-    class="absolute bottom-[calc(var(--composer-h,0px)+1.25rem)] left-1/2 z-10 grid
-           size-9 -translate-x-1/2 place-items-center rounded-full bg-control text-fg
-           ring-1 ring-hairline"
+    class="absolute bottom-[calc(var(--composer-h,0px)+1.25rem)] left-1/2 z-10 size-9 -translate-x-1/2
+           rounded-full text-fg"
   >
-    <Icon name="down" size={18} />
+    <!-- 圈：底色 + 跟输入卡片同一条边。它是缩的那一层，也负责裁里面的箭头 -->
+    <span
+      transition:aperture
+      class="grid size-9 place-items-center overflow-hidden rounded-full border border-control
+             bg-surface/92"
+    >
+      <!-- 箭头：反着缩，屏幕上尺寸不变。包一层是为了让它居中、并且不参与圈那条
+           transition；这层**就是 18px**（跟图标一样大）—— 36px 的话它的中心和
+           圈的中心会差半个「边框 + grid 居中」的量（实测中心抖 1px）。 -->
+      <span transition:aperture={{ inverse: true }} class="block size-[18px]">
+        <Icon name="down" size={18} />
+      </span>
+    </span>
   </button>
 {/if}
 
