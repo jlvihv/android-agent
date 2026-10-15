@@ -137,10 +137,15 @@ provider / model 换了（`/api/llm`）。这两种情况下代码会
 
 ### 3.3 两套缓存字段谁优先
 
-取命中数时要在
-`prompt_tokens_details.cached_tokens` 和 `prompt_cache_hit_tokens` 里取**大**的那个。
-用 `.or()` 的话，只要前者是 `Some(0)`（有些网关冷启动会填 0 而不是省略字段），
-后者报的真值就被吞掉，日志显示 0% —— 而这是唯一能证明缓存生效的数字。
+取命中数时要在 `prompt_tokens_details.cached_tokens` 和 `prompt_cache_hit_tokens`
+里取**大**的那个。用 `.or()` 的话，只要前者是 `Some(0)`（有些网关冷启动会填 0
+而不是省略字段），后者报的真值就被吞掉，日志显示 0% —— 而这是唯一能证明缓存
+生效的数字。
+
+这段归一**只写在一个地方**：`openai.rs` 的 `Usage::view()` 把 provider 原样字段
+折成互斥的 `UsageView`（`uncached_input` / `cache_read` / `cache_write` /
+`output` / `reasoning`），并且**顺手把命中率算好**。核心内部、SSE、`/api/session`、
+前端拿到的都是它 —— 前端不再解析 provider 字段名（以前两边各算一份，容易跑偏）。
 
 ---
 
@@ -175,7 +180,7 @@ prompt cache 命中 93.4%（cached=1920 prompt=2056 completion=2  reasoning=0）
 
 ### 怎么读这些数字
 
-用量字段有**两套写法**，都接上了（`core/src/agent.rs` 的 `Usage`）：
+用量字段有**两套写法**，`core/src/openai.rs` 的 `Usage`（provider 原样）都接：
 
 | 风格 | 字段 |
 |---|---|
@@ -186,8 +191,12 @@ OpenCode Go 的 `deepseek-v4.1-flash` 走的是 **OpenAI 系**。
 `prompt_cache_hit_tokens` 是 `null` —— 如果只按 DeepSeek 的字段名解析，
 就会误以为"这个 provider 不支持缓存"。
 
-另外 `completion_tokens_details.reasoning_tokens` 也值得看：
-DeepSeek 系的推理 token 按 **output** 计费（$1.20/M），
+对外的数字是 `UsageView`（互斥桶），不是上面这些原始字段：`prompt_tokens`
+含缓存，减掉 `cache_read` 才是 `uncached_input`；`input = uncached_input +
+cache_read + cache_write`，加起来不会重复。`cache_hit_ratio` 是核心算好的，
+`null` = provider 没报（和「报了 0」不是一回事）。
+
+另外 `reasoning` 也值得看：DeepSeek 系的推理 token 按 **output** 计费（$1.20/M），
 一次简单问答就能产生 25–136 个推理 token。
 
 ### 怎么打开用量上报
@@ -217,6 +226,7 @@ req["stream_options"] = json!({ "include_usage": true });
 | `tool_schemas_serialize_byte_identically` | schema 序列化字节确定 |
 | `browser_and_search_are_only_reachable_through_the_sandbox_cli` | 浏览器和搜索只能从沙箱那个门进（工具表里不能有 `browser` / `search`，提示词里必须有 `agent browser` / `agent search`） |
 | `usage_understands_both_cache_field_styles` | 两套缓存字段都认，同时在时取大的那个 |
+| `usage_view_splits_the_disjoint_buckets_once` | 归一成互斥桶：`uncached + read + write == input`，命中率只算一份 |
 
 `full_request_body_is_prefix_stable_across_turns` 是硬的那条：它不断言中间函数，
 而是直接断言**构造好的请求体**（`build_request()`，和 `stream_one` 走同一条路）

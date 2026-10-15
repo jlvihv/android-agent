@@ -8,11 +8,12 @@
    * 假上限（环就只剩一条轨道）。
    *
    * 数字口径（面板里都写清楚，不让人猜）：
-   *   上下文   = 最近一次请求的 `prompt_tokens`（整段历史 + 系统提示词 + 工具）
-   *   输入/输出 = 最近一次调用的 `prompt_tokens` / `completion_tokens`
-   *   缓存命中 = 命中的缓存 token ÷ 输入（同一套两套写的字段，见 `cachedTokens`）
+   *   上下文   = 最近一次请求的 `input`（整段历史 + 系统提示词 + 工具）
+   *   输入/输出 = 最近一次调用的 `input` / `output`
+   *   缓存命中 = `cache_read` ÷ `input` —— 归一和命中率都在核心算好了
+   *              （见 `core/src/openai.rs` 的 `UsageView`），前端只读不重算。
    */
-  import { cachedTokens, cacheHitRatio, reasoningTokens, type SessionUsage } from '../lib/sse';
+  import { type SessionUsage } from '../lib/sse';
   import Sheet from './Sheet.svelte';
 
   let {
@@ -42,7 +43,7 @@
   const KILO = 1_000;
   const MEGA = 1_000_000;
 
-  const used = $derived(usage?.last.prompt_tokens ?? 0);
+  const used = $derived(usage?.last.input ?? 0);
   /** 0..1；没有窗口就是 null */
   const ratio = $derived(ctxWindow ? Math.min(1, used / ctxWindow) : null);
   /**
@@ -142,9 +143,6 @@
 
 {#if open && usage}
   {@const u = usage.last}
-  {@const hit = cachedTokens(u)}
-  {@const hr = cacheHitRatio(u)}
-  {@const reason = reasoningTokens(u)}
   <!-- 高度贴合内容：这里就几行数字，别撑到半屏 -->
   <Sheet title="上下文用量" hug onclose={() => (open = false)}>
     <div class="flex flex-col gap-3 pb-2">
@@ -166,22 +164,32 @@
         <div class="flex items-baseline gap-3 border-b-2 border-ink px-3.5 py-3">
           <span class="text-[15px]">最近一次调用</span>
           <span class="ml-auto text-[15px] text-muted">
-            输入 {fmt(u.prompt_tokens)} · 输出 {fmt(u.completion_tokens)}
+            输入 {fmt(u.input)} · 输出 {fmt(u.output)}
           </span>
         </div>
-        {#if reason != null}
+        <div class="flex items-baseline gap-3 border-b-2 border-ink px-3.5 py-3">
+          <span class="text-[15px]">未缓存输入</span>
+          <span class="ml-auto text-[15px] text-muted">{fmt(u.uncached_input)} token</span>
+        </div>
+        {#if u.cache_write > 0}
+          <div class="flex items-baseline gap-3 border-b-2 border-ink px-3.5 py-3">
+            <span class="text-[15px]">缓存写入</span>
+            <span class="ml-auto text-[15px] text-muted">{fmt(u.cache_write)} token</span>
+          </div>
+        {/if}
+        {#if u.reasoning > 0}
           <div class="flex items-baseline gap-3 border-b-2 border-ink px-3.5 py-3">
             <span class="text-[15px]">其中思考</span>
-            <span class="ml-auto text-[15px] text-muted">{fmt(reason)} token</span>
+            <span class="ml-auto text-[15px] text-muted">{fmt(u.reasoning)} token</span>
           </div>
         {/if}
         <div class="flex items-baseline gap-3 px-3.5 py-3">
           <span class="text-[15px]">缓存命中</span>
           <span class="ml-auto text-[15px] text-muted">
-            {#if hr == null || hit == null}
+            {#if u.cache_hit_ratio == null}
               provider 没报（这个端点不支持）
             {:else}
-              {fmt(hit)} / {fmt(u.prompt_tokens)} · {fmtPct(hr)}
+              {fmt(u.cache_read)} / {fmt(u.input)} · {fmtPct(u.cache_hit_ratio)}
             {/if}
           </span>
         </div>
@@ -197,8 +205,8 @@
         <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3">
           <span class="text-[15px]">调用次数</span>
           <span class="ml-auto text-[15px] text-muted">
-            {usage.total.calls} 次{#if usage.total.input > 0 && usage.total.cached > 0}
-              · 命中 {fmtPct(usage.total.cached / usage.total.input)}{/if}
+            {usage.total.calls} 次{#if usage.total.input > 0 && usage.total.cache_read > 0}
+              · 命中 {fmtPct(usage.total.cache_read / usage.total.input)}{/if}
           </span>
         </div>
       </div>

@@ -1075,14 +1075,14 @@ impl AppState {
     ///
     /// 库的读写都丢给阻塞池：库锁和定时落盘是同一把，落盘在写大事务时，
     /// 直接在这里等会占住一个 worker。
-    pub async fn record_usage(&self, row: &crate::db::UsageRow, u: &crate::openai::Usage) {
+    pub async fn record_usage(&self, row: &crate::db::UsageRow, v: &crate::openai::UsageView) {
         // 内存里还没有（重启后头一次）：先从库里接上之前的，**再**写这一行 —— 反过来就算两遍
         let base = self.usage_of(&row.session_id).await;
         if let Ok(mut g) = self.usage.lock() {
             g.entry(row.session_id.clone())
                 .or_insert(base)
                 .get_or_insert_with(UsageStats::default)
-                .add(u);
+                .add(v);
         }
         let Some(db) = self.db() else { return };
         let row = row.clone();
@@ -1475,29 +1475,35 @@ pub struct Auth {
 
 /// 一个会话的 token 用量 —— 输入框上那个上下文圆环和它点开的面板。
 ///
-/// `last` 是「**现在这个上下文有多大**」：一次请求发出去的 `prompt_tokens`
-/// 就是当时整段历史 + 系统提示词 + 工具定义的大小，所以它比累计值更能说明
-/// 「还剩多少余量」。
+/// `last` 是「**现在这个上下文有多大**」：一次请求发出去的 `input` 就是当时
+/// 整段历史 + 系统提示词 + 工具定义的大小，所以它比累计值更能说明「还剩多少余量」。
 ///
-/// 缓存字段有**两套写法**（OpenAI 系 / DeepSeek 系），归一在
-/// `Usage::cached_tokens()` 里。
+/// 桶是**互斥**的（见 `openai::UsageView`）：`input = uncached_input +
+/// cache_read + cache_write`，加起来不会重复。归一（含命中率）只在
+/// `Usage::view()` 里做一次。
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct UsageStats {
-    /// 最近一次 LLM 调用
-    pub last: Option<crate::openai::Usage>,
-    /// 本会话累计
+    /// 最近一次 LLM 调用（已归一化）
+    pub last: Option<crate::openai::UsageView>,
+    /// 本会话累计（同一个互斥桶口径）
     pub input: u64,
+    pub uncached_input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
     pub output: u64,
-    pub cached: u64,
+    pub reasoning: u64,
     pub calls: u64,
 }
 
 impl UsageStats {
-    fn add(&mut self, u: &crate::openai::Usage) {
-        self.last = Some(u.clone());
-        self.input += u.prompt_tokens as u64;
-        self.output += u.completion_tokens as u64;
-        self.cached += u.cached_tokens().unwrap_or(0) as u64;
+    fn add(&mut self, v: &crate::openai::UsageView) {
+        self.last = Some(v.clone());
+        self.input += v.input as u64;
+        self.uncached_input += v.uncached_input as u64;
+        self.cache_read += v.cache_read as u64;
+        self.cache_write += v.cache_write as u64;
+        self.output += v.output as u64;
+        self.reasoning += v.reasoning as u64;
         self.calls += 1;
     }
 }
@@ -1633,23 +1639,41 @@ mod tests {
             }),
             ..Default::default()
         };
-        st.record_usage(&usage_row("a"), &u1).await;
+        st.record_usage(&usage_row("a"), &u1.view()).await;
         let s = st.usage_of("a").await.unwrap();
-        assert_eq!((s.input, s.output, s.cached, s.calls), (1000, 50, 800, 1));
-        assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1000);
+        // 互斥桶：input 含缓存，uncached + cache_read = input
+        assert_eq!(
+            (
+                s.input,
+                s.uncached_input,
+                s.cache_read,
+                s.cache_write,
+                s.output,
+                s.calls
+            ),
+            (1000, 200, 800, 0, 50, 1)
+        );
+        let last = s.last.as_ref().unwrap();
+        assert_eq!(
+            (last.input, last.uncached_input, last.cache_read),
+            (1000, 200, 800)
+        );
+        assert_eq!(last.cache_hit_ratio, Some(0.8));
 
-        // 第二步：last 换成新的，累计往上加
+        // 第二步：last 换成新的，累计往上加。DeepSeek 系那套字段名也要认
         let u2 = Usage {
             prompt_tokens: 1500,
             completion_tokens: 20,
-            // DeepSeek 系那套写法，两套都要认
             prompt_cache_hit_tokens: Some(1400),
             ..Default::default()
         };
-        st.record_usage(&usage_row("a"), &u2).await;
+        st.record_usage(&usage_row("a"), &u2.view()).await;
         let s = st.usage_of("a").await.unwrap();
-        assert_eq!((s.input, s.output, s.cached, s.calls), (2500, 70, 2200, 2));
-        assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1500);
+        assert_eq!(
+            (s.input, s.uncached_input, s.cache_read, s.output, s.calls),
+            (2500, 300, 2200, 70, 2)
+        );
+        assert_eq!(s.last.as_ref().unwrap().input, 1500);
 
         assert!(st.usage_of("b").await.is_none(), "另外那个会话不受影响");
 
@@ -1694,20 +1718,20 @@ mod tests {
 
         let st = with_db();
         let (r, u) = step(1000, 50);
-        st.record_usage(&r, &u).await;
+        st.record_usage(&r, &u.view()).await;
         let (r, u) = step(1500, 20);
-        st.record_usage(&r, &u).await;
+        st.record_usage(&r, &u.view()).await;
 
         // 「重启」：内存里什么都没有，从库里接上
         let st = with_db();
         let s = st.usage_of("a").await.expect("库里有");
         assert_eq!((s.input, s.output, s.calls), (2500, 70, 2));
-        assert_eq!(s.last.as_ref().unwrap().prompt_tokens, 1500);
+        assert_eq!(s.last.as_ref().unwrap().input, 1500);
 
         // 重启后**没先问过** usage_of 就来了一步：也得先接上库里的，再加这一步
         let st = with_db();
         let (r, u) = step(2000, 10);
-        st.record_usage(&r, &u).await;
+        st.record_usage(&r, &u.view()).await;
         let s = st.usage_of("a").await.unwrap();
         assert_eq!((s.input, s.calls), (4500, 3), "不多算、不漏算");
 
@@ -1716,7 +1740,7 @@ mod tests {
         assert!(st.usage_of("a").await.is_none());
         assert!(with_db().usage_of("a").await.is_none());
         let (r, u) = step(300, 5);
-        st.record_usage(&r, &u).await;
+        st.record_usage(&r, &u.view()).await;
         let s = with_db().usage_of("a").await.unwrap();
         assert_eq!((s.input, s.calls), (300, 1));
     }

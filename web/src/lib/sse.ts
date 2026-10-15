@@ -144,58 +144,44 @@ export async function* streamFrom(
 // ---------------------------------------------------------------------------
 
 /**
- * 一次 LLM 调用的 token 用量（核心 `data-usage` part 的形状，
- * 见 `core/src/openai.rs` 的 `Usage`）。
+ * 一次 LLM 调用的 token 用量。**形状就是核心归一化之后的 `UsageView`**
+ * （见 `core/src/openai.rs`）—— 互斥的桶 + 核心算好的命中率。
  *
- * `prompt_tokens` = 这一次请求发出去的整段上下文，所以它同时就是
- * 「现在上下文有多大」；`completion_tokens` 是这一步的输出。
+ * `input` = 这一次请求发出去的整段上下文（整段历史 + 系统提示词 + 工具），
+ * 所以它同时就是「现在上下文有多大」；`uncached_input` + `cache_read` +
+ * `cache_write` = `input`，加起来不会重复。
+ *
+ * provider 的两套字段名、`cached_tokens: 0` 这些坑全在核心处理完了，
+ * 前端只读这里的数，**不再自己解析**（以前两边各算一份，容易跑偏）。
  */
 export type Usage = {
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-  /** 缓存命中：OpenAI 系、DeepSeek 系各一套写法 */
-  prompt_tokens_details?: { cached_tokens?: number | null } | null;
-  completion_tokens_details?: { reasoning_tokens?: number | null } | null;
-  prompt_cache_hit_tokens?: number | null;
-  prompt_cache_miss_tokens?: number | null;
+  input: number;
+  uncached_input: number;
+  cache_read: number;
+  cache_write: number;
+  output: number;
+  reasoning: number;
+  total: number;
+  /** 命中率 0..1；provider 没报缓存字段是 null（和「报了 0」不是一回事） */
+  cache_hit_ratio: number | null;
 };
 
-/** 本会话累计的用量。 */
-export type UsageTotals = { input: number; output: number; cached: number; calls: number };
+/** 本会话累计的用量（同一个互斥桶口径）。 */
+export type UsageTotals = {
+  input: number;
+  uncached_input: number;
+  cache_read: number;
+  cache_write: number;
+  output: number;
+  reasoning: number;
+  calls: number;
+};
 
 /**
  * 一个会话的用量：最近一次调用 + 累计。输入框上那个圆环读它，
  * 形状和 `/api/session` 的 `usage` 字段一致（那边 `last` 可能缺）。
  */
 export type SessionUsage = { last: Usage; total: UsageTotals };
-
-/**
- * 命中的缓存 token 数。两套字段都接，同时出现取**大**的那个 ——
- * 和核心 `Usage::cached_tokens()` 同一条规则（有些网关冷启动会先报
- * `cached_tokens: 0` 而不是省略，用 `.or()` 会把真值吞掉）。
- *
- * provider 不报就返回 `null`（别把「不知道」说成 0）。
- */
-export function cachedTokens(u: Usage): number | null {
-  const openai = u.prompt_tokens_details?.cached_tokens;
-  const deepseek = u.prompt_cache_hit_tokens;
-  if (openai != null && deepseek != null) return Math.max(openai, deepseek);
-  return openai ?? deepseek ?? null;
-}
-
-/** 推理 token（DeepSeek 系按 output 计费，所以它直接影响成本）。 */
-export function reasoningTokens(u: Usage): number | null {
-  return u.completion_tokens_details?.reasoning_tokens ?? null;
-}
-
-/** 缓存命中率 0..1；provider 不报就是 `null`。夹到 [0,1] —— `prompt_tokens`
- *  含不含缓存部分各家定义不同，直接相除会出现 >100%。 */
-export function cacheHitRatio(u: Usage): number | null {
-  const hit = cachedTokens(u);
-  if (hit == null || !u.prompt_tokens) return null;
-  return Math.min(1, Math.max(0, hit / u.prompt_tokens));
-}
 
 /**
  * 用量来了就喊一声。

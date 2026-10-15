@@ -255,6 +255,10 @@ pub struct Usage {
     pub prompt_cache_hit_tokens: Option<u32>,
     #[serde(default)]
     pub prompt_cache_miss_tokens: Option<u32>,
+    /// Anthropic 系的缓存**写入**（创建）字段。我们这两套协议（Chat / Responses）
+    /// 都不报它，但接了不亏 —— `Usage` 是宽松反序列化，未来接别的协议时也能用。
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -268,6 +272,67 @@ pub struct CompletionTokensDetails {
     /// 推理 token。DeepSeek 系按 output 计费，所以它直接影响成本。
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
+}
+
+/// 一次调用的用量，**归一化**之后给核心内部和界面用的形状。
+///
+/// 和 `Usage`（provider 原样字段）分开的理由：provider 报的 `prompt_tokens` 是
+/// **含缓存**的聚合值，而缓存又有两套字段名（OpenAI 系 / DeepSeek 系）——
+/// 拿它当「输入」再单独加缓存就重复了。这里归一成**互斥的桶**，
+/// 并且**命中率只算一次**：绕开两套字段名、`cached_tokens: 0` 这些坑的地方
+/// 只有 `Usage::view()` 和下面的 `from_buckets`，前端不再自己解析。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct UsageView {
+    /// 这次请求发出去的输入总量（= 未缓存 + 缓存读 + 缓存写）。上下文圆环读它。
+    pub input: u32,
+    /// 未命中缓存、按全价计的输入
+    pub uncached_input: u32,
+    /// 缓存读取（命中）
+    pub cache_read: u32,
+    /// 缓存写入（创建）。OpenAI 系不报，是 0
+    pub cache_write: u32,
+    /// 输出（含推理）
+    pub output: u32,
+    /// 推理 token（`output` 的子集，DeepSeek 系按 output 计费）
+    pub reasoning: u32,
+    /// 这一次调用的总 token
+    pub total: u32,
+    /// 命中率 = `cache_read / input`，夹在 0..1。provider **没报**缓存字段是 `None`
+    /// （和「报了 0」不是一回事）
+    pub cache_hit_ratio: Option<f64>,
+}
+
+impl UsageView {
+    /// 从原始桶拼出归一化用量。`Usage::view()` 和从库里重建（`db::session_usage`）
+    /// 都走这里 —— 命中率的算法只有这一份。
+    ///
+    /// `cache_reported` = provider 报没报缓存字段（没报的话三个缓存桶都是 0，
+    /// 但那不是「命中 0%」）。
+    pub fn from_buckets(
+        input: u32,
+        cache_read: u32,
+        cache_write: u32,
+        output: u32,
+        reasoning: u32,
+        cache_reported: bool,
+    ) -> Self {
+        // 不变式：传进来的 `input` 是含缓存的输入总量。网关偶尔把它报得比缓存
+        // 还小，兜一下别算出负数。
+        let input = input.max(cache_read + cache_write);
+        let uncached_input = input - cache_read - cache_write;
+        let cache_hit_ratio = (cache_reported && input > 0)
+            .then(|| (cache_read as f64 / input as f64).clamp(0.0, 1.0));
+        Self {
+            input,
+            uncached_input,
+            cache_read,
+            cache_write,
+            output,
+            reasoning,
+            total: input + output,
+            cache_hit_ratio,
+        }
+    }
 }
 
 impl Usage {
@@ -294,16 +359,27 @@ impl Usage {
             .and_then(|d| d.reasoning_tokens)
     }
 
+    /// 归一化：provider 原样字段 → **互斥桶 + 算好的命中率**。
+    ///
+    /// 整个后端只在这里调一次（`agent.rs` 的 usage 块）。之后核心内部、SSE、
+    /// `/api/session`、前端拿到的都是这个 —— 不再有第二处解析两套缓存字段名的代码。
+    pub fn view(&self) -> UsageView {
+        let reported = self.cached_tokens();
+        UsageView::from_buckets(
+            self.prompt_tokens,
+            reported.unwrap_or(0),
+            self.cache_creation_input_tokens.unwrap_or(0),
+            self.completion_tokens,
+            self.reasoning_tokens().unwrap_or(0),
+            reported.is_some(),
+        )
+    }
+
     /// 缓存命中率。provider 不报缓存字段时返回 None。
     ///
-    /// 夹到 `[0,1]`：`prompt_tokens` 含不含缓存部分各厂商定义不同，
-    /// 有的实现里它是 miss-only，直接相除会得到 >100%。
+    /// 就是 `view()` 里那个数 —— 留着是给测试 / 只想取一个数的调用方。
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        let hit = self.cached_tokens()? as f64;
-        if self.prompt_tokens == 0 {
-            return None;
-        }
-        Some((hit / self.prompt_tokens as f64).clamp(0.0, 1.0))
+        self.view().cache_hit_ratio
     }
 }
 
@@ -640,5 +716,51 @@ mod tests {
         // provider 什么都不报时不能瞎猜
         let unknown: Usage = serde_json::from_value(json!({ "prompt_tokens": 50 })).unwrap();
         assert_eq!(unknown.cache_hit_ratio(), None);
+    }
+
+    /// 归一化：互斥桶 + 命中率只算一份。provider 报的 prompt_tokens 含缓存，
+    /// 减出来之后 uncached + cache_read + cache_write == input。
+    #[test]
+    fn usage_view_splits_the_disjoint_buckets_once() {
+        let openai: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 40,
+            "prompt_tokens_details": { "cached_tokens": 800 },
+            "completion_tokens_details": { "reasoning_tokens": 12 }
+        }))
+        .unwrap();
+        let v = openai.view();
+        assert_eq!(
+            (
+                v.input,
+                v.uncached_input,
+                v.cache_read,
+                v.cache_write,
+                v.output,
+                v.reasoning
+            ),
+            (1000, 200, 800, 0, 40, 12)
+        );
+        assert_eq!(v.total, 1040);
+        assert_eq!(v.cache_hit_ratio, Some(0.8));
+
+        // Anthropic 系的缓存写入也接；没报读取时命中率是 None（不是 0%）
+        let write_only: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 500,
+            "cache_creation_input_tokens": 120
+        }))
+        .unwrap();
+        let v = write_only.view();
+        assert_eq!(
+            (v.input, v.uncached_input, v.cache_read, v.cache_write),
+            (500, 380, 0, 120)
+        );
+        assert_eq!(v.cache_hit_ratio, None);
+
+        // provider 什么都不报：三个桶都是 0，命中率 None（不能当成「命中 0%」）
+        let unknown: Usage = serde_json::from_value(json!({ "prompt_tokens": 50 })).unwrap();
+        let v = unknown.view();
+        assert_eq!((v.input, v.uncached_input, v.cache_read), (50, 50, 0));
+        assert_eq!(v.cache_hit_ratio, None);
     }
 }

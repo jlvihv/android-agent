@@ -102,17 +102,19 @@ CREATE TABLE IF NOT EXISTS relay (
 --
 -- 只追加：删会话、清空会话都**不删**这些行（拿来做分析的 —— 花在哪、缓存命中多少）。
 -- 清空会话只把它的行标成 `cleared = 1`：输入框那个上下文圆环只算没清掉的那些。
--- `cached` / `reasoning` 是 NULL = 服务商没报这个字段（和 0 不是一回事）。
+-- `cached`（缓存读取）/ `cache_write`（缓存写入）/ `reasoning` 是 NULL = 服务商
+-- 没报这个字段（和 0 不是一回事）。
 CREATE TABLE IF NOT EXISTS usage (
-  id         INTEGER PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  at         INTEGER NOT NULL,   -- 这一步结束的时刻（毫秒）
-  provider   TEXT NOT NULL,
-  model      TEXT NOT NULL,
-  input      INTEGER NOT NULL,   -- prompt_tokens
-  output     INTEGER NOT NULL,   -- completion_tokens
-  cached     INTEGER,
-  reasoning  INTEGER,
+  id          INTEGER PRIMARY KEY,
+  session_id  TEXT NOT NULL,
+  at          INTEGER NOT NULL,   -- 这一步结束的时刻（毫秒）
+  provider    TEXT NOT NULL,
+  model       TEXT NOT NULL,
+  input       INTEGER NOT NULL,   -- 输入总量（含缓存 = 未缓存 + 缓存读 + 缓存写）
+  output      INTEGER NOT NULL,   -- completion_tokens
+  cached      INTEGER,            -- 缓存读取（命中）
+  cache_write INTEGER,            -- 缓存写入（创建；OpenAI 系不报）
+  reasoning   INTEGER,
   finish     TEXT,               -- 模型报的结束原因（stop / tool_calls / length……）
   ms         INTEGER NOT NULL,   -- 这一步从发请求到流完花了多久（含重试）
   cleared    INTEGER NOT NULL DEFAULT 0
@@ -153,9 +155,13 @@ pub struct UsageRow {
     pub at: u64,
     pub provider: String,
     pub model: String,
+    /// 输入总量（含缓存 = 未缓存 + 缓存读 + 缓存写）
     pub input: u32,
     pub output: u32,
+    /// 缓存读取（NULL = 服务商没报；和 0 不是一回事）
     pub cached: Option<u32>,
+    /// 缓存写入（OpenAI 系不报，一般是 NULL）
+    pub cache_write: Option<u32>,
     pub reasoning: Option<u32>,
     pub finish: Option<String>,
     pub ms: u64,
@@ -226,6 +232,27 @@ struct PlannedMessages {
     rows: Vec<String>,
 }
 
+/// 老库补列。`SCHEMA` 只做 `CREATE TABLE IF NOT EXISTS`，已经建过的表不会自动加列 ——
+/// 新增的列（目前只有 `usage.cache_write`）得在这里显式补。幂等，重复跑没事。
+fn migrate(conn: &Connection) -> Result<()> {
+    let mut has_cache_write = false;
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(usage)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(1)?;
+            if name == "cache_write" {
+                has_cache_write = true;
+                break;
+            }
+        }
+    }
+    if !has_cache_write {
+        conn.execute_batch("ALTER TABLE usage ADD COLUMN cache_write INTEGER")?;
+    }
+    Ok(())
+}
+
 pub struct Db {
     inner: Mutex<Inner>,
 }
@@ -237,6 +264,7 @@ impl Db {
         }
         let conn = Connection::open(path).with_context(|| format!("打开 {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("建表")?;
+        migrate(&conn)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
@@ -251,6 +279,7 @@ impl Db {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
@@ -801,8 +830,8 @@ impl Db {
     pub fn add_usage(&self, r: &UsageRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO usage(session_id, at, provider, model, input, output, cached, reasoning, finish, ms)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO usage(session_id, at, provider, model, input, output, cached, cache_write, reasoning, finish, ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     r.session_id,
                     r.at as i64,
@@ -811,6 +840,7 @@ impl Db {
                     r.input,
                     r.output,
                     r.cached,
+                    r.cache_write,
                     r.reasoning,
                     r.finish,
                     r.ms as i64
@@ -823,45 +853,65 @@ impl Db {
     /// 这个会话（上次清空之后）的用量：累计 + 最近那一次。一次都没有是 `None`。
     pub fn session_usage(&self, sid: &str) -> Result<Option<crate::state::UsageStats>> {
         self.with(|c| {
-            let (calls, input, output, cached): (i64, i64, i64, i64) = c.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(input), 0), COALESCE(SUM(output), 0), COALESCE(SUM(cached), 0)
+            let (calls, input, uncached, output, cache_read, cache_write, reasoning): (
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+            ) = c.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(input), 0),
+                        COALESCE(SUM(input - COALESCE(cached, 0) - COALESCE(cache_write, 0)), 0),
+                        COALESCE(SUM(output), 0), COALESCE(SUM(cached), 0),
+                        COALESCE(SUM(cache_write), 0), COALESCE(SUM(reasoning), 0)
                  FROM usage WHERE session_id = ?1 AND cleared = 0",
                 [sid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
             )?;
             if calls == 0 {
                 return Ok(None);
             }
+            // 最近那次：从存下来的桶重建 UsageView（命中率的算法只有那一处）
             let last = c.query_row(
-                "SELECT input, output, cached, reasoning FROM usage
+                "SELECT input, output, cached, cache_write, reasoning FROM usage
                  WHERE session_id = ?1 AND cleared = 0 ORDER BY id DESC LIMIT 1",
                 [sid],
                 |r| {
                     let input: u32 = r.get(0)?;
                     let output: u32 = r.get(1)?;
                     let cached: Option<u32> = r.get(2)?;
-                    let reasoning: Option<u32> = r.get(3)?;
-                    Ok(crate::openai::Usage {
-                        prompt_tokens: input,
-                        completion_tokens: output,
-                        total_tokens: input + output,
-                        prompt_tokens_details: cached.map(|n| crate::openai::PromptTokensDetails {
-                            cached_tokens: Some(n),
-                        }),
-                        completion_tokens_details: reasoning.map(|n| {
-                            crate::openai::CompletionTokensDetails {
-                                reasoning_tokens: Some(n),
-                            }
-                        }),
-                        ..Default::default()
-                    })
+                    let cache_write: Option<u32> = r.get(3)?;
+                    let reasoning: Option<u32> = r.get(4)?;
+                    Ok(crate::openai::UsageView::from_buckets(
+                        input,
+                        cached.unwrap_or(0),
+                        cache_write.unwrap_or(0),
+                        output,
+                        reasoning.unwrap_or(0),
+                        cached.is_some(),
+                    ))
                 },
             )?;
             Ok(Some(crate::state::UsageStats {
                 last: Some(last),
                 input: input as u64,
+                uncached_input: uncached as u64,
+                cache_read: cache_read as u64,
+                cache_write: cache_write as u64,
                 output: output as u64,
-                cached: cached as u64,
+                reasoning: reasoning as u64,
                 calls: calls as u64,
             }))
         })
@@ -940,6 +990,7 @@ mod tests {
             input,
             output: 7,
             cached: Some(input / 2),
+            cache_write: None,
             reasoning: None,
             finish: Some("stop".into()),
             ms: 1200,
@@ -947,11 +998,24 @@ mod tests {
         db.add_usage(&row(100)).unwrap();
         db.add_usage(&row(300)).unwrap();
         let u = db.session_usage("s").unwrap().unwrap();
-        assert_eq!((u.input, u.output, u.cached, u.calls), (400, 14, 200, 2));
+        assert_eq!(
+            (
+                u.input,
+                u.uncached_input,
+                u.cache_read,
+                u.cache_write,
+                u.output,
+                u.calls
+            ),
+            (400, 200, 200, 0, 14, 2)
+        );
         let last = u.last.unwrap();
-        assert_eq!(last.prompt_tokens, 300);
-        assert_eq!(last.cached_tokens(), Some(150));
-        assert_eq!(last.reasoning_tokens(), None, "没报的还是没报，不变成 0");
+        assert_eq!(
+            (last.input, last.uncached_input, last.cache_read),
+            (300, 150, 150)
+        );
+        assert_eq!(last.cache_hit_ratio, Some(0.5));
+        assert_eq!(last.reasoning, 0, "没报的还是 0，不编一个假的");
 
         db.clear_usage("s").unwrap();
         assert!(db.session_usage("s").unwrap().is_none());

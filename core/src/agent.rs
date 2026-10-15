@@ -2047,38 +2047,41 @@ async fn stream_one(
         // 通知栏：这一步说了什么，结束那一条拿它当回复预览
         status.step_text(&text_acc);
 
-        // 把缓存命中情况摆出来 —— 这是验证 prompt cache 的唯一硬证据
+        // 归一化**只在这里做一次**：之后日志、SSE、/api/session、前端拿到的都是
+        // 同一个互斥桶 + 算好的命中率（见 `UsageView`）—— 前端不再解析两套字段名。
         if let Some(u) = &usage {
-            match u.cache_hit_ratio() {
+            let view = u.view();
+            match view.cache_hit_ratio {
                 Some(ratio) => tracing::info!(
                     "prompt cache 命中 {:.1}%（cached={} prompt={} completion={} reasoning={}）",
                     ratio * 100.0,
-                    u.cached_tokens().unwrap_or(0),
-                    u.prompt_tokens,
-                    u.completion_tokens,
-                    u.reasoning_tokens().unwrap_or(0),
+                    view.cache_read,
+                    view.input,
+                    view.output,
+                    view.reasoning,
                 ),
                 None => tracing::info!(
                     "prompt={} completion={}（provider 未报缓存字段）",
-                    u.prompt_tokens,
-                    u.completion_tokens
+                    view.input,
+                    view.output
                 ),
             }
-            send(tx, sse::data_part("usage", serde_json::to_value(u)?)).await;
+            send(tx, sse::data_part("usage", serde_json::to_value(&view)?)).await;
             // 记到这个会话上：输入框那个上下文圆环读它，也进库（`usage` 表）留着分析
             let row = crate::db::UsageRow {
                 session_id: sid.to_string(),
                 at: now_ms(),
                 provider: provider.name.clone(),
                 model: provider.model.clone(),
-                input: u.prompt_tokens,
-                output: u.completion_tokens,
+                input: view.input,
+                output: view.output,
                 cached: u.cached_tokens(),
+                cache_write: u.cache_creation_input_tokens,
                 reasoning: u.reasoning_tokens(),
                 finish: finish.clone(),
                 ms: step_started.elapsed().as_millis() as u64,
             };
-            core.state.record_usage(&row, u).await;
+            core.state.record_usage(&row, &view).await;
         }
 
         let mut calls: Vec<RecordedToolCall> = acc

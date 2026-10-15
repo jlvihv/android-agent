@@ -15,7 +15,6 @@
     streamFrom,
     onQueuedDelivered,
     onUsage,
-    cachedTokens,
     type Message,
     type Part,
     type UiChunk,
@@ -25,6 +24,17 @@
     type SessionUsage,
   } from './lib/sse';
   import { uid } from './lib/uid';
+
+  /** 累计用量的零值（桶的字段名只有一处定义，见 `lib/sse.ts` 的 `UsageTotals`）。 */
+  const emptyTotals = (): UsageTotals => ({
+    input: 0,
+    uncached_input: 0,
+    cache_read: 0,
+    cache_write: 0,
+    output: 0,
+    reasoning: 0,
+    calls: 0,
+  });
   import Icon from './components/Icon.svelte';
   import Composer from './components/Composer.svelte';
   import MessageList from './components/MessageList.svelte';
@@ -89,13 +99,18 @@
    */
   $effect(() =>
     onUsage((u) => {
-      const t = usage?.total ?? { input: 0, output: 0, cached: 0, calls: 0 };
+      // 核心已经把用量归一成互斥桶了（`UsageView`），这里只把这一步的桶加上去 ——
+      // 不再解析 provider 字段，也不自己算命中率。
+      const t = usage?.total ?? emptyTotals();
       usage = {
         last: u,
         total: {
-          input: t.input + u.prompt_tokens,
-          output: t.output + u.completion_tokens,
-          cached: t.cached + (cachedTokens(u) ?? 0),
+          input: t.input + u.input,
+          uncached_input: t.uncached_input + u.uncached_input,
+          cache_read: t.cache_read + u.cache_read,
+          cache_write: t.cache_write + u.cache_write,
+          output: t.output + u.output,
+          reasoning: t.reasoning + u.reasoning,
           calls: t.calls + 1,
         },
       };
@@ -267,8 +282,11 @@
             last: d.usage.last,
             total: {
               input: d.usage.input ?? 0,
+              uncached_input: d.usage.uncached_input ?? 0,
+              cache_read: d.usage.cache_read ?? 0,
+              cache_write: d.usage.cache_write ?? 0,
               output: d.usage.output ?? 0,
-              cached: d.usage.cached ?? 0,
+              reasoning: d.usage.reasoning ?? 0,
               calls: d.usage.calls ?? 0,
             },
           }

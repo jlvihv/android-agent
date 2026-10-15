@@ -489,18 +489,16 @@ fn convert_usage(u: ResponsesUsage) -> Usage {
         prompt_tokens: u.input_tokens,
         completion_tokens: u.output_tokens,
         total_tokens: u.total_tokens,
+        // 没报就是 None（不是 0）—— 命中率那里「没报」和「报了 0%」是两回事。
         prompt_tokens_details: Some(PromptTokensDetails {
-            cached_tokens: Some(u.input_tokens_details.map(|d| d.cached_tokens).unwrap_or(0)),
+            cached_tokens: u.input_tokens_details.map(|d| d.cached_tokens),
         }),
         completion_tokens_details: Some(CompletionTokensDetails {
-            reasoning_tokens: Some(
-                u.output_tokens_details
-                    .map(|d| d.reasoning_tokens)
-                    .unwrap_or(0),
-            ),
+            reasoning_tokens: u.output_tokens_details.map(|d| d.reasoning_tokens),
         }),
         prompt_cache_hit_tokens: None,
         prompt_cache_miss_tokens: None,
+        cache_creation_input_tokens: None,
     }
 }
 
