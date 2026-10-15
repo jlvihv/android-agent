@@ -29,6 +29,11 @@ export type Machine = {
   relay: boolean;
   /** 现在连着的就是它 */
   current: boolean;
+  /**
+   * 经服务器的那几台在不在线（中继说的）。`null` / 没有 = 不知道（局域网里看得到的
+   * 不用问；中继是老版本、或者问不到）—— 不知道就照常让人点。
+   */
+  online?: boolean | null;
 };
 
 /** 本机核心自己（面板第一行「这台手机 / 这台电脑」）。 */

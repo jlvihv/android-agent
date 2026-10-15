@@ -41,6 +41,9 @@
     if (page === 'pair') input?.focus();
   });
 
+  /** 中继说它不在线（不知道的不算；眼前这页就是它的话显然在线） */
+  const offline = (m: Machine) => m.relay && m.online === false && !machines.isHere(m.id);
+
   function ask(m: Machine) {
     target = m;
     code = '';
@@ -71,20 +74,24 @@
   }
 </script>
 
-<!-- 一行机器。当前那台不画成按钮（点它等于什么也不做），勾在右边，和「选择模型」一致。 -->
+<!-- 一行机器。当前那台不画成按钮（点它等于什么也不做），勾在右边，和「选择模型」一致。
+     不在线的（`off`）也不是按钮：点了只会等来一个「连不上」，灰着放在那儿说清楚就行。 -->
 {#snippet row(
   icon: 'phone' | 'computer' | 'globe',
   name: string,
   sub: string,
   current: boolean,
   onpick: () => void,
+  off = false,
 )}
+  {@const still = current || off}
   <svelte:element
-    this={current ? 'div' : 'button'}
-    type={current ? undefined : 'button'}
-    role={current ? 'group' : undefined}
-    onclick={current ? undefined : onpick}
-    class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left"
+    this={still ? 'div' : 'button'}
+    type={still ? undefined : 'button'}
+    role={still ? 'group' : undefined}
+    aria-disabled={off || undefined}
+    onclick={still ? undefined : onpick}
+    class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left {off ? 'opacity-50' : ''}"
   >
     <Icon name={icon} size={18} class="shrink-0 text-muted" />
     <span class="min-w-0 flex-1">
@@ -120,12 +127,15 @@
           m.relay ? 'globe' : 'computer',
           m.name,
           m.relay
-            ? '经服务器连（不在同一个 Wi-Fi 里）'
+            ? offline(m)
+              ? '离线（它现在没连上服务器）'
+              : '经服务器连（不在同一个 Wi-Fi 里）'
             : machines.isHere(m.id)
               ? `${m.host}:${m.port}`
               : `${m.host}:${m.port} · ${m.paired ? '已配对' : '第一次连要输配对码'}`,
           machines.isHere(m.id),
           () => (m.paired ? machines.connect(m.id) : ask(m)),
+          offline(m),
         )}
       {/each}
 

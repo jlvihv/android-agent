@@ -547,6 +547,8 @@ async fn machines_list(State(st): State<Arc<AppState>>) -> Response {
     let Some(m) = st.machines() else {
         return no_store();
     };
+    // 经中继的那几台在不在线（有缓存，十秒内不重问）
+    m.refresh_presence().await;
     let list: Vec<Value> = m
         .panel()
         .into_iter()
@@ -559,6 +561,7 @@ async fn machines_list(State(st): State<Arc<AppState>>) -> Response {
                 "paired": p.paired,
                 "relay": p.relay,
                 "current": p.current,
+                "online": p.online,
             })
         })
         .collect();

@@ -25,7 +25,9 @@
 //! 对面 → 中继   HOST <id> <mac>             mac = HMAC(key, "host\n<id>\n<随机数>")
 //!               DIAL <id> <mac>             mac = HMAC(key, "dial\n<id>\n<随机数>")
 //!               ACCEPT <id> <票> <mac>      mac = HMAC(key, "accept\n<id>\n<票>\n<随机数>")
+//!               ONLINE <id,id,…> <mac>      mac = HMAC(key, "online\n<id,id,…>\n<随机数>")
 //! 中继 → 对面   OK  或  ERR <原因>
+//!               ONLINE 的回答是 `OK <其中在线的 id,…>`，然后就断开
 //! 之后（HOST） 中继 → 电脑  CONNECT <票> / PING；电脑 → 中继  PING
 //! ```
 
@@ -54,8 +56,11 @@ pub const PING_EVERY: Duration = Duration::from_secs(20);
 pub const DEAD_AFTER: Duration = Duration::from_secs(60);
 /// 手机拨号之后，等电脑为它开好那条连接最多多久。
 const ACCEPT_WAIT: Duration = Duration::from_secs(10);
-/// 握手的一行最长多少字节（id、票、mac 都是几十字节；再长就是乱来的）。
-const LINE_MAX: usize = 256;
+/// 握手的一行最长多少字节（id、票、mac 都是几十字节；`ONLINE` 一次问几台，一台
+/// 三十来字节；再长就是乱来的）。
+const LINE_MAX: usize = 2048;
+/// `ONLINE` 一次最多问几台。
+const ONLINE_MAX: usize = 32;
 /// 同时最多有多少条「电脑还没接」的拨号。防有密钥的一方（或 bug）把内存撑爆。
 const PENDING_MAX: usize = 256;
 
@@ -196,6 +201,50 @@ async fn handshake(s: &mut TcpStream, key: &[u8], role: Role<'_>) -> io::Result<
         ("ERR", why) => Err(other(why.to_string())),
         _ => Err(other(format!("中继回了看不懂的东西：{reply}"))),
     }
+}
+
+/// 问中继：这几台电脑（实例 id）里哪些现在挂在它上面。
+///
+/// 「选择机器」面板用：不在同一个 Wi-Fi 里的电脑，不在线就别让人点了再等一个 502。
+/// 要密钥（和拨号一样）：不然谁都能拿 id 来探「这台电脑在不在家」。
+///
+/// 老版本的中继不认这一句，回 `ERR` —— 调用方当成「不知道」。
+pub async fn online(addr: &str, key: &[u8], ids: &[&str]) -> io::Result<Vec<String>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ids.len() > ONLINE_MAX || !ids.iter().all(|id| valid_token(id)) {
+        return Err(other("要问的电脑太多，或者 id 不合法"));
+    }
+    let list = ids.join(",");
+    let mut s = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| other(format!("连中继 {addr} 超时")))??;
+    let _ = s.set_nodelay(true);
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let hello = read_line(&mut s).await?;
+        let nonce = match hello.split_once(' ') {
+            Some((MAGIC, n)) => n.to_string(),
+            _ => return Err(other("对面不是中继（或者版本对不上）")),
+        };
+        let m = mac(key, &["online", &list, &nonce]);
+        write_line(&mut s, &format!("ONLINE {list} {m}")).await?;
+        let reply = read_line(&mut s).await?;
+        match reply
+            .split_once(' ')
+            .map_or((reply.as_str(), ""), |(a, b)| (a, b))
+        {
+            ("OK", up) => Ok(up
+                .split(',')
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()),
+            ("ERR", why) => Err(other(why.to_string())),
+            _ => Err(other(format!("中继回了看不懂的东西：{reply}"))),
+        }
+    })
+    .await
+    .map_err(|_| other("问中继超时"))?
 }
 
 /// 家里电脑这一头：一直挂在中继上，每来一个拨号就新开一条数据连接交给 `on_conn`。
@@ -360,6 +409,18 @@ impl Relay {
             ["DIAL", id, m] if valid_token(id) && mac_ok(&self.key, &["dial", id, &nonce], m) => {
                 let id = id.to_string();
                 self.dial(s, &id).await
+            }
+            ["ONLINE", list, m] if mac_ok(&self.key, &["online", list, &nonce], m) => {
+                let ids: Vec<&str> = list.split(',').collect();
+                if ids.len() > ONLINE_MAX || !ids.iter().all(|id| valid_token(id)) {
+                    write_line(&mut s, "ERR 要问的电脑太多，或者 id 不合法").await?;
+                    return Ok(());
+                }
+                let up: Vec<&str> = match self.hosts.lock() {
+                    Ok(g) => ids.into_iter().filter(|id| g.contains_key(*id)).collect(),
+                    Err(_) => return Err(other("中继内部状态坏了")),
+                };
+                write_line(&mut s, &format!("OK {}", up.join(","))).await
             }
             ["ACCEPT", id, t, m]
                 if valid_token(id)
@@ -531,6 +592,40 @@ mod tests {
             s.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, msg);
         }
+    }
+
+    /// 「选择机器」靠它把不在线的电脑标出来：只报挂着的那几台；没密钥的问不了。
+    #[tokio::test]
+    async fn the_relay_says_which_hosts_are_online() {
+        let addr = relay().await;
+        echo_host(&addr, "home").await;
+        let key = parse_key(KEY).unwrap();
+        let up = online(&addr, &key, &["home", "office"]).await.unwrap();
+        assert_eq!(up, ["home"]);
+        assert!(online(&addr, &key, &["office"]).await.unwrap().is_empty());
+
+        let bad = parse_key("ffeeddccbbaa99887766554433221100").unwrap();
+        assert!(
+            online(&addr, &bad, &["home"]).await.is_err(),
+            "没密钥不告诉你"
+        );
+    }
+
+    /// 老中继不认 `ONLINE`（回 ERR）：报错，由调用方当成「不知道」—— 不能当成「都不在线」。
+    #[tokio::test]
+    async fn an_old_relay_that_does_not_know_online_is_an_error() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            write_line(&mut s, &format!("{MAGIC} n")).await.unwrap();
+            let _ = read_line(&mut s).await;
+            write_line(&mut s, "ERR 密钥不对，或者握手格式不对")
+                .await
+                .unwrap();
+        });
+        let key = parse_key(KEY).unwrap();
+        assert!(online(&addr, &key, &["home"]).await.is_err());
     }
 
     #[tokio::test]

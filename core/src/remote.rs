@@ -472,6 +472,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 「选择机器」里经中继的那几台：中继说它在线才算在线，关着机的标成离线
+    /// （不然点了要等一个 502 才知道）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_panel_says_which_computers_behind_the_relay_are_online() {
+        crate::llm::install_crypto_provider();
+        let relay = relay().await;
+        let (_st, port, code, dir) = computer(Some(&relay)).await;
+        let phone = Machines::with_db(Arc::new(
+            crate::db::Db::open(&dir.join("phone.db")).unwrap(),
+        ));
+        let m = phone.pair("127.0.0.1", port, &code).await.unwrap();
+        // 另一台：配对过、挂同一个中继，但现在没挂上来（关机了）
+        phone.upsert(crate::machines::Machine {
+            id: "gone".into(),
+            name: "关着的电脑".into(),
+            token: "x".into(),
+            fingerprint: "0".repeat(64),
+            relay: m.relay.clone(),
+            lan: None,
+        });
+
+        phone.refresh_presence().await;
+        let panel = phone.panel();
+        let online = |id: &str| panel.iter().find(|p| p.id == id).map(|p| p.online);
+        assert_eq!(online(&m.id), Some(Some(true)), "{panel:?}");
+        assert_eq!(online("gone"), Some(Some(false)), "{panel:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 一个只搬字节的转发（放在「电脑」前面），记着接了几条连接。
     async fn counting_proxy(to: u16) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

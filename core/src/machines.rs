@@ -12,8 +12,9 @@
 //! 记账在库里的 `machines` 表（每台电脑一行：凭据、证书指纹、中继、局域网地址），
 //! 「上次连的是哪台」也在库里（`meta` 表的 `current_machine`）—— 手机下次启动接着连。
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -66,6 +67,9 @@ pub struct Panel {
     pub relay: bool,
     /// 现在连着的就是它
     pub current: bool,
+    /// 经中继的那几台在不在线（中继说的，见 `refresh_presence`）。`None` = 不知道
+    /// （局域网里看得到的不用问；中继是老版本、或者问不到）
+    pub online: Option<bool>,
 }
 
 /// 一条连上的隧道：地址由 `Conn` 的两个方法拼（壳和页面拿的不一样，见它们自己的说明）。
@@ -118,7 +122,18 @@ pub struct Machines {
     /// 局域网里看到过的（配没配对都在）
     found: Mutex<Vec<Found>>,
     current: Mutex<Option<Current>>,
+    /// 经中继的那几台在不在线：id → 在线（中继说的）。问不到的不在里面
+    presence: Mutex<HashMap<String, bool>>,
+    /// 上次问中继是什么时候（`PRESENCE_TTL` 内不再问）
+    presence_at: Mutex<Option<Instant>>,
+    /// 同一时刻只有一个在问：面板 1.5 秒轮询一次，别同时打出好几个
+    presence_asking: tokio::sync::Mutex<()>,
 }
+
+/// 「谁在线」问一次管多久。面板开着时 1.5 秒轮询一次，不能每次都去连中继。
+const PRESENCE_TTL: Duration = Duration::from_secs(10);
+/// 问中继最多等多久（面板那次轮询在等它）。
+const PRESENCE_WAIT: Duration = Duration::from_millis(1500);
 
 impl Machines {
     pub fn new(db: Arc<Db>, state: Weak<AppState>) -> Arc<Self> {
@@ -132,6 +147,9 @@ impl Machines {
             list: Mutex::new(list),
             found: Mutex::new(Vec::new()),
             current: Mutex::new(None),
+            presence: Mutex::new(HashMap::new()),
+            presence_at: Mutex::new(None),
+            presence_asking: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -266,6 +284,7 @@ impl Machines {
     /// 「局域网 / 经服务器」之间换来换去时，它在面板上的位置不跟着跳。
     pub fn panel(&self) -> Vec<Panel> {
         let cur = self.current_id();
+        let presence = self.presence.lock().map(|g| g.clone()).unwrap_or_default();
         let found = self.found.lock().map(|g| g.clone()).unwrap_or_default();
         let list = self.list();
         let here: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
@@ -285,6 +304,7 @@ impl Machines {
                     paired: paired.is_some(),
                     relay: false,
                     current: cur.as_deref() == Some(f.id.as_str()),
+                    online: None,
                 }
             })
             .collect();
@@ -305,6 +325,7 @@ impl Machines {
                 paired: true,
                 relay: m.relay.is_some(),
                 current,
+                online: presence.get(&m.id).copied(),
             });
         }
         out.sort_by(|a, b| {
@@ -314,6 +335,76 @@ impl Machines {
                 .then_with(|| a.id.cmp(&b.id))
         });
         out
+    }
+
+    /// 问中继：经它连的那几台现在在不在线（`panel` 的 `online`）。
+    ///
+    /// `PRESENCE_TTL` 内问过就不再问；同时来的几次只问一次（后来的等着用结果）。
+    /// 问不到（中继是老版本、超时、断网）就是「不知道」—— 宁可照旧让人点，也不能把
+    /// 在线的说成离线。
+    pub async fn refresh_presence(&self) {
+        let fresh = |at: &Mutex<Option<Instant>>| {
+            at.lock()
+                .ok()
+                .and_then(|g| *g)
+                .is_some_and(|t| t.elapsed() < PRESENCE_TTL)
+        };
+        if fresh(&self.presence_at) {
+            return;
+        }
+        let _asking = self.presence_asking.lock().await;
+        if fresh(&self.presence_at) {
+            return; // 等锁的时候别人刚问完
+        }
+
+        // 按中继分组：不同的电脑可能挂在不同的中继上
+        let mut by_relay: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for m in self.list() {
+            if let Some(r) = &m.relay {
+                by_relay
+                    .entry((r.addr.clone(), r.key.clone()))
+                    .or_default()
+                    .push(m.id.clone());
+            }
+        }
+        let mut asks = tokio::task::JoinSet::new();
+        for ((addr, key), ids) in by_relay {
+            asks.spawn(async move {
+                let key = agent_relay::parse_key(&key).ok()?;
+                let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                let r =
+                    tokio::time::timeout(PRESENCE_WAIT, agent_relay::online(&addr, &key, &refs))
+                        .await;
+                match r {
+                    Ok(Ok(up)) => Some(
+                        ids.iter()
+                            .map(|id| (id.clone(), up.contains(id)))
+                            .collect::<Vec<_>>(),
+                    ),
+                    Ok(Err(e)) => {
+                        tracing::debug!("问中继 {addr} 谁在线：{e}");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!("问中继 {addr} 谁在线：超时");
+                        None
+                    }
+                }
+            });
+        }
+        let known: HashMap<String, bool> = asks
+            .join_all()
+            .await
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        if let Ok(mut g) = self.presence.lock() {
+            *g = known;
+        }
+        if let Ok(mut g) = self.presence_at.lock() {
+            *g = Some(Instant::now());
+        }
     }
 
     /// 和局域网里的一台电脑配对：输它终端（或设置页）上显示的 6 位码，换回凭据。
