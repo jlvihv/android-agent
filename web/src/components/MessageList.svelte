@@ -154,6 +154,34 @@
   const argsOf = (t: ToolPart) => (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
 
   /**
+   * 面板里那份参数。面板要**完整**的参数（不能像折叠行那样只看开头），而参数还在
+   * 流式时每来一小段就整段解析一遍 —— 模型用 edit 写一个 30KB 的文件就是几千次 ×
+   * 30KB。和 Markdown 同一个办法：变化先攒着，一帧解析一次。打开面板那一下在
+   * `openTool` 里同步算好，第一帧就对。
+   */
+  let panelArgs = $state<Record<string, unknown>>({});
+  let argsRaf = 0;
+  $effect(() => {
+    const t = sheet?.kind === 'tool' ? sheet.tool : null;
+    if (!t) return;
+    if (t.input !== undefined) {
+      panelArgs = t.input as Record<string, unknown>;
+      return;
+    }
+    void t.inputText;
+    argsRaf ||= requestAnimationFrame(() => {
+      argsRaf = 0;
+      panelArgs = argsOf(t);
+    });
+  });
+  $effect(() => () => cancelAnimationFrame(argsRaf));
+
+  function openTool(msg: Message, tool: ToolPart) {
+    panelArgs = argsOf(tool);
+    sheet = { kind: 'tool', msg, tool };
+  }
+
+  /**
    * 「离底部多近算贴着底」（px）。两处用同一个数：列表的贴底判定（`onscroll`）
    * 和工具输出里的跟尾（`followTail`）—— 同一个含义别写两个值。
    *
@@ -413,7 +441,7 @@
           {:else if part.type === 'tool'}
             {@const tool = part}
             <button
-              onclick={() => (sheet = { kind: 'tool', msg, tool })}
+              onclick={() => openTool(msg, tool)}
               class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
             >
               <Icon name="clock" size={16} class="shrink-0 text-faint" />
@@ -482,7 +510,7 @@
     {@const s = sheet}
     {@const t = s.tool}
     {@const res = describeResult(t)}
-    {@const inp = describeInput(t, argsOf(t))}
+    {@const inp = describeInput(t, panelArgs)}
     <Sheet title={toolTitle(t)} onclose={() => (sheet = null)}>
       <div class="flex flex-col gap-4">
         {#if inp.primary}

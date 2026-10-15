@@ -447,9 +447,18 @@
   // 但**服务端的 agent 不会停**（前台服务保着进程，Rust 线程照跑，
   // SSE 客户端断开只是让 tx.send 失败然后被忽略）。
   // 所以切回来时从服务端拉最新状态，而不是相信本地的旧视图。
+  //
+  // 三个事件常常一起来（手机切回前台：visibilitychange + focus + pageshow），
+  // 只认第一个：不然同样的两个请求一下发三遍 —— 经隧道 / 中继时每个都是一条新连接。
+  /** 两次同步至少隔这么久（ms） */
+  const SYNC_GAP_MS = 1000;
+  let lastSync = 0;
   $effect(() => {
     const sync = () => {
       if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastSync < SYNC_GAP_MS) return;
+      lastSync = now;
       void loadMessages();
       void loadSessions();
     };
