@@ -311,6 +311,10 @@ impl Usage {
 // SSE 解析
 // ---------------------------------------------------------------------------
 
+/// 两个数据帧之间最多等多久（注释帧不算）。和 HTTP client 的读超时同一个量级：
+/// 长上下文的预填充可能要等一阵，有的服务端（DeepSeek）这段时间只发 keep-alive。
+const DATA_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// 把一条 SSE 响应体读成一串 `StreamChunk`。
 ///
 /// `map` 把每条事件的 `data:` 载荷变成 chunk（两条协议的差异都在这里面）。
@@ -335,7 +339,12 @@ where
     // 收到过结束标记没有：`[DONE]`（Chat），或者带 finish_reason / 用量的那一帧
     // （Responses 没有 `[DONE]`，`response.completed` 映射成后者）。
     let mut terminal = false;
+    // 最近一次收到**数据帧**的时刻。客户端的读超时管不住「服务端只发 keep-alive」：
+    // 那几个字节每次都把它续上，回合就永远「进行中」。这里只认数据帧。
+    let mut last_data = tokio::time::Instant::now();
+    let got_data = std::sync::atomic::AtomicBool::new(false);
     let mut on_chunk = |data: &str| -> anyhow::Result<Option<StreamChunk>> {
+        got_data.store(true, std::sync::atomic::Ordering::Relaxed);
         let c = map(data)?;
         if let Some(c) = &c {
             terminal |= c.usage.is_some() || c.choices.iter().any(|ch| ch.finish_reason.is_some());
@@ -343,8 +352,16 @@ where
         Ok(c)
     };
     loop {
-        let Some(next) = stream.next().await else {
-            break;
+        if got_data.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            last_data = tokio::time::Instant::now();
+        }
+        let next = match tokio::time::timeout_at(last_data + DATA_IDLE, stream.next()).await {
+            Ok(Some(next)) => next,
+            Ok(None) => break,
+            Err(_) => anyhow::bail!(
+                "{} 秒没有收到任何内容（只有 keep-alive）",
+                DATA_IDLE.as_secs()
+            ),
         };
         buf.extend_from_slice(&next?);
 

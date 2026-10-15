@@ -3093,6 +3093,75 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// Responses 端点回了 200 却只发 keep-alive（实测 OpenCode Go 的 deepseek-flash）：
+    /// 不能就这么挂着 —— 认成「没有这套 API」，退回 Chat Completions，回合照常完成。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_responses_endpoint_that_only_sends_keepalives_falls_back_to_chat() {
+        crate::llm::install_crypto_provider();
+        let keepalives = || {
+            let (tx, rx) = mpsc::channel::<Result<&'static str, std::io::Error>>(1);
+            tokio::spawn(async move {
+                while tx.send(Ok(": keep-alive\n\n")).await.is_ok() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            });
+            let s = tokio_stream::wrappers::ReceiverStream::new(rx);
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(s),
+            )
+        };
+        let app = axum::Router::new()
+            .route(
+                "/responses",
+                axum::routing::post(move || async move { keepalives() }),
+            )
+            .route(
+                "/chat/completions",
+                axum::routing::post(|| async {
+                    let body: String = OK_REPLY.iter().map(|f| format!("data: {f}\n\n")).collect();
+                    ([("content-type", "text/event-stream")], body)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = Provider::compatible("fake", &base, "m", "k"); // api_style = Auto
+        let core = Core::new();
+        let sid = core.state.chat.write().await.create();
+        let t = core.state.begin_turn(&sid).unwrap();
+        *core.state.vision.write().unwrap() = Some((format!("{base}|m"), false));
+        *core.state.files.write().unwrap() = Some((format!("{base}|m"), false));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_turn(&core, &p, "你好", vec![], &sid, t, tx),
+        )
+        .await
+        .expect("回合卡在只发 keep-alive 的 Responses 端点上了")
+        .unwrap();
+
+        let last = core
+            .state
+            .chat
+            .read()
+            .await
+            .get(&sid)
+            .unwrap()
+            .messages
+            .last()
+            .cloned();
+        assert!(
+            matches!(last, Some(ChatMessage::Assistant { ref content, .. }) if content == "好了"),
+            "{last:?}"
+        );
+        assert!(
+            crate::llm::responses_known_unsupported(&p),
+            "记住了，下一步不再白等"
+        );
+    }
+
     /// 一次「调工具、拿结果、再来一步」的假回话：第一步要一个**不存在的工具**
     ///（`execute_tool` 立刻回「未知工具」——不用沙箱，也不碰网络）。
     const TOOL_CALL_REPLY: [&str; 3] = [

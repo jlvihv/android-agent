@@ -27,6 +27,16 @@ use crate::responses::ResponsesRequest;
 /// 而不是通用 SDK / HTTP 库名"。
 pub const USER_AGENT: &str = concat!("android-agent/", env!("CARGO_PKG_VERSION"));
 
+/// Responses 流开了之后，第一个事件最多等多久（见 `StreamError::Silent`）。
+///
+/// `response.created` 是服务端收下请求就发的，不等模型，正常是亚秒级；
+/// 给宽一点是为了手机网络上的抖动。
+const RESPONSES_FIRST_EVENT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    std::time::Duration::from_secs(15)
+};
+
 /// 用哪套协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -334,13 +344,31 @@ impl Provider {
             .post_stream(&self.responses_url(), req, session_id)
             .await?;
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        // 第一个事件（不管是什么）到了就喊一声。不能等第一个 chunk：
+        // `response.created` 这类事件不产出 chunk，而第一个 chunk 要等模型预填充完。
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut seen = Some(seen_tx);
+        let pump = tokio::spawn(async move {
             let mut mapper = crate::responses::Mapper::default();
-            let r = openai::pump_frames(resp, tx.clone(), |data| mapper.map(data)).await;
+            let r = openai::pump_frames(resp, tx.clone(), |data| {
+                if let Some(s) = seen.take() {
+                    let _ = s.send(());
+                }
+                mapper.map(data)
+            })
+            .await;
             if let Err(e) = r {
                 let _ = tx.send(Err(e));
             }
         });
+        // 收到事件，或者流已经结束（`seen` 被丢掉 —— 错误 / 断开都在 rx 里）都算数
+        if tokio::time::timeout(RESPONSES_FIRST_EVENT, seen_rx)
+            .await
+            .is_err()
+        {
+            pump.abort(); // 连接随之关掉
+            return Err(StreamError::Silent(RESPONSES_FIRST_EVENT.as_secs()));
+        }
         Ok(rx)
     }
 }
@@ -415,6 +443,14 @@ pub(crate) fn shared_http() -> anyhow::Result<reqwest::Client> {
 pub enum StreamError {
     #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
+    /// Responses 端点回了 200，却迟迟不给一个事件（只有 `: keep-alive`）。
+    ///
+    /// 真的 Responses 实现**一开流就先发 `response.created`**，不等模型；这种
+    /// 「连上了、什么都不说」的端点就是没有这套 API（实测 OpenCode Go 的
+    /// deepseek-flash）。keep-alive 每几秒来一下，读超时永远不触发 —— 不单独
+    /// 认出来的话回合就永远「进行中」。
+    #[error("Responses 端点 {0} 秒内没有发出任何事件")]
+    Silent(u64),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -452,6 +488,7 @@ impl StreamError {
                     .any(|k| b.contains(k));
                 negative && about_route && !about_other
             }
+            StreamError::Silent(_) => true,
             StreamError::Other(_) => false,
         }
     }
@@ -466,6 +503,7 @@ impl StreamError {
             StreamError::Http { status, .. } => {
                 matches!(*status, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
             }
+            StreamError::Silent(_) => false,
             // 只认网络层的错误（发请求时 reqwest 报的）；别的（建 client 失败之类）不重试
             StreamError::Other(e) => e.downcast_ref::<reqwest::Error>().is_some(),
         }
