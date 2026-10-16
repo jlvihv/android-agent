@@ -319,7 +319,8 @@
   // —— 窗口化 ——
   //
   // 长对话不能把几百条消息全挂进 DOM（节点数和内存都线性涨）。只渲染最后
-  // `limit` 条；往上翻到顶再往前补一窗，并补偿 scrollTop，视口不跳。
+  // `limit` 条；往上翻到顶再往前补一窗，并补偿 scrollTop，视口不跳；回到底部再收回
+  // 最后一窗（见 `onscroll`）。
   // 注意 `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** ——
   // 这个才是真的封顶。
   //
@@ -383,8 +384,13 @@
   function onscroll() {
     const el = scroller!;
     gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (gap < NEAR_BOTTOM) pinned = true;
-    else if (el.scrollTop < lastTop - 1) pinned = false;
+    if (gap < NEAR_BOTTOM) {
+      pinned = true;
+      // 回到底部了：往上补出来的更早那几窗收回去。窗口只增不减的话，往上翻过一次，
+      // 之后整个会话都一直挂在 DOM 里（实测 90 条的长会话：2000 → 5900 个节点）。
+      // 在底部收不会跳：被拿掉的都在视口上方，scrollTop 被夹到新的底，贴底照旧
+      if (limit > WINDOW_STEP && !loadingEarlier) limit = WINDOW_STEP;
+    } else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
     // 快到顶了 → 再补一窗更早的（窗口化）
     if (el.scrollTop < LOAD_EARLIER_AT) void loadEarlier();
