@@ -37,6 +37,7 @@ set -euo pipefail
 exec 0</dev/null
 
 . "$(dirname "$0")/adb.sh"
+agent_dev >/dev/null || true   # 选一台设备（同时设 ANDROID_SERIAL）
 
 PKG=dev.vihv.agent
 ICON=dev.vihv.agent/.MainActivity

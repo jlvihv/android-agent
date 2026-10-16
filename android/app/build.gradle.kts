@@ -35,16 +35,16 @@ android {
     }
 
     signingConfigs {
-        // 换一把 key：AGENT_KEYSTORE=<路径>（口令/别名沿用 debug key 那套：
-        // storepass=android / alias=androiddebugkey；PKCS12 里两者是同一个口令）。
-        //
-        // 为什么需要：手机上的包可能是**另一台机器**的 debug keystore 签的
-        // （都叫 CN=Android Debug，但证书指纹不同），Android 不允许换签名覆盖
-        // 安装。指定成同一把 key 就能 `install -r`，不必卸载重装
-        // （见 scripts/phone-reinstall.sh）。
-        System.getenv("AGENT_KEYSTORE")?.takeIf { it.isNotBlank() }?.let { p ->
+        // 签名用的 key：默认 `~/Downloads/debug.keystore`（本机一直用的那把），
+        // 要换就 `AGENT_KEYSTORE=<路径>`。口令/别名沿用 debug key 那套：
+        // storepass=android、alias=androiddebugkey（PKCS12 里两者是同一个口令）。
+        val home = System.getProperty("user.home")
+        val key = (System.getenv("AGENT_KEYSTORE")?.takeIf { it.isNotBlank() }
+            ?: "$home/Downloads/debug.keystore")
+            .replaceFirst(Regex("^~"), home)
+        if (file(key).isFile) {
             create("local") {
-                storeFile = file(p.replaceFirst(Regex("^~"), System.getProperty("user.home")))
+                storeFile = file(key)
                 storePassword = System.getenv("AGENT_KEYSTORE_PASS") ?: "android"
                 keyAlias = System.getenv("AGENT_KEY_ALIAS") ?: "androiddebugkey"
                 keyPassword = System.getenv("AGENT_KEY_PASS") ?: "android"
@@ -59,10 +59,9 @@ android {
         }
         release {
             isMinifyEnabled = true
-            // 本地装 release 用 debug key 签（AGP 默认就有一把
-            // ~/.android/debug.keystore）。和 debug 包同一把钥匙，能互相覆盖安装。
+            // 本地装 release 和 debug 用同一把 key（AGP 自带的 debug key 作为
+            // 上面的 keystore 不在时的退路，两者能互相覆盖安装）。
             // 正式发布前要换成自己的 keystore。
-            // AGENT_KEYSTORE 给了就优先用那把（见上面 signingConfigs）。
             signingConfig = signingConfigs.findByName("local") ?: signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

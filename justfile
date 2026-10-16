@@ -171,13 +171,14 @@ dom-audit *ARGS:
 # 无线调试：手机和电脑同一个 WiFi，手机上「开发者选项 → 无线调试」
 #
 #   just wifi-pair 192.168.0.34:41234 123456   # 首次（地址和码在手机屏幕上）
-#   just wifi                                  # 之后每次
-#   just wifi-tcpip                            # 或者：USB 插一次，之后自动走 WiFi
+#   just wifi 192.168.0.34:41234               # 连上（地址是「无线调试」页面上那行）
+#   just wifi                                   # 之后每次（地址记着，掉线自连）
+#   just wifi-tcpip                             # 或者：USB 插一次，之后自动走 WiFi
 #
 # 配过一次就不用再管了 —— 下面的 forward / phone / doctor 只依赖 adb，
 # 不关心底下是 USB 还是无线。
-wifi:
-    scripts/phone-adb.sh connect
+wifi *ARGS:
+    scripts/phone-adb.sh connect {{ARGS}}
 
 wifi-pair addr code:
     scripts/phone-adb.sh pair {{addr}} {{code}}
@@ -386,17 +387,9 @@ android-install: android-debug
     . scripts/jdk.sh
     cd {{and}} && ./gradlew :app:installDebug
 
-# release APK：R8 混淆/压缩 + 用 debug key 签（本地能直接装）。
+# release APK：R8 混淆/压缩 + 签名（见 app/build.gradle.kts 里的 signingConfigs）。
 # 原生核心两者都是 release（android-libs 里的 `--release`），区别只在
 # Kotlin/dex 那层和签名。
-#
-# 装上去报 INSTALL_FAILED_UPDATE_INCOMPATIBLE（签名对不上）时**别卸载** —— 那会丢
-# 会话库和 rootfs。手机上的包可能是另一台机器的 debug keystore 签的，找出那把 key
-# 带上即可覆盖装：
-#
-#   AGENT_KEYSTORE=~/Downloads/debug.keystore just android-install-release
-#
-# 怎么认指纹见 docs/07-debugging.md §4。
 #
 # assemble 前同样删一遍（理由见 android-debug 上面那段）。
 android-release: android-bindings web-build android-libs

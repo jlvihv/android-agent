@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# 让 adb 走 WiFi。三种办法，按「省事」排：
+# 让 adb 走 WiFi。地址在手机上：开发者选项 → 无线调试（**每台手机每开一次都
+# 可能换端口**，所以地址要敲一次给它，之后脚本自己记着）。
 #
-#   scripts/phone-adb.sh            # 看看现在什么情况（连了谁 + 发现到的服务）
-#   scripts/phone-adb.sh connect    # 自动发现并连上（配过对之后；mdns 找得到就行）
+#   scripts/phone-adb.sh            # 看看现在什么情况（连了谁 + 记着的地址）
+#   scripts/phone-adb.sh connect <ip:port>
+#                                   # 连上并记住；不带地址就用上次记住的那个
 #   scripts/phone-adb.sh pair <ip:port> <6 位码>
-#                                   # 首次配对（Android 11+）。地址和码都在手机上：
-#                                   # 开发者选项 → 无线调试 → 使用配对码配对设备
+#                                   # 首次配对（Android 11+）
 #   scripts/phone-adb.sh tcpip      # 经典办法：USB 插一次就够，之后走 WiFi（5555）。
 #                                   # 会自动从 `ip route` 取手机 WiFi 地址。
 #   scripts/phone-adb.sh disconnect # 断开无线连接（USB 不受影响）
@@ -24,59 +25,33 @@ exec 0</dev/null
 
 . "$(dirname "$0")/adb.sh"
 
-# mdns 发现：$1 = 服务类型
-mdns_addr() {
-  "$ADB" mdns services 2>/dev/null | awk -v s="$1" '$2 == s { print $3; exit }' || true
-}
-
 wifi_ip() {
   "$ADB" shell ip route 2>/dev/null | awk '/wlan0/ { print $9; exit }' | tr -d '\r' || true
 }
 
-need_mdns() {
-  if ! "$ADB" mdns services >/dev/null 2>&1; then
-    cat >&2 <<EOF
-这份 adb 不支持 \`adb mdns\`（$("$ADB" version 2>/dev/null | tail -1)），没法自动发现。
-两条路：
-  - 换 SDK 里的 adb：AGENT_ADB=\$HOME/Android/Sdk/platform-tools/adb $0 $*
-  - 手动给地址：$0 pair <ip:port> <6 位码>
+usage_connect() {
+  cat >&2 <<EOF
+用法：$0 connect <ip:port>
+地址在手机上：开发者选项 → 无线调试（页面上那行「IP 地址和端口」）。
+连过一次之后就记着了，以后不带地址也行。
 EOF
-    exit 1
-  fi
+  exit 2
 }
 
 case "${1:-status}" in
   status)
     "$ADB" devices -l
-    echo
-    if "$ADB" mdns services >/dev/null 2>&1; then
-      "$ADB" mdns services
-    else
-      echo "(这份 adb 不支持 mdns 发现；无线调试仍然可以用 connect/pair 手动连)"
-    fi
+    a="$(phone_addr)"
+    [ -n "$a" ] && echo "记着的地址: $a"
     ;;
 
   connect)
-    if [ -n "${2:-}" ]; then
-      addr="$2"
-    else
-      need_mdns connect
-      addr=$(mdns_addr _adb-tls-connect._tcp)
-      if [ -z "$addr" ]; then
-        cat >&2 <<'EOF'
-没发现无线调试服务。检查：
-  - 手机和电脑在同一个 WiFi（不是访客网络 / 开了 AP 隔离）
-  - 手机：开发者选项 → 无线调试 已打开，并且**停留在那个页面上**
-  - 已经用 USB 连过？那用 `scripts/phone-adb.sh tcpip` 更省事
-EOF
-        exit 1
-      fi
-    fi
-    "$ADB" connect "$addr"
+    addr="${2:-$(phone_addr)}"
+    [ -n "$addr" ] || usage_connect
+    "$ADB" connect "$addr" && phone_remember "$addr"
     ;;
 
   pair)
-    need_mdns pair
     addr="${2:-}"
     code="${3:-}"
     if [ -z "$addr" ] || [ -z "$code" ]; then
@@ -99,7 +74,7 @@ EOF
       echo "取不到手机的 WiFi 地址（wlan0）。手机连上 WiFi 了吗？" >&2
       exit 1
     fi
-    "$ADB" connect "$ip:$port"
+    "$ADB" connect "$ip:$port" && phone_remember "$ip:$port"
     ;;
 
   disconnect)

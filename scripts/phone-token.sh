@@ -18,6 +18,7 @@ exec 0</dev/null
 
 PKG=dev.vihv.agent
 . "$(dirname "$0")/adb.sh"
+agent_dev >/dev/null || true   # 选一台设备（同时设 ANDROID_SERIAL）
 
 if [ "${AGENT_TOKEN:-}" != "" ]; then
   echo "$AGENT_TOKEN"

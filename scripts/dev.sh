@@ -14,7 +14,6 @@
 set -u
 
 # adb 用哪份、设备侧端口怎么找，都交给 scripts/ 里的共用脚本 ——
-# 这里不再自己判断（发行版自带的 adb 可能没有 `adb mdns`）。
 . "$(dirname "${BASH_SOURCE[0]}")/adb.sh"
 APK="${APK:-android/app/build/outputs/apk/debug/app-debug.apk}"
 PKG=dev.vihv.agent
@@ -24,24 +23,20 @@ HOST_PORT="${HOST_PORT:-18787}"
 # 无线调试会自己掉线（端口变了 / 手机休眠 / 切 Wi-Fi）。
 # 掉了就用 mDNS 重新发现并 connect —— 别每次手动折腾。
 dev_pick() {
-  DEV="$("$ADB" devices | awk '$2=="device"{print $1; exit}')"
+  DEV="$(agent_dev || true)"
   if [ -z "$DEV" ]; then
-    echo "设备掉了，用 mDNS 重连…" >&2
-    "$ADB" kill-server >/dev/null 2>&1
-    sleep 1
-    "$ADB" start-server >/dev/null 2>&1
-    sleep 4
-    local addr
-    addr="$("$ADB" mdns services 2>/dev/null | awk '/_adb-tls-connect/{print $3; exit}')"
-    if [ -n "$addr" ]; then
-      timeout 15 "$ADB" connect "$addr" >/dev/null 2>&1
-      sleep 2
-      DEV="$("$ADB" devices | awk '$2=="device"{print $1; exit}')"
-    fi
+    # 无线调试会自己掉线（端口变了 / 手机休眠 / 切 Wi-Fi），也可能电脑刚睡醒、
+    # adb server 被重启过（显式连接不跨 server 重启）。拿上次记下的地址重连一次。
+    echo "设备掉了，重连 $(phone_addr)…" >&2
+    phone_reconnect || true
+    sleep 2
+    DEV="$(agent_dev || true)"
   fi
   if [ -z "$DEV" ]; then
-    echo "还是连不上。检查手机的无线调试是否开着（它会自己关）。" >&2
-    "$ADB" mdns services >&2
+    cat >&2 <<'EOF'
+还连不上。手机上确认「开发者选项 → 无线调试」开着，然后带上那行的地址：
+  just wifi <ip:port>
+EOF
     return 1
   fi
   echo "设备: $DEV"
@@ -75,6 +70,7 @@ dev_restart() {
 # force-stop 会解绑无障碍服务，重启后必须重新触发一次。
 # 注意保留用户已有的其它服务（比如 Minis）。
 dev_a11y_on() {
+  [ -n "${DEV:-}" ] || dev_pick || return 1
   local cur others
   cur="$("$ADB" -s "$DEV" shell settings get secure enabled_accessibility_services | tr -d '\r')"
   others="$(echo "$cur" | tr ':' '\n' | grep -v "^$A11Y$" | grep -v '^null$' | paste -sd: -)"
@@ -84,8 +80,11 @@ dev_a11y_on() {
   "$ADB" -s "$DEV" shell settings put secure enabled_accessibility_services "${others:+$others:}$A11Y"
   "$ADB" -s "$DEV" shell settings put secure accessibility_enabled 1
   sleep 4
-  curl -sS -m 10 "http://127.0.0.1:$HOST_PORT/api/health" \
-    | python3 -c "import sys,json; print('device =', json.load(sys.stdin)['device'])"
+  # 核心的 /api 要凭据（docs/07 的「核心的接口要凭据」），顺手确认设备那条链路是通的
+  tok="$(scripts/phone-token.sh 2>/dev/null || true)"
+  curl -sS -m 10 -H "x-agent-token: $tok" "http://127.0.0.1:$HOST_PORT/api/health" \
+    | python3 -c "import sys,json; print('device =', json.load(sys.stdin)['device'])" \
+    || echo "device = ?（没拿到 /api/health，跑 just doctor 看）"
 }
 
 # 安卓上 App 不继承 shell 环境变量，所以运行时注入。

@@ -34,7 +34,7 @@ exec 0</dev/null
 
 PKG=dev.vihv.agent
 
-# 统一用 SDK 里那份 adb（发行版自带的可能没有 mdns 等功能）
+# 统一用 SDK 里那份 adb（见 scripts/adb.sh）
 . "$(dirname "$0")/adb.sh"
 
 if [ "${1:-}" != "" ]; then
@@ -47,12 +47,12 @@ if [ "${PHONE_PORT:-}" != "" ]; then
 fi
 
 "$ADB" wait-for-device >/dev/null 2>&1 || true
-dev=$("$ADB" devices | awk '$2 == "device" { print $1; exit }')
+dev=$(agent_dev || true)
 if [ -z "${dev:-}" ]; then
   cat >&2 <<'EOF'
 没有连着的设备。先连上：
-  just wifi          # 已经配对过（自动发现）
-  just wifi-tcpip    # 或者：USB 插一次，之后自动走 WiFi
+  just wifi <ip:port>   # 地址在手机上：开发者选项 → 无线调试
+  just wifi-tcpip       # 或者：USB 插一次，之后自动走 WiFi
 EOF
   exit 1
 fi

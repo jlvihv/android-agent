@@ -36,7 +36,11 @@ python3 scripts/agentctl.py --json "…" # 一整份机器可读转录，给脚�
 #   开发者选项 → 无线调试 → 使用配对码配对设备
 just wifi-pair 192.168.0.34:41241 123456
 
-# 之后每次
+# 连上。地址取「无线调试」页面上那行（**和配对用的那个不是同一个**），
+# 连过一次就记着了：
+just wifi 192.168.0.34:41751
+
+# 之后
 just wifi
 
 # 或者经典办法：USB 插一次，之后就不用插了（自动取手机的 WiFi 地址）
@@ -64,15 +68,14 @@ stderr 说一句。不想让它动手机：`AGENT_NO_WAKE=1 just phone "…"`。
 细节（两个冻结机制、数据表、为什么关电池优化治不好）见
 [docs/06](06-persistence-and-background.md) 的「深度后台：整个进程会被冻住」。
 
-两个坑：
+一个坑：
 
-- **发行版自带的 adb 可能没有 `adb mdns`**。这台机器上 `/usr/bin/adb`
-  （37.0.0-android-tools）就没有，而无线调试的自动发现全靠
-  `adb mdns services` 里那行 `_adb-tls-connect._tcp`。所以 `scripts/adb.sh`
-  会优先用 SDK 里那份（`$ANDROID_HOME/platform-tools/adb`）。
-  真正干活的是 adb **server**（5037 端口），客户端只是跟它说话 —— 别让旧客户端
-  抢先把 server 起来；要覆盖就 `AGENT_ADB=/path/to/adb just wifi`。
-- 无线下 `adb logcat` / `/proc/net/tcp` 都还能读（就是慢一点），所以端口发现照旧。
+- **发行版自带的 adb 常常是旧版**（和 Android Studio 抢 server、缺功能）。所以
+  `scripts/adb.sh` 优先用 SDK 里那份（`$ANDROID_HOME/platform-tools/adb`），
+  要覆盖就 `AGENT_ADB=/path/to/adb`。真正干活的是 adb **server**（5037 端口），
+  客户端只是跟它说话 —— 别让旧客户端抢先把 server 起来。
+
+无线下 `adb logcat` / `/proc/net/tcp` 都还能读（就是慢一点），所以端口发现照旧。
 
 ### 本机端口固定 18787
 
@@ -135,9 +138,8 @@ just emu stop
 
 AVD 是 `agent-x86`（1080×2400 / density 420 / 4G RAM）。为什么要它：
 
-- **真机是无线调试**：手机一睡、用户一用、VPN 一抖，链路就掉，`adb devices`
-  还会卡在 mdns 发现上。要连得上就用 `adb connect <ip>:<port>` 直连
-  （端口可以 `adb mdns services` 问，或 `just wifi`）。
+- **真机是无线调试**：手机一睡、用户一用、VPN 一抖，链路就掉。掉了就
+  `just wifi <ip:port>` 重连（地址在手机上：开发者选项 → 无线调试）。
 - **但更常见的原因是手机自己在内存里挣扎**（见过一次：11.0G/11.5G 已用、
   swap 4.8G/5.8G，系统在换页）。表现很像"我们的 bug"：App 进程活着、核心的
   端口在 LISTEN，但 connect 上去没有任何响应、logcat 里连启动日志都刷没了
@@ -234,40 +236,6 @@ just phone -- --session <会话 id> "…"    # 写进指定的那条
 也就是说：**提示词和调试流程的迭代都不用重装**；只有改 Rust 逻辑才要。
 （改工具描述要重装 —— 工具表是编译进去的，但它和系统提示词一样属于「可缓存
 前缀」，改完先用 `/request` 确认序列化没变样，见 §6。）
-
-### 装 release 包：签名对不上，就换同一把 key（别急着卸载）
-
-`just android-install-release` = release APK（R8 混淆，原生核心也一直是 release；
-两者只是 Kotlin/dex 那层和签名的区别）。
-
-手机上那个包如果是**另一台机器**的 debug keystore 签的（都叫 `CN=Android Debug`，
-指纹不同），`install -r` 会报：
-
-```
-INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package dev.vihv.agent signatures do not
-match newer version; ignoring!
-```
-
-Android 不允许换签名覆盖安装，但**先别 `uninstall`**（会话库和 rootfs 都会没）。先把
-手机上那个包用的证书指纹拉出来，再用同一把 key 重签：
-
-```sh
-p=$(adb shell pm path dev.vihv.agent | tr -d '\r' | sed 's/^package://')
-adb exec-out run-as dev.vihv.agent cat "$p" > /tmp/installed.apk   # 只有 debug 包能这么读
-~/Library/Android/sdk/build-tools/*/apksigner verify --print-certs /tmp/installed.apk \
-  | grep 'SHA-256'                       # 或者 keytool -list -v -keystore <k> -storepass android
-
-AGENT_KEYSTORE=~/Downloads/debug.keystore just android-install-release
-```
-
-`AGENT_KEYSTORE` 会当成 signingConfig（debug / release 都认，见
-`android/app/build.gradle.kts`），口令和别名沿用 debug 那套（`android` /
-`androiddebugkey`），不同的话用 `AGENT_KEYSTORE_PASS` / `AGENT_KEY_ALIAS` /
-`AGENT_KEY_PASS`。release 包被覆盖装完 `flags` 里就没有 `DEBUGGABLE` 了。
-
-实在找不到那把 key（指纹对不上任何一把）才走 `scripts/phone-reinstall.sh`：它先备份
-`sessions.db` / `llm.json`，卸了重装再放回去，顺带把「所有文件访问」授回去 —— 代价是
-rootfs 重解、agent 写在 `/root` 里的东西没了（`/sdcard/Agent` 不受影响）。
 
 ---
 
