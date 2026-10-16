@@ -84,7 +84,11 @@ pub fn render(root_guest: &str, host: &Path) -> anyhow::Result<String> {
 
     if !dirs.is_empty() {
         out.push_str("\n目录\n");
-        let width = dirs.iter().map(|d| d.name.chars().count()).max().unwrap_or(0);
+        let width = dirs
+            .iter()
+            .map(|d| d.name.chars().count())
+            .max()
+            .unwrap_or(0);
         for d in &dirs {
             out.push_str(&format!(
                 "  {:<width$}  {:>5} 项  {:>9}  {}\n",
@@ -102,7 +106,11 @@ pub fn render(root_guest: &str, host: &Path) -> anyhow::Result<String> {
             "\n散在根目录的文件（{} 个）—— 成品收进子目录，临时的放 /tmp 或删掉\n",
             files.len()
         ));
-        let width = files.iter().map(|f| f.name.chars().count()).max().unwrap_or(0);
+        let width = files
+            .iter()
+            .map(|f| f.name.chars().count())
+            .max()
+            .unwrap_or(0);
         for f in &files {
             out.push_str(&format!(
                 "  {:<width$}  {:>9}  {}\n",

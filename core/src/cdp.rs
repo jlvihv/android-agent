@@ -187,13 +187,13 @@ struct Inner {
     profile: Profile,
 }
 
+/// 地址和标题**不缓存**：点链接、提交表单、跑 JS 都会让页面跳走，记下来的那份很快就
+/// 过期了（`list_tabs` 曾经报着一个早就离开的地址）。要的时候问 Chrome（见 `live_pages`）。
 struct Tab {
     /// 模型看到的编号（1 起，不随关闭重排 —— `switch_tab` 用的是它）
     id: i32,
     target: String,
     session: String,
-    url: String,
-    title: String,
 }
 
 impl CdpBrowser {
@@ -302,7 +302,6 @@ impl CdpBrowser {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                self.remember(g, real.clone(), title.clone());
                 let mut text = format!("已打开 {real}");
                 if !title.is_empty() {
                     text.push_str(&format!("\n标题：{title}"));
@@ -588,7 +587,6 @@ impl CdpBrowser {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                self.remember(g, url.clone(), String::new());
                 Ok(with_page_info(
                     ok(&format!("已后退到 {url}"), None, None),
                     &info,
@@ -728,18 +726,14 @@ impl CdpBrowser {
                         "标签页已经到上限（{MAX_TABS} 只）了，先 `agent browser close_tab` 关一只"
                     ));
                 }
-                self.open_tab(g, url.as_deref())?;
+                let landed = self.open_tab(g, url.as_deref())?;
                 let t = &g.tabs[g.current];
                 Ok(ok(
                     &format!(
                         "已开第 {} 只标签（共 {} 只）：{}",
                         t.id,
                         g.tabs.len(),
-                        if t.url.is_empty() {
-                            "空白页"
-                        } else {
-                            &t.url
-                        }
+                        landed.as_deref().map_or("空白页", page_label)
                     ),
                     None,
                     None,
@@ -753,17 +747,20 @@ impl CdpBrowser {
                         None,
                     ));
                 }
+                let live = self.live_pages(g)?;
                 let mut text = format!("共 {} 只标签：", g.tabs.len());
                 for (i, t) in g.tabs.iter().enumerate() {
+                    let (url, title): (String, String) =
+                        live.get(&t.target).cloned().unwrap_or_default();
+                    let page = if page_label(&url) == "空白页" {
+                        "空白页".to_string()
+                    } else {
+                        format!("{title} {url}").trim().to_string()
+                    };
                     text.push_str(&format!(
-                        "\n  [{}]{} {}",
+                        "\n  [{}]{} {page}",
                         t.id,
                         if i == g.current { " ← 当前" } else { "" },
-                        if t.url.is_empty() {
-                            "空白页".to_string()
-                        } else {
-                            format!("{} {}", t.title, t.url).trim().to_string()
-                        }
                     ));
                 }
                 Ok(ok(&text, None, None))
@@ -781,17 +778,11 @@ impl CdpBrowser {
                     ));
                 };
                 g.current = i;
+                let live = self.live_pages(g)?;
                 let t = &g.tabs[i];
+                let url = live.get(&t.target).map(|(u, _)| u.as_str()).unwrap_or("");
                 Ok(ok(
-                    &format!(
-                        "已切到第 {} 只：{}",
-                        t.id,
-                        if t.url.is_empty() {
-                            "空白页"
-                        } else {
-                            &t.url
-                        }
-                    ),
+                    &format!("已切到第 {} 只：{}", t.id, page_label(url)),
                     None,
                     None,
                 ))
@@ -834,18 +825,33 @@ impl CdpBrowser {
             .ok_or_else(|| "还没有打开任何页面".to_string())
     }
 
-    /// 记下当前页的 url / 标题（`list_tabs` 用）
-    fn remember(&self, g: &mut Inner, url: String, title: String) {
-        if let Some(t) = g.tabs.get_mut(g.current) {
-            t.url = url;
-            if !title.is_empty() {
-                t.title = title;
-            }
-        }
+    /// 每只标签**现在**的地址和标题（targetId → (url, title)）。一次 `Target.getTargets`
+    /// 就全拿到了，不用挨个切过去问。
+    fn live_pages(
+        &self,
+        g: &mut Inner,
+    ) -> Result<std::collections::HashMap<String, (String, String)>, String> {
+        let conn = self.ensure_conn(g)?;
+        let r = conn.call(None, "Target.getTargets", json!({}))?;
+        let str_of =
+            |t: &Value, k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Ok(r.get("targetInfos")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|t| {
+                        (
+                            str_of(t, "targetId"),
+                            (str_of(t, "url"), str_of(t, "title")),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
-    /// 开一只标签并切过去。`url` 给了就导航（等加载完成）。
-    fn open_tab(&self, g: &mut Inner, url: Option<&str>) -> Result<(), String> {
+    /// 开一只标签并切过去。`url` 给了就导航（等加载完成），回落地的地址。
+    fn open_tab(&self, g: &mut Inner, url: Option<&str>) -> Result<Option<String>, String> {
         let profile = g.profile;
         let id = g.next_id;
         g.next_id += 1;
@@ -884,16 +890,12 @@ impl CdpBrowser {
                 self.await_dom_stable(conn, &session, SETTLE_BUDGET)?;
                 install_target_fix(conn, &session);
                 let info = page_info(conn, &session)?;
-                Some((
+                Some(
                     info.get("url")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&target_url)
                         .to_string(),
-                    info.get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ))
+                )
             }
             None => None,
         };
@@ -901,14 +903,9 @@ impl CdpBrowser {
             id,
             target,
             session,
-            url: String::new(),
-            title: String::new(),
         });
         g.current = g.tabs.len() - 1;
-        if let Some((real, title)) = landed {
-            self.remember(g, real, title);
-        }
-        Ok(())
+        Ok(landed)
     }
 
     /// 动作之后等页面安定（SPA 的渲染大多在这一小段里出来）
@@ -1719,6 +1716,15 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
+/// 标签的地址怎么写：没地址 / `about:blank` 就是「空白页」。
+fn page_label(url: &str) -> &str {
+    if url.is_empty() || url == "about:blank" {
+        "空白页"
+    } else {
+        url
+    }
+}
+
 fn ok(text: &str, url: Option<String>, title: Option<String>) -> Value {
     let mut v = json!({ "ok": true, "text": text });
     if let Some(u) = url.filter(|u| !u.is_empty()) {
@@ -1998,6 +2004,16 @@ mod tests {
             true
         );
 
+        // 点链接跳走：标签列表、切标签报的都得是**现在**的地址（以前缓存的是 navigate
+        // 那一刻的，点完链接还报着旧地址）
+        let v = act(json!({"action": "click", "selector": "a"}));
+        assert_eq!(v["ok"], true, "{v}");
+        let v = act(json!({"action": "list_tabs"}));
+        assert!(
+            text_of(&v).contains(&format!("{base}x")),
+            "跳转后的地址：{v}"
+        );
+
         // 多标签
         let v = act(json!({"action": "new_tab", "url": base}));
         assert_eq!(v["ok"], true, "{v}");
@@ -2006,6 +2022,10 @@ mod tests {
         assert!(t.contains("当前"), "{t}");
         let v = act(json!({"action": "switch_tab", "tab": 1}));
         assert_eq!(v["ok"], true, "{v}");
+        assert!(
+            text_of(&v).contains(&format!("{base}x")),
+            "切回来报的也是现在的地址：{v}"
+        );
         let v = act(json!({"action": "close_tab"}));
         assert_eq!(v["ok"], true, "{v}");
         // 关不存在的标签要说清楚有哪些

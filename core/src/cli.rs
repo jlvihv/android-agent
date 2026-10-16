@@ -84,13 +84,7 @@ struct Sub {
     body: String,
 }
 
-fn sub(
-    name: &str,
-    on: &'static [Machine],
-    prompt: &'static str,
-    help: &str,
-    body: &str,
-) -> Sub {
+fn sub(name: &str, on: &'static [Machine], prompt: &'static str, help: &str, body: &str) -> Sub {
     Sub {
         name: name.to_string(),
         help: help.to_string(),
@@ -291,7 +285,10 @@ pub fn prompt_clause(m: Machine) -> String {
             .map_or(items.len(), |i| i + 1);
         items.insert(
             at,
-            format!("`agent {}`（这台手机的系统能力）", crate::phone::names().join("|")),
+            format!(
+                "`agent {}`（这台手机的系统能力）",
+                crate::phone::names().join("|")
+            ),
         );
     }
     items.join("、")
@@ -366,13 +363,15 @@ json_args() {
 # 纯数字参数：非数字直接报错，别拼出一段坏 JSON 给核心
 int_arg() { case "${1:-}" in ''|*[!0-9]*) echo "agent ${2}：要一个数字，给的是「${1:-}」" >&2; exit 2 ;; esac; }
 
-# 设备操作（按键 / 点击 / 滑动 / 启动）：发给核心，失败变成非 0 退出码 ——
+# 核心回的纯文本原样打出来；以「错误：」开头的变成非 0 退出码 ——
 # 模型常写 `agent tap … && …` 这种链，回了 0 它会当成成功接着往下跑
-act() {
-  _r=$(post /api/command "{\"cmd\":$1}")
-  printf '%s\n' "$_r"
-  case "$_r" in *'"ok":true'*) ;; *) exit 1 ;; esac
+say() {
+  printf '%s\n' "$1"
+  case "$1" in 错误：*) exit 1 ;; esac
 }
+
+# 设备操作（按键 / 点击 / 滑动 / 启动 / 打开）：核心回纯文本
+act() { say "$(post '/api/command?format=text' "{\"cmd\":$1}")"; }
 
 "##;
 
@@ -399,17 +398,21 @@ const BROWSER_ACTIONS: &[&str] = &[
 ];
 
 fn browser_help() -> String {
-    let mut lines =
-        vec!["  agent browser <动作> [参数…]        驱动浏览器（agent browser --help 看每个动作）：".to_string()];
+    let mut lines = vec![
+        "  agent browser <动作> [参数…]        驱动浏览器（agent browser --help 看每个动作）："
+            .to_string(),
+    ];
     lines.extend(
         BROWSER_ACTIONS
             .chunks(4)
             .map(|c| format!("      {}", c.join(" | "))),
     );
     lines.extend([
-        "    一条命令里可以连做多步：agent browser navigate <url> && agent browser get_backbone 3".into(),
+        "    一条命令里可以连做多步：agent browser navigate <url> && agent browser get_backbone 3"
+            .into(),
         "    截图路径在 screenshot 的返回里，要 read 它才看得见。".into(),
-        "    复杂参数直接给 JSON：agent browser '{\"action\":\"click\",\"x\":100,\"y\":200}'".into(),
+        "    复杂参数直接给 JSON：agent browser '{\"action\":\"click\",\"x\":100,\"y\":200}'"
+            .into(),
     ]);
     lines.join("\n")
 }
@@ -508,7 +511,7 @@ EOT
       \{*) [ $# -eq 0 ] || { echo "JSON 形式后面不该再跟参数：$*" >&2; exit 2; }; body="$act_" ;;
       *) echo "agent browser：不认识的动作「${act_}」" >&2; usage; exit 2 ;;
     esac
-    post /api/browser "$body""##;
+    say "$(post /api/browser "$body")""##;
 
 const SEARCH_BODY: &str = r##"    shift || true
     if [ -z "${1:-}" ]; then
@@ -526,7 +529,7 @@ const SEARCH_BODY: &str = r##"    shift || true
     post /api/websearch "$body""##;
 
 const WEATHER_BODY: &str = r##"    shift || true
-    post /api/weather "{\"argv\":$(json_args "$@")}""##;
+    say "$(post /api/weather "{\"argv\":$(json_args "$@")}")""##;
 
 const OPEN_BODY: &str = r##"    shift || true
     uri=""
@@ -540,13 +543,11 @@ const OPEN_BODY: &str = r##"    shift || true
       echo "agent open: 参数里没有 URI，跳过: $*" >&2
       exit 0
     fi
-    out=$(post /api/command "{\"cmd\":{\"type\":\"open\",\"url\":\"$(esc "$uri")\"}}")
+    # 打不开也不让调用方炸（同上：$BROWSER / xdg-open 常被链在脚本里），只报到 stderr
+    out=$(post '/api/command?format=text' "{\"cmd\":{\"type\":\"open\",\"url\":\"$(esc "$uri")\"}}")
     case "$out" in
-      *'"ok":true'*) echo "已打开: $uri" ;;
-      *)
-        detail=$(printf '%s' "$out" | sed -n 's/.*"detail":"\([^"]*\)".*/\1/p')
-        echo "没能打开（${detail:-没有响应}）：$uri" >&2
-        ;;
+      错误：*) echo "没能打开 ${uri}：${out#错误：}" >&2 ;;
+      *) echo "已打开: $uri" ;;
     esac"##;
 
 const KEY_BODY: &str = r##"    case "${2:-}" in
@@ -572,21 +573,15 @@ const PHONE_BODY: &str = r##"    _name="$cmd"; shift || true
     if [ "$_name" = "screenshot" ] && [ $# -eq 0 ] && [ -n "${AGENT_WORKDIR:-}" ]; then
       set -- --path "${AGENT_WORKDIR}/screenshots/shot-$(date +%Y%m%d-%H%M%S).png"
     fi
-    out=$(post /api/device "{\"cmd\":\"$_name\",\"argv\":$(json_args "$@")}")
-    printf '%s\n' "$out"
-    # 失败要变成退出码：模型常写 `agent sms list && …` 这种链，
-    # 回了 0 的话它会拿着空输出继续往下跑。
-    case "$out" in *'"ok":false'*) exit 1 ;; esac"##;
+    say "$(post /api/device "{\"cmd\":\"$_name\",\"argv\":$(json_args "$@")}")""##;
 
 // 工具回的图片落在当前目录下（`$AGENT_WORKDIR`，核心那边见 `http::mcp_run`）。
 // 出错时核心回的文字以「错误：」开头 —— 变成非 0 退出码，`&&` 链才会断。
 const MCP_BODY: &str = r##"    shift || true
-    out=$(post /api/mcp "{\"argv\":$(json_args "$@"),\"workdir\":\"$(esc "${AGENT_WORKDIR:-}")\"}")
-    printf '%s\n' "$out"
-    case "$out" in 错误：*) exit 1 ;; esac"##;
+    say "$(post /api/mcp "{\"argv\":$(json_args "$@"),\"workdir\":\"$(esc "${AGENT_WORKDIR:-}")\"}")""##;
 
 const FILES_BODY: &str = r##"    shift || true
-    post /api/files "{\"path\":\"$(esc "${1:-/workspace}")\"}""##;
+    say "$(post /api/files "{\"path\":\"$(esc "${1:-/workspace}")\"}")""##;
 
 const SETUP_BODY: &str = r##"    shift || true
     exec /usr/local/bin/agent-setup "$@""##;
@@ -665,12 +660,22 @@ mod tests {
         for m in Machine::ALL {
             let (code, help, err) = run(m, &["help"]);
             assert_eq!(code, 0, "{m:?} 的 agent help 失败：{err}");
-            for s in ["agent browser", "agent search", "agent weather", "agent open", "agent mcp", "agent debug"] {
+            for s in [
+                "agent browser",
+                "agent search",
+                "agent weather",
+                "agent open",
+                "agent mcp",
+                "agent debug",
+            ] {
                 assert!(help.contains(s), "{m:?} 的 help 里少了 {s}");
             }
             // 模型不该看到「手机上 / 电脑上 / 只有…才有」这层区分
             for leak in ["手机上", "电脑上", "只有手机", "两端", "宿主模式"] {
-                assert!(!help.contains(leak), "{m:?} 的 help 里提到了「{leak}」：\n{help}");
+                assert!(
+                    !help.contains(leak),
+                    "{m:?} 的 help 里提到了「{leak}」：\n{help}"
+                );
             }
             let phone = m == Machine::Phone;
             for c in crate::phone::COMMANDS {
@@ -732,8 +737,15 @@ mod tests {
     fn browser_actions_match_the_core() {
         let s = script(Machine::Host);
         for action in crate::cdp::ACTIONS {
-            let name = if *action == "set_user_agent" { "user_agent" } else { action };
-            assert!(s.contains(&format!("      {name})")), "CLI 里没有浏览器动作 {name}");
+            let name = if *action == "set_user_agent" {
+                "user_agent"
+            } else {
+                action
+            };
+            assert!(
+                s.contains(&format!("      {name})")),
+                "CLI 里没有浏览器动作 {name}"
+            );
         }
     }
 
@@ -750,16 +762,28 @@ mod tests {
     fn prompt_clause_follows_the_machine() {
         let phone = prompt_clause(Machine::Phone);
         assert!(phone.contains("`agent key|tap|swipe|launch`"), "{phone}");
-        assert!(phone.contains(&format!("`agent {}`", crate::phone::names().join("|"))), "{phone}");
-        assert!(phone.contains("真 WebView") && phone.contains("`agent ps`"), "{phone}");
+        assert!(
+            phone.contains(&format!("`agent {}`", crate::phone::names().join("|"))),
+            "{phone}"
+        );
+        assert!(
+            phone.contains("真 WebView") && phone.contains("`agent ps`"),
+            "{phone}"
+        );
 
         let host = prompt_clause(Machine::Host);
-        assert!(host.contains("无头 Chrome") && host.contains("默认程序"), "{host}");
+        assert!(
+            host.contains("无头 Chrome") && host.contains("默认程序"),
+            "{host}"
+        );
         for s in ["agent ps", "agent key", "agent sms", "agent debug"] {
             assert!(!host.contains(s), "宿主上不该提 {s}：{host}");
         }
         let sandbox = prompt_clause(Machine::Sandbox);
-        assert!(sandbox.contains("`agent ps`") && !sandbox.contains("agent key"), "{sandbox}");
+        assert!(
+            sandbox.contains("`agent ps`") && !sandbox.contains("agent key"),
+            "{sandbox}"
+        );
     }
 
     /// 浏览器的动作清单 help 和提示词里都有，而且是同一份。
@@ -772,7 +796,10 @@ mod tests {
                 assert!(help.contains(a), "{m:?} 的 help 里少了 {a}");
                 assert!(prompt.contains(a), "{m:?} 的提示词里少了 {a}");
             }
-            assert!(prompt.contains("`agent search <检索意图> [条数]`"), "{prompt}");
+            assert!(
+                prompt.contains("`agent search <检索意图> [条数]`"),
+                "{prompt}"
+            );
         }
     }
 
@@ -786,7 +813,10 @@ mod tests {
             let mut bad: Vec<String> = Vec::new();
             let mut i = 0usize;
             while i < b.len() {
-                if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+                if b[i] == b'$'
+                    && i + 1 < b.len()
+                    && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_')
+                {
                     let mut j = i + 1;
                     while j < b.len() && name(b[j]) {
                         j += 1;

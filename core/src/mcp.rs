@@ -96,7 +96,10 @@ pub fn parse_add(args: &[String]) -> anyhow::Result<Server> {
         match flag.as_str() {
             "--token" => {
                 let t = value.trim();
-                let t = t.strip_prefix("Bearer ").or_else(|| t.strip_prefix("bearer ")).unwrap_or(t);
+                let t = t
+                    .strip_prefix("Bearer ")
+                    .or_else(|| t.strip_prefix("bearer "))
+                    .unwrap_or(t);
                 headers.insert("Authorization".to_string(), format!("Bearer {t}"));
             }
             "--header" => {
@@ -171,7 +174,10 @@ impl Mcp {
     }
 
     pub fn is_enabled(&self, name: &str) -> bool {
-        self.disabled.read().map(|g| !g.contains(name)).unwrap_or(true)
+        self.disabled
+            .read()
+            .map(|g| !g.contains(name))
+            .unwrap_or(true)
     }
 
     pub fn set_enabled(&self, name: &str, enabled: bool) {
@@ -191,7 +197,8 @@ impl Mcp {
             .into_iter()
             .find(|s| s.name == name)
             .ok_or_else(|| {
-                let names: Vec<String> = self.enabled_servers().into_iter().map(|s| s.name).collect();
+                let names: Vec<String> =
+                    self.enabled_servers().into_iter().map(|s| s.name).collect();
                 if names.is_empty() {
                     anyhow::anyhow!("没有叫 {name} 的 MCP 服务（还没接任何服务）")
                 } else {
@@ -232,8 +239,12 @@ impl Mcp {
 
     /// 调一个工具，回原样的 `result`（`content` / `isError` / `structuredContent`）。
     pub async fn call(&self, srv: &Server, tool: &str, args: Value) -> anyhow::Result<Value> {
-        self.rpc(srv, "tools/call", json!({ "name": tool, "arguments": args }))
-            .await
+        self.rpc(
+            srv,
+            "tools/call",
+            json!({ "name": tool, "arguments": args }),
+        )
+        .await
     }
 
     /// 一次 JSON-RPC 请求（没握手就先握手；会话过期 —— 404 —— 就重新握手再来一次）。
@@ -354,9 +365,13 @@ fn result_of(srv: &Server, r: &Reply) -> anyhow::Result<Value> {
         let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("");
         anyhow::bail!("MCP 服务 {} 报错：{msg}（{e}）", srv.name);
     }
-    v.get("result")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("MCP 服务 {} 的回复里没有 result：{}", srv.name, clip(&r.body)))
+    v.get("result").cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "MCP 服务 {} 的回复里没有 result：{}",
+            srv.name,
+            clip(&r.body)
+        )
+    })
 }
 
 /// 把响应体解码成 JSON-RPC 信封。
@@ -427,7 +442,11 @@ async fn list(mcp: &Mcp, only: Option<&str>) -> anyhow::Result<String> {
             Ok(tools) => {
                 out.push(format!("{}（{} 个工具）", srv.name, tools.len()));
                 for t in tools {
-                    out.push(format!("  {}  {}", t.name, first_line(&t.description, LIST_DESCRIPTION)));
+                    out.push(format!(
+                        "  {}  {}",
+                        t.name,
+                        first_line(&t.description, LIST_DESCRIPTION)
+                    ));
                 }
             }
             // 列全部时一个服务挂了不连累别的；只看一个的话就是错
@@ -436,7 +455,9 @@ async fn list(mcp: &Mcp, only: Option<&str>) -> anyhow::Result<String> {
         }
     }
     out.push(String::new());
-    out.push("看参数：agent mcp <服务> <工具> --help；调用：agent mcp <服务> <工具> '<json参数>'".into());
+    out.push(
+        "看参数：agent mcp <服务> <工具> --help；调用：agent mcp <服务> <工具> '<json参数>'".into(),
+    );
     Ok(out.join("\n"))
 }
 
@@ -479,15 +500,28 @@ async fn call(
 /// `tools/call` 的 `result` → 文字。图片 / 音频落盘给路径，资源给正文或链接。
 fn render_result(result: &Value, out: Option<&OutDir>) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for c in result["content"].as_array().map(Vec::as_slice).unwrap_or_default() {
+    for c in result["content"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
         match c["type"].as_str().unwrap_or("") {
             "text" => parts.push(c["text"].as_str().unwrap_or("").to_string()),
             kind @ ("image" | "audio") => {
                 let mime = c["mimeType"].as_str().unwrap_or("application/octet-stream");
-                parts.push(match save_blob(c["data"].as_str().unwrap_or(""), mime, out) {
-                    Ok(path) => format!("[{kind}（{mime}）：{path}{}]", if kind == "image" { "，用 read 看" } else { "" }),
-                    Err(e) => format!("[{kind}（{mime}）没能保存：{e:#}]"),
-                });
+                parts.push(
+                    match save_blob(c["data"].as_str().unwrap_or(""), mime, out) {
+                        Ok(path) => format!(
+                            "[{kind}（{mime}）：{path}{}]",
+                            if kind == "image" {
+                                "，用 read 看"
+                            } else {
+                                ""
+                            }
+                        ),
+                        Err(e) => format!("[{kind}（{mime}）没能保存：{e:#}]"),
+                    },
+                );
             }
             "resource" => {
                 let r = &c["resource"];
@@ -539,7 +573,11 @@ fn save_blob(b64: &str, mime: &str, out: Option<&OutDir>) -> anyhow::Result<Stri
 }
 
 fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = s
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     if line.chars().count() <= max {
         line.to_string()
     } else {
@@ -600,8 +638,15 @@ mod tests {
     #[test]
     fn rpc_bodies_can_be_sse_or_json() {
         let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/x\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":1}}\n\n";
-        assert_eq!(decode_rpc_body(sse).unwrap()["result"]["a"], 1, "跳过通知帧");
-        assert_eq!(decode_rpc_body("{\"id\":1,\"result\":2}").unwrap()["result"], 2);
+        assert_eq!(
+            decode_rpc_body(sse).unwrap()["result"]["a"],
+            1,
+            "跳过通知帧"
+        );
+        assert_eq!(
+            decode_rpc_body("{\"id\":1,\"result\":2}").unwrap()["result"],
+            2
+        );
         assert!(decode_rpc_body("<html>").is_err());
     }
 
@@ -629,9 +674,13 @@ mod tests {
             guest: "/workspace/abc/mcp".into(),
             prefix: "",
         };
-        let r = json!({ "content": [{ "type": "image", "mimeType": "image/png", "data": "aGk=" }] });
+        let r =
+            json!({ "content": [{ "type": "image", "mimeType": "image/png", "data": "aGk=" }] });
         let text = render_result(&r, Some(&out));
-        assert!(text.starts_with("[image（image/png）：/workspace/abc/mcp/"), "{text}");
+        assert!(
+            text.starts_with("[image（image/png）：/workspace/abc/mcp/"),
+            "{text}"
+        );
         let name = text.rsplit('/').next().unwrap().split('，').next().unwrap();
         assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"hi");
         let _ = std::fs::remove_dir_all(&dir);
@@ -640,7 +689,10 @@ mod tests {
     #[test]
     fn prompt_line_always_says_how_to_add() {
         let none = prompt_line(&[]);
-        assert!(none.contains("没有可用的服务") && none.contains("agent mcp add"), "{none}");
+        assert!(
+            none.contains("没有可用的服务") && none.contains("agent mcp add"),
+            "{none}"
+        );
         let s = prompt_line(&[Server {
             name: "gh".into(),
             url: "https://x".into(),
@@ -655,7 +707,10 @@ mod tests {
         let s = a(&["gh", "https://x/mcp", "--token", "abc"]).unwrap();
         assert_eq!(s.headers["Authorization"], "Bearer abc");
         let s = a(&["gh", "https://x/mcp", "--token", "Bearer abc"]).unwrap();
-        assert_eq!(s.headers["Authorization"], "Bearer abc", "已经带了 Bearer 不重复加");
+        assert_eq!(
+            s.headers["Authorization"], "Bearer abc",
+            "已经带了 Bearer 不重复加"
+        );
         let s = a(&["gh", "https://x/mcp", "--header", "X-Api-Key: k1"]).unwrap();
         assert_eq!(s.headers["X-Api-Key"], "k1");
         assert!(a(&["gh"]).is_err());
@@ -683,11 +738,17 @@ mod tests {
         ) -> axum::response::Response {
             use axum::response::IntoResponse;
             let method = req["method"].as_str().unwrap_or("").to_string();
-            let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
             if auth != "Bearer t0k" {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no").into_response();
             }
-            let sid = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let sid = headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let mut g = st.lock().unwrap();
             g.log.push(method.clone());
             let id = req["id"].clone();
@@ -732,7 +793,9 @@ mod tests {
             }
         }
         let st = Arc::new(Mutex::new(Fake::default()));
-        let app = Router::new().route("/mcp", axum_post(handle)).with_state(st.clone());
+        let app = Router::new()
+            .route("/mcp", axum_post(handle))
+            .with_state(st.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -751,37 +814,64 @@ mod tests {
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         let listed = run(&mcp, &argv(&["list"]), None).await.unwrap();
-        assert!(listed.starts_with("fake（2 个工具）"), "两页都要翻到：{listed}");
-        assert!(listed.contains("  echo  回声") && !listed.contains("第二行"), "list 只给第一行：{listed}");
+        assert!(
+            listed.starts_with("fake（2 个工具）"),
+            "两页都要翻到：{listed}"
+        );
+        assert!(
+            listed.contains("  echo  回声") && !listed.contains("第二行"),
+            "list 只给第一行：{listed}"
+        );
 
         let per_server = run(&mcp, &argv(&["fake", "--help"]), None).await.unwrap();
-        assert!(per_server.starts_with("fake（2 个工具）"), "对服务要帮助 = 列它的工具：{per_server}");
-        assert!(run(&mcp, &argv(&["--help"]), None).await.unwrap().starts_with("用法"));
+        assert!(
+            per_server.starts_with("fake（2 个工具）"),
+            "对服务要帮助 = 列它的工具：{per_server}"
+        );
+        assert!(run(&mcp, &argv(&["--help"]), None)
+            .await
+            .unwrap()
+            .starts_with("用法"));
 
-        let help = run(&mcp, &argv(&["fake", "add", "--help"]), None).await.unwrap();
-        assert!(help.contains("加法") && help.contains("\"properties\""), "{help}");
+        let help = run(&mcp, &argv(&["fake", "add", "--help"]), None)
+            .await
+            .unwrap();
+        assert!(
+            help.contains("加法") && help.contains("\"properties\""),
+            "{help}"
+        );
 
         // 第一次调用碰上会话过期（404）→ 重新握手 → 成功
-        let out = run(&mcp, &argv(&["fake", "echo", r#"{"msg":"你好"}"#]), None).await.unwrap();
+        let out = run(&mcp, &argv(&["fake", "echo", r#"{"msg":"你好"}"#]), None)
+            .await
+            .unwrap();
         assert_eq!(out, "echo: 你好");
         assert_eq!(st.lock().unwrap().inits, 2, "会话过期后要重新握手");
 
         // 工具自己说失败了（isError）→ 错误
-        let err = run(&mcp, &argv(&["fake", "echo", r#"{"msg":"boom"}"#]), None).await.unwrap_err();
+        let err = run(&mcp, &argv(&["fake", "echo", r#"{"msg":"boom"}"#]), None)
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("echo: boom"), "{err:#}");
 
         // 参数不是 JSON 对象 / 服务名不对 / 工具名不对
-        assert!(run(&mcp, &argv(&["fake", "echo", "[1]"]), None).await.is_err());
+        assert!(run(&mcp, &argv(&["fake", "echo", "[1]"]), None)
+            .await
+            .is_err());
         let e = run(&mcp, &argv(&["nope"]), None).await.unwrap_err();
         assert!(format!("{e:#}").contains("有的是：fake"), "{e:#}");
-        let e = run(&mcp, &argv(&["fake", "zzz", "--help"]), None).await.unwrap_err();
+        let e = run(&mcp, &argv(&["fake", "zzz", "--help"]), None)
+            .await
+            .unwrap_err();
         assert!(format!("{e:#}").contains("没有工具 zzz"), "{e:#}");
 
         // 停用：list 里标出来、不去连；调用直接拒（说清是用户关的）
         mcp.set_enabled("fake", false);
         let listed = run(&mcp, &argv(&["list"]), None).await.unwrap();
         assert!(listed.starts_with("fake（已停用）"), "{listed}");
-        let e = run(&mcp, &argv(&["fake", "echo", "{}"]), None).await.unwrap_err();
+        let e = run(&mcp, &argv(&["fake", "echo", "{}"]), None)
+            .await
+            .unwrap_err();
         assert!(format!("{e:#}").contains("已停用"), "{e:#}");
         assert!(mcp.enabled_servers().is_empty());
         mcp.set_enabled("fake", true);

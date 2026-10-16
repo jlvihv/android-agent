@@ -2,7 +2,7 @@ package dev.vihv.agent
 
 import android.util.Log
 import org.json.JSONObject
-import uniffi.agent_core.CoreException
+import uniffi.agent_core.HostException
 import uniffi.agent_core.DeviceHost
 
 /**
@@ -24,13 +24,13 @@ class DeviceHostImpl(
 
     /**
      * 由 Rust 从 `spawn_blocking` 线程调用。
-     * 抛 `CoreException.Failed` 表示失败，Rust 侧会收到 Err。
+     * 抛 `HostException.Failed` 表示失败，Rust 侧会收到 Err。
      */
     override fun execute(cmdJson: String): String {
         val cmd = try {
             JSONObject(cmdJson)
         } catch (t: Throwable) {
-            throw CoreException.Failed("指令不是合法 JSON: ${t.message}")
+            throw HostException.Failed("指令不是合法 JSON: ${t.message}")
         }
 
         return try {
@@ -46,13 +46,13 @@ class DeviceHostImpl(
                 // 打开一个 URI：http(s) / App 深链 / intent:// / tel: ——
                 // 沙箱里的 agent-open（$BROWSER）走这里，见 UriLauncher
                 "open" -> UriLauncher.open(service, android.net.Uri.parse(cmd.getString("url")))
-                else -> throw CoreException.Failed("未知指令: $type")
+                else -> throw HostException.Failed("未知指令: $type")
             }
-        } catch (e: CoreException) {
+        } catch (e: HostException) {
             throw e
         } catch (t: Throwable) {
             Log.w(TAG, "指令执行失败: $cmdJson", t)
-            throw CoreException.Failed(t.message ?: t.toString())
+            throw HostException.Failed(t.message ?: t.toString())
         }
     }
 

@@ -74,7 +74,10 @@ pub fn scan(host: &Path, guest: &str) -> Vec<Skill> {
             continue;
         };
         out.push(Skill {
-            name: meta.name.filter(|n| !n.is_empty()).unwrap_or_else(|| dir.clone()),
+            name: meta
+                .name
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| dir.clone()),
             description: clip(&description, MAX_DESCRIPTION),
             path: format!("{}/{dir}/SKILL.md", guest.trim_end_matches('/')),
             dir,
@@ -93,10 +96,14 @@ pub fn index(skills: &[Skill]) -> String {
     if on.is_empty() {
         return String::new();
     }
-    let mut s =
-        String::from("- 技能（skill）：遇到下面这些事，先用 read 读对应的 SKILL.md，按里面的做法来：");
+    let mut s = String::from(
+        "- 技能（skill）：遇到下面这些事，先用 read 读对应的 SKILL.md，按里面的做法来：",
+    );
     for k in on {
-        s.push_str(&format!("\n  - {}：{}（{}）", k.name, k.description, k.path));
+        s.push_str(&format!(
+            "\n  - {}：{}（{}）",
+            k.name, k.description, k.path
+        ));
     }
     s
 }
@@ -193,7 +200,8 @@ fn frontmatter(text: &str) -> Option<Meta> {
         let value = if matches!(value, ">" | "|" | ">-" | "|-" | ">+" | "|+") {
             // 折叠块：下面缩进的那几行
             let mut parts = Vec::new();
-            while i < body.len() && (body[i].starts_with([' ', '\t']) || body[i].trim().is_empty()) {
+            while i < body.len() && (body[i].starts_with([' ', '\t']) || body[i].trim().is_empty())
+            {
                 let t = body[i].trim();
                 if !t.is_empty() {
                     parts.push(t);
@@ -257,11 +265,15 @@ mod tests {
         assert_eq!(m.name.as_deref(), Some("x"));
         assert_eq!(m.description.as_deref(), Some("a: b"), "值里的冒号不能截断");
 
-        let m = frontmatter("---\nname: y\ndescription: >\n  第一行\n  第二行\n\nother: 1\n---\n").unwrap();
+        let m = frontmatter("---\nname: y\ndescription: >\n  第一行\n  第二行\n\nother: 1\n---\n")
+            .unwrap();
         assert_eq!(m.description.as_deref(), Some("第一行 第二行"));
 
         assert_eq!(frontmatter("# 没有 frontmatter\n"), None);
-        assert!(frontmatter("\u{feff}---\nname: z\n---\n").is_some(), "BOM 开头也认");
+        assert!(
+            frontmatter("\u{feff}---\nname: z\n---\n").is_some(),
+            "BOM 开头也认"
+        );
     }
 
     /// 按目录名排序、没描述的跳过、没名字用目录名、路径是模型视角的。
@@ -294,7 +306,10 @@ mod tests {
                 },
             ]
         );
-        assert!(scan(&root.join("nope"), "/x").is_empty(), "目录不存在就是没有");
+        assert!(
+            scan(&root.join("nope"), "/x").is_empty(),
+            "目录不存在就是没有"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -310,7 +325,10 @@ mod tests {
         };
         let s = index(std::slice::from_ref(&pdf));
         assert!(s.starts_with("- 技能（skill）"), "{s}");
-        assert!(s.contains("\n  - pdf：处理 PDF（/workspace/skills/pdf/SKILL.md）"), "{s}");
+        assert!(
+            s.contains("\n  - pdf：处理 PDF（/workspace/skills/pdf/SKILL.md）"),
+            "{s}"
+        );
         pdf.enabled = false;
         assert_eq!(index(&[pdf]), "", "停用的不列");
     }
@@ -324,9 +342,16 @@ mod tests {
         let got = scan(&root, "/workspace/skills");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "create-skill");
-        assert!(got[0].description.contains("安装"), "{}", got[0].description);
+        assert!(
+            got[0].description.contains("安装"),
+            "{}",
+            got[0].description
+        );
         let body = std::fs::read_to_string(root.join(CREATE_SKILL).join("SKILL.md")).unwrap();
-        assert!(body.contains("git clone <地址> /workspace/skills/<名字>"), "{body}");
+        assert!(
+            body.contains("git clone <地址> /workspace/skills/<名字>"),
+            "{body}"
+        );
         assert!(!body.contains("//"), "目录拼接别出双斜杠：{body}");
         let _ = std::fs::remove_dir_all(&root);
     }

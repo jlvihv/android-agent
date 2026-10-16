@@ -1230,7 +1230,12 @@ impl AppState {
             db.set_mcp_server(&srv.name, Some(&srv))?;
         }
         let name = srv.name.clone();
-        let mut list: Vec<_> = self.mcp.servers().into_iter().filter(|s| s.name != name).collect();
+        let mut list: Vec<_> = self
+            .mcp
+            .servers()
+            .into_iter()
+            .filter(|s| s.name != name)
+            .collect();
         list.push(srv);
         self.mcp.set_servers(list);
         self.mcp.forget_session(&name).await;
@@ -1292,7 +1297,11 @@ impl AppState {
             return Vec::new();
         };
         let (host, guest) = sb.skills_dir();
-        let off = self.disabled_skills.read().map(|g| g.clone()).unwrap_or_default();
+        let off = self
+            .disabled_skills
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         crate::skills::scan(&host, &guest)
             .into_iter()
             .map(|mut s| {
@@ -1732,15 +1741,16 @@ mod tests {
         // 后面拼的那段（MCP / skill）不在这里比：只比基础那份选得对不对
         let st = AppState::new();
         assert!(
-            st.system_prompt()
-                .starts_with(crate::agent::system_prompt(crate::platform::Platform::Android)),
+            st.system_prompt().starts_with(crate::agent::system_prompt(
+                crate::platform::Platform::Android
+            )),
             "还没有沙箱时（安卓 boot 阶段 / 纯 Rust 环境）用手机那份"
         );
 
         st.set_linux(Arc::new(LinuxSandbox::host(std::env::temp_dir())));
-        assert!(st
-            .system_prompt()
-            .starts_with(crate::agent::system_prompt(crate::platform::Platform::host())));
+        assert!(st.system_prompt().starts_with(crate::agent::system_prompt(
+            crate::platform::Platform::host()
+        )));
 
         // 运行时覆盖照旧最高优先（`/api/debug/system-prompt` 调提示词那条路）
         st.set_system_prompt(Some("改过的".into()));
@@ -1802,7 +1812,10 @@ mod tests {
         )));
         let bare = st.system_prompt().into_owned();
         assert!(bare.contains("agent mcp add"), "没接也要说怎么接：{bare}");
-        assert!(!bare.contains("技能（skill）"), "一个 skill 都没有就不列：{bare}");
+        assert!(
+            !bare.contains("技能（skill）"),
+            "一个 skill 都没有就不列：{bare}"
+        );
 
         std::fs::create_dir_all(root.join("ws/skills/pdf")).unwrap();
         std::fs::write(
@@ -1811,9 +1824,15 @@ mod tests {
         )
         .unwrap();
         let p = st.system_prompt().into_owned();
-        assert!(p.starts_with(&bare), "装之前那份原样在前面（只在末尾多出索引）");
+        assert!(
+            p.starts_with(&bare),
+            "装之前那份原样在前面（只在末尾多出索引）"
+        );
         assert!(p.contains("技能（skill）"), "{p}");
-        assert!(p.contains("pdf：处理 PDF（/workspace/skills/pdf/SKILL.md）"), "{p}");
+        assert!(
+            p.contains("pdf：处理 PDF（/workspace/skills/pdf/SKILL.md）"),
+            "{p}"
+        );
         assert!(!p.contains("正文不进提示词"));
         assert_eq!(st.system_prompt(), p, "没变就逐字节一样");
 
@@ -2118,8 +2137,13 @@ mod tests {
         let id = &ids[0];
         let att = dir.join("a.png");
         std::fs::write(&att, b"x").unwrap();
-        st.chat.write().await.get_mut(id).unwrap().messages.push(
-            crate::agent::ChatMessage::User {
+        st.chat
+            .write()
+            .await
+            .get_mut(id)
+            .unwrap()
+            .messages
+            .push(crate::agent::ChatMessage::User {
                 text: String::new(),
                 attachments: vec![crate::agent::Attachment {
                     id: "a.png".into(),
@@ -2128,8 +2152,7 @@ mod tests {
                     name: "a.png".into(),
                     kind: crate::agent::AttachmentKind::Image,
                 }],
-            },
-        );
+            });
         let turn = st.begin_turn(id).unwrap();
 
         st.delete_session(id).await;

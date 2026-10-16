@@ -357,14 +357,20 @@ mod tests {
     fn a_trailing_newline_is_not_a_line() {
         let text = format!("{}\n", lines(30, "l"));
         let v = read(&text, "/root/x.txt", 5, Some(3)).unwrap();
-        assert!(v.content.contains("文件还有 23 行（共 30 行"), "{}", v.content);
+        assert!(
+            v.content.contains("文件还有 23 行（共 30 行"),
+            "{}",
+            v.content
+        );
         assert!(v.content.contains("offset=8"), "{}", v.content);
         assert_eq!(v.total_lines, 30);
 
         let v = read(&text, "/root/x.txt", 28, Some(3)).unwrap();
         assert_eq!(v.content, "l27\nl28\nl29", "读到最后一行就没有续读提示");
 
-        let err = read(&text, "/root/x.txt", 31, None).unwrap_err().to_string();
+        let err = read(&text, "/root/x.txt", 31, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("共 30 行"), "{err}");
     }
 

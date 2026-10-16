@@ -53,6 +53,10 @@ android {
     }
 
     buildTypes {
+        // debug 也认 AGENT_KEYSTORE：手机上的包是别的机器签的时候，`installDebug` 照样能覆盖装
+        debug {
+            signingConfig = signingConfigs.findByName("local") ?: signingConfigs.getByName("debug")
+        }
         release {
             isMinifyEnabled = true
             // 本地装 release 用 debug key 签（AGP 默认就有一把

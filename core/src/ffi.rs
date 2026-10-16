@@ -26,13 +26,37 @@ use crate::phone::PhoneApi;
 use crate::state::{BrowserApi, DeviceApi};
 use crate::Core;
 
-/// 统一的错误类型。`flat_error` 让 Kotlin 侧只拿到一个异常类 + 消息字符串，
-/// 不用为每个变体生成嵌套类型。
+/// Rust → Kotlin 的错误（核心的函数抛给壳的）。`flat_error` 让 Kotlin 侧只拿到一个
+/// 异常类 + 消息字符串，不用为每个变体生成嵌套类型。
+///
+/// **只能单向用**：flat 错误从 Kotlin 那边**接不回来**（uniffi：`Can't lift flat errors`，
+/// 是 panic）。Kotlin 往 Rust 抛的（三个回调）用 [`HostError`]。
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum CoreError {
     #[error("{message}")]
     Failed { message: String },
+}
+
+/// Kotlin → Rust 的错误：`DeviceHost` / `BrowserHost` / `PhoneHost` 的实现抛
+/// `HostException.Failed(detail)` 表示失败，Rust 侧收到一个普通的 Err。
+///
+/// 为什么不和 [`CoreError`] 共用：那个是 flat 的，回调里一抛就 panic、整个 App abort
+/// （实测：`agent launch` 一个没装的包名，「找不到应用」就把 App 弄崩了）。非 flat 的
+/// 字段又不能叫 `message`（和 Kotlin `Throwable.message` 撞名），所以叫 `detail`。
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum HostError {
+    #[error("{detail}")]
+    Failed { detail: String },
+}
+
+/// 回调里抛了**没声明**的异常（不是 `HostException`）：当成一次普通失败，别 panic。
+impl From<uniffi::UnexpectedUniFFICallbackError> for HostError {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        HostError::Failed {
+            detail: format!("壳那边出了意外：{}", e.reason),
+        }
+    }
 }
 
 impl From<anyhow::Error> for CoreError {
@@ -73,8 +97,8 @@ pub trait DeviceHost: Send + Sync {
     /// 执行一条指令（`Command` 的 JSON），返回结果描述。
     ///
     /// 错误类型必须是 uniffi Error —— `Result<_, String>` 不行，
-    /// bindgen 会报 `unknown throw type: Some(String)`。
-    fn execute(&self, cmd_json: String) -> Result<String, CoreError>;
+    /// bindgen 会报 `unknown throw type: Some(String)`；也不能是 flat 的（见 [`HostError`]）。
+    fn execute(&self, cmd_json: String) -> Result<String, HostError>;
 
     /// 设备/实现名，仅用于展示
     fn name(&self) -> String;
@@ -108,7 +132,7 @@ impl DeviceApi for HostAdapter {
 #[uniffi::export(callback_interface)]
 pub trait BrowserHost: Send + Sync {
     /// 执行一个动作（JSON），返回结果 JSON。形状见 `BrowserApi::execute`。
-    fn execute(&self, action_json: String) -> Result<String, CoreError>;
+    fn execute(&self, action_json: String) -> Result<String, HostError>;
 }
 
 struct BrowserAdapter(Box<dyn BrowserHost>);
@@ -135,7 +159,7 @@ impl BrowserApi for BrowserAdapter {
 #[uniffi::export(callback_interface)]
 pub trait PhoneHost: Send + Sync {
     /// 跑一条手机命令，返回 `{"ok":…}` 形状的 JSON 字符串。
-    fn call(&self, name: String, argv: Vec<String>) -> Result<String, CoreError>;
+    fn call(&self, name: String, argv: Vec<String>) -> Result<String, HostError>;
 }
 
 struct PhoneAdapter(Box<dyn PhoneHost>);
@@ -429,12 +453,27 @@ mod tests {
     struct FakeHost;
 
     impl DeviceHost for FakeHost {
-        fn execute(&self, cmd_json: String) -> Result<String, CoreError> {
+        fn execute(&self, cmd_json: String) -> Result<String, HostError> {
+            if cmd_json.contains("nope") {
+                return Err(HostError::Failed {
+                    detail: "找不到应用 nope（没装？）".into(),
+                });
+            }
             Ok(format!("handled {cmd_json}"))
         }
         fn name(&self) -> String {
             "fake".into()
         }
+    }
+
+    /// 壳那边的失败到 Rust 这边是一个普通的 Err（带着原话），不是 panic。
+    #[test]
+    fn a_host_failure_is_an_ordinary_error() {
+        let adapter = HostAdapter(Box::new(FakeHost));
+        let e = adapter
+            .execute(r#"{"type":"launch","package":"nope"}"#)
+            .unwrap_err();
+        assert!(e.contains("找不到应用 nope"), "{e}");
     }
 
     #[test]

@@ -1414,7 +1414,11 @@ async fn drive(
                     return stop_with_pending(core, sid, tx, &calls[n..]).await;
                 }
             };
-            send(tx, tool_output_event(&call.id, &outcome.text, &outcome.images)).await;
+            send(
+                tx,
+                tool_output_event(&call.id, &outcome.text, &outcome.images),
+            )
+            .await;
             append(
                 core,
                 sid,
@@ -2046,11 +2050,7 @@ async fn stream_one(
         if aborted {
             // `calls` 里只剩有 id 和名字的，正是发过 tool-input-start 的那些
             for c in &calls {
-                send(
-                    tx,
-                    tool_output_event(&c.id, "错误：已停止", &[]),
-                )
-                .await;
+                send(tx, tool_output_event(&c.id, "错误：已停止", &[])).await;
             }
             return Ok(StepOutput {
                 content: text_acc,
@@ -3398,7 +3398,10 @@ mod tests {
                 );
             } else {
                 assert!(bash.contains("Alpine") && bash.contains("apk add"));
-                assert!(prompt.contains("agent ps"), "{p:?}: 沙箱里的进程用 agent ps 看");
+                assert!(
+                    prompt.contains("agent ps"),
+                    "{p:?}: 沙箱里的进程用 agent ps 看"
+                );
             }
         }
         let mac = &tools(Platform::Macos)[1].description;

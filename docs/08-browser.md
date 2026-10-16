@@ -37,6 +37,9 @@ POST /api/browser ───────────────────┤  
 - **`BrowserHost`（uniffi callback）** 和 `DeviceHost`（无障碍）是**两条独立的路**。
   浏览器不需要无障碍权限，所以 `AgentApp.onCreate` 就注入了；设备那条要等服务连上。
 - **`POST /api/browser`** 是唯一的入口，body 就是动作（一个 `action` + 可选参数）。
+  回的是**纯文本**（`http::browser_text`）：后端的 `{ok, text, url?, title?}` 里 `text`
+  本来就是给人看的，原样给；失败写成 `错误：…`（CLI 以非 0 退出）；页面网址只在正文
+  里没提到时补一行，多标签时补一行在哪只标签上。
   ① `agent browser` 走它，于是 bash 能脚本化驱动浏览器；
   ② 走到一次工具调用要花一整轮 LLM，调试时不现实 —— 有个能直接打的入口，
   改一行 JS 就能立刻验。
@@ -50,9 +53,8 @@ POST /api/browser ───────────────────┤  
   （少给 / 多给都报错）。
 
   截图不在工具结果里：图落在 `/root/.browser/`，模型得自己 `read`。所以 `Core::browser()`
-  在截图返回的 `text` 里写了一句「用 read 看它」（写进 JSON 字段而不是另打一行，
-  免得 `| jq` / `| python3 -c json.load` 被打断）。模型本来就这么干（6 次截图
-  全是自己 read 回来的）。
+  在截图返回的 `text` 里写了一句「用 read 看它」（路径就在正文里）。模型本来就这么干
+  （6 次截图全是自己 read 回来的）。
 
 ## 4. 无头 WebView 必须自己做的事
 

@@ -40,6 +40,7 @@ pub mod mock;
 pub mod models;
 pub mod openai;
 pub mod phone;
+pub mod plain;
 pub mod platform;
 pub mod prompt;
 pub mod providers;

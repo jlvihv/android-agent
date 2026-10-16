@@ -5,7 +5,7 @@
 ## 1. 一句话
 
 模型在沙箱里敲 `agent sms list`，核心把它转给 Kotlin 的 `DeviceApisImpl`，
-后者用 Android API 干活、回一段 JSON。**它们只有手机上有** —— 电脑上的
+后者用 Android API 干活、回一段 JSON（核心再排成纯文本给模型）。**它们只有手机上有** —— 电脑上的
 `agent help` 里没有这一段，敲了也直接拒绝。
 
 ## 2. 为什么不做成工具
@@ -43,7 +43,7 @@ help、`case` 分发、系统提示词里那份清单都从同一张表（`cli::
 短信、没有闹钟。写错了的表现是模型拿一条根本跑不通的命令反复试。
 
 后端还有第四道兜底：桌面上 `state.phone()` 一直是 `None`，`/api/device` 会回
-`{"ok":false,"error":{"code":"unavailable",…}}`。
+`错误：…（unavailable）`。
 
 ## 4. 三个门，各有各的开法
 
@@ -80,14 +80,24 @@ Activity 发、结果只能从 `onRequestPermissionsResult` 回。`AgentPermissi
 
 ```sh
 $ agent sms list --limit 2
-{"ok":true,"data":{"messages":[{"id":"1","address":"10086","body":"验证码 123456","date":"2026-10-15T20:19:19","type":"inbox"}]}}
+messages:
+  date | id | address | body | type
+  2026-10-15T20:19:19 | 1 | 10086 | 验证码 123456 | inbox
+  …
 
 $ agent location current
-{"ok":true,"data":{"latitude":31.2304,"longitude":121.4737,"accuracy_m":5,"source":"fresh", …}}
+accuracy_m: 5
+latitude: 31.2304
+longitude: 121.4737
+source: fresh
+…
 ```
 
-- 输出**始终是那一行 JSON**（`{"ok":…,"data":…}` 或 `{"ok":false,"error":{"code","message"}}`）。
-  `ok:false` 时 CLI 以非 0 退出 —— `&&` 链因此会断，模型不会拿着空输出往下走。
+- 壳回的是 `{"ok":…,"data":…}` / `{"ok":false,"error":{"code","message"}}`，**核心排成纯文本**
+  再给模型（`plain::render`：对象一行一个 `键: 值`，一组字段相同的记录排成表）—— 原样透出
+  JSON 的话模型读到的是一串引号和转义。失败写成 `错误：消息（错误码）`，CLI 以非 0 退出
+  —— `&&` 链因此会断，模型不会拿着空输出往下走；错误码留着，让它分得清「用户拒了权限」
+  和「参数错了」。
 - `--help` 每个命令都认（用法文本由 Kotlin 回，避免两处各写一份）。
 - 参数从 shell 原样传过去（`{"cmd":"sms","argv":["list","--limit","2"]}`），
   解析在 Kotlin（`PhoneArgs`）：Rust 那边不需要懂每个命令的参数，加子命令不用动它。

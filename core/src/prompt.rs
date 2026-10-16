@@ -65,8 +65,7 @@ pub fn system_prompt_with(p: Platform, phone: bool) -> &'static str {
         OnceLock::new(),
         OnceLock::new(),
     ];
-    PROMPTS[p as usize * 2 + usize::from(phone)]
-        .get_or_init(|| compose_prompt(p, phone))
+    PROMPTS[p as usize * 2 + usize::from(phone)].get_or_init(|| compose_prompt(p, phone))
 }
 
 /// 提示词和工具描述里**随平台变**的那几句。共用的句子只在 `compose_prompt` /
@@ -255,7 +254,10 @@ mod tests {
     fn device_commands_are_only_promised_where_they_exist() {
         let phone = system_prompt_with(Platform::Android, true);
         let want = format!("`agent {}`", crate::phone::names().join("|"));
-        assert!(phone.contains(&want), "手机形态的清单不对，应该是 {want}：\n{phone}");
+        assert!(
+            phone.contains(&want),
+            "手机形态的清单不对，应该是 {want}：\n{phone}"
+        );
 
         // 三个平台的「没有设备能力」形态（手机之外的任何机器）：一个字都不该提
         for plat in Platform::ALL {
@@ -284,12 +286,12 @@ mod tests {
         let dir = crate::linux::session_guest_dir("0199e1f0-aaaa-7000-8000-000000000001");
         for p in Platform::ALL {
             for phone in [false, true] {
-            let s = system_prompt_with(p, phone);
-            assert!(!s.contains(&dir), "{p:?} 的提示词里出现了会话目录：{dir}");
-            assert!(
-                !s.contains("sessions/"),
-                "{p:?} 的提示词里出现了 sessions/ 这种具体路径"
-            );
+                let s = system_prompt_with(p, phone);
+                assert!(!s.contains(&dir), "{p:?} 的提示词里出现了会话目录：{dir}");
+                assert!(
+                    !s.contains("sessions/"),
+                    "{p:?} 的提示词里出现了 sessions/ 这种具体路径"
+                );
             }
         }
     }
@@ -299,9 +301,9 @@ mod tests {
     fn the_cli_sentence_stays_clean() {
         for p in Platform::ALL {
             for phone in [false, true] {
-            let s = system_prompt_with(p, phone);
-            assert!(!s.contains("、、"), "拼出双顿号了：\n{s}");
-            assert!(!s.contains("（）"), "拼出空括号了：\n{s}");
+                let s = system_prompt_with(p, phone);
+                assert!(!s.contains("、、"), "拼出双顿号了：\n{s}");
+                assert!(!s.contains("（）"), "拼出空括号了：\n{s}");
             }
         }
     }

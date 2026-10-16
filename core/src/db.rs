@@ -755,7 +755,10 @@ impl Db {
                     [kind, name],
                 )
             } else {
-                c.execute("DELETE FROM disabled WHERE kind = ?1 AND name = ?2", [kind, name])
+                c.execute(
+                    "DELETE FROM disabled WHERE kind = ?1 AND name = ?2",
+                    [kind, name],
+                )
             }
             .map(|_| ())
         })
@@ -969,10 +972,7 @@ impl Db {
                 reasoning: reasoning as u64,
                 calls: calls as u64,
                 cache_reported_input: reported as u64,
-                cache_hit_ratio: crate::openai::cache_hit_ratio(
-                    cache_read as u64,
-                    reported as u64,
-                ),
+                cache_hit_ratio: crate::openai::cache_hit_ratio(cache_read as u64, reported as u64),
             }))
         })
     }

@@ -377,12 +377,45 @@ struct CommandBody {
 }
 
 /// 前端 → Rust → 设备。这是"人按按钮"的通路。
+/// 回 `{id, ok, detail}`；带 `?format=text` 时回纯文本（`agent key / tap / swipe /
+/// launch / open` 用）：成功就是 `detail`，失败写成 `错误：…`。
 async fn post_command(
     State(st): State<Arc<AppState>>,
+    Query(q): Query<FormatQuery>,
     Json(body): Json<CommandBody>,
-) -> impl IntoResponse {
+) -> Response {
     let ack = dispatch(&st, body.cmd).await;
-    Json(ack)
+    if q.format.as_deref() != Some("text") {
+        return Json(ack).into_response();
+    }
+    let detail = ack
+        .get("detail")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .trim();
+    let text = if ack.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+        if detail.is_empty() {
+            "完成".to_string()
+        } else {
+            detail.to_string()
+        }
+    } else {
+        format!(
+            "错误：{}",
+            if detail.is_empty() {
+                "失败了"
+            } else {
+                detail
+            }
+        )
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+}
+
+#[derive(Deserialize)]
+struct FormatQuery {
+    #[serde(default)]
+    format: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -850,10 +883,13 @@ async fn list_procs(State(st): State<Arc<AppState>>, Query(q): Query<ProcsQuery>
     .into_response()
 }
 
-/// `POST /api/browser` → 直接跑一个浏览器动作（对应 `browser` 工具）。
+/// `POST /api/browser` → 跑一个浏览器动作（`agent browser` 走它）。
 ///
-/// body 就是工具参数的形状（`{action, url, selector, …}`），返回 Kotlin 给的
-/// 结果 JSON。
+/// body 是动作（`{action, url, selector, …}`）。回 `text/plain`：就是给模型看的那段
+/// 文字（见 `browser_text`），出错时以 `错误：` 开头（CLI 据此以非 0 退出）——
+/// 和工具结果、`agent search`、`agent mcp` 同一个写法。两个后端（手机的 WebView、
+/// 电脑的 CDP）回的都是 `{ok, text, url?, title?, …}`，`text` 本来就是给人看的，
+/// 原样透出 JSON 的话模型看到的是一串 `\n` 转义。
 ///
 /// 为什么要有这个入口：
 ///
@@ -863,10 +899,54 @@ async fn list_procs(State(st): State<Arc<AppState>>, Query(q): Query<ProcsQuery>
 ///    有个能直接打的入口，改一行 JS 就能立刻验。
 async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let core = Core { state: st.clone() };
-    match core.browser(&body.to_string()).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
+    let text = match core.browser(&body.to_string()).await {
+        Ok(v) => browser_text(&v),
+        Err(e) => format!("错误：{e:#}"),
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+}
+
+/// 浏览器回包 → 纯文本。
+///
+/// 正文就是 `text`；`ok: false` 写成 `错误：…`。页面信息（`url` / `title`）只在正文
+/// 里还没提到时补一行 —— 模型靠它记「现在在哪页」，但 `navigate` 那种正文里已经写了。
+/// 多标签时（手机后端每个回包都带 `tab` / `tabs`）再补一行在哪只标签上。
+fn browser_text(v: &Value) -> String {
+    let text = v
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim_end();
+    if v.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+        return format!(
+            "错误：{}",
+            if text.is_empty() {
+                "浏览器动作失败"
+            } else {
+                text
+            }
+        );
     }
+    let mut out = if text.is_empty() {
+        "(无输出)".to_string()
+    } else {
+        text.to_string()
+    };
+    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    if !url.is_empty() && !out.contains(url) {
+        let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        if title.is_empty() {
+            out.push_str(&format!("\n[页面：{url}]"));
+        } else {
+            out.push_str(&format!("\n[页面：{title} — {url}]"));
+        }
+    }
+    let tabs = v.get("tabs").and_then(|t| t.as_u64()).unwrap_or(0);
+    if tabs > 1 {
+        let tab = v.get("tab").and_then(|t| t.as_u64()).unwrap_or(0);
+        out.push_str(&format!("\n[标签 #{tab}，共 {tabs} 只]"));
+    }
+    out
 }
 
 /// `POST /api/device` → 跑一条**手机系统能力**命令（`{cmd, argv}`）。
@@ -875,32 +955,47 @@ async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>
 /// 为什么单独开一条而不是挤进 `/api/command`：那条是**无障碍指令**（点按/滑动/按键，
 /// 需要服务连着），而这些只需要普通权限；两者的可用条件不同（见 `phone` 模块）。
 ///
-/// **恒用 200 回**，成不成看 body 里的 `ok`：沙箱里的 `wget` 对 5xx 会**重试**，
-/// 于是一次“没有这台设备”会被放成三次请求、还打了三条日志；`curl` 不带 `-f`
-/// 又不认 4xx。一句话：状态码这条路不要用，让 `ok` 说话。
+/// 回 `text/plain`：壳回的 `{ok, data}` 里的 `data` 用 `plain::render` 排成文字；
+/// 失败写成 `错误：…（错误码）`，CLI 据此以非 0 退出。错误码是给模型分辨用的：
+/// `permission_denied`（用户拒了，别重试）、`bad_args`（参数错了）……
+///
+/// **恒用 200 回**：沙箱里的 `wget` 对 5xx 会**重试**，于是一次“没有这台设备”会被
+/// 放成三次请求；成不成看正文开头。
 async fn device_command(State(st): State<Arc<AppState>>, Json(body): Json<DeviceBody>) -> Response {
     let core = Core { state: st.clone() };
-    
-    match core.phone(&body.cmd, &body.argv).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => Json(json!({
-            "ok": false,
-            "error": {
-                // 这个码是给模型分辨用的：
-                //   unknown_command —— 名字写错了（可用的是 phone::COMMANDS）
-                //   unavailable     —— 这台机器上没这个能力（桌面；别重试）
-                //   failed          —— 真的执行失败了（权限被拒、API 报错…）
-                "code": if !crate::phone::is_command(&body.cmd) {
-                    "unknown_command"
-                } else if st.phone().is_none() {
-                    "unavailable"
-                } else {
-                    "failed"
-                },
-                "message": format!("{e:#}"),
-            },
-        }))
-        .into_response(),
+    let text = match core.phone(&body.cmd, &body.argv).await {
+        Ok(v) => device_text(&v),
+        Err(e) => {
+            let code = if !crate::phone::is_command(&body.cmd) {
+                "unknown_command"
+            } else if st.phone().is_none() {
+                "unavailable"
+            } else {
+                "failed"
+            };
+            format!("错误：{e:#}（{code}）")
+        }
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+}
+
+/// 壳的回包（`phone::normalize_reply` 收敛过的 `{ok, data}` / `{ok:false, error}`）→ 文字。
+fn device_text(v: &Value) -> String {
+    if v.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+        let e = &v["error"];
+        let msg = e
+            .get("message")
+            .and_then(|m| m.as_str())
+            .or_else(|| e.as_str())
+            .unwrap_or("失败了（壳没说原因）");
+        return match e.get("code").and_then(|c| c.as_str()) {
+            Some(code) => format!("错误：{msg}（{code}）"),
+            None => format!("错误：{msg}"),
+        };
+    }
+    match v.get("data") {
+        None | Some(Value::Null) => "完成".to_string(),
+        Some(d) => crate::plain::render(d),
     }
 }
 
@@ -919,7 +1014,7 @@ struct DeviceBody {
 /// 为什么要有它：模型只看得见自己敲过的路径，看不见「这个目录整体乱了」。
 async fn list_files(State(st): State<Arc<AppState>>, Json(body): Json<FilesBody>) -> Response {
     let Some(sb) = st.linux() else {
-        return "沙箱还没起来（首次启动要解压 rootfs，看设置页的进度）".into_response();
+        return "错误：沙箱还没起来（首次启动要解压 rootfs，看设置页的进度）".into_response();
     };
     let guest = body
         .path
@@ -928,9 +1023,9 @@ async fn list_files(State(st): State<Arc<AppState>>, Json(body): Json<FilesBody>
     match sb.resolve_path(&guest) {
         Ok(host) => match crate::workspace::render(&guest, &host) {
             Ok(text) => text.into_response(),
-            Err(e) => format!("{e:#}\n").into_response(),
+            Err(e) => format!("错误：{e:#}").into_response(),
         },
-        Err(e) => format!("{e:#}\n").into_response(),
+        Err(e) => format!("错误：{e:#}").into_response(),
     }
 }
 
@@ -945,14 +1040,12 @@ struct FilesBody {
 /// 沙箱里的 `agent weather` 走它。解析在 Rust 侧（`weather` 模块）：
 /// 与设备命令不同，这个只是查网络，**手机和电脑上都能用**。
 async fn weather_run(Json(body): Json<WeatherBody>) -> Response {
-    match crate::weather::run(&body.argv).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => Json(json!({
-            "ok": false,
-            "error": { "code": "weather_failed", "message": format!("{e:#}") },
-        }))
-        .into_response(),
-    }
+    // 回纯文本（`plain::render`），出错以「错误：」开头 —— 和别的 `agent` 命令一样
+    let text = match crate::weather::run(&body.argv).await {
+        Ok(v) => crate::plain::render(&v["data"]),
+        Err(e) => format!("错误：{e:#}"),
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1015,7 +1108,10 @@ async fn mcp_remove(st: &AppState, args: &[String]) -> anyhow::Result<String> {
     let [name] = args else {
         anyhow::bail!("用法：agent mcp remove <名字>");
     };
-    anyhow::ensure!(st.remove_mcp_server(name).await?, "没有叫 {name} 的 MCP 服务");
+    anyhow::ensure!(
+        st.remove_mcp_server(name).await?,
+        "没有叫 {name} 的 MCP 服务"
+    );
     Ok(format!("已删掉 {name}。"))
 }
 
@@ -1079,7 +1175,10 @@ struct SaveMcpBody {
 
 /// `POST /api/mcp/servers` → 加 / 改一个服务，存完试着列一下工具（连得上就回工具数，
 /// 连不上也照样存着，回原因 —— 可能只是这会儿没网）。
-async fn save_mcp_server(State(st): State<Arc<AppState>>, Json(body): Json<SaveMcpBody>) -> Response {
+async fn save_mcp_server(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<SaveMcpBody>,
+) -> Response {
     let old = st.mcp.servers().into_iter().find(|s| s.name == body.name);
     let srv = crate::mcp::Server {
         name: body.name.trim().to_string(),
@@ -1096,7 +1195,11 @@ async fn save_mcp_server(State(st): State<Arc<AppState>>, Json(body): Json<SaveM
         return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
     }
     if let Err(e) = st.put_mcp_server(srv.clone()).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("存不进去：{e:#}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("存不进去：{e:#}"),
+        )
+            .into_response();
     }
     match st.mcp.tools(&srv).await {
         Ok(tools) => Json(json!({ "ok": true, "tools": tools.len() })).into_response(),
@@ -1109,7 +1212,10 @@ struct DeleteMcpBody {
     name: String,
 }
 
-async fn delete_mcp_server(State(st): State<Arc<AppState>>, Json(body): Json<DeleteMcpBody>) -> Response {
+async fn delete_mcp_server(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<DeleteMcpBody>,
+) -> Response {
     match st.remove_mcp_server(&body.name).await {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("删不掉：{e:#}")).into_response(),
@@ -1132,7 +1238,10 @@ async fn set_mcp_enabled(State(st): State<Arc<AppState>>, Json(b): Json<EnabledB
 }
 
 /// `POST /api/skills/enabled` → 启用 / 停用一个 skill（`{name: 目录名, enabled}`）。
-async fn set_skill_enabled(State(st): State<Arc<AppState>>, Json(b): Json<EnabledBody>) -> Response {
+async fn set_skill_enabled(
+    State(st): State<Arc<AppState>>,
+    Json(b): Json<EnabledBody>,
+) -> Response {
     match st.set_skill_enabled(&b.name, b.enabled) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
@@ -3119,6 +3228,64 @@ mod tests {
         (st, root)
     }
 
+    /// 手机系统能力的回包 → 纯文本：数据排成文字；失败写「错误：消息（错误码）」，
+    /// 错误码留着（模型靠它分辨「用户拒了权限」和「参数错了」）。
+    #[test]
+    fn device_replies_render_as_plain_text() {
+        let t = |v: serde_json::Value| crate::http::device_text(&v);
+        assert_eq!(
+            t(serde_json::json!({ "ok": true, "data": { "level": 82, "charging": true } })),
+            "charging: true\nlevel: 82"
+        );
+        assert_eq!(
+            t(
+                serde_json::json!({ "ok": false, "error": { "code": "permission_denied", "message": "用户拒绝了短信权限" } })
+            ),
+            "错误：用户拒绝了短信权限（permission_denied）"
+        );
+        assert_eq!(t(serde_json::json!({ "ok": true, "data": null })), "完成");
+        assert_eq!(
+            t(serde_json::json!({ "ok": true, "data": "用法：agent sms list …" })),
+            "用法：agent sms list …"
+        );
+    }
+
+    /// 浏览器回包渲染成纯文本：正文原样，失败写「错误：」，页面 / 标签信息只在需要时补。
+    #[test]
+    fn browser_replies_render_as_plain_text() {
+        let t = |v: serde_json::Value| crate::http::browser_text(&v);
+        assert_eq!(
+            t(
+                serde_json::json!({ "ok": true, "text": "已打开 https://a.com/\n标题：A", "url": "https://a.com/", "title": "A" })
+            ),
+            "已打开 https://a.com/\n标题：A",
+            "正文里已经有网址就不再补"
+        );
+        assert_eq!(
+            t(
+                serde_json::json!({ "ok": true, "text": "已点击 <a> 登录", "url": "https://a.com/x", "title": "X" })
+            ),
+            "已点击 <a> 登录\n[页面：X — https://a.com/x]"
+        );
+        assert_eq!(
+            t(serde_json::json!({ "ok": false, "text": "找不到元素 #q" })),
+            "错误：找不到元素 #q"
+        );
+        assert_eq!(
+            t(serde_json::json!({ "ok": true, "text": "ok", "tab": 2, "tabs": 3 })),
+            "ok\n[标签 #2，共 3 只]"
+        );
+        assert_eq!(
+            t(serde_json::json!({ "ok": true, "text": "ok", "tab": 1, "tabs": 1 })),
+            "ok",
+            "单标签不啰嗦"
+        );
+        assert_eq!(
+            t(serde_json::json!({ "text": "没有 ok 字段的原样文本" })),
+            "没有 ok 字段的原样文本"
+        );
+    }
+
     /// 用户停用的 MCP 服务，agent 不能靠 `agent mcp add` 重新接一次把它打开（开关是用户的）。
     /// 在连网之前就拒，配置和开关都不动。
     #[tokio::test]
@@ -3135,7 +3302,11 @@ mod tests {
             .unwrap_err();
         assert!(format!("{e:#}").contains("停用"), "{e:#}");
         assert!(!st.mcp.is_enabled("gh"));
-        assert_eq!(st.mcp.servers()[0].url, "https://example.invalid/mcp", "配置不动");
+        assert_eq!(
+            st.mcp.servers()[0].url,
+            "https://example.invalid/mcp",
+            "配置不动"
+        );
     }
 
     /// `agent ps` 的后端：`/api/procs` 跟别的 `/api` 一样要凭据，`?format=text`

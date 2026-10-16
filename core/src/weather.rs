@@ -61,17 +61,31 @@ pub fn parse_args(argv: &[String]) -> anyhow::Result<Args> {
         match a.as_str() {
             "current" | "hourly" | "daily" | "report" => sub = a.clone(),
             "--lat" => {
-                lat = Some(value("--lat")?.parse().map_err(|_| {
-                    anyhow::anyhow!("--lat 要一个数字（十进制度），给的是「{}」", a)
-                })?)
+                let v = value("--lat")?;
+                lat =
+                    Some(v.parse().map_err(|_| {
+                        anyhow::anyhow!("--lat 要一个数字（十进制度），给的是「{v}」")
+                    })?)
             }
             "--lon" => {
-                lon = Some(value("--lon")?.parse().map_err(|_| {
-                    anyhow::anyhow!("--lon 要一个数字（十进制度），给的是「{}」", a)
-                })?)
+                let v = value("--lon")?;
+                lon =
+                    Some(v.parse().map_err(|_| {
+                        anyhow::anyhow!("--lon 要一个数字（十进制度），给的是「{v}」")
+                    })?)
             }
-            "--hours" => hours = value("--hours")?.parse()?,
-            "--days" => days = value("--days")?.parse()?,
+            "--hours" => {
+                let v = value("--hours")?;
+                hours = v
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--hours 要一个正整数，给的是「{v}」"))?
+            }
+            "--days" => {
+                let v = value("--days")?;
+                days = v
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--days 要一个正整数，给的是「{v}」"))?
+            }
             "-h" | "--help" => anyhow::bail!("{USAGE}"),
             other => anyhow::bail!("不认识的参数：{other}\n{USAGE}"),
         }
@@ -230,22 +244,33 @@ fn shape(a: &Args, raw: &Value) -> anyhow::Result<Value> {
     }
 
     if a.sub == "hourly" || a.sub == "report" {
-        data["hourly"] = zip_time(raw, "hourly", &[
-            ("temperature_2m", "temperature_c"),
-            ("precipitation_probability", "precipitation_probability_pct"),
-            ("weather_code", "code"),
-        ])?;
+        data["hourly"] = zip_time(
+            raw,
+            "hourly",
+            &[
+                ("temperature_2m", "temperature_c"),
+                ("precipitation_probability", "precipitation_probability_pct"),
+                ("weather_code", "code"),
+            ],
+        )?;
     }
 
     if a.sub == "daily" || a.sub == "report" {
-        data["daily"] = zip_time(raw, "daily", &[
-            ("weather_code", "code"),
-            ("temperature_2m_max", "high_c"),
-            ("temperature_2m_min", "low_c"),
-            ("precipitation_probability_max", "precipitation_probability_pct"),
-            ("sunrise", "sunrise"),
-            ("sunset", "sunset"),
-        ])?;
+        data["daily"] = zip_time(
+            raw,
+            "daily",
+            &[
+                ("weather_code", "code"),
+                ("temperature_2m_max", "high_c"),
+                ("temperature_2m_min", "low_c"),
+                (
+                    "precipitation_probability_max",
+                    "precipitation_probability_pct",
+                ),
+                ("sunrise", "sunrise"),
+                ("sunset", "sunset"),
+            ],
+        )?;
         // daily 那段补一个中文的天气描述：模型和界面都要用，别让它自己拿 code 去查表
         if let Some(arr) = data["daily"].as_array_mut() {
             for row in arr {
@@ -300,6 +325,21 @@ mod tests {
         parse_args(&s.iter().map(|x| x.to_string()).collect::<Vec<_>>()).unwrap()
     }
 
+    /// 参数值写错时，报错里给的是**那个值**（不是参数名）—— 模型要看见自己写了什么。
+    #[test]
+    fn bad_values_are_quoted_back() {
+        let err = |a: &[&str]| {
+            format!(
+                "{:#}",
+                parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap_err()
+            )
+        };
+        assert!(err(&["--lat", "abc", "--lon", "1"]).contains("「abc」"));
+        assert!(err(&["--lat", "1", "--lon", "东经"]).contains("「东经」"));
+        assert!(err(&["--lat", "1", "--lon", "2", "--days", "x"])
+            .contains("--days 要一个正整数，给的是「x」"));
+    }
+
     #[test]
     fn subcommand_defaults_to_report() {
         let a = args(&["--lat", "31.2", "--lon", "121.4"]);
@@ -311,8 +351,8 @@ mod tests {
     /// 纬度 -90..90、经度 -180..180：写反了要报错，不能"照样查出一个结果"。
     #[test]
     fn coordinates_are_range_checked_and_required() {
-        let e = parse_args(&["--lat".into(), "121".into(), "--lon".into(), "31".into()])
-            .unwrap_err();
+        let e =
+            parse_args(&["--lat".into(), "121".into(), "--lon".into(), "31".into()]).unwrap_err();
         assert!(e.to_string().contains("-90..90"), "{e}");
 
         let e = parse_args(&["--lat".into(), "31".into()]).unwrap_err();
@@ -324,8 +364,14 @@ mod tests {
 
     #[test]
     fn hours_and_days_are_clamped_to_what_the_api_allows() {
-        assert_eq!(args(&["--lat", "1", "--lon", "1", "--hours", "999"]).hours, MAX_HOURS);
-        assert_eq!(args(&["--lat", "1", "--lon", "1", "--days", "99"]).days, MAX_DAYS);
+        assert_eq!(
+            args(&["--lat", "1", "--lon", "1", "--hours", "999"]).hours,
+            MAX_HOURS
+        );
+        assert_eq!(
+            args(&["--lat", "1", "--lon", "1", "--days", "99"]).days,
+            MAX_DAYS
+        );
         assert_eq!(args(&["--lat", "1", "--lon", "1", "--hours", "0"]).hours, 1);
     }
 
@@ -381,7 +427,10 @@ mod tests {
         assert_eq!(out["data"]["current"]["condition"], "阴");
         assert_eq!(out["data"]["current"]["temperature_c"], 8.4);
         assert_eq!(out["data"]["hourly"][1]["temperature_c"], 9.1);
-        assert_eq!(out["data"]["hourly"][1]["precipitation_probability_pct"], 20);
+        assert_eq!(
+            out["data"]["hourly"][1]["precipitation_probability_pct"],
+            20
+        );
         assert_eq!(out["data"]["daily"][0]["condition"], "小雨");
         assert_eq!(out["data"]["daily"][0]["high_c"], 10.0);
         assert_eq!(out["data"]["daily"][0]["sunset"], "2026-02-05T17:29");
@@ -406,7 +455,9 @@ mod tests {
     /// 帮助文本要跟着实际支持的东西走（不然模型照 help 用会撞墙）。
     #[test]
     fn usage_mentions_every_subcommand() {
-        for s in ["current", "hourly", "daily", "report", "--lat", "--lon", "--hours", "--days"] {
+        for s in [
+            "current", "hourly", "daily", "report", "--lat", "--lon", "--hours", "--days",
+        ] {
             assert!(USAGE.contains(s), "用法里少了 {s}");
         }
     }

@@ -14,8 +14,8 @@
 //! 首轮冷启动、上下文窗口占用、以及模型注意力被无关细节稀释。
 
 use agent_core::agent::tools;
-use agent_core::prompt::system_prompt_with;
 use agent_core::platform::Platform;
+use agent_core::prompt::system_prompt_with;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,7 +45,11 @@ fn main() {
     };
 
     let mut plain_chars = prompt.chars().count();
-    let shape = if phone { "手机形态" } else { "无设备能力" };
+    let shape = if phone {
+        "手机形态"
+    } else {
+        "无设备能力"
+    };
     println!(
         "=== SYSTEM_PROMPT · {} 字符（其中汉字 {}）· {shape} ===\n{prompt}\n",
         plain_chars,

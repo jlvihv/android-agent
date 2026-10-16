@@ -310,9 +310,10 @@ impl ExecResult {
         }
         if self.timed_out {
             // 说清「上面是半截的」，否则模型会当成完整输出，再按它推理
-            out.push(timeout_note.unwrap_or_else(|| {
-                "[超时，已终止：上面是到被终止为止的输出，可能不全]".into()
-            }));
+            out.push(
+                timeout_note
+                    .unwrap_or_else(|| "[超时，已终止：上面是到被终止为止的输出，可能不全]".into()),
+            );
         } else if let Some(sig) = self.signal {
             out.push(format!("[被信号 {sig} 终止：{}]", signal_hint(sig)));
         }
@@ -1617,9 +1618,15 @@ impl LinuxSandbox {
     fn install_builtin_skills(&self) {
         let (host, guest) = self.skills_dir();
         let dir = host.join(crate::skills::CREATE_SKILL);
-        let r = std::fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| {
-            write_if_changed(&dir.join("SKILL.md"), &crate::skills::create_skill_md(&guest), false)
-        });
+        let r = std::fs::create_dir_all(&dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| {
+                write_if_changed(
+                    &dir.join("SKILL.md"),
+                    &crate::skills::create_skill_md(&guest),
+                    false,
+                )
+            });
         if let Err(e) = r {
             tracing::warn!("内置 skill 没写进去（{}）：{e:#}", dir.display());
         }
@@ -2247,7 +2254,10 @@ impl LinuxSandbox {
     /// - 沙箱没挂 workspace（安卓上没给「所有文件访问权限」）：会话目录建不出来。
     pub fn session_host_dir(&self, sid: &str) -> Option<PathBuf> {
         match &self.mode {
-            Mode::Proot(cfg) => cfg.workspace.as_ref().map(|w| w.join(session_dir_name(sid))),
+            Mode::Proot(cfg) => cfg
+                .workspace
+                .as_ref()
+                .map(|w| w.join(session_dir_name(sid))),
             Mode::Host { .. } => None,
         }
     }
@@ -3028,7 +3038,9 @@ mod tests {
     fn command_line_runs_the_command_in_its_own_process_group() {
         let t = TempRoot::new("setsid");
         std::fs::write(t.dir.join("bin/setsid"), b"").unwrap();
-        let argv = t.sandbox().command_line("echo hi", "/.agent-exit/x", WORKSPACE);
+        let argv = t
+            .sandbox()
+            .command_line("echo hi", "/.agent-exit/x", WORKSPACE);
         let setsid_at = argv
             .iter()
             .position(|a| a == "/bin/setsid")
@@ -3057,7 +3069,9 @@ mod tests {
     #[test]
     fn command_line_degrades_without_setsid() {
         let t = TempRoot::new("nosetsid");
-        let argv = t.sandbox().command_line("true", "/.agent-exit/x", WORKSPACE);
+        let argv = t
+            .sandbox()
+            .command_line("true", "/.agent-exit/x", WORKSPACE);
         assert!(!argv.iter().any(|a| a.ends_with("setsid")), "{argv:?}");
         let runner = argv.iter().find(|a| a.contains("rc=$?")).unwrap();
         assert!(
@@ -3086,12 +3100,14 @@ mod tests {
             argv[i + 1].clone()
         };
         assert!(
-            runner_of(sb.command_line("true", "/.agent-exit/x", WORKSPACE)).starts_with("/bin/sh -c"),
+            runner_of(sb.command_line("true", "/.agent-exit/x", WORKSPACE))
+                .starts_with("/bin/sh -c"),
             "没装就退回 ash"
         );
         std::fs::write(t.dir.join("bin/bash"), b"").unwrap();
         assert!(
-            runner_of(sb.command_line("true", "/.agent-exit/x", WORKSPACE)).starts_with("/bin/bash -c"),
+            runner_of(sb.command_line("true", "/.agent-exit/x", WORKSPACE))
+                .starts_with("/bin/bash -c"),
             "装了就该用 bash，不然模型写的 bash 语法白写"
         );
     }
@@ -3297,7 +3313,9 @@ mod tests {
         std::fs::create_dir_all(t.dir.join("usr/bin")).unwrap();
         std::os::unix::fs::symlink("/bin/busybox", t.dir.join("usr/bin/setsid")).unwrap();
 
-        let argv = t.sandbox().command_line("true", "/.agent-exit/x", WORKSPACE);
+        let argv = t
+            .sandbox()
+            .command_line("true", "/.agent-exit/x", WORKSPACE);
         assert!(
             argv.iter().any(|a| a == "/usr/bin/setsid"),
             "绝对符号链接也算在：{argv:?}"
@@ -4461,7 +4479,9 @@ mod tests {
         for bad in ['i', 'l', 'o', '0', '1'] {
             assert!(!n.contains(bad), "别用容易看混的字符：{n}");
         }
-        assert!(n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(n
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
 
         // 真会话 id 是 uuid（前 8 位是时间戳，彼此很像）—— 这种输入最容易撞
         let mut seen = std::collections::HashSet::new();
@@ -4475,7 +4495,11 @@ mod tests {
     fn session_dir_is_under_the_workspace() {
         let sid = "0199e1f0-aaaa-7000-8000-000000000001";
         let guest = session_guest_dir(sid);
-        assert_eq!(guest, format!("/workspace/{}", session_dir_name(sid)), "{guest}");
+        assert_eq!(
+            guest,
+            format!("/workspace/{}", session_dir_name(sid)),
+            "{guest}"
+        );
     }
 
     /// 宿主模式（电脑上）**不分会话目录**：`pwd` 就是 workspace，文件落在它下面，
@@ -4521,9 +4545,15 @@ mod tests {
             panic!("t.sandbox() 应该是 proot")
         };
         cfg.workspace = None;
-        assert_eq!(sb.session_cwd(Some(sid)), WORKSPACE, "没挂 workspace 就退回根");
+        assert_eq!(
+            sb.session_cwd(Some(sid)),
+            WORKSPACE,
+            "没挂 workspace 就退回根"
+        );
 
-        let Mode::Proot(cfg) = &mut sb.mode else { unreachable!() };
+        let Mode::Proot(cfg) = &mut sb.mode else {
+            unreachable!()
+        };
         cfg.workspace = Some(t.dir.join("ws"));
         assert_eq!(sb.session_cwd(Some(sid)), session_guest_dir(sid));
         assert_eq!(sb.session_cwd(None), WORKSPACE);
