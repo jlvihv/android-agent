@@ -30,6 +30,7 @@ pub mod desktop;
 pub mod editor;
 pub mod ffi;
 pub mod gc;
+pub mod html;
 pub mod http;
 pub mod imaging;
 pub mod linux;
@@ -44,6 +45,7 @@ pub mod plain;
 pub mod platform;
 pub mod prompt;
 pub mod providers;
+pub mod readable;
 pub mod reader;
 #[cfg(not(target_os = "android"))]
 pub mod remote;

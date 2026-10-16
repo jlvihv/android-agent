@@ -115,6 +115,14 @@ fn subcommands() -> Vec<Sub> {
             SEARCH_BODY,
         ),
         sub(
+            "readable",
+            ALL,
+            "`agent readable [文件]`（从 HTML 里抽文章正文：`curl -sL <url> | agent readable`）",
+            "  agent readable [文件]               从 HTML 里抽文章正文（纯文本）；不给文件就读标准输入：\n\
+             \x20   curl -sL <url> | agent readable   （不联网；JS 渲染的页面用 agent browser get_readable）",
+            READABLE_BODY,
+        ),
+        sub(
             "weather",
             ALL,
             "",
@@ -528,6 +536,34 @@ const SEARCH_BODY: &str = r##"    shift || true
     fi
     post /api/websearch "$body""##;
 
+// 请求体就是 HTML 原文（不包 JSON：几 MB 的页面转义一遍既慢又容易出错）。
+// curl 的 `@-` / wget 的 `--post-file` 都是直接把文件流过去，不经过 shell 变量。
+const READABLE_BODY: &str = r##"    shift || true
+    case "${1:-}" in
+      -h|--help) echo "用法：agent readable [文件]（不给文件就读标准输入，比如 curl -sL <url> | agent readable）"; exit 0 ;;
+    esac
+    [ $# -le 1 ] || { echo "用法：agent readable [文件]（一次一个）" >&2; exit 2; }
+    src="${1:--}"
+    if [ "$src" = - ]; then
+      if [ -t 0 ]; then
+        echo "用法：agent readable [文件]（没给文件，标准输入也不是管道 —— 比如 curl -sL <url> | agent readable）" >&2
+        exit 2
+      fi
+    elif [ ! -r "$src" ]; then
+      echo "agent readable：读不到文件 ${src}" >&2
+      exit 2
+    fi
+    guard /api/readable
+    if command -v curl >/dev/null 2>&1; then
+      out=$(curl -sS -m 120 -H "$AUTH" -H 'content-type: text/html' --data-binary "@$src" "$BASE/api/readable") \
+        || { echo "POST /api/readable 失败" >&2; exit 1; }
+    else
+      [ "$src" = - ] && src=/dev/stdin
+      out=$(wget -q -T 120 -O - --header "$AUTH" --header 'content-type: text/html' --post-file "$src" "$BASE/api/readable") \
+        || { echo "POST /api/readable 失败" >&2; exit 1; }
+    fi
+    say "$out""##;
+
 const WEATHER_BODY: &str = r##"    shift || true
     say "$(post /api/weather "{\"argv\":$(json_args "$@")}")""##;
 
@@ -664,6 +700,7 @@ mod tests {
                 "agent browser",
                 "agent search",
                 "agent weather",
+                "agent readable",
                 "agent open",
                 "agent mcp",
                 "agent debug",
@@ -723,6 +760,8 @@ mod tests {
             &["launch"],
             &["kill", "abc"],
             &["debug"],
+            &["readable", "a.html", "b.html"],
+            &["readable", "/没有这个文件.html"],
         ];
         for args in bad {
             let (code, _, err) = run(Machine::Phone, args);
@@ -799,6 +838,13 @@ mod tests {
             assert!(
                 prompt.contains("`agent search <检索意图> [条数]`"),
                 "{prompt}"
+            );
+            // 抽正文紧跟在搜索后面：搜到链接 → curl | agent readable 读全文，是一条路
+            let search = prompt.find("`agent search").unwrap();
+            let readable = prompt.find("`agent readable [文件]`").expect(&prompt);
+            assert!(
+                search < readable && !prompt[search..readable].contains("`agent open"),
+                "{m:?}：readable 该紧跟在 search 后面：{prompt}"
             );
         }
     }

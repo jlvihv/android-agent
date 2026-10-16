@@ -37,6 +37,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alpine/upgrade", post(alpine_upgrade))
         .route("/api/browser", post(browser_action))
         .route("/api/weather", post(weather_run))
+        // HTML → 正文（`agent readable`）。请求体就是 HTML 本身，不包 JSON
+        .route("/api/readable", post(readable_run))
         .route("/api/mcp", post(mcp_run))
         .route("/api/mcp/servers", get(mcp_servers).post(save_mcp_server))
         .route("/api/mcp/servers/delete", post(delete_mcp_server))
@@ -1050,6 +1052,32 @@ async fn weather_run(Json(body): Json<WeatherBody>) -> Response {
     let text = match crate::weather::run(&body.argv).await {
         Ok(v) => crate::plain::render(&v["data"]),
         Err(e) => format!("错误：{e:#}"),
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+}
+
+/// `agent readable` 一次最多收多大的 HTML。正常文章页几百 KB，带内联脚本的大站
+/// 也就几 MB；再大多半是喂错了东西（视频、压缩包），别全读进手机内存。
+const READABLE_MAX: usize = 16 * 1024 * 1024;
+
+/// `POST /api/readable` → 正文（请求体是 HTML 原文，回纯文本，出错以「错误：」开头）。
+///
+/// 用 `Body` 自己读而不是 `Bytes` 提取器：后者超过 axum 默认的 2MB 会回一句英文的
+/// 413，CLI 认不出那是错误。
+async fn readable_run(body: axum::body::Body) -> Response {
+    let text = match axum::body::to_bytes(body, READABLE_MAX).await {
+        Err(_) => format!(
+            "错误：HTML 超过 {}，不像一个网页",
+            crate::reader::fmt_size(READABLE_MAX)
+        ),
+        // 解析 + 打分是纯 CPU 活，大页面要几十毫秒：别占着 async 线程
+        Ok(b) => {
+            match tokio::task::spawn_blocking(move || crate::readable::extract_bytes(&b)).await {
+                Ok(Ok(a)) => crate::readable::render(&a),
+                Ok(Err(e)) => format!("错误：{e:#}"),
+                Err(e) => format!("错误：{e}"),
+            }
+        }
     };
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
 }
@@ -3443,6 +3471,76 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert!(v["leftovers"].as_array().unwrap().is_empty());
         assert!(v["running"].as_array().unwrap().is_empty());
+    }
+
+    /// `agent readable` 从头到尾走一遍：生成的脚本 → curl → `/api/readable` → 正文。
+    /// 页面故意做到 2MB 以上（axum 默认的请求体上限），大页面也得收得下；
+    /// 不是 UTF-8 的以「错误：」回来，脚本据此非 0 退出。
+    #[tokio::test]
+    async fn agent_readable_pipes_html_through_the_core() {
+        let st = crate::state::AppState::new();
+        st.set_token(Some("s3cret".into()));
+        let (base, _) = serve(st).await;
+        let dir = std::env::temp_dir().join(format!("agent-readable-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("agent");
+        std::fs::write(&script, crate::cli::script(crate::cli::Machine::Host)).unwrap();
+
+        let para =
+            "这是正文里的一段话，长到足够让 Readability 认出这里才是文章，逗号也够多，打分才高。";
+        let filler = format!(
+            "<script>var x = '{}';</script>",
+            "x".repeat(3 * 1024 * 1024)
+        );
+        let html = format!(
+            "<html><head><title>大页面</title>{filler}</head><body><nav>首页 关于</nav>\
+             <article><p>{para}</p><p>{para}第二段。</p><p>{para}第三段。</p></article></body></html>"
+        );
+        let run = |input: Vec<u8>| {
+            let script = script.clone();
+            let base = base.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    let mut child = std::process::Command::new("sh")
+                        .arg(&script)
+                        .arg("readable")
+                        .env("AGENT_BASE", &base)
+                        .env("AGENT_TOKEN", "s3cret")
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(&input).unwrap();
+                    child.wait_with_output().unwrap()
+                })
+                .await
+                .unwrap()
+            }
+        };
+
+        let out = run(html.into_bytes()).await;
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.starts_with("大页面\n\n"), "{text}");
+        assert!(
+            text.contains("第三段。") && !text.contains("首页"),
+            "{text}"
+        );
+
+        let out = run(b"<meta charset=gbk>\xd6\xd0\xce\xc4".to_vec()).await;
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{text}");
+        assert!(
+            text.starts_with("错误：") && text.contains("iconv"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 两个源分开：`sandbox.localhost` 上只有沙箱文件，而且不关进 opaque origin

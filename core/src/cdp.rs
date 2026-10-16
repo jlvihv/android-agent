@@ -435,18 +435,25 @@ impl CdpBrowser {
                 if let Some(e) = err_of(&out) {
                     return Err(e);
                 }
-                let mut text = out
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                // 和手机那边（`BrowserController.getReadable`）一字不差：同一个动作，
+                // 模型在两种机器上看到的该是同一个样子
+                let s = |k: &str| out.get(k).and_then(|v| v.as_str()).unwrap_or("");
+                let mut text = s("text").to_string();
                 if text.chars().count() > TEXT_MAX_CHARS {
-                    text = clip(&text, TEXT_MAX_CHARS);
+                    text = text.chars().take(TEXT_MAX_CHARS).collect::<String>() + "\n…（已截断）";
                 }
-                let src = out.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                let title = out.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let chars = out.get("length").and_then(|v| v.as_u64()).unwrap_or(0);
+                let title = s("title");
+                let title = if title.is_empty() {
+                    String::new()
+                } else {
+                    format!("：【{title}】")
+                };
                 Ok(ok(
-                    &format!("正文（{src}）：\n{title}\n\n{text}"),
+                    &format!(
+                        "正文{title}（原文 {chars} 字，来源 {}）\n{text}",
+                        s("source")
+                    ),
                     None,
                     None,
                 ))

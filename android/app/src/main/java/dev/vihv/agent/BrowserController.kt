@@ -900,8 +900,9 @@ class BrowserController(private val app: Application) : BrowserHost {
         val out = evalToJson(readableJs()) ?: return errObj("抽正文失败")
         out.optString("error").takeIf { it.isNotEmpty() }?.let { return errObj(it) }
 
+        // 和电脑那边（cdp.rs 的 get_readable）一字不差：同一个动作，模型在两种机器上
+        // 看到的该是同一个样子
         val title = out.optString("title")
-        val desc = out.optString("description")
         var text = out.optString("text")
         val chars = out.optInt("length")
         if (text.length > TEXT_MAX_CHARS) {
@@ -910,9 +911,7 @@ class BrowserController(private val app: Application) : BrowserHost {
         val head = buildString {
             append("正文")
             if (title.isNotEmpty()) append("：【$title】")
-            append("（原文 $chars 字，来源 ${out.optString("source")}")
-            append(if (desc.isNotEmpty()) "；描述：${desc.take(160)}" else "")
-            append("）")
+            append("（原文 $chars 字，来源 ${out.optString("source")}）")
         }
         return ok("$head\n$text")
     }
