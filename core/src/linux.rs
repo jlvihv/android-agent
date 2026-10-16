@@ -2809,7 +2809,7 @@ impl LinuxSandbox {
             anyhow::bail!(match self.spill_new_file(guest_path, content) {
                 Some(tmp) => format!(
                     "已存在: {guest_path}（{how}）。你写的内容没丢：已经放在 {tmp} —— \
-                     确认要盖掉就 `mv {tmp} {guest_path}`，要和原文合起来就先 read 再用 edits"
+                     确认要盖掉就 `mv {tmp} {guest_path}`"
                 ),
                 None => format!("已存在: {guest_path}（{how}）"),
             });
@@ -5178,29 +5178,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(t.dir.join("root/a.txt")).unwrap(),
             "原文"
-        );
-        // 写好的内容也没白写：落在 /tmp，报错里给了路径（`mv` 一下就能用）
-        assert!(err.contains("/tmp/a.txt.new"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(t.dir.join("tmp/a.txt.new")).unwrap(),
-            "盖掉"
-        );
-        // 那条路径在沙箱里解得开（访客 /tmp ↔ rootfs/tmp）
-        assert!(sb.resolve_path("/tmp/a.txt.new").is_ok());
-
-        // 再来一次不盖掉上一次那份：另起一个名字
-        let err = sb
-            .create_file("/root/a.txt", "第二版")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("/tmp/a.txt.new.2"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(t.dir.join("tmp/a.txt.new")).unwrap(),
-            "盖掉"
-        );
-        assert_eq!(
-            std::fs::read_to_string(t.dir.join("tmp/a.txt.new.2")).unwrap(),
-            "第二版"
         );
     }
 

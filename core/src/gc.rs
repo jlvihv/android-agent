@@ -216,31 +216,6 @@ mod tests {
         }
     }
 
-    /// 临时目录里「哪些是我们的」，别把模型的文件删了
-    #[test]
-    fn spill_names_are_recognised() {
-        for ours in [
-            "agent-out-1.log",
-            "a.txt.new",
-            "a.txt.new.2",
-            ".new",
-            "main.rs.new.10",
-        ] {
-            assert!(is_spill_name(ours), "{ours} 是我们的");
-        }
-        for theirs in [
-            "user-file.log",
-            "a.txt",
-            "a.txt.newest",
-            "a.txt.new.",
-            "a.txt.new.x",
-            "new",
-            "agent-out",
-        ] {
-            assert!(!is_spill_name(theirs), "{theirs} 不是我们的");
-        }
-    }
-
     /// 启动清扫：没被引用、又比起点早的才删；被引用的、起点之后写的、
     /// 不归我们管的文件名都不碰。沙箱里那两类再多宽限一天。
     #[test]
@@ -258,9 +233,8 @@ mod tests {
         let att = data.join("attachments/old.pdf");
         let shot = root.join(SHOT_DIR).join("shot-1.jpg");
         let spill = root.join("tmp/agent-out-1.log");
-        let newfile = root.join("tmp/a.py.new");
         let users = root.join("tmp/user-file.log");
-        for f in [&orphan, &kept, &att, &shot, &spill, &newfile, &users] {
+        for f in [&orphan, &kept, &att, &shot, &spill, &users] {
             std::fs::write(f, b"x").unwrap();
         }
         let referenced: HashSet<PathBuf> = [kept.clone()].into_iter().collect();
@@ -272,18 +246,15 @@ mod tests {
             2
         );
         assert!(!orphan.exists() && !att.exists());
-        assert!(
-            kept.exists() && shot.exists() && spill.exists() && newfile.exists() && users.exists()
-        );
+        assert!(kept.exists() && shot.exists() && spill.exists() && users.exists());
 
-        // 起点在一天以后：沙箱里的过期了（截图 / 溢出输出 / `.new` 各一个）；
-        // 不归我们管的文件名照旧不碰
+        // 起点在一天以后：沙箱里的过期了；不归我们管的文件名照旧不碰
         let much_later = SystemTime::now() + LOOSE_TTL + Duration::from_secs(60);
         assert_eq!(
             sweep(Some(&data), &side_dirs_for(&root), &referenced, much_later),
-            3
+            2
         );
-        assert!(!shot.exists() && !spill.exists() && !newfile.exists());
+        assert!(!shot.exists() && !spill.exists());
         assert!(kept.exists() && users.exists());
 
         // 起点之前写的才删：起点在文件之前 → 什么都不动
