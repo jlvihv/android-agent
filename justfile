@@ -390,6 +390,14 @@ android-install: android-debug
 # 原生核心两者都是 release（android-libs 里的 `--release`），区别只在
 # Kotlin/dex 那层和签名。
 #
+# 装上去报 INSTALL_FAILED_UPDATE_INCOMPATIBLE（签名对不上）时**别卸载** —— 那会丢
+# 会话库和 rootfs。手机上的包可能是另一台机器的 debug keystore 签的，找出那把 key
+# 带上即可覆盖装：
+#
+#   AGENT_KEYSTORE=~/Downloads/debug.keystore just android-install-release
+#
+# 怎么认指纹见 docs/07-debugging.md §4。
+#
 # assemble 前同样删一遍（理由见 android-debug 上面那段）。
 android-release: android-bindings web-build android-libs
     #!/usr/bin/env bash

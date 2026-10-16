@@ -235,6 +235,40 @@ just phone -- --session <会话 id> "…"    # 写进指定的那条
 （改工具描述要重装 —— 工具表是编译进去的，但它和系统提示词一样属于「可缓存
 前缀」，改完先用 `/request` 确认序列化没变样，见 §6。）
 
+### 装 release 包：签名对不上，就换同一把 key（别急着卸载）
+
+`just android-install-release` = release APK（R8 混淆，原生核心也一直是 release；
+两者只是 Kotlin/dex 那层和签名的区别）。
+
+手机上那个包如果是**另一台机器**的 debug keystore 签的（都叫 `CN=Android Debug`，
+指纹不同），`install -r` 会报：
+
+```
+INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package dev.vihv.agent signatures do not
+match newer version; ignoring!
+```
+
+Android 不允许换签名覆盖安装，但**先别 `uninstall`**（会话库和 rootfs 都会没）。先把
+手机上那个包用的证书指纹拉出来，再用同一把 key 重签：
+
+```sh
+p=$(adb shell pm path dev.vihv.agent | tr -d '\r' | sed 's/^package://')
+adb exec-out run-as dev.vihv.agent cat "$p" > /tmp/installed.apk   # 只有 debug 包能这么读
+~/Library/Android/sdk/build-tools/*/apksigner verify --print-certs /tmp/installed.apk \
+  | grep 'SHA-256'                       # 或者 keytool -list -v -keystore <k> -storepass android
+
+AGENT_KEYSTORE=~/Downloads/debug.keystore just android-install-release
+```
+
+`AGENT_KEYSTORE` 会当成 signingConfig（debug / release 都认，见
+`android/app/build.gradle.kts`），口令和别名沿用 debug 那套（`android` /
+`androiddebugkey`），不同的话用 `AGENT_KEYSTORE_PASS` / `AGENT_KEY_ALIAS` /
+`AGENT_KEY_PASS`。release 包被覆盖装完 `flags` 里就没有 `DEBUGGABLE` 了。
+
+实在找不到那把 key（指纹对不上任何一把）才走 `scripts/phone-reinstall.sh`：它先备份
+`sessions.db` / `llm.json`，卸了重装再放回去，顺带把「所有文件访问」授回去 —— 代价是
+rootfs 重解、agent 写在 `/root` 里的东西没了（`/sdcard/Agent` 不受影响）。
+
 ---
 
 ## 5. `/api/debug/*`：为了「看一眼现在什么情况」
