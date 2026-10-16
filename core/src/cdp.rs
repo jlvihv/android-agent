@@ -199,15 +199,27 @@ struct Inner {
     endpoint: String,
     tabs: Vec<Tab>,
     current: usize,
-    next_id: i32,
     profile: Profile,
     /// 最后一次有动作的时候（判断整个浏览器空闲了多久）
     last_action: Instant,
-    /// 空闲太久被自动关掉的标签编号：模型再用它时说清楚是怎么没的
+    /// 空闲太久被自动关掉、模型还不知道的标签编号：再用它时说清楚是怎么没的，而且在它
+    /// 下一次 `list_tabs` 之前**不重用**（见 `alloc_id`）
     reaped: Vec<i32>,
 }
 
 impl Inner {
+    /// 新标签的编号：**最小的空号**。同时开着的几只就是 1..N，`--tab 2` 就是第 2 只
+    /// （以前只增不减，反复开关几轮就成了 31 / 35 / 43，模型照直觉写 `--tab 2` 就落空）。
+    ///
+    /// 重用的风险是模型还记着一个关掉的编号、下一步悄悄落到新开的那只上。模型自己
+    /// `close_tab` 的它知道，可以马上重用；被空闲回收的它不知道 —— 那些号留到它下一次
+    /// `list_tabs` 看过之后再放出来，在那之前用它报的是「空闲太久，已自动关掉」。
+    fn alloc_id(&self) -> i32 {
+        (1..)
+            .find(|n| !self.tabs.iter().any(|t| t.id == *n) && !self.reaped.contains(n))
+            .expect("编号用不完")
+    }
+
     fn new(endpoint: String) -> Self {
         Self {
             conn: None,
@@ -215,7 +227,6 @@ impl Inner {
             endpoint,
             tabs: Vec::new(),
             current: 0,
-            next_id: 1,
             profile: Profile::Desktop,
             last_action: Instant::now(),
             reaped: Vec::new(),
@@ -226,7 +237,7 @@ impl Inner {
 /// 地址和标题**不缓存**：点链接、提交表单、跑 JS 都会让页面跳走，记下来的那份很快就
 /// 过期了（`list_tabs` 曾经报着一个早就离开的地址）。要的时候问 Chrome（见 `live_pages`）。
 struct Tab {
-    /// 模型看到的编号（1 起，不随关闭重排 —— `switch_tab` / `--tab` 用的是它）
+    /// 模型看到的编号（1 起，最小的空号，不随关闭重排 —— `switch_tab` / `--tab` 用的是它）
     id: i32,
     target: String,
     page: Arc<Mutex<Page>>,
@@ -833,6 +844,8 @@ impl CdpBrowser {
     fn tab_table(&self, g: &mut Inner, name: &str, a: &Value) -> Result<Value, String> {
         match name {
             "list_tabs" => {
+                // 模型看过现在有哪些了：被空闲回收的那些号可以重用了（见 `alloc_id`）
+                g.reaped.clear();
                 let live = if g.tabs.is_empty() {
                     Default::default()
                 } else {
@@ -1029,8 +1042,7 @@ impl CdpBrowser {
                 return Err(e);
             }
         };
-        let id = g.next_id;
-        g.next_id += 1;
+        let id = g.alloc_id();
         let page = Arc::new(Mutex::new(page));
         g.tabs.push(Tab {
             id,
@@ -2121,6 +2133,18 @@ mod tests {
             v["text"].as_str().unwrap().contains("自动关掉"),
             "说清楚是怎么没的：{v}"
         );
+
+        // 编号：最小的空号。被回收的 1 号在模型 list_tabs 之前不重用（它还记着「标签 1」）
+        assert_eq!(act(json!({"action": "new_tab"}))["opened"], 4);
+        assert_eq!(act(json!({"action": "list_tabs"}))["ok"], true);
+        assert_eq!(
+            act(json!({"action": "new_tab"}))["opened"],
+            1,
+            "看过列表了：1 号放出来"
+        );
+        // 自己关掉的号马上就能重用（是它自己关的，它知道）
+        assert_eq!(act(json!({"action": "close_tab", "tab": 3}))["ok"], true);
+        assert_eq!(act(json!({"action": "new_tab"}))["opened"], 3);
 
         // 标签关光 + 浏览器空闲够久：Chrome 也关
         while act(json!({"action": "close_tab"}))["ok"] == true {}

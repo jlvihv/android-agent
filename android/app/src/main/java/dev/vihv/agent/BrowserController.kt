@@ -119,7 +119,7 @@ class BrowserController(private val app: Application) : BrowserHost {
 
     private val main = Handler(Looper.getMainLooper())
 
-    /** 空闲太久被自动关掉的标签编号：模型再用它时说清楚是怎么没的 */
+    /** 空闲太久被自动关掉、模型还不知道的标签编号：再用它时说清楚是怎么没的，在它下一次 list_tabs 之前不重用 */
     private val reaped = java.util.concurrent.CopyOnWriteArrayList<Int>()
 
     /** 每 [SWEEP_MS] 查一次空闲标签（App 活着就一直转；在主线程上跑） */
@@ -209,8 +209,20 @@ class BrowserController(private val app: Application) : BrowserHost {
     /** 主线程独占：当前标签在 [tabs] 里的下标 */
     private var currentIdx = 0
 
-    /** 标签 id 只增不重用 —— 模型提到"标签 2"时不会指向另一只页 */
-    private var nextTabId = 1
+    /**
+     * 新标签的编号：**最小的空号**（和电脑那边 `cdp.rs` 的 `alloc_id` 同一个规则）。
+     * 同时开着的几只就是 1..N，`--tab 2` 就是第 2 只 —— 以前只增不减，反复开关几轮就成了
+     * 31 / 35 / 43，模型照直觉写 `--tab 2` 就落空。
+     *
+     * 被空闲回收、模型还不知道的号（[reaped]）留到它下一次 list_tabs 之后再重用：不然它
+     * 记着的「标签 3」会悄悄落到新开的那只上。模型自己 close_tab 的它知道，马上可以重用。
+     * **主线程调**。
+     */
+    private fun allocTabId(): Int {
+        var n = 1
+        while (tabs.any { it.id == n } || n in reaped) n++
+        return n
+    }
 
     /**
      * 当前动作操作的那只 WebView。
@@ -683,7 +695,7 @@ class BrowserController(private val app: Application) : BrowserHost {
      */
     private fun createTab(url: String?): Tab {
         val v = WebView(app)
-        val tab = Tab(nextTabId++, v)
+        val tab = Tab(allocTabId(), v)
         configureWebView(v, tab)
         if (!url.isNullOrEmpty()) v.loadUrl(url)
         return tab
@@ -1008,6 +1020,8 @@ class BrowserController(private val app: Application) : BrowserHost {
 
     /** 列出所有标签（只回数据，文字在核心里排）。多标签时模型靠它记账 */
     private fun listTabs(): JSONObject {
+        // 模型看过现在有哪些了：被空闲回收的那些号可以重用了（见 [allocTabId]）
+        reaped.clear()
         val list = onMain {
             val cur = curTab()?.id
             JSONArray().apply {
