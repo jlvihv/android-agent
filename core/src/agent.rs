@@ -1284,6 +1284,9 @@ struct StepOutput {
     calls: Vec<RecordedToolCall>,
     /// 流到一半用户按了停止。已经流出来的正文/思考照样进历史，工具调用作废。
     aborted: bool,
+    /// 流出过内容之后连接断了（`Some(原因)`）。和 `aborted` 一样：已经流出来的进历史、
+    /// 没写完的工具调用作废 —— 但回合不结束，`drive` 退避后接着下一步。
+    interrupted: Option<String>,
 }
 
 impl StepOutput {
@@ -1295,6 +1298,7 @@ impl StepOutput {
             reasoning_items: Vec::new(),
             calls: Vec::new(),
             aborted: true,
+            interrupted: None,
         }
     }
 }
@@ -1324,6 +1328,9 @@ async fn drive(
     //
     // `step_no` 只为一件事存在：**第一轮不取队列**（见下面 `deliver_queued`）。
     let mut step_no = 0usize;
+    // 连着几步都是流到一半断掉的（见 `StepOutput::interrupted`）。正常走完一步就清零；
+    // 连着断满 `RETRY_DELAYS` 那么多次就不再接着跑了 —— 多半不是偶发的网络抖动
+    let mut interrupts = 0usize;
     loop {
         if turn.abort_requested() {
             send(tx, sse::abort("已停止")).await;
@@ -1381,6 +1388,24 @@ async fn drive(
             send(tx, sse::finish()).await;
             return Ok(());
         }
+
+        // 流到一半断了：已经流出来的上面进了历史，退避后接着下一步 —— 模型看得到自己
+        // 说到哪了，从那接着做（界面上只是多出新的，不会有两份）
+        if let Some(why) = step.interrupted {
+            if interrupts >= RETRY_DELAYS.len() {
+                send(tx, sse::error(&why)).await;
+                send(tx, sse::finish()).await;
+                anyhow::bail!("{why}");
+            }
+            if !backoff(tx, turn, interrupts, &why, Retry::Continue).await {
+                send(tx, sse::abort("已停止")).await;
+                send(tx, sse::finish()).await;
+                return Ok(());
+            }
+            interrupts += 1;
+            continue;
+        }
+        interrupts = 0;
 
         let calls = step.calls;
         if calls.is_empty() {
@@ -1845,7 +1870,7 @@ async fn stream_one(
         let mut rx = match opened {
             Ok(rx) => rx,
             Err(e) if e.is_transient() && attempt < RETRY_DELAYS.len() => {
-                if !backoff(tx, turn, attempt, &format!("{e:#}")).await {
+                if !backoff(tx, turn, attempt, &format!("{e:#}"), Retry::Again).await {
                     return Ok(StepOutput::aborted());
                 }
                 attempt += 1;
@@ -1870,6 +1895,8 @@ async fn stream_one(
         let mut reasoning_items: Vec<Value> = Vec::new();
         // 往前端流出过内容没有（决定流断了还能不能重来）
         let mut emitted = false;
+        // 流出过内容之后断了：原因（见 `StepOutput::interrupted`）
+        let mut interrupted: Option<String> = None;
 
         let mut aborted = false;
         loop {
@@ -1889,11 +1916,18 @@ async fn stream_one(
                 // 流在出任何内容之前就断了（连上之后网络掉了、网关掐了连接）：
                 // 跟连不上一样，重来
                 Err(e) if !emitted && attempt < RETRY_DELAYS.len() => {
-                    if !backoff(tx, turn, attempt, &format!("{e:#}")).await {
+                    if !backoff(tx, turn, attempt, &format!("{e:#}"), Retry::Again).await {
                         return Ok(StepOutput::aborted());
                     }
                     attempt += 1;
                     continue 'attempt;
+                }
+                // 已经流出过内容才断（网关掐了长连接，实测：`peer closed connection
+                // without sending TLS close_notify`）：整步重来的话界面上就是两份。
+                // 流出来的留着、没写完的工具调用作废，交给 `drive` 接着下一步
+                Err(e) if emitted => {
+                    interrupted = Some(format!("{e:#}"));
+                    break;
                 }
                 Err(e) => return Err(e),
             };
@@ -2057,6 +2091,7 @@ async fn stream_one(
                 reasoning_items,
                 calls: Vec::new(),
                 aborted: true,
+                interrupted: None,
             });
         }
 
@@ -2078,6 +2113,19 @@ async fn stream_one(
             calls.clear();
         }
 
+        // 连接断在半路：工具调用的参数多半是半截 JSON，一个都不能执行（同上）。
+        // 已经在界面上露头的告诉前端作废了；`drive` 下一步会让模型重新来
+        if interrupted.is_some() {
+            for c in &calls {
+                send(
+                    tx,
+                    tool_output_event(&c.id, "错误：连接中断，这个工具调用没写完，已作废", &[]),
+                )
+                .await;
+            }
+            calls.clear();
+        }
+
         for c in &calls {
             let input: Value = serde_json::from_str(&c.arguments).unwrap_or(json!({}));
             send(tx, sse::tool_input_available(&c.id, &c.name, input)).await;
@@ -2089,6 +2137,7 @@ async fn stream_one(
             reasoning_items,
             calls,
             aborted: false,
+            interrupted,
         });
     }
 }
@@ -2101,6 +2150,15 @@ const RETRY_DELAYS: [u64; 3] = if cfg!(test) {
     [2_000, 5_000, 10_000]
 };
 
+/// 退避之后做什么（只影响跟前端说的那句话）
+#[derive(Clone, Copy)]
+enum Retry {
+    /// 这一步整个重来（还什么都没流出来）
+    Again,
+    /// 流出过内容才断：留着已有的，接着下一步
+    Continue,
+}
+
 /// 重试前：告诉前端在等什么（不然界面就是一段莫名其妙的停顿），然后退避。
 /// 等的时候按停止要立刻生效。返回 `false` = 用户停了。
 async fn backoff(
@@ -2108,12 +2166,17 @@ async fn backoff(
     turn: &crate::state::Turn,
     attempt: usize,
     why: &str,
+    kind: Retry,
 ) -> bool {
     let ms = RETRY_DELAYS[attempt];
     let secs = ms / 1000;
     let short: String = why.chars().take(160).collect();
+    let (what, then) = match kind {
+        Retry::Again => ("请求出错", "重试"),
+        Retry::Continue => ("连接中断", "接着跑"),
+    };
     tracing::warn!(
-        "LLM 请求失败（{short}），{secs}s 后第 {} 次重试",
+        "LLM {what}（{short}），{secs}s 后{then}（第 {} 次）",
         attempt + 1
     );
     send(
@@ -2122,7 +2185,7 @@ async fn backoff(
             "warning",
             json!({
                 "message": format!(
-                    "请求出错（{short}），{secs} 秒后重试（第 {}/{} 次）",
+                    "{what}（{short}），{secs} 秒后{then}（第 {}/{} 次）",
                     attempt + 1,
                     RETRY_DELAYS.len()
                 )
@@ -2792,6 +2855,12 @@ mod tests {
 
     /// 跑一个回合直到结束，返回 (结果, 推给前端的全部 chunk, 会话里最后一条)。
     async fn run_scripted(base: &str) -> (anyhow::Result<()>, Vec<Value>, Option<ChatMessage>) {
+        let (r, chunks, all) = run_scripted_all(base).await;
+        (r, chunks, all.last().cloned())
+    }
+
+    /// 同上，但给出会话里的全部消息。
+    async fn run_scripted_all(base: &str) -> (anyhow::Result<()>, Vec<Value>, Vec<ChatMessage>) {
         crate::llm::install_crypto_provider();
         let mut p = Provider::compatible("fake", base, "m", "k");
         p.api_style = crate::llm::ApiStyle::Chat;
@@ -2819,8 +2888,7 @@ mod tests {
             .get(&sid)
             .unwrap()
             .messages
-            .last()
-            .cloned();
+            .clone();
         (r, chunks, last)
     }
 
@@ -2850,10 +2918,9 @@ mod tests {
         assert!(!chunks.iter().any(|c| c["type"] == "error"));
     }
 
-    /// 不该重试的：鉴权失败（重来也没用）；以及已经流出了内容才断的
-    /// （重来的话界面上就是两份）。
+    /// 不该重试的：鉴权失败（重来也没用）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn permanent_failures_and_half_streamed_replies_are_not_retried() {
+    async fn permanent_failures_are_not_retried() {
         let (base, hits) = scripted_provider(vec![Err(401), Ok(OK_REPLY.to_vec())]).await;
         let (r, _, _) = run_scripted(&base).await;
         assert!(r.is_err());
@@ -2862,12 +2929,71 @@ mod tests {
             1,
             "401 不重试"
         );
+    }
 
-        let half = vec![r#"{"choices":[{"delta":{"content":"说到一半"}}]}"#];
+    /// 流出过内容才断（网关掐了长连接）：**不整步重来**（界面上会是两份），已经流出来的
+    /// 进历史、写了一半的工具调用作废，退避后接着下一步 —— 下一次请求里模型看得到自己
+    /// 说到哪了。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reply_cut_off_mid_stream_keeps_what_streamed_and_carries_on() {
+        // 正文说到一半，还露出了一个工具调用的头（参数没写完）就断了
+        let half = vec![
+            r#"{"choices":[{"delta":{"content":"说到一半"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{\"comm"}}]}}]}"#,
+        ];
         let (base, hits) = scripted_provider(vec![Ok(half), Ok(OK_REPLY.to_vec())]).await;
-        let (r, _, _) = run_scripted(&base).await;
-        assert!(r.is_err(), "流出过内容就断了：报错，不重来");
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (r, chunks, all) = run_scripted_all(&base).await;
+        r.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let assistants: Vec<(&str, usize)> = all
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => Some((content.as_str(), tool_calls.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistants,
+            [("说到一半", 0), ("好了", 0)],
+            "断之前的留着（工具调用作废），接着的那一步照常进历史"
+        );
+        assert!(
+            !all.iter().any(|m| matches!(m, ChatMessage::Tool { .. })),
+            "半截的工具调用一个都没执行"
+        );
+        // 露过头的工具调用告诉前端作废了，不然那一行一直转圈
+        assert!(
+            chunks.iter().any(|c| c["type"] == "tool-output-available"
+                && c["output"].to_string().contains("连接中断")),
+            "{chunks:?}"
+        );
+        let warning = chunks
+            .iter()
+            .find(|c| c["type"] == "data-warning")
+            .expect("要告诉前端在等什么");
+        assert!(warning.to_string().contains("接着跑"), "{warning}");
+        assert!(!chunks.iter().any(|c| c["type"] == "error"));
+    }
+
+    /// 连着断：断满 `RETRY_DELAYS` 那么多次就报错，不无休止地接着跑。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reply_that_keeps_getting_cut_off_gives_up() {
+        let half = vec![r#"{"choices":[{"delta":{"content":"又断了"}}]}"#];
+        let script = vec![Ok(half); RETRY_DELAYS.len() + 2];
+        let (base, hits) = scripted_provider(script).await;
+        let (r, chunks, _) = run_scripted_all(&base).await;
+        assert!(r.is_err());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            RETRY_DELAYS.len() + 1,
+            "第一次 + 接着跑的那几次"
+        );
+        assert!(chunks.iter().any(|c| c["type"] == "error"));
     }
 
     /// Responses 端点回了 200 却只发 keep-alive（实测 OpenCode Go 的 deepseek-flash）：
