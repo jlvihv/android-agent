@@ -5,9 +5,10 @@
    * 尺寸照 Claude 的「选择模型」面板（1080×2424 @420dpi → 411×923 css）：
    *   全宽贴底，上圆角 **rounded-4xl（32px）**。Claude 那边是 43px（对整条弧
    *   最小二乘拟合，RMS 残差 0.6px）—— 不追像素对齐，取刻度里最接近的一档
-   *   底色 **#151515**（= --color-ink，和页面底色同一个值）—— 面板是靠遮罩把页面
-   *   压暗才「浮」起来的，不是自己变亮；里面的卡片才是 #20201f（= --color-surface）
-   *   遮罩：页面底色 #151515 被压到 #0e0e0e ≈ 35% 黑
+   *   底色 **#111111**（= --color-panel）—— 页面是纯黑（= --color-ink），遮罩又
+   *   压不暗纯黑，面板只能**自己比页面亮一档**才浮得起来（以前靠遮罩把 #151515 的
+   *   页面压下去）；里面的卡片才是 #20201f（= --color-surface）
+   *   遮罩：页面上的内容（文字 / 图片）被压暗 ≈ 35% 黑
    *   抓手 36×5 居中，距面板顶 5.3
    *   标题 17px 半粗居中，头部下面没有分隔线
    *   左右内边距 **12px**（卡片距屏幕边 12；卡片自己的内边距是 14px）
@@ -204,7 +205,7 @@
   class="fixed inset-x-0 bottom-[var(--kb,0px)] z-[56] flex max-h-[var(--sheet-max-h)] {hug
          ? 'min-h-0'
          : 'min-h-[var(--sheet-min-h)]'} flex-col
-         rounded-t-4xl bg-ink pt-1 will-change-transform"
+         rounded-t-4xl bg-panel pt-1 will-change-transform"
 >
   <div class="shrink-0">
     <div class="mx-auto h-1.5 w-9 rounded-full bg-control"></div>

@@ -469,7 +469,11 @@ impl SessionStore {
         gone
     }
 
-    /// 给侧边栏用的列表，最近更新的在前。
+    /// 给侧边栏用的列表，**按创建时间**排（新建的在最上面）。
+    ///
+    /// 以前按 `updated_at`（最近聊过的在前），结果是**正在说话的会话会在列表里往上
+    /// 跳**：两个会话各跑一个回合时，它们来回换位 —— 抽屉开着就能看见列表在动，
+    /// 点错是迟早的事。创建时间不会变，位置就是死的（新建的插到最上面，其余不动）。
     ///
     /// **空会话不进列表**：前端点「新对话」不同，那是本地清空视图、服务端
     /// 到第一句话才建会话（见 `POST /api/chat` 的 `fresh`）。这里是兜底 ——
@@ -477,7 +481,9 @@ impl SessionStore {
     /// 以及启动时 `active_mut()` 顺手建的，都是没内容的，不该在抽屉里占位。
     pub fn list(&self) -> Vec<Value> {
         let mut v: Vec<&ChatSession> = self.sessions.iter().filter(|s| s.has_content()).collect();
-        v.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        // created_at 撞车（同一毫秒建的）时拿 id 兜底：顺序必须**确定** ——
+        // 同一个列表反复拉，每次都得一模一样，不然抽屉又会自己动
+        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
         v.into_iter()
             .map(|s| {
                 json!({
@@ -4423,6 +4429,40 @@ mod tests {
         // 清空过（/api/reset）又回到「不算数」
         store.get_mut(&id).unwrap().clear();
         assert!(store.list().is_empty());
+    }
+
+    /// 列表按**创建时间**排：刚聊过的会话不会因此往上跳。
+    #[test]
+    fn session_list_is_ordered_by_creation_not_recency() {
+        let mut older = ChatSession::new();
+        older.title = "先建的".into();
+        older.created_at = 100;
+        older.updated_at = 900; // 刚聊过 —— 按 updated_at 排的话它会插到最前面
+        older.messages = vec![ChatMessage::user("早")];
+
+        let mut newer = ChatSession::new();
+        newer.title = "后建的".into();
+        newer.created_at = 200;
+        newer.updated_at = 300;
+        newer.messages = vec![ChatMessage::user("晚")];
+
+        // 故意把数组顺序放成和创建时间相反：排序得自己把顺序摆正
+        let mut store = SessionStore {
+            sessions: vec![older, newer],
+            active: String::new(),
+        };
+        let titles = |s: &SessionStore| -> Vec<String> {
+            s.list()
+                .iter()
+                .map(|v| v["title"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(titles(&store), ["后建的", "先建的"], "新建的在上面");
+
+        // 先建的那个又聊了一句（updated_at 跳到最新）：位置还是不动 ——
+        // 这就是要的「固定」：两个对话同时跑，它们在列表里不换位
+        store.sessions[0].updated_at = 10_000;
+        assert_eq!(titles(&store), ["后建的", "先建的"]);
     }
 
     /// 测排队用：一个假端点 + 一个会话 + 排着一条 `q1`。

@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 和 web 侧的设计令牌 ink 一致：暖调近黑，不是纯黑 -->
-    <color name="ink">#FF151515</color>
+    <!-- 和 web 侧的设计令牌 ink 一致：**纯黑**（页面底色；OLED 省电）。
+         这是 windowBackground —— 冷启动时 WebView 还没画出东西的那一层，
+         不同步改就会先闪一下旧色再跳黑。 -->
+    <color name="ink">#FF000000</color>
 
     <!-- 下面几个和 web/src/app.css 的设计令牌一一对应（原生面板用得到）。
          只补需要的三个：文字、次要文字、分隔线。 -->
