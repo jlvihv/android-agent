@@ -1037,7 +1037,8 @@ struct Layout {
     exit: (PathBuf, String),
     /// 浏览器截图
     shots: crate::gc::ShotDir,
-    /// bash 输出被截断时溢出的完整输出
+    /// bash 输出被截断时溢出的完整输出（也是 `create_file` 遇上已存在文件时，
+    /// 把写好的内容放一放的地方）
     spills: (PathBuf, String),
 }
 
@@ -2797,14 +2798,22 @@ impl LinuxSandbox {
 
     /// `edit` 工具的 create 模式：新建一个文件（父目录按需建）。
     ///
-    /// 已存在就报错，**不静默覆盖** —— 想改已有文件应该先 `read` 再用 `edits`，
-    /// 那样改错了还能在 diff 里看出来；直接盖掉等于把原文扔了。
+    /// 已存在就不覆盖（想改已有文件应该先 `read` 再用 `edits`，那样改错了还能在
+    /// diff 里看出来；直接盖掉等于把原文扔了）—— 但写好的内容**不扔**：落到
+    /// 临时目录（见 [`Self::spill_new_file`]），报错里说清它在哪、怎么用。不然
+    /// 模型辛辛苦苦写的一大段就白写了，只能从头再写一遍。
     pub fn create_file(&self, guest_path: &str, content: &str) -> anyhow::Result<CreatedFile> {
         let host = self.resolve_new_path(guest_path)?;
-        anyhow::ensure!(
-            !host.exists(),
-            "已存在: {guest_path}（content 只用于新建；要改它请先 read，再用 edits）"
-        );
+        if host.exists() {
+            let how = "content 只用于新建；要改它请先 read，再用 edits";
+            anyhow::bail!(match self.spill_new_file(guest_path, content) {
+                Some(tmp) => format!(
+                    "已存在: {guest_path}（{how}）。你写的内容没丢：已经放在 {tmp} —— \
+                     确认要盖掉就 `mv {tmp} {guest_path}`，要和原文合起来就先 read 再用 edits"
+                ),
+                None => format!("已存在: {guest_path}（{how}）"),
+            });
+        }
 
         if let Some(dir) = host.parent() {
             std::fs::create_dir_all(dir)
@@ -2817,6 +2826,31 @@ impl LinuxSandbox {
             lines: content.lines().count(),
             bytes: content.len(),
         })
+    }
+
+    /// 目标已存在时，把模型写好的内容放到临时目录，返回**模型看到的路径**。
+    ///
+    /// 落点就是 `bash` 输出溢出的那个目录（见 `Layout::spills`：沙箱里是 rootfs 的
+    /// `/tmp`，宿主模式下是系统临时目录）—— 模型在哪里都能 `mv`。名字取目标文件的
+    /// 名字加 `.new`（一看就知道是给谁的），已经在了就往后排号，不盖掉上一次那份。
+    /// 写不进去就算了（返回 `None`）：报错本身是正事，不能因为留个副本把报错弄没。
+    fn spill_new_file(&self, guest_path: &str, content: &str) -> Option<String> {
+        let (dir, guest_dir) = self.layout().spills;
+        let base = Path::new(guest_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty() && n != "." && n != "..")
+            .unwrap_or_else(|| "new-file".into());
+        std::fs::create_dir_all(&dir).ok()?;
+        let mut name = format!("{base}.new");
+        for n in 2..100 {
+            if !dir.join(&name).exists() {
+                break;
+            }
+            name = format!("{base}.new.{n}");
+        }
+        std::fs::write(dir.join(&name), content).ok()?;
+        Some(Path::new(&guest_dir).join(&name).display().to_string())
     }
 
     /// `read` 工具：先嗅魔数，是图片就走图片那条路（缩放 + 内联），
@@ -5144,6 +5178,29 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(t.dir.join("root/a.txt")).unwrap(),
             "原文"
+        );
+        // 写好的内容也没白写：落在 /tmp，报错里给了路径（`mv` 一下就能用）
+        assert!(err.contains("/tmp/a.txt.new"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(t.dir.join("tmp/a.txt.new")).unwrap(),
+            "盖掉"
+        );
+        // 那条路径在沙箱里解得开（访客 /tmp ↔ rootfs/tmp）
+        assert!(sb.resolve_path("/tmp/a.txt.new").is_ok());
+
+        // 再来一次不盖掉上一次那份：另起一个名字
+        let err = sb
+            .create_file("/root/a.txt", "第二版")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/tmp/a.txt.new.2"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(t.dir.join("tmp/a.txt.new")).unwrap(),
+            "盖掉"
+        );
+        assert_eq!(
+            std::fs::read_to_string(t.dir.join("tmp/a.txt.new.2")).unwrap(),
+            "第二版"
         );
     }
 
