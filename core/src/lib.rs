@@ -49,6 +49,7 @@ pub mod readable;
 pub mod reader;
 #[cfg(not(target_os = "android"))]
 pub mod remote;
+pub mod resident;
 pub mod responses;
 pub mod search;
 pub mod single;

@@ -98,7 +98,7 @@ dev-host: web-build
     export AGENT_LLM_NAME="${AGENT_LLM_NAME:-opencode-go}"
     export AGENT_LINUX_HOST=1
     export AGENT_HOST_WORKSPACE="${AGENT_HOST_WORKSPACE:-$PWD}"
-    cargo run --manifest-path {{core}}/Cargo.toml --bin agent-dev
+    cargo run --release --manifest-path {{core}}/Cargo.toml --bin agent-dev
 
 # --- 中继（出门在外连家里的电脑，见 docs/12-relay.md） ----------------------
 

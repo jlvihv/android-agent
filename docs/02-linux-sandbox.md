@@ -312,14 +312,47 @@ Rust core                     ▼
 （`agent ps` / `agent kill <pid>`，见上面「进程模型」），调试时看自己（`agent debug …`）。
 见 [docs/07-debugging.md](07-debugging.md) §8。
 
-### 进程模型：一条命令一个 proot、一个进程组
+### 进程模型：一个常驻 shell，每条命令一个作业、一个进程组
 
-**一条命令一个 proot**（`run_live()`），不用长命 shell 复用。OpenMinis 量过
-这件事并把数字写在了 `ShellExecutionStrategy.kt` 里：他们的 guest 里
-`sh -c "echo hi"` 冷启动 4.2 ms（`setsid` 版 8.5 ms），而每次工具调用的宿主
-开销是 65–90 ms —— 复用 shell 省下的那点钱，换来的是整套带内完成标记的坑
-（标记被 `read()` 切两半、修它的 hold-back 缓冲把所有短输出吞了、超时命令
-继续污染下一条命令的 stdout，五个月炸三次）。我们要的只是进程退出码。
+**沙箱里常驻一个 proot + bash**（`resident.rs`），每条命令是它的一个 fork。以前是
+**一条命令一个 proot**，手机上实测一条 `true` 要 **~170ms**（不算 HTTP）：proot 自己
+启动，再在它底下 exec `setsid` → `sh` → `bash` —— proot 底下每 exec 一次 ~19ms（每个
+系统调用都被 ptrace 拦一道），bash 启动 ~45ms。在已经跑着的 bash 里 fork 一个子 shell
+只要 ~6ms。现在一条命令的固定开销 **~29ms**（不算 HTTP），一个两百多次 bash 调用的长
+回合省下半分钟以上。宿主模式（电脑上，没有 proot）起一个 bash 本来就几毫秒，仍然走老路。
+
+OpenMinis 也试过复用 shell，踩的是**带内完成标记**的坑（标记被 `read()` 切两半、修它的
+hold-back 缓冲把短输出吞了、超时命令继续污染下一条命令的 stdout）。我们不在输出里放
+任何标记 —— 每条命令有**自己的**输出通道和状态文件：
+
+- 核心写 `<id>.sh`（脚本）、`<id>.run`（`set +m`、`cd`、`export` 这条命令自己的环境，
+  再 `. <id>.sh`），建两个命名管道 `<id>.out` / `<id>.err`，往常驻 bash 的 stdin 写一行
+  `<id>`
+- 常驻 bash（`resident::DISPATCHER`）起一个后台作业：
+  `( ( . <id>.run ) </dev/null >"<id>.out" 2>"<id>.err"; printf '%s' "$?" > "<id>" ) &`，
+  再把 `$!` 写进 `<id>.pid`。`set -m` 让**每个作业自成一个进程组**（组号就是 `$!`）
+- 之后的一切 —— 等状态文件、超时按组杀、收输出、退出码、溢出落盘 —— 和以前同一套代码
+  （`LinuxSandbox::collect`）。命名管道的 EOF 语义和子进程的管道一样：命令和它没脱离的
+  子孙都关了写端才 EOF
+- 作业是 fork：`cd` / `export` / 变量 / `set -e` 都漏不到下一条（有测试）；作业里
+  `set +m`，脚本里的 `cmd &` 照旧留在命令自己的组里，跟以前一样被一起杀
+- 两层子 shell：`exit N` 只结束里面那层，外面照样写下退出码（不用 `trap EXIT`，模型的
+  脚本自己也常设，会把我们的盖掉）
+- **`$$` 的坑**：子 shell 里的 `$$` 是常驻 bash 自己的 pid（bash 规定的）—— `kill $$` 会
+  杀掉常驻 shell，`/tmp/x.$$` 在两条同时跑的命令之间会撞。脚本里出现 `$$` 的命令单独
+  `exec` 一个 bash 跑（`resident::needs_own_shell`，手机上多 ~45ms）
+- 几条命令能同时跑（并行的工具调用、几个会话）：常驻 bash 只负责起作业，不等它们
+- 常驻的那个挂了，下一条命令自动起一个新的；命令**确定没跑起来**（交不过去、它半路
+  没了、5 秒内没写下进程组号）才退回老路，所以不会跑两遍。起不来就 60 秒内都走老路。
+  没装 bash 之前、升级 Alpine 期间（`set_maintenance` 会关掉它）也走老路
+
+> 管道比状态文件先关是常态（外面那层写退出码还差几毫秒）。拿到 EOF 之后有界地再等
+> 一下状态文件（`STATUS_AFTER_EOF`）—— 第一次装到手机上时没等，一半的命令报 `exit -1`。
+>
+> macOS 的 kqueue 不报 FIFO 的 EOF，读端要等到「输出安静」那条 150ms 上限才收：常驻
+> shell 只在宿主模式的测试里用，所以只是测试慢一点。
+
+下面这些（状态文件、按组杀、不漏孤儿）两条路通用。
 
 **没有 `--kill-on-exit`**。它让 proot 在命令退出的瞬间对整棵
 树发 SIGKILL（proot 的 `terminate_tracee` → `kill_all_tracees`），于是
@@ -370,7 +403,9 @@ Rust core                     ▼
 属于哪条命令），`agent kill <pid>` 停掉（先 SIGTERM，几秒不走再 SIGKILL）。
 归因靠 `TracerPid` —— guest 进程的 tracer 就是那条命令的 proot，而**只有核心
 记得**哪个 proot 是哪条命令起的（刻意脱离的进程父进程早就是 init 了，光靠 `ps`
-认不出它们是谁、什么时候起的）。实现在 `linux.rs` 的 `LinuxSandbox::procs`
+认不出它们是谁、什么时候起的）。常驻 shell 跑的命令共用一个 proot，再往下分：在这条
+命令的进程组里，或者 `/proc/<pid>/environ` 里带着它的 `AGENT_RUN_ID`（每条命令都导出；
+刻意 `setsid` 脱离的进程不在组里，但 exec 出来时环境是带着的）。实现在 `linux.rs` 的 `LinuxSandbox::procs`
 （`RunRegistry` + `/proc` 扫描）；`/proc` 被 hidepid 限制的机器上它会**明说**
 「看不见」，而不是假装「什么都没有」。对应的接口是 `GET /api/procs`。
 

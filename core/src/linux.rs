@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::editor::{self, Edit, EditOutcome};
 use crate::reader::{self, ReadView};
+use crate::resident::{self, Resident};
 
 /// 单次命令的默认超时。
 ///
@@ -86,6 +87,20 @@ const SETSID_PATHS: [&str; 2] = ["/usr/bin/setsid", "/bin/setsid"];
 
 /// 状态文件的轮询间隔。
 const STATUS_POLL: Duration = Duration::from_millis(25);
+/// 刚开始那一小段查得勤一点：大多数命令几十毫秒就完，按 25ms 一拍查，平均白等十几毫秒
+/// （常驻 shell 之后一条命令的固定开销就剩三十来毫秒，这十几毫秒占了一大块）。之后再
+/// 放宽 —— 跑十分钟的编译不该每 5ms 醒一次。
+const STATUS_POLL_FAST: Duration = Duration::from_millis(5);
+const FAST_POLL_FOR: Duration = Duration::from_millis(300);
+
+/// 这一拍睡多久（见 `STATUS_POLL_FAST`）
+fn poll_interval(since: Duration) -> Duration {
+    if since < FAST_POLL_FOR {
+        STATUS_POLL_FAST
+    } else {
+        STATUS_POLL
+    }
+}
 
 /// 命令退出后，输出安静这么久就算读完了（见 `wait_for_quiet`）。
 const OUTPUT_QUIET: Duration = Duration::from_millis(150);
@@ -101,6 +116,14 @@ const REAP_GRACE: Duration = Duration::from_millis(2_000);
 
 /// 被我们杀掉之后，给读端收尾的时间。
 const DRAIN_AFTER_KILL: Duration = Duration::from_millis(200);
+
+/// 常驻 shell 起来（读完 profile、写下自己的 pid）最多等这么久
+const RESIDENT_BOOT: Duration = Duration::from_secs(10);
+/// 交出去的命令多久之内该起来（常驻 shell 写下它的进程组号）—— 没起来就算没跑，
+/// 退回老路（命令确定没跑过，退回去不会跑两遍）
+const RESIDENT_SPAWN: Duration = Duration::from_secs(5);
+/// 常驻 shell 起不来之后，这么久之内不再试（每条命令都白等一次启动不划算）
+const RESIDENT_RETRY: Duration = Duration::from_secs(60);
 
 /// 超过这么久的状态文件算上次崩溃留下的，清掉。
 ///
@@ -376,9 +399,17 @@ impl StatusFile {
         }
     }
 
+    /// 同名、带后缀的伴生文件（常驻 shell 用：`.sh` 脚本、`.run`、`.out` / `.err` 管道）
+    fn extra(&self, ext: &str) -> PathBuf {
+        PathBuf::from(format!("{}.{ext}", self.host.display()))
+    }
+
     fn clean_up(&self) {
         let _ = std::fs::remove_file(&self.host);
         let _ = std::fs::remove_file(&self.pid_host);
+        for ext in ["sh", "run", "out", "err"] {
+            let _ = std::fs::remove_file(self.extra(ext));
+        }
     }
 }
 
@@ -499,6 +530,24 @@ impl OutputTap {
     }
 }
 
+/// 命令起来之后交给 `LinuxSandbox::collect` 的那一摊东西。
+struct Collect<'a> {
+    started: Instant,
+    timeout: Duration,
+    status: &'a StatusFile,
+    out_task: tokio::task::JoinHandle<()>,
+    err_task: tokio::task::JoinHandle<()>,
+    tap: Arc<OutputTap>,
+    out_cap: Arc<Mutex<Capture>>,
+    err_cap: Arc<Mutex<Capture>>,
+    guard: CommandGuard,
+    /// proot 自己的退出（老路才有：常驻 shell 那个不跟着一条命令退）
+    exit_rx: Option<tokio::sync::oneshot::Receiver<std::io::Result<std::process::ExitStatus>>>,
+    /// 登记表里的那条（`agent ps`）
+    run: Option<RunKey>,
+    using_bash: bool,
+}
+
 /// 这次调用是怎么结束的。
 enum Done {
     /// runner 报出了命令的退出码 —— 权威值
@@ -604,6 +653,16 @@ struct RawProc {
     tracer: i32,
     /// 截断过的命令行
     cmdline: String,
+    /// 环境里的 `AGENT_RUN_ID`（常驻 shell 跑的命令都带：它 exec 出来的进程 —— 包括
+    /// 刻意脱离的常驻进程 —— 靠它认回是哪条命令起的，见 `procs_with`）
+    run_id: Option<String>,
+}
+
+/// `/proc/<pid>/environ` 里的 `AGENT_RUN_ID`
+fn environ_run_id(raw: &[u8]) -> Option<String> {
+    raw.split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(b"AGENT_RUN_ID="))
+        .map(|v| String::from_utf8_lossy(v).into_owned())
 }
 
 /// 扫一个 /proc（测试里喂假的）。
@@ -633,6 +692,14 @@ fn scan_procs_in(proc_dir: &Path) -> Vec<RawProc> {
         let cmdline = std::fs::read(dir.join("cmdline"))
             .map(|b| render_cmdline(&b))
             .unwrap_or_default();
+        // 只有 guest 进程（有 tracer 的）才可能是我们的，别的不读
+        let run_id = if tracer != 0 {
+            std::fs::read(dir.join("environ"))
+                .ok()
+                .and_then(|b| environ_run_id(&b))
+        } else {
+            None
+        };
         out.push(RawProc {
             pid,
             ppid,
@@ -640,6 +707,7 @@ fn scan_procs_in(proc_dir: &Path) -> Vec<RawProc> {
             state,
             tracer,
             cmdline,
+            run_id,
         });
     }
     out
@@ -732,18 +800,27 @@ struct RunInfo {
     command: String,
     /// 起于（epoch 毫秒）
     started_ms: u64,
-    /// proot 自己的 pid：**它名下的 tracee 就是这条命令的进程**
+    /// proot 自己的 pid：**它名下的 tracee 就是这条命令的进程**。常驻 shell 跑的命令
+    /// 共用常驻的那个 proot —— 那时还要再按 `resident` 分（见 `procs_with`）
     proot_pid: i32,
     /// runner 写 pid 的宿主路径（读出来是这条命令的进程组）
     pid_file: PathBuf,
     /// 命令结束了吗。结束了还有活着的进程 = 刻意脱离的常驻进程。
     finished: bool,
+    /// 常驻 shell 跑的：这条命令的 `AGENT_RUN_ID`
+    resident: Option<String>,
+    /// 命令的进程组（结束时记下来 —— pid 文件那时已经删了）
+    pgid: Option<i32>,
 }
+
+/// 登记表里的一条（自增编号：常驻 shell 跑的命令共用一个 proot，不能拿它当键）
+type RunKey = u64;
 
 /// 命令登记表。
 #[derive(Default)]
 struct RunRegistry {
-    runs: BTreeMap<i32, RunInfo>,
+    runs: BTreeMap<RunKey, RunInfo>,
+    next: RunKey,
 }
 
 impl RunRegistry {
@@ -751,29 +828,35 @@ impl RunRegistry {
     /// 被调到的时候才清。
     const KEEP: usize = 64;
 
-    fn add(&mut self, run: RunInfo) {
-        self.runs.insert(run.proot_pid, run);
+    fn add(&mut self, run: RunInfo) -> RunKey {
+        let key = self.next;
+        self.next += 1;
+        self.runs.insert(key, run);
         while self.runs.len() > Self::KEEP {
             // 先扔「已结束且 proot 已经不在了」的；实在没有就扔最老的
             let victim = self
                 .runs
                 .iter()
                 .find(|(_, r)| r.finished && !pid_alive(r.proot_pid))
-                .map(|(p, _)| *p)
+                .map(|(k, _)| *k)
                 .or_else(|| self.runs.keys().next().copied());
             match victim {
-                Some(p) => {
-                    self.runs.remove(&p);
+                Some(k) => {
+                    self.runs.remove(&k);
                 }
                 None => break,
             }
         }
+        key
     }
 
     /// 命令结束（不代表它名下的进程都死了 —— 刻意脱离的还在）。
-    fn finish(&mut self, proot_pid: i32) {
-        if let Some(r) = self.runs.get_mut(&proot_pid) {
+    fn finish(&mut self, key: RunKey, pgid: Option<i32>) {
+        if let Some(r) = self.runs.get_mut(&key) {
             r.finished = true;
+            if pgid.is_some() {
+                r.pgid = pgid;
+            }
         }
     }
 
@@ -781,7 +864,7 @@ impl RunRegistry {
     ///
     /// 这也顺手挡住了 pid 复用：proot 死后的登记不会再被拿去归因。
     fn prune(&mut self) {
-        self.runs.retain(|pid, _| pid_alive(*pid));
+        self.runs.retain(|_, r| pid_alive(r.proot_pid));
     }
 }
 
@@ -971,6 +1054,15 @@ pub struct LinuxSandbox {
     /// 命令走 `run_maintenance`。一边换 musl 一边跑模型的命令，两边都可能拿到
     /// 半新半旧的库。
     maintenance: std::sync::atomic::AtomicBool,
+    /// 常驻 shell（见 `resident`）。`None` = 还没起 / 挂了 / 被关了，下一条命令再起。
+    resident: Mutex<Option<Arc<Resident>>>,
+    /// 起常驻 shell 那一段串起来：两条命令同时来，只起一个
+    resident_start: tokio::sync::Mutex<()>,
+    /// 上次起常驻 shell 失败的时刻：一段时间内不再试，直接走老路
+    resident_failed_at: Mutex<Option<Instant>>,
+    /// 用不用常驻 shell。沙箱里用；宿主模式不用（那边起一个 bash 本来就快，几毫秒），
+    /// 只有测试里打开 —— 两边是同一套协议，测试在宿主模式下就能把它跑一遍
+    use_resident: std::sync::atomic::AtomicBool,
 }
 
 /// 这台机器上有没有「手机系统能力」（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
@@ -1209,32 +1301,44 @@ impl LinuxSandbox {
     }
 
     fn with_mode(mode: Mode) -> Self {
+        let use_resident = matches!(mode, Mode::Proot(_));
         Self {
             mode,
             agent_port: AtomicU16::new(0),
             agent_token: std::sync::RwLock::new(None),
             runs: Mutex::new(RunRegistry::default()),
             maintenance: std::sync::atomic::AtomicBool::new(false),
+            resident: Mutex::new(None),
+            resident_start: tokio::sync::Mutex::new(()),
+            resident_failed_at: Mutex::new(None),
+            use_resident: std::sync::atomic::AtomicBool::new(use_resident),
         }
     }
 
     /// 登记一条刚起的命令（`agent ps` 靠它把进程认到命令上）。
-    fn register_run(&self, proot_pid: i32, script: &str, pid_file: PathBuf) {
-        if let Ok(mut r) = self.runs.lock() {
-            r.add(RunInfo {
-                command: clip_chars(&one_line(script), 160),
-                started_ms: now_ms(),
-                proot_pid,
-                pid_file,
-                finished: false,
-            });
-        }
+    fn register_run(
+        &self,
+        proot_pid: i32,
+        script: &str,
+        pid_file: PathBuf,
+        resident: Option<String>,
+    ) -> Option<RunKey> {
+        let mut r = self.runs.lock().ok()?;
+        Some(r.add(RunInfo {
+            command: clip_chars(&one_line(script), 160),
+            started_ms: now_ms(),
+            proot_pid,
+            pid_file,
+            finished: false,
+            resident,
+            pgid: None,
+        }))
     }
 
     /// 命令跑完了。**不代表它名下没进程了** —— 刻意脱离的还在（见 `procs`）。
-    fn finish_run(&self, proot_pid: i32) {
+    fn finish_run(&self, key: RunKey, pgid: Option<i32>) {
         if let Ok(mut r) = self.runs.lock() {
-            r.finish(proot_pid);
+            r.finish(key, pgid);
         }
     }
 
@@ -1270,17 +1374,31 @@ impl LinuxSandbox {
         let now = now_ms();
         let mut leftovers = Vec::new();
         let mut running = Vec::new();
-        for run in runs.runs.values() {
-            // 命令自己那棵树的进程（正在跑的）
+        let mut gone: Vec<RunKey> = Vec::new();
+        for (key, run) in runs.runs.iter() {
+            // 进程组：runner 写下的那个（结束时记下的；拿不到就退回 proot 的 pid）
+            let pgid = read_pgid(&run.pid_file)
+                .or(run.pgid)
+                .unwrap_or(run.proot_pid);
+            // 命令自己那棵树的进程（正在跑的）。常驻 shell 跑的命令共用一个 proot：
+            // 再按「在这条命令的进程组里」或者「环境里带着它的 AGENT_RUN_ID」分
+            // （刻意 `setsid` 脱离的常驻进程不在组里，但 exec 出来时环境是带着的）
             let mine: Vec<&RawProc> = all
                 .iter()
                 .filter(|p| p.tracer == run.proot_pid && p.state != 'Z')
+                .filter(|p| match &run.resident {
+                    None => true,
+                    Some(id) => p.pgid == pgid || p.run_id.as_deref() == Some(id.as_str()),
+                })
                 .collect();
             if mine.is_empty() {
+                // 常驻 shell 那个 proot 一直活着，`prune` 清不掉它名下的登记：结束了、
+                // 名下也没进程了的，这里清
+                if run.finished && run.resident.is_some() {
+                    gone.push(*key);
+                }
                 continue;
             }
-            // 进程组：runner 写下的那个（拿不到就退回 proot 的 pid）
-            let pgid = read_pgid(&run.pid_file).unwrap_or(run.proot_pid);
             let age = now.saturating_sub(run.started_ms) / 1000;
             if run.finished {
                 for p in mine {
@@ -1303,6 +1421,9 @@ impl LinuxSandbox {
                 });
             }
         }
+        for k in gone {
+            runs.runs.remove(&k);
+        }
         leftovers.sort_by_key(|e| e.pid);
         running.sort_by_key(|r| std::cmp::Reverse(r.age_secs));
 
@@ -1317,7 +1438,8 @@ impl LinuxSandbox {
         //    systemd 的服务、用户会话的 daemon 一大片（journald / NetworkManager /
         //    sshd…），把它们列成「`agent kill` 可以停掉」比漏掉糟得多。
         //    孤儿 proot 名下的 tracee 也要收（它们自己的 ppid 还指着 guest 里的父进程）。
-        let known: std::collections::BTreeSet<i32> = runs.runs.keys().copied().collect();
+        let known: std::collections::BTreeSet<i32> =
+            runs.runs.values().map(|r| r.proot_pid).collect();
         let proot_name = self
             .proot_config()
             .and_then(|cfg| cfg.proot.file_name())
@@ -1845,6 +1967,38 @@ impl LinuxSandbox {
         status: &str,
         cwd: &str,
     ) -> Vec<String> {
+        let mut cmd = Self::proot_prefix(cfg, cwd);
+
+        macro_rules! arg {
+            ($($x:expr),+ $(,)?) => {{ $( cmd.push($x.to_string()); )+ }};
+        }
+
+        // 装过 bash 就用 bash：模型写的命令常带 bash 语法（`[[ ]]`、数组、
+        // 进程替换、`<<<`），拿 ash 跑会报 "syntax error"。首次预装之前
+        // （或者手动清了 rootfs）没有 bash，退回 /bin/sh（这时结果里会
+        // 提醒模型去装，见 `ExecResult::to_text`）。
+        let shell = if cfg.rootfs.join("bin/bash").is_file() {
+            "/bin/bash"
+        } else {
+            "/bin/sh"
+        };
+
+        // 没有 setsid 就退回「不分组」：那时 pid 文件不能信（`$$` 不是组号），
+        // 超时 / 停止只能拿 proot 自己的组当靶子（见 `CommandGuard::target`）。
+        let setsid = Self::setsid_guest(cfg);
+        let runner = runner_script(shell, setsid.is_some());
+        if let Some(s) = setsid {
+            arg!(s);
+        }
+        // runner 本身跑在 /bin/sh 里（busybox 一定在，`$$` / printf / `$?` 都是
+        // POSIX）；模型那段脚本由 runner 交给上面选出的 shell 执行。
+        arg!("/bin/sh", "-c", runner, "sh", script, status);
+
+        cmd
+    }
+
+    /// proot 那一段（到 `-w <cwd>` 为止）：每条命令一个 proot 的老路和常驻 shell 共用。
+    fn proot_prefix(cfg: &SandboxConfig, cwd: &str) -> Vec<String> {
         let mut cmd: Vec<String> = Vec::with_capacity(24);
 
         macro_rules! arg {
@@ -1879,28 +2033,6 @@ impl LinuxSandbox {
         }
 
         arg!("-w", cwd);
-
-        // 装过 bash 就用 bash：模型写的命令常带 bash 语法（`[[ ]]`、数组、
-        // 进程替换、`<<<`），拿 ash 跑会报 "syntax error"。首次预装之前
-        // （或者手动清了 rootfs）没有 bash，退回 /bin/sh（这时结果里会
-        // 提醒模型去装，见 `ExecResult::to_text`）。
-        let shell = if cfg.rootfs.join("bin/bash").is_file() {
-            "/bin/bash"
-        } else {
-            "/bin/sh"
-        };
-
-        // 没有 setsid 就退回「不分组」：那时 pid 文件不能信（`$$` 不是组号），
-        // 超时 / 停止只能拿 proot 自己的组当靶子（见 `CommandGuard::target`）。
-        let setsid = Self::setsid_guest(cfg);
-        let runner = runner_script(shell, setsid.is_some());
-        if let Some(s) = setsid {
-            arg!(s);
-        }
-        // runner 本身跑在 /bin/sh 里（busybox 一定在，`$$` / printf / `$?` 都是
-        // POSIX）；模型那段脚本由 runner 交给上面选出的 shell 执行。
-        arg!("/bin/sh", "-c", runner, "sh", script, status);
-
         cmd
     }
 
@@ -2000,12 +2132,46 @@ impl LinuxSandbox {
             !self.maintenance.load(Ordering::Relaxed),
             "沙箱正在升级 Alpine（设置 → Linux 沙箱），这期间不能跑命令；几分钟后再试"
         );
+        if self.use_resident.load(Ordering::Relaxed) {
+            if let Some(r) = self.resident().await {
+                match self
+                    .exec_resident(&r, script, timeout, live.clone(), session)
+                    .await
+                {
+                    Ok(res) => return Ok(res),
+                    // 命令**没跑起来**（交不过去 / 常驻的那个半路没了）：关掉它，这条走老路
+                    Err(e) => {
+                        tracing::warn!("常驻 shell 没接住这条命令（走老路）：{e:#}");
+                        self.stop_resident();
+                    }
+                }
+            }
+        }
         self.exec(script, timeout, live, session).await
     }
 
     /// 进入 / 退出维护状态（见 `maintenance` 字段）。
     pub fn set_maintenance(&self, on: bool) {
         self.maintenance.store(on, Ordering::Relaxed);
+        // 要换 rootfs 了：常驻的那个还拿着旧的 musl / bash，关掉，维护完了下一条命令再起
+        if on {
+            self.stop_resident();
+        }
+    }
+
+    /// 关掉常驻 shell（下一条命令会再起一个）。
+    pub fn stop_resident(&self) {
+        let old = self.resident.lock().ok().and_then(|mut g| g.take());
+        if let Some(r) = old {
+            r.stop();
+        }
+    }
+
+    /// 测试：宿主模式下也走常驻 shell（协议和沙箱里同一套）
+    #[cfg(test)]
+    fn with_resident(self) -> Self {
+        self.use_resident.store(true, Ordering::Relaxed);
+        self
     }
 
     /// 维护期间自己的命令（`apk upgrade`、验收）：不受 `maintenance` 拦。
@@ -2015,7 +2181,237 @@ impl LinuxSandbox {
         timeout: Duration,
         live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     ) -> anyhow::Result<ExecResult> {
+        // 维护（换 rootfs）期间不碰常驻 shell：每条命令一个新 proot，拿到的是当下的 rootfs
         self.exec(script, timeout, live, None).await
+    }
+
+    /// 能用常驻 shell 吗：沙箱里要装过 bash（作业控制 `set -m` 是 bash 的）
+    fn resident_capable(&self) -> bool {
+        match &self.mode {
+            Mode::Proot(cfg) => cfg.rootfs.join("bin/bash").is_file(),
+            Mode::Host { .. } => host_bash().is_some(),
+        }
+    }
+
+    /// 拿常驻 shell：活着就用，没有就起一个（起不来就 `None`，走老路）。
+    async fn resident(&self) -> Option<Arc<Resident>> {
+        let current = || {
+            self.resident
+                .lock()
+                .ok()?
+                .as_ref()
+                .filter(|r| r.alive())
+                .cloned()
+        };
+        if let Some(r) = current() {
+            return Some(r);
+        }
+        if !self.resident_capable() {
+            return None;
+        }
+        let _one = self.resident_start.lock().await;
+        if let Some(r) = current() {
+            return Some(r);
+        }
+        let failed = self.resident_failed_at.lock().ok().and_then(|g| *g);
+        if failed.is_some_and(|t| t.elapsed() < RESIDENT_RETRY) {
+            return None;
+        }
+        match self.start_resident().await {
+            Ok(r) => {
+                if let Ok(mut g) = self.resident.lock() {
+                    *g = Some(r.clone());
+                }
+                Some(r)
+            }
+            Err(e) => {
+                tracing::warn!("常驻 shell 起不来（{RESIDENT_RETRY:?} 内走老路）：{e:#}");
+                if let Ok(mut g) = self.resident_failed_at.lock() {
+                    *g = Some(Instant::now());
+                }
+                None
+            }
+        }
+    }
+
+    /// 起一个常驻 shell，等到它真的跑起来（写下自己的 pid）。
+    async fn start_resident(&self) -> anyhow::Result<Arc<Resident>> {
+        let (exit_dir, exit_guest) = self.layout().exit;
+        std::fs::create_dir_all(&exit_dir)?;
+        let name = Resident::marker_name();
+        let marker = exit_dir.join(&name);
+        let tail = |shell: String| -> Vec<String> {
+            vec![
+                shell,
+                "--noprofile".into(),
+                "--norc".into(),
+                "-c".into(),
+                resident::DISPATCHER.into(),
+                "bash".into(),
+                exit_guest.clone(),
+                name.clone(),
+            ]
+        };
+        let r = match &self.mode {
+            Mode::Proot(cfg) => {
+                if let Some(tmp) = &cfg.tmp {
+                    let _ = std::fs::create_dir_all(tmp);
+                }
+                let mut argv = Self::proot_prefix(cfg, "/");
+                argv.extend(tail("/bin/bash".into()));
+                Resident::start(&argv, &self.guest_env(cfg), None, &marker)?
+            }
+            Mode::Host { workspace } => {
+                let bash = host_bash().ok_or_else(|| anyhow::anyhow!("这台机器上没有 bash"))?;
+                let argv = tail(bash.display().to_string());
+                Resident::start(&argv, &self.host_env(), Some(workspace), &marker)?
+            }
+        };
+        let r = Arc::new(r);
+        let started = Instant::now();
+        while !r.ready() {
+            anyhow::ensure!(r.alive(), "常驻 shell 一起来就退出了");
+            anyhow::ensure!(
+                started.elapsed() < RESIDENT_BOOT,
+                "常驻 shell {RESIDENT_BOOT:?} 还没起来"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(r)
+    }
+
+    /// 一条命令自己的环境（常驻 shell 的作业里 `export`）：所在目录，以及核心的
+    /// 端口 / 凭据（它们可能在常驻 shell 起来之后才定下来，所以每条命令现给）。
+    fn job_env(&self, cwd: &str) -> Vec<(String, String)> {
+        let mut env = match &self.mode {
+            Mode::Host { workspace } => {
+                let mut e = self.host_env();
+                e.push(("AGENT_WORKDIR".into(), workspace.display().to_string()));
+                e
+            }
+            Mode::Proot(_) => vec![("AGENT_WORKDIR".into(), cwd.to_string())],
+        };
+        let port = self.agent_port.load(Ordering::Relaxed);
+        if port != 0 {
+            env.push(("AGENT_PORT".into(), port.to_string()));
+            env.push(("AGENT_BASE".into(), format!("http://127.0.0.1:{port}")));
+        }
+        if let Some(t) = self.agent_token.read().ok().and_then(|g| g.clone()) {
+            env.push(("AGENT_TOKEN".into(), t));
+        }
+        env
+    }
+
+    /// 用常驻 shell 跑一条命令（见 `resident` 模块）。
+    ///
+    /// `Err` 只有一种意思：**命令没跑起来**（文件写不了、交不过去、常驻的那个半路
+    /// 没了）—— 调用方退回老路，不会跑两遍。命令起来之后的一切（非 0 退出、超时、
+    /// 被杀）都是 `Ok`，和老路一样由 `collect` 收。
+    async fn exec_resident(
+        &self,
+        r: &Arc<Resident>,
+        script: &str,
+        timeout: Duration,
+        live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+        session: Option<&str>,
+    ) -> anyhow::Result<ExecResult> {
+        let started = Instant::now();
+        let (exit_dir, exit_guest) = self.layout().exit;
+        let status = StatusFile::new(&exit_dir, &exit_guest);
+        let id = status
+            .host
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(d) = session.and_then(|sid| self.session_host_dir(sid)) {
+            let _ = std::fs::create_dir_all(d);
+        }
+        // 宿主模式下 `session_cwd` 给的是沙箱里的名字（`/workspace`）—— 老路是拿宿主上
+        // 的真目录直接当子进程的 cwd，这里也得是真目录
+        let cwd = match &self.mode {
+            Mode::Host { workspace } => workspace.display().to_string(),
+            Mode::Proot(_) => self.session_cwd(session),
+        };
+        let mut env = self.job_env(&cwd);
+        env.push(("AGENT_RUN_ID".into(), id.clone()));
+        std::fs::write(status.extra("sh"), script)?;
+        std::fs::write(
+            status.extra("run"),
+            resident::run_file(
+                &cwd,
+                &env,
+                &format!("{exit_guest}/{id}.sh"),
+                resident::needs_own_shell(script),
+            ),
+        )?;
+        let (out_fifo, err_fifo) = (status.extra("out"), status.extra("err"));
+        resident::mkfifo(&out_fifo)?;
+        resident::mkfifo(&err_fifo)?;
+
+        let tap = Arc::new(OutputTap::new(started));
+        let out_cap = Arc::new(Mutex::new(Capture::default()));
+        let err_cap = Arc::new(Mutex::new(Capture::default()));
+        let reader = |fifo: PathBuf,
+                      live: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+                      cap: Arc<Mutex<Capture>>| {
+            let tap = tap.clone();
+            tokio::spawn(async move {
+                let rx = resident::open_fifo_reader(fifo).await;
+                Capture::read_into(rx, live, cap, Some(tap)).await
+            })
+        };
+        let out_task = reader(out_fifo.clone(), live.clone(), out_cap.clone());
+        let err_task = reader(err_fifo.clone(), live, err_cap.clone());
+        // 读端在阻塞线程里等写端：命令没起来的话放它们出来
+        let unblock = || {
+            resident::unblock_fifo(&out_fifo);
+            resident::unblock_fifo(&err_fifo);
+        };
+
+        // 交出去，等它起来（常驻 shell 写下这条命令的进程组号）
+        let spawned = async {
+            r.submit(&id).await?;
+            let t = Instant::now();
+            while read_pgid(&status.pid_host).is_none() {
+                anyhow::ensure!(r.alive(), "常驻 shell 半路退出了");
+                anyhow::ensure!(
+                    t.elapsed() < RESIDENT_SPAWN,
+                    "常驻 shell {RESIDENT_SPAWN:?} 没把命令起来"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            anyhow::Ok(())
+        };
+        if let Err(e) = spawned.await {
+            unblock();
+            out_task.abort();
+            err_task.abort();
+            return Err(e);
+        }
+
+        let run = self.register_run(r.pid(), script, status.pid_host.clone(), Some(id));
+        // 杀谁：只认这条命令自己的组（pid 文件）。**没有兜底** —— 兜底的那个组是常驻
+        // shell 自己的，杀了它所有命令一起没
+        let guard = CommandGuard::new(status.pid_host.clone(), None);
+        let res = self
+            .collect(Collect {
+                started,
+                timeout,
+                status: &status,
+                out_task,
+                err_task,
+                tap,
+                out_cap,
+                err_cap,
+                guard,
+                exit_rx: None,
+                run,
+                using_bash: true,
+            })
+            .await;
+        unblock();
+        Ok(res)
     }
 
     async fn exec(
@@ -2080,16 +2476,17 @@ impl LinuxSandbox {
         // **宿主模式不登记** —— 那套归因靠 `TracerPid == 这条命令的 proot`，
         // 而宿主模式根本没有 proot（`procs()` 也因此直接回一句「用 ps/pgrep」）。
         let proot = matches!(self.mode, Mode::Proot(_));
-        if let (Some(pid), true) = (child_pgid, proot) {
-            self.register_run(pid, script, status.pid_host.clone());
-        }
+        let run = match (child_pgid, proot) {
+            (Some(pid), true) => self.register_run(pid, script, status.pid_host.clone(), None),
+            _ => None,
+        };
 
         // 退出状态 + 收尸走后台任务：proot 可能在给一条常驻进程当 tracer，活
         // 多久不知道，**不能在这里等它**。但也不能把 `Child` 丢了不管 —— 它是
         // 我们的子进程，没人 `wait` 就会变僵尸。
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
-        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let _ = exit_tx.send(child.wait().await);
         });
@@ -2117,8 +2514,43 @@ impl LinuxSandbox {
         ));
 
         // future 被丢掉（用户按停止 / 回合取消）时靠它收场
-        let mut guard = CommandGuard::new(status.pid_host.clone(), child_pgid);
+        let guard = CommandGuard::new(status.pid_host.clone(), child_pgid);
 
+        Ok(self
+            .collect(Collect {
+                started,
+                timeout,
+                status: &status,
+                out_task,
+                err_task,
+                tap,
+                out_cap,
+                err_cap,
+                guard,
+                exit_rx: Some(exit_rx),
+                run,
+                using_bash,
+            })
+            .await)
+    }
+
+    /// 命令起来之后的一切：等结束（状态文件 / 管道 EOF / 超时）、超时就按组杀、
+    /// 收输出、定退出码。每条命令一个 proot 的老路和常驻 shell 共用。
+    async fn collect(&self, c: Collect<'_>) -> ExecResult {
+        let Collect {
+            started,
+            timeout,
+            status,
+            out_task,
+            err_task,
+            tap,
+            out_cap,
+            err_cap,
+            mut guard,
+            exit_rx,
+            run,
+            using_bash,
+        } = c;
         // 等这次调用结束。两条独立的路，先到先算：
         //  - runner 写下的状态文件 = 命令真的退出了（proot 可能还在）
         //  - 两根管道都 EOF = 没人再拿着写端（proot 也退了）
@@ -2152,7 +2584,11 @@ impl LinuxSandbox {
         // 那条路上可能还差一拍没看到文件，再读一次。
         let status_code = match done {
             Done::Status(c) => Some(c),
-            _ => read_status_code(&status.host),
+            // 管道先关了：命令（里面那层）已经退了，写退出码的是外面那层，可能还差
+            // 几毫秒 —— 常驻 shell 那条路上很常见（以前要等 proot 整个退出，那时状态
+            // 文件早写好了）。有界地等一下
+            Done::PipesClosed => wait_status(&status.host, STATUS_AFTER_EOF).await,
+            Done::TimedOut => read_status_code(&status.host),
         };
         // 拿不到状态文件（runner 没起来、被我们杀了）才退回 proot 的退出码；
         // 这时它多半马上就退，但也可能还在当 tracer，所以是有界的等。
@@ -2160,22 +2596,24 @@ impl LinuxSandbox {
         // 超时不在此列：code / signal 都是我们自己定的，用不着 proot 的退出码 ——
         // 而它那会儿很可能正给一条刻意脱离的常驻进程当 tracer，白等 REAP_GRACE
         // （3 秒的超时能变成 5.5 秒返回）。
-        let proot_exit = if timed_out || status_code.is_some() {
-            None
-        } else {
-            let early = exit_rx.try_recv().ok().and_then(|r| r.ok());
-            match early {
-                Some(st) => Some(st),
-                None => tokio::time::timeout(REAP_GRACE, exit_rx)
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .and_then(|r| r.ok()),
+        let proot_exit = match exit_rx {
+            Some(mut exit_rx) if !timed_out && status_code.is_none() => {
+                let early = exit_rx.try_recv().ok().and_then(|r| r.ok());
+                match early {
+                    Some(st) => Some(st),
+                    None => tokio::time::timeout(REAP_GRACE, exit_rx)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .and_then(|r| r.ok()),
+                }
             }
+            _ => None,
         };
+        let pgid = guard.target();
         guard.disarm();
-        if let (Some(pid), true) = (child_pgid, proot) {
-            self.finish_run(pid);
+        if let Some(key) = run {
+            self.finish_run(key, pgid);
         }
 
         let code = if timed_out {
@@ -2204,7 +2642,7 @@ impl LinuxSandbox {
             signal_of_exit(code).or_else(|| proot_exit.and_then(|s| s.signal()))
         };
 
-        Ok(ExecResult {
+        ExecResult {
             code,
             signal,
             stdout: stdout_text,
@@ -2216,7 +2654,7 @@ impl LinuxSandbox {
             timed_out,
             full_output_path,
             using_bash,
-        })
+        }
     }
 
     /// 把捕获到的输出写进 rootfs 的 `/tmp`，返回沙箱内的路径。
@@ -2784,7 +3222,24 @@ async fn wait_for_done(
         if started.elapsed() >= timeout {
             break Done::TimedOut;
         }
-        tokio::time::sleep(STATUS_POLL).await;
+        tokio::time::sleep(poll_interval(started.elapsed())).await;
+    }
+}
+
+/// 管道都 EOF 之后，状态文件最多再等这么久
+const STATUS_AFTER_EOF: Duration = Duration::from_millis(500);
+
+/// 等状态文件出现（有界）。
+async fn wait_status(path: &Path, budget: Duration) -> Option<i32> {
+    let t = Instant::now();
+    loop {
+        if let Some(c) = read_status_code(path) {
+            return Some(c);
+        }
+        if t.elapsed() >= budget {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
@@ -2812,7 +3267,7 @@ async fn wait_for_quiet(
         if since >= OUTPUT_QUIET && tap.quiet_for(OUTPUT_QUIET) {
             return;
         }
-        tokio::time::sleep(STATUS_POLL).await;
+        tokio::time::sleep(poll_interval(since)).await;
     }
 }
 
@@ -3402,7 +3857,14 @@ mod tests {
             .unwrap();
         let proot = child.id() as i32;
         let pid_file = t.dir.join("nope.pid"); // 没有 pid 文件 = 退回 proot 自己的 pid
-        sb.register_run(proot, "setsid sh -c 'while :; do date; done'", pid_file);
+        let key = sb
+            .register_run(
+                proot,
+                "setsid sh -c 'while :; do date; done'",
+                pid_file,
+                None,
+            )
+            .unwrap();
 
         let fake = vec![
             RawProc {
@@ -3412,6 +3874,7 @@ mod tests {
                 state: 'S',
                 tracer: proot,
                 cmdline: "sh -c while :; do date; done".into(),
+                run_id: None,
             },
             // 上个 App 生命留下的孤儿 proot（名字对得上）＋它名下的 tracee
             RawProc {
@@ -3421,6 +3884,7 @@ mod tests {
                 state: 'S',
                 tracer: 0,
                 cmdline: "proot -0 -r /files/rootfs /bin/sh -c sleep 9".into(),
+                run_id: None,
             },
             RawProc {
                 pid: 9002,
@@ -3429,6 +3893,7 @@ mod tests {
                 state: 'S',
                 tracer: 4242,
                 cmdline: "别人的".into(),
+                run_id: None,
             },
             // **不是** proot 的 ppid==1 进程（桌面上那是 systemd 的服务）：
             // 列进「可以 kill」比漏掉糟得多 —— 这条就是那个坑的回归测试
@@ -3439,6 +3904,7 @@ mod tests {
                 state: 'S',
                 tracer: 0,
                 cmdline: "/usr/lib/systemd/systemd-journald".into(),
+                run_id: None,
             },
         ];
         // 命令还在跑：进 running，不逐个列进程
@@ -3472,7 +3938,7 @@ mod tests {
         );
 
         // 命令结束了，它还活着 = 刻意脱离的常驻进程：能拿到 pid 就能杀
-        sb.finish_run(proot);
+        sb.finish_run(key, None);
         let r = sb.procs_with(fake, None);
         assert!(r.running.is_empty());
         assert_eq!(r.leftovers.len(), 1);
@@ -3519,6 +3985,7 @@ mod tests {
             // 名字得对得上（`is_proot`）—— 只有 proot 才可能是「我们上一次
             // 生命留下的」，随便一个 ppid==1 的进程不行
             cmdline: "proot -0 -r /files/rootfs /bin/sh -c echo hi".into(),
+            run_id: None,
         };
         // 父进程还在、又不归我们的 → 不是孤儿（单元测试里 cargo 自己就是这种）
         let alive_parent = RawProc {
@@ -3528,6 +3995,7 @@ mod tests {
             state: 'S',
             tracer: 0,
             cmdline: "别人的孩子".into(),
+            run_id: None,
         };
         let r = sb.procs_with(vec![other, alive_parent], None);
         assert!(r.leftovers.is_empty() && r.running.is_empty());
@@ -3771,6 +4239,282 @@ mod tests {
             .unwrap();
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "pid {pid} 还活着 —— 进程组没杀干净");
+    }
+
+    // —— 常驻 shell（宿主模式下打开它：和沙箱里同一套协议，在本机就能跑） ——
+
+    // （在 macOS 上每条要多等 ~150ms：kqueue 对 FIFO 的 EOF 不报，读端要等到「输出安静」
+    // 那条上限才收。Linux / 安卓的 epoll 会报，手机上实测一条 34ms。只影响测试的速度。）
+    fn resident_sandbox(tag: &str) -> (TempRoot, LinuxSandbox) {
+        let t = TempRoot::new(tag);
+        let sb = LinuxSandbox::host(t.dir.clone()).with_resident();
+        (t, sb)
+    }
+
+    async fn run_ok(sb: &LinuxSandbox, script: &str) -> ExecResult {
+        sb.run(script, Duration::from_secs(20), None).await.unwrap()
+    }
+
+    /// 基本的：输出分开、退出码、cwd，而且真的是常驻 shell 跑的（带 AGENT_RUN_ID）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_runs_commands_with_separate_streams_and_exit_codes() {
+        let (t, sb) = resident_sandbox("res-basic");
+        let r = run_ok(
+            &sb,
+            "pwd; echo out; echo err >&2; echo id=$AGENT_RUN_ID; exit 7",
+        )
+        .await;
+        assert_eq!(r.code, 7, "{r:?}");
+        assert!(r.stdout.contains(&t.dir.display().to_string()), "{r:?}");
+        assert!(
+            r.stdout.contains("out") && !r.stdout.contains("err"),
+            "{r:?}"
+        );
+        assert_eq!(r.stderr.trim(), "err");
+        assert!(
+            !r.stdout.contains("id=\n") && r.stdout.contains("id="),
+            "走的是常驻 shell：{r:?}"
+        );
+        // `exit` 只结束这一条：常驻的那个还在，下一条照跑
+        let r = run_ok(&sb, "echo still here").await;
+        assert_eq!((r.code, r.stdout.trim()), (0, "still here"));
+        // 脚本自己设的 trap EXIT 不会把我们的退出码吃掉
+        let r = run_ok(&sb, "trap 'echo bye' EXIT; exit 3").await;
+        assert_eq!((r.code, r.stdout.trim()), (3, "bye"), "{r:?}");
+        // stdin 是 /dev/null：读 stdin 的命令不会挂住
+        let r = run_ok(&sb, "cat; echo done").await;
+        assert_eq!(r.stdout.trim(), "done");
+    }
+
+    /// 每条命令是常驻 shell 的一个 fork：cd / export / 变量都漏不到下一条
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_commands_do_not_leak_state_into_each_other() {
+        let (t, sb) = resident_sandbox("res-iso");
+        run_ok(&sb, "cd /; export LEAK=1; X=2; alias ll=ls; set -e").await;
+        let r = run_ok(
+            &sb,
+            "pwd; echo \"leak=${LEAK:-} x=${X:-}\"; false; echo after-false",
+        )
+        .await;
+        assert!(
+            r.stdout.contains(&t.dir.display().to_string()),
+            "cwd 回到原处：{r:?}"
+        );
+        assert!(r.stdout.contains("leak= x="), "{r:?}");
+        assert!(r.stdout.contains("after-false"), "set -e 也没漏过来：{r:?}");
+    }
+
+    /// 超时杀**这条命令的整组**（`&` 起的子孙一起），但杀不到常驻 shell 自己
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_timeout_kills_the_command_group_but_not_the_shell() {
+        let (t, sb) = resident_sandbox("res-kill");
+        let r = sb
+            .run(
+                "sh -c 'echo $$ > alive.pid; sleep 120' & sleep 120",
+                Duration::from_millis(800),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(r.timed_out, "{r:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid: i32 = std::fs::read_to_string(t.dir.join("alive.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "pid {pid} 还活着 —— 组没杀干净"
+        );
+        let r = run_ok(&sb, "echo ok").await;
+        assert_eq!(r.stdout.trim(), "ok", "常驻 shell 不该被一起杀");
+    }
+
+    /// 回合取消（future 被丢掉）：一样按组杀
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_cancel_kills_the_command_group() {
+        let (t, sb) = resident_sandbox("res-cancel");
+        let fut = sb.run("echo $$ > me.pid; sleep 120", Duration::from_secs(60), None);
+        let _ = tokio::time::timeout(Duration::from_millis(800), fut).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid: i32 = std::fs::read_to_string(t.dir.join("me.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(unsafe { libc::kill(pid, 0) } != 0, "取消之后 {pid} 还活着");
+    }
+
+    /// 刻意脱离的常驻进程：命令自己退出就返回，不等它
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_returns_when_the_command_exits_not_when_the_daemon_does() {
+        let (_t, sb) = resident_sandbox("res-daemon");
+        let started = Instant::now();
+        let r = run_ok(&sb, "setsid sleep 30 > /dev/null 2>&1 & echo started").await;
+        assert_eq!((r.code, r.stdout.trim()), (0, "started"), "{r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 几条命令同时跑（并行的工具调用、几个会话）：互不等，输出不串
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resident_runs_commands_concurrently() {
+        let (_t, sb) = resident_sandbox("res-par");
+        let sb = Arc::new(sb);
+        run_ok(&sb, "true").await; // 先把常驻 shell 起好，别把启动算进去
+        let started = Instant::now();
+        let tasks: Vec<_> = (0..5)
+            .map(|i| {
+                let sb = sb.clone();
+                tokio::spawn(async move { run_ok(&sb, &format!("sleep 1; echo n{i}")).await })
+            })
+            .collect();
+        for (i, h) in tasks.into_iter().enumerate() {
+            let r = h.await.unwrap();
+            assert_eq!(r.stdout.trim(), format!("n{i}"));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 常驻的那个被杀了：下一条命令照常（重起一个），不报错
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_resident_shell_is_replaced_transparently() {
+        let (_t, sb) = resident_sandbox("res-dead");
+        run_ok(&sb, "true").await;
+        let first = sb.resident.lock().unwrap().as_ref().unwrap().pid();
+        unsafe { libc::kill(-first, libc::SIGKILL) };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let r = run_ok(&sb, "echo again").await;
+        assert_eq!(r.stdout.trim(), "again", "{r:?}");
+        let second = sb.resident.lock().unwrap().as_ref().unwrap().pid();
+        assert_ne!(first, second, "换了一个新的");
+    }
+
+    /// `agent ps` 在常驻 shell 下的归因：几条命令共用一个 proot，按「在这条命令的组里」
+    /// 或「环境里带着它的 AGENT_RUN_ID」分（刻意 setsid 脱离的常驻进程走后一条）；常驻
+    /// bash 自己、别的命令的进程都不算它的
+    #[test]
+    fn procs_attributes_resident_commands_by_group_and_run_id() {
+        let t = TempRoot::new("procsres");
+        let sb = t.sandbox();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .unwrap();
+        let proot = child.id() as i32; // 常驻的那个 proot（只要求活着）
+        let key = sb
+            .register_run(
+                proot,
+                "nohup myserver &",
+                t.dir.join("gone.pid"),
+                Some("r1".into()),
+            )
+            .unwrap();
+        sb.finish_run(key, Some(7000));
+        let p = |pid: i32, pgid: i32, run_id: Option<&str>| RawProc {
+            pid,
+            ppid: 1,
+            pgid,
+            state: 'S',
+            tracer: proot,
+            cmdline: format!("proc {pid}"),
+            run_id: run_id.map(String::from),
+        };
+        let fake = vec![
+            p(7001, 7000, None),          // 还在这条命令的组里
+            p(7100, 7100, Some("r1")),    // setsid 脱离了，但环境带着它的 id
+            p(6000, proot, None),         // 常驻 bash 自己
+            p(7200, 7200, Some("other")), // 别的命令的
+        ];
+        let r = sb.procs_with(fake, None);
+        let pids: Vec<i32> = r.leftovers.iter().map(|e| e.pid).collect();
+        assert_eq!(pids, [7001, 7100], "{r:?}");
+        assert!(r.leftovers.iter().all(|e| e.command == "nohup myserver &"));
+        // 名下的进程都没了：登记清掉（常驻 proot 一直活着，`prune` 清不了它）
+        let r = sb.procs_with(vec![p(6000, proot, None)], None);
+        assert!(r.leftovers.is_empty());
+        assert!(
+            sb.runs.lock().unwrap().runs.is_empty(),
+            "结束且没进程的登记该清掉"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// `$$` 是这条命令自己的 pid（脚本里用了它就单独起 bash，见 `needs_own_shell`）：
+    /// 两条同时跑的命令各是各的，`kill $$` 只结束自己、杀不到常驻 shell
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dollar_dollar_is_the_command_not_the_resident_shell() {
+        let (_t, sb) = resident_sandbox("res-pid");
+        let sb = Arc::new(sb);
+        run_ok(&sb, "true").await;
+        let shell = sb
+            .resident
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .shell_pid()
+            .unwrap();
+        let (a, b) = tokio::join!(
+            run_ok(&sb, "echo $$; sleep 0.3"),
+            run_ok(&sb, "echo $$; sleep 0.3")
+        );
+        let (a, b) = (a.stdout.trim().to_string(), b.stdout.trim().to_string());
+        assert_ne!(a, b, "两条命令的 $$ 撞了");
+        assert_ne!(a, shell.to_string(), "$$ 不该是常驻 shell");
+        let r = run_ok(&sb, "echo before; kill -9 $$; echo never").await;
+        assert!(
+            r.stdout.contains("before") && !r.stdout.contains("never"),
+            "{r:?}"
+        );
+        let r = run_ok(&sb, "echo alive").await;
+        assert_eq!(r.stdout.trim(), "alive", "kill $$ 不该把常驻 shell 杀掉");
+    }
+
+    /// 很短的命令一条接一条：每条的退出码都得拿到（管道比状态文件先关的那个竞态 ——
+    /// 手机上实测出过 `exit -1`）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_reports_exit_codes_of_many_quick_commands() {
+        let (_t, sb) = resident_sandbox("res-quick");
+        for i in 0..60 {
+            let r = run_ok(&sb, &format!("echo {i}; exit {}", i % 4)).await;
+            assert_eq!(
+                (r.code, r.stdout.trim()),
+                (i % 4, i.to_string().as_str()),
+                "第 {i} 条：{r:?}"
+            );
+        }
+    }
+
+    /// 边跑边推输出（前端实时显示）照旧
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_streams_output_live() {
+        let (_t, sb) = resident_sandbox("res-live");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = sb
+            .run_live(
+                "echo a; sleep 0.3; echo b",
+                Duration::from_secs(10),
+                Some(tx),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.code, 0);
+        let mut got = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            got.extend(c);
+        }
+        assert_eq!(String::from_utf8_lossy(&got), "a\nb\n");
     }
 
     /// 管道正常关闭（常见情形）：drain 不能多 await 一次 —— 那条路上
