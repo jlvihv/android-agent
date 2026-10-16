@@ -3,6 +3,9 @@
    * 渲染 markdown 块。走 Svelte 组件而不是 {@html}：
    * 没有 XSS 面，样式也全在 Tailwind 里。
    *
+   * `base`：这段文字**来源文件**的目录（查看器渲染 `.md` 时给，如 `/root/docs/`），
+   * 文件里的相对链接按它解析；消息里不传。
+   *
    * 列表、引用可以嵌套，所以块和行内都是递归 snippet。
    */
   import { untrack } from 'svelte';
@@ -10,7 +13,7 @@
   import { parse, sandboxUrl, mediaKind, type Block, type Span, type Align } from '../lib/markdown';
   import { openViewer } from '../lib/viewer.svelte.ts';
 
-  let { text }: { text: string } = $props();
+  let { text, base = '' }: { text: string; base?: string } = $props();
 
   // 流式时每个 delta 都会改 text，一帧里可能来好几个。整段重新解析 +
   // 重新渲染一帧做一次就够了：变化先攒着，下一帧取最新值。
@@ -26,7 +29,7 @@
   });
   $effect(() => () => cancelAnimationFrame(raf));
 
-  const doc = $derived(parse(shown));
+  const doc = $derived(parse(shown, base));
 
   const HEADING = ['', 'text-xl', 'text-lg', 'text-base', 'text-base', 'text-sm', 'text-sm'];
   const ALIGN: Record<string, string> = { left: 'text-left', center: 'text-center', right: 'text-right' };

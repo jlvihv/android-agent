@@ -2,8 +2,9 @@
   /**
    * 沙箱文件查看器：全屏覆盖层，从右边滑进来。
    *
-   * 分四种：音视频用播放器；图片居中显示；**网页**（.html / 目录列表）放 iframe；
-   * 其余文本（.sh / .py / .json / …）自己拉出来渲染成等宽文本。
+   * 分五种：音视频用播放器；图片居中显示；**网页**（.html / 目录列表）放 iframe；
+   * markdown（.md / .markdown）拉出来渲染成文档；其余文本（.sh / .py / .json / …）
+   * 自己拉出来渲染成等宽文本。
    *
    * 为什么文本不丢给 iframe：`.sh` 要是发成 `application/x-sh`，WebView 不认，
    * iframe 里一片空白。服务端把这些发成 `text/plain` 了，
@@ -25,15 +26,19 @@
   import { probeBackground } from '../lib/pagebg';
   import { mediaKind, sandboxPageUrl } from '../lib/markdown';
   import TextView from './TextView.svelte';
+  import MarkdownFile from './MarkdownFile.svelte';
 
   const IMAGE = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i;
   /** 明确是网页的扩展名 */
   const HTMLISH = /\.(x?html?|xhtml|php)$/i;
   /** 有没有「像扩展名」的后缀。没有的（`报告`、`LICENSE`）当网页/目录处理 */
   const HAS_EXT = /\.[a-z0-9]+$/i;
+  /** markdown：渲染成文档看，而不是把源码丢进 TextView */
+  const MARKDOWN = /\.(md|markdown|mdown|mkd)$/i;
 
   const path = $derived((viewer.url ?? '').split(/[?#]/)[0]);
   const isImage = $derived(viewer.kind === 'image' || IMAGE.test(path));
+  const isMarkdown = $derived(!isImage && MARKDOWN.test(path));
   // 目录列表是服务端生成的 HTML：带结尾斜杠的、或者**没有扩展名**的都可能是它
   // （服务端对不带斜杠的目录会 302 到带斜杠的，fetch 会跟着走，拿回来是 HTML）。
   // 反过来，有扩展名的（.sh/.py/.json/…）才走文本视图。
@@ -170,6 +175,8 @@
         style:background={frameBg}
         class="absolute inset-0 size-full"
       ></iframe>
+    {:else if isMarkdown}
+      <MarkdownFile url={viewer.url ?? ''} />
     {:else}
       <TextView url={viewer.url ?? ''} />
     {/if}

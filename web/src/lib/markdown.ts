@@ -108,11 +108,16 @@ function cells(row: string): string[] {
   return out;
 }
 
-export function parse(src: string): Block[] {
-  return blocks(src.replace(/\r\n?/g, '\n').split('\n'));
+/**
+ * `dir`：这段文字**所在文件**的目录（`/root/notes/`，以 / 结尾）。只有查看器渲染
+ * `.md` 文件时才给 —— 那种文件里的相对链接是相对它自己的，得先补成绝对路径
+ * （见 `resolveRelative`）。消息里的 markdown 传空串。
+ */
+export function parse(src: string, dir = ''): Block[] {
+  return blocks(src.replace(/\r\n?/g, '\n').split('\n'), dir);
 }
 
-function blocks(lines: string[]): Block[] {
+function blocks(lines: string[], dir: string): Block[] {
   const out: Block[] = [];
   let i = 0;
 
@@ -146,7 +151,7 @@ function blocks(lines: string[]): Block[] {
 
     const h = HEADING.exec(line);
     if (h) {
-      out.push({ t: 'h', level: h[1].length, spans: inline(h[2]) });
+      out.push({ t: 'h', level: h[1].length, spans: inline(h[2], dir) });
       i++;
       continue;
     }
@@ -170,10 +175,10 @@ function blocks(lines: string[]): Block[] {
       while (i < lines.length && !blank(lines[i]) && lines[i].includes('|')) {
         const c = cells(lines[i]);
         // 列数对齐表头：少的补空，多的丢掉
-        rows.push(head.map((_, k) => inline(c[k] ?? '')));
+        rows.push(head.map((_, k) => inline(c[k] ?? '', dir)));
         i++;
       }
-      out.push({ t: 'table', align, head: head.map((c) => inline(c)), rows });
+      out.push({ t: 'table', align, head: head.map((c) => inline(c, dir)), rows });
       continue;
     }
 
@@ -186,13 +191,13 @@ function blocks(lines: string[]): Block[] {
         else inner.push(lines[i]);
         i++;
       }
-      out.push({ t: 'quote', blocks: blocks(inner) });
+      out.push({ t: 'quote', blocks: blocks(inner, dir) });
       continue;
     }
 
     const m = ITEM.exec(line);
     if (m) {
-      i = list(lines, i, out);
+      i = list(lines, i, out, dir);
       continue;
     }
 
@@ -202,14 +207,14 @@ function blocks(lines: string[]): Block[] {
       para.push(lines[i].trim());
       i++;
     }
-    out.push({ t: 'p', spans: inline(para.join('\n')) });
+    out.push({ t: 'p', spans: inline(para.join('\n'), dir) });
   }
 
   return out;
 }
 
 /** 从第 i 行开始收一个列表，推进 out，返回下一个未消费的行号 */
-function list(lines: string[], i: number, out: Block[]): number {
+function list(lines: string[], i: number, out: Block[], dir: string): number {
   const first = ITEM.exec(lines[i])!;
   const base = indentOf(lines[i]);
   const ordered = first[3] !== undefined;
@@ -266,7 +271,7 @@ function list(lines: string[], i: number, out: Block[]): number {
       body[0] = body[0].slice(tm[0].length);
     }
     if (body.some((b, k) => k > 0 && blank(b))) tight = false;
-    items.push({ task, blocks: blocks(body) });
+    items.push({ task, blocks: blocks(body, dir) });
 
     // 项之间的空行已经被上面的内层循环吃掉了，这里直接看下一行
   }
@@ -362,7 +367,52 @@ export function sandboxUrl(href: string): string | null {
   return sandboxPath(decoded) + tail;
 }
 
-export function inline(src: string): Span[] {
+/**
+ * 相对地址 → 所在文件目录下的**沙箱绝对路径**（`/root/notes/a.md`）。
+ *
+ * 消息里的 `preview:` 链接是模型写的，本来就是绝对路径；而 md **文件**里的
+ * `[docs/07](07-debugging.md)`、`![](images/a.png)` 是相对文件自己写的，得先补成
+ * 绝对路径，`safeHref` 才会把它当沙箱文件、渲染成能点能看的链接。
+ *
+ * `dir` 是所在目录（以 `/` 结尾），为空时（消息、思考面板）原样返回。
+ */
+export function resolveRelative(href: string, dir: string): string {
+  const h = href.trim();
+  if (!dir || !h) return href;
+  // 有协议的、协议相对的、已经是绝对路径的、纯锚点的：都不是「相对」
+  if (/^[a-z][a-z0-9+.-]*:/i.test(h) || h.startsWith('//') || h.startsWith('/') || h.startsWith('#')) {
+    return href;
+  }
+  const cut = h.search(/[?#]/);
+  const path = cut === -1 ? h : h.slice(0, cut);
+  const tail = cut === -1 ? '' : h.slice(cut);
+  // `.` / `..` 就地折算，和浏览器解相对地址一个意思
+  const out: string[] = [];
+  for (const seg of (dir + path).split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') out.pop();
+    else out.push(seg);
+  }
+  return `/${out.join('/')}${path.endsWith('/') ? '/' : ''}${tail}`;
+}
+
+/**
+ * `/sandbox/<钥匙>/root/x.md` → `/root/x.md`（沙箱里的路径）。
+ *
+ * 查看器渲染 md 时要拿**文件所在目录**当基准去解相对链接，而它手上只有服务端 URL。
+ * 不是沙箱地址（附件、外链）返回 null。钥匙不参与匹配，只看形状。
+ */
+export function sandboxGuestPath(url: string): string | null {
+  const m = /^\/sandbox\/[^/?#]+(\/[^?#]*)/.exec(url.split(/[?#]/)[0]);
+  if (!m) return null;
+  try {
+    return decodeURI(m[1]);
+  } catch {
+    return m[1];
+  }
+}
+
+export function inline(src: string, dir = ''): Span[] {
   const out: Span[] = [];
   let text = '';
   const flush = () => {
@@ -402,7 +452,7 @@ export function inline(src: string): Span[] {
 
     // 强调 / 删除线
     if (c === '*' || c === '_' || c === '~') {
-      const span = emphasis(src, i);
+      const span = emphasis(src, i, dir);
       if (span) {
         flush();
         out.push(span.node);
@@ -415,7 +465,7 @@ export function inline(src: string): Span[] {
     if (c === '!' && src[i + 1] === '[') {
       const l = link(src, i + 1);
       if (l) {
-        const href = safeHref(l.href);
+        const href = safeHref(resolveRelative(l.href, dir));
         flush();
         if (href && !/^mailto:/i.test(href)) out.push({ t: 'img', src: href, alt: l.text });
         else text += l.text;
@@ -429,8 +479,8 @@ export function inline(src: string): Span[] {
       const l = link(src, i);
       if (l) {
         flush();
-        const href = safeHref(l.href);
-        const c2 = inline(l.text);
+        const href = safeHref(resolveRelative(l.href, dir));
+        const c2 = inline(l.text, dir);
         if (href) out.push({ t: 'link', href, c: c2 });
         else out.push(...c2);
         i = l.end;
@@ -477,7 +527,7 @@ export function inline(src: string): Span[] {
  *   - `_` 两侧是字母数字时不算（snake_case）
  *   - 内容递归解析，所以 `**粗体里的 *斜体***` 能嵌套
  */
-function emphasis(src: string, i: number): { node: Span; end: number } | null {
+function emphasis(src: string, i: number, dir: string): { node: Span; end: number } | null {
   const c = src[i];
   let n = 1;
   while (src[i + n] === c) n++;
@@ -503,7 +553,7 @@ function emphasis(src: string, i: number): { node: Span; end: number } | null {
     const before = src[run - 1];
     const wordAfter = c === '_' && WORD.test(src[end + n] ?? '');
     if (end > i + n && !/\s/.test(before) && !wordAfter && (c !== '~' || r === 2)) {
-      const inner = inline(src.slice(i + n, end));
+      const inner = inline(src.slice(i + n, end), dir);
       const node: Span =
         c === '~'
           ? { t: 'del', c: inner }
