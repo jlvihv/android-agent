@@ -427,36 +427,19 @@ impl CdpBrowser {
                 };
                 Ok(ok(&format!("{head}\n{text}"), None, None))
             }
+            // 只取渲染后的 HTML：抽正文和排版在 `Core::browser` 里做（和手机、和
+            // `agent readable` 同一套，见 readable.rs）
             "get_readable" => {
                 let session = self.session(g)?;
                 let conn = self.ensure_conn(g)?;
-                let js = page_js("readable", json!({}))?;
+                let js = page_js("page_html", json!({}))?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
                 }
-                // 和手机那边（`BrowserController.getReadable`）一字不差：同一个动作，
-                // 模型在两种机器上看到的该是同一个样子
-                let s = |k: &str| out.get(k).and_then(|v| v.as_str()).unwrap_or("");
-                let mut text = s("text").to_string();
-                if text.chars().count() > TEXT_MAX_CHARS {
-                    text = text.chars().take(TEXT_MAX_CHARS).collect::<String>() + "\n…（已截断）";
-                }
-                let chars = out.get("length").and_then(|v| v.as_u64()).unwrap_or(0);
-                let title = s("title");
-                let title = if title.is_empty() {
-                    String::new()
-                } else {
-                    format!("：【{title}】")
-                };
-                Ok(ok(
-                    &format!(
-                        "正文{title}（原文 {chars} 字，来源 {}）\n{text}",
-                        s("source")
-                    ),
-                    None,
-                    None,
-                ))
+                let mut v = out;
+                v["ok"] = json!(true);
+                Ok(v)
             }
             "wait_for_dom_stable" => {
                 let secs = a
@@ -1947,13 +1930,22 @@ mod tests {
         let v = act(json!({"action": "get_text"}));
         assert!(text_of(&v).contains("hello 骨架"), "{v}");
         assert!(text_of(&v).contains("一个链接"), "{v}");
+        // get_readable：后端只回渲染后的 HTML，看不见的元素标上 hidden（排版在 Core 里）
         let v = act(json!({"action": "get_readable"}));
-        let t = text_of(&v);
-        assert!(t.contains("这是一段正文"), "{t}");
+        assert_eq!(v["ok"], true, "{v}");
+        let html = v["html"].as_str().expect("要回 html");
+        assert!(html.contains("这是一段正文"), "{html}");
         assert!(
-            t.contains("body(fallback)") || t.contains("best-block"),
-            "{t}"
+            html.contains(r#"<div id="secret" style="display:none" hidden="">"#),
+            "CSS 藏起来的要标上 hidden：{html}"
         );
+        let t = crate::readable_reply(html).unwrap();
+        assert!(t.contains("这是一段正文") && !t.contains("藏起来"), "{t}");
+        // 标记取完就摘掉：页面原样不动
+        let v = act(
+            json!({"action": "js", "script": "return document.querySelectorAll('[hidden]').length;"}),
+        );
+        assert!(text_of(&v).contains('0'), "{v}");
 
         // 输入 + 点击 + JS 读回来
         let v = act(json!({"action": "type", "selector": "#q", "text": "abc"}));
@@ -2068,6 +2060,7 @@ mod tests {
 <meta name="viewport" content="width=device-width, initial-scale=1"></head><body>
 <h1 id="h">hello 骨架</h1>
 <p>这是一段正文，长到足够让 readable 认出它来，不然会被当成噪音丢掉。</p>
+<div id="secret" style="display:none">藏起来的字不该被读出来</div>
 <a href="/x">一个链接</a>
 <input id="q" placeholder="搜索">
 <button id="go" onclick="document.title='clicked'">点我</button>

@@ -483,7 +483,11 @@ impl SessionStore {
         let mut v: Vec<&ChatSession> = self.sessions.iter().filter(|s| s.has_content()).collect();
         // created_at 撞车（同一毫秒建的）时拿 id 兜底：顺序必须**确定** ——
         // 同一个列表反复拉，每次都得一模一样，不然抽屉又会自己动
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         v.into_iter()
             .map(|s| {
                 json!({

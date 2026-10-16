@@ -39,7 +39,7 @@ pub const KINDS: &[&str] = &[
     "dom_sig",
     "page_info",
     "backbone",
-    "readable",
+    "page_html",
     "click_sel",
     "click_xy",
     "type",
@@ -72,7 +72,7 @@ pub fn build(kind: &str, params: &str) -> Result<String, String> {
     Ok(match kind {
         "dom_sig" => DOM_SIG_JS.to_string(),
         "page_info" => PAGE_INFO_JS.to_string(),
-        "readable" => READABLE_JS.to_string(),
+        "page_html" => PAGE_HTML_JS.to_string(),
         "target_fix" => TARGET_FIX_JS.to_string(),
         "backbone" => backbone_js(num("max_depth", 5).clamp(1, 10) as usize),
         "click_sel" => click_sel_js(&s("selector")?),
@@ -570,108 +570,37 @@ const BACKBONE_JS: &str = r##"
 })()
 "##;
 
-/// 抽正文（Readability 的简化版，只留真管用的那几条）。
-const READABLE_JS: &str = r##"
+/// 取渲染后的整页 HTML（`get_readable` 用：抽正文在核心里做，和 `agent readable`
+/// 同一套，见 `readable.rs`）。
+///
+/// 浏览器比一段 HTML 字符串多知道一件事：**哪些元素看不见**（CSS 藏起来的弹窗、
+/// 折叠菜单、移动版 / 桌面版二选一的那半）。所以先把它们临时标上 `hidden`（解析器
+/// 跳过带 `hidden` 的元素），取完 `outerHTML` 马上摘掉，页面原样不动。
+/// 本来就带 `hidden` 的不碰；藏起来的元素里面不用再往下看。
+const PAGE_HTML_JS: &str = r##"
 (function() {
-  var SKIP_TAGS = {NAV:1, FOOTER:1, ASIDE:1, HEADER:1, FORM:1, SCRIPT:1, STYLE:1, NOSCRIPT:1, IFRAME:1, BUTTON:1, SELECT:1};
-  var JUNK = /(^|[\s_-])(nav|menu|sidebar|footer|header|comment|share|sharing|social|promo|ads?|advert|breadcrumb|cookie|consent|privacy|legal|terms|gdpr|ccpa|disclaimer|banner|subscribe|newsletter|signup|login|paywall|related|recommend|popup|modal|toolbar|masthead)([\s_-]|$)/i;
-  var POS = /(^|[\s_-])(article|body|content|entry|main|page|post|story|text|blog|read)([\s_-]|$)/i;
-  var NEG = /(^|[\s_-])(nav|menu|sidebar|footer|comment|promo|related|recommend|popular|banner|cookie|consent|privacy|legal|terms|gdpr|subscribe|newsletter|signup|login|paywall|popup|modal|advert|ads?|social|share|widget|tool|tags)([\s_-]|$)/i;
-  function t(el) { return (el.innerText || el.textContent || '').trim(); }
-  function names(el) {
-    return (typeof el.className === 'string' ? el.className : '') + ' ' +
-           (el.id || '') + ' ' + (el.getAttribute ? (el.getAttribute('role') || '') : '');
-  }
-  function inChrome(el) {
-    try { return !!el.closest('nav, footer, aside, header, form, [aria-hidden="true"]'); } catch (e) { return false; }
-  }
-  // 自己或**上面 6 层**里任何一层像周边，就当周边。只查自己不够 ——
-  // 周边信息常常长这样：一堆正常 `<p>` 包在一个 `#...CookieNotice` 壳里。
-  function junk(el) {
-    var cur = el, depth = 0;
-    while (cur && cur !== document.body && depth++ < 6) {
-      if (JUNK.test(names(cur))) return true;
-      cur = cur.parentElement;
+  var marked = [];
+  var root = document.body || document.documentElement;
+  var walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+    acceptNode: function(el) {
+      if (el.hasAttribute('hidden')) return NodeFilter.FILTER_REJECT;
+      var st = getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden') {
+        marked.push(el);
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
     }
-    return false;
+  });
+  while (walker.nextNode()) {}
+  var html;
+  try {
+    for (var i = 0; i < marked.length; i++) marked[i].setAttribute('hidden', '');
+    html = document.documentElement.outerHTML;
+  } finally {
+    for (var i = 0; i < marked.length; i++) marked[i].removeAttribute('hidden');
   }
-  function hidden(el) {
-    var st = getComputedStyle(el);
-    return st.display === 'none' || st.visibility === 'hidden';
-  }
-  function bad(el) { return SKIP_TAGS[el.tagName] || inChrome(el) || hidden(el) || junk(el); }
-  function weight(el) {
-    var s = names(el);
-    if (NEG.test(s)) return 0.15;
-    if (POS.test(s)) return 2;
-    return 1;
-  }
-
-  var h1 = null;
-  var hs = document.querySelectorAll('h1');
-  for (var i = 0; i < hs.length; i++) {
-    if (!bad(hs[i]) && t(hs[i]).length > 3) { h1 = hs[i]; break; }
-  }
-
-  var cands = document.querySelectorAll('article, main, [role=main], div, section, td');
-  var best = null, bestScore = 0;
-  for (var i = 0; i < cands.length; i++) {
-    var c = cands[i];
-    if (bad(c)) continue;
-    var ps = c.querySelectorAll('p');
-    if (!ps.length) continue;
-    var s = 0;
-    for (var j = 0; j < ps.length; j++) {
-      var p = ps[j];
-      if (bad(p)) continue;
-      var pt = t(p);
-      if (pt.length < 25) continue;
-      s += 1 + Math.min(pt.length / 100, 3);
-    }
-    if (s <= 0) continue;
-    s *= weight(c);
-    if (h1 && c.contains(h1)) s += 20;
-    var all = t(c);
-    var linkLen = 0;
-    var as = c.querySelectorAll('a');
-    for (var k = 0; k < as.length; k++) linkLen += t(as[k]).length;
-    if (all.length > 0 && linkLen / all.length > 0.5) s *= 0.3;
-    s += Math.min(all.length / 1000, 5);
-    if (s > bestScore) { bestScore = s; best = c; }
-  }
-
-  var host = best, source = 'best-block';
-  if (!host || bestScore < 6) { host = document.body; source = 'body(fallback)'; }
-
-  var chunks = [];
-  var nodes = host.querySelectorAll('h1, h2, h3, p, li, blockquote, pre, figcaption');
-  for (var i = 0; i < nodes.length; i++) {
-    var n = nodes[i];
-    if (bad(n)) continue;
-    if (n.tagName === 'LI' && n.querySelector('p')) continue;
-    var txt = t(n);
-    if (!txt || txt.length < 2) continue;
-    if (n.tagName === 'PRE') { chunks.push('```\n' + (n.innerText || '') + '\n```'); continue; }
-    if (n.tagName === 'H1' || n.tagName === 'H2' || n.tagName === 'H3') { chunks.push('## ' + txt); continue; }
-    if (chunks.length > 400) break;
-    var links = n.querySelectorAll('a[href]');
-    if (links.length === 1 && t(links[0]).length > txt.length * 0.6) {
-      try {
-        var u = new URL(links[0].href);
-        var where = (u.host === location.host) ? (u.pathname + (u.search || '')) : (u.host + u.pathname);
-        chunks.push(txt + '  [' + where + ']');
-        continue;
-      } catch (e) {}
-    }
-    chunks.push(txt);
-  }
-  var out = [];
-  for (var i = 0; i < chunks.length; i++) {
-    if (i > 0 && chunks[i] === chunks[i - 1]) continue;
-    out.push(chunks[i]);
-  }
-  var body = out.join('\n\n');
-  return JSON.stringify({text: body.substring(0, 40000), length: body.length, source: source, title: document.title, url: location.href});
+  return JSON.stringify({html: html, hidden: marked.length, title: document.title, url: location.href});
 })()
 "##;
 
@@ -687,7 +616,7 @@ mod tests {
             ("dom_sig", "{}"),
             ("page_info", "{}"),
             ("backbone", "{}"),
-            ("readable", "{}"),
+            ("page_html", "{}"),
             ("target_fix", "{}"),
             ("click_sel", r#"{"selector":".a"}"#),
             ("click_xy", r#"{"x":1,"y":2}"#),

@@ -443,6 +443,9 @@ impl Core {
         // AI 写完网页能自己开来看。回来的结果再改写回 `preview:`
         let port = self.port();
         let key = self.state.auth().sandbox_key;
+        let readable = serde_json::from_str::<serde_json::Value>(action_json)
+            .ok()
+            .is_some_and(|v| v["action"] == "get_readable");
         let action = match serde_json::from_str::<serde_json::Value>(action_json) {
             Ok(mut v) => {
                 let mapped = v
@@ -474,6 +477,21 @@ impl Core {
         };
         let mut v: serde_json::Value =
             serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "text": raw }));
+        if readable {
+            // 两个后端都只回渲染后的 HTML：抽正文在这里做一次（在改写沙箱地址之前 ——
+            // 几 MB 的 HTML 没必要逐个字符串过一遍）
+            if let Some(html) = v.as_object_mut().and_then(|o| o.remove("html")) {
+                let html = html.as_str().unwrap_or("").to_string();
+                let r = tokio::task::spawn_blocking(move || readable_reply(&html)).await?;
+                match r {
+                    Ok(text) => v["text"] = serde_json::Value::String(text),
+                    Err(e) => {
+                        v["ok"] = serde_json::Value::Bool(false);
+                        v["text"] = serde_json::Value::String(e);
+                    }
+                }
+            }
+        }
         rewrite_strings(&mut v, &|s| http::sandbox_url_to_guest(s, port, &key));
         // 截图：图本体在沙箱里（Kotlin 写的），**不会**自动进上下文 ——
         // 没有工具能把它挂到工具结果上，所以要让模型自己 read。
@@ -839,6 +857,26 @@ impl Core {
             .map_err(|e| anyhow::anyhow!("runtime thread died: {e}"))?
             .map_err(|e| anyhow::anyhow!(e))
     }
+}
+
+/// `get_readable` 一次最多给多少字（和 `get_text` 一样 —— 浏览器动作的结果会进历史）
+const READABLE_MAX_CHARS: usize = 12_000;
+
+/// `get_readable` 取回的整页 HTML → 正文（和 `agent readable` 一个样子，只多一个长度上限）。
+fn readable_reply(html: &str) -> Result<String, String> {
+    let a = readable::extract(html).map_err(|_| {
+        "页面里没有可读的文字（还没加载完？先 `agent browser wait_for_dom_stable` 再试）"
+            .to_string()
+    })?;
+    let text = readable::render(&a);
+    let total = text.chars().count();
+    if total <= READABLE_MAX_CHARS {
+        return Ok(text);
+    }
+    let head: String = text.chars().take(READABLE_MAX_CHARS).collect();
+    Ok(format!(
+        "{head}\n…（已截断，全文 {total} 字；页面不靠 JS 渲染的话，`curl -sL <url> | agent readable > 文件` 能拿到全文）"
+    ))
 }
 
 /// 把一个 JSON 里所有字符串都过一遍 `f`。

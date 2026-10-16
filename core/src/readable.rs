@@ -1,7 +1,12 @@
-//! `agent readable`：给一段 HTML，抽出文章正文（纯文本）。
+//! 抽文章正文：给一段 HTML，回纯文本。
 //!
-//! 像一个普通的 Unix 工具：只管 HTML → 文字，不联网（网页由 curl / wget 去拿），
-//! `curl -sL <url> | agent readable`。
+//! 两个入口共用这一份：
+//!
+//! - `agent readable`：像一个普通的 Unix 工具，只管 HTML → 文字，不联网（网页由
+//!   curl / wget 去拿），`curl -sL <url> | agent readable`
+//! - `agent browser get_readable`：浏览器（手机 WebView / 电脑无头 Chrome）取回渲染后的
+//!   整页 HTML，看不见的元素已标上 `hidden`（`browser_js.rs` 的 `page_html`），在
+//!   `Core::browser` 里过这里
 //!
 //! ## 怎么找正文
 //!
@@ -26,8 +31,7 @@
 //!
 //! ## 排成什么样
 //!
-//! 和浏览器里那份 `READABLE_JS`（`browser_js.rs`）一个写法 —— 模型从两边拿到的正文长得
-//! 一样：段落之间空一行；标题写成 `## 标题`；`<pre>` 包进 ```` ``` ````；一段话基本就是
+//! 段落之间空一行；标题写成 `## 标题`；`<pre>` 包进 ```` ``` ````；一段话基本就是
 //! 一个链接时后面附上 `  [去哪]`；相邻的重复块去掉。另外：数据表格一行一条、格子用
 //! ` | ` 隔开（排版用的表照普通块读）；`<br><br>` 分段的老网页照样分段。
 
@@ -886,7 +890,7 @@ fn collapse(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// 链接去哪：同站只写路径，别的站写 域名 + 路径（`READABLE_JS` 同款，外站的短查询串多留着）。
+/// 链接去哪：同站只写路径，别的站写 域名 + 路径（外站的短查询串留着）。
 /// 页内锚点、`javascript:` 不算去处。
 fn where_to(href: &str, host: &str) -> Option<String> {
     let href = href.trim();

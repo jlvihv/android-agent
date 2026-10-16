@@ -888,32 +888,16 @@ class BrowserController(private val app: Application) : BrowserHost {
     }
 
     /**
-     * 抽正文（文章页用它，不要用 get_text）。
-     *
-     * `get_text` 给的是整个 body 的 innerText，导航/页脚/推荐位/广告语全在上面 ——
-     * 一篇 CNBC 报道能拿回 6415 字，一半是菜单和免责声明。这里先找“最像正文的
-     * 容器”（段落密度 + 链接密度惩罚），再按文档顺序只取标题/段落/列表项/引用/代码，
-     * 顺带去重、去掉导航块。
+     * 抽正文（文章页用它，不要用 get_text）：这里只取渲染后的整页 HTML（看不见的元素
+     * 已标上 `hidden`），抽正文和排版在核心里做 —— 和电脑、和 `agent readable` 同一套
+     * （core/src/readable.rs）。
      */
     private fun getReadable(): JSONObject {
         ensureWeb()
-        val out = evalToJson(readableJs()) ?: return errObj("抽正文失败")
+        val out = evalToJson(js("page_html")) ?: return errObj("取页面 HTML 失败")
         out.optString("error").takeIf { it.isNotEmpty() }?.let { return errObj(it) }
-
-        // 和电脑那边（cdp.rs 的 get_readable）一字不差：同一个动作，模型在两种机器上
-        // 看到的该是同一个样子
-        val title = out.optString("title")
-        var text = out.optString("text")
-        val chars = out.optInt("length")
-        if (text.length > TEXT_MAX_CHARS) {
-            text = text.take(TEXT_MAX_CHARS) + "\n…（已截断）"
-        }
-        val head = buildString {
-            append("正文")
-            if (title.isNotEmpty()) append("：【$title】")
-            append("（原文 $chars 字，来源 ${out.optString("source")}）")
-        }
-        return ok("$head\n$text")
+        if (!out.has("html")) return errObj("取页面 HTML 失败")
+        return out.put("ok", true)
     }
 
     // -----------------------------------------------------------------------
@@ -1455,7 +1439,6 @@ class BrowserController(private val app: Application) : BrowserHost {
     private fun pressJs(key: String) = js("press", """{"key":${JSONObject.quote(key)}}""")
     private fun findElementsJs(selector: String) = js("find_elements", """{"selector":${JSONObject.quote(selector)}}""")
     private fun backboneJs(maxDepth: Int) = js("backbone", """{"max_depth":$maxDepth}""")
-    private fun readableJs() = js("readable")
     private fun targetFixJs() = js("target_fix")
     private fun domSigJs() = js("dom_sig")
     private fun pageInfoJs() = js("page_info")
