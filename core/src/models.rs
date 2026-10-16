@@ -11,8 +11,14 @@
 //! 判定方式：先用 base_url 认出是目录里的哪个 provider（精确 api → host），
 //! 再按模型 id 查 `modalities.input` 里有没有 `image`。
 //!
-//! 目录缓存进库里的 `http_cache`（原样存响应 + 抓取时刻），48 小时过期；
+//! 目录缓存进库里的 `http_cache`（抓取时刻 + **只留用得上的字段**），48 小时过期；
 //! 网络挂了就用旧缓存。
+//!
+//! 为什么不原样存：目录是全网的（230 家、8800 多个条目 —— 同一个模型在几十家网关下各登记
+//! 一次），原样 5.5MB，而这里只读每个模型的名字、输入模态、上下文 / 输出上限。存之前按
+//! `CatalogProvider` / `CatalogModel` 重新序列化一遍（反序列化时本来就只认这几项），
+//! 剩 1MB 出头 —— 手机上每 48 小时少往闪存写 4MB 多。其它服务商的条目**不能删**：
+//! 配的是中转站 / 自建网关时，靠「跨服务商按 id 查」认模型（见 `find_model`）。
 //! 判定不出来时返回 `None` —— 调用方保留原来的值，**不要**因为一次网络抖动
 //! 就把「能看图」刷成「不能」。
 
@@ -20,7 +26,7 @@ use std::collections::BTreeMap;
 
 use std::time::{Duration, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
 use crate::llm::Provider;
@@ -53,37 +59,51 @@ pub struct ModelInfo {
 
 type Catalog = BTreeMap<String, CatalogProvider>;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+// 这几个结构也是**缓存的格式**：只写有值的字段（见模块说明）
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct CatalogProvider {
     /// 这个 provider 的 API base，用来跟配置里的 base_url 对上
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     api: Option<String>,
     #[serde(default)]
     models: BTreeMap<String, CatalogModel>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct CatalogModel {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     modalities: Option<Modalities>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     limit: Option<Limit>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct Modalities {
     #[serde(default)]
     input: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct Limit {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     context: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     output: Option<u64>,
+}
+
+/// 缓存的那份：只留用得上的字段；名字和 id 一样的不存（查不到名字本来就用 id）。
+fn slim(mut cat: Catalog) -> String {
+    for p in cat.values_mut() {
+        for (id, m) in p.models.iter_mut() {
+            if m.name.as_deref() == Some(id.as_str()) {
+                m.name = None;
+            }
+        }
+    }
+    serde_json::to_string(&cat).unwrap_or_default()
 }
 
 /// 读目录：先用新鲜的缓存（库里的 `http_cache`）；没有就联网拉。联网失败退回旧缓存。
@@ -101,9 +121,9 @@ async fn catalog(refresh: bool, db: Option<&Db>) -> Option<Catalog> {
         }
     }
     match fetch_catalog().await {
-        Ok((cat, raw)) => {
+        Ok(cat) => {
             if let Some(db) = db {
-                if let Err(e) = db.put_cached(CATALOG_URL, &raw, now_secs()) {
+                if let Err(e) = db.put_cached(CATALOG_URL, &slim(cat.clone()), now_secs()) {
                     tracing::warn!("写 models.dev 缓存失败: {e:#}");
                 }
             }
@@ -123,7 +143,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-async fn fetch_catalog() -> anyhow::Result<(Catalog, String)> {
+async fn fetch_catalog() -> anyhow::Result<Catalog> {
     let http = crate::llm::shared_http()?;
     let resp = http
         .get(CATALOG_URL)
@@ -139,7 +159,7 @@ async fn fetch_catalog() -> anyhow::Result<(Catalog, String)> {
     let raw = resp.text().await?;
     let cat: Catalog = serde_json::from_str(&raw)?;
     anyhow::ensure!(!cat.is_empty(), "models.dev 目录是空的");
-    Ok((cat, raw))
+    Ok(cat)
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +484,42 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    /// 缓存的那份只留用得上的字段，读回来查出来的结果和原样的一样
+    #[test]
+    fn the_cached_catalog_keeps_only_what_is_used() {
+        let raw = r#"{"p":{"name":"P","api":"https://p.example/v1","doc":"https://…","models":{
+          "m1":{"id":"m1","name":"m1","description":"很长的一段介绍","cost":{"input":1},"release_date":"2026-01-01",
+                "modalities":{"input":["text","image"],"output":["text"]},"limit":{"context":1000,"output":10}},
+          "m2":{"id":"m2","name":"Model Two","modalities":{"input":["text"]}}}}}"#;
+        let cat: Catalog = serde_json::from_str(raw).unwrap();
+        let cached = slim(cat.clone());
+        for gone in [
+            "description",
+            "cost",
+            "release_date",
+            "doc",
+            "\"output\":[",
+            "\"name\":\"m1\"",
+        ] {
+            assert!(!cached.contains(gone), "{gone} 不该进缓存：{cached}");
+        }
+        let back: Catalog = serde_json::from_str(&cached).unwrap();
+        let key = provider_entry(&back, "https://p.example/v1").map(|(k, _)| k);
+        let m1 = find_model(&back, key, "m1").unwrap();
+        assert_eq!(model_vision(m1), Some(true));
+        assert_eq!(m1.limit.as_ref().and_then(|l| l.context), Some(1000));
+        assert_eq!(
+            find_model(&back, key, "m2").unwrap().name.as_deref(),
+            Some("Model Two")
+        );
+        assert!(
+            cached.len() * 2 < raw.len(),
+            "{} vs {}",
+            cached.len(),
+            raw.len()
+        );
     }
 
     #[test]

@@ -29,6 +29,9 @@ use crate::agent::{ChatMessage, ChatSession, SessionStore, Stub};
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+-- checkpoint 之后把 WAL 截回 1MB：默认不截，文件一直停在历史最高点（一次大写入之后
+-- WAL 比主库还大，实测 8MB 对 6MB）
+PRAGMA journal_size_limit = 1048576;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -1106,6 +1109,23 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 打开的库都限制了 WAL 的大小（不然一次大写入之后它一直停在最高点）
+    #[test]
+    fn the_wal_is_capped() {
+        let dir = std::env::temp_dir().join(format!("agent-db-wal-{}", uuid::Uuid::now_v7()));
+        let db = Db::open(&dir.join("sessions.db")).unwrap();
+        let limit: i64 = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, 1024 * 1024);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// 用量是拿来分析的：清空会话只是标记，删会话也不动它 —— 行一直在。
     /// 用量汇总：按天（只算最近 N 天）、按模型（全部历史，用得多的在前）；没报缓存的行按 0 算。
