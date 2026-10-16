@@ -482,7 +482,9 @@ impl Core {
             // 几 MB 的 HTML 没必要逐个字符串过一遍）
             if let Some(html) = v.as_object_mut().and_then(|o| o.remove("html")) {
                 let html = html.as_str().unwrap_or("").to_string();
-                let r = tokio::task::spawn_blocking(move || readable_reply(&html)).await?;
+                let spill = self.state.linux().map(|s| s.spill_dir());
+                let r = tokio::task::spawn_blocking(move || readable_reply(&html, spill.as_ref()))
+                    .await?;
                 match r {
                     Ok(text) => v["text"] = serde_json::Value::String(text),
                     Err(e) => {
@@ -862,8 +864,15 @@ impl Core {
 /// `get_readable` 一次最多给多少字（和 `get_text` 一样 —— 浏览器动作的结果会进历史）
 const READABLE_MAX_CHARS: usize = 12_000;
 
+/// 截断时全文存到哪：`(宿主上的目录, 沙箱里看到的路径)` —— 和 bash 输出溢出同一个地方
+/// （`LinuxSandbox::spill_dir`），文件名也是 `agent-out-` 开头，启动清扫一并收掉（见 `gc`）。
+type SpillDir = (std::path::PathBuf, String);
+
 /// `get_readable` 取回的整页 HTML → 正文（和 `agent readable` 一个样子，只多一个长度上限）。
-fn readable_reply(html: &str) -> Result<String, String> {
+///
+/// 超过上限：只给前面的**整行**（和 `read` 一样，不从一行中间劈开），全文存进溢出目录，
+/// 末尾写明在哪、用 `read` 从第几行接着读 —— 这里的行号就是那个文件的行号。
+fn readable_reply(html: &str, spill: Option<&SpillDir>) -> Result<String, String> {
     let a = readable::extract(html).map_err(|_| {
         "页面里没有可读的文字（还没加载完？先 `agent browser wait_for_dom_stable` 再试）"
             .to_string()
@@ -873,9 +882,39 @@ fn readable_reply(html: &str) -> Result<String, String> {
     if total <= READABLE_MAX_CHARS {
         return Ok(text);
     }
-    let head: String = text.chars().take(READABLE_MAX_CHARS).collect();
+    let (mut shown, mut lines, mut cut) = (0usize, 0usize, 0usize);
+    for line in text.split_inclusive('\n') {
+        let n = line.chars().count();
+        if shown + n > READABLE_MAX_CHARS {
+            break;
+        }
+        shown += n;
+        lines += 1;
+        cut += line.len();
+    }
+    if lines == 0 {
+        // 第一行就超长（几乎不会有）：只能按字截
+        cut = text
+            .char_indices()
+            .nth(READABLE_MAX_CHARS)
+            .map_or(text.len(), |(i, _)| i);
+        shown = READABLE_MAX_CHARS;
+    }
+    let head = text[..cut].trim_end();
+    let all_lines = text.lines().count();
+    let saved = spill.and_then(|(host, guest)| {
+        let name = format!("agent-out-readable-{}.txt", uuid::Uuid::now_v7());
+        std::fs::create_dir_all(host).ok()?;
+        std::fs::write(host.join(&name), &text).ok()?;
+        Some(format!("{}/{name}", guest.trim_end_matches('/')))
+    });
+    let next = match &saved {
+        Some(p) if lines > 0 => format!("全文在 {p}，用 read {p} offset={} 继续。", lines + 1),
+        Some(p) => format!("全文在 {p}，用 read 读。"),
+        None => "全文没能存下来。".to_string(),
+    };
     Ok(format!(
-        "{head}\n…（已截断，全文 {total} 字；页面不靠 JS 渲染的话，`curl -sL <url> | agent readable > 文件` 能拿到全文）"
+        "{head}\n\n[已截断：显示了前 {shown} 字（第 1-{lines} 行），全文 {total} 字、{all_lines} 行。{next}]"
     ))
 }
 
@@ -997,6 +1036,71 @@ async fn provision_tools(st: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `get_readable` 截断了：只给整行，全文存进溢出目录，`offset` 正好指向第一行没给的
+    #[test]
+    fn truncated_readable_saves_the_full_text_and_says_where_to_continue() {
+        let paras: String = (1..=600)
+            .map(|i| {
+                format!(
+                    "<p>第{i}段。这是一段足够长的正文，用来撑满上限，让截断真的发生在中间。</p>"
+                )
+            })
+            .collect();
+        let html = format!(
+            "<html><head><title>长文</title></head><body><article>{paras}</article></body></html>"
+        );
+        let dir =
+            std::env::temp_dir().join(format!("agent-readable-spill-{}", uuid::Uuid::now_v7()));
+        let spill: SpillDir = (dir.clone(), "/tmp".into());
+
+        let out = readable_reply(&html, Some(&spill)).unwrap();
+        let (shown, note) = out.rsplit_once("\n\n[已截断：").expect(&out);
+        assert!(shown.chars().count() <= READABLE_MAX_CHARS);
+        assert!(
+            shown.ends_with('。'),
+            "只截整行：{}",
+            &shown[shown.len() - 60..]
+        );
+
+        let path = note
+            .split("read ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        let name = path.strip_prefix("/tmp/").expect(path);
+        assert!(name.starts_with("agent-out-"), "启动清扫认这个前缀：{name}");
+        let full = std::fs::read_to_string(dir.join(name)).unwrap();
+        assert!(full.contains("第600段。"), "全文都在");
+
+        let offset: usize = note
+            .split("offset=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let lines: Vec<&str> = full.lines().collect();
+        assert_eq!(
+            lines[..offset - 1].join("\n").trim_end(),
+            shown,
+            "前面给的就是文件的前 offset-1 行"
+        );
+        assert!(!shown.contains(lines[offset - 1]) || lines[offset - 1].is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+
+        // 存不下来也照样回正文，只是说清楚
+        let out = readable_reply(&html, None).unwrap();
+        assert!(
+            out.ends_with("全文没能存下来。]"),
+            "{}",
+            &out[out.len() - 80..]
+        );
+    }
 
     /// agent 的浏览器打开沙箱文件：`preview:` 进去换成独立源上的 URL，
     /// 结果里的 URL 再换回 `preview:`（端口和钥匙不进历史）。网址原样。

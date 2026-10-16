@@ -127,7 +127,9 @@ ImageReader(RGBA) ──surface──> VirtualDisplay ──> Presentation 窗�
 `get_readable` 和 `agent readable` 是**同一套算法**（见下一小节）：两个后端（手机 WebView、
 电脑无头 Chrome）都只做一件事 —— 跑 `browser_js.rs` 里的 `page_html`，取回**渲染后**的整页
 HTML；抽正文、排版在 `Core::browser` 里做一次。所以两端、两个命令的输出一字不差（标题、作者
-/ 时间、正文），`get_readable` 只多一个 1.2 万字的上限（结果要进历史）。
+/ 时间、正文），`get_readable` 只多一个 1.2 万字的上限（结果要进历史）：超了只给前面的整行，
+全文存进 bash 输出溢出的同一个地方（`/tmp/agent-out-readable-*.txt`，启动时一并清掉），
+末尾写明用 `read <路径> offset=N` 接着读 —— 截掉的部分不会丢。
 
 浏览器比一段 HTML 字符串多知道两件事，都保住了：
 

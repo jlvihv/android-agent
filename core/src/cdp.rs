@@ -1939,7 +1939,7 @@ mod tests {
             html.contains(r#"<div id="secret" style="display:none" hidden="">"#),
             "CSS 藏起来的要标上 hidden：{html}"
         );
-        let t = crate::readable_reply(html).unwrap();
+        let t = crate::readable_reply(html, None).unwrap();
         assert!(t.contains("这是一段正文") && !t.contains("藏起来"), "{t}");
         // 标记取完就摘掉：页面原样不动
         let v = act(
