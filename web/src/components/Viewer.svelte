@@ -17,6 +17,7 @@
    * 页面就能拆掉自己的 sandbox。
    */
   import { quintOut } from 'svelte/easing';
+  import Img from './Img.svelte';
   import Icon from './Icon.svelte';
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
@@ -156,7 +157,7 @@
       </div>
     {:else if isImage}
       <div class="grid h-full place-items-center overflow-auto p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-        <img src={viewer.url} alt={viewer.title} class="max-h-full max-w-full object-contain" />
+        <Img src={viewer.url ?? ''} alt={viewer.title ?? ''} class="max-h-full max-w-full object-contain" />
       </div>
     {:else if isWebPage}
       <!-- 底色跟页面走（探不到就白底 —— 浏览器对无样式文档的默认）：

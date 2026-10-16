@@ -6,6 +6,7 @@
    * 列表、引用可以嵌套，所以块和行内都是递归 snippet。
    */
   import { untrack } from 'svelte';
+  import Img from './Img.svelte';
   import { parse, sandboxUrl, mediaKind, type Block, type Span, type Align } from '../lib/markdown';
   import { openViewer } from '../lib/viewer.svelte.ts';
 
@@ -84,7 +85,7 @@
         disabled={!local}
         onclick={() => local && openViewer(local, s.alt)}
       >
-        <img src={local ?? s.src} alt={s.alt} loading="lazy" class="max-h-80 max-w-full object-contain" />
+        <Img src={local ?? s.src} alt={s.alt} loading="lazy" class="max-h-80 max-w-full object-contain" />
       </button>
     {:else}
       {@const local = sandboxUrl(s.href)}

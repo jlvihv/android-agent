@@ -633,7 +633,7 @@ fn build_messages(
         // OpenAI 要求 assistant 的每个 tool_call 后面**紧跟着**对应的 tool
         // 消息，中间不能插 user —— 一个回合调了 3 个工具、只有第 1 个带图时，
         // 图绝不能插在第 1、2 个 tool 之间。
-        let mut carriers: Vec<(String, ImagePart)> = Vec::new();
+        let mut carriers: Vec<ImagePart> = Vec::new();
         while i < msgs.len() {
             match &msgs[i] {
                 ChatMessage::Tool {
@@ -646,15 +646,15 @@ fn build_messages(
                         content: content.clone(),
                     });
                     for img in images {
-                        carriers.push((tool_call_id.clone(), img.clone()));
+                        carriers.push(img.clone());
                     }
                     i += 1;
                 }
                 _ => break,
             }
         }
-        for (id, img) in carriers {
-            out.push(image_carrier(&id, &img, supports_images));
+        for img in carriers {
+            out.push(image_carrier(&img, supports_images));
         }
     }
     Ok(out)
@@ -665,11 +665,9 @@ fn build_messages(
 /// 为什么是 user 消息：Chat Completions 的 tool 消息内容只能是字符串，
 /// 工具结果里的图片没有别的合法位置可挂。Responses API 没这个问题（图片
 /// 直接放在 `function_call_output` 里，见 `build_responses_input`）。
-fn image_carrier(tool_call_id: &str, img: &ImagePart, supports_images: bool) -> Message {
-    let label = format!(
-        "[read 返回的图片（tool_call_id: {tool_call_id}）；原文件：{}]",
-        img.source
-    );
+fn image_carrier(img: &ImagePart, supports_images: bool) -> Message {
+    // 同一步读了好几张图时，靠路径分清哪张是哪张（tool_call_id 对模型没意义）
+    let label = format!("[read {}]", img.source);
 
     let mut parts: Vec<Part> = vec![text_part(label)];
     if supports_images {
@@ -679,14 +677,11 @@ fn image_carrier(tool_call_id: &str, img: &ImagePart, supports_images: bool) -> 
             Ok(url) => parts.push(image_part(url)),
             Err(e) => {
                 tracing::warn!("图片读不到了 {}: {e}", img.path);
-                parts.push(text_part("[图片文件已丢失，本轮没能附带]".to_string()));
+                parts.push(text_part("[图片文件丢了，没能附带]".to_string()));
             }
         }
     } else {
-        parts.push(text_part(
-            "[当前模型不支持图片输入，这张图没有附带；它在沙箱里，可以用 bash 处理或让用户在界面上看]"
-                .to_string(),
-        ));
+        parts.push(text_part("[当前模型看不了图，没有附带]".to_string()));
     }
 
     Message::User {
@@ -741,10 +736,7 @@ fn user_message(
         match a.kind {
             AttachmentKind::Image => {
                 if !supports_images {
-                    parts.push(text_part(format!(
-                        "[当前模型不支持图片输入，{}没有附带；可以让用户在界面上看，或存到沙箱用 bash 处理]",
-                        a.name
-                    )));
+                    parts.push(text_part("[当前模型看不了图，没有附带]".to_string()));
                     continue;
                 }
                 match crate::imaging::cached_data_url(&a.path, &a.mime) {
@@ -1707,10 +1699,7 @@ fn user_message_content(
         match a.kind {
             AttachmentKind::Image => {
                 if !supports_images {
-                    parts.push(input_text(format!(
-                        "[当前模型不支持图片输入，{}没有附带]",
-                        a.name
-                    )));
+                    parts.push(input_text("[当前模型看不了图，没有附带]".to_string()));
                     continue;
                 }
                 match crate::imaging::cached_data_url(&a.path, &a.mime) {
@@ -2628,9 +2617,9 @@ async fn execute_tool(
     ToolOutcome::error(format!("未知工具 {name}"))
 }
 
-/// 图片结果：缩好的字节落盘（历史回放时还要重发），回给模型一段能读的说明
-/// （mime、尺寸、大小、原图路径都在里面）；图片本体作为 `images` 走
-/// `build_messages` 里那条 carrier。
+/// 图片结果：缩好的字节落盘（历史回放时还要重发），回给模型一句说明（格式、原尺寸、
+/// 大小，缩过的话发过去多大）；图片本体作为 `images` 走 `build_messages` 里那条 carrier
+/// （Responses 协议直接放在工具结果里）。
 async fn read_image_outcome(
     core: &Core,
     guest_path: &str,
@@ -2644,19 +2633,20 @@ async fn read_image_outcome(
         .map(|p| core.state.cached_supports_images(&p))
         .unwrap_or(true);
 
+    // 只说图本身：格式、原尺寸、大小，缩过的话发过去的是多大（在图上估坐标要用）。
+    // 路径不回显 —— 就是模型自己刚传进来的那个。
     let mime = img.mime.clone();
     let size = crate::reader::fmt_size(img.source_bytes);
-    let original = format!("{}×{}", img.original_width, img.original_height);
-    let mut output = format!("读取图片 {mime}（{original}，{size}");
+    let mut output = format!(
+        "图片 {mime}，{}×{}，{size}",
+        img.original_width, img.original_height
+    );
     if (img.width, img.height) != (img.original_width, img.original_height) {
-        output.push_str(&format!("，已缩到 {}×{}", img.width, img.height));
+        output.push_str(&format!("（缩到 {}×{} 发给你）", img.width, img.height));
     }
-    output.push_str(&format!(
-        "）。原文件：{guest_path} —— 要裁剪或看元数据就用这个路径。"
-    ));
 
     if !supports_images {
-        output.push_str("\n[当前模型不支持图片输入，这张图没有发给模型]");
+        output.push_str("。当前模型看不了图，这张没发给你");
         return ToolOutcome::text(output);
     }
 
@@ -2671,7 +2661,7 @@ async fn read_image_outcome(
         },
         Err(e) => {
             tracing::warn!("图片落盘失败: {e:#}");
-            output.push_str(&format!("\n[图片没能保存，本轮没发给模型：{e:#}]"));
+            output.push_str(&format!("。图没能保存，这次没发给你：{e:#}"));
             ToolOutcome::text(output)
         }
     }

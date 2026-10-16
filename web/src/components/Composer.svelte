@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import Img from './Img.svelte';
   import AttachSheet from './AttachSheet.svelte';
   import ContextMeter from './ContextMeter.svelte';
   import { store } from '../lib/store.svelte.ts';
@@ -160,9 +161,10 @@
         <div class="relative">
           {#if c.state === 'ready'}
             {#if c.kind === 'image'}
-              <img
+              <Img
                 src={c.url}
                 alt={c.name}
+                compact
                 class="size-14 rounded-xl border border-hairline object-cover"
               />
             {:else}

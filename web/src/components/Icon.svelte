@@ -15,7 +15,7 @@
    *   gear 16.8 · newchat 16.8 · clock 16.6 · menu 16.2×10.2 · phone 10×16.6
    *   computer 16.2×15.5 · terminal 16.4×14.2 · sparkle 15.8
    *   chat 15.0 · pencil 14.9 · trash 14.6 · plus 14.2
-   *   file / newfile 12.8×14.6 · camera 16.4×13 · globe 16.8
+   *   file / newfile 12.8×14.6 · camera 16.4×13 · globe 16.8 · image / imagebroken 16.2×14.2
    *   send 11.8×13.2 · down 11.8×13.2 · stop 8 · back 7.3×12.8 · chevron 6.8×11.8
    */
   type Name =
@@ -36,6 +36,7 @@
     | 'gear'
     | 'camera'
     | 'image'
+    | 'imagebroken'
     | 'file'
     | 'newfile'
     | 'check'
@@ -214,6 +215,21 @@
     <rect x="2.8" y="3.8" width="14.4" height="12.4" rx="2" stroke="currentColor" stroke-width="1.8" />
     <circle cx="7.3" cy="8.2" r="1.4" stroke="currentColor" stroke-width="1.8" />
     <path d="m4.6 15.4 4-4 3.2 3.2 2.2-2.2 2 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{:else if name === 'imagebroken'}
+  <!-- 图裂了：和 `image` 同一个外框和小太阳（墨迹一样），一道折线裂纹从上到下劈穿画面。
+       试过把外框拆成错开的两半：20px 下要么缝粘成一条 S 形线，要么左半边窄得把太阳
+       挤没了，读起来像字母「B0」。完整外框 + 裂纹最好认。图片加载不出来时用。 -->
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" class={cls}>
+    <rect x="2.8" y="3.8" width="14.4" height="12.4" rx="2" stroke="currentColor" stroke-width="1.8" />
+    <circle cx="6.6" cy="7.8" r="1.3" fill="currentColor" />
+    <path
+      d="m11.4 3.8-1.6 4.4 2.4 2.6-1.8 2.4.8 3"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
   </svg>
 {:else if name === 'file'}
   <!-- 文件：右上折角 + 左下折角线。墨迹 12.8×14.6。 -->

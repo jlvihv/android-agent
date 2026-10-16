@@ -12,6 +12,7 @@
    * 每个思考、每次工具调用**各开各的面板**，面板里只有它自己。
    */
   import { tick } from 'svelte';
+  import Img from './Img.svelte';
   import { cubicIn } from 'svelte/easing';
   import type { Message, ToolPart } from '../lib/sse';
   import { sandboxPath } from '../lib/markdown';
@@ -471,7 +472,7 @@
               aria-label="查看大图：{a.name}"
               class="block max-w-full overflow-hidden rounded-card border border-hairline"
             >
-              <img src={a.url} alt={a.name} class="block max-h-48 max-w-full object-cover" />
+              <Img src={a.url} alt={a.name} class="block max-h-48 max-w-full object-cover" />
             </button>
           {:else}
             <span
@@ -689,7 +690,7 @@
 
             {#each res.images as img}
               <!-- 工具返回的图：展示原图（沙箱路由），模型看的是缩放后的那份 -->
-              <img
+              <Img
                 src={sandboxPath(img)}
                 alt="工具返回的图片"
                 class="max-h-80 w-auto self-start rounded-xl bg-hairline-soft object-contain"
