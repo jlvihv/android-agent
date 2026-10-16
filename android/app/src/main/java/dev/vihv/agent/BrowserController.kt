@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.webkit.CookieManager
@@ -89,6 +90,16 @@ class BrowserController(private val app: Application) : BrowserHost {
         private const val MAX_TABS = 4
 
         /**
+         * 一只标签这么久没被任何动作用到就自动关掉（每只 WebView 都占着渲染内存）。
+         * 和电脑那边（cdp.rs 的 `TAB_IDLE`）同一个值。不按「回合结束」关：回合结束多半
+         * 只是在等用户回话，下一句往往还要接着用同一页。
+         */
+        private const val TAB_IDLE_MS = 15 * 60_000L
+
+        /** 多久查一次 */
+        private const val SWEEP_MS = 60_000L
+
+        /**
          * 桌面版的 UA 和视口。
          *
          * **两个必须一起换**：只换 UA 不换视口的话，桌面版布局塞进 411px 宽，
@@ -108,6 +119,56 @@ class BrowserController(private val app: Application) : BrowserHost {
 
     private val main = Handler(Looper.getMainLooper())
 
+    /** 空闲太久被自动关掉的标签编号：模型再用它时说清楚是怎么没的 */
+    private val reaped = java.util.concurrent.CopyOnWriteArrayList<Int>()
+
+    /** 每 [SWEEP_MS] 查一次空闲标签（App 活着就一直转；在主线程上跑） */
+    private val sweeper = object : Runnable {
+        override fun run() {
+            sweepIdle()
+            main.postDelayed(this, SWEEP_MS)
+        }
+    }
+
+    init {
+        main.postDelayed(sweeper, SWEEP_MS)
+    }
+
+    /**
+     * 关掉超过 [TAB_IDLE_MS] 没用的标签。**主线程调**。
+     *
+     * 两种不碰：agent 正在跑动作（[lock] 拿不到 —— 这一轮跳过，下一轮再看），以及
+     * 面板正挂着给用户看的那只（人在看，不能在他眼前消失）。
+     */
+    private fun sweepIdle() {
+        if (!lock.tryLock()) return
+        try {
+            val now = SystemClock.elapsedRealtime()
+            val watched = if (panelHolder != null) curTab() else null
+            for (t in tabs.toList()) {
+                if (t === watched || now - t.lastUsed < TAB_IDLE_MS) continue
+                reaped.add(t.id)
+                dropTab(t)
+                Log.i(TAG, "标签 ${t.id} 空闲超过 ${TAB_IDLE_MS / 60_000} 分钟，自动关掉")
+            }
+            if (tabs.isEmpty()) refreshAttached()
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /** 现有标签的编号（从动作线程调） */
+    @Suppress("UNCHECKED_CAST")
+    private fun tabIds(): List<Int> = (onMain { tabs.map { it.id } } as? List<Int>) ?: emptyList()
+
+    /** 「没有标签 N」：是被自动回收的就说清楚 */
+    private fun missingTab(id: Int, have: List<Int>): String =
+        if (id in reaped) {
+            "标签 $id 空闲太久（${TAB_IDLE_MS / 60_000} 分钟没用），已经自动关掉了 —— 要用就重新 new_tab 打开"
+        } else {
+            "没有标签 $id（现有：$have；用 list_tabs 看）"
+        }
+
     /** 手机自己的 UA（建 WebView 时记下来，切桌面版后能切回）*/
     @Volatile
     private var defaultUa: String = DEFAULT_MOBILE_UA
@@ -120,6 +181,10 @@ class BrowserController(private val app: Application) : BrowserHost {
      * （`awaitLoad` 看到计数变了就以为自己的页好了）。
      */
     private class Tab(val id: Int, val web: WebView) {
+        /** 最后一次被动作用到（`dispatch` 开始和结束各记一次）。见 [sweepIdle] */
+        @Volatile
+        var lastUsed = SystemClock.elapsedRealtime()
+
         /** 页每次开始加载 +1（`onPageStarted`）*/
         val started = AtomicInteger()
 
@@ -501,7 +566,7 @@ class BrowserController(private val app: Application) : BrowserHost {
                 if (at >= 0) { setCurrent(at); true } else false
             } as? Boolean ?: false
             if (!ok) {
-                return err("没有标签 ${want}（当前有：${onMain { tabs.map { it.id } } ?: emptyList<Int>()}）")
+                return err(missingTab(want, tabIds()))
             }
         } else if (!managesTabs) {
             // 没给 tab：确保当前标签存在（第一次用浏览器时这里建第一只）
@@ -509,6 +574,10 @@ class BrowserController(private val app: Application) : BrowserHost {
         }
 
         curTab()?.lastError = null
+        // 「用了这只标签」：页面上的动作，以及切过去（就是要用它）。列 / 关标签不算 ——
+        // 不然一次 list_tabs 就能把当前那只一直续着（和电脑那边一样）
+        val usesTab = !managesTabs || name == "switch_tab"
+        if (usesTab) curTab()?.lastUsed = SystemClock.elapsedRealtime()
 
         val out: JSONObject = when (name) {
             "navigate" -> navigate(a.optString("url"))
@@ -531,6 +600,9 @@ class BrowserController(private val app: Application) : BrowserHost {
             "close_tab" -> closeTab(a.optInt("tab", 0))
             else -> return err("未知动作: $name")
         }
+
+        // 动作可能跑了很久（等加载）：结束时再记一次，免得刚用完就被当成空闲
+        if (usesTab) onMain { curTab()?.lastUsed = SystemClock.elapsedRealtime() }
 
         // 每个动作回都带上"我在哪只标签上"：模型多标签时靠它记账
         out.put("tab", onMain { curTab()?.id } ?: 0)
@@ -963,8 +1035,7 @@ class BrowserController(private val app: Application) : BrowserHost {
             true
         } as? Boolean ?: false
         if (!okSwitch) {
-            val have = onMain { tabs.map { it.id } } ?: emptyList<Int>()
-            return errObj("没有标签 $id（现有：$have；用 list_tabs 看）")
+            return errObj(missingTab(id, tabIds()))
         }
         val info = pageInfo()
         return JSONObject()
@@ -983,7 +1054,7 @@ class BrowserController(private val app: Application) : BrowserHost {
             refreshAttached()
             true
         } as? Boolean ?: false
-        if (!okClose) return errObj("没有标签 $target")
+        if (!okClose) return errObj(missingTab(target, tabIds()))
         val out = JSONObject().put("ok", true).put("closed", target)
         if ((onMain { tabs.size } as? Int ?: 0) > 0) {
             val info = pageInfo()

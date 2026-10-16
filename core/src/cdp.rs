@@ -44,7 +44,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -79,6 +79,15 @@ const TEXT_MAX_CHARS: usize = 12_000;
 /// 标签页上限。比手机（4 只）宽：电脑上几只标签能**并行**操作（见 `CdpBrowser`），
 /// 同时读几个网页正是用得上的时候；内存也不像手机那么紧。
 const MAX_TABS: usize = 8;
+
+/// 一只标签这么久没被任何动作用到，就自动关掉（它在 Chrome 里占着一个渲染进程）。
+/// 不按「会话 / 回合结束」关：回合结束多半只是在等用户回话，下一句往往还要接着用同一页。
+const TAB_IDLE: Duration = Duration::from_secs(15 * 60);
+/// 标签都关光了、整个浏览器又这么久没动作：把自己起的那个 Chrome 也关掉（几百 MB）。
+/// 下次要用时再起 —— profile 是持久的，登录态还在。
+const CHROME_IDLE: Duration = Duration::from_secs(30 * 60);
+/// 多久查一次
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// 截图质量。截图进的是模型上下文，不是相册。
 const SHOT_QUALITY: u32 = 80;
@@ -154,7 +163,8 @@ pub struct CdpBrowser {
     shots: ShotDir,
     /// 用户按了停止：正在跑的动作在下一个检查点退出
     cancelled: AtomicBool,
-    inner: Mutex<Inner>,
+    /// `Arc`：后台的回收线程拿一个弱引用（见 `spawn_sweeper`）
+    inner: Arc<Mutex<Inner>>,
 }
 
 /// 自己起的那个 Chrome 进程。`Drop` 就杀掉它 —— 核心退出 / 浏览器被换掉时
@@ -191,6 +201,26 @@ struct Inner {
     current: usize,
     next_id: i32,
     profile: Profile,
+    /// 最后一次有动作的时候（判断整个浏览器空闲了多久）
+    last_action: Instant,
+    /// 空闲太久被自动关掉的标签编号：模型再用它时说清楚是怎么没的
+    reaped: Vec<i32>,
+}
+
+impl Inner {
+    fn new(endpoint: String) -> Self {
+        Self {
+            conn: None,
+            chrome: None,
+            endpoint,
+            tabs: Vec::new(),
+            current: 0,
+            next_id: 1,
+            profile: Profile::Desktop,
+            last_action: Instant::now(),
+            reaped: Vec::new(),
+        }
+    }
 }
 
 /// 地址和标题**不缓存**：点链接、提交表单、跑 JS 都会让页面跳走，记下来的那份很快就
@@ -200,6 +230,8 @@ struct Tab {
     id: i32,
     target: String,
     page: Arc<Mutex<Page>>,
+    /// 最后一次被动作用到（选中它的那一下记一次，见 `page_action`）
+    last_used: Instant,
 }
 
 /// 一只标签自己的连接（直连页面那一端：消息里不带 sessionId）。
@@ -255,6 +287,12 @@ const TAB_ACTIONS: &[&str] = &[
 
 /// 「没有这只标签」：顺便列出现有的
 fn no_such_tab(g: &Inner, want: i64) -> String {
+    if g.reaped.iter().any(|&r| r as i64 == want) {
+        return format!(
+            "标签 {want} 空闲太久（{} 分钟没用），已经自动关掉了 —— 要用就重新 new_tab 打开",
+            TAB_IDLE.as_secs() / 60
+        );
+    }
     format!(
         "没有编号 {want} 的标签（现有的：{}；用 list_tabs 看）",
         g.tabs
@@ -268,16 +306,10 @@ fn no_such_tab(g: &Inner, want: i64) -> String {
 impl CdpBrowser {
     /// 连一个**已经在跑**的 Chrome（`AGENT_CDP` 指的那个）
     pub fn connect_to(endpoint: String, shots: ShotDir) -> Self {
+        let inner = Arc::new(Mutex::new(Inner::new(endpoint.clone())));
+        spawn_sweeper(Arc::downgrade(&inner), false);
         Self {
-            inner: Mutex::new(Inner {
-                conn: None,
-                chrome: None,
-                endpoint: endpoint.clone(),
-                tabs: Vec::new(),
-                current: 0,
-                next_id: 1,
-                profile: Profile::Desktop,
-            }),
+            inner,
             endpoint,
             managed: false,
             shots,
@@ -287,20 +319,14 @@ impl CdpBrowser {
 
     /// 自己起一个无头 Chrome（端口起来之后才知道，所以先空着）
     pub fn managed(shots: ShotDir) -> Self {
+        let inner = Arc::new(Mutex::new(Inner::new(String::new())));
+        spawn_sweeper(Arc::downgrade(&inner), true);
         Self {
             endpoint: String::new(),
             managed: true,
             shots,
             cancelled: AtomicBool::new(false),
-            inner: Mutex::new(Inner {
-                conn: None,
-                chrome: None,
-                endpoint: String::new(),
-                tabs: Vec::new(),
-                current: 0,
-                next_id: 1,
-                profile: Profile::Desktop,
-            }),
+            inner,
         }
     }
 
@@ -341,6 +367,7 @@ impl CdpBrowser {
         if !ACTIONS.contains(&name) {
             return Err(format!("未知动作: {name}（支持：{}）", ACTIONS.join(" ")));
         }
+        self.lock()?.last_action = Instant::now();
         let mut out = match name {
             "new_tab" => self.new_tab(a)?,
             "set_user_agent" => self.set_user_agent(a)?,
@@ -395,7 +422,8 @@ impl CdpBrowser {
             } else if g.tabs.is_empty() {
                 self.create_tab(g)?;
             }
-            let t = &g.tabs[g.current];
+            let t = &mut g.tabs[g.current];
+            t.last_used = Instant::now();
             Ok((t.id, t.page.clone(), g.profile))
         })?;
         let mut p = page
@@ -829,6 +857,8 @@ impl CdpBrowser {
                     .position(|t| t.id as i64 == want)
                     .ok_or_else(|| no_such_tab(g, want))?;
                 g.current = i;
+                // 切过去就是要用它：算一次「用了」（列 / 关标签不算，见 `sweep`）
+                g.tabs[i].last_used = Instant::now();
                 let target = g.tabs[i].target.clone();
                 let conn = self.ensure_conn(g)?;
                 // 切到前台（截图、焦点都认它）。每只标签在自己的窗口里，不切也不会被
@@ -1006,6 +1036,7 @@ impl CdpBrowser {
             id,
             target,
             page: page.clone(),
+            last_used: Instant::now(),
         });
         g.current = g.tabs.len() - 1;
         Ok((id, page))
@@ -1083,6 +1114,63 @@ impl BrowserApi for CdpBrowser {
             Err(e) => json!({ "ok": false, "text": e }),
         };
         Ok(out.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 空闲回收
+// ---------------------------------------------------------------------------
+
+/// 后台线程：每 `SWEEP_EVERY` 查一次（见 `sweep`）。只拿一个弱引用 —— 浏览器被换掉 /
+/// 核心退出，它下一轮就自己退出，不会把 `Inner`（连带 Chrome 进程）一直吊着。
+fn spawn_sweeper(inner: Weak<Mutex<Inner>>, managed: bool) {
+    let _ = std::thread::Builder::new()
+        .name("agent-cdp-sweep".into())
+        .spawn(move || loop {
+            std::thread::sleep(SWEEP_EVERY);
+            let Some(inner) = inner.upgrade() else { return };
+            let guard = inner.lock();
+            if let Ok(mut g) = guard {
+                sweep(&mut g, managed, Instant::now());
+            }
+        });
+}
+
+/// 关掉空闲太久的标签；标签关光、整个浏览器也空闲够久了，关掉自己起的 Chrome。
+///
+/// **正在被动作用着的标签不碰**：它的锁拿不到（`try_lock`）就是有动作在跑（比如一次
+/// 等了很久的 `navigate`）—— 跳过，下一轮再看。这里拿着标签表的锁、只 `try_lock`
+/// 标签的锁，不会和 `page_action`（先标签表、放开、再标签）死锁。
+fn sweep(g: &mut Inner, managed: bool, now: Instant) {
+    let idle = |t: &Tab| now.saturating_duration_since(t.last_used) >= TAB_IDLE;
+    let mut i = 0;
+    while i < g.tabs.len() {
+        if !idle(&g.tabs[i]) || g.tabs[i].page.try_lock().is_err() {
+            i += 1;
+            continue;
+        }
+        let t = g.tabs.remove(i);
+        if let Some(c) = g.conn.as_mut().filter(|c| !c.dead) {
+            let _ = c.call(None, "Target.closeTarget", json!({ "targetId": t.target }));
+        }
+        tracing::info!(
+            "标签 {} 空闲超过 {} 分钟，自动关掉",
+            t.id,
+            TAB_IDLE.as_secs() / 60
+        );
+        g.reaped.push(t.id);
+        if i < g.current || g.current >= g.tabs.len() {
+            g.current = g.current.saturating_sub(1);
+        }
+    }
+    let quiet = now.saturating_duration_since(g.last_action) >= CHROME_IDLE;
+    if managed && g.tabs.is_empty() && g.chrome.is_some() && quiet {
+        tracing::info!(
+            "浏览器空闲超过 {} 分钟、没有标签了：关掉自己起的 Chrome（下次用时再起）",
+            CHROME_IDLE.as_secs() / 60
+        );
+        g.conn = None;
+        g.chrome = None; // Drop 就杀进程
     }
 }
 
@@ -1984,6 +2072,76 @@ mod tests {
         assert!(e.contains("AGENT_CHROME"), "{e}");
     }
 
+    /// 真 Chrome 的测试一个一个跑：同一个进程里同时起几个 Chrome，会抢同一个临时 profile
+    /// （正式运行时一个核心只有一个浏览器，关旧的会等它退出再起新的，碰不到这个）
+    fn real_chrome() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: Mutex<()> = Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 空闲回收：15 分钟没用的标签关掉（正在被动作用着的不碰），标签关光、整个浏览器
+    /// 空闲 30 分钟就把自己起的 Chrome 也关了 —— 下一个动作照常能用（重新起一个）。
+    /// 时间是往回拨的，不用真等。
+    ///
+    ///     AGENT_CDP_TEST=1 cargo test cdp::
+    #[test]
+    fn idle_tabs_and_an_idle_chrome_are_reaped() {
+        if std::env::var("AGENT_CDP_TEST").as_deref() != Ok("1") {
+            eprintln!("跳过（设 AGENT_CDP_TEST=1 才跑；会自己起 Chrome）");
+            return;
+        }
+        let _one_at_a_time = real_chrome();
+        let b = CdpBrowser::managed(shots_for_test());
+        let act = |j: Value| -> Value {
+            serde_json::from_str(&b.execute(&j.to_string()).unwrap()).unwrap()
+        };
+        for _ in 0..3 {
+            let v = act(json!({"action": "new_tab"}));
+            assert_eq!(v["ok"], true, "{v}");
+        }
+        let long_ago = |d: Duration| {
+            Instant::now()
+                .checked_sub(d + Duration::from_secs(1))
+                .unwrap()
+        };
+        {
+            let mut g = b.inner.lock().unwrap();
+            g.tabs[0].last_used = long_ago(TAB_IDLE); // 1：空闲 → 关
+            g.tabs[1].last_used = long_ago(TAB_IDLE); // 2：空闲，但正被一个动作用着 → 不碰
+            let busy = g.tabs[1].page.clone();
+            let _held = busy.lock().unwrap();
+            sweep(&mut g, true, Instant::now());
+            let left: Vec<i32> = g.tabs.iter().map(|t| t.id).collect();
+            assert_eq!(left, [2, 3], "只关空闲且没人用的那只");
+            assert!(g.chrome.is_some(), "还有标签：Chrome 不关");
+        }
+        let v = act(json!({"action": "switch_tab", "tab": 1}));
+        assert_eq!(v["ok"], false);
+        assert!(
+            v["text"].as_str().unwrap().contains("自动关掉"),
+            "说清楚是怎么没的：{v}"
+        );
+
+        // 标签关光 + 浏览器空闲够久：Chrome 也关
+        while act(json!({"action": "close_tab"}))["ok"] == true {}
+        {
+            let mut g = b.inner.lock().unwrap();
+            g.last_action = long_ago(Duration::ZERO); // 刚动过：不关
+            sweep(&mut g, true, Instant::now());
+            assert!(g.chrome.is_some());
+            g.last_action = long_ago(CHROME_IDLE);
+            sweep(&mut g, true, Instant::now());
+            assert!(
+                g.chrome.is_none() && g.conn.is_none(),
+                "空闲够久：关掉自己起的 Chrome"
+            );
+        }
+        // 下一个动作照常：重新起一个
+        let v = act(json!({"action": "js", "script": "return 1 + 1"}));
+        assert!(v["text"].as_str().unwrap().contains('2'), "{v}");
+        assert!(b.inner.lock().unwrap().chrome.is_some());
+    }
+
     /// **不同标签上的动作真的同时跑**：页面要 1 秒才回（慢服务器，每个连接一个线程），
     /// 三只标签上同时 `navigate` —— 串行要 3 秒多，并行 1 秒多。同一只标签上的照旧排队。
     ///
@@ -1994,6 +2152,7 @@ mod tests {
             eprintln!("跳过（设 AGENT_CDP_TEST=1 才跑；会自己起 Chrome）");
             return;
         }
+        let _one_at_a_time = real_chrome();
         use std::io::{Read as _, Write as _};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
@@ -2079,6 +2238,7 @@ mod tests {
             eprintln!("跳过（设 AGENT_CDP_TEST=1 才跑；会自己起 Chrome）");
             return;
         }
+        let _one_at_a_time = real_chrome();
         let (base, _srv) = serve_test_page();
         // **自己起** Chrome（和核心走同一条路）：不用先另开一个终端起浏览器
         let b = CdpBrowser::managed(shots_for_test());
