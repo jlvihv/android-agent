@@ -103,7 +103,7 @@ fn subcommands() -> Vec<Sub> {
         sub(
             "browser",
             ALL,
-            "`agent browser <动作> [参数…]`（{browser}；动作：{actions}；一条命令里可以用 && 连做多步）",
+            "`agent browser [--tab N] <动作> [参数…]`（{browser}；动作：{actions}；一条命令里可以用 && 连做多步；`--tab N` 在第 N 只标签上做，几只标签上的可以 `&` 同时跑）",
             &browser_help(),
             BROWSER_BODY,
         ),
@@ -426,10 +426,16 @@ fn browser_help() -> String {
 }
 
 const BROWSER_BODY: &str = r##"    shift || true
+    # `--tab N` 放在动作前：先切到第 N 只再做（电脑上不同标签上的动作能同时跑）
+    tab_=""
+    if [ "${1:-}" = "--tab" ]; then
+      int_arg "${2:-}" "browser --tab"
+      tab_="$2"; shift 2
+    fi
     act_="${1:-}"; shift || true
     usage() {
       cat >&2 <<'EOT'
-用法：agent browser <动作> [参数…]
+用法：agent browser [--tab N] <动作> [参数…]
   navigate <url>                   打开网页
   get_backbone [深度]              读页面结构（含可点的 selector）
   click <选择器>                    点击（也可以用 JSON 给 x/y）
@@ -451,6 +457,9 @@ const BROWSER_BODY: &str = r##"    shift || true
 
 一条命令里可以连做多步（省轮次）：
   agent browser navigate <url> && agent browser get_backbone 3 && agent browser click '#x'
+--tab N 放在动作前：在第 N 只标签上做（先切过去）。几个网页一起读：
+  agent browser new_tab <url1> & agent browser new_tab <url2> & wait
+  agent browser --tab 1 get_readable > a.txt & agent browser --tab 2 get_readable > b.txt & wait
 参数给不全 / 给多了都会报错，不会静默忽略 —— 少给一个 url 就等于开空白页。
 EOT
     }
@@ -519,6 +528,13 @@ EOT
       \{*) [ $# -eq 0 ] || { echo "JSON 形式后面不该再跟参数：$*" >&2; exit 2; }; body="$act_" ;;
       *) echo "agent browser：不认识的动作「${act_}」" >&2; usage; exit 2 ;;
     esac
+    if [ -n "$tab_" ]; then
+      case "$act_" in
+        new_tab|list_tabs|switch_tab|close_tab)
+          echo "agent browser：--tab 只用在页面上的动作前（${act_} 自己就管标签）" >&2; exit 2 ;;
+      esac
+      body="{\"tab\":${tab_},${body#\{}"
+    fi
     say "$(post /api/browser "$body")""##;
 
 const SEARCH_BODY: &str = r##"    shift || true

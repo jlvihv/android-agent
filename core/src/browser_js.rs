@@ -18,11 +18,16 @@ use serde_json::Value;
 /// 骨架树给模型的节点上限（它会进历史，按钱算）
 const BACKBONE_MAX_NODES: usize = 220;
 
-/// 每页开始加载时把 `target=_blank` 掰成 `_self`。
+/// 每页开始加载时把「开新窗口」都掰成在当前标签里打开：`target=_blank` 的链接，
+/// 以及脚本里的 `window.open(url)`。
 ///
-/// 不掰的后果：点一个「在新标签打开」的链接，新页面开在**我们管不到**的地方 ——
-/// 手机上是一只新 WebView（不在 `tabs` 里），桌面上是一个新 target。模型看到的是
-/// 「点了没反应」，然后对着同一屏截三张图。
+/// 不掰的后果：新页面开在**我们管不到**的地方 —— 桌面上是一个没登记的 target
+/// （`list_tabs` 里没有、切不过去，还一直占着资源），手机上 WebView 没开多窗口，
+/// 倒是会在当前这只里打开。模型看到的是「点了没反应」，然后对着同一屏截三张图。
+/// 两边统一成手机那样：在当前标签里打开（要多只标签，模型自己 `new_tab`）。
+///
+/// `window.open()` 不带地址（先开空白窗口、再往里写）的没法掰：回 `null`，和
+/// 「被弹窗拦截了」一样 —— 页面一般有兜底（直接跳过去）。
 const TARGET_FIX_JS: &str = r#"
 (function() {
   if (window.__agentTargetFix) return;
@@ -31,6 +36,11 @@ const TARGET_FIX_JS: &str = r#"
     var a = e.target && e.target.closest && e.target.closest('a[target]');
     if (a && a.target && a.target !== '_self') a.target = '_self';
   }, true);
+  window.open = function(url) {
+    if (!url) return null;
+    try { location.href = new URL(String(url), location.href).href; } catch (e) { return null; }
+    return window;
+  };
 })()
 "#;
 

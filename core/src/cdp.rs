@@ -44,7 +44,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -76,8 +76,9 @@ const BACKBONE_MAX_CHARS: usize = 12_000;
 /// 正文 / JS 返回值上限
 const TEXT_MAX_CHARS: usize = 12_000;
 
-/// 标签页上限（和 Kotlin 一致：三页以上模型自己就转不过来了）
-const MAX_TABS: usize = 4;
+/// 标签页上限。比手机（4 只）宽：电脑上几只标签能**并行**操作（见 `CdpBrowser`），
+/// 同时读几个网页正是用得上的时候；内存也不像手机那么紧。
+const MAX_TABS: usize = 8;
 
 /// 截图质量。截图进的是模型上下文，不是相册。
 const SHOT_QUALITY: u32 = 80;
@@ -173,8 +174,13 @@ impl Drop for Chrome {
     }
 }
 
-/// 连接 + 标签页。整个 `execute` 期间被 Mutex 串住：两个动作交叉执行会让
-/// `navigate A → click` 点到别的页面上（和 Kotlin 那个 `lock` 同一个理由）。
+/// 浏览器这一层：Chrome 进程、浏览器级的连接（开 / 关 / 列标签用）、标签表。
+///
+/// **两层锁**（这是电脑上能并行的原因）：
+/// - 这一层的 Mutex 只在动标签表的那一下拿着（找目标标签、开 / 关 / 切标签），
+///   **不跨等待**（等加载、等 DOM 安定都不在它里面）
+/// - 每只标签一条**自己的**连接（连的是那个页面的调试地址），自己一把锁：同一只
+///   标签上的动作串行（`navigate A → click` 不能被插队），不同标签之间互不等
 struct Inner {
     conn: Option<Conn>,
     /// 自己起的 Chrome（连别人的时候是 None）
@@ -190,10 +196,73 @@ struct Inner {
 /// 地址和标题**不缓存**：点链接、提交表单、跑 JS 都会让页面跳走，记下来的那份很快就
 /// 过期了（`list_tabs` 曾经报着一个早就离开的地址）。要的时候问 Chrome（见 `live_pages`）。
 struct Tab {
-    /// 模型看到的编号（1 起，不随关闭重排 —— `switch_tab` 用的是它）
+    /// 模型看到的编号（1 起，不随关闭重排 —— `switch_tab` / `--tab` 用的是它）
     id: i32,
     target: String,
-    session: String,
+    page: Arc<Mutex<Page>>,
+}
+
+/// 一只标签自己的连接（直连页面那一端：消息里不带 sessionId）。
+struct Page {
+    conn: Conn,
+    endpoint: String,
+    target: String,
+}
+
+impl Page {
+    fn open(endpoint: &str, target: &str, profile: Profile) -> Result<Self, String> {
+        let mut conn = Conn::connect_page(endpoint, target)?;
+        conn.call(None, "Page.enable", json!({}))?;
+        apply_profile(&mut conn, "", profile)?;
+        // 「开新窗口 → 在当前标签打开」在每个新文档的脚本**之前**就装上（和手机在
+        // `onPageStarted` 里注同一个时机）：页面加载途中调的 `window.open` 也拦得住。
+        // 加载完再注一次（`install_target_fix`）仍然保留，管的是已经在的那个文档
+        let fix = page_js("target_fix", json!({}))?;
+        conn.call(
+            None,
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": fix }),
+        )?;
+        // 无头 Chrome 里页面默认「没有焦点」：`document.hasFocus()`、焦点相关的
+        // 事件都不对。模拟成有焦点（老版本没有这个方法也无所谓）
+        let _ = conn.call(
+            None,
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        );
+        Ok(Self {
+            conn,
+            endpoint: endpoint.to_string(),
+            target: target.to_string(),
+        })
+    }
+
+    /// 连接断了：重连同一个页面（Chrome 里那只标签还在的话）
+    fn reconnect(&mut self, profile: Profile) -> Result<(), String> {
+        *self = Page::open(&self.endpoint, &self.target, profile)?;
+        Ok(())
+    }
+}
+
+/// 标签表上的动作（其余的都是页面上的动作，见 `CdpBrowser::page_action`）
+const TAB_ACTIONS: &[&str] = &[
+    "new_tab",
+    "list_tabs",
+    "switch_tab",
+    "close_tab",
+    "set_user_agent",
+];
+
+/// 「没有这只标签」：顺便列出现有的
+fn no_such_tab(g: &Inner, want: i64) -> String {
+    format!(
+        "没有编号 {want} 的标签（现有的：{}；用 list_tabs 看）",
+        g.tabs
+            .iter()
+            .map(|t| t.id.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 impl CdpBrowser {
@@ -265,16 +334,97 @@ impl CdpBrowser {
         }
     }
 
-    fn dispatch(&self, g: &mut Inner, name: &str, a: &Value) -> Result<Value, String> {
+    /// 一个动作：先认名字，再分到标签表那层或者某一只标签上。
+    fn run(&self, name: &str, a: &Value) -> Result<Value, String> {
         // 先认名字：不认识的动作不该顺手去开标签（那会先去连 Chrome，
         // 报出来的是一句「连不上」，把「动作写错了」这件事盖掉）
         if !ACTIONS.contains(&name) {
             return Err(format!("未知动作: {name}（支持：{}）", ACTIONS.join(" ")));
         }
-        // 需要页面的动作：没有标签就先开一只（空白页）
-        if name != "list_tabs" && name != "new_tab" && g.tabs.is_empty() {
-            self.open_tab(g, None)?;
+        let mut out = match name {
+            "new_tab" => self.new_tab(a)?,
+            "set_user_agent" => self.set_user_agent(a)?,
+            n if TAB_ACTIONS.contains(&n) => self.with_browser(|g| self.tab_table(g, n, a))?,
+            n => self.page_action(n, a)?,
+        };
+        // 每个动作回都带上「在哪只标签上、一共几只」（和手机那边同款）：模型多标签时
+        // 靠它记账。页面动作已经填了它实际落在哪只上（并行时「当前」可能已经被别人切走）
+        let g = self.lock()?;
+        if out.get("tab").is_none() {
+            out["tab"] = json!(g.tabs.get(g.current).map_or(0, |t| t.id));
         }
+        out["tabs"] = json!(g.tabs.len());
+        Ok(out)
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Inner>, String> {
+        self.inner
+            .lock()
+            .map_err(|_| "浏览器状态被锁坏了（上一个动作 panic 过？）".to_string())
+    }
+
+    /// 拿着标签表那把锁做一件事。浏览器级的连接断了：重连一次再试 —— 只试一次，
+    /// 再断就是真有问题（Chrome 自己还活着时，连接空闲一会儿也可能断）
+    fn with_browser<T>(&self, f: impl Fn(&mut Inner) -> Result<T, String>) -> Result<T, String> {
+        let mut g = self.lock()?;
+        let r = f(&mut g);
+        if g.conn.as_ref().is_some_and(|c| c.dead) {
+            tracing::info!("和 Chrome 的连接断了，重连");
+            return match self.reconnect(&mut g) {
+                Ok(()) => f(&mut g),
+                Err(e) => Err(format!("和浏览器的连接断了，重连也失败：{e}")),
+            };
+        }
+        r
+    }
+
+    /// 页面上的动作。带了 `tab` 就先切到那只（和手机一个语义：「当前标签」永远是
+    /// 动作实际发生的那只）；没有标签就先开一只空白的。
+    ///
+    /// 标签表的锁只在挑标签那一下拿着；动作本身只锁这一只标签 —— 所以
+    /// `agent browser --tab 1 … & agent browser --tab 2 … &` 是真的同时在跑。
+    fn page_action(&self, name: &str, a: &Value) -> Result<Value, String> {
+        let (id, page, profile) = self.with_browser(|g| {
+            if let Some(want) = a.get("tab").and_then(|v| v.as_i64()) {
+                let i = g
+                    .tabs
+                    .iter()
+                    .position(|t| t.id as i64 == want)
+                    .ok_or_else(|| no_such_tab(g, want))?;
+                g.current = i;
+            } else if g.tabs.is_empty() {
+                self.create_tab(g)?;
+            }
+            let t = &g.tabs[g.current];
+            Ok((t.id, t.page.clone(), g.profile))
+        })?;
+        let mut p = page
+            .lock()
+            .map_err(|_| format!("第 {id} 只标签的状态被锁坏了"))?;
+        let mut r = self.page_dispatch(&mut p, name, a);
+        if p.conn.dead {
+            tracing::info!("第 {id} 只标签的连接断了，重连");
+            r = match p.reconnect(profile) {
+                Ok(()) => self.page_dispatch(&mut p, name, a),
+                Err(e) => {
+                    // 页面都连不上了：多半是 Chrome 整个没了。让浏览器那层重连 / 重起，
+                    // 并把已经不在的标签从表里去掉
+                    drop(p);
+                    let _ = self.with_browser(|g| self.reconnect(g));
+                    Err(format!("和第 {id} 只标签的连接断了，重连也失败：{e}"))
+                }
+            };
+        }
+        let mut v = r?;
+        v["tab"] = json!(id);
+        Ok(v)
+    }
+
+    /// 一只标签上的动作：只碰它自己的连接。
+    fn page_dispatch(&self, p: &mut Page, name: &str, a: &Value) -> Result<Value, String> {
+        let conn = &mut p.conn;
+        // 每只标签一条自己的连接（直连页面），消息里不带 sessionId
+        let session = String::new();
         match name {
             "navigate" => {
                 let url = a.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
@@ -283,34 +433,7 @@ impl CdpBrowser {
                 }
                 let target =
                     normalize_url(url).ok_or_else(|| format!("只支持 http/https：{url}"))?;
-                let idx = g.current;
-                let session = g.tabs[idx].session.clone();
-                let conn = self.ensure_conn(g)?;
-                conn.drain_events();
-                conn.call(Some(&session), "Page.navigate", json!({ "url": target }))?;
-                let loaded = conn.wait_event(&session, "Page.loadEventFired", NAV_TIMEOUT)?;
-                self.await_dom_stable(conn, &session, SETTLE_BUDGET)?;
-                install_target_fix(conn, &session);
-                let info = page_info(conn, &session)?;
-                let real = info
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&target)
-                    .to_string();
-                let title = info
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let mut text = format!("已打开 {real}");
-                if !title.is_empty() {
-                    text.push_str(&format!("\n标题：{title}"));
-                }
-                if !loaded {
-                    // SPA 经常不触发 loadEventFired；不是失败，如实说
-                    text.push_str("\n（页面可能还在加载）");
-                }
-                Ok(ok(&text, Some(real), Some(title)))
+                self.navigate_on(conn, &target)
             }
             "get_backbone" => {
                 let depth = a
@@ -319,8 +442,6 @@ impl CdpBrowser {
                     .unwrap_or(5)
                     .clamp(1, 10);
                 let js = page_js("backbone", json!({ "max_depth": depth }))?;
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
@@ -354,8 +475,6 @@ impl CdpBrowser {
                 } else {
                     return Err("click 需要 selector，或者 x + y".into());
                 };
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
                     return Err(e);
@@ -381,8 +500,6 @@ impl CdpBrowser {
                     return Err("缺少参数 selector".into());
                 }
                 let text = a.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let js = page_js("type", json!({ "selector": sel, "text": text }))?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
@@ -404,8 +521,6 @@ impl CdpBrowser {
             }
             "get_text" => {
                 let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let js = page_js("get_text", json!({ "selector": sel }))?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
@@ -430,8 +545,6 @@ impl CdpBrowser {
             // 只取渲染后的 HTML：抽正文和排版在 `Core::browser` 里做（和手机、和
             // `agent readable` 同一套，见 readable.rs）
             "get_readable" => {
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let js = page_js("page_html", json!({}))?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
@@ -447,8 +560,6 @@ impl CdpBrowser {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(10)
                     .max(1);
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let sig_js = page_js("dom_sig", json!({}))?;
                 let before = eval_str(conn, &session, &sig_js)?;
                 self.await_dom_stable(conn, &session, Duration::from_secs(secs as u64))?;
@@ -471,8 +582,6 @@ impl CdpBrowser {
                     .unwrap_or("down");
                 let amount = a.get("amount").and_then(|v| v.as_i64()).unwrap_or(600);
                 let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let js = page_js(
                     "scroll",
                     json!({ "direction": dir, "amount": amount, "selector": sel }),
@@ -508,8 +617,6 @@ impl CdpBrowser {
                     .get("full_page")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let r = conn.call(
                     Some(&session),
                     "Page.captureScreenshot",
@@ -545,8 +652,6 @@ impl CdpBrowser {
                 Ok(out)
             }
             "back" => {
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let h = conn.call(Some(&session), "Page.getNavigationHistory", json!({}))?;
                 let idx = h.get("currentIndex").and_then(|v| v.as_i64()).unwrap_or(0);
                 let entries = h
@@ -584,8 +689,6 @@ impl CdpBrowser {
             }
             "press" => {
                 let key = a.get("key").and_then(|v| v.as_str()).unwrap_or("");
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let js = page_js("press", json!({ "key": key }))?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
@@ -611,8 +714,6 @@ impl CdpBrowser {
                 if sel.is_empty() {
                     return Err("缺少参数 selector".into());
                 }
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 let js = page_js("find_elements", json!({ "selector": sel }))?;
                 let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
                 if let Some(e) = err_of(&out) {
@@ -644,51 +745,11 @@ impl CdpBrowser {
                 }
                 Ok(ok(&text, None, None))
             }
-            "set_user_agent" => {
-                let want = match a.get("user_agent").and_then(|v| v.as_str()) {
-                    Some("mobile") => Profile::Mobile,
-                    Some("desktop") => Profile::Desktop,
-                    other => {
-                        return Err(format!(
-                            "user_agent 只能是 mobile 或 desktop，给的是 {other:?}"
-                        ))
-                    }
-                };
-                g.profile = want;
-                let sessions: Vec<String> = g.tabs.iter().map(|t| t.session.clone()).collect();
-                let current = g.current;
-                let conn = self.ensure_conn(g)?;
-                for s in &sessions {
-                    apply_profile(conn, s, want)?;
-                }
-                conn.drain_events();
-                if let Some(s) = sessions.get(current) {
-                    // 换视口/UA 必须重载才生效（页面已经按旧值渲染过了）
-                    conn.call(Some(s), "Page.reload", json!({}))?;
-                    conn.wait_event(s, "Page.loadEventFired", NAV_TIMEOUT)?;
-                    self.await_dom_stable(conn, s, SETTLE_BUDGET)?;
-                    install_target_fix(conn, s);
-                }
-                Ok(ok(
-                    &format!(
-                        "已切到{}版（UA + 视口一起换，页面已重载）",
-                        if want == Profile::Mobile {
-                            "移动"
-                        } else {
-                            "桌面"
-                        }
-                    ),
-                    None,
-                    None,
-                ))
-            }
             "js" => {
                 let script = a.get("script").and_then(|v| v.as_str()).unwrap_or("");
                 if script.trim().is_empty() {
                     return Err("缺少参数 script".into());
                 }
-                let session = self.session(g)?;
-                let conn = self.ensure_conn(g)?;
                 // 包一层 async IIFE：`await fetch(...)` 是这个动作最值钱的用法。
                 // CDP 的 `awaitPromise` 会等它，不用像 Kotlin 那边 kick + 轮询。
                 let expr = format!("(async function() {{\n{script}\n}})()");
@@ -705,89 +766,88 @@ impl CdpBrowser {
                 }
                 Ok(ok(&format!("JS 返回：\n{body}"), None, None))
             }
-            "new_tab" => {
-                let url = a
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                if g.tabs.len() >= MAX_TABS {
-                    return Err(format!(
-                        "标签页已经到上限（{MAX_TABS} 只）了，先 `agent browser close_tab` 关一只"
-                    ));
-                }
-                let landed = self.open_tab(g, url.as_deref())?;
-                let t = &g.tabs[g.current];
-                Ok(ok(
-                    &format!(
-                        "已开第 {} 只标签（共 {} 只）：{}",
-                        t.id,
-                        g.tabs.len(),
-                        landed.as_deref().map_or("空白页", page_label)
-                    ),
-                    None,
-                    None,
-                ))
-            }
+            other => Err(format!("未知动作: {other}（支持：{}）", ACTIONS.join(" "))),
+        }
+    }
+
+    /// 在这只标签上打开一个（已经规范化的）地址，等它加载完、安定下来。
+    fn navigate_on(&self, conn: &mut Conn, target: &str) -> Result<Value, String> {
+        let session = String::new();
+        conn.drain_events();
+        conn.call(Some(&session), "Page.navigate", json!({ "url": target }))?;
+        let loaded = conn.wait_event(&session, "Page.loadEventFired", NAV_TIMEOUT)?;
+        self.await_dom_stable(conn, &session, SETTLE_BUDGET)?;
+        install_target_fix(conn, &session);
+        let info = page_info(conn, &session)?;
+        let real = info
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or(target)
+            .to_string();
+        let title = info
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut text = format!("已打开 {real}");
+        if !title.is_empty() {
+            text.push_str(&format!("\n标题：{title}"));
+        }
+        if !loaded {
+            // SPA 经常不触发 loadEventFired；不是失败，如实说
+            text.push_str("\n（页面可能还在加载）");
+        }
+        Ok(ok(&text, Some(real), Some(title)))
+    }
+
+    /// 标签表上的动作：列 / 切 / 关。回结构化的数据（文字在 `Core::browser` 里排，
+    /// 和手机那边同一份 —— 见 `lib.rs` 的 `tab_reply`）。
+    fn tab_table(&self, g: &mut Inner, name: &str, a: &Value) -> Result<Value, String> {
+        match name {
             "list_tabs" => {
-                if g.tabs.is_empty() {
-                    return Ok(ok(
-                        "还没有标签页（navigate 或 new_tab 会开一只）",
-                        None,
-                        None,
-                    ));
-                }
-                let live = self.live_pages(g)?;
-                let mut text = format!("共 {} 只标签：", g.tabs.len());
-                for (i, t) in g.tabs.iter().enumerate() {
-                    let (url, title): (String, String) =
-                        live.get(&t.target).cloned().unwrap_or_default();
-                    let page = if page_label(&url) == "空白页" {
-                        "空白页".to_string()
-                    } else {
-                        format!("{title} {url}").trim().to_string()
-                    };
-                    text.push_str(&format!(
-                        "\n  [{}]{} {page}",
-                        t.id,
-                        if i == g.current { " ← 当前" } else { "" },
-                    ));
-                }
-                Ok(ok(&text, None, None))
+                let live = if g.tabs.is_empty() {
+                    Default::default()
+                } else {
+                    self.live_pages(g)?
+                };
+                let list: Vec<Value> = g
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let (url, title) = live.get(&t.target).cloned().unwrap_or_default();
+                        json!({ "id": t.id, "url": url, "title": title, "current": i == g.current })
+                    })
+                    .collect();
+                Ok(json!({ "ok": true, "list": list }))
             }
             "switch_tab" => {
                 let want = a.get("tab").and_then(|v| v.as_i64()).unwrap_or(-1);
-                let Some(i) = g.tabs.iter().position(|t| t.id as i64 == want) else {
-                    return Err(format!(
-                        "没有编号 {want} 的标签（现有的：{}）",
-                        g.tabs
-                            .iter()
-                            .map(|t| t.id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ));
-                };
+                let i = g
+                    .tabs
+                    .iter()
+                    .position(|t| t.id as i64 == want)
+                    .ok_or_else(|| no_such_tab(g, want))?;
                 g.current = i;
+                let target = g.tabs[i].target.clone();
+                let conn = self.ensure_conn(g)?;
+                // 切到前台（截图、焦点都认它）。每只标签在自己的窗口里，不切也不会被
+                // 当成后台标签降频 —— 这一步只是和「用户切标签」的语义对齐
+                let _ = conn.call(None, "Target.activateTarget", json!({ "targetId": target }));
                 let live = self.live_pages(g)?;
-                let t = &g.tabs[i];
-                let url = live.get(&t.target).map(|(u, _)| u.as_str()).unwrap_or("");
-                Ok(ok(
-                    &format!("已切到第 {} 只：{}", t.id, page_label(url)),
-                    None,
-                    None,
-                ))
+                let (url, title) = live.get(&target).cloned().unwrap_or_default();
+                Ok(json!({ "ok": true, "url": url, "title": title }))
             }
             "close_tab" => {
                 if g.tabs.is_empty() {
                     return Err("没有标签页可关".into());
                 }
-                let want = a.get("tab").and_then(|v| v.as_i64());
-                let i = match want {
+                let i = match a.get("tab").and_then(|v| v.as_i64()) {
                     Some(n) => g
                         .tabs
                         .iter()
                         .position(|t| t.id as i64 == n)
-                        .ok_or_else(|| format!("没有编号 {n} 的标签"))?,
+                        .ok_or_else(|| no_such_tab(g, n))?,
                     None => g.current,
                 };
                 let target = g.tabs[i].target.clone();
@@ -795,24 +855,97 @@ impl CdpBrowser {
                 let conn = self.ensure_conn(g)?;
                 conn.call(None, "Target.closeTarget", json!({ "targetId": target }))?;
                 g.tabs.remove(i);
-                g.current = g.current.min(g.tabs.len().saturating_sub(1));
-                Ok(ok(
-                    &format!("已关掉第 {id} 只（还剩 {} 只）", g.tabs.len()),
-                    None,
-                    None,
-                ))
+                if i < g.current || g.current >= g.tabs.len() {
+                    g.current = g.current.saturating_sub(1);
+                }
+                let mut v = json!({ "ok": true, "closed": id });
+                if let Some(t) = g.tabs.get(g.current) {
+                    let target = t.target.clone();
+                    let live = self.live_pages(g)?;
+                    let (url, title) = live.get(&target).cloned().unwrap_or_default();
+                    v["url"] = json!(url);
+                    v["title"] = json!(title);
+                }
+                Ok(v)
             }
-            // 上面 `ACTIONS` 已经拦过一遍；走到这儿说明两边对不上了
-            other => Err(format!("未知动作: {other}（支持：{}）", ACTIONS.join(" "))),
+            other => Err(format!("不是标签表上的动作：{other}")),
         }
     }
 
-    /// 当前标签的 session（没有标签就是错误 —— 调用前已经保证开过一只）
-    fn session(&self, g: &Inner) -> Result<String, String> {
-        g.tabs
-            .get(g.current)
-            .map(|t| t.session.clone())
-            .ok_or_else(|| "还没有打开任何页面".to_string())
+    /// 开一只标签并切过去。只拿标签表那把锁一小会儿：要导航的话，导航在锁外面
+    /// 做 —— 几只 `new_tab <url>` 一起发是真的一起加载
+    fn new_tab(&self, a: &Value) -> Result<Value, String> {
+        let url = a
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let target = match url {
+            Some(u) => Some(normalize_url(u).ok_or_else(|| format!("只支持 http/https：{u}"))?),
+            None => None,
+        };
+        let (id, page) = self.with_browser(|g| {
+            if g.tabs.len() >= MAX_TABS {
+                return Err(format!(
+                    "标签页已经到上限（{MAX_TABS} 只）了，先 `agent browser close_tab` 关一只"
+                ));
+            }
+            self.create_tab(g)
+        })?;
+        let mut v = json!({ "ok": true, "opened": id, "tab": id });
+        if let Some(t) = target {
+            let mut p = page
+                .lock()
+                .map_err(|_| format!("第 {id} 只标签的状态被锁坏了"))?;
+            let nav = self.navigate_on(&mut p.conn, &t)?;
+            v["url"] = nav["url"].clone();
+            v["title"] = nav["title"].clone();
+        }
+        Ok(v)
+    }
+
+    /// 换 UA + 视口：每只标签都换（新开的按新档位开），当前那只重载才生效。
+    fn set_user_agent(&self, a: &Value) -> Result<Value, String> {
+        let want = match a.get("user_agent").and_then(|v| v.as_str()) {
+            Some("mobile") => Profile::Mobile,
+            Some("desktop") => Profile::Desktop,
+            other => {
+                return Err(format!(
+                    "user_agent 只能是 mobile 或 desktop，给的是 {other:?}"
+                ))
+            }
+        };
+        let (pages, current) = self.with_browser(|g| {
+            g.profile = want;
+            let pages: Vec<_> = g.tabs.iter().map(|t| t.page.clone()).collect();
+            Ok((pages, g.tabs.get(g.current).map(|t| t.page.clone())))
+        })?;
+        for page in &pages {
+            let mut p = page.lock().map_err(|_| "标签的状态被锁坏了".to_string())?;
+            apply_profile(&mut p.conn, "", want)?;
+        }
+        if let Some(page) = current {
+            let mut p = page.lock().map_err(|_| "标签的状态被锁坏了".to_string())?;
+            let conn = &mut p.conn;
+            // 换视口/UA 必须重载才生效（页面已经按旧值渲染过了）
+            conn.drain_events();
+            conn.call(None, "Page.reload", json!({}))?;
+            conn.wait_event("", "Page.loadEventFired", NAV_TIMEOUT)?;
+            self.await_dom_stable(conn, "", SETTLE_BUDGET)?;
+            install_target_fix(conn, "");
+        }
+        Ok(ok(
+            &format!(
+                "已切到{}版（UA + 视口一起换，页面已重载）",
+                if want == Profile::Mobile {
+                    "移动"
+                } else {
+                    "桌面"
+                }
+            ),
+            None,
+            None,
+        ))
     }
 
     /// 每只标签**现在**的地址和标题（targetId → (url, title)）。一次 `Target.getTargets`
@@ -840,62 +973,51 @@ impl CdpBrowser {
             .unwrap_or_default())
     }
 
-    /// 开一只标签并切过去。`url` 给了就导航（等加载完成），回落地的地址。
-    fn open_tab(&self, g: &mut Inner, url: Option<&str>) -> Result<Option<String>, String> {
+    /// 开一只空白标签并切过去，回 (编号, 它的连接)。每只标签开在**自己的窗口**里：
+    /// 无头 Chrome 一个窗口里只有一只标签算「可见」，别的都被当成后台降频（实测
+    /// `visibilityState=hidden`）—— 几只标签并行操作时就会互相拖慢。
+    fn create_tab(&self, g: &mut Inner) -> Result<(i32, Arc<Mutex<Page>>), String> {
         let profile = g.profile;
-        let id = g.next_id;
-        g.next_id += 1;
         let conn = self.ensure_conn(g)?;
-        let r = conn.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
+        let r = conn.call(
+            None,
+            "Target.createTarget",
+            json!({ "url": "about:blank", "newWindow": true }),
+        )?;
         let target = r
             .get("targetId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "createTarget 没给 targetId".to_string())?
             .to_string();
-        let r = conn.call(
-            None,
-            "Target.attachToTarget",
-            json!({ "targetId": target, "flatten": true }),
-        )?;
-        let session = r
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "attachToTarget 没给 sessionId".to_string())?
-            .to_string();
-        conn.call(Some(&session), "Page.enable", json!({}))?;
-        apply_profile(conn, &session, profile)?;
-        // 导航先做（还要用 `conn`），**最后**才登记标签 —— 中途借用 `g.tabs`
-        // 会把上面那个 `&mut Conn` 的借用打断
-        let landed = match url {
-            Some(u) => {
-                let target_url =
-                    normalize_url(u).ok_or_else(|| format!("只支持 http/https：{u}"))?;
-                conn.drain_events();
-                conn.call(
-                    Some(&session),
-                    "Page.navigate",
-                    json!({ "url": target_url }),
-                )?;
-                conn.wait_event(&session, "Page.loadEventFired", NAV_TIMEOUT)?;
-                self.await_dom_stable(conn, &session, SETTLE_BUDGET)?;
-                install_target_fix(conn, &session);
-                let info = page_info(conn, &session)?;
-                Some(
-                    info.get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&target_url)
-                        .to_string(),
-                )
+        let ep = self.endpoint_of(g);
+        let page = match Page::open(&ep, &target, profile) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(c) = g.conn.as_mut() {
+                    let _ = c.call(None, "Target.closeTarget", json!({ "targetId": target }));
+                }
+                return Err(e);
             }
-            None => None,
         };
+        let id = g.next_id;
+        g.next_id += 1;
+        let page = Arc::new(Mutex::new(page));
         g.tabs.push(Tab {
             id,
             target,
-            session,
+            page: page.clone(),
         });
         g.current = g.tabs.len() - 1;
-        Ok(landed)
+        Ok((id, page))
+    }
+
+    /// 连的是哪个地址（自己起的那个要等起来才知道）
+    fn endpoint_of(&self, g: &Inner) -> String {
+        if self.managed {
+            g.endpoint.clone()
+        } else {
+            self.endpoint.clone()
+        }
     }
 
     /// 动作之后等页面安定（SPA 的渲染大多在这一小段里出来）
@@ -955,19 +1077,7 @@ impl BrowserApi for CdpBrowser {
             return Ok(json!({ "ok": true, "text": "已请求取消" }).to_string());
         }
         self.cancelled.store(false, Ordering::Relaxed);
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| "浏览器状态被锁坏了（上一个动作 panic 过？）".to_string())?;
-        let mut res = self.dispatch(&mut g, name, &a);
-        // 连接断了：重连（标签页重新挂上）再试一次。只试一次 —— 再断就是真有问题
-        if g.conn.as_ref().is_some_and(|c| c.dead) {
-            tracing::info!("和 Chrome 的连接断了，重连");
-            res = match self.reconnect(&mut g) {
-                Ok(()) => self.dispatch(&mut g, name, &a),
-                Err(e) => Err(format!("和浏览器的连接断了，重连也失败：{e}")),
-            };
-        }
+        let res = self.run(name, &a);
         let out = match res {
             Ok(v) => v,
             Err(e) => json!({ "ok": false, "text": e }),
@@ -1025,11 +1135,34 @@ impl Conn {
         })
     }
 
+    /// 直连一只标签（`/devtools/page/<targetId>`）：每只标签一条，各自收发、互不排队。
+    /// 消息不带 sessionId，事件也不带（`wait_event` 用空串认它们）。
+    fn connect_page(endpoint: &str, target: &str) -> Result<Self, String> {
+        let base = endpoint
+            .trim_end_matches('/')
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        let ws_url = format!("{base}/devtools/page/{target}");
+        let (ws, _) = tungstenite::connect(ws_url.as_str())
+            .map_err(|e| format!("连不上这只标签（{ws_url}）：{e}"))?;
+        if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
+            tcp.set_read_timeout(Some(Duration::from_millis(200)))
+                .map_err(|e| format!("设置读超时失败: {e}"))?;
+        }
+        Ok(Self {
+            ws,
+            next_id: 1,
+            events: Vec::new(),
+            dead: false,
+        })
+    }
+
     fn send(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<i64, String> {
         let id = self.next_id;
         self.next_id += 1;
         let mut msg = json!({ "id": id, "method": method, "params": params });
-        if let Some(s) = session {
+        // 空的 session = 直连页面的那种连接（见 `connect_page`），不带 sessionId
+        if let Some(s) = session.filter(|s| !s.is_empty()) {
             msg["sessionId"] = json!(s);
         }
         if let Err(e) = self.ws.send(Message::Text(msg.to_string().into())) {
@@ -1124,7 +1257,7 @@ impl Conn {
         loop {
             if let Some(pos) = self.events.iter().position(|e| {
                 e.get("method").and_then(|m| m.as_str()) == Some(method)
-                    && e.get("sessionId").and_then(|s| s.as_str()) == Some(session)
+                    && e.get("sessionId").and_then(|s| s.as_str()).unwrap_or("") == session
             }) {
                 self.events.remove(pos);
                 return Ok(true);
@@ -1171,9 +1304,9 @@ impl Conn {
 impl CdpBrowser {
     /// 懒连接：第一次要动作的时候才连 —— 自己起 Chrome 的话，**也是这时候才拉起
     /// 它**（启动核心不该等一个浏览器）。
-    /// 连接断了之后：重新连上，把原来的标签页重新挂上（CDP 的 session 跟着连接
-    /// 走，旧的全作废；而标签页在 Chrome 里还在，`targetId` 不变）。自己起的
-    /// Chrome 要是已经退出了，就重新起一个 —— 那时标签页确实没了。
+    /// 浏览器级的连接断了之后：重新连上。标签各有各的连接，不跟着这条断 —— 这里只把
+    /// Chrome 里已经不在的标签从表里去掉。自己起的 Chrome 要是已经退出了，就重新起
+    /// 一个（那时标签页确实都没了）。
     fn reconnect(&self, g: &mut Inner) -> Result<(), String> {
         g.conn = None;
         if let Some(c) = g.chrome.as_mut() {
@@ -1181,42 +1314,18 @@ impl CdpBrowser {
                 tracing::info!("自己起的 Chrome 已经退出了，重新起");
                 g.chrome = None;
                 g.tabs.clear();
+                g.current = 0;
             }
         }
-        let profile = g.profile;
-        let old = std::mem::take(&mut g.tabs);
-        let current = old.get(g.current).map(|t| t.id);
-        let conn = self.ensure_conn(g)?;
-        let mut kept = Vec::new();
-        for mut t in old {
-            let attached = conn
-                .call(
-                    None,
-                    "Target.attachToTarget",
-                    json!({ "targetId": t.target, "flatten": true }),
-                )
-                .ok()
-                .and_then(|r| {
-                    r.get("sessionId")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                });
-            let Some(session) = attached else {
-                continue; // 那只标签已经没了
-            };
-            if conn.call(Some(&session), "Page.enable", json!({})).is_err()
-                || apply_profile(conn, &session, profile).is_err()
-            {
-                continue;
-            }
-            t.session = session;
-            kept.push(t);
-        }
-        g.current = kept
+        self.ensure_conn(g)?;
+        let live = self.live_pages(g)?;
+        let current = g.tabs.get(g.current).map(|t| t.id);
+        g.tabs.retain(|t| live.contains_key(&t.target));
+        g.current = g
+            .tabs
             .iter()
             .position(|t| Some(t.id) == current)
-            .unwrap_or(kept.len().saturating_sub(1));
-        g.tabs = kept;
+            .unwrap_or(g.tabs.len().saturating_sub(1));
         Ok(())
     }
 
@@ -1706,15 +1815,6 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
-/// 标签的地址怎么写：没地址 / `about:blank` 就是「空白页」。
-fn page_label(url: &str) -> &str {
-    if url.is_empty() || url == "about:blank" {
-        "空白页"
-    } else {
-        url
-    }
-}
-
 fn ok(text: &str, url: Option<String>, title: Option<String>) -> Value {
     let mut v = json!({ "ok": true, "text": text });
     if let Some(u) = url.filter(|u| !u.is_empty()) {
@@ -1857,24 +1957,19 @@ mod tests {
     fn every_action_is_reachable() {
         // 连一个**连不上**的地址：这些动作在碰网络之前就该报「参数」类的错
         let b = CdpBrowser::connect_to("http://127.0.0.1:1".into(), shots_for_test());
-        let mut g = Inner {
-            conn: None,
-            chrome: None,
-            endpoint: "http://127.0.0.1:1".into(),
-            tabs: Vec::new(),
-            current: 0,
-            next_id: 1,
-            profile: Profile::Desktop,
-        };
-        // 不连 Chrome：这些动作在碰网络之前就该报「参数」类的错，不能是「未知动作」
+        // 不连 Chrome：这些动作在碰网络之前就该报「参数」类的错，或者「连不上」——
+        // 不能是「未知动作」（那说明 run / page_dispatch / tab_table 里漏了分支）
         for a in ACTIONS {
-            let r = b.dispatch(&mut g, a, &json!({}));
+            let r = b.run(a, &json!({}));
             if let Err(e) = &r {
-                assert!(!e.contains("未知动作"), "{a} 在 dispatch 里没有分支：{e}");
+                assert!(
+                    !e.contains("未知动作") && !e.contains("不是标签表上的动作"),
+                    "{a} 没有分支：{e}"
+                );
             }
         }
         // 反过来：不认识的动作要说清楚支持哪些（模型据此纠正）
-        let e = b.dispatch(&mut g, "nope", &json!({})).unwrap_err();
+        let e = b.run("nope", &json!({})).unwrap_err();
         assert!(e.contains("未知动作") && e.contains("navigate"), "{e}");
     }
 
@@ -1887,6 +1982,90 @@ mod tests {
         };
         assert!(e.contains("AGENT_CDP"), "{e}");
         assert!(e.contains("AGENT_CHROME"), "{e}");
+    }
+
+    /// **不同标签上的动作真的同时跑**：页面要 1 秒才回（慢服务器，每个连接一个线程），
+    /// 三只标签上同时 `navigate` —— 串行要 3 秒多，并行 1 秒多。同一只标签上的照旧排队。
+    ///
+    ///     AGENT_CDP_TEST=1 cargo test cdp::
+    #[test]
+    fn actions_on_different_tabs_run_in_parallel() {
+        if std::env::var("AGENT_CDP_TEST").as_deref() != Ok("1") {
+            eprintln!("跳过（设 AGENT_CDP_TEST=1 才跑；会自己起 Chrome）");
+            return;
+        }
+        use std::io::{Read as _, Write as _};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { break };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let path = String::from_utf8_lossy(&buf[..n])
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    std::thread::sleep(Duration::from_millis(1000));
+                    let body = format!("<!doctype html><title>{path}</title><p>页面 {path}</p>");
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let b = std::sync::Arc::new(CdpBrowser::managed(shots_for_test()));
+        let act = |b: &CdpBrowser, j: Value| -> Value {
+            serde_json::from_str(&b.execute(&j.to_string()).unwrap()).unwrap()
+        };
+        for _ in 0..3 {
+            assert_eq!(act(&b, json!({"action": "new_tab"}))["ok"], true);
+        }
+        let t0 = Instant::now();
+        let handles: Vec<_> = (1..=3)
+            .map(|i| {
+                let (b, base) = (b.clone(), base.clone());
+                std::thread::spawn(move || {
+                    act(
+                        &b,
+                        json!({"action": "navigate", "tab": i, "url": format!("{base}/p{i}")}),
+                    )
+                })
+            })
+            .collect();
+        let outs: Vec<Value> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let took = t0.elapsed();
+        eprintln!("三只标签同时 navigate（各要 1 秒）：{took:?}");
+        for (i, v) in outs.iter().enumerate() {
+            assert_eq!(v["ok"], true, "{v}");
+            assert_eq!(v["tab"], json!(i + 1), "回包说的是它实际落在哪只上：{v}");
+            assert!(
+                v["url"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/p{}", i + 1)),
+                "{v}"
+            );
+        }
+        assert!(
+            took < Duration::from_millis(2500),
+            "三只标签上的 navigate 应该是同时跑的（各要 1 秒），花了 {took:?}"
+        );
+        // 各自落在自己那只上，没有互相踩
+        for i in 1..=3 {
+            let v = act(
+                &b,
+                json!({"action": "js", "tab": i, "script": "return location.pathname"}),
+            );
+            assert!(
+                v["text"].as_str().unwrap().contains(&format!("/p{i}")),
+                "{v}"
+            );
+        }
     }
 
     /// **真 Chrome 的端到端**：自己起一个无头 Chrome，起一个本地的假页面，
@@ -2007,26 +2186,56 @@ mod tests {
         // 那一刻的，点完链接还报着旧地址）
         let v = act(json!({"action": "click", "selector": "a"}));
         assert_eq!(v["ok"], true, "{v}");
+        // 标签那几个动作只回数据，文字由 `Core` 排（`crate::tab_reply`，和手机同一份）
+        let tab_text = |name: &str, v: &Value| crate::tab_reply(name, v).unwrap_or_default();
         let v = act(json!({"action": "list_tabs"}));
         assert!(
-            text_of(&v).contains(&format!("{base}x")),
+            tab_text("list_tabs", &v).contains(&format!("{base}x")),
             "跳转后的地址：{v}"
         );
 
         // 多标签
         let v = act(json!({"action": "new_tab", "url": base}));
         assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(
+            (v["opened"].clone(), v["tabs"].clone()),
+            (json!(2), json!(2)),
+            "{v}"
+        );
         let v = act(json!({"action": "list_tabs"}));
-        let t = text_of(&v);
-        assert!(t.contains("当前"), "{t}");
+        let t = tab_text("list_tabs", &v);
+        assert!(t.contains("[2]") && t.contains("← 当前"), "{t}");
         let v = act(json!({"action": "switch_tab", "tab": 1}));
         assert_eq!(v["ok"], true, "{v}");
         assert!(
-            text_of(&v).contains(&format!("{base}x")),
+            tab_text("switch_tab", &v).contains(&format!("{base}x")),
             "切回来报的也是现在的地址：{v}"
+        );
+        // 每只标签在自己的窗口里：切走的那只也不会被当成后台标签降频
+        let v = act(json!({"action": "js", "script": "return document.visibilityState"}));
+        assert!(text_of(&v).contains("visible"), "{v}");
+        let v = act(json!({"action": "js", "tab": 2, "script": "return document.visibilityState"}));
+        assert!(text_of(&v).contains("visible"), "{v}");
+        assert_eq!(v["tab"], 2, "带了 tab：在那只上做，并切过去：{v}");
+        // window.open 在当前标签打开，不会开出一只没登记的
+        let v = act(json!({"action": "js", "script": "window.open('/opened'); return 1"}));
+        assert_eq!(v["ok"], true, "{v}");
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let v = act(json!({"action": "js", "script": "return location.pathname"}));
+        assert!(text_of(&v).contains("/opened"), "{v}");
+        assert_eq!(
+            act(json!({"action": "list_tabs"}))["list"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
         );
         let v = act(json!({"action": "close_tab"}));
         assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(
+            (v["closed"].clone(), v["tabs"].clone()),
+            (json!(2), json!(1)),
+            "{v}"
+        );
         // 关不存在的标签要说清楚有哪些
         let v = act(json!({"action": "switch_tab", "tab": 99}));
         assert_eq!(v["ok"], false, "{v}");

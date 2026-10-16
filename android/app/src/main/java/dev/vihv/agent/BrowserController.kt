@@ -924,30 +924,33 @@ class BrowserController(private val app: Application) : BrowserHost {
             awaitDomStable(SETTLE_BUDGET_MS)
         }
         onMain { refreshAttached() }
-        val info = pageInfo()
-        val what = if (target != null) "已打开 $target" else "空白页（接着用 navigate）"
-        return ok(
-            "开了标签 ${t.id}（共 ${onMain { tabs.size }} 只）：$what",
-            info?.optString("url").orEmpty(),
-            info?.optString("title").orEmpty(),
-        )
+        // 只回数据：文字在核心里排（`lib.rs` 的 `tab_reply`，和电脑那边同一份）
+        val out = JSONObject().put("ok", true).put("opened", t.id)
+        if (target != null) {
+            val info = pageInfo()
+            out.put("url", info?.optString("url").orEmpty())
+            out.put("title", info?.optString("title").orEmpty())
+        }
+        return out
     }
 
-    /** 列出所有标签。多标签时模型靠它记账 */
+    /** 列出所有标签（只回数据，文字在核心里排）。多标签时模型靠它记账 */
     private fun listTabs(): JSONObject {
-        val out = onMain {
+        val list = onMain {
             val cur = curTab()?.id
-            if (tabs.isEmpty()) return@onMain "（一个标签都没有）"
-            tabs.joinToString("\n") { t ->
-                val u = runCatching { t.web.url }.getOrNull().orEmpty()
-                val ti = runCatching { t.web.title }.getOrNull().orEmpty()
-                val mark = if (t.id == cur) "→" else " "
-                val title = if (ti.isBlank()) "(空)" else ti.take(60)
-                "$mark 标签 ${t.id}：$title — ${u.take(110)}"
+            JSONArray().apply {
+                for (t in tabs) {
+                    put(
+                        JSONObject()
+                            .put("id", t.id)
+                            .put("url", runCatching { t.web.url }.getOrNull().orEmpty())
+                            .put("title", runCatching { t.web.title }.getOrNull().orEmpty())
+                            .put("current", t.id == cur),
+                    )
+                }
             }
-        } as? String ?: ""
-        val cur = onMain { curTab()?.id } ?: 0
-        return ok("共 ${onMain { tabs.size }} 只（当前是标签 $cur）：\n$out")
+        } as? JSONArray ?: JSONArray()
+        return JSONObject().put("ok", true).put("list", list)
     }
 
     /** 切到某只标签 */
@@ -964,11 +967,10 @@ class BrowserController(private val app: Application) : BrowserHost {
             return errObj("没有标签 $id（现有：$have；用 list_tabs 看）")
         }
         val info = pageInfo()
-        return ok(
-            "切到标签 $id",
-            info?.optString("url").orEmpty(),
-            info?.optString("title").orEmpty(),
-        )
+        return JSONObject()
+            .put("ok", true)
+            .put("url", info?.optString("url").orEmpty())
+            .put("title", info?.optString("title").orEmpty())
     }
 
     /** 关一只标签。不给 `tab` 就是关当前这只 */
@@ -982,14 +984,13 @@ class BrowserController(private val app: Application) : BrowserHost {
             true
         } as? Boolean ?: false
         if (!okClose) return errObj("没有标签 $target")
-        val left = onMain { tabs.size } as? Int ?: 0
-        if (left == 0) return ok("关掉标签 $target，现在一个标签都不剩了（下一次动作会开一只新的）")
-        val info = pageInfo()
-        return ok(
-            "关掉标签 $target，剩 $left 只（当前是标签 ${onMain { curTab()?.id } ?: 0}）",
-            info?.optString("url").orEmpty(),
-            info?.optString("title").orEmpty(),
-        )
+        val out = JSONObject().put("ok", true).put("closed", target)
+        if ((onMain { tabs.size } as? Int ?: 0) > 0) {
+            val info = pageInfo()
+            out.put("url", info?.optString("url").orEmpty())
+            out.put("title", info?.optString("title").orEmpty())
+        }
+        return out
     }
 
     /** 等 DOM 安定（动态内容/无限滚动靠它）。`timeout` 秒，默认 10 */

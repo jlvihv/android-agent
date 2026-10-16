@@ -443,9 +443,11 @@ impl Core {
         // AI 写完网页能自己开来看。回来的结果再改写回 `preview:`
         let port = self.port();
         let key = self.state.auth().sandbox_key;
-        let readable = serde_json::from_str::<serde_json::Value>(action_json)
+        let name = serde_json::from_str::<serde_json::Value>(action_json)
             .ok()
-            .is_some_and(|v| v["action"] == "get_readable");
+            .and_then(|v| v["action"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        let readable = name == "get_readable";
         let action = match serde_json::from_str::<serde_json::Value>(action_json) {
             Ok(mut v) => {
                 let mapped = v
@@ -492,6 +494,14 @@ impl Core {
                         v["text"] = serde_json::Value::String(e);
                     }
                 }
+            }
+        }
+        // 标签表上那几个动作：两个后端只回数据，文字在这里排一份。后端要是还附了
+        // 话（手机那边吞掉的页面弹窗会追加在 `text` 后面），接在后头
+        if v["ok"] != false {
+            if let Some(text) = tab_reply(&name, &v) {
+                let extra = v["text"].as_str().unwrap_or("").to_string();
+                v["text"] = serde_json::Value::String(text + &extra);
             }
         }
         rewrite_strings(&mut v, &|s| http::sandbox_url_to_guest(s, port, &key));
@@ -916,6 +926,71 @@ fn readable_reply(html: &str, spill: Option<&SpillDir>) -> Result<String, String
     Ok(format!(
         "{head}\n\n[已截断：显示了前 {shown} 字（第 1-{lines} 行），全文 {total} 字、{all_lines} 行。{next}]"
     ))
+}
+
+/// 标签表上那几个动作（开 / 列 / 切 / 关）回的文字。
+///
+/// 两个后端（手机 WebView、电脑无头 Chrome）只回数据（`opened` / `list` / `closed`，
+/// 外加每个动作都带的 `tab` / `tabs`、页面的 `url` / `title`），文字只在这里排 ——
+/// 以前两边各写一套，同一个动作模型在两种机器上看到两个样子。
+fn tab_reply(action: &str, v: &serde_json::Value) -> Option<String> {
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    let n = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+    let page = |url: &str, title: &str| {
+        if url.is_empty() || url == "about:blank" {
+            "空白页".to_string()
+        } else if title.trim().is_empty() {
+            url.to_string()
+        } else {
+            format!("{} — {url}", title.trim())
+        }
+    };
+    Some(match action {
+        "new_tab" => format!(
+            "已开标签 {}（共 {} 只）：{}",
+            n("opened"),
+            n("tabs"),
+            if s("url").is_empty() {
+                "空白页（接着用 navigate）".to_string()
+            } else {
+                page(s("url"), s("title"))
+            }
+        ),
+        "list_tabs" => {
+            let list = v.get("list")?.as_array()?;
+            if list.is_empty() {
+                return Some("还没有标签页（navigate 或 new_tab 会开一只）".into());
+            }
+            let mut out = format!("共 {} 只标签：", list.len());
+            for t in list {
+                let field = |k: &str| t.get(k).and_then(|x| x.as_str()).unwrap_or("");
+                out.push_str(&format!(
+                    "\n  [{}] {}{}",
+                    t.get("id").and_then(|x| x.as_i64()).unwrap_or(0),
+                    page(field("url"), field("title")),
+                    if t.get("current").and_then(|x| x.as_bool()) == Some(true) {
+                        "  ← 当前"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            out
+        }
+        "switch_tab" => format!("已切到标签 {}：{}", n("tab"), page(s("url"), s("title"))),
+        "close_tab" if n("tabs") == 0 => format!(
+            "已关掉标签 {}，一只都不剩了（下一个动作会开一只新的）",
+            n("closed")
+        ),
+        "close_tab" => format!(
+            "已关掉标签 {}，还剩 {} 只，当前是标签 {}：{}",
+            n("closed"),
+            n("tabs"),
+            n("tab"),
+            page(s("url"), s("title"))
+        ),
+        _ => return None,
+    })
 }
 
 /// 把一个 JSON 里所有字符串都过一遍 `f`。
