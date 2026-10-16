@@ -53,7 +53,7 @@
         <div class="flex items-center gap-3 border-b-2 border-ink px-3.5 py-3 last:border-b-0">
           <span class="min-w-0 flex-1">
             <span class="block truncate text-[17px] {s.enabled ? '' : 'text-muted'}">{s.name}</span>
-            <span class="line-clamp-2 block text-meta {s.enabled ? 'text-muted' : 'text-faint'}">
+            <span class="line-clamp-2 text-meta {s.enabled ? 'text-muted' : 'text-faint'}">
               {s.enabled ? '' : '已停用 · '}{s.description}
             </span>
           </span>

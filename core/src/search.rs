@@ -146,7 +146,7 @@ async fn search_mcp(query: &str, num: usize) -> anyhow::Result<Found> {
         anyhow::bail!(
             "Exa 免费额度用尽（按 IP 限 2 次/秒、50 次/天）。这个额度是**同一个出口 IP \
              共用**的，别人的手机也可能把它用掉。三条出路：① 过一会儿再试；\
-             ② 配一个 Exa key（写进会话库 search 行或 EXA_API_KEY 环境变量）；\
+             ② 让用户在 设置 → 联网搜索 里填一个 Exa key；\
              ③ 改用 browser 打开搜索引擎（bing.com / duckduckgo.com）自己找。\
              原始响应：{}",
             text.chars().take(200).collect::<String>()

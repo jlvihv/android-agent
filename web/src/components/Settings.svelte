@@ -12,26 +12,46 @@
     current: boolean;
     /** 「其他（OpenAI 兼容）」：要自己填 Base URL */
     custom: boolean;
+    /** 用哪套协议：选的，没选就是预设的 */
+    apiStyle: ApiStyle;
+    /** 预设的协议（标「默认」用） */
+    apiStyleDefault: ApiStyle;
+    /** 正在用的那家：「自动」这会儿实际落在哪套上；别的家是 null */
+    transport: 'responses' | 'chat' | null;
   };
+
+  export type ApiStyle = 'auto' | 'responses' | 'chat';
 </script>
 
 <script lang="ts">
   /**
    * 设置页。从抽屉左下角的齿轮、或者选择模型面板里「模型提供商」页最下面的「管理模型提供商」进来。
    *
-   * 几栏：「模型提供商」、「MCP 服务」（见 McpSection）、「技能（Skill）」（见 SkillsSection）、「连接手机」（配对码，见 PairingSection；只有电脑上自己开这个
-   * 页面时才有）和「Linux 沙箱」（Alpine 版本 / 升级，见 SandboxSection；
-   * 桌面宿主模式下没有这一栏）。换机器不在这里：在侧栏底栏的机器标签（见 MachineSheet）。模型提供商：内置几家服务商，每家只填 API Key；Base URL、
-   * 协议都内置好了，模型清单自动拉（见 core/src/providers.rs）。几家可以
-   * 同时配好，在选择模型面板里点哪家的模型就切到哪家。
+   * 从上到下：
+   * - 模型提供商：内置几家，每家只填 API Key（Base URL 内置，模型清单自动拉，见
+   *   core/src/providers.rs）；协议默认是预设的，详情页里能改（ProviderPage）。几家可以
+   *   同时配好，在选择模型面板里点哪家的模型就切到哪家
+   * - 手机权限（PermissionsSection）：只在手机 App 里有
+   * - MCP 服务、技能（McpSection / SkillsSection）
+   * - 联网搜索（SearchSection）：Exa key，可选
+   * - 用量（UsageSection）
+   * - 连接手机（PairingSection）：配对码，只有电脑上自己开这个页面时才有
+   * - Linux 沙箱（SandboxSection）：Alpine 版本 / 升级，桌面宿主模式下没有
+   * - 状态（StatusSection）：各部件通不通 + 版本
+   *
+   * 换机器不在这里：在侧栏底栏的机器标签（见 MachineSheet）。
    */
   import Icon from './Icon.svelte';
   import Page from './Page.svelte';
   import McpSection from './McpSection.svelte';
   import PairingSection from './PairingSection.svelte';
+  import PermissionsSection from './PermissionsSection.svelte';
   import ProviderPage from './ProviderPage.svelte';
   import SandboxSection from './SandboxSection.svelte';
+  import SearchSection from './SearchSection.svelte';
   import SkillsSection from './SkillsSection.svelte';
+  import StatusSection from './StatusSection.svelte';
+  import UsageSection from './UsageSection.svelte';
   import { store } from '../lib/store.svelte.ts';
 
   let { onclose }: { onclose: () => void } = $props();
@@ -87,10 +107,14 @@
     {/each}
   </div>
   {#if err}<p class="px-1 pt-3 text-xs text-bad">{err}</p>{/if}
+  <PermissionsSection />
   <McpSection />
   <SkillsSection />
+  <SearchSection />
+  <UsageSection />
   <PairingSection />
   <SandboxSection />
+  <StatusSection />
 </Page>
 
 {#if open}

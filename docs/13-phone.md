@@ -102,6 +102,19 @@ source: fresh
 - 参数从 shell 原样传过去（`{"cmd":"sms","argv":["list","--limit","2"]}`），
   解析在 Kotlin（`PhoneArgs`）：Rust 那边不需要懂每个命令的参数，加子命令不用动它。
 
+## 授权：设置页「手机权限」
+
+这些能力要的授权散在系统设置的好几个角落，以前只在首次启动时各问一次，没给就找不到入口了。
+现在设置页有一栏（`PermissionCenter.kt` + `PermissionsSection.svelte`，经 `AgentHost` 桥）：
+每项现在开没开，没开的点一下去开 —— 能弹框的弹框（通讯录 / 日历 / 短信 / 定位 / 通知），
+弹不了的送去对应的系统设置页（无障碍、所有文件、忽略电池优化、实时更新、通知读取、修改
+系统设置）；运行时权限被拒过、系统已经不再弹框的，送去 App 详情页。剪贴板没有能授予的权限
+（Android 10+ 只让前台 App 读），只做说明。
+
+**通知读取**（`agent notifications list|recent`）是通知监听服务（`AgentNotificationListener`），
+没有弹框，要用户在系统的「通知使用权」里打开。`recent` 的缓冲只在内存里（最多 100 条、
+进程重启清空）—— 通知是别人的私信和验证码，不往盘上写。
+
 ## 7. 加一个新能力要动哪几处
 
 1. `core/src/phone.rs` 的 `COMMANDS` 加一项（名字 + `agent help` 里的用法）——

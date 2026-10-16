@@ -42,6 +42,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/mcp/servers/delete", post(delete_mcp_server))
         .route("/api/mcp/servers/enabled", post(set_mcp_enabled))
         .route("/api/skills", get(list_skills))
+        .route("/api/usage", get(usage_summary))
         .route("/api/skills/enabled", post(set_skill_enabled))
         // 看一眼工作目录（`agent files`）—— 只读，不动任何文件
         .route("/api/files", post(list_files))
@@ -49,7 +50,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 沙箱里的 `agent <设备命令>` 走它（见 `phone` 模块）。
         .route("/api/device", post(device_command))
         .route("/api/websearch", post(web_search))
-        .route("/api/websearch/config", post(set_search_config))
+        .route(
+            "/api/websearch/config",
+            get(search_config).post(set_search_config),
+        )
         .route("/api/edit", post(edit_file))
         .route("/api/llm", post(set_llm))
         .route("/api/models", get(get_models))
@@ -58,6 +62,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/providers/{id}",
             post(save_provider).delete(delete_provider),
         )
+        .route("/api/providers/{id}/api-style", post(set_api_style))
         .route("/api/model", post(set_model))
         .route(
             "/api/attachment",
@@ -325,6 +330,7 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "version": VERSION,
+        "git": crate::state::GIT,
         "port": st.port.load(std::sync::atomic::Ordering::Relaxed),
         "platform": std::env::consts::OS,
         "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),
@@ -1248,6 +1254,38 @@ async fn set_skill_enabled(
     }
 }
 
+/// `GET /api/usage` → 用量汇总（设置页「用量」）：最近 14 天按天、全部历史按模型。
+///
+/// 只报 token 和缓存命中，**不估钱**：models.dev 有目录价，但包月套餐（OpenCode Go 这类）
+/// 按目录价算出来的数字是错的，不如不给。
+async fn usage_summary(State(st): State<Arc<AppState>>) -> Response {
+    const DAYS: u32 = 14;
+    let Some(db) = st.db() else {
+        return Json(json!({ "byDay": [], "byModel": [] })).into_response();
+    };
+    let r = tokio::task::spawn_blocking(move || db.usage_summary(DAYS)).await;
+    let s = match r {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    let rows = |v: Vec<(String, i64, i64, i64, i64)>| -> Vec<Value> {
+        v.into_iter()
+            .map(|(key, calls, input, cache_read, output)| {
+                json!({
+                    "key": key,
+                    "calls": calls,
+                    "input": input,
+                    "cacheRead": cache_read,
+                    "output": output,
+                    "hitRatio": if input > 0 { Some(cache_read as f64 / input as f64) } else { None },
+                })
+            })
+            .collect()
+    };
+    Json(json!({ "byDay": rows(s.by_day), "byModel": rows(s.by_model) })).into_response()
+}
+
 /// `GET /api/skills` → 装了哪些 skill（带启用状态），以及放在哪（设置页用）。
 async fn list_skills(State(st): State<Arc<AppState>>) -> Json<Value> {
     let dir = st.linux().map(|sb| sb.skills_dir().1);
@@ -1330,10 +1368,24 @@ struct SearchConfigBody {
     exa_api_key: String,
 }
 
+/// `GET /api/websearch/config` → 配没配 Exa key（设置页用）。key 本身不回，只回末尾几位；
+/// `fromEnv` = 环境变量 `EXA_API_KEY` 给的（桌面开发），设置页里改不了它。
+async fn search_config(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let env = std::env::var("EXA_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let key = crate::search::read_key(&st);
+    Json(json!({
+        "configured": key.is_some(),
+        "keyHint": key.as_deref().map(crate::providers::key_hint),
+        "fromEnv": env.is_some(),
+    }))
+}
+
 /// `POST /api/websearch/config` → 存 Exa 的 key（库里 `meta` 的 `exa_api_key`）。
 ///
-/// 空字符串就是清掉。为什么不给前端做界面：这是“免费用完了才需要”的逃生口，
-/// 先用 curl / agentctl 设一下就够（见 docs/09）。
+/// 空字符串就是清掉。不配也能搜（走 Exa 免 key 的公开端点，按 IP 限额）；免费额度
+/// 用完了才需要它（见 docs/09）。设置页「联网搜索」那一栏就是填它的。
 async fn set_search_config(
     State(st): State<Arc<AppState>>,
     Json(body): Json<SearchConfigBody>,
@@ -1775,7 +1827,7 @@ async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery
 
     let mut jobs = tokio::task::JoinSet::new();
     for (id, creds) in store {
-        let Some(p) = crate::providers::provider(&id, &creds, "") else {
+        let Some(p) = st.provider_for(&id, &creds, "") else {
             continue;
         };
         let st = st.clone();
@@ -1846,10 +1898,24 @@ async fn switch_provider(st: &Arc<AppState>, p: &Provider) -> (bool, bool) {
 ///
 /// 只回「配没配」和 Key 的最后 4 位，不回 Key 本身。
 async fn list_providers(State(st): State<Arc<AppState>>) -> Response {
-    let current = st.llm().map(|p| crate::providers::identify(&p));
+    let cur = st.llm();
+    let current = cur.as_ref().map(crate::providers::identify);
     let store = st.providers.read().map(|g| g.clone()).unwrap_or_default();
     let row = |id: &str, name: &str, base_url: String, key_url: Option<&str>| {
         let creds = store.get(id);
+        let is_current = current == Some(id);
+        // 协议：选的（没选就是预设的），以及「自动」这会儿实际落在哪套上 ——
+        // 只有正在用的那家知道模型，「这个端点 + 模型不支持 Responses」是按模型记的
+        let style = st
+            .api_style_override(id)
+            .unwrap_or_else(|| crate::providers::default_api_style(id));
+        let transport = cur
+            .as_ref()
+            .filter(|_| is_current)
+            .map(|p| match p.transport() {
+                crate::llm::Transport::Responses => "responses",
+                crate::llm::Transport::Chat => "chat",
+            });
         json!({
             "id": id,
             "name": name,
@@ -1857,8 +1923,11 @@ async fn list_providers(State(st): State<Arc<AppState>>) -> Response {
             "keyUrl": key_url,
             "configured": creds.is_some(),
             "keyHint": creds.map(|c| crate::providers::key_hint(&c.api_key)),
-            "current": current == Some(id),
+            "current": is_current,
             "custom": id == crate::providers::CUSTOM,
+            "apiStyle": style.as_str(),
+            "apiStyleDefault": crate::providers::default_api_style(id).as_str(),
+            "transport": transport,
         })
     };
     let mut rows: Vec<serde_json::Value> = crate::providers::PRESETS
@@ -1876,6 +1945,34 @@ async fn list_providers(State(st): State<Arc<AppState>>) -> Response {
         None,
     ));
     Json(json!({ "providers": rows })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ApiStyleBody {
+    /// auto | responses | chat；和预设的一样就当「回到默认」（不单独存）
+    style: String,
+}
+
+/// `POST /api/providers/{id}/api-style` → 选这家用哪套协议。
+async fn set_api_style(
+    State(st): State<Arc<AppState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<ApiStyleBody>,
+) -> Response {
+    if !crate::providers::is_known(&id) {
+        return (StatusCode::NOT_FOUND, "没有这个服务商").into_response();
+    }
+    let style = match body.style.as_str() {
+        s @ ("auto" | "responses" | "chat") => crate::llm::ApiStyle::parse(s),
+        other => {
+            return (StatusCode::BAD_REQUEST, format!("不认识的协议：{other}")).into_response()
+        }
+    };
+    let keep = (style != crate::providers::default_api_style(&id)).then_some(style);
+    match st.set_api_style(&id, keep) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1914,7 +2011,7 @@ async fn save_provider(
         api_key,
         base_url: body.base_url.trim().trim_end_matches('/').to_string(),
     };
-    let Some(probe) = crate::providers::provider(&id, &creds, "") else {
+    let Some(probe) = st.provider_for(&id, &creds, "") else {
         return (StatusCode::BAD_REQUEST, "Base URL 不能为空").into_response();
     };
     if let Err(e) = crate::models::verify(&probe).await {
@@ -1935,7 +2032,7 @@ async fn save_provider(
             _ => crate::providers::pick_default(&id, &ids),
         };
         if let Some(model) = model {
-            if let Some(mut p) = crate::providers::provider(&id, &creds, &model) {
+            if let Some(mut p) = st.provider_for(&id, &creds, &model) {
                 p.reasoning_effort = current.and_then(|c| c.reasoning_effort);
                 switch_provider(&st, &p).await;
                 switched = true;
@@ -1972,9 +2069,7 @@ async fn delete_provider(
             .read()
             .ok()
             .and_then(|g| g.iter().next().map(|(k, v)| (k.clone(), v.clone())));
-        match next
-            .and_then(|(nid, c)| Some((nid.clone(), crate::providers::provider(&nid, &c, "")?)))
-        {
+        match next.and_then(|(nid, c)| Some((nid.clone(), st.provider_for(&nid, &c, "")?))) {
             Some((nid, probe)) => {
                 let ids: Vec<String> = st
                     .models_of(&nid, &probe, false)
@@ -2087,7 +2182,7 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
                 )
                     .into_response();
             };
-            let Some(mut p) = crate::providers::provider(id, &creds, "") else {
+            let Some(mut p) = st.provider_for(id, &creds, "") else {
                 return (StatusCode::BAD_REQUEST, "这家服务商的配置不完整").into_response();
             };
             p.reasoning_effort = cur.and_then(|c| c.reasoning_effort);
@@ -2266,6 +2361,7 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 
     Json(json!({
         "version": VERSION,
+        "git": crate::state::GIT,
         "platform": std::env::consts::OS,
         "port": st.port.load(std::sync::atomic::Ordering::Relaxed),
         "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),

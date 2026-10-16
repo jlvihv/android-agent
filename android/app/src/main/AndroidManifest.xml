@@ -26,6 +26,8 @@
     <!-- 通知权限。没有它 Android 13+ 不显示那个通知（服务照样跑，只是用户看不见）。
          只在真的起回合时问一次，不在启动时问。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 设置页「忽略电池优化」：弹系统那个「允许在后台运行」对话框要它 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- 设备命令（`agent contacts|calendar|sms|location|alarm`）要的权限。
          都是**运行时**权限：第一次用到那个命令时才会弹框（见 AgentPermissions ——
@@ -107,6 +109,17 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 通知读取（`agent notifications`）。用户在系统设置的「通知使用权」里打开 -->
+        <service
+            android:name=".AgentNotificationListener"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
         </service>
 
         <!-- 回合进行中保活。`exported="false"`：只有我们自己能起它 -->

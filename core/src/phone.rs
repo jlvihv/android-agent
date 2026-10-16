@@ -50,6 +50,10 @@ pub const COMMANDS: &[Command] = &[
     },
     Command { name: "sms", usage: "sms list [--limit N] | search <词> | get <id> | stats" },
     Command { name: "notify", usage: "notify --title T [--body B]       发一条系统通知" },
+    Command {
+        name: "notifications",
+        usage: "notifications [list|recent] [--limit N] [--app 包名]   通知栏里的 / 最近收到过的通知",
+    },
     Command { name: "speak", usage: "speak <文本> [--voice zh-CN]      朗读" },
 ];
 

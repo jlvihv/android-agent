@@ -92,6 +92,12 @@ pub fn is_known(id: &str) -> bool {
 }
 
 /// 用存下来的凭据造一个 `Provider`。`model` 空着就先占位（调用方拉完清单再定）。
+/// 这家预设的协议（自定义的那家是 Auto）。
+pub fn default_api_style(id: &str) -> ApiStyle {
+    preset(id).map_or(ApiStyle::Auto, |p| p.api_style)
+}
+
+/// 组装一家服务商。**协议是预设的** —— 要带上用户选的协议走 `AppState::provider_for`。
 pub fn provider(id: &str, creds: &Creds, model: &str) -> Option<Provider> {
     let (base_url, api_style) = match preset(id) {
         Some(p) => (p.base_url.to_string(), p.api_style),

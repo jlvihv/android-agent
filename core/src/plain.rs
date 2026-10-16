@@ -29,7 +29,7 @@ fn block(v: &Value, indent: usize, out: &mut Vec<String>) {
             }
             for (k, x) in m {
                 if is_scalar(x) {
-                    out.push(format!("{pad}{k}: {}", scalar(x)));
+                    push_value(out, &format!("{pad}{k}: "), &format!("{pad}  "), &scalar(x));
                 } else if x.as_array().is_some_and(|a| a.is_empty()) {
                     out.push(format!("{pad}{k}: （无）"));
                 } else {
@@ -50,7 +50,7 @@ fn block(v: &Value, indent: usize, out: &mut Vec<String>) {
             } else {
                 for x in a {
                     if is_scalar(x) {
-                        out.push(format!("{pad}- {}", scalar(x)));
+                        push_value(out, &format!("{pad}- "), &format!("{pad}  "), &scalar(x));
                     } else {
                         // 非扁平的记录：第一行带 `- `，其余对齐缩进
                         let mut sub = Vec::new();
@@ -63,7 +63,17 @@ fn block(v: &Value, indent: usize, out: &mut Vec<String>) {
                 }
             }
         }
-        x => out.push(format!("{pad}{}", scalar(x))),
+        x => push_value(out, &pad, &pad, &scalar(x)),
+    }
+}
+
+/// 一个可能有好几行的值：第一行接在 `lead` 后面，续行用 `cont` 缩进 —— 不然通知正文、
+/// 短信这种多行的值，第二行会顶格，和下一个字段混在一起分不清。
+fn push_value(out: &mut Vec<String>, lead: &str, cont: &str, v: &str) {
+    let mut lines = v.lines();
+    out.push(format!("{lead}{}", lines.next().unwrap_or("")));
+    for l in lines {
+        out.push(format!("{cont}{l}"));
     }
 }
 
@@ -160,6 +170,14 @@ mod tests {
             render(&v),
             "empty: （无）\npeople:\n  - name: 张三\n    phones:\n      - 1\n      - 2\n  - name: 李四\n    phones: （无）\ntags:\n  - a\n  - b"
         );
+    }
+
+    /// 多行的值：续行缩进到值的那一层，不顶格。
+    #[test]
+    fn multiline_values_stay_indented() {
+        let v = json!({ "n": { "text": "第一行\n第二行", "title": "t" } });
+        assert_eq!(render(&v), "n:\n  text: 第一行\n    第二行\n  title: t");
+        assert_eq!(render(&json!(["a\nb"])), "- a\n  b");
     }
 
     #[test]

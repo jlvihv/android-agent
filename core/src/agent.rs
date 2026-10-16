@@ -257,7 +257,7 @@ fn new_provider_session() -> String {
     format!("agent-core-{}", uuid::Uuid::now_v7())
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

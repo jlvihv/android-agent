@@ -863,6 +863,16 @@ class MainActivity : Activity() {
 
     /** 页面的方法调用会跑到 JavaBridge 线程上，得自己回主线程 */
     inner class BackHost {
+        /** 设置页「手机权限」那一栏：每一项现在开没开（JSON 数组，见 PermissionCenter） */
+        @JavascriptInterface
+        fun permissions(): String = PermissionCenter.status(this@MainActivity).toString()
+
+        /** 去开某一项：弹框或者送去对应的系统设置页 */
+        @JavascriptInterface
+        fun grant(key: String) {
+            runOnUiThread { PermissionCenter.request(this@MainActivity, key) }
+        }
+
         @JavascriptInterface
         fun setBackHandled(handled: Boolean) {
             runOnUiThread {

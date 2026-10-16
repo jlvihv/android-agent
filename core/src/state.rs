@@ -20,6 +20,9 @@ use crate::phone::PhoneApi;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 编进去的 git 提交号（`build.rs`）。拿不到 git 时是空串。
+pub const GIT: &str = env!("AGENT_GIT");
+
 // ---------------------------------------------------------------------------
 // Rust → 设备侧：指令
 // ---------------------------------------------------------------------------
@@ -251,6 +254,8 @@ pub struct AppState {
     /// `llm` 是「当前在用的那一个」（含模型），这里是「配好了的全部」：
     /// 选择模型面板把这几家的模型都列出来，点哪个就切到哪家。
     pub providers: RwLock<crate::providers::Store>,
+    /// 每家服务商选的协议（库里 `provider_api_style` 表）。没选的用预设的（`providers::PRESETS`）
+    api_styles: RwLock<std::collections::HashMap<String, crate::llm::ApiStyle>>,
     /// 远程 MCP 服务（配置 + 各自的会话 + 停用名单）。见 `mcp` 模块。
     pub mcp: crate::mcp::Mcp,
     /// 停用的 skill（目录名）。库里 `disabled` 表 kind = 'skill' 那几行
@@ -368,6 +373,7 @@ impl AppState {
             llm: RwLock::new(None),
             providers: RwLock::new(Default::default()),
             mcp: Default::default(),
+            api_styles: Default::default(),
             disabled_skills: Default::default(),
             model_lists: Mutex::new(HashMap::new()),
             data_dir: RwLock::new(None),
@@ -492,6 +498,17 @@ impl AppState {
                 match db.mcp_servers() {
                     Ok(list) => self.mcp.set_servers(list),
                     Err(e) => tracing::warn!("读 MCP 服务失败: {e:#}"),
+                }
+                match db.api_styles() {
+                    Ok(rows) => {
+                        if let Ok(mut g) = self.api_styles.write() {
+                            *g = rows
+                                .into_iter()
+                                .map(|(id, s)| (id, crate::llm::ApiStyle::parse(&s)))
+                                .collect();
+                        }
+                    }
+                    Err(e) => tracing::warn!("读服务商协议失败: {e:#}"),
                 }
                 match db.disabled() {
                     Ok(rows) => {
@@ -1257,6 +1274,48 @@ impl AppState {
         Ok(had)
     }
 
+    /// 组装一家服务商（预设 + Key + 模型），协议按用户选的来（没选就是预设的）。
+    /// **用到服务商的地方都走这里** —— 直接调 `providers::provider` 会漏掉用户选的协议。
+    pub fn provider_for(
+        &self,
+        id: &str,
+        creds: &crate::providers::Creds,
+        model: &str,
+    ) -> Option<Provider> {
+        let mut p = crate::providers::provider(id, creds, model)?;
+        if let Some(s) = self.api_style_override(id) {
+            p.api_style = s;
+        }
+        Some(p)
+    }
+
+    /// 用户给这家选的协议（`None` = 没选，用预设的）。
+    pub fn api_style_override(&self, id: &str) -> Option<crate::llm::ApiStyle> {
+        self.api_styles.read().ok()?.get(id).copied()
+    }
+
+    /// 选一家的协议（`None` = 回到预设的）。正在用的就是这家的话，当前配置跟着换。
+    pub fn set_api_style(
+        &self,
+        id: &str,
+        style: Option<crate::llm::ApiStyle>,
+    ) -> anyhow::Result<()> {
+        if let Some(db) = self.db() {
+            db.set_api_style(id, style.map(|s| s.as_str()))?;
+        }
+        if let Ok(mut g) = self.api_styles.write() {
+            match style {
+                Some(s) => g.insert(id.to_string(), s),
+                None => g.remove(id),
+            };
+        }
+        if let Some(mut cur) = self.llm().filter(|p| crate::providers::identify(p) == id) {
+            cur.api_style = style.unwrap_or_else(|| crate::providers::default_api_style(id));
+            self.set_llm(cur);
+        }
+        Ok(())
+    }
+
     /// 启用 / 停用一个 MCP 服务（停用的不进提示词，模型调它会被拒）。
     pub async fn set_mcp_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -1755,6 +1814,54 @@ mod tests {
         // 运行时覆盖照旧最高优先（`/api/debug/system-prompt` 调提示词那条路）
         st.set_system_prompt(Some("改过的".into()));
         assert!(st.system_prompt().starts_with("改过的\n\n"));
+    }
+
+    /// 选的协议：存进库、重开还在；组装服务商时用它（不是预设的）；正在用的就是这家
+    /// 的话当前配置跟着换；回到默认就是删掉那一行。
+    #[test]
+    fn a_chosen_api_style_sticks_and_applies() {
+        use crate::llm::ApiStyle;
+        let dir = temp_dir("apistyle");
+        let creds = crate::providers::Creds {
+            api_key: "sk-1".into(),
+            base_url: String::new(),
+        };
+        let st = AppState::new();
+        st.open_db(&dir);
+        assert_eq!(
+            st.provider_for("deepseek", &creds, "m").unwrap().api_style,
+            ApiStyle::Chat,
+            "预设"
+        );
+        st.set_llm(st.provider_for("deepseek", &creds, "m").unwrap());
+
+        st.set_api_style("deepseek", Some(ApiStyle::Responses))
+            .unwrap();
+        assert_eq!(
+            st.provider_for("deepseek", &creds, "m").unwrap().api_style,
+            ApiStyle::Responses
+        );
+        assert_eq!(
+            st.llm().unwrap().api_style,
+            ApiStyle::Responses,
+            "正在用的跟着换"
+        );
+
+        let st2 = AppState::new();
+        st2.open_db(&dir);
+        assert_eq!(
+            st2.api_style_override("deepseek"),
+            Some(ApiStyle::Responses),
+            "重开还在"
+        );
+
+        st2.set_api_style("deepseek", None).unwrap();
+        assert_eq!(
+            st2.provider_for("deepseek", &creds, "m").unwrap().api_style,
+            ApiStyle::Chat,
+            "回到预设"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 配置按列存在表里：改模型、改 Key 都落在表里，重开还在，凭据也不变。

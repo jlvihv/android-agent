@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS providers (
   base_url TEXT NOT NULL
 );
 
+-- 每家服务商选的协议（auto | responses | chat）。不在表里 = 用预设的（providers.rs）
+CREATE TABLE IF NOT EXISTS provider_api_style (
+  id        TEXT PRIMARY KEY,
+  api_style TEXT NOT NULL
+);
+
 -- 远程 MCP 服务（见 mcp.rs）。headers 是 JSON 对象（一般就是 Authorization）
 CREATE TABLE IF NOT EXISTS mcp_servers (
   name    TEXT PRIMARY KEY,
@@ -245,6 +251,13 @@ struct PlannedMessages {
     /// `rows[0]` 的 seq
     from: usize,
     rows: Vec<String>,
+}
+
+/// `Db::usage_summary` 的结果。
+#[derive(Debug, Default)]
+pub struct UsageSummary {
+    pub by_day: Vec<(String, i64, i64, i64, i64)>,
+    pub by_model: Vec<(String, i64, i64, i64, i64)>,
 }
 
 pub struct Db {
@@ -738,6 +751,30 @@ impl Db {
         })
     }
 
+    /// 每家服务商选的协议：(服务商 id, auto | responses | chat)。
+    pub fn api_styles(&self) -> Result<Vec<(String, String)>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id, api_style FROM provider_api_style")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })
+    }
+
+    /// 存 / 删（`None` = 回到预设的）一家的协议。
+    pub fn set_api_style(&self, id: &str, style: Option<&str>) -> Result<()> {
+        self.with(|c| match style {
+            None => c
+                .execute("DELETE FROM provider_api_style WHERE id = ?1", [id])
+                .map(|_| ()),
+            Some(s) => c
+                .execute(
+                    "INSERT OR REPLACE INTO provider_api_style(id, api_style) VALUES(?1, ?2)",
+                    [id, s],
+                )
+                .map(|_| ()),
+        })
+    }
+
     /// 停用名单：(kind, name)。
     pub fn disabled(&self) -> Result<Vec<(String, String)>> {
         self.with(|c| {
@@ -977,6 +1014,38 @@ impl Db {
         })
     }
 
+    /// 用量汇总（设置页「用量」）：全部历史（包括清空过、删掉的会话 —— 行一直留着）。
+    ///
+    /// `by_day` 是最近 `days` 天、按本地日期分组（最新在前）；`by_model` 是全部历史按
+    /// 服务商 + 模型分组（用得多的在前）。一行：`(键, 次数, 输入, 缓存读, 输出)`，
+    /// 输入含缓存（和 `usage.input` 同一个口径）。
+    pub fn usage_summary(&self, days: u32) -> Result<UsageSummary> {
+        type Row = (String, i64, i64, i64, i64);
+        let since_ms = crate::agent::now_ms().saturating_sub(u64::from(days) * 86_400_000) as i64;
+        self.with(|c| {
+            let collect = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<Vec<Row>> {
+                let mut st = c.prepare(sql)?;
+                let rows = st.query_map(p, |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?;
+                rows.collect()
+            };
+            let by_day = collect(
+                "SELECT date(at / 1000, 'unixepoch', 'localtime') AS d, COUNT(*), SUM(input),
+                        COALESCE(SUM(cached), 0), SUM(output)
+                 FROM usage WHERE at >= ?1 GROUP BY d ORDER BY d DESC",
+                &[&since_ms],
+            )?;
+            let by_model = collect(
+                "SELECT provider || ' / ' || model AS m, COUNT(*), SUM(input),
+                        COALESCE(SUM(cached), 0), SUM(output)
+                 FROM usage GROUP BY m ORDER BY SUM(input) + SUM(output) DESC",
+                &[],
+            )?;
+            Ok(UsageSummary { by_day, by_model })
+        })
+    }
+
     /// 会话清空了：它之前的用量不再算进「当前上下文」（行留着，见 SCHEMA）。
     pub fn clear_usage(&self, sid: &str) -> Result<()> {
         self.with(|c| {
@@ -1039,6 +1108,38 @@ mod tests {
     use super::*;
 
     /// 用量是拿来分析的：清空会话只是标记，删会话也不动它 —— 行一直在。
+    /// 用量汇总：按天（只算最近 N 天）、按模型（全部历史，用得多的在前）；没报缓存的行按 0 算。
+    #[test]
+    fn usage_summary_groups_by_day_and_model() {
+        let db = Db::in_memory().unwrap();
+        let now = crate::agent::now_ms();
+        let row = |at: u64, model: &str, input: u32, cached: Option<u32>| UsageRow {
+            session_id: "s".into(),
+            at,
+            provider: "p".into(),
+            model: model.into(),
+            input,
+            output: 10,
+            cached,
+            ..Default::default()
+        };
+        db.add_usage(&row(now, "a", 1000, Some(800))).unwrap();
+        db.add_usage(&row(now, "a", 500, None)).unwrap();
+        db.add_usage(&row(now, "b", 100, Some(50))).unwrap();
+        db.add_usage(&row(now - 30 * 86_400_000, "b", 9000, Some(0)))
+            .unwrap();
+
+        let s = db.usage_summary(14).unwrap();
+        assert_eq!(s.by_day.len(), 1, "30 天前那条不在最近 14 天里");
+        assert_eq!(s.by_day[0].1, 3);
+        assert_eq!((s.by_day[0].2, s.by_day[0].3), (1600, 850));
+        assert_eq!(
+            s.by_model[0].0, "p / b",
+            "全部历史：b 用得多（9000 那条也算）"
+        );
+        assert_eq!(s.by_model[1], ("p / a".to_string(), 2, 1500, 800, 20));
+    }
+
     #[test]
     fn usage_rows_are_kept_when_a_session_is_cleared() {
         let db = Db::in_memory().unwrap();
