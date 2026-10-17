@@ -266,24 +266,13 @@
   // 现在：在底部附近才算"贴着"；内容或容器尺寸一变（流式长高、键盘弹起、
   // 输入框长高），贴着就跟到底。用 ResizeObserver，不用每个 delta 都跑。
   let content: HTMLDivElement | null = $state(null);
-  let pinned = $state(true);
-  /** 离底部多远（px）。除了 `pinned` 还要它：决定要不要显「回到最新」 */
-  let gap = $state(0);
-
-  /**
-   * 「回到最新」的显示门槛（px）。
-   *
-   * 比 `NEAR_BOTTOM`（48，判贴底）大一截：48 那块是「差不多就在底部」的
-   * 缓冲区，一进去按钮就冒出来会显得毛躁。
-   */
-  const JUMP_GAP = 120;
-  let showJump = $derived(!pinned && gap > JUMP_GAP);
 
   const toBottom = () => {
     if (!scroller) return;
     scroller.scrollTop = scroller.scrollHeight;
-    // 到底了就是 0：不写的话按钮要等下一个滚动事件才收起来
-    gap = 0;
+    // 观察层跟着刷一下（`gap` 是推导出来的）：不刷的话「回到最新」要等下一个
+    // 滚动事件才收起来。
+    measure();
   };
 
   /** 点「回到最新」：跟用户自己滚到底一个效果 */
@@ -339,39 +328,147 @@
   //      一窗（`tail`），往上翻到头再去要更早的一窗（`onloadearlier`）。
   //   2. **挂多少进 DOM** —— `limit`（这里管的）。长对话不能把几百条消息全挂
   //      进 DOM（节点数和内存都线性涨），所以只渲染最后 `limit` 条；往上翻先放
-  //      手上还没挂的（`limit += step`），手上没有了才去服务端要。
+  //      手上还没挂的（`extra += step`），手上没有了才去服务端要。
   //
-  // 这里是「窗口化」，不只影响布局：DOM 里只挂最后 `step + extra` 条；往上翻
-  // 先放手上还没挂的（`extra += step`），手上没有了就找服务端要一窗
-  //（`onloadearlier`）。
+  // 三层结构，**只有一个地方动它**。以前是四个地方各写各的（`onscroll` /
+  // `fillViewport` / 切会话 / `ResizeObserver`），彼此的约束靠注释维系 ——
+  // 「收窗口」和「不够一屏就接着要」那次一收一要地打起来就是这么来的：
   //
-  // `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** —— 封顶靠这个。
+  //   观察层（滚动 / 尺寸事件里，**只记事实**）  scrollTop / contentH / viewH / pinned / settled
+  //   意图层（`$derived`，**纯计算**）            wantOlder（该往前要）/ wantCollapse（该收）
+  //   落地层（**一个** `$effect`）                收窗口 → 预取 → 插入 + 补偿
+  //
+  // 于是 `ResizeObserver` 只**量**尺寸、切会话只管「回到尾部」—— 收窗口交给落地层
+  // （换一条会话，`pinned` 一置真，`wantCollapse` 自己就成立了）。
   //
   // 这里的「条」是**消息**（用户/助手），不是工具调用：一个回合的思考、
   // 工具、正文都是同一条助手消息里的 parts。所以 10 条 = 5 个回合。
   //
-  // 没有按钮：全是滚动自己触发的（用户无感）。两个入口：
-  //   - `onscroll`：快贴到顶了就去要（提前一屏，滚得快也不会看见顶边露白）
-  //   - `fillViewport`：这一窗**比视口还矮**（根本滚不动 —— 短消息很常见）时
-  //     自己接着要，否则滚动事件永远不来，那一截历史就再见不到了
-  /** 滚到这个位置（px）以内就去要更早的一窗 */
+  // `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** —— 封顶靠这个。
+  /** 滚到这个位置（px）以内就该往前要了 */
   const LOAD_EARLIER_AT = 400;
-  /** 滚动停下来多久算「停住了」（没有 `scrollend` 的浏览器用这个兑底） */
+  /** 滚动停下来多久算「停住了」（没有 `scrollend` 的内核用它兜底） */
   const IDLE_MS = 150;
-  /** 用户已经滚到顶附近了，等停稳再拉（见 `scheduleEarlier`） */
-  let wantEarlier = false;
-  let earlierTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // —— 观察层：只记事实，不做决定 ——
+  let scrollTop = $state(0);
+  let contentH = $state(0);
+  let viewH = $state(0);
+  /**
+   * 贴底（跟着最新内容走）。**只有用户往上翻才取消** —— 理由见 `onscroll` 里那段。
+   */
+  let pinned = $state(true);
+  /**
+   * 这一轮滚动停稳了没有。动界面必须等它为真：插入要写 `scrollTop`，而程序化写
+   * `scrollTop` 会把手机上手势正在进行的惯性滑动掐掉（见 `loadEarlier`）。
+   */
+  let settled = $state(true);
+  /**
+   * 量过尺寸没有。**没量过之前一个决定都不做**：`contentH` / `viewH` 初始都是 0，
+   * 「这一窗还不够一屏」会白白成立一次 —— 实测那一拉是在首帧乱序的时机插进去的，
+   * 接着就被落地层的「收窗口」收掉（换掉挂出来的那 10 条 → DOM 一抖 `scrollTop`
+   * 被夹成 0），补偿再照着失真后的位置写，界面就停在顶部了。
+   */
+  let measured = $state(false);
+  /**
+   * 最后 `step` 条挂出来有多高（px）—— 收窗口的判据。
+   *
+   * 为什么不用 `contentH > viewH`（那个更直接）：它**会跟着 `extra` 变**，于是和
+   * 「不够一屏就接着要」互相触发 —— 内容高度在视口附近时一收一要地空转（实测
+   * 5 秒里落地层跑了 139 次、`extra` 在 0/10 之间来回跳）。换成「**收完之后**
+   * 还装得满一屏吗」就不动了：这个量只跟最后那几条自己的高度有关。
+   */
+  let tailH = $state(0);
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  /** `loadEarlier` 正在跑：别重入（滚动事件很密，落地层也会反复跑） */
+  let loadingEarlier = false;
+
+  // —— 意图层：全是纯推导 ——
+  /** 离底部多远（px）。除了 `pinned` 还要它：决定要不要显「回到最新」 */
+  let gap = $derived(contentH - scrollTop - viewH);
   /**
    * 往上翻多放出来的条数（`step` 的整数倍）。
    *
-   * 分成 `step + extra` 而不是一个可写的 `limit`：一窗多大是外面说了算的
-   *（和发给服务端的 `tail` 同一个数），这里只管「多放了几窗」。
+   * 整个窗口化只有这一个「要记住」的量：`limit = step + extra`。它只被写两处，
+   * 而且都在落地层那条路上 —— 收（`extra = 0`）和 `loadEarlier` 放（`+= step`）。
    */
   let extra = $state(0);
   let limit = $derived(step + extra);
-  let loadingEarlier = false;
-
   let start = $derived(Math.max(0, messages.length - limit));
+  /**
+   * 该往前要了。**两条路看的不是同一件事**：
+   *
+   *   - 没贴底（用户自己往上翻了）：贴到顶就要（`scrollTop < LOAD_EARLIER_AT`）
+   *   - 还贴着底：只有**整屏都装得下**（根本滚不动）才要 —— 那一截历史不然就见不到了
+   *
+   * 为什么要分「贴不贴底」：贴底时 `scrollTop` 是 0 并不能说明用户想看更早的 ——
+   * 首屏刚渲染、还没滚到底的那一两帧也是 0（实测：那样会误拉一页，而且是在首帧
+   * 乱序的时机插进去，DOM 一抖把 `scrollTop` 夹成 0，之后没人再拉回底部）。
+   */
+  let wantOlder = $derived(
+    measured && hasolder && (pinned ? contentH <= viewH : scrollTop < LOAD_EARLIER_AT),
+  );
+  /**
+   * 该把往上的窗口收回去（封顶 DOM）：贴底、放过更早的、而且**收完之后还装得满一屏**。
+   *
+   * 最后那个前提不能少：收完空出一截的话，「不够一屏就接着要」立刻又把它要回来，
+   * 两边一收一要地空转（见 `tailH`）。
+   */
+  let wantCollapse = $derived(pinned && extra > 0 && !loadingEarlier && tailH > viewH);
+
+  /**
+   * 「回到最新」的显示门槛（px）。
+   *
+   * 比 `NEAR_BOTTOM`（48，判贴底）大一截：48 那块是「差不多就在底部」的
+   * 缓冲区，一进去按钮就冒出来会显得毛躁。
+   */
+  const JUMP_GAP = 120;
+  let showJump = $derived(!pinned && gap > JUMP_GAP);
+
+  /**
+   * 只有用户**往上**翻才取消贴底。
+   *
+   * 每次滚动都按「离底部多远」重算的话：程序刚把列表滚到底，滚动事件
+   * 还没派发，内容又长了一截（流式时很常见），事件里一算离底部超过
+   * 48px，就误判成用户往上翻了 —— 之后再也不跟，回复结束时停在半截。
+   */
+  function onscroll() {
+    const el = scroller!;
+    scrollTop = el.scrollTop;
+    contentH = el.scrollHeight;
+    viewH = el.clientHeight;
+    if (gap < NEAR_BOTTOM) pinned = true;
+    else if (el.scrollTop < lastTop - 1) pinned = false;
+    lastTop = el.scrollTop;
+    // 还在滚：落地层这一会儿只**预取**、不动界面（见那里），等停稳再插
+    settled = false;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      settled = true;
+    }, IDLE_MS);
+  }
+
+
+  /** 量一次尺寸（挂载后、尺寸变化时）—— 只写观察层，不做决定 */
+  function measure() {
+    const el = scroller;
+    if (!el) return;
+    scrollTop = el.scrollTop;
+    contentH = el.scrollHeight;
+    viewH = el.clientHeight;
+    tailH = tailHeight();
+    measured = true;
+  }
+
+  /** 最后 `step` 条（含之间的间距）从第一条的顶到最后一条的底，有多少 px */
+  function tailHeight(): number {
+    const kids = content?.children;
+    if (!kids || kids.length < step) return 0;
+    const tail = [...kids].slice(-step);
+    const first = tail[0].getBoundingClientRect().top;
+    const last = tail[tail.length - 1].getBoundingClientRect().bottom;
+    return last - first;
+  }
 
   async function loadEarlier() {
     if (loadingEarlier || !scroller || !content) return;
@@ -389,17 +486,22 @@
     const anchor = kids.find((el) => el.getBoundingClientRect().bottom > edge);
     const before = anchor?.getBoundingClientRect().top ?? 0;
 
-    // 手上还有没挂出来的就先挂出来；到顶了才去服务端要一窗
+    // 手上还有没挂出来的就先挂出来；到顶了才去服务端要一窗。
+    //
+    // **窗口先放大，再去要**（顺序不能反）：反过来的话，服务端那一窗插进数组时
+    // 「挂出来的那一段」会整个换一批 —— 首屏窗口是 10 条，插完还是 10 条但内容
+    // 错位（`start = messages.length - limit` 跟着挪），Svelte 于是把节点挪来挪去。
+    // 实测那一抖会把 `scrollTop` 夹到 0，而参照消息的位置也跟着失真（量出 -4298），
+    // 补偿照着它写就把视口送回了顶部。先放大窗口，插进来的新内容就只是**加在
+    // 现有节点上面**，谁也不动。
     let grew = false;
     try {
       if (start > 0) {
         extra += step;
         grew = true;
       } else if (hasolder && onloadearlier) {
-        grew = await onloadearlier();
-        // 拿到的那一窗也要真的挂出来（数组变长、窗口不跟着长的话它就压在
-        // 窗口上面看不见，用户会以为「往上翻了但是没东西」）
-        if (grew) extra += step;
+        extra += step;
+        grew = (await onloadearlier()) || grew;
       }
     } finally {
       if (grew) {
@@ -422,118 +524,53 @@
     }
   }
 
-  /**
-   * 只有用户**往上**翻才取消贴底。
-   *
-   * 每次滚动都按"离底部多远"重算的话：程序刚把列表滚到底，滚动事件
-   * 还没派发，内容又长了一截（流式时很常见），事件里一算离底部超过
-   * 48px，就误判成用户往上翻了 —— 之后再也不跟，回复结束时停在半截。
-   */
-  function onscroll() {
-    const el = scroller!;
-    gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (gap < NEAR_BOTTOM) {
-      pinned = true;
-      // 回到底部了：往上补出来的更早那几窗收回去。窗口只增不减的话，往上翻过一次，
-      // 之后整个会话都一直挂在 DOM 里（实测 90 条的长会话：2000 → 5900 个节点）。
-      // 在底部收不会跳：被拿掉的都在视口上方，scrollTop 被夹到新的底，贴底照旧。
-      //
-      // **整屏都装得下的时候不收**：那时「回到底部」是白说的（根本没得滚），
-      // 收了只会让 `fillViewport` 又把它要回来 —— 一收一要地反复渲染，
-      // 还会一路把历史全拉下来。
-      if (extra > 0 && !loadingEarlier && el.scrollHeight > el.clientHeight) {
-        extra = 0;
-        // 视口之外那一堆旧页也一起收掉（`App` 那边的内存封顶）—— 收完手上只留三窗
-        ontrim?.();
-      }
-    } else if (el.scrollTop < lastTop - 1) pinned = false;
-    lastTop = el.scrollTop;
-    // 快到顶了：先把内容拿到手（不动界面），等这一轮滑动**停下来**再插
-    wantEarlier = el.scrollTop < LOAD_EARLIER_AT;
-    if (wantEarlier) {
-      onprefetch?.();
-      scheduleEarlier();
+  // —— 落地层：唯一动界面、唯一动 `extra` 的地方 ——
+  //
+  // 顺序要紧：**先收再要**（反过来会打架，见 `wantCollapse` 的注释）。
+  $effect(() => {
+    if (wantCollapse) {
+      extra = 0;
+      // 视口之外那堆旧页也一起收掉（`App` 那边的内存封顶）
+      ontrim?.();
+      return;
     }
-  }
-
-  /**
-   * 「快贴到顶了」这个意图先记下，等滑动停了再动手。
-   *
-   * 为什么不能在滚动中直接要：插入历史内容必须把 `scrollTop` 补回来，而**程序化地
-   * 写 `scrollTop` 会把手机上手势正在进行的惯性滑动掐掉** —— 用户那边就是「滑到一半
-   * 突然停了，而且停的不是刚才看的地方」。
-   *
-   * 浏览器原生的 scroll anchoring 本可以替我们干这件事（不动 JS），但它对我们这种
-   * 场景**正好不生效**：`overflow-anchor` 默认开着、插入内容也会自动补 scrollTop，
-   * 可“用户正在滚动”时 Chromium 把 anchoring 抑制掉了（实测：把手势放在滚动中，
-   * 插入 2000px 内容，位置靠的是我们那一次 JS 写 —— 而那一写同时把惯性抹了）。
-   *
-   * 所以等它停稳再插（`scrollend` 有就用它，没有就用「150ms 没有滚动事件」兜底）：
-   * 那时没人跟它抢，位置一定是对的，也不会抹掉任何手势。本地/局域网那点延迟
-   * （几十毫秒）看不出来；经中继是「先停下、内容再出现」，总比跳一下强。
-   *
-   * 内容本身是**滚动中**就预取好的（`onprefetch`），所以停稳那一刻只是插入 +
-   * 补偿，不再等一个网络来回。
-   */
-  function scheduleEarlier() {
-    clearTimeout(earlierTimer);
-    earlierTimer = setTimeout(settleEarlier, IDLE_MS);
-  }
-
-  /**
-   * 滑停了（超时和 `scrollend` 都走到这儿，谁先到算谁的）：该插就插。
-   */
-  function settleEarlier() {
-    clearTimeout(earlierTimer);
-    if (!wantEarlier) return;
-    wantEarlier = false;
+    if (!wantOlder) return;
+    // 滚着的时候只**预取**（不动界面）：插入要改 `scrollTop`，而那会把手机上
+    // 正在进行的惯性滑动掐掉 —— 等停稳（`settled`）再插。
+    if (!settled) {
+      onprefetch?.();
+      return;
+    }
     void loadEarlier();
-  }
+  });
 
-  // `scrollend` 有就听：惯性滑完它立刻发，比「150ms 没有滚动事件」准。
-  // 老内核（Safari / 老 WebView）没有它，靠上面那个超时兜底。
+  // 贴底就跟着内容长（流式、插入都不例外）；不贴底一动不动。
+  // 尺寸变化也走这条 —— 视口一变高，贴底的人该跟着到底。
+  $effect(() => {
+    void contentH;
+    void viewH;
+    if (pinned) toBottom();
+  });
+
+  // `scrollend` 有就用它（惯性滑完立刻发，比 150ms 准）；老内核靠那个超时兜底。
   $effect(() => {
     const el = scroller;
     if (!el) return;
-    const on = () => settleEarlier();
+    const on = () => {
+      clearTimeout(idleTimer);
+      settled = true;
+    };
     el.addEventListener('scrollend', on);
     return () => el.removeEventListener('scrollend', on);
   });
 
-  /**
-   * 手里这一窗**滚不动**（还不够一屏高）却有更早的 → 自己接着要。
-   *
-   * 没有按钮之后全靠滚动触发，而这种情况恰恰滚不了：滚动事件永远不来，
-   * 那一截历史就再见不到了（10 条短消息不到一屏，很常见）。还滚得动就不管，
-   * 交给 `onscroll`（它更及时）。
-   */
-  function fillViewport() {
-    if (!scroller || loadingEarlier) return;
-    if (!(start > 0 || hasolder)) return;
-    if (scroller.scrollHeight > scroller.clientHeight) return;
-    void loadEarlier();
-  }
-  // 手里几条 / 窗口多大 / 还有没有更早 / 视口高度变了 —— 任何一样变了都重看一遍
-  //「够不够一屏」。`untrack`：不看 `loadEarlier` 内部读写的那些，不然两边会互相
-  // 触发出无限循环（它自己会 `extra += step`、我们会因为 `extra` 变而重跑）。
-  $effect(() => {
-    void messages.length;
-    void limit;
-    void hasolder;
-    void gap;
-    untrack(fillViewport);
-  });
-
+  // `ResizeObserver` 只**量**：尺寸一变就把观察层刷新一遍，决定交给落地层。
   $effect(() => {
     if (!scroller || !content) return;
-    const ro = new ResizeObserver(() => {
-      // 离底部的距离也跟着内容长：不更新的话，用户在往上翻时
-      // 「回到最新」要靠下一次滚动才冒出来
-      gap = scroller!.scrollHeight - scroller!.scrollTop - scroller!.clientHeight;
-      if (pinned) toBottom();
-    });
+    const ro = new ResizeObserver(() => measure());
     ro.observe(scroller);
     ro.observe(content);
+    measure();
     return () => ro.disconnect();
   });
 
@@ -574,7 +611,7 @@
     // 切会话 → 挂出来的窗口收回来（否则新会话只显示尾巴那几条）。
     // **不能盯 `messages[0]`**：往上翻一窗也会换掉它（服务端那一窗插到前面），
     // 那时候把窗口收回去等于刚翻出来的又收起来了。
-    extra = 0;
+    // 这里不用自己收：`pinned` 一置真，落地层的 `wantCollapse` 就成立了。
     toBottom();
   });
 </script>
