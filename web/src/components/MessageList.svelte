@@ -350,6 +350,11 @@
   //     自己接着要，否则滚动事件永远不来，那一截历史就再见不到了
   /** 滚到这个位置（px）以内就去要更早的一窗 */
   const LOAD_EARLIER_AT = 400;
+  /** 滚动停下来多久算「停住了」（没有 `scrollend` 的浏览器用这个兑底） */
+  const IDLE_MS = 150;
+  /** 用户已经滚到顶附近了，等停稳再拉（见 `scheduleEarlier`） */
+  let wantEarlier = false;
+  let earlierTimer: ReturnType<typeof setTimeout> | undefined;
   /**
    * 往上翻多放出来的条数（`step` 的整数倍）。
    *
@@ -393,7 +398,18 @@
     } finally {
       if (grew) {
         await tick();
-        if (anchor) scroller.scrollTop += anchor.getBoundingClientRect().top - before;
+        if (anchor) {
+          // 浏览器自己的 **scroll anchoring** 一般已经把视口钉住了（措辞见下）——
+          // 这时一个字也别写：程序化地改 `scrollTop` 会把手机上手势正在进行的
+          // 惯性滑动**挡掉**，用户那边就是「滑到一半突然停了，而且停的不是刚才看的地方」。
+          // 只有浏览器没兜住（真漂了）才自己补。
+          //
+          // 原生 anchoring：新内容插在视口**上方**时自动调 scrollTop，让视口里那条
+          // 不动（Chromium 默认就开）。测法：往内容前面插一个 2000px 的 div，同步读
+          // —— `scrollTop` 自己 +2024、参照那条的位置一个字没变。
+          const drift = anchor.getBoundingClientRect().top - before;
+          if (Math.abs(drift) > 1) scroller.scrollTop += drift;
+        }
         lastTop = scroller.scrollTop;
       }
       loadingEarlier = false;
@@ -422,8 +438,36 @@
       if (extra > 0 && !loadingEarlier && el.scrollHeight > el.clientHeight) extra = 0;
     } else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
-    // 快到顶了 → 再要一窗更早的
-    if (el.scrollTop < LOAD_EARLIER_AT) void loadEarlier();
+    // 快到顶了 → 等这一轮滑动**停下来**再去要更早的一窗（见 `scheduleEarlier`）
+    wantEarlier = el.scrollTop < LOAD_EARLIER_AT;
+    if (wantEarlier) scheduleEarlier();
+  }
+
+  /**
+   * 「快贴到顶了」这个意图先记下，等滑动停了再动手。
+   *
+   * 为什么不能在滚动中直接要：插入历史内容必须把 `scrollTop` 补回来，而**程序化地
+   * 写 `scrollTop` 会把手机上手势正在进行的惯性滑动掐掉** —— 用户那边就是「滑到一半
+   * 突然停了，而且停的不是刚才看的地方」。
+   *
+   * 浏览器原生的 scroll anchoring 本可以替我们干这件事（不动 JS），但它对我们这种
+   * 场景**正好不生效**：`overflow-anchor` 默认开着、插入内容也会自动补 scrollTop，
+   * 可“用户正在滚动”时 Chromium 把 anchoring 抑制掉了（实测：把手势放在滚动中，
+   * 插入 2000px 内容，位置靠的是我们那一次 JS 写 —— 而那一写同时把惯性抹了）。
+   *
+   * 所以等它停下来再插（不听 `scrollend`：惯性滑完它就发，但 Safari/老内核没有它，
+   * 统一用「150ms 没有滚动事件」判停，一个数管所有浏览器）。
+   * 那时没人跟它抢，位置一定是对的，也不会抹掉任何手势。本地/局域网那点延迟
+   * （几十毫秒）看不出来；经中继是「先停下、内容再出现」，总比跳一下强。
+   */
+  function scheduleEarlier() {
+    clearTimeout(earlierTimer);
+    earlierTimer = setTimeout(() => {
+      if (wantEarlier) {
+        wantEarlier = false;
+        void loadEarlier();
+      }
+    }, IDLE_MS);
   }
 
   /**
@@ -439,7 +483,6 @@
     if (scroller.scrollHeight > scroller.clientHeight) return;
     void loadEarlier();
   }
-
   // 手里几条 / 窗口多大 / 还有没有更早 / 视口高度变了 —— 任何一样变了都重看一遍
   //「够不够一屏」。`untrack`：不看 `loadEarlier` 内部读写的那些，不然两边会互相
   // 触发出无限循环（它自己会 `extra += step`、我们会因为 `extra` 变而重跑）。
