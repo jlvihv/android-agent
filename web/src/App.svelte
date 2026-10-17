@@ -50,6 +50,33 @@
   let sessions = $state<Session[]>([]);
 
   /**
+   * 一窗多少条消息（视图消息的条数，**不是回合数**：一个回合的思考 / 工具 / 正文
+   * 都在同一条助手消息里，所以 40 条 ≈ 20 个回合）。
+   *
+   * 首屏就只跟服务端要这么多（`tail`），往上翻到头再要更早的一窗 —— 整段历史
+   * 每打开一次就传一遍很亏（一个长会话几 MB，而一屏只看得到几十条）。
+   * 同一个数也给 `MessageList`（它管「挂多少条进 DOM」）—— 那边一次挂的、
+   * 这边一次要的，是同一档数量。
+   */
+  const MSG_WINDOW = 40;
+
+  /**
+   * 手上这窗消息在**完整视图**里的起点（服务端的 `from`）：
+   * `messages` = 完整视图的 `[windowFrom, windowFrom + messages.length)`。
+   *
+   * 为什么要它：服务端算增量补丁时用的是完整视图的下标（`replaceFrom`），
+   * 而我们手上只有尾巴这一窗 —— 把这个数带回去，它替我们翻译。
+   */
+  let windowFrom = $state(0);
+  /** 服务端那边还有没有更早的（还有就把「显示更早的 N 条」/ 滚到顶变成去拉一窗） */
+  let hasOlder = $state(false);
+
+  /** 正在路上的那份 `loadMessages` 是哪一份（会话|窗口|rev）；空 = 没有 */
+  let inflight = '';
+  /** 路上这份还在跑的时候又有调用被合并掉了：回来后必须再补一次（见下面的注释） */
+  let inflightAgain = false;
+
+  /**
    * 排队等着交给模型的消息 —— 它是**服务端**那份队列的本地镜子。
    *
    * 队列本身在核心（`AppState::queued`）：`POST /api/chat` 碰上这个会话正跑着
@@ -203,9 +230,26 @@
     // 刚点了「新对话」还没发第一句：服务端那边还是旧会话（新的根本还没建），
     // 拉回来会把刚清空的界面又填满旧内容。
     if (fresh) return;
+    // 同一份（会话 + 窗口 + rev）已经在路上了就别再发：触发源有好几个
+    //（挂载、WS 连上、回合起停、切回前台），它们常常挤在同一瞬间 —— 实测首屏
+    // 发了三份一模一样的窗口（每次一窗，长会话里就是白花几份流量）。
+    // 被合并掉的那一次不能就这么算了（它可能正是「回合刚跑完，去拿最后那几条」），
+    // 所以下面会在这一份回来之后再补一次 —— 见 `inflightAgain`。
+    const key = `${sessionId}|${windowFrom}|${rev}`;
+    if (key === inflight) {
+      // 已经在路上了：**不能直接不管** —— 被合并掉的往往是「这个回合刚跑完，去把
+      // 最后那几条拿回来」那一次，而它要的东西可能比路上这份更新（路上那份可能在
+      // 回合结束之前就在服务端算好了）。记一笔，等它回来再补一次。
+      inflightAgain = true;
+      return;
+    }
+    inflight = key;
+    inflightAgain = false;
     const at = sent;
     try {
-      const r = await fetch(`/api/session?rev=${encodeURIComponent(rev)}`);
+      const r = await fetch(
+        `/api/session?rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
+      );
       if (!r.ok) return;
       const d = (await r.json()) as {
         messages?: Message[];
@@ -230,6 +274,10 @@
         keepParts?: number | null;
         /** token 用量（输入框那个圆环）。服务端那份是权威 */
         usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
+        /** 这一窗在**完整视图**里的起点（`messages` 下标从这里开始） */
+        from?: number;
+        /** 更早的还有没有（`false` = 这就是整段了） */
+        hasMore?: boolean;
       };
       // 请求在路上的时候本地发了一条（`send`）：这份是发之前的样子，拿它整份
       // 覆盖会把刚推进去的用户消息和正在流的那条助手消息冲掉 —— 流接着往一个
@@ -261,6 +309,7 @@
       const same = sid === sessionId;
       if (d.append && same) {
         // 服务端只补了差的那段：前面的原样留着，从 replaceFrom 换掉尾部
+        //（`replaceFrom` 已经是**我们这边的**下标了，服务端按 `from` 翻译过了）
         const from = Math.min(d.replaceFrom ?? 0, messages.length);
         const fresh = d.messages ?? [];
         const keep = d.keepParts;
@@ -268,6 +317,7 @@
           const old = messages[from];
           if (!old || old.role !== 'assistant' || old.parts.length < keep || !fresh[0]) {
             // 本地那条和服务端以为的对不上：老老实实要一份全量
+            //（`rev = ''` → 下一份是尾部窗口，回来时会按 `from` 接在旧的那段后面）
             rev = '';
             return loadMessages();
           }
@@ -275,12 +325,69 @@
         }
         messages = [...messages.slice(0, from), ...fresh];
       } else {
-        messages = same ? reconcile(messages, d.messages ?? []) : (d.messages ?? []);
+        // 整份（首屏那一窗 / 服务端认为我们对不上了）。本地可能还留着更早的那些
+        //（用户往上翻过）：能对上就只换后面那一段，别把界面拽回尾部。
+        const fresh = d.messages ?? [];
+        const at = d.from ?? 0;
+        const cut = same ? spliceAt(fresh, at) : -1;
+        if (cut >= 0) {
+          messages = [...messages.slice(0, cut), ...reconcile(messages.slice(cut), fresh)];
+        } else {
+          messages = same && at === 0 ? reconcile(messages, fresh) : fresh;
+          windowFrom = at;
+        }
+        hasOlder = !!d.hasMore;
       }
       if (d.turnError) showTurnError(d.turnError);
       sessionId = sid;
     } catch {
       /* 拉不到就算了 */
+    } finally {
+      if (inflight === key) {
+        inflight = '';
+        // 被合并掉的那次在这里补上（新的一份 key 不一样，不会自己把自己的门堵上）
+        if (inflightAgain) {
+          inflightAgain = false;
+          void loadMessages();
+        }
+      }
+    }
+  }
+
+  /**
+   * 往上翻一页更早的（`MessageList` 滚到顶 / 点「显示更早的 N 条」时叫它）。
+   *
+   * 只跟服务端要**这一窗** —— 历史是只追加的，这一窗要回来就永远是对的，不用管
+   * `rev`（那套是给「当前回合在长」用的）。返回 `true` = 真拿到了新东西（调用方
+   * 据此补偿滚动位置，不补偿的话视口会跳）。
+   *
+   * 接不上就整窗丢掉、不硬塞：宁可少显示一窗，也不能在中间留个洞（那会导致后面
+   * 所有下标都对不上，`replaceFrom` 那套全乱）。
+   */
+  async function loadOlder(): Promise<boolean> {
+    const sid = sessionId;
+    if (!hasOlder || !sid) return false;
+    try {
+      const r = await fetch(
+        `/api/session?id=${encodeURIComponent(sid)}&before=${windowFrom}&tail=${MSG_WINDOW}`,
+      );
+      if (!r.ok) return false;
+      const d = (await r.json()) as { messages?: Message[]; from?: number; hasMore?: boolean };
+      // 这一路走的过程中会话切走了 / 换了一条：这一页不要了
+      if (sid !== sessionId) return false;
+      const page = d.messages ?? [];
+      const from = d.from ?? 0;
+      if (!page.length) {
+        hasOlder = !!d.hasMore;
+        return false;
+      }
+      if (from + page.length !== windowFrom) return false;
+      messages = [...page, ...messages];
+      windowFrom = from;
+      hasOlder = !!d.hasMore;
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -335,6 +442,22 @@
   let sessionId = $state('');
 
   /**
+   * 服务端这份「整窗」该从本地第几条接上（接不上 = -1）。
+   *
+   * 两边说的是同一套下标：`at` 是它在完整视图里的起点，而本地是从 `windowFrom`
+   * 开始的，所以 `at - windowFrom` 就是它在本地数组里的位置。落在手上这段里还得
+   * id 对得上才算（对不上说明这是另一条会话的内容 / 被重置过）；正好接在尾巴
+   * 后面（`=== messages.length`）不用对 id，下标已经说明了它是接着的。
+   */
+  function spliceAt(fresh: Message[], at: number): number {
+    if (!fresh.length) return -1;
+    const i = at - windowFrom;
+    if (i < 0 || i > messages.length) return -1;
+    if (i === messages.length) return i;
+    return messages[i].id === fresh[0].id ? i : -1;
+  }
+
+  /**
    * 能复用的旧消息对象原样留着，Svelte 就不会重新渲染它们的 DOM。
    *
    * 服务端的会话是**只追加**的：一条消息 append 之后内容不再变。唯一的例外
@@ -377,6 +500,9 @@
     rev = '';
     sessionId = '';
     messages = [];
+    // 新会话还没跑过，手上这一窗的起点和「还有没有更早的」都从头算
+    windowFrom = 0;
+    hasOlder = false;
     // 新会话还没跑过，用量也从零开始
     usage = null;
     // 新会话在服务端**还不存在**，所以它一定没在跑 —— 不清的话会留着上一条
@@ -395,6 +521,8 @@
     fresh = false;
     rev = '';
     sessionId = '';
+    windowFrom = 0;
+    hasOlder = false;
     await Promise.all([loadSessions(), loadMessages()]);
     drawer = false;
   }
@@ -420,6 +548,8 @@
     fresh = false;
     rev = '';
     sessionId = '';
+    windowFrom = 0;
+    hasOlder = false;
     await Promise.all([loadSessions(), loadMessages()]);
   }
 
@@ -829,7 +959,16 @@
       {#if messages.length === 0 && queuedMsgs.length === 0}
         <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
       {:else}
-        <MessageList {messages} pending={queuedMsgs} ondrop={dropQueued} follow={ownSend} session={sessionId} />
+        <MessageList
+          {messages}
+          pending={queuedMsgs}
+          ondrop={dropQueued}
+          follow={ownSend}
+          session={sessionId}
+          hasolder={hasOlder}
+          onloadearlier={loadOlder}
+          step={MSG_WINDOW}
+        />
       {/if}
     </main>
 

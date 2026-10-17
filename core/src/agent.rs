@@ -936,6 +936,91 @@ pub fn session_view_count_before(sess: &ChatSession, upto: usize) -> usize {
     n
 }
 
+/// 视图里的**回合边界**：`(视图下标, DB 下标)`，第一个总是 `(0, 0)`。
+///
+/// `session_view_range` 的两个端点只能取这里的下标（或者末尾）：边界之间那些
+/// assistant 消息是**并进上一条**的（一个回合的多步合成一条），从中间切开就会被
+/// 当成新的一条，跟整段视图对不上。
+///
+/// 「一次取多少」和「从哪切」是两件事：条数是客户端说了算（它只渲染得了一屏），
+/// 切点只能落在这里。
+pub fn session_boundaries(sess: &ChatSession) -> Vec<(usize, usize)> {
+    let mut out = vec![(0usize, 0usize)];
+    let mut n = 0usize;
+    let mut last_assistant = false;
+    for (i, m) in sess.messages.iter().enumerate() {
+        match m {
+            // User 一定开新的一条（合并规则里 User 打断 assistant 的合并）。
+            // 记的是**它之前**的视图条数 —— 也就是它自己在新视图里的下标：
+            // 它自己还没算进去
+            ChatMessage::User { .. } => {
+                last_assistant = false;
+                out.push((n, i));
+                n += 1;
+            }
+            // assistant 只在「上一条不是 assistant」时起一条 —— 所以它从来不是切点
+            ChatMessage::Assistant {
+                content,
+                reasoning,
+                tool_calls,
+                ..
+            } => {
+                if content.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
+                    continue;
+                }
+                if !last_assistant {
+                    n += 1;
+                    last_assistant = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 尾部窗口的起点（DB 下标）：**一定是回合边界**，它之后至少 `tail` 条视图消息
+/// （不够就到 0 —— 整段就这么点）。
+///
+/// 多给一点没关系（最多多一个回合），少给才会让界面缺内容。`tail = 0` = 整段
+/// （脚本 / 调试那条路照旧）。
+pub fn session_tail_start(sess: &ChatSession, tail: usize) -> usize {
+    let total = session_view_count_before(sess, sess.messages.len());
+    if tail == 0 || total <= tail {
+        return 0;
+    }
+    let want = total - tail;
+    session_boundaries(sess)
+        .into_iter()
+        .rfind(|(count, _)| *count <= want)
+        .map(|(_, i)| i)
+        .unwrap_or(0)
+}
+
+/// 往前翻一页：`(窗口起点, 窗口终点)`（都是 DB 下标、都是回合边界）。
+///
+/// 这一窗**最多** `limit` 条视图消息，终点不超过 `before` —— 也就是客户端手上
+/// 那窗的起点（上一次响应里的 `from`）。所以一页接一页往前要，拼起来正好是
+/// 完整视图，既不重也不要漏（有测试盯着）。
+pub fn session_page(sess: &ChatSession, before: usize, limit: usize) -> (usize, usize) {
+    let bounds = session_boundaries(sess);
+    let total = session_view_count_before(sess, sess.messages.len());
+    let upto = before.min(total);
+    // 终点：视图下标 ≤ upto 的最后一个边界（正常就正好是 upto 那个）
+    let end = bounds
+        .iter()
+        .rfind(|(count, _)| *count <= upto)
+        .copied()
+        .unwrap_or((0, 0));
+    let want = end.0.saturating_sub(limit);
+    let start = bounds
+        .iter()
+        .rfind(|(count, _)| *count <= want)
+        .map(|&(_, i)| i)
+        .unwrap_or(0);
+    (start, end.1)
+}
+
 /// 同 `session_view`，但只产出 `messages[from..]` 对应的那部分。
 ///
 /// **`from` 必须是一个「回合边界」**（上一条是 User，或 0）—— 否则开头那个
@@ -945,10 +1030,23 @@ pub fn session_view_count_before(sess: &ChatSession, upto: usize) -> usize {
 /// 存在的理由：会话是只追加的，除当前正在长的那个回合，前面的输出都是最终的，
 /// 客户端不用每轮重收整段历史（含每个 50KB 的 bash 输出）。
 pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
-    let from = from.min(sess.messages.len());
+    session_view_range(sess, from, sess.messages.len())
+}
+
+/// 同 `session_view`，但只要 `messages[from..upto]` 那一段。
+///
+/// 两个端点都必须是**回合边界**（见 [`session_boundaries`]）——
+/// 从中间切开的话，开头那个 assistant 会被当成新的一条，而整段视图里它是并进上一条的。
+///
+/// 存在的理由：往前翻的时候只发这一窗，不把整段历史（含每个 50KB 的 bash 输出）
+/// 重新发一遍 —— 客户端一屏也就几十条，给多了它也不渲染。
+pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<Value> {
+    let len = sess.messages.len();
+    let from = from.min(len);
+    let upto = upto.clamp(from, len);
     // 工具结果按 id 索引：只需要切片内的（一个回合的 tool 结果都在它自己后面）
     let mut results: HashMap<&str, (&str, &[ImagePart])> = HashMap::new();
-    for m in &sess.messages[from..] {
+    for m in &sess.messages[from..upto] {
         if let ChatMessage::Tool {
             tool_call_id,
             content,
@@ -960,7 +1058,7 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
     }
 
     let mut out: Vec<Value> = Vec::new();
-    for (i, m) in sess.messages.iter().enumerate().skip(from) {
+    for (i, m) in sess.messages[from..upto].iter().enumerate().map(|(k, m)| (from + k, m)) {
         match m {
             // 系统提示词（第一条，以及后续的“提示词升级”）是给模型看的，不给用户看
             ChatMessage::System(_) => {}
@@ -4243,6 +4341,126 @@ mod tests {
             let joined: Vec<Value> = full[..head].iter().cloned().chain(tail).collect();
             assert_eq!(joined, full, "from={from} 时增量结果与完整视图不一致");
         }
+    }
+
+    /// 一个长会话：`turns` 个回合，每个回合 user + assistant（思考 + 工具调用）
+    /// + tool 结果 + assistant（正文）—— 视图里每回合就两条（user + 合并的 assistant）。
+    fn long_session(turns: usize) -> ChatSession {
+        let mut sess = ChatSession::new();
+        sess.messages.push(ChatMessage::System("sys".into()));
+        for t in 0..turns {
+            sess.messages.push(ChatMessage::user(format!("问{t}")));
+            sess.messages.push(ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: format!("想{t}"),
+                tool_calls: vec![RecordedToolCall {
+                    id: format!("c{t}"),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_items: Vec::new(),
+            });
+            sess.messages.push(ChatMessage::Tool {
+                tool_call_id: format!("c{t}"),
+                content: format!("输出{t}"),
+                images: vec![],
+            });
+            sess.messages.push(ChatMessage::Assistant {
+                content: format!("答{t}"),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_items: Vec::new(),
+            });
+        }
+        sess
+    }
+
+    /// 尾部窗口：起点必须是回合边界，给的**不能少于**要的（少了界面就缺内容），
+    /// 也不能多给太多（多给一个回合就到顶了）。
+    #[test]
+    fn tail_window_starts_on_a_turn_boundary_and_covers_the_tail() {
+        let sess = long_session(12);
+        let full = session_view(&sess);
+        let total = full.len();
+        assert_eq!(total, 24, "12 个回合 × 2 条");
+
+        for tail in 0..=total + 5 {
+            let start = session_tail_start(&sess, tail);
+            assert!(
+                start == 0 || matches!(sess.messages[start], ChatMessage::User { .. }),
+                "tail={tail} 的起点不在回合边界上"
+            );
+            let from = session_view_count_before(&sess, start);
+            if tail == 0 {
+                // `0` 是老语义：整段（脚本 / 调试那条路）——它不算「窗口」，不参与下面
+                // 那个「不能多给」的上界
+                assert_eq!(start, 0, "tail=0 必须给整段");
+                continue;
+            }
+            let got = total - from;
+            assert!(
+                got >= tail.min(total),
+                "tail={tail} 只给了 {got} 条"
+            );
+            assert!(got <= tail.min(total) + 2, "tail={tail} 多给了 {got} 条");
+            // 切出来的那一段必须和整段视图逐字对得上（合并规则一致）
+            assert_eq!(
+                session_view_range(&sess, start, sess.messages.len()),
+                full[from..].to_vec(),
+                "tail={tail} 的窗口和整段视图对不上"
+            );
+        }
+        // `tail = 0` 是老语义：整段
+        assert_eq!(
+            session_view_count_before(&sess, session_tail_start(&sess, 0)),
+            0
+        );
+    }
+
+    /// 往前翻页：一页接一页（终点正好接上下一窗的起点），拼起来**正好**是整段视图。
+    #[test]
+    fn paging_backwards_rebuilds_the_whole_view() {
+        let sess = long_session(12);
+        let full = session_view(&sess);
+        let total = full.len();
+
+        // 尾部那一窗（前端首屏就是它）
+        let mut start = session_tail_start(&sess, 6);
+        let mut from = session_view_count_before(&sess, start);
+        let mut acc = session_view_range(&sess, start, sess.messages.len());
+        assert_eq!(acc, full[from..].to_vec(), "尾部窗口和整段视图对不上");
+
+        let mut pages = 1;
+        while from > 0 {
+            pages += 1;
+            assert!(pages < 50, "往前翻没有尽头");
+            let (s, e) = session_page(&sess, from, 6);
+            assert_eq!(e, start, "这一页的终点必须正好接上上一窗的起点");
+            assert!(s < e, "起点必须真的往前移了");
+            let page = session_view_range(&sess, s, e);
+            assert!(
+                page.len() <= 6 + 2,
+                "一页给了 {} 条（要的是 6）",
+                page.len()
+            );
+            assert_eq!(
+                session_view_count_before(&sess, s) + page.len(),
+                from,
+                "接起来不能有缝"
+            );
+            acc = [page, acc].concat();
+            start = s;
+            from = session_view_count_before(&sess, s);
+        }
+
+        assert_eq!(from, 0, "翻到头必须是视图下标 0");
+        assert_eq!(acc, full, "一页页拼起来必须正好是整段视图");
+        assert!(pages > 1, "12 个回合按 6 条一页要翻好几页（实际 {pages}）");
+        // 到头了再要也不会往前跑（空页面，没有更早的了）
+        let (s, e) = session_page(&sess, 0, 6);
+        assert_eq!(session_view_count_before(&sess, s), 0, "到头了还往前给");
+        assert!(session_view_range(&sess, s, e).is_empty(), "到头了还给内容");
+        assert_eq!(total, full.len());
     }
 
     /// 轮询补丁的不变式：客户端手上是**任意时刻**（`messages[..n]`）的视图，

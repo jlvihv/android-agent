@@ -2243,6 +2243,18 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
 /// 轮询带上次拿到的 `rev`：一致就只回一句 `unchanged`。不然每次轮询都要把
 /// 整段历史（可能几百 KB）重新拼成 JSON 再传一遍 —— 一段长任务（比如一条
 /// 跑几分钟的 `apk add`）期间内容根本没变，而那要传几十次。
+///
+/// 另外两个参数让它能「只给要显示的那些」：
+///
+/// - `tail=N`：**只给最后 N 条**（视图消息的条数）。前端一屏只看得到几十条，
+///   没必要把整段历史（含每个 50KB 的 bash 输出）都传过去 —— 长会话首次打开
+///   就是几 MB。不传 / `0` = 整段（脚本、调试那条路照旧）。
+/// - `before=<from>`：往前翻一页（`from` 就是上一次响应里的那个字段，原样带回来）。
+///   历史是只追加的，往前翻永远是在读**已经定了的**东西，所以这一路不带 rev、
+///   不参与增量那一套。
+///
+/// 响应里的 `from` / `hasMore` 是给客户端的窗口指针：`messages` 是完整视图里
+/// `[from, from + messages.len())` 那一段，`hasMore` = 上面还有没有更早的。
 async fn get_session(
     State(st): State<Arc<AppState>>,
     Query(q): Query<SessionQuery>,
@@ -2256,9 +2268,17 @@ async fn get_session(
         }
     };
     let Some(id) = id else {
-        return Json(json!({ "messages": [], "queued": [], "rev": "", "busy": false }));
+        return Json(json!({
+            "messages": [], "queued": [], "rev": "", "busy": false, "from": 0, "hasMore": false
+        }));
     };
-    let mut v = session_body(&st, &id, &q.rev).await;
+
+    // 往前翻一页（用户往上滚）：只要那一窗消息
+    if let Some(before) = q.before {
+        return Json(session_page_body(&st, &id, before, q.window()).await);
+    }
+
+    let mut v = session_body(&st, &id, &q.rev, q.tail.unwrap_or(0), q.from).await;
     // 哪个会话：前端按它过滤排队那几条
     v["session"] = json!(id);
     // 上一个回合是怎么失败的（没在跑时才报）。排队消息接着开的回合没有人订阅它的流，
@@ -2271,8 +2291,43 @@ async fn get_session(
     Json(v)
 }
 
+/// 往前翻一页的正文（`?before=<from>`）：`before` 是客户端手上那窗的起点。
+///
+/// 只回 `messages` / `from` / `hasMore` —— 排队、用量、rev 那些是**当前**的事，
+/// 跟一页历史没关系；混在一起发反而要让客户端去分辨哪些能用。
+async fn session_page_body(st: &AppState, id: &str, before: usize, limit: usize) -> Value {
+    if let Err(e) = st.ensure_loaded(id).await {
+        return json!({ "messages": [], "from": before, "hasMore": true, "error": format!("{e:#}") });
+    }
+    let store = st.chat.read().await;
+    let Some(sess) = store.get(id) else {
+        return json!({ "messages": [], "from": 0, "hasMore": false });
+    };
+    if !sess.resident() {
+        // 刚读完又被 gc 放掉了（极少见）：这一页先不发，让客户端下次再要 ——
+        // 回 hasMore: true 而不是 false，不然那一截历史就静悄悄地看不到了
+        return json!({ "messages": [], "from": before, "hasMore": true });
+    }
+    let (start, end) = crate::agent::session_page(sess, before, limit);
+    let from = crate::agent::session_view_count_before(sess, start);
+    json!({
+        "messages": crate::agent::session_view_range(sess, start, end),
+        "from": from,
+        "hasMore": from > 0,
+    })
+}
+
 /// `get_session` 的正文（不含 `session` / `turnError` 这两个每条路都要带的字段）。
-async fn session_body(st: &AppState, id: &str, client_rev: &str) -> Value {
+///
+/// `tail` = 尾部窗口的条数（`0` = 整段）；`client_from` = 客户端手上那窗的起点
+/// （增量补丁的下标要按它翻译，见下）。
+async fn session_body(
+    st: &AppState,
+    id: &str,
+    client_rev: &str,
+    tail: usize,
+    client_from: Option<usize>,
+) -> Value {
     // 「进行中」看的是**这个**会话：别的会话在跑不影响这里发消息
     let busy = st.is_busy(id);
     // 不活跃的会话消息不在内存里，先读回来
@@ -2292,7 +2347,9 @@ async fn session_body(st: &AppState, id: &str, client_rev: &str) -> Value {
 
     let store = st.chat.read().await;
     let Some(sess) = store.get(id) else {
-        return json!({ "messages": [], "queued": queued, "rev": "", "busy": false });
+        return json!({
+            "messages": [], "queued": queued, "rev": "", "busy": false, "from": 0, "hasMore": false
+        });
     };
     if !sess.resident() {
         // 读进来之后、拿锁之前又被放掉了（极少见）：让客户端下次再来
@@ -2305,29 +2362,48 @@ async fn session_body(st: &AppState, id: &str, client_rev: &str) -> Value {
 
     // 增量：客户端上次的 rev 里有 (会话 id, 已存消息数)。同一个会话、且它手上的
     // 消息数没超过当前（没被重置）→ 只补差的那段，见 `session_patch`。
+    //
+    // **下标要翻译**：补丁里的 `replaceFrom` 是整段视图的下标，而客户端手上可能只有
+    // 尾部那一窗（`tail=N`）—— 它那边的下标比整段的小 `client_from`。落点在它手上
+    // 那窗之外（说明它离得太远，比如从冻住里醒来）就退到下面「重发尾部窗口」。
+    // 不带 `client_from` 的（脚本、老客户端）按整段算，和以前一模一样。
     if let Some((cid, client_len)) = parse_rev(client_rev) {
         if cid == sess.id && client_len <= sess.messages.len() {
             let p = crate::agent::session_patch(sess, client_len);
-            drop(store);
-            return json!({
-                "messages": p.messages,
-                "queued": queued,
-                "rev": rev,
-                "busy": busy,
-                "append": true,
-                "replaceFrom": p.replace_from,
-                "keepParts": p.keep_parts,
-                "usage": usage,
-            });
+            let base = client_from.unwrap_or(0);
+            if p.replace_from >= base {
+                drop(store);
+                return json!({
+                    "messages": p.messages,
+                    "queued": queued,
+                    "rev": rev,
+                    "busy": busy,
+                    "append": true,
+                    "replaceFrom": p.replace_from - base,
+                    "keepParts": p.keep_parts,
+                    "usage": usage,
+                });
+            }
         }
     }
 
-    let msgs = crate::agent::session_view(sess);
+    // 尾部窗口（`tail = 0` 就是整段）。起点落在回合边界上，见 `session_tail_start`。
+    let start = crate::agent::session_tail_start(sess, tail);
+    let from = crate::agent::session_view_count_before(sess, start);
+    let msgs = crate::agent::session_view_range(sess, start, sess.messages.len());
     drop(store);
 
     // busy 让前端知道「服务端还在跑」—— App 切到后台时 agent 不会停，
     // 切回来要能看出还在进行中，而不是以为卡住了。
-    json!({ "messages": msgs, "queued": queued, "rev": rev, "busy": busy, "usage": usage })
+    json!({
+        "messages": msgs,
+        "queued": queued,
+        "rev": rev,
+        "busy": busy,
+        "usage": usage,
+        "from": from,
+        "hasMore": from > 0,
+    })
 }
 
 /// 从 rev 里解出 (会话 id, 已存消息数)。格式见 `session_rev`。
@@ -2349,6 +2425,24 @@ struct SessionQuery {
     /// 要哪个会话。不给 = 当前活动会话。
     #[serde(default)]
     id: Option<String>,
+    /// 只给最后 `tail` 条视图消息（`0` / 不给 = 整段）。界面首屏就带它。
+    #[serde(default)]
+    tail: Option<usize>,
+    /// 往前翻一页：要「视图下标 < before」那一窗（`before` = 上一次响应里的 `from`）。
+    #[serde(default)]
+    before: Option<usize>,
+    /// 客户端手上那窗的起点（`from`）。增量补丁的下标按它翻译。
+    #[serde(default)]
+    from: Option<usize>,
+}
+
+impl SessionQuery {
+    /// 一窗多大（往前翻一页 / 尾部窗口的默认档）。
+    ///
+    /// 前端的渲染窗口是同一数量级 —— 它一次也只挂得住几十条。
+    fn window(&self) -> usize {
+        self.tail.filter(|n| *n > 0).unwrap_or(40)
+    }
 }
 
 /// 会话版本号。**只看元数据，不碰消息内容**，所以便宜。

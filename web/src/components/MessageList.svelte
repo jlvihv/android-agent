@@ -45,6 +45,12 @@
     follow = 0,
     /** 当前会话 id：变了（切会话 / 第一次装载）就把视口落在尾部 */
     session = '',
+    /** 服务端还有没有更早的（`App` 说）—— 手上这一段到顶了就叫 `onloadearlier` 去要 */
+    hasolder = false,
+    /** 往上翻到头：去服务端要一窗更早的。返回 true = 真的拿到了 */
+    onloadearlier,
+    /** 一窗多少条（和 `App` 发给服务端的 `tail` 同一个数） */
+    step = 40,
   }: {
     messages: Message[];
     pending?: Message[];
@@ -52,6 +58,9 @@
     ondrop?: (id: string) => void;
     follow?: number;
     session?: string;
+    hasolder?: boolean;
+    onloadearlier?: () => Promise<boolean>;
+    step?: number;
   } = $props();
 
   let scroller: HTMLDivElement | null = $state(null);
@@ -318,46 +327,43 @@
 
   // —— 窗口化 ——
   //
-  // 长对话不能把几百条消息全挂进 DOM（节点数和内存都线性涨）。只渲染最后
-  // `limit` 条；往上翻到顶再往前补一窗，并补偿 scrollTop，视口不跳；回到底部再收回
-  // 最后一窗（见 `onscroll`）。
-  // 注意 `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** ——
-  // 这个才是真的封顶。
+  // 两层窗口，别搞混：
+  //
+  //   1. **手里有多少** —— `messages`（`App` 管的）。首屏只和服务端要尾巴上那
+  //      一窗（`tail`），往上翻到头再去要更早的一窗（`onloadearlier`）。
+  //   2. **挂多少进 DOM** —— `limit`（这里管的）。长对话不能把几百条消息全挂
+  //      进 DOM（节点数和内存都线性涨），所以只渲染最后 `limit` 条；往上翻先放
+  //      手上还没挂的（`limit += step`），手上没有了才去服务端要。
+  //
+  // `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** —— 封顶靠这个。
   //
   // 这里的「条」是**消息**（用户/助手），不是工具调用：一个回合的思考、
-  // 工具、正文都是同一条助手消息里的 parts。所以 40 条 ≈ 20 个回合，
-  // 每个回合里几十个工具调用都算在这一条里。
-  const WINDOW_STEP = 40;
+  // 工具、正文都是同一条助手消息里的 parts。所以 40 条 ≈ 20 个回合。
   /** 滚到这个位置（px）就再补一窗更早的 */
   const LOAD_EARLIER_AT = 200;
-  let limit = $state(WINDOW_STEP);
+  /**
+   * 往上翻多放出来的条数（`step` 的整数倍）。
+   *
+   * 分成 `step + extra` 而不是一个可写的 `limit`：一窗多大是外面说了算的
+   *（和发给服务端的 `tail` 同一个数），这里只管「多放了几窗」。
+   */
+  let extra = $state(0);
+  let limit = $derived(step + extra);
   let loadingEarlier = false;
 
   let start = $derived(Math.max(0, messages.length - limit));
 
-  /** 切会话 → 窗口收回来（否则新会话只显示尾巴那几条） */
-  let windowKey = $state('');
-  $effect(() => {
-    const k = messages[0]?.id ?? '';
-    if (k !== windowKey) {
-      windowKey = k;
-      limit = WINDOW_STEP;
-    }
-  });
-
   async function loadEarlier() {
-    if (loadingEarlier || start === 0 || !scroller || !content) return;
+    if (loadingEarlier || !scroller || !content) return;
     loadingEarlier = true;
+    // 用户要看更早的了 —— 别再贴底：拉的时候内容一变高，`ResizeObserver` 看见
+    // `pinned` 就可能把我们拽回尾部（白拉一窗，视口还跳一下）。
 
     // 锚定当前视口里**最上面那条消息**，补完把它对回原处。
     //
     // 为什么不用「补进来多少高度就补多少 scrollTop」（以前就是那么干的）：
     // 那个写法默认「这期间容器高度只因为补窗变过」—— 锚点法不依赖任何前提，
     // 只认那一条消息自己的位置（只有**它上面**多出来的东西会移动它）。
-    //
-    // （实测两种写法在夹具里都是 0px：`await tick()` 只跨一个微任务，中间
-    // 几乎长不出东西。留着是为了前提变化时不至于露出来 —— 比如以后把
-    // `tick()` 换成等一帧。）
     //
     // 「显示更早的 N 条」按钮要排除（它在消息前面，自己的位置不会变）——
     // 拿它当锚点就等于不补偿，正在读的那条会被顶下去。
@@ -366,12 +372,26 @@
     const anchor = kids.find((el) => el.getBoundingClientRect().bottom > edge);
     const before = anchor?.getBoundingClientRect().top ?? 0;
 
-    limit += WINDOW_STEP;
-    await tick();
-
-    if (anchor) scroller.scrollTop += anchor.getBoundingClientRect().top - before;
-    lastTop = scroller.scrollTop;
-    loadingEarlier = false;
+    // 手上还有没挂出来的就先挂出来；到顶了才去服务端要一窗
+    let grew = false;
+    try {
+      if (start > 0) {
+        extra += step;
+        grew = true;
+      } else if (hasolder && onloadearlier) {
+        grew = await onloadearlier();
+        // 拿到的那一窗也要真的挂出来（数组变长、窗口不跟着长的话它就压在
+        // 窗口上面看不见，用户会以为「往上翻了但是没东西」）
+        if (grew) extra += step;
+      }
+    } finally {
+      if (grew) {
+        await tick();
+        if (anchor) scroller.scrollTop += anchor.getBoundingClientRect().top - before;
+        lastTop = scroller.scrollTop;
+      }
+      loadingEarlier = false;
+    }
   }
 
   /**
@@ -389,7 +409,7 @@
       // 回到底部了：往上补出来的更早那几窗收回去。窗口只增不减的话，往上翻过一次，
       // 之后整个会话都一直挂在 DOM 里（实测 90 条的长会话：2000 → 5900 个节点）。
       // 在底部收不会跳：被拿掉的都在视口上方，scrollTop 被夹到新的底，贴底照旧
-      if (limit > WINDOW_STEP && !loadingEarlier) limit = WINDOW_STEP;
+      if (extra > 0 && !loadingEarlier) extra = 0;
     } else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
     // 快到顶了 → 再补一窗更早的（窗口化）
@@ -443,6 +463,10 @@
     if (session === lastSession) return;
     lastSession = session;
     pinned = true;
+    // 切会话 → 挂出来的窗口收回来（否则新会话只显示尾巴那几条）。
+    // **不能盯 `messages[0]`**：往上翻一窗也会换掉它（服务端那一窗插到前面），
+    // 那时候把窗口收回去等于刚翻出来的又收起来了。
+    extra = 0;
     toBottom();
   });
 </script>
@@ -522,12 +546,12 @@
   class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[calc(var(--hdr)+var(--fade-top))] pb-[calc(var(--composer-h,0px)+1rem)]"
 >
 <div bind:this={content} class="flex flex-col gap-6">
-  {#if start > 0}
+  {#if start > 0 || hasolder}
     <button
       onclick={loadEarlier}
       class="load-earlier self-center rounded-full bg-hairline px-3 py-1 text-xs text-muted"
     >
-      显示更早的 {Math.min(WINDOW_STEP, start)} 条
+      显示更早的 {start > 0 ? Math.min(step, start) : step} 条
     </button>
   {/if}
   {#each messages.slice(start) as msg (msg.id)}
