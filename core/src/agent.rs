@@ -1093,7 +1093,7 @@ pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<V
                     let images: Vec<&str> = result
                         .map(|(_, imgs)| imgs.iter().map(|i| i.source.as_str()).collect())
                         .unwrap_or_default();
-                    parts.push(json!({
+                    let mut part = json!({
                         "type": "tool",
                         "toolCallId": tc.id,
                         "toolName": tc.name,
@@ -1102,9 +1102,16 @@ pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<V
                             .unwrap_or_else(|_| json!(tc.arguments)),
                         // 没有输出就是还在跑（服务端此刻正在执行）
                         "state": if output.is_some() { "output" } else { "ready" },
-                        "output": output,
                         "images": images,
-                    }));
+                    });
+                    // 还在跑就**不带** `output`，别写成 `null`：前端的类型是 `output?: string`，
+                    // 只认「没有」。踩过：`null` 进了 `failed()` 的 `startsWith`，渲染时抛错把
+                    // Svelte 那一轮更新整个打断 —— 切回一个工具正跑着的会话，界面停在上一个
+                    // 会话的内容上、没有停止键，直到那个工具跑完。
+                    if let Some(o) = output {
+                        part["output"] = json!(o);
+                    }
+                    parts.push(part);
                 }
                 if parts.is_empty() {
                     continue;
@@ -4205,6 +4212,31 @@ mod tests {
         let parts = v[1]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["output"], json!("a.txt\n\n[exit 0]"));
         assert_eq!(parts[0]["images"], json!(["/workspace/shot.png"]));
+    }
+
+    /// 工具还在跑（没有结果）：**不带** `output`，不能是 `null` —— 前端的类型是
+    /// `output?: string`，`null` 进了 `failed()` 的 `startsWith` 会在渲染时抛错，把那一轮
+    /// 界面更新整个打断（切回一个工具正跑着的会话：没有停止键、内容停在上一个会话）。
+    #[test]
+    fn session_view_running_tool_has_no_output_field() {
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::user("问"),
+            ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![RecordedToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"sleep 30"}"#.into(),
+                }],
+                reasoning_items: Vec::new(),
+            },
+        ];
+        let v = session_view(&sess);
+        let part = &v[1]["parts"][0];
+        assert_eq!(part["state"], "ready");
+        assert!(part.get("output").is_none(), "{part}");
     }
 
     /// 工具结果的 SSE 事件：正文是纯文本；有图才带 `images`。
