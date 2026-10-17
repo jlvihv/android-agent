@@ -38,12 +38,12 @@ describe('wantOlder', () => {
     expect(wantOlder(facts({ hasOlder: false, start: 20 }))).toBe(true);
   });
 
-  test('服务端还有更早的、用户往上翻 → 离顶**一屏**就该要（留给预取）', () => {
-    // 视口 800：799 还算「一屏之内」（该提前拉），801 就不该了
-    expect(wantOlder(facts({ hasOlder: true, scrollTop: 799, viewH: 800 }))).toBe(true);
-    expect(wantOlder(facts({ hasOlder: true, scrollTop: 801, viewH: 800 }))).toBe(false);
+  test('服务端还有更早的、用户往上翻 → 离顶**两屏**就该要（留给预取）', () => {
+    // 视口 800：1599 还算「两屏之内」（该提前拉），1601 就不该了
+    expect(wantOlder(facts({ hasOlder: true, scrollTop: 1599, viewH: 800 }))).toBe(true);
+    expect(wantOlder(facts({ hasOlder: true, scrollTop: 1601, viewH: 800 }))).toBe(false);
     // 视口越高，提前得越多（桌面大窗口）
-    expect(wantOlder(facts({ hasOlder: true, scrollTop: 1200, viewH: 1400 }))).toBe(true);
+    expect(wantOlder(facts({ hasOlder: true, scrollTop: 2600, viewH: 1400 }))).toBe(true);
   });
 
   test('贴底时「在顶部」说明不了什么：够长就不动（首屏那两帧 scrollTop 也是 0）', () => {
