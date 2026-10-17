@@ -15,6 +15,7 @@
   import { wantOlder as olderWanted, wantCollapse as collapseWanted, insertNow } from '../lib/window';
   import Img from './Img.svelte';
   import { cubicIn } from 'svelte/easing';
+  import { fade } from 'svelte/transition';
   import type { Message, ToolPart } from '../lib/sse';
   import { sandboxPath } from '../lib/markdown';
   import { describeInput, describeResult, failed } from '../lib/toolview';
@@ -71,6 +72,15 @@
   } = $props();
 
   let scroller: HTMLDivElement | null = $state(null);
+
+  /** 排队那条「虚线变实」的时长（ms）：× 的淡出用它；气泡颜色过渡的 `duration-200` 得是同一个数 */
+  const BUBBLE_MS = 200;
+  /**
+   * 用户气泡的边框和底色。**边框两种状态都在**（发出去是透明的）—— 盒子尺寸
+   * 一致，变的只有颜色，见 `userMessage` 上面那段注释。
+   */
+  const bubbleFrame = (queued: boolean) =>
+    `border border-dashed transition-colors duration-200 ${queued ? 'border-control bg-bubble/40' : 'border-transparent bg-bubble'}`;
 
   /** 当前打开的面板。一次只有一个。 */
   let sheet = $state<
@@ -406,6 +416,11 @@
   let extra = $state(0);
   let limit = $derived(step + extra);
   let start = $derived(Math.max(0, messages.length - limit));
+  /**
+   * 挂出来的这一段 + 排队中的那几条（画在正文末尾）。合在一个数组里给**同一个**
+   * each —— 理由见模板里那段注释（虚线变实要复用同一个节点）。
+   */
+  let shown = $derived([...messages.slice(start), ...pending]);
   /** 观察层的那几个数（策略函数的入参，见 `lib/window.ts`） */
   let facts = $derived({ measured, hasOlder: hasolder, start, pinned, scrollTop, contentH, viewH, extra, loadingEarlier, tailH });
   /** 该往前要了（手上还有没挂出来的，或服务端还有更早的，而且用户正看着顶那一带） */
@@ -625,7 +640,12 @@
 
 <!-- 用户消息的气泡。**排队中那条也走这里** —— 同一个气泡、同一套尺寸、
      颜色、对齐，只多一圈虚线；× 挂在气泡**左边**（那个位置本来就是空的：
-     用户消息贴右）。挂出去而不是挤进去，气泡的宽度就和发出去的一模一样。 -->
+     用户消息贴右）。挂出去而不是挤进去，气泡的宽度就和发出去的一模一样。
+
+     边框**两种状态都有**，发出去的那条只是透明（`bubbleFrame`）：以前只有排队
+     那条带 1px 边，发出去边一去掉气泡就宽、高各少 2px（实测 66×46 → 64×44），
+     贴底的列表里顶边往下一挪、文字贴着 84% 上限时还会重新折行 —— 看着就是
+     「跳一下」。现在只有颜色变（虚线淡掉、底色变实），盒子一像素都不动。 -->
 {#snippet userMessage(msg: Message)}
   {@const atts = msg.parts.filter((p) => p.type === 'image' || p.type === 'file')}
   {@const text = msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
@@ -634,15 +654,15 @@
     <!-- 常见情况：只有正文，一层 <p> 就够。不为了「可能会有的附件」
          恒常多套一层 div（对齐 + 收缩 + 上限 84%）。 -->
     <p
-      class="self-end max-w-[84%] rounded-card px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words
-             {queued ? 'relative border border-dashed border-control bg-bubble/40' : 'bg-bubble'}"
+      class="relative self-end max-w-[84%] rounded-card px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words
+             {bubbleFrame(queued)}"
     >
       {text}
       {#if queued}{@render dropBtn(msg.id)}{/if}
     </p>
   {:else}
     <!-- 有附件：缩略图/药丸在上，正文气泡在下 -->
-    <div class="flex max-w-[84%] flex-col items-end gap-2 self-end {queued ? 'relative' : ''}">
+    <div class="relative flex max-w-[84%] flex-col items-end gap-2 self-end">
       {#if queued}{@render dropBtn(msg.id)}{/if}
       <div class="flex flex-wrap justify-end gap-2">
         {#each atts as a (a.id)}
@@ -669,7 +689,7 @@
       {#if text}
         <p
           class="max-w-full rounded-card px-3.5 py-2.5 text-base leading-6 whitespace-pre-wrap break-words
-                 {queued ? 'border border-dashed border-control bg-bubble/40' : 'bg-bubble'}"
+                 {bubbleFrame(queued)}"
         >
           {text}
         </p>
@@ -679,7 +699,9 @@
 {/snippet}
 
 {#snippet dropBtn(id: string)}
+  <!-- 发出去的那一刻淡出（和气泡的颜色过渡同一个时长），不是凭空消失 -->
   <button
+    transition:fade={{ duration: BUBBLE_MS }}
     onclick={() => ondrop?.(id)}
     aria-label="从队列里去掉"
     title="从队列里去掉"
@@ -698,7 +720,11 @@
   class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[calc(var(--hdr)+var(--fade-top))] pb-[calc(var(--composer-h,0px)+1rem)]"
 >
 <div bind:this={content} class="flex flex-col gap-6">
-  {#each messages.slice(start) as msg (msg.id)}
+  <!-- 排队中（还没发出去）的那几条**接在同一个 each 里**（`shown`），不另开一个：
+       发出去时 App 用**同一个 id** 把它挪进 `messages`，同一个 key → Svelte 复用
+       同一个节点，只是 `done` 翻了 —— 于是颜色能真的过渡（虚线淡掉、底色变实）。
+       分两个 each 的话是旧节点销毁、新节点创建，什么过渡都谈不上。 -->
+  {#each shown as msg (msg.id)}
     {#if msg.role === 'user'}
       {@render userMessage(msg)}
     {:else}
@@ -753,13 +779,6 @@
     {/if}
   {/each}
 
-  <!-- 排队中（还没发出去）的那几条：画在正文末尾，就是普通用户气泡的样子，
-       只是虚线 + 左边一个 ×。数据上它们不在 `messages` 里（没发过、服务端
-       不知道），发出去的那一刻才变成真正的那条 —— 样子几乎不变，所以看起来
-       就是「虚线变实」。 -->
-  {#each pending as p (p.id)}
-    {@render userMessage(p)}
-  {/each}
 </div>
 </div>
 
