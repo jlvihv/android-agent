@@ -346,8 +346,6 @@
   // 工具、正文都是同一条助手消息里的 parts。所以 10 条 = 5 个回合。
   //
   // `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** —— 封顶靠这个。
-  /** 滚到这个位置（px）以内就该往前要了 */
-  const LOAD_EARLIER_AT = 400;
   /** 滚动停下来多久算「停住了」（没有 `scrollend` 的内核用它兜底） */
   const IDLE_MS = 150;
 
@@ -399,7 +397,7 @@
   /** 观察层的那几个数（策略函数的入参，见 `lib/window.ts`） */
   let facts = $derived({ measured, hasOlder: hasolder, start, pinned, scrollTop, contentH, viewH, extra, loadingEarlier, tailH });
   /** 该往前要了（手上还有没挂出来的，或服务端还有更早的，而且用户正看着顶那一带） */
-  let wantOlder = $derived(olderWanted({ ...facts, nearTop: LOAD_EARLIER_AT }));
+  let wantOlder = $derived(olderWanted(facts));
   /** 该把往上的窗口收回去（贴底、收完还装得满一屏、没有正在跑的加载） */
   let wantCollapse = $derived(collapseWanted(facts));
 
@@ -532,10 +530,14 @@
 
   // 贴底就跟着内容长（流式、插入都不例外）；不贴底一动不动。
   // 尺寸变化也走这条 —— 视口一变高，贴底的人该跟着到底。
+  //
+  // `pinned` 只**读**（`untrack`）：它一变就 `toBottom()` 的话，用户自己往下滚到
+  // 离底 48px 以内就会被一把拽到最底（实测就是那个「在底部几行往下滑会跳变到最底」）。
+  // 原来只有尺寸变化才跟 —— 保持那个行为。
   $effect(() => {
     void contentH;
     void viewH;
-    if (pinned) toBottom();
+    if (untrack(() => pinned)) toBottom();
   });
 
   // `scrollend` 有就用它（惯性滑完立刻发，比 150ms 准）；老内核靠那个超时兜底。

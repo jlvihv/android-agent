@@ -9,7 +9,7 @@
 /** 「还有没有更早的」的一半事实：`start` 是手上没挂出来的，`hasOlder` 是服务端的 */
 export type OlderFacts = Pick<
   WindowFacts,
-  'measured' | 'hasOlder' | 'start' | 'pinned' | 'scrollTop' | 'contentH' | 'viewH' | 'nearTop'
+  'measured' | 'hasOlder' | 'start' | 'pinned' | 'scrollTop' | 'contentH' | 'viewH'
 >;
 
 /** 收窗口要的那几个数 */
@@ -37,8 +37,6 @@ export type WindowFacts = {
   loadingEarlier: boolean;
   /** 最后 `step` 条挂出来有多高 */
   tailH: number;
-  /** 滚到离顶这么近就该往前要（px） */
-  nearTop: number;
 };
 
 /**
@@ -51,7 +49,7 @@ export type WindowFacts = {
  *
  * 贴不贴底看的是**两件事**，不能混：
  *
- *   - 没贴底（用户自己往上翻了）：贴到顶就要
+ *   - 没贴底（用户自己往上翻了）：**离顶一屏就**要（见 `nearTop`）
  *   - 还贴着底：只有**整屏都装不下**才要（根本滚不动的那种）
  *
  * 后者不能用「`scrollTop` 是 0」来判：首屏刚渲染、还没滚到底的那一两帧也是 0，
@@ -60,7 +58,21 @@ export type WindowFacts = {
 export function wantOlder(f: OlderFacts): boolean {
   if (!f.measured) return false;
   if (!(f.start > 0 || f.hasOlder)) return false;
-  return f.pinned ? f.contentH <= f.viewH : f.scrollTop < f.nearTop;
+  return f.pinned ? f.contentH <= f.viewH : f.scrollTop < nearTop(f.viewH);
+}
+
+/**
+ * 「离顶多近就该往前要」：**一屏**（视口高）。
+ *
+ * 这一屏是留给**预取**的余量：滚到这里就把下一窗拉回来（不动界面），用户滑到顶时
+ * 内容已经到手，停稳直接插。
+ *
+ * 不能写成一个很小的死数（以前是 400px）：一屏通常 700~900px，400px 等于
+ * 「滑到顶才开始拉」—— 用户到顶之后要干等一个网络来回（实测就是这个观感）。
+ * 留一屏的意思是「用户还要滑一屏才到顶」，这段时间正好盖住一个来回。
+ */
+function nearTop(viewH: number): number {
+  return viewH;
 }
 
 /**
