@@ -11,7 +11,7 @@
    *
    * 每个思考、每次工具调用**各开各的面板**，面板里只有它自己。
    */
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import Img from './Img.svelte';
   import { cubicIn } from 'svelte/easing';
   import type { Message, ToolPart } from '../lib/sse';
@@ -45,9 +45,9 @@
     follow = 0,
     /** 当前会话 id：变了（切会话 / 第一次装载）就把视口落在尾部 */
     session = '',
-    /** 服务端还有没有更早的（`App` 说）—— 手上这一段到顶了就叫 `onloadearlier` 去要 */
+    /** 服务端还有没有更早的（`App` 说）—— 手上这一段到顶了就自己叫 `onloadearlier` 去要 */
     hasolder = false,
-    /** 往上翻到头：去服务端要一窗更早的。返回 true = 真的拿到了 */
+    /** 往上翻到头（或这一窗还不到一屏）时去服务端要一窗更早的。返回 true = 真的拿到了 */
     onloadearlier,
     /** 一窗多少条（和 `App` 发给服务端的 `tail` 同一个数） */
     step = 10,
@@ -335,12 +335,21 @@
   //      进 DOM（节点数和内存都线性涨），所以只渲染最后 `limit` 条；往上翻先放
   //      手上还没挂的（`limit += step`），手上没有了才去服务端要。
   //
+  // 这里是「窗口化」，不只影响布局：DOM 里只挂最后 `step + extra` 条；往上翻
+  // 先放手上还没挂的（`extra += step`），手上没有了就找服务端要一窗
+  //（`onloadearlier`）。
+  //
   // `content-visibility: auto` 只省布局/绘制，**不省 DOM 节点** —— 封顶靠这个。
   //
   // 这里的「条」是**消息**（用户/助手），不是工具调用：一个回合的思考、
   // 工具、正文都是同一条助手消息里的 parts。所以 10 条 = 5 个回合。
-  /** 滚到这个位置（px）就再补一窗更早的 */
-  const LOAD_EARLIER_AT = 200;
+  //
+  // 没有按钮：全是滚动自己触发的（用户无感）。两个入口：
+  //   - `onscroll`：快贴到顶了就去要（提前一屏，滚得快也不会看见顶边露白）
+  //   - `fillViewport`：这一窗**比视口还矮**（根本滚不动 —— 短消息很常见）时
+  //     自己接着要，否则滚动事件永远不来，那一截历史就再见不到了
+  /** 滚到这个位置（px）以内就去要更早的一窗 */
+  const LOAD_EARLIER_AT = 400;
   /**
    * 往上翻多放出来的条数（`step` 的整数倍）。
    *
@@ -364,10 +373,7 @@
     // 为什么不用「补进来多少高度就补多少 scrollTop」（以前就是那么干的）：
     // 那个写法默认「这期间容器高度只因为补窗变过」—— 锚点法不依赖任何前提，
     // 只认那一条消息自己的位置（只有**它上面**多出来的东西会移动它）。
-    //
-    // 「显示更早的 N 条」按钮要排除（它在消息前面，自己的位置不会变）——
-    // 拿它当锚点就等于不补偿，正在读的那条会被顶下去。
-    const kids = [...content.children].filter((el) => !el.classList.contains('load-earlier'));
+    const kids = [...content.children];
     const edge = scroller.getBoundingClientRect().top;
     const anchor = kids.find((el) => el.getBoundingClientRect().bottom > edge);
     const before = anchor?.getBoundingClientRect().top ?? 0;
@@ -408,13 +414,42 @@
       pinned = true;
       // 回到底部了：往上补出来的更早那几窗收回去。窗口只增不减的话，往上翻过一次，
       // 之后整个会话都一直挂在 DOM 里（实测 90 条的长会话：2000 → 5900 个节点）。
-      // 在底部收不会跳：被拿掉的都在视口上方，scrollTop 被夹到新的底，贴底照旧
-      if (extra > 0 && !loadingEarlier) extra = 0;
+      // 在底部收不会跳：被拿掉的都在视口上方，scrollTop 被夹到新的底，贴底照旧。
+      //
+      // **整屏都装得下的时候不收**：那时「回到底部」是白说的（根本没得滚），
+      // 收了只会让 `fillViewport` 又把它要回来 —— 一收一要地反复渲染，
+      // 还会一路把历史全拉下来。
+      if (extra > 0 && !loadingEarlier && el.scrollHeight > el.clientHeight) extra = 0;
     } else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
-    // 快到顶了 → 再补一窗更早的（窗口化）
+    // 快到顶了 → 再要一窗更早的
     if (el.scrollTop < LOAD_EARLIER_AT) void loadEarlier();
   }
+
+  /**
+   * 手里这一窗**滚不动**（还不够一屏高）却有更早的 → 自己接着要。
+   *
+   * 没有按钮之后全靠滚动触发，而这种情况恰恰滚不了：滚动事件永远不来，
+   * 那一截历史就再见不到了（10 条短消息不到一屏，很常见）。还滚得动就不管，
+   * 交给 `onscroll`（它更及时）。
+   */
+  function fillViewport() {
+    if (!scroller || loadingEarlier) return;
+    if (!(start > 0 || hasolder)) return;
+    if (scroller.scrollHeight > scroller.clientHeight) return;
+    void loadEarlier();
+  }
+
+  // 手里几条 / 窗口多大 / 还有没有更早 / 视口高度变了 —— 任何一样变了都重看一遍
+  //「够不够一屏」。`untrack`：不看 `loadEarlier` 内部读写的那些，不然两边会互相
+  // 触发出无限循环（它自己会 `extra += step`、我们会因为 `extra` 变而重跑）。
+  $effect(() => {
+    void messages.length;
+    void limit;
+    void hasolder;
+    void gap;
+    untrack(fillViewport);
+  });
 
   $effect(() => {
     if (!scroller || !content) return;
@@ -546,14 +581,6 @@
   class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[calc(var(--hdr)+var(--fade-top))] pb-[calc(var(--composer-h,0px)+1rem)]"
 >
 <div bind:this={content} class="flex flex-col gap-6">
-  {#if start > 0 || hasolder}
-    <button
-      onclick={loadEarlier}
-      class="load-earlier self-center rounded-full bg-hairline px-3 py-1 text-xs text-muted"
-    >
-      显示更早的 {start > 0 ? Math.min(step, start) : step} 条
-    </button>
-  {/if}
   {#each messages.slice(start) as msg (msg.id)}
     {#if msg.role === 'user'}
       {@render userMessage(msg)}
