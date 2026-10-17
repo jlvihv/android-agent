@@ -40,12 +40,35 @@ export type Ack = {
   detail: string;
 };
 
+/**
+ * 一个回合此刻在干什么（Rust 的 `status::Snapshot`）。
+ *
+ * 页面只用 `sid` / `phase` / `active` 当「有事情在发生」的信号，状态文案和通知栏
+ * 那一行是壳的事（见 docs/06）。字段还是照抄，免得以后想用的时候又得对一遍。
+ */
+export type TurnStatus = {
+  sid: string;
+  title: string;
+  phase: 'thinking' | 'streaming' | 'tool' | 'done';
+  tool?: string;
+  detail?: string;
+  started_at_ms: number;
+  active: boolean;
+  finished_at_ms?: number;
+  ok: boolean;
+  stopped: boolean;
+};
+
 /** Rust `Event` 枚举（serde tag = "type"） */
 export type AgentEvent =
   | ({ type: 'hello' } & Hello)
   | ({ type: 'device' } & DeviceInfo)
   | { type: 'log'; level: string; msg: string }
-  | ({ type: 'ack' } & Ack);
+  | ({ type: 'ack' } & Ack)
+  /** 一个回合的状态播报（通知栏用）。**任何会话**的回合都会推到这里 */
+  | { type: 'turn'; status: TurnStatus }
+  /** 「还有没有回合在跑」（全局的，不分会话）。起止各一条 */
+  | { type: 'turn_active'; active: boolean };
 
 /** 前端 → Rust 的 WS 消息 */
 export type ClientMsg =

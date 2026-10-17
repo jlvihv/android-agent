@@ -94,6 +94,17 @@ class AgentStore {
   acks = $state<(Ack & { ts: number })[]>([]);
   /** 当前正在流式接收的助手消息 */
   streaming = $state<Message | null>(null);
+  /**
+   * **有没有回合在跑**（总线上的 `turn_active`；全局的，不分会话）。
+   *
+   * 页面自己发起的回合它自己清楚（`App` 的 `busy`），可别人发起的它一无所知 ——
+   * 手机上按的、另一台电脑上那个页面按的、排队消息接着开的那个回合，都是别人在动。
+   * 所以这个位只当**信号**用：一变，`App` 就去把会话对一次账（`loadMessages`）。
+   *
+   * 不带会话 id（核心那边也只有一个全局的「有没有」）——对账时 `?session` 会
+   * 如实回答「**这个**会话在不在跑」，不是这个会话在跑就对完收工，不轮询。
+   */
+  turnActive = $state(false);
 
   #ws: WebSocket | null = null;
   #retry = 0;
@@ -201,6 +212,16 @@ class AgentStore {
           { id: ev.id, ok: ev.ok, detail: ev.detail, ts: Date.now() },
           ...this.acks,
         ].slice(0, MAX_ACKS);
+        break;
+
+      case 'turn_active':
+        this.turnActive = ev.active;
+        break;
+
+      // 逐条状态（`turn`）只喂通知栏那一行，页面不吃：正文和消息列表有自己的路
+      // （正在跑的那条流 / 轮询）。这里置个位就够。
+      case 'turn':
+        this.turnActive = true;
         break;
     }
   }

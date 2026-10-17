@@ -51,6 +51,23 @@ export type UiChunk =
 
 const DONE = Symbol('done');
 
+/**
+ * 一条流最多能静默多久（ms）。
+ *
+ * 服务端每 15 秒一条 keep-alive 注释心跳（`sse_response` 的 `KeepAlive`，
+ * 注释行对解析器是透明的）——所以「45 秒一个字节都没有」只可能是连接已经
+ * 死了、而对端又没关连接（换 Wi-Fi、NAT 把空闲连接默默地丢了、手机从冻住
+ * 里醒来）。
+ *
+ * 不盯这一点的话：`reader.read()` 会一直挂着，这边的回合就永远是「运行中」——
+ * `loadMessages` 又认 `busy` 这个门，连切回前台的同步都进不来，界面就停在
+ * 半截，只有刷新才看得见服务端那份完整的历史。
+ *
+ * 手机壳订阅回合状态那条流用的是同一个数、同一个理由
+ * （`TurnStream.kt` 的 `READ_TIMEOUT_MS`）。
+ */
+const IDLE_TIMEOUT_MS = 45_000;
+
 // ---------------------------------------------------------------------------
 // SSE 帧解析
 // ---------------------------------------------------------------------------
@@ -112,7 +129,17 @@ export async function* parseUiStream(
   };
 
   for (;;) {
-    const { done, value } = await reader.read();
+    // 静默超时：到点了就把读掐掉（`cancel` 让挂着的这次 read 以 done 收场）。
+    // 生成器于是正常结束，调用方（`App` 的 `run`）会去拉一次服务端的历史 ——
+    // 界面自己接上，最多晚 45 秒，不用人手刷新。
+    const idle = setTimeout(() => void reader.cancel(), IDLE_TIMEOUT_MS);
+    let done: boolean;
+    let value: Uint8Array | undefined;
+    try {
+      ({ done, value } = await reader.read());
+    } finally {
+      clearTimeout(idle);
+    }
     if (done) break;
     buf += decoder.decode(value, { stream: true });
     yield* drain(false);
