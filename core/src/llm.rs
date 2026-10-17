@@ -308,6 +308,15 @@ impl Provider {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            // 记一笔：**服务端到底说了什么**只有这里看得到。界面只显示给用户看的那句，
+            // 而失败之后重试成功的话，那次失败连痕迹都不留（踩过：一次 400 只能靠用户
+            // 截图里的文字去猜，日记里什么都没有）。
+            tracing::warn!(
+                "{} 返回 {}：{}",
+                url,
+                status.as_u16(),
+                body.chars().take(400).collect::<String>()
+            );
             return Err(StreamError::Http {
                 status: status.as_u16(),
                 body,
@@ -507,17 +516,36 @@ impl StreamError {
     ///
     /// 手机网络上一次抖动不该让一个跑了半天的回合直接报错结束（agent 不限
     /// 步数，长任务中途碰到一次的概率很高）。鉴权失败、请求本身有问题（400）
-    /// 这类重试也没用，不算。
+    /// 这类重试也没用，不算 —— **除了**下面那种「400 里写着网关自己出错了」的。
     pub fn is_transient(&self) -> bool {
         match self {
-            StreamError::Http { status, .. } => {
+            StreamError::Http { status, body } => {
                 matches!(*status, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+                    || (*status == 400 && gateway_failed(body))
             }
             StreamError::Silent(_) => false,
             // 只认网络层的错误（发请求时 reqwest 报的）；别的（建 client 失败之类）不重试
             StreamError::Other(e) => e.downcast_ref::<reqwest::Error>().is_some(),
         }
     }
+}
+
+/// 400 里写着「网关 / 上游自己出错」的那种（**不是**请求有问题）。
+///
+/// OpenCode Go 偶尔会这样回一条本来能过的请求：
+///
+/// ```text
+/// {"error":{"type":"server_error","message":"Upstream request failed: [unsupported_request] Message content must contain text."}}
+/// ```
+///
+/// 同一条请求重发就好（实测：它失败之后把**原样**的请求复放三次，全部 200），
+/// 所以值得重试。判定只认 `error.type == "server_error"`：真正的请求错误
+/// （`invalid_request_error` 之类）重试也没用，仍旧不重试。
+fn gateway_failed(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/error/type").and_then(|t| t.as_str()).map(str::to_string))
+        .is_some_and(|t| t == "server_error")
 }
 
 /// 已知不支持 Responses 的端点：`base_url|model`。
@@ -668,6 +696,24 @@ mod tests {
         for s in [400, 401, 403, 404, 422] {
             assert!(!http(s).is_transient(), "{s}");
         }
+        // 但「400 里写着网关自己出错了」要重试（OpenCode Go 就是这么回上游失败的）：
+        // 同一条请求重发就过了，不是我们的请求有问题
+        let with_body = |status: u16, body: &str| StreamError::Http {
+            status,
+            body: body.into(),
+        };
+        assert!(with_body(
+            400,
+            r#"{"error":{"type":"server_error","message":"Upstream request failed: [unsupported_request] Message content must contain text."}}"#
+        )
+        .is_transient());
+        // 真正的请求错误（我们组错了请求）不重试，重发多少遍都一样
+        assert!(!with_body(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"Unknown parameter: 'foo'"}}"#
+        )
+        .is_transient());
+        assert!(!with_body(400, "<html>502</html>").is_transient());
         assert!(!StreamError::Other(anyhow::anyhow!("建 HTTP client 失败")).is_transient());
     }
 
