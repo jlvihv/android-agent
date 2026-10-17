@@ -25,6 +25,14 @@
     totalsOf,
   } from './lib/sse';
   import { uid } from './lib/uid';
+import {
+  applyPatch,
+  applyWindow,
+  prependPage,
+  trimOlder,
+  type SessionPayload,
+  type Window,
+} from './lib/session';
 
   import Icon from './components/Icon.svelte';
   import Composer from './components/Composer.svelte';
@@ -71,10 +79,33 @@
   /** 服务端那边还有没有更早的（还有就滚到顶/不够一屏时自己去拉一窗，没有按钮） */
   let hasOlder = $state(false);
 
+  /**
+   * 手上最多留几条更早的（回到底部时收回）。
+   *
+   * `MessageList` 那层只管**挂进 DOM** 的（一窗 10 条）；这里管**手里**的（往上翻
+   * 多少就留多少）—— 一页 10 条在真实会话里约 300 KB（工具输出很胖），翻十页就是
+   * 3 MB 常驻。留三窗：再往上翻一两屏不用重新拉，再早就丢掉重拉。
+   */
+  const KEEP_MSGS = MSG_WINDOW * 3;
+
+  /**
+   * 预取好的、还没插进去的那一窗（见 `prefetchOlder` / `loadOlder`）。
+   *
+   * 为什么要预取：插入必须等用户滑停了才能做（在滑动中写 `scrollTop` 会把手机上
+   * 正在进行的惯性滑动掉），那就不应该连网络也一起等 —— 滚动中先把内容拿到手，
+   * 停下的那一刻直接插，本地/局域网下就是「停下即到」。
+   */
+  let pending: { sid: string; base: number; page: Message[]; from: number; hasMore: boolean } | null =
+    null;
+
   /** 正在路上的那份 `loadMessages` 是哪一份（会话|窗口|rev）；空 = 没有 */
   let inflight = '';
   /** 路上这份还在跑的时候又有调用被合并掉了：回来后必须再补一次（见下面的注释） */
   let inflightAgain = false;
+  /** 正在拉更早的一窗（插入那一次），别重入 */
+  let loadingOlder = false;
+  /** 预取在路上（滚动中会反复叫它，别每帧都发一个请求） */
+  let prefetching = false;
 
   /**
    * 排队等着交给模型的消息 —— 它是**服务端**那份队列的本地镜子。
@@ -246,6 +277,9 @@
     inflight = key;
     inflightAgain = false;
     const at = sent;
+    // 发请求时手上那一窗的起点。补丁的 `replaceFrom` 是服务端按**这个**翻译过来的，
+    // 而请求在路上时用户可能往上翻了一页（数组前面多了一段）—— 下标就不作数了。
+    const winAt = windowFrom;
     try {
       const r = await fetch(
         `/api/session?rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
@@ -306,37 +340,25 @@
       usage = d.usage?.last ? { last: d.usage.last, total: totalsOf(d.usage) } : null;
       // 会话 id 变了（切会话 / 重置）就不能按 id 复用旧消息 ——
       // `u1` 这种 id 每条会话都会有。`sid` 在上面算过了。
+      //
+      // 补丁 / 整窗两条路的规则在 `lib/session.ts` 里（有测试盯着，见 `bun test`）。
       const same = sid === sessionId;
       if (d.append && same) {
-        // 服务端只补了差的那段：前面的原样留着，从 replaceFrom 换掉尾部
-        //（`replaceFrom` 已经是**我们这边的**下标了，服务端按 `from` 翻译过了）
-        const from = Math.min(d.replaceFrom ?? 0, messages.length);
-        const fresh = d.messages ?? [];
-        const keep = d.keepParts;
-        if (keep != null) {
-          const old = messages[from];
-          if (!old || old.role !== 'assistant' || old.parts.length < keep || !fresh[0]) {
-            // 本地那条和服务端以为的对不上：老老实实要一份全量
+        const r = applyPatch({ messages, windowFrom, hasOlder }, d as SessionPayload, winAt);
+        if (!r.ok) {
+          if (r.why === 'mismatch') {
+            // 本地那条和服务端以为的对不上：老老实实重新要一份全量
             //（`rev = ''` → 下一份是尾部窗口，回来时会按 `from` 接在旧的那段后面）
             rev = '';
             return loadMessages();
           }
-          fresh[0] = { ...fresh[0], parts: [...old.parts.slice(0, keep), ...fresh[0].parts] };
+          // 'stale'：这一路上窗口变过（用户往上翻了一页），补丁的下标是按旧窗口
+          // 算的 —— 作废。下一次同步（轮询 / 聚焦 / 回合结束）会重算。
+          return;
         }
-        messages = [...messages.slice(0, from), ...fresh];
+        setWindow(r.window);
       } else {
-        // 整份（首屏那一窗 / 服务端认为我们对不上了）。本地可能还留着更早的那些
-        //（用户往上翻过）：能对上就只换后面那一段，别把界面拽回尾部。
-        const fresh = d.messages ?? [];
-        const at = d.from ?? 0;
-        const cut = same ? spliceAt(fresh, at) : -1;
-        if (cut >= 0) {
-          messages = [...messages.slice(0, cut), ...reconcile(messages.slice(cut), fresh)];
-        } else {
-          messages = same && at === 0 ? reconcile(messages, fresh) : fresh;
-          windowFrom = at;
-        }
-        hasOlder = !!d.hasMore;
+        setWindow(applyWindow({ messages, windowFrom, hasOlder }, d as SessionPayload, same));
       }
       if (d.turnError) showTurnError(d.turnError);
       sessionId = sid;
@@ -351,43 +373,6 @@
           void loadMessages();
         }
       }
-    }
-  }
-
-  /**
-   * 往上翻一页更早的（`MessageList` 滚到顶 / 这一窗还不到一屏时叫它）。
-   *
-   * 只跟服务端要**这一窗** —— 历史是只追加的，这一窗要回来就永远是对的，不用管
-   * `rev`（那套是给「当前回合在长」用的）。返回 `true` = 真拿到了新东西（调用方
-   * 据此补偿滚动位置，不补偿的话视口会跳）。
-   *
-   * 接不上就整窗丢掉、不硬塞：宁可少显示一窗，也不能在中间留个洞（那会导致后面
-   * 所有下标都对不上，`replaceFrom` 那套全乱）。
-   */
-  async function loadOlder(): Promise<boolean> {
-    const sid = sessionId;
-    if (!hasOlder || !sid) return false;
-    try {
-      const r = await fetch(
-        `/api/session?id=${encodeURIComponent(sid)}&before=${windowFrom}&tail=${MSG_WINDOW}`,
-      );
-      if (!r.ok) return false;
-      const d = (await r.json()) as { messages?: Message[]; from?: number; hasMore?: boolean };
-      // 这一路走的过程中会话切走了 / 换了一条：这一页不要了
-      if (sid !== sessionId) return false;
-      const page = d.messages ?? [];
-      const from = d.from ?? 0;
-      if (!page.length) {
-        hasOlder = !!d.hasMore;
-        return false;
-      }
-      if (from + page.length !== windowFrom) return false;
-      messages = [...page, ...messages];
-      windowFrom = from;
-      hasOlder = !!d.hasMore;
-      return true;
-    } catch {
-      return false;
     }
   }
 
@@ -442,45 +427,116 @@
   let sessionId = $state('');
 
   /**
-   * 服务端这份「整窗」该从本地第几条接上（接不上 = -1）。
+   * 把算好的三个值写回去（`$state` 得逐个赋值才触发更新）。
    *
-   * 两边说的是同一套下标：`at` 是它在完整视图里的起点，而本地是从 `windowFrom`
-   * 开始的，所以 `at - windowFrom` 就是它在本地数组里的位置。落在手上这段里还得
-   * id 对得上才算（对不上说明这是另一条会话的内容 / 被重置过）；正好接在尾巴
-   * 后面（`=== messages.length`）不用对 id，下标已经说明了它是接着的。
+   * 手上这一窗 = 完整视图的 `[windowFrom, windowFrom + messages.length)`。
    */
-  function spliceAt(fresh: Message[], at: number): number {
-    if (!fresh.length) return -1;
-    const i = at - windowFrom;
-    if (i < 0 || i > messages.length) return -1;
-    if (i === messages.length) return i;
-    return messages[i].id === fresh[0].id ? i : -1;
+  function setWindow(w: Window) {
+    messages = w.messages;
+    windowFrom = w.windowFrom;
+    hasOlder = w.hasOlder;
   }
 
   /**
-   * 能复用的旧消息对象原样留着，Svelte 就不会重新渲染它们的 DOM。
-   *
-   * 服务端的会话是**只追加**的：一条消息 append 之后内容不再变。唯一的例外
-   * 是最后一条 assistant —— 一个回合里它会把多步的 parts 合进来、越变越长。
-   * 所以除了最后一条，能按 id 对上的消息直接复用；最后一条永远用新的。
-   *
-   * 不能比 `JSON.stringify(o) === JSON.stringify(m)`：轮询每 1.5 秒就要把
-   * **整段历史**（包括每个 50KB 的 bash 输出）序列化两遍 —— 长任务轮询时
-   * 这是最大的一笔 CPU 和 GC。id 是位置标识，只追加的情况下对 id 就够了。
+   * 从 `MessageList` 自己那个窗口状态里取一份（三件套）—— 读的是当前 `$state`。
    */
-  function reconcile(prev: Message[], next: Message[]): Message[] {
-    // 切会话 / 清空 / 换了一条会话：不能复用
-    if (next.length < prev.length) return next;
-    if (prev.length > 0 && next.length > 0 && prev[0].id !== next[0].id) return next;
+  function currentWindow(): Window {
+    return { messages, windowFrom, hasOlder };
+  }
 
-    // 只复用「上次就已经不是最后一条」的消息：上次的最后一条当时可能还在长
-    // （一个回合里 assistant 消息会把多步 parts 合进来），它保存的可能是半成品。
-    const out = next.slice();
-    const prevLast = prev.length - 1;
-    for (let i = 0; i < Math.min(prev.length, next.length); i++) {
-      if (i < prevLast && prev[i].id === next[i].id) out[i] = prev[i];
+  /**
+   * 把更早的一页插到手上（预取的、或刚拉到的）。返回 `true` = 真插上了。
+   *
+   * 接不上就整页丢掉（`prependPage` 给 null）：宁可少一窗，也不能在中间留个洞。
+   */
+  function insertOlder(p: { page: Message[]; from: number; hasMore: boolean }): boolean {
+    if (!p.page.length) {
+      // 空页：把「还有没有」记下来（服务端偶尔会有这么一下），下次再要
+      hasOlder = p.hasMore;
+      return false;
     }
-    return out;
+    const next = prependPage(currentWindow(), { messages: p.page, from: p.from, hasMore: p.hasMore });
+    if (!next) return false;
+    setWindow(next);
+    // 插进去之后窗口起点变了：手上那份预取（如果有）的基准点也跟着过时 ——
+    // 丢掉，下一次贴到顶时按新的起点重新预取（不然会拿着一份对不上的干等）。
+    pending = null;
+    return true;
+  }
+
+  /**
+   * 翻页请求本身（预取和插都用它）。返回 null = 这一份不能用了。
+   */
+  async function fetchOlder(base: number): Promise<Omit<NonNullable<typeof pending>, 'sid' | 'base'> | null> {
+    const sid = sessionId;
+    try {
+      const r = await fetch(
+        `/api/session?id=${encodeURIComponent(sid)}&before=${base}&tail=${MSG_WINDOW}`,
+      );
+      if (!r.ok) return null;
+      const d = (await r.json()) as SessionPayload;
+      // 这一路走的过程中会话切走了 / 窗口又变了一页：这份不要了
+      if (sid !== sessionId || base !== windowFrom || !hasOlder) return null;
+      return { page: d.messages ?? [], from: d.from ?? 0, hasMore: !!d.hasMore };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 滚动中先把下一窗拿到手（不动界面）：等用户滑停了直接插，不再等一个来回。
+   *
+   * 失败不算事 —— 真要的时候 `loadOlder` 会重拉一次。
+   */
+  async function prefetchOlder(): Promise<void> {
+    if (!hasOlder || !sessionId || pending || prefetching || loadingOlder) return;
+    const base = windowFrom;
+    prefetching = true;
+    try {
+      const got = await fetchOlder(base);
+      if (!got || base !== windowFrom || pending) return;
+      pending = { sid: sessionId, base, ...got };
+    } finally {
+      prefetching = false;
+    }
+  }
+
+  /**
+   * 真的插一窗更早的（`MessageList` 判停之后叫它）。
+   *
+   * 只跟服务端要**这一窗** —— 历史是只追加的，这一窗要回来就永远是对的，不用管
+   * `rev`（那套是给「当前回合在长」用的）。返回 `true` = 真拿到了新东西（调用方
+   * 据此补偿滚动位置，不补偿的话视口会跳）。
+   */
+  async function loadOlder(): Promise<boolean> {
+    if (!hasOlder || !sessionId) return false;
+    // 预取的还在手上、又正好接得上 → 直接用
+    if (pending && pending.sid === sessionId && pending.base === windowFrom) {
+      const p = pending;
+      pending = null;
+      return insertOlder(p);
+    }
+    pending = null;
+    loadingOlder = true;
+    try {
+      const got = await fetchOlder(windowFrom);
+      return got ? insertOlder(got) : false;
+    } finally {
+      loadingOlder = false;
+    }
+  }
+
+  /**
+   * 回到底部了（`MessageList` 说）：把视口之外的旧页丢掉，给内存封顶。
+   *
+   * 这一步只动**前面**那些（下标跟着 `windowFrom` 平移，所以补丁的下标依旧对得上），
+   * 界面不动：被丢掉的全在视口上方，`MessageList` 那层本来就只挂着最后 10 条。
+   */
+  function trimOldPages(): void {
+    const next = trimOlder(currentWindow(), KEEP_MSGS);
+    if (next) setWindow(next);
+    // 预取的基准点可能已经不在了
+    if (pending && pending.base !== windowFrom) pending = null;
   }
 
   async function loadSessions() {
@@ -503,6 +559,7 @@
     // 新会话还没跑过，手上这一窗的起点和「还有没有更早的」都从头算
     windowFrom = 0;
     hasOlder = false;
+    pending = null;
     // 新会话还没跑过，用量也从零开始
     usage = null;
     // 新会话在服务端**还不存在**，所以它一定没在跑 —— 不清的话会留着上一条
@@ -523,6 +580,7 @@
     sessionId = '';
     windowFrom = 0;
     hasOlder = false;
+    pending = null;
     await Promise.all([loadSessions(), loadMessages()]);
     drawer = false;
   }
@@ -550,6 +608,7 @@
     sessionId = '';
     windowFrom = 0;
     hasOlder = false;
+    pending = null;
     await Promise.all([loadSessions(), loadMessages()]);
   }
 
@@ -967,6 +1026,8 @@
           session={sessionId}
           hasolder={hasOlder}
           onloadearlier={loadOlder}
+          onprefetch={prefetchOlder}
+          ontrim={trimOldPages}
           step={MSG_WINDOW}
         />
       {/if}

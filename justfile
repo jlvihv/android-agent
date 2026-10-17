@@ -50,8 +50,18 @@ export NDK_HOME := ndk_home
 check:
     cargo clippy --manifest-path {{core}}/Cargo.toml --all-targets -- -D warnings
 
+# 后端 + 前端（`web/tests/` 那几个纯函数）。
+#
+# 为什么前端也得跑：窗口 / 下标对齐这种不变式（注意：下标是**完整视图**的，而客户端
+# 手上只有一窗）手测抓不住 —— 连续两个 bug 都出在这里。那边只跑纯逻辑，不上 DOM，
+# 毫秒级。
 test:
     cargo test --manifest-path {{core}}/Cargo.toml
+    cd {{web}} && bun test
+
+# 只跑前端那几个（改 `lib/session.ts` 时快）
+web-test:
+    cd {{web}} && bun test
 
 # 起核心：mock 设备 + 本地 Linux 沙箱（桌面）
 #

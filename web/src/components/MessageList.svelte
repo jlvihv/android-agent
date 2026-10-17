@@ -49,6 +49,10 @@
     hasolder = false,
     /** 往上翻到头（或这一窗还不到一屏）时去服务端要一窗更早的。返回 true = 真的拿到了 */
     onloadearlier,
+    /** 滚动中先把下一窗拿到手（不动界面）—— 停稳那一刻直接插，不再等一个来回 */
+    onprefetch,
+    /** 回到底部了：视口之外的旧页可以丢掉了（内存封顶） */
+    ontrim,
     /** 一窗多少条（和 `App` 发给服务端的 `tail` 同一个数） */
     step = 10,
   }: {
@@ -60,6 +64,8 @@
     session?: string;
     hasolder?: boolean;
     onloadearlier?: () => Promise<boolean>;
+    onprefetch?: () => void;
+    ontrim?: () => void;
     step?: number;
   } = $props();
 
@@ -435,12 +441,19 @@
       // **整屏都装得下的时候不收**：那时「回到底部」是白说的（根本没得滚），
       // 收了只会让 `fillViewport` 又把它要回来 —— 一收一要地反复渲染，
       // 还会一路把历史全拉下来。
-      if (extra > 0 && !loadingEarlier && el.scrollHeight > el.clientHeight) extra = 0;
+      if (extra > 0 && !loadingEarlier && el.scrollHeight > el.clientHeight) {
+        extra = 0;
+        // 视口之外那一堆旧页也一起收掉（`App` 那边的内存封顶）—— 收完手上只留三窗
+        ontrim?.();
+      }
     } else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
-    // 快到顶了 → 等这一轮滑动**停下来**再去要更早的一窗（见 `scheduleEarlier`）
+    // 快到顶了：先把内容拿到手（不动界面），等这一轮滑动**停下来**再插
     wantEarlier = el.scrollTop < LOAD_EARLIER_AT;
-    if (wantEarlier) scheduleEarlier();
+    if (wantEarlier) {
+      onprefetch?.();
+      scheduleEarlier();
+    }
   }
 
   /**
@@ -455,20 +468,37 @@
    * 可“用户正在滚动”时 Chromium 把 anchoring 抑制掉了（实测：把手势放在滚动中，
    * 插入 2000px 内容，位置靠的是我们那一次 JS 写 —— 而那一写同时把惯性抹了）。
    *
-   * 所以等它停下来再插（不听 `scrollend`：惯性滑完它就发，但 Safari/老内核没有它，
-   * 统一用「150ms 没有滚动事件」判停，一个数管所有浏览器）。
+   * 所以等它停稳再插（`scrollend` 有就用它，没有就用「150ms 没有滚动事件」兜底）：
    * 那时没人跟它抢，位置一定是对的，也不会抹掉任何手势。本地/局域网那点延迟
    * （几十毫秒）看不出来；经中继是「先停下、内容再出现」，总比跳一下强。
+   *
+   * 内容本身是**滚动中**就预取好的（`onprefetch`），所以停稳那一刻只是插入 +
+   * 补偿，不再等一个网络来回。
    */
   function scheduleEarlier() {
     clearTimeout(earlierTimer);
-    earlierTimer = setTimeout(() => {
-      if (wantEarlier) {
-        wantEarlier = false;
-        void loadEarlier();
-      }
-    }, IDLE_MS);
+    earlierTimer = setTimeout(settleEarlier, IDLE_MS);
   }
+
+  /**
+   * 滑停了（超时和 `scrollend` 都走到这儿，谁先到算谁的）：该插就插。
+   */
+  function settleEarlier() {
+    clearTimeout(earlierTimer);
+    if (!wantEarlier) return;
+    wantEarlier = false;
+    void loadEarlier();
+  }
+
+  // `scrollend` 有就听：惯性滑完它立刻发，比「150ms 没有滚动事件」准。
+  // 老内核（Safari / 老 WebView）没有它，靠上面那个超时兜底。
+  $effect(() => {
+    const el = scroller;
+    if (!el) return;
+    const on = () => settleEarlier();
+    el.addEventListener('scrollend', on);
+    return () => el.removeEventListener('scrollend', on);
+  });
 
   /**
    * 手里这一窗**滚不动**（还不够一屏高）却有更早的 → 自己接着要。
