@@ -667,7 +667,36 @@ fn build_messages(
             out.push(image_carrier(&img, supports_images));
         }
     }
+    pass_back_empty_reasoning(&mut out);
     Ok(out)
+}
+
+/// 思考模型：**每一条** assistant 消息都带 `reasoning_content`，这一步没想就传 `""`。
+///
+/// 思考模型也会有「这一步没思考、直接调工具」的时候，思考内容是空的 —— 以前空的
+/// 就整个省掉字段，DeepSeek 的严格后端就回 400：
+///
+/// ```text
+/// The `reasoning_content` in the thinking mode must be passed back to the API.
+/// ```
+///
+/// 实测（jl 上那次）：失败的请求里当前回合有一条 assistant 没带这个字段，前面几个
+/// 回合也有同样缺的却都过了 —— 网关后面不同上游宽严不一，所以不能指望它总是放过。
+///
+/// 「是不是思考模型」看历史里**有没有一条带思考内容**：不吐思考的模型（OpenAI 的
+/// Chat Completions）历史里一条都没有，字段照旧一个都不出现，不给它塞陌生字段。
+fn pass_back_empty_reasoning(msgs: &mut [Message]) {
+    let thinking = msgs
+        .iter()
+        .any(|m| matches!(m, Message::Assistant { reasoning_content: Some(_), .. }));
+    if !thinking {
+        return;
+    }
+    for m in msgs {
+        if let Message::Assistant { reasoning_content, .. } = m {
+            reasoning_content.get_or_insert_with(String::new);
+        }
+    }
 }
 
 /// 把一张工具返回的图片包成一条 `user` 消息。
@@ -3432,10 +3461,30 @@ mod tests {
             assistants[1]["reasoning_content"], "目录里有两个文件",
             "没调工具的那步也要传"
         );
-        assert!(
-            assistants[2].get("reasoning_content").is_none(),
-            "没有思考内容就不带字段"
+        assert_eq!(
+            assistants[2]["reasoning_content"], "",
+            "思考模型某一步没想（直接调工具）：也得带上，传空串 —— 省掉字段 DeepSeek 回 400"
         );
+    }
+
+    /// 不吐思考的模型（历史里一条思考内容都没有）：字段一个都不出现。
+    #[test]
+    fn chat_requests_omit_reasoning_for_models_that_never_think() {
+        let mut sess = ChatSession::new();
+        sess.messages = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::user("U"),
+            ChatMessage::Assistant {
+                content: "好".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_items: Vec::new(),
+            },
+        ];
+        let req = build_request(&sess, Platform::Android, "m", false, false, None).unwrap();
+        let v = serde_json::to_value(&req).unwrap();
+        let a = v["messages"].as_array().unwrap().iter().find(|m| m["role"] == "assistant").unwrap();
+        assert!(a.get("reasoning_content").is_none(), "{a}");
     }
 
     fn call(id: &str) -> RecordedToolCall {
