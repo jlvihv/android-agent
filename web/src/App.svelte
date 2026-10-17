@@ -97,9 +97,10 @@ import {
   /**
    * 预取好的、还没插进去的那一窗（见 `prefetchOlder` / `loadOlder`）。
    *
-   * 为什么要预取：插入必须等用户滑停了才能做（在滑动中写 `scrollTop` 会把手机上
-   * 正在进行的惯性滑动掉），那就不应该连网络也一起等 —— 滚动中先把内容拿到手，
-   * 停下的那一刻直接插，本地/局域网下就是「停下即到」。
+   * 为什么要预取：有时插入得等用户滑停（贴在 0 上 / 内核没有 scroll anchoring，得
+   * 自己写 `scrollTop`，而那会把手机上正在进行的惯性滑动掐掉，见 `lib/window.ts` 的
+   * `insertNow`），那就不应该连网络也一起等 —— 滚动中先把内容拿到手，停下的那一刻
+   * 直接插。常态（有 anchoring、没贴顶）根本不等停：拿到就插。
    */
   let pending: { sid: string; base: number; page: Message[]; from: number; hasMore: boolean } | null =
     null;
@@ -110,8 +111,13 @@ import {
   let inflightAgain = false;
   /** 正在拉更早的一窗（插入那一次），别重入 */
   let loadingOlder = false;
-  /** 预取在路上（滚动中会反复叫它，别每帧都发一个请求） */
-  let prefetching = false;
+  /**
+   * 预取在路上（滚动中会反复叫它，别每帧都发一个请求）。
+   *
+   * 存的是那个 promise 而不是一个布尔：真要插的时候（`loadOlder`）预取要是还在路上，
+   * **等它**就行 —— 以前是另发一份一模一样的请求，等于白白多一个来回。
+   */
+  let prefetching: Promise<void> | null = null;
 
 
   /**
@@ -489,16 +495,17 @@ import {
    *
    * 失败不算事 —— 真要的时候 `loadOlder` 会重拉一次。
    */
-  async function prefetchOlder(): Promise<void> {
+  function prefetchOlder(): void {
     if (!hasOlder || !sessionId || pending || prefetching || loadingOlder) return;
     const base = windowFrom;
-    prefetching = true;
-    try {
-      const got = await fetchOlder(base);      if (!got || base !== windowFrom || pending) return;
+    const p = (async () => {
+      const got = await fetchOlder(base);
+      if (!got || base !== windowFrom || pending) return;
       pending = { sid: sessionId, base, ...got };
-    } finally {
-      prefetching = false;
-    }
+    })().finally(() => {
+      if (prefetching === p) prefetching = null;
+    });
+    prefetching = p;
   }
 
   /**
@@ -510,6 +517,9 @@ import {
    */
   async function loadOlder(): Promise<boolean> {
     if (!hasOlder || !sessionId) return false; // hasOlder = 手上这窗的起点 > 0
+    // 预取还在路上：等它（它要的就是这一窗），别另发一份
+    if (prefetching) await prefetching;
+    if (!hasOlder || !sessionId) return false;
     // 预取的还在手上、又正好接得上 → 直接用
     if (pending && pending.sid === sessionId && pending.base === windowFrom) {
       const p = pending;
@@ -519,7 +529,8 @@ import {
     pending = null;
     loadingOlder = true;
     try {
-      const got = await fetchOlder(windowFrom);      return got ? insertOlder(got) : false;
+      const got = await fetchOlder(windowFrom);
+      return got ? insertOlder(got) : false;
     } finally {
       loadingOlder = false;
     }

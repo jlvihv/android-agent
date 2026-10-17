@@ -92,3 +92,33 @@ function nearTop(viewH: number): number {
 export function wantCollapse(f: CollapseFacts): boolean {
   return f.pinned && f.extra > 0 && !f.loadingEarlier && f.tailH > f.viewH;
 }
+
+/** 「现在能不能插」要的那几个数 */
+export type InsertFacts = {
+  /** 这一轮滚动停稳了 */
+  settled: boolean;
+  scrollTop: number;
+  /** 浏览器有原生 scroll anchoring（`CSS.supports('overflow-anchor', 'auto')`） */
+  anchoring: boolean;
+};
+
+/**
+ * 现在能不能把更早的一窗插到上面：**停稳了**，或者**浏览器会替我们钉住视口**。
+ *
+ * 插入本身不难，难在插完视口不能动：要么浏览器的 scroll anchoring 自己把 `scrollTop`
+ * 补上，要么我们写 `scrollTop` —— 而后者会把手机上正在进行的惯性滑动掐掉。所以：
+ *
+ *   - 有 anchoring、而且**不在最顶上**（`scrollTop > 0`）：滑动中也直接插，一个字都
+ *     不用写。这是常态 —— 离顶两屏就开始要，内容一到就插，用户滑到那里时上面早就
+ *     有东西了，根本碰不到顶。
+ *   - 已经贴在 0 上：**anchoring 在 0 不生效**（实测：`scrollTop` 0 时往前面插
+ *     1000px，参照那条被推下去 1000px；1 / 50 时漂移都是 0）—— 只能自己写
+ *     `scrollTop`，那就得等停稳。没有 anchoring 的内核（老 Safari）一律这样。
+ *
+ * 以前一律「等停稳」：那等于一直滑就一直不插，用户必然撞到顶、停手、再等 150ms
+ * 才看见东西 —— 局域网里也卡一下，就是这个。（当初得出「anchoring 在用户滚动时
+ * 不参与」的那次实测，插入点恰好在 0 上。）
+ */
+export function insertNow(f: InsertFacts): boolean {
+  return f.settled || (f.anchoring && f.scrollTop > 0);
+}

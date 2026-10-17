@@ -12,7 +12,7 @@
    * 每个思考、每次工具调用**各开各的面板**，面板里只有它自己。
    */
   import { tick, untrack } from 'svelte';
-  import { wantOlder as olderWanted, wantCollapse as collapseWanted } from '../lib/window';
+  import { wantOlder as olderWanted, wantCollapse as collapseWanted, insertNow } from '../lib/window';
   import Img from './Img.svelte';
   import { cubicIn } from 'svelte/easing';
   import type { Message, ToolPart } from '../lib/sse';
@@ -379,8 +379,20 @@
    */
   let tailH = $state(0);
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
-  /** `loadEarlier` 正在跑：别重入（滚动事件很密，落地层也会反复跑） */
-  let loadingEarlier = false;
+  /**
+   * `loadEarlier` 正在跑：别重入（滚动事件很密，落地层也会反复跑）。
+   *
+   * `$state`：它一落下，落地层得**再看一眼** —— 一窗插完还在离顶两屏以内（这一窗
+   * 不高）就接着要下一窗。以前靠插入引起的滚动事件把 `settled` 拨一下顺带重跑，
+   * 现在滑动中就插，没有那一下了。
+   */
+  let loadingEarlier = $state(false);
+  /**
+   * 浏览器有原生 scroll anchoring（Chromium / Android WebView / Firefox 都有）：
+   * 往视口上方插内容时它自己补 `scrollTop`，我们一个字都不用写 —— 滑动中也能插。
+   * 见 `lib/window.ts` 的 `insertNow`。
+   */
+  const ANCHORING = typeof CSS !== 'undefined' && CSS.supports('overflow-anchor', 'auto');
 
   // —— 意图层：全是纯推导 ——
   /** 离底部多远（px）。除了 `pinned` 还要它：决定要不要显「回到最新」 */
@@ -400,6 +412,8 @@
   let wantOlder = $derived(olderWanted(facts));
   /** 该把往上的窗口收回去（贴底、收完还装得满一屏、没有正在跑的加载） */
   let wantCollapse = $derived(collapseWanted(facts));
+  /** 现在插不会动到视口（停稳了，或者浏览器会替我们钉住） */
+  let canInsert = $derived(insertNow({ settled, scrollTop, anchoring: ANCHORING }));
 
   /**
    * 「回到最新」的显示门槛（px）。
@@ -425,7 +439,7 @@
     if (gap < NEAR_BOTTOM) pinned = true;
     else if (el.scrollTop < lastTop - 1) pinned = false;
     lastTop = el.scrollTop;
-    // 还在滚：落地层这一会儿只**预取**、不动界面（见那里），等停稳再插
+    // 还在滚：贴在 0 上 / 没有 anchoring 时落地层只**预取**、等停稳再插（见 `insertNow`）
     settled = false;
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -461,15 +475,20 @@
     // 用户要看更早的了 —— 别再贴底：拉的时候内容一变高，`ResizeObserver` 看见
     // `pinned` 就可能把我们拽回尾部（白拉一窗，视口还跳一下）。
 
-    // 锚定当前视口里**最上面那条消息**，补完把它对回原处。
+    // 锚定当前视口里**最上面那条消息**，补完看它**上面**多出来多少。
     //
     // 为什么不用「补进来多少高度就补多少 scrollTop」（以前就是那么干的）：
     // 那个写法默认「这期间容器高度只因为补窗变过」—— 锚点法不依赖任何前提，
     // 只认那一条消息自己的位置（只有**它上面**多出来的东西会移动它）。
+    //
+    // 量的是它在**内容里**的位置（离内容顶多远），不是在视口里的：现在滑动中也会插，
+    // 而 `await` 那一路上用户还在滑 —— 视口位置的变化里混着用户自己滑的那段，拿它
+    // 当「漂移」去补，就是把用户往回拽（还顺手掐掉惯性）。内容位置只有插入会改。
     const kids = [...content.children];
     const edge = scroller.getBoundingClientRect().top;
+    const offsetOf = (el: Element) => el.getBoundingClientRect().top - edge + scroller!.scrollTop;
     const anchor = kids.find((el) => el.getBoundingClientRect().bottom > edge);
-    const before = anchor?.getBoundingClientRect().top ?? 0;
+    const before = anchor ? offsetOf(anchor) : 0;
 
     // 手上还有没挂出来的就先挂出来；到顶了才去服务端要一窗。
     //
@@ -479,7 +498,8 @@
     // 实测那一抖会把 `scrollTop` 夹到 0，而参照消息的位置也跟着失真（量出 -4298），
     // 补偿照着它写就把视口送回了顶部。先放大窗口，插进来的新内容就只是**加在
     // 现有节点上面**，谁也不动。
-    let grew = false;    try {
+    let grew = false;
+    try {
       if (start > 0) {
         extra += step;
         grew = true;
@@ -491,16 +511,15 @@
       if (grew) {
         await tick();
         if (anchor) {
-          // 浏览器自己的 **scroll anchoring** 一般已经把视口钉住了（措辞见下）——
-          // 这时一个字也别写：程序化地改 `scrollTop` 会把手机上手势正在进行的
-          // 惯性滑动**挡掉**，用户那边就是「滑到一半突然停了，而且停的不是刚才看的地方」。
-          // 只有浏览器没兜住（真漂了）才自己补。
+          // 浏览器自己的 **scroll anchoring** 一般已经把视口钉住了 —— 这时一个字也别写：
+          // 程序化地改 `scrollTop` 会把手机上手势正在进行的惯性滑动**挡掉**，用户那边
+          // 就是「滑到一半突然停了，而且停的不是刚才看的地方」。
           //
-          // 原生 anchoring：新内容插在视口**上方**时自动调 scrollTop，让视口里那条
-          // 不动（Chromium 默认就开）。测法：往内容前面插一个 2000px 的 div，同步读
-          // —— `scrollTop` 自己 +2024、参照那条的位置一个字没变。
-          const drift = anchor.getBoundingClientRect().top - before;
-          if (Math.abs(drift) > 1) scroller.scrollTop += drift;
+          // 它没兜住只有两种情况：内核没有 anchoring，或者插入那一刻贴在 0 上（anchoring
+          // 在 0 不生效）。后者认得出来：钉住了的话 `scrollTop` 至少多了 `grown`，不可能
+          // 还是 0。这两种才自己补，补的就是锚点上面多出来的那段。
+          const grown = offsetOf(anchor) - before;
+          if (grown > 1 && (!ANCHORING || scroller.scrollTop < 1)) scroller.scrollTop += grown;
         }
         lastTop = scroller.scrollTop;
       }
@@ -518,10 +537,10 @@
       ontrim?.();
       return;
     }
-    if (!wantOlder) return;
-    // 滚着的时候只**预取**（不动界面）：插入要改 `scrollTop`，而那会把手机上
-    // 正在进行的惯性滑动掐掉 —— 等停稳（`settled`）再插。
-    if (!settled) {
+    if (!wantOlder || loadingEarlier) return;
+    // 插了会动到视口（贴在 0 上 / 没有 anchoring，得自己写 `scrollTop`，而那会把手机上
+    // 正在进行的惯性滑动掐掉）：先只**预取**（不动界面），等停稳再插。
+    if (!canInsert) {
       onprefetch?.();
       return;
     }

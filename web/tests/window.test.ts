@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { wantCollapse, wantOlder, type WindowFacts } from '../src/lib/window';
+import { insertNow, wantCollapse, wantOlder, type WindowFacts } from '../src/lib/window';
 
 /** 一份「什么都正常」的事实，各用例只改自己关心的那几个 */
 const facts = (over: Partial<WindowFacts> = {}): WindowFacts => ({
@@ -91,5 +91,21 @@ describe('两条策略不许同时成立（一收一要就是空转的源头）'
                     const f = facts({ measured, hasOlder, start, pinned, scrollTop, extra, tailH, contentH, viewH: 800 });
                     expect(wantOlder(f) && wantCollapse(f)).toBe(false);
                   }
+  });
+});
+
+describe('insertNow', () => {
+  test('停稳了 → 插（在不在顶上、有没有 anchoring 都行）', () => {
+    expect(insertNow({ settled: true, scrollTop: 0, anchoring: false })).toBe(true);
+    expect(insertNow({ settled: true, scrollTop: 900, anchoring: true })).toBe(true);
+  });
+  test('滑动中、有 anchoring、不在顶上 → 直接插（浏览器钉住视口，不写 scrollTop）', () => {
+    expect(insertNow({ settled: false, scrollTop: 1, anchoring: true })).toBe(true);
+  });
+  test('滑动中贴在 0 上 → 等停稳（anchoring 在 0 不生效，得自己写 scrollTop）', () => {
+    expect(insertNow({ settled: false, scrollTop: 0, anchoring: true })).toBe(false);
+  });
+  test('滑动中、没有 anchoring → 等停稳', () => {
+    expect(insertNow({ settled: false, scrollTop: 900, anchoring: false })).toBe(false);
   });
 });
