@@ -70,6 +70,11 @@ async fn stream_one(...) {
 > 这是 **Chat Completions** 的绕法。**Responses API** 不需要：图片直接放在
 > `function_call_output.output` 的内容块数组里（`build_responses_input`），
 > 更干净、也不多一条消息。两条协议编码同一份历史，前缀不变式一致。
+>
+> **只内联最近几张**（`KEEP_IMAGES`）：更早的图换成一句「要再看就重新
+> read」。全内联的话图多的会话会把请求撑过网关上限（实测 53 张渲染图、
+> 50MB → 413，会话卡死）。截断点每多 `KEEP_IMAGES` 张图才整块往前挪一次，
+> 这是**唯一**有意打破前缀的地方，挪一次缓存断一次，不是每步都断。
 
 三条规则：
 

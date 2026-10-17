@@ -619,6 +619,7 @@ fn build_messages(
 ) -> anyhow::Result<Vec<Message>> {
     let msgs = &sess.messages;
     let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
+    let mut budget = ImageBudget::new(sess);
     let mut i = 0;
     while i < msgs.len() {
         // 带附件的用户消息：正文 + 图片 / PDF 内容块拼在一条消息里。
@@ -643,7 +644,7 @@ fn build_messages(
         // OpenAI 要求 assistant 的每个 tool_call 后面**紧跟着**对应的 tool
         // 消息，中间不能插 user —— 一个回合调了 3 个工具、只有第 1 个带图时，
         // 图绝不能插在第 1、2 个 tool 之间。
-        let mut carriers: Vec<ImagePart> = Vec::new();
+        let mut carriers: Vec<(ImagePart, bool)> = Vec::new();
         while i < msgs.len() {
             match &msgs[i] {
                 ChatMessage::Tool {
@@ -656,15 +657,15 @@ fn build_messages(
                         content: content.clone(),
                     });
                     for img in images {
-                        carriers.push(img.clone());
+                        carriers.push((img.clone(), budget.next()));
                     }
                     i += 1;
                 }
                 _ => break,
             }
         }
-        for img in carriers {
-            out.push(image_carrier(&img, supports_images));
+        for (img, inline) in carriers {
+            out.push(image_carrier(&img, supports_images, inline));
         }
     }
     pass_back_empty_reasoning(&mut out);
@@ -686,16 +687,68 @@ fn build_messages(
 /// 「是不是思考模型」看历史里**有没有一条带思考内容**：不吐思考的模型（OpenAI 的
 /// Chat Completions）历史里一条都没有，字段照旧一个都不出现，不给它塞陌生字段。
 fn pass_back_empty_reasoning(msgs: &mut [Message]) {
-    let thinking = msgs
-        .iter()
-        .any(|m| matches!(m, Message::Assistant { reasoning_content: Some(_), .. }));
+    let thinking = msgs.iter().any(|m| {
+        matches!(
+            m,
+            Message::Assistant {
+                reasoning_content: Some(_),
+                ..
+            }
+        )
+    });
     if !thinking {
         return;
     }
     for m in msgs {
-        if let Message::Assistant { reasoning_content, .. } = m {
+        if let Message::Assistant {
+            reasoning_content, ..
+        } = m
+        {
             reasoning_content.get_or_insert_with(String::new);
         }
+    }
+}
+
+/// 工具读到的图，请求里只内联最近这么几张（更早的换成一句文字说明）。
+///
+/// 全都内联的话，图多的会话请求体会一路涨到网关的上限：jl 上一次 3D 建模，
+/// 模型反复渲染、看图，53 张 PNG 把请求撑到 50MB，网关直接回
+/// `413 length limit exceeded` —— 原样重发必然还是 413，会话就此卡死。
+/// 老的渲染图模型也用不上，要再看可以重新 `read`。
+const KEEP_IMAGES: usize = 4;
+
+/// 按顺序数历史里工具读到的图，决定每一张内联不内联（见 `KEEP_IMAGES`）。
+///
+/// 截断点**按整块往前挪**：内联的张数在 `KEEP_IMAGES` 到 `2 * KEEP_IMAGES - 1`
+/// 之间摆动，每多读 `KEEP_IMAGES` 张图才挪一次。每挪一次前缀就变了、prompt
+/// cache 断一次，一张一挪的话每步都断。截断点只由历史推导，请求仍然是确定的。
+struct ImageBudget {
+    /// 从第几张（从 0 数）开始内联
+    from: usize,
+    seen: usize,
+}
+
+impl ImageBudget {
+    fn new(sess: &ChatSession) -> Self {
+        let total: usize = sess
+            .messages
+            .iter()
+            .map(|m| match m {
+                ChatMessage::Tool { images, .. } => images.len(),
+                _ => 0,
+            })
+            .sum();
+        Self {
+            from: total.saturating_sub(KEEP_IMAGES) / KEEP_IMAGES * KEEP_IMAGES,
+            seen: 0,
+        }
+    }
+
+    /// 历史里的下一张工具图要不要内联
+    fn next(&mut self) -> bool {
+        let inline = self.seen >= self.from;
+        self.seen += 1;
+        inline
     }
 }
 
@@ -704,12 +757,14 @@ fn pass_back_empty_reasoning(msgs: &mut [Message]) {
 /// 为什么是 user 消息：Chat Completions 的 tool 消息内容只能是字符串，
 /// 工具结果里的图片没有别的合法位置可挂。Responses API 没这个问题（图片
 /// 直接放在 `function_call_output` 里，见 `build_responses_input`）。
-fn image_carrier(img: &ImagePart, supports_images: bool) -> Message {
+fn image_carrier(img: &ImagePart, supports_images: bool, inline: bool) -> Message {
     // 同一步读了好几张图时，靠路径分清哪张是哪张（tool_call_id 对模型没意义）
     let label = format!("[read {}]", img.source);
 
     let mut parts: Vec<Part> = vec![text_part(label)];
-    if supports_images {
+    if !inline {
+        parts.push(text_part(prompt::IMAGE_EVICTED.to_string()));
+    } else if supports_images {
         // 走缓存：每一步都要重新组装请求，不能每步都把同一张图重新 base64。
         // 字节仍然逐字一致（文件不变），prompt cache 照命中。
         match crate::imaging::cached_data_url(&img.path, &img.mime) {
@@ -1087,7 +1142,11 @@ pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<V
     }
 
     let mut out: Vec<Value> = Vec::new();
-    for (i, m) in sess.messages[from..upto].iter().enumerate().map(|(k, m)| (from + k, m)) {
+    for (i, m) in sess.messages[from..upto]
+        .iter()
+        .enumerate()
+        .map(|(k, m)| (from + k, m))
+    {
         match m {
             // 系统提示词（第一条，以及后续的“提示词升级”）是给模型看的，不给用户看
             ChatMessage::System(_) => {}
@@ -1760,6 +1819,7 @@ fn build_responses_input(
     supports_files: bool,
 ) -> Vec<InputItem> {
     let mut out: Vec<InputItem> = Vec::new();
+    let mut budget = ImageBudget::new(sess);
     for m in &sess.messages {
         match m {
             ChatMessage::System(s) => {
@@ -1809,7 +1869,7 @@ fn build_responses_input(
             } => out.push(InputItem::FunctionCallOutput(FunctionCallOutputItem {
                 kind: "function_call_output",
                 call_id: tool_call_id.clone(),
-                output: tool_output(content, images, supports_images),
+                output: tool_output(content, images, supports_images, &mut budget),
             })),
         }
     }
@@ -1907,12 +1967,22 @@ fn user_message_content(
 }
 
 /// 工具结果的 Responses 形态：图片直放在 `function_call_output` 里。
-fn tool_output(content: &str, images: &[ImagePart], supports_images: bool) -> ToolOutput {
+fn tool_output(
+    content: &str,
+    images: &[ImagePart],
+    supports_images: bool,
+    budget: &mut ImageBudget,
+) -> ToolOutput {
     if images.is_empty() || !supports_images {
+        budget.seen += images.len();
         return ToolOutput::Text(content.to_string());
     }
     let mut parts: Vec<InputPart> = vec![input_text(content.to_string())];
     for img in images {
+        if !budget.next() {
+            parts.push(input_text(prompt::IMAGE_EVICTED.to_string()));
+            continue;
+        }
         match crate::imaging::cached_data_url(&img.path, &img.mime) {
             Ok(url) => parts.push(input_image(url)),
             Err(e) => tracing::warn!("图片读不到了 {}: {e}", img.path),
@@ -1925,6 +1995,7 @@ fn tool_output(content: &str, images: &[ImagePart], supports_images: bool) -> To
 /// （模型不支持的模态不读）。
 fn inline_files(sess: &ChatSession, images: bool, pdfs: bool) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let mut budget = ImageBudget::new(sess);
     for m in &sess.messages {
         match m {
             ChatMessage::User { attachments, .. } => {
@@ -1939,7 +2010,11 @@ fn inline_files(sess: &ChatSession, images: bool, pdfs: bool) -> Vec<(String, St
                 }
             }
             ChatMessage::Tool { images: imgs, .. } if images => {
-                out.extend(imgs.iter().map(|i| (i.path.clone(), i.mime.clone())));
+                for i in imgs {
+                    if budget.next() {
+                        out.push((i.path.clone(), i.mime.clone()));
+                    }
+                }
             }
             _ => {}
         }
@@ -3483,7 +3558,12 @@ mod tests {
         ];
         let req = build_request(&sess, Platform::Android, "m", false, false, None).unwrap();
         let v = serde_json::to_value(&req).unwrap();
-        let a = v["messages"].as_array().unwrap().iter().find(|m| m["role"] == "assistant").unwrap();
+        let a = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
         assert!(a.get("reasoning_content").is_none(), "{a}");
     }
 
@@ -4229,6 +4309,81 @@ mod tests {
         assert!(e.to_string().contains("至少"), "{e}");
     }
 
+    /// 读过的图只内联最近几张，截断点按 `KEEP_IMAGES` 一块一块往前挪；
+    /// 两种编码（Chat / Responses）挪的位置一致。
+    #[test]
+    fn only_recent_tool_images_are_inlined() {
+        let img = std::env::temp_dir().join(format!("agent-evict-{}.png", std::process::id()));
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let reads = |n: usize| {
+            let mut sess = ChatSession::new();
+            sess.messages.push(ChatMessage::user("渲染几张看看"));
+            for k in 0..n {
+                let id = format!("c{k}");
+                sess.messages.push(ChatMessage::Assistant {
+                    content: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: vec![RecordedToolCall {
+                        id: id.clone(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning_items: Vec::new(),
+                });
+                sess.messages.push(ChatMessage::Tool {
+                    tool_call_id: id,
+                    content: "{}".into(),
+                    images: vec![ImagePart {
+                        path: img.display().to_string(),
+                        mime: "image/png".into(),
+                        source: format!("/workspace/r{k}.png"),
+                    }],
+                });
+            }
+            sess
+        };
+        // 每张图内联没有（按历史顺序）
+        let chat = |sess: &ChatSession| -> Vec<bool> {
+            let v = serde_json::to_value(build_messages(sess, true, true).unwrap()).unwrap();
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "user" && m["content"].is_array())
+                .map(|m| m["content"][1]["type"] == "image_url")
+                .collect()
+        };
+        let responses = |sess: &ChatSession| -> Vec<bool> {
+            let v = serde_json::to_value(build_responses_input(sess, true, true)).unwrap();
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["type"] == "function_call_output")
+                .map(|m| m["output"][1]["type"] == "input_image")
+                .collect()
+        };
+        let k = KEEP_IMAGES;
+        for (n, from) in [
+            (k - 1, 0),
+            (2 * k - 1, 0),
+            (2 * k, k),
+            (3 * k - 1, k),
+            (3 * k, 2 * k),
+        ] {
+            let sess = reads(n);
+            let want: Vec<bool> = (0..n).map(|i| i >= from).collect();
+            assert_eq!(chat(&sess), want, "chat n={n}");
+            assert_eq!(responses(&sess), want, "responses n={n}");
+            let prewarm = inline_files(&sess, true, true).len();
+            assert_eq!(prewarm, n - from, "prewarm n={n}");
+        }
+
+        // 省掉的那张留着路径和说明，模型知道可以重新 read
+        let v = serde_json::to_value(build_messages(&reads(2 * k), true, true).unwrap()).unwrap();
+        let first = &v.as_array().unwrap()[3]["content"];
+        assert_eq!(first[0]["text"], "[read /workspace/r0.png]");
+        assert_eq!(first[1]["text"], prompt::IMAGE_EVICTED);
+    }
+
     /// 界面上的工具结果就是**模型收到的那段原文**，原样；读到的图片另给沙箱里的
     /// 原图路径。
     #[test]
@@ -4479,10 +4634,7 @@ mod tests {
                 continue;
             }
             let got = total - from;
-            assert!(
-                got >= tail.min(total),
-                "tail={tail} 只给了 {got} 条"
-            );
+            assert!(got >= tail.min(total), "tail={tail} 只给了 {got} 条");
             assert!(got <= tail.min(total) + 2, "tail={tail} 多给了 {got} 条");
             // 切出来的那一段必须和整段视图逐字对得上（合并规则一致）
             assert_eq!(

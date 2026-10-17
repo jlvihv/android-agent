@@ -544,7 +544,11 @@ impl StreamError {
 fn gateway_failed(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.pointer("/error/type").and_then(|t| t.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.pointer("/error/type")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
         .is_some_and(|t| t == "server_error")
 }
 

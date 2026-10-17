@@ -241,6 +241,9 @@ pub fn edit_schema() -> Value {
 /// 进程在两步之间被杀留下的会话。
 pub const INTERRUPTED: &str = "错误：没有结果，回合被中断（用户停止或 App 被关闭）";
 
+/// 历史里较早的图，请求里换成这句（只内联最近几张，见 `agent::KEEP_IMAGES`）。
+pub const IMAGE_EVICTED: &str = "[这张图较早，已不在上下文里；要再看就重新 read]";
+
 #[cfg(test)]
 mod tests {
     use super::*;
