@@ -2246,7 +2246,7 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
 ///
 /// 另外两个参数让它能「只给要显示的那些」：
 ///
-/// - `tail=N`：**只给最后 N 条**（视图消息的条数）。前端一屏只看得到几十条，
+/// - `tail=N`：**只给最后 N 条**（视图消息的条数）。前端一屏只看得到几条，
 ///   没必要把整段历史（含每个 50KB 的 bash 输出）都传过去 —— 长会话首次打开
 ///   就是几 MB。不传 / `0` = 整段（脚本、调试那条路照旧）。
 /// - `before=<from>`：往前翻一页（`from` 就是上一次响应里的那个字段，原样带回来）。
@@ -2437,11 +2437,12 @@ struct SessionQuery {
 }
 
 impl SessionQuery {
-    /// 一窗多大（往前翻一页 / 尾部窗口的默认档）。
+    /// 一窗多大（往前翻一页的默认档；前端每次都带 `tail`，这儿只是它没带时的兑底）。
     ///
-    /// 前端的渲染窗口是同一数量级 —— 它一次也只挂得住几十条。
+    /// 和前端那个 `MSG_WINDOW` 同一个数：两侧对不上的话，要么白传（服务端
+    /// 给多了）要么半天翻不出一屏（给少了）。
     fn window(&self) -> usize {
-        self.tail.filter(|n| *n > 0).unwrap_or(40)
+        self.tail.filter(|n| *n > 0).unwrap_or(10)
     }
 }
 
