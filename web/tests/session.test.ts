@@ -31,11 +31,11 @@ function msg(i: number, parts?: Part[]): Message {
 /** 完整视图：n 条，下标即位置。 */
 const full = (n: number): Message[] => Array.from({ length: n }, (_, i) => msg(i));
 
-const win = (messages: Message[], windowFrom: number, hasOlder = windowFrom > 0): Window => ({
-  messages,
-  windowFrom,
-  hasOlder,
-});
+/**
+ * 手上这一窗。注意**没有** `hasOlder` 字段：它恒等于 `windowFrom > 0`，由 `App`
+ * 推导（存成状态就会陈旧 —— 收窗口之后正是这个坑，见 `lib/session.ts` 顶上那段）。
+ */
+const win = (messages: Message[], windowFrom: number): Window => ({ messages, windowFrom });
 
 describe('reconcile', () => {
   test('按 id 复用，但**不复用最后一条**（那个回合可能还在长）', () => {
@@ -141,10 +141,9 @@ describe('applyPatch', () => {
 
 describe('applyWindow', () => {
   test('本地空的（首屏）：整份换上，起点用服务端的', () => {
-    const w = applyWindow(win([], 0, false), { messages: full(40).slice(35), from: 35, hasMore: true }, false);
+    const w = applyWindow(win([], 0), { messages: full(40).slice(35), from: 35, hasMore: true }, false);
     expect(w.messages).toHaveLength(5);
     expect(w.windowFrom).toBe(35);
-    expect(w.hasOlder).toBe(true);
   });
 
   test('本地还有更早的、能接上：只换后面那段，起点不动', () => {
@@ -190,7 +189,6 @@ describe('trimOlder', () => {
     // 留下的是【完整视图】的最后 30 条（70..99），起点就跟到 70
     expect(w?.windowFrom).toBe(70);
     expect(w?.messages[0].id).toBe('u70');
-    expect(w?.hasOlder).toBe(true); // 服务端那边还有更早的
   });
 
   test('没到该收的时候：不动', () => {

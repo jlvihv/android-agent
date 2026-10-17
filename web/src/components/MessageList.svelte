@@ -12,6 +12,7 @@
    * 每个思考、每次工具调用**各开各的面板**，面板里只有它自己。
    */
   import { tick, untrack } from 'svelte';
+  import { wantOlder as olderWanted, wantCollapse as collapseWanted } from '../lib/window';
   import Img from './Img.svelte';
   import { cubicIn } from 'svelte/easing';
   import type { Message, ToolPart } from '../lib/sse';
@@ -395,26 +396,12 @@
   let extra = $state(0);
   let limit = $derived(step + extra);
   let start = $derived(Math.max(0, messages.length - limit));
-  /**
-   * 该往前要了。**两条路看的不是同一件事**：
-   *
-   *   - 没贴底（用户自己往上翻了）：贴到顶就要（`scrollTop < LOAD_EARLIER_AT`）
-   *   - 还贴着底：只有**整屏都装得下**（根本滚不动）才要 —— 那一截历史不然就见不到了
-   *
-   * 为什么要分「贴不贴底」：贴底时 `scrollTop` 是 0 并不能说明用户想看更早的 ——
-   * 首屏刚渲染、还没滚到底的那一两帧也是 0（实测：那样会误拉一页，而且是在首帧
-   * 乱序的时机插进去，DOM 一抖把 `scrollTop` 夹成 0，之后没人再拉回底部）。
-   */
-  let wantOlder = $derived(
-    measured && hasolder && (pinned ? contentH <= viewH : scrollTop < LOAD_EARLIER_AT),
-  );
-  /**
-   * 该把往上的窗口收回去（封顶 DOM）：贴底、放过更早的、而且**收完之后还装得满一屏**。
-   *
-   * 最后那个前提不能少：收完空出一截的话，「不够一屏就接着要」立刻又把它要回来，
-   * 两边一收一要地空转（见 `tailH`）。
-   */
-  let wantCollapse = $derived(pinned && extra > 0 && !loadingEarlier && tailH > viewH);
+  /** 观察层的那几个数（策略函数的入参，见 `lib/window.ts`） */
+  let facts = $derived({ measured, hasOlder: hasolder, start, pinned, scrollTop, contentH, viewH, extra, loadingEarlier, tailH });
+  /** 该往前要了（手上还有没挂出来的，或服务端还有更早的，而且用户正看着顶那一带） */
+  let wantOlder = $derived(olderWanted({ ...facts, nearTop: LOAD_EARLIER_AT }));
+  /** 该把往上的窗口收回去（贴底、收完还装得满一屏、没有正在跑的加载） */
+  let wantCollapse = $derived(collapseWanted(facts));
 
   /**
    * 「回到最新」的显示门槛（px）。
@@ -494,8 +481,7 @@
     // 实测那一抖会把 `scrollTop` 夹到 0，而参照消息的位置也跟着失真（量出 -4298），
     // 补偿照着它写就把视口送回了顶部。先放大窗口，插进来的新内容就只是**加在
     // 现有节点上面**，谁也不动。
-    let grew = false;
-    try {
+    let grew = false;    try {
       if (start > 0) {
         extra += step;
         grew = true;

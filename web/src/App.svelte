@@ -76,8 +76,14 @@ import {
    * 而我们手上只有尾巴这一窗 —— 把这个数带回去，它替我们翻译。
    */
   let windowFrom = $state(0);
-  /** 服务端那边还有没有更早的（还有就滚到顶/不够一屏时自己去拉一窗，没有按钮） */
-  let hasOlder = $state(false);
+  /**
+   * 服务端那边还有没有更早的。**推导的**，不是状态：它恒等于「手上这窗的起点 > 0」。
+   *
+   * 存成状态会陈旧（踩过）：`trimOldPages` 一收窗口，手上就少了几十条 —— 那些
+   * 服务端还有，可标志还是上次翻完时的 `false`，于是「该往前要」再也不成立，
+   * 用户看到的是「第一次能翻，滚回底部再往上翻就翻不动了」。
+   */
+  let hasOlder = $derived(windowFrom > 0);
 
   /**
    * 手上最多留几条更早的（回到底部时收回）。
@@ -345,7 +351,7 @@ import {
       // 补丁 / 整窗两条路的规则在 `lib/session.ts` 里（有测试盯着，见 `bun test`）。
       const same = sid === sessionId;
       if (d.append && same) {
-        const r = applyPatch({ messages, windowFrom, hasOlder }, d as SessionPayload, winAt);
+        const r = applyPatch({ messages, windowFrom }, d as SessionPayload, winAt);
         if (!r.ok) {
           if (r.why === 'mismatch') {
             // 本地那条和服务端以为的对不上：老老实实重新要一份全量
@@ -359,7 +365,7 @@ import {
         }
         setWindow(r.window);
       } else {
-        setWindow(applyWindow({ messages, windowFrom, hasOlder }, d as SessionPayload, same));
+        setWindow(applyWindow({ messages, windowFrom }, d as SessionPayload, same));
       }
       if (d.turnError) showTurnError(d.turnError);
       sessionId = sid;
@@ -435,14 +441,13 @@ import {
   function setWindow(w: Window) {
     messages = w.messages;
     windowFrom = w.windowFrom;
-    hasOlder = w.hasOlder;
   }
 
   /**
    * 从 `MessageList` 自己那个窗口状态里取一份（三件套）—— 读的是当前 `$state`。
    */
   function currentWindow(): Window {
-    return { messages, windowFrom, hasOlder };
+    return { messages, windowFrom };
   }
 
   /**
@@ -451,13 +456,8 @@ import {
    * 接不上就整页丢掉（`prependPage` 给 null）：宁可少一窗，也不能在中间留个洞。
    */
   function insertOlder(p: { page: Message[]; from: number; hasMore: boolean }): boolean {
-    if (!p.page.length) {
-      // 空页：把「还有没有」记下来（服务端偶尔会有这么一下），下次再要
-      hasOlder = p.hasMore;
-      return false;
-    }
-    const next = prependPage(currentWindow(), { messages: p.page, from: p.from, hasMore: p.hasMore });
-    if (!next) return false;
+    if (!p.page.length) return false; // 空页：什么都不用做，下次再要
+    const next = prependPage(currentWindow(), { messages: p.page, from: p.from, hasMore: p.hasMore });    if (!next) return false;
     setWindow(next);
     // 插进去之后窗口起点变了：手上那份预取（如果有）的基准点也跟着过时 ——
     // 丢掉，下一次贴到顶时按新的起点重新预取（不然会拿着一份对不上的干等）。
@@ -476,8 +476,8 @@ import {
       );
       if (!r.ok) return null;
       const d = (await r.json()) as SessionPayload;
-      // 这一路走的过程中会话切走了 / 窗口又变了一页：这份不要了
-      if (sid !== sessionId || base !== windowFrom || !hasOlder) return null;
+      // 这一路走的过程中会话切走了 / 窗口又变了一页 / 已经没有更早的了：这份不要了
+      if (sid !== sessionId || base !== windowFrom || windowFrom === 0) return null;
       return { page: d.messages ?? [], from: d.from ?? 0, hasMore: !!d.hasMore };
     } catch {
       return null;
@@ -494,8 +494,7 @@ import {
     const base = windowFrom;
     prefetching = true;
     try {
-      const got = await fetchOlder(base);
-      if (!got || base !== windowFrom || pending) return;
+      const got = await fetchOlder(base);      if (!got || base !== windowFrom || pending) return;
       pending = { sid: sessionId, base, ...got };
     } finally {
       prefetching = false;
@@ -510,7 +509,7 @@ import {
    * 据此补偿滚动位置，不补偿的话视口会跳）。
    */
   async function loadOlder(): Promise<boolean> {
-    if (!hasOlder || !sessionId) return false;
+    if (!hasOlder || !sessionId) return false; // hasOlder = 手上这窗的起点 > 0
     // 预取的还在手上、又正好接得上 → 直接用
     if (pending && pending.sid === sessionId && pending.base === windowFrom) {
       const p = pending;
@@ -520,8 +519,7 @@ import {
     pending = null;
     loadingOlder = true;
     try {
-      const got = await fetchOlder(windowFrom);
-      return got ? insertOlder(got) : false;
+      const got = await fetchOlder(windowFrom);      return got ? insertOlder(got) : false;
     } finally {
       loadingOlder = false;
     }
@@ -559,7 +557,6 @@ import {
     messages = [];
     // 新会话还没跑过，手上这一窗的起点和「还有没有更早的」都从头算
     windowFrom = 0;
-    hasOlder = false;
     pending = null;
     // 新会话还没跑过，用量也从零开始
     usage = null;
@@ -580,7 +577,6 @@ import {
     rev = '';
     sessionId = '';
     windowFrom = 0;
-    hasOlder = false;
     pending = null;
     await Promise.all([loadSessions(), loadMessages()]);
     drawer = false;
@@ -608,7 +604,6 @@ import {
     rev = '';
     sessionId = '';
     windowFrom = 0;
-    hasOlder = false;
     pending = null;
     await Promise.all([loadSessions(), loadMessages()]);
   }

@@ -14,8 +14,14 @@
 
 import type { Message } from './sse';
 
-/** 手上这一窗：`messages` 是完整视图里 `[windowFrom, windowFrom + len)` 那一段。 */
-export type Window = { messages: Message[]; windowFrom: number; hasOlder: boolean };
+/**
+ * 手上这一窗：`messages` 是完整视图里 `[windowFrom, windowFrom + len)` 那一段。
+ *
+ * **「更早的还有没有」不在这里** —— 它恒等于 `windowFrom > 0`，调用方自己推导
+ * （`App` 的 `hasOlder`）。存成状态就会陈旧：`trimOlder` 一收窗口它就与事实不符，
+ * 而「该往前要」正好看它（踩过：翻到底之后再往上滚，什么都不发生）。
+ */
+export type Window = { messages: Message[]; windowFrom: number };
 
 /**
  * `/api/session` 的回包里我们在这里用得上的字段（排队、用量那些 App 自己处理）。
@@ -122,13 +128,11 @@ export function applyWindow(w: Window, d: SessionPayload, same: boolean): Window
     return {
       messages: [...w.messages.slice(0, cut), ...reconcile(w.messages.slice(cut), fresh)],
       windowFrom: w.windowFrom,
-      hasOlder: !!d.hasMore,
     };
   }
   return {
     messages: same && at === 0 ? reconcile(w.messages, fresh) : fresh,
     windowFrom: at,
-    hasOlder: !!d.hasMore,
   };
 }
 
@@ -136,19 +140,15 @@ export function applyWindow(w: Window, d: SessionPayload, same: boolean): Window
  * 往前翻一页（`?before=<windowFrom>`）：这一窗接在手上的前面。
  *
  * 接不上就整页丢掉（返回 null）：宁可少显示一窗，也不能在中间留个洞 —— 洞会让
- * 之后所有下标都对不上，`replaceFrom` 那套全乱。空页面也返回 null（调用方只管把
- * `hasMore` 记下来）。
+ * 之后所有下标都对不上，`replaceFrom` 那套全乱。空页面也返回 null（调用方什么都不
+ * 用做，下次再要）。
  */
 export function prependPage(w: Window, d: SessionPayload): Window | null {
   const page = d.messages ?? [];
   if (!page.length) return null;
   const from = d.from ?? 0;
   if (from + page.length !== w.windowFrom) return null;
-  return {
-    messages: [...page, ...w.messages],
-    windowFrom: from,
-    hasOlder: !!d.hasMore,
-  };
+  return { messages: [...page, ...w.messages], windowFrom: from };
 }
 
 /**
@@ -158,7 +158,8 @@ export function prependPage(w: Window, d: SessionPayload): Window | null {
  * 多少就留多少 —— 一页 10 条在真实会话里约 300 KB，翻十页就是 3 MB 常驻。所以
  * 回到底部（不再看更早的了）时收到 `keep` 条：刚好够再往上翻一两屏不用重新拉。
  *
- * 返回 null = 没到该收的时候（不用动）。
+ * 返回 null = 没到该收的时候（不用动）。注意收完 `windowFrom` 就 > 0 了 ——
+ * 调用方那个推导出来的「还有更早的」会自动跟着变真（存成状态时这里正是踩过的坑）。
  */
 export function trimOlder(w: Window, keep: number): Window | null {
   const over = w.messages.length - keep;
@@ -167,6 +168,5 @@ export function trimOlder(w: Window, keep: number): Window | null {
     messages: w.messages.slice(over),
     // 起点跟着走：删掉的是**前面**那几条，下标必须对齐，不然补丁全错位
     windowFrom: w.windowFrom + over,
-    hasOlder: w.hasOlder,
   };
 }
