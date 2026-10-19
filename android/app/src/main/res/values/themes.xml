@@ -3,14 +3,30 @@
     <!-- 不用 AndroidX/Material，就用平台自带那套。
          系统栏透明 —— 页面自己用 env(safe-area-inset-*) 留白。
 
-         **主题本身不分深浅**：界面全在 WebView 里（深浅由页面自己的
-         `prefers-color-scheme` 跟系统走，见 web/src/app.css），原生只剩
-         `windowBackground` 这一层 —— 它取 `@color/ink`，而那份颜色是
-         分浅色 / `values-night/` 两份的，跟着系统资源限定符自己切。 -->
-    <style name="Theme.Agent" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+         **主题必须分深浅**（values/ 这份浅、`values-night/` 那份深）。
+         不是因为原生界面在乎 —— 界面全在 WebView 里 —— 而是因为
+         **WebView 的 `prefers-color-scheme` 只认主题的 `isLightTheme`**：
+         targetSdk 33+ 起（我们是 35），页面拿到的深浅**不是**系统的 `uiMode`，
+         而是 app 当前主题的 `android:isLightTheme`（官方文档 dark-theme 那页
+         写得很直白）。`Theme.DeviceDefault` 是**恒定深色**主题（`Theme.Material`
+         那一支，`isLightTheme=false`），所以只挂它一份的时候，页面永远收到
+         `prefers-color-scheme: dark` —— 手机开到浅色也不变（就是这个 bug：
+         页面在手机上和电脑浏览器上表现不一样，因为浏览器看的是系统）。
+         两套 parent（.Light / 默认深色）带着各自的 `isLightTheme`，资源限定符
+         自己切，页面这才跟得上系统。
+
+         原生只剩 `windowBackground` 这一层 —— 它取 `@color/ink`，也是
+         浅色 / `values-night/` 两份，跟着系统资源限定符自己切。 -->
+    <style name="Theme.AgentBase" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
         <item name="android:windowBackground">@color/ink</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
     </style>
+
+    <!-- 真正挂到 manifest / Activity 上的那个名字。它只做一件事：把深浅两份
+         的差别（parent → `isLightTheme`）藏在 `Theme.AgentBase` 里 —— `Theme.Agent` 自己
+         在 values / values-night / values-v27 / values-night-v27 各有定义，
+         `@style/Theme.AgentBase` 在每套配置下自己解析成当色的那份。 -->
+    <style name="Theme.Agent" parent="@style/Theme.AgentBase" />
 </resources>

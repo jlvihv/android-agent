@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- API 27+ 才有刘海模式 -->
-    <style name="Theme.Agent" parent="@android:style/Theme.DeviceDefault.NoActionBar">
-        <item name="android:windowBackground">@color/ink</item>
-        <item name="android:statusBarColor">@android:color/transparent</item>
-        <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    <!-- API 27+ 才有刘海模式。只补这一条 —— 其余的条子和 parent 都在
+         `@style/Theme.AgentBase` 里（浅色/深色各一份，见 values/values-night）。
+         **这里千万别再写 parent="@android:style/Theme.DeviceDefault..."**：
+         这个文件覆盖 values/ 的定义，写死 parent 就会把浅色又焊成深色
+         （原来就是这么漏的：values-v27 写了恒定深色的 parent，
+         values-night 又没 v27 版本，于是 API 27+ 的机器永远 dark）。 -->
+    <style name="Theme.Agent" parent="@style/Theme.AgentBase">
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
 </resources>

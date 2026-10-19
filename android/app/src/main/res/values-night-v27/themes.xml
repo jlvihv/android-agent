@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- API 27+ 的深色版：和 `values-v27` 一样只补刘海那一条，
+         parent 走 `@style/Theme.AgentBase`（night 配置下解析到深色那份）。 -->
+    <style name="Theme.Agent" parent="@style/Theme.AgentBase">
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

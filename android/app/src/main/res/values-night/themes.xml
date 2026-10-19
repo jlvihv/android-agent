@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色主题：`values/themes.xml` 那份的深色版。**不是装饰性的重复** ——
+         WebView 的 `prefers-color-scheme` 只认主题的 `isLightTheme`（理由写在
+         values/themes.xml 顶上）。`Theme.DeviceDefault` 是恒定深色那一支，
+         `isLightTheme=false`，正好是页面要的 `prefers-color-scheme: dark`。
+         条目要和 values 那份保持一致（只换 parent）。 -->
+    <style name="Theme.AgentBase" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@color/ink</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+
+    <style name="Theme.Agent" parent="@style/Theme.AgentBase" />
+</resources>

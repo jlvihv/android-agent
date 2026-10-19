@@ -303,10 +303,18 @@ class MainActivity : Activity() {
      * 系统在浅色/深色之间切了。
      *
      * manifest 里 `uiMode` 是**自己处理**的（不重建 Activity）—— 重建会把整个页面
-     * 状态冲掉、WebView 重新加载，而前端换配色本来只是 `prefers-color-scheme`
-     * 一句话的事（WebView 自己盯着 uiMode，会重新算媒体查询）。
-     * 代价是**壳这边原生那两层要自己补**：页面背后那层底色（重画时露出来）、
-     * 系统栏图标。窗口背景不用管 —— 它只在冷启动那一下露出来，那时配置已经是新的了。
+     * 状态冲掉、WebView 重新加载。
+     *
+     * 页面换配色靠的是 WebView 的 `prefers-color-scheme`，但**它盯的不是 uiMode，
+     * 而是 app 主题的 `android:isLightTheme`**（targetSdk 33+，见
+     * `res/values/themes.xml` 顶上那段）。配置一变，WebView 会收到
+     * `onConfigurationChanged` → `notifyRendererPreferenceUpdate`，按**新配置**
+     * 重新解析主题（`values` / `values-night` 两份 `Theme.Agent.Base`），页面
+     * 媒体查询跟着重算 —— 实测切过去再切回来都不用重载。前提是主题真的分了深浅
+     * 两份，只挂一份恒定深色的 `Theme.DeviceDefault` 的话页面永远 dark。
+     *
+     * 壳这边原生那两层要自己补：页面背后那层底色（重画时露出来）、系统栏图标。
+     * 窗口背景不用管 —— 它只在冷启动那一下露出来，那时配置已经是新的了。
      */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
