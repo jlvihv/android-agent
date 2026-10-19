@@ -58,8 +58,18 @@
       return false;
     }
   });
+  /**
+   * `allow-popups-to-escape-sandbox`：沙箱 iframe 里 `window.open` / `target=_blank`
+   * 拿到的是 about:blank，真实地址要等页面自己写进去 —— 壳的 `onCreateWindow`
+   * 接到的就是 about:blank，AI 写的网页里点外链等于没反应。放开这个 token，
+   * 弹窗不受沙箱约束，URL 原样交到壳手上（见 MainActivity 的 onCreateWindow）。
+   *
+   * `allow-top-navigation-by-user-activation`：用户主动点的那一下允许导航顶层，
+   * 主 WebView 的 `shouldOverrideUrlLoading` 就能接住，交给系统浏览器 / App
+   * （起点、微信这些注册了 App Links 的会直接进 App）。
+   */
   const frameSandbox = $derived(
-    `allow-scripts allow-forms allow-modals allow-popups allow-downloads${isolated ? ' allow-same-origin' : ''}`,
+    `allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-downloads${isolated ? ' allow-same-origin' : ''}`,
   );
 
   $effect(() => onBack(closeViewer, drag));
