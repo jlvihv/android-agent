@@ -41,12 +41,21 @@
     | 'newfile'
     | 'check'
     | 'globe'
+    | 'star'
     | 'phone'
     | 'computer'
     | 'close';
 
-  let { name, size = 20, class: cls = '' }: { name: Name; size?: number; class?: string } =
-    $props();
+  /**
+   * `filled`：填充型画法（目前只有 `star` 用）。每颗星两个状态必须**同一形状**
+   * —— 收藏 / 未收藏切换时不能一个描边一个填充还换了墨迹大小，否则点一下会跳。
+   */
+  let {
+    name,
+    size = 20,
+    class: cls = '',
+    filled = false,
+  }: { name: Name; size?: number; class?: string; filled?: boolean } = $props();
 </script>
 
 {#if name === 'menu'}
@@ -269,6 +278,24 @@
     <circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.8" />
     <ellipse cx="10" cy="10" rx="3.6" ry="7.5" stroke="currentColor" stroke-width="1.8" />
     <path d="M2.5 10h15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+  </svg>
+{:else if name === 'star'}
+  <!-- 五角星。**只靠 `fill` 区分收藏 / 未收藏**，路径一个字都不换：
+       两套路径（描边版 / 填充版）墨迹差半个像素，切换时会“跳”一下。
+       外接圆半径 7.5 → 墨迹 ≈ 16.6，和 globe / gear 同档。 -->
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 20 20"
+    fill={filled ? 'currentColor' : 'none'}
+    class={cls}
+  >
+    <path
+      d="M10 2.4l2.32 4.7 5.18.75-3.75 3.66.885 5.16L10 14.43l-4.635 2.44.885-5.16L2.5 7.85l5.18-.75z"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linejoin="round"
+    />
   </svg>
 {:else if name === 'phone'}
   <!-- 手机：竖圆角矩形 + 底部一条横线。宽 8.2 是手机的天然比例（进不了

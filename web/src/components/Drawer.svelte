@@ -22,6 +22,9 @@
    *   宽屏 —— 并排的一栏：没有遮罩、不能拖、不接返回键，头部那个菜单按钮也没了
    * 中间那一段（搜索框 + 列表 + 底栏）是同一个 snippet，两边都用它。
    *
+   * 列表里**收藏的页面**在会话上面（不搜索时）：AI 做的网页不用回聊天记录里找，
+   * 点一下直接在查看器里打开。长按收藏行 = 取消收藏；收藏本身在查看器右上角的星。
+   *
    * DOM 刻意浅：aside 只有三个孩子（搜索框 / 列表 / 底栏），
    * 中间那层仅仅是滚动容器 —— 滚动区必须是单个元素，省不掉。
    *
@@ -36,6 +39,9 @@
   import Icon from './Icon.svelte';
   import { untrack } from 'svelte';
   import { machines } from '../lib/machines.svelte.ts';
+  import { favorites, type Favorite } from '../lib/favorites.svelte.ts';
+  import { sandboxPath } from '../lib/markdown';
+  import { openViewer } from '../lib/viewer.svelte.ts';
 
   export type Session = {
     id: string;
@@ -90,6 +96,12 @@
     if (onmachine) void untrack(() => machines.load());
   });
 
+  // 收藏列表也是「一拉就有」：模块级那份（查看器里点星会直接改它），
+  // 这里只负责确保它已经拉过。
+  $effect(() => {
+    void favorites.load();
+  });
+
   /** 搜索防抖（ms）：输入停顿这么久再打后端。一边打字一边发请求纯属浪费；
    *  effect 的清理函数会把上一个计时器干掉，所以快速输入不会堆积请求。 */
   const SEARCH_DEBOUNCE_MS = 180;
@@ -107,10 +119,12 @@
   const SLIDE_OUT_MIN_MS = 80;
   /** 遮罩淡入 / 淡出的时长（ms） */
   const SCRIM_FADE_MS = 220;
-  /** 长按菜单的尺寸（rem）：`w-40` = 10 宽；两行 `py-3.5` + 留白 ≈ 8 高。
-   *  弹出时要把它夹在抽屉（`--drawer-w`）和屏幕里，所以这两个数得跟着菜单改。 */
+  /** 长按菜单的尺寸（rem）：`w-40` = 10 宽；两行 `py-3.5` + 留白 ≈ 8 高，
+   *  一行（收藏那个「取消收藏」）≈ 4 高。弹出时要把它夹在抽屉（`--drawer-w`）
+   *  和屏幕里，所以这几个数得跟着菜单改。 */
   const MENU_W = 10;
   const MENU_H = 8;
+  const MENU_ONE_H = 4;
   /** 菜单离抽屉 / 屏幕边留的空隙（rem） */
   const MENU_GAP = 0.5;
 
@@ -278,8 +292,8 @@
     };
   }
 
-  // 长按弹出的菜单
-  let menu = $state<{ id: string; x: number; y: number } | null>(null);
+  // 长按弹出的菜单。会话两行（重命名 / 删除），收藏一行（取消收藏）
+  let menu = $state<{ kind: 'session' | 'page'; id: string; x: number; y: number } | null>(null);
   // 正在重命名的行
   let renaming = $state<string | null>(null);
   let draft = $state('');
@@ -287,17 +301,23 @@
   let pressTimer: ReturnType<typeof setTimeout> | undefined;
   let longPressed = false;
 
-  function pressStart(e: PointerEvent, id: string) {
+  function pressStart(e: PointerEvent, kind: 'session' | 'page', id: string) {
     longPressed = false;
     clearTimeout(pressTimer);
     const { clientX: x, clientY: y } = e;
     pressTimer = setTimeout(() => {
       longPressed = true;
-      menu = { id, x, y };
+      menu = { kind, id, x, y };
       navigator.vibrate?.(HAPTIC_MS);
     }, LONG_PRESS_MS);
   }
   const pressEnd = () => clearTimeout(pressTimer);
+
+  /** 点收藏行：直接打开那个页面，顺手收起抽屉（宽屏那一栏不受影响） */
+  function openPage(f: Favorite) {
+    openViewer(sandboxPath(f.path), f.title);
+    onclose();
+  }
 
   function pick(id: string) {
     const s = sessions.find((v) => v.id === id);
@@ -345,6 +365,34 @@
   <div
     class="min-h-0 flex-1 overflow-y-auto px-4 pt-[var(--fade-top)] pb-[var(--fade-top)]"
   >
+    <!-- 收藏的页面：AI 做的网页收藏后列在这儿，点一下直接开（不搜索时才有；
+         搜索是在找对话，这时候把页面混进结果里没有意义）。 -->
+    {#if !q.trim() && favorites.list.length}
+      <p class="flex items-center gap-2 px-3 pt-3 pb-1 text-xs text-faint">
+        <Icon name="star" size={13} class="shrink-0 text-muted" />
+        <span class="truncate">收藏的页面</span>
+      </p>
+      {#each favorites.list as f (f.path)}
+        <button
+          onpointerdown={(e) => pressStart(e, 'page', f.path)}
+          onpointerup={pressEnd}
+          onpointercancel={pressEnd}
+          oncontextmenu={(e) => e.preventDefault()}
+          onclick={() => {
+            if (longPressed) return;
+            openPage(f);
+          }}
+          class="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left"
+        >
+          <Icon name="file" size={18} class="shrink-0 text-muted" />
+          <span class="min-w-0 flex-1">
+            <span class="block truncate text-base">{f.title}</span>
+            <span class="block truncate text-meta text-faint">{f.path}</span>
+          </span>
+        </button>
+      {/each}
+    {/if}
+
     {#if q.trim()}
       {#if hits.length === 0}
         <p class="px-3 py-3 text-sm text-faint">
@@ -387,7 +435,7 @@
           />
         {:else}
           <button
-            onpointerdown={(e) => pressStart(e, s.id)}
+            onpointerdown={(e) => pressStart(e, 'session', s.id)}
             onpointerup={pressEnd}
             onpointercancel={pressEnd}
             oncontextmenu={(e) => e.preventDefault()}
@@ -495,24 +543,39 @@
   <div
     class="fixed z-[61] w-40 overflow-hidden rounded-2xl bg-bubble shadow-2xl shadow-drop"
     style="left: min({m.x}px, calc(var(--drawer-w) - {MENU_W + MENU_GAP}rem));
-           top: min({m.y}px, calc(100dvh - {MENU_H + MENU_GAP}rem))"
+           top: min({m.y}px, calc(100dvh - {(m.kind === 'page' ? MENU_ONE_H : MENU_H) + MENU_GAP}rem))"
   >
-    <button
-      onclick={() => pick(m.id)}
-      class="flex w-full items-center gap-3 px-4 py-3.5 text-left text-base text-fg"
-    >
-      <Icon name="pencil" size={18} class="text-muted" />
-      重命名
-    </button>
-    <button
-      onclick={() => {
-        ondelete(m.id);
-        menu = null;
-      }}
-      class="flex w-full items-center gap-3 px-4 py-3.5 text-left text-base text-danger"
-    >
-      <Icon name="trash" size={18} />
-      删除
-    </button>
+    {#if m.kind === 'page'}
+      <!-- 收藏行只有一件事可做：取消（重命名没做 —— 标题是页面自己的，
+           真嫌长了改页面 <title> 更直接） -->
+      <button
+        onclick={() => {
+          void favorites.remove(m.id);
+          menu = null;
+        }}
+        class="flex w-full items-center gap-3 px-4 py-3.5 text-left text-base text-fg"
+      >
+        <Icon name="star" size={18} filled class="text-muted" />
+        取消收藏
+      </button>
+    {:else}
+      <button
+        onclick={() => pick(m.id)}
+        class="flex w-full items-center gap-3 px-4 py-3.5 text-left text-base text-fg"
+      >
+        <Icon name="pencil" size={18} class="text-muted" />
+        重命名
+      </button>
+      <button
+        onclick={() => {
+          ondelete(m.id);
+          menu = null;
+        }}
+        class="flex w-full items-center gap-3 px-4 py-3.5 text-left text-base text-danger"
+      >
+        <Icon name="trash" size={18} />
+        删除
+      </button>
+    {/if}
   </div>
 {/if}

@@ -46,6 +46,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/skills", get(list_skills))
         .route("/api/usage", get(usage_summary))
         .route("/api/skills/enabled", post(set_skill_enabled))
+        // 收藏的页面（AI 在沙箱里做的网页）：抽屉里列出来、点一下直达。
+        // 只存沙箱绝对路径 + 标题，不存 URL（见 db.rs 的 favorites 表）
+        .route("/api/favorites", get(list_favorites).post(save_favorite))
+        .route("/api/favorites/delete", post(delete_favorite))
         // 看一眼工作目录（`agent files`）—— 只读，不动任何文件
         .route("/api/files", post(list_files))
         // 手机系统能力（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
@@ -1279,6 +1283,105 @@ async fn set_skill_enabled(
     match st.set_skill_enabled(&b.name, b.enabled) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// 收藏标题最多多长。页面自己写的 `<title>` 可能是一整段，抽屉里一行放不下。
+const FAVORITE_TITLE_MAX: usize = 120;
+
+/// 收藏的沙箱路径只收绝对路径，且不许带 `..`。
+///
+/// 存进去的只是字符串，打开时还要过 `LinuxSandbox::resolve_path`；但这里是
+/// 进库的那一道，先在源头挡一下 —— 免得放进去一个以后永远打不开的路径。
+fn favorite_path(raw: &str) -> Option<String> {
+    let p = raw.trim();
+    if !p.starts_with('/') || p.contains('\0') || p.split('/').any(|s| s == "..") {
+        return None;
+    }
+    Some(p.to_string())
+}
+
+/// 收藏列表的响应体（三个接口都回同一份：客户端直接拿它当权威列表，
+/// 不用自己猜排序 / 去重）。
+fn favorites_payload(st: &AppState) -> Result<Value, String> {
+    let list = match st.db() {
+        Some(db) => db.favorites().map_err(|e| format!("读不出来：{e:#}"))?,
+        None => Vec::new(),
+    };
+    let out: Vec<Value> = list
+        .into_iter()
+        .map(|f| json!({ "path": f.path, "title": f.title, "createdAt": f.created_at }))
+        .collect();
+    Ok(json!({ "favorites": out }))
+}
+
+/// `GET /api/favorites` → 收藏的页面，最近收的在前。
+async fn list_favorites(State(st): State<Arc<AppState>>) -> Response {
+    match favorites_payload(&st) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FavoriteBody {
+    /// 沙箱里的绝对路径（`/workspace/report/index.html`）
+    path: String,
+    /// 显示名。空 = 用文件名（客户端取不到页面 `<title>` 时会这样）
+    #[serde(default)]
+    title: String,
+}
+
+/// `POST /api/favorites` → 收藏一个页面（`{path, title}`）。重复收藏只更新标题。
+async fn save_favorite(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<FavoriteBody>,
+) -> Response {
+    let Some(path) = favorite_path(&body.path) else {
+        return (StatusCode::BAD_REQUEST, "路径要是沙箱里的绝对路径").into_response();
+    };
+    let Some(db) = st.db() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "这台机器没有库，记不下收藏").into_response();
+    };
+    let title = body.title.trim();
+    let title: String = if title.is_empty() {
+        path.rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or(&path)
+            .chars()
+            .take(FAVORITE_TITLE_MAX)
+            .collect()
+    } else {
+        title.chars().take(FAVORITE_TITLE_MAX).collect()
+    };
+    if let Err(e) = db.set_favorite(&path, Some(&title)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("存不进去：{e:#}")).into_response();
+    }
+    match favorites_payload(&st) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteFavoriteBody {
+    path: String,
+}
+
+/// `POST /api/favorites/delete` → 取消收藏（`{path}`）。
+async fn delete_favorite(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<DeleteFavoriteBody>,
+) -> Response {
+    let Some(db) = st.db() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "这台机器没有库").into_response();
+    };
+    if let Err(e) = db.set_favorite(body.path.trim(), None) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("删不掉：{e:#}")).into_response();
+    }
+    match favorites_payload(&st) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 

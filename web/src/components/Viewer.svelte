@@ -23,8 +23,9 @@
   import { onBack } from '../lib/overlay';
   import { dismissable, RELEASE } from '../lib/drag';
   import { viewer, closeViewer } from '../lib/viewer.svelte.ts';
+  import { favorites } from '../lib/favorites.svelte.ts';
   import { probeBackground } from '../lib/pagebg';
-  import { mediaKind, sandboxPageUrl } from '../lib/markdown';
+  import { mediaKind, sandboxGuestPath, sandboxPageUrl } from '../lib/markdown';
   import TextView from './TextView.svelte';
   import MarkdownFile from './MarkdownFile.svelte';
 
@@ -47,6 +48,55 @@
     !isImage && (HTMLISH.test(path) || path.endsWith('/') || !HAS_EXT.test(path)),
   );
   const media = $derived(mediaKind(viewer.url ?? ''));
+
+  /**
+   * 这个页面对应的沙箱路径（收藏用）。不是网页 / 不是沙箱文件时为 null ——
+   * 图片、音视频、文本、附件的 URL 上也没有「收藏」这回事。
+   */
+  const favPath = $derived(isWebPage ? sandboxGuestPath(viewer.url ?? '') : null);
+  const faved = $derived(!!favPath && favorites.has(favPath));
+
+  // 星是「亮 / 不亮」的，进来先要有一份收藏列表（模块级，抽屉那边也用这一份）
+  $effect(() => {
+    void favorites.load();
+  });
+
+  /**
+   * 网页标题。iframe 在**另一个源**（`sandbox.localhost`）上，读不到里面的
+   * `document`，所以自己再取一份源码，只抠 `<title>` —— 不解析别的。
+   * 取不到（不是 HTML、网络失败）就用查看器给的标题（文件名）。
+   *
+   * 有了它，抽屉里那一行才是「销售报表」而不是「index.html」——
+   * AI 做的页面文件名经常是 `index.html` / `out.html`，光看名字分不清。
+   */
+  async function pageTitle(url: string, fallback: string): Promise<string> {
+    try {
+      const r = await fetch(url, { credentials: 'omit' });
+      if (r.ok) {
+        const html = await r.text();
+        const raw = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1];
+        if (raw) {
+          // 实体（`&amp;` 之类）交给浏览器解。textarea 是 RCDATA：
+          // 塞进去的标签只会当文字，不会执行 / 不会建节点。
+          const t = document.createElement('textarea');
+          t.innerHTML = raw;
+          const title = t.value.replace(/\s+/g, ' ').trim();
+          if (title) return title.slice(0, 120);
+        }
+      }
+    } catch {
+      /* 取不到就用文件名 */
+    }
+    return fallback;
+  }
+
+  /** 右上角那颗星：已收藏 = 取消，没收藏 = 收（标题顺手从页面里取一次） */
+  async function toggleFavorite() {
+    const path = favPath;
+    if (!path) return;
+    if (favorites.has(path)) await favorites.remove(path);
+    else await favorites.add(path, await pageTitle(viewer.url ?? '', viewer.title));
+  }
 
   /** iframe 实际加载的地址（沙箱网页换到独立的源上） */
   const frameSrc = $derived(viewer.url ? sandboxPageUrl(viewer.url) : '');
@@ -158,6 +208,19 @@
       <Icon name="back" size={20} />
     </button>
     <span class="min-w-0 truncate text-base font-medium">{viewer.title}</span>
+    <!-- 收藏：只有网页才有。已收藏是陶土橙的实心星，没收藏是 muted 的空心星 ——
+         形状是同一个路径，只换 fill（见 Icon 的 `star`）。 -->
+    {#if favPath}
+      <button
+        class="ml-auto shrink-0 p-1 {faved ? 'text-accent' : 'text-muted'}"
+        aria-label={faved ? '取消收藏' : '收藏页面'}
+        aria-pressed={faved}
+        title={faved ? '取消收藏' : '收藏页面'}
+        onclick={() => void toggleFavorite()}
+      >
+        <Icon name="star" size={20} filled={faved} />
+      </button>
+    {/if}
   </header>
 
   <div class="relative min-h-0 flex-1 border-t border-hairline">

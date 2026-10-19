@@ -99,6 +99,18 @@ CREATE TABLE IF NOT EXISTS disabled (
   PRIMARY KEY (kind, name)
 );
 
+-- 收藏的页面（AI 在沙箱里做的网页，抽屉里点一下直达）。
+--
+-- `path` 存的是**沙箱里的绝对路径**（`/workspace/report/index.html`），不带
+-- `/sandbox/<钥匙>` 那一段 —— 钥匙每次运行/每台机器都不一样，存完整 URL
+-- 换台机器、重开一次就废了。要打开时前端自己拼（`sandboxPath`）。
+-- `title` 是收藏那一刻从页面 `<title>` 里取的；取不到就是文件名。
+CREATE TABLE IF NOT EXISTS favorites (
+  path       TEXT PRIMARY KEY,
+  title      TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 -- 这些端点不支持 Responses API（`base_url|model`），直接走 Chat Completions
 CREATE TABLE IF NOT EXISTS responses_unsupported (
   endpoint TEXT PRIMARY KEY
@@ -169,6 +181,17 @@ pub struct LlmConfig {
     pub api_style: crate::llm::ApiStyle,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+}
+
+/// `favorites` 表的一行（一个收藏的页面）。
+///
+/// `path` 是沙箱里的绝对路径，`created_at` 是毫秒。标题只是显示用的，
+/// 打开页面靠 `path`（拼上当前的 `/sandbox/<钥匙>`）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Favorite {
+    pub path: String,
+    pub title: String,
+    pub created_at: u64,
 }
 
 /// `usage` 表的一行（一次 LLM 调用）。
@@ -818,6 +841,43 @@ impl Db {
                         s.url,
                         serde_json::to_string(&s.headers).unwrap_or_else(|_| "{}".into())
                     ],
+                )
+                .map(|_| ()),
+        })
+    }
+
+    /// 收藏的页面，最近收的在前。
+    pub fn favorites(&self) -> Result<Vec<Favorite>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT path, title, created_at FROM favorites ORDER BY created_at DESC, path",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok(Favorite {
+                    path: r.get(0)?,
+                    title: r.get(1)?,
+                    // SQLite 里是 INTEGER；rusqlite 不给 u64 实现 FromSql（见会话那几个同理）
+                    created_at: r.get::<_, i64>(2)? as u64,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// 收藏 / 取消收藏（`None` = 取消）。
+    ///
+    /// 同一个 path 再收一次只更新标题（比如页面改名了再点一次星），**不动**
+    /// `created_at` —— 否则抽屉里那一行会莫名其妙跳到最上面。
+    pub fn set_favorite(&self, path: &str, title: Option<&str>) -> Result<()> {
+        self.with(|c| match title {
+            None => c
+                .execute("DELETE FROM favorites WHERE path = ?1", [path])
+                .map(|_| ()),
+            Some(t) => c
+                .execute(
+                    "INSERT INTO favorites(path, title, created_at) VALUES(?1, ?2, ?3)
+                     ON CONFLICT(path) DO UPDATE SET title = excluded.title",
+                    params![path, t, crate::agent::now_ms() as i64],
                 )
                 .map(|_| ()),
         })
@@ -1661,5 +1721,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0, "下次 sync 把它从盘上清掉");
+    }
+
+    /// 收藏：收两次只更新标题、不换位置；取消就是真删了。
+    #[test]
+    fn favorites_update_in_place_and_can_be_removed() {
+        let db = Db::in_memory().unwrap();
+        db.set_favorite("/workspace/a.html", Some("第一版"))
+            .unwrap();
+        db.set_favorite("/workspace/b.html", Some("B"))
+            .unwrap();
+
+        // 同一毫秒里收两个，`created_at` 一样 —— 不报错、也不丢行
+        assert_eq!(db.favorites().unwrap().len(), 2);
+
+        db.set_favorite("/workspace/a.html", Some("改过的标题"))
+            .unwrap();
+        let list = db.favorites().unwrap();
+        assert_eq!(list.len(), 2, "重复收藏不该多出一行");
+        let a = list
+            .iter()
+            .find(|f| f.path == "/workspace/a.html")
+            .unwrap();
+        assert_eq!(a.title, "改过的标题");
+
+        db.set_favorite("/workspace/a.html", None).unwrap();
+        let list = db.favorites().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].path, "/workspace/b.html");
     }
 }
