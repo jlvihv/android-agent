@@ -175,7 +175,7 @@
     </div>
 
     {#if machines.err}
-      <p class="px-3.5 pt-3 text-meta leading-relaxed text-red-400">{machines.err}</p>
+      <p class="px-3.5 pt-3 text-meta leading-relaxed text-bad">{machines.err}</p>
     {/if}
 
   {:else if page === 'pair'}
@@ -193,7 +193,7 @@
         onkeydown={(e) => e.key === 'Enter' && code.trim().length >= 6 && submit()}
       />
       {#if machines.err}
-        <p class="pt-2 text-meta leading-relaxed text-red-400">{machines.err}</p>
+        <p class="pt-2 text-meta leading-relaxed text-bad">{machines.err}</p>
       {/if}
       <button
         type="button"
@@ -249,7 +249,7 @@
         </label>
       </div>
       {#if machines.err}
-        <p class="pt-2 text-meta leading-relaxed text-red-400">{machines.err}</p>
+        <p class="pt-2 text-meta leading-relaxed text-bad">{machines.err}</p>
       {/if}
       <button
         type="button"

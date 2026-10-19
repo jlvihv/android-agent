@@ -493,7 +493,7 @@
   <!-- 长按菜单。点别处关掉。 -->
   <button class="fixed inset-0 z-[60]" aria-label="关闭菜单" onclick={() => (menu = null)}></button>
   <div
-    class="fixed z-[61] w-40 overflow-hidden rounded-2xl bg-bubble shadow-2xl shadow-black/60"
+    class="fixed z-[61] w-40 overflow-hidden rounded-2xl bg-bubble shadow-2xl shadow-drop"
     style="left: min({m.x}px, calc(var(--drawer-w) - {MENU_W + MENU_GAP}rem));
            top: min({m.y}px, calc(100dvh - {MENU_H + MENU_GAP}rem))"
   >

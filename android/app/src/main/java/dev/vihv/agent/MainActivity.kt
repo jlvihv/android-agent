@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ContentValues
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -252,7 +253,8 @@ class MainActivity : Activity() {
             window.decorView.systemUiVisibility =
                 View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
         }
-        // 深色背景 → 状态栏图标保持亮色。默认就是这个，显式写一下防止被系统改。
+        // 深色底 → 状态栏图标用亮的；浅色底反过来。当前是什么底由系统给
+        // （见 `applyBarIcons`）。
         //
         // ⚠️ 必须包起来：`window.insetsController` 在 **decor view 还没建出来**时
         // 会 NPE —— 不是返回 null，而是它内部 `mDecor.getWindowInsetsController()`
@@ -260,14 +262,56 @@ class MainActivity : Activity() {
         // API 35 模拟器上在 `onCreate` 里调到这行就崩、**整个进程跟着死**
         // （真机 API 36 上碰巧没崩，所以一直没发现）。
         // 它只管图标亮不亮，崩掉不值得。
+        applyBarIcons()
+    }
+
+    /** 系统现在是深色吗（`uiMode`。页面那套跟着它走，见 web/src/app.css）*/
+    private fun isDark(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+
+    /**
+     * 状态栏 / 导航栏里那几个图标画成亮的还是暗的。
+     *
+     * 页面的配色跟随系统（浅色 / 深色两套，见 `web/src/app.css`），系统栏也得跟着
+     * —— 写死亮图标的话，浅色下白箭头压在暖白纸上＝看不见。
+     * 这里只管图标颜色：背景一直是透明的（`edgeToEdge`），页面自己铺到栏底下。
+     */
+    private fun applyBarIcons() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val darkIcons = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
             runCatching {
                 window.insetsController?.setSystemBarsAppearance(
-                    0,
-                    android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS,
+                    if (isDark()) 0 else darkIcons,
+                    darkIcons,
                 )
-            }.onFailure { Log.w(TAG, "设置状态栏外观失败（decor 还没建好？）", it) }
+            }.onFailure { Log.w(TAG, "设置系统栏外观失败（decor 还没建好？）", it) }
+            return
         }
+        // API 26~29 走老的 systemUiVisibility（这几位 API 26 上就有）。
+        @Suppress("DEPRECATION")
+        var vis = window.decorView.systemUiVisibility
+        @Suppress("DEPRECATION")
+        val light = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        vis = if (isDark()) vis and light.inv() else vis or light
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = vis
+    }
+
+    /**
+     * 系统在浅色/深色之间切了。
+     *
+     * manifest 里 `uiMode` 是**自己处理**的（不重建 Activity）—— 重建会把整个页面
+     * 状态冲掉、WebView 重新加载，而前端换配色本来只是 `prefers-color-scheme`
+     * 一句话的事（WebView 自己盯着 uiMode，会重新算媒体查询）。
+     * 代价是**壳这边原生那两层要自己补**：页面背后那层底色（重画时露出来）、
+     * 系统栏图标。窗口背景不用管 —— 它只在冷启动那一下露出来，那时配置已经是新的了。
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        web?.setBackgroundColor(getColor(R.color.ink))
+        applyBarIcons()
     }
 
     /**
@@ -306,8 +350,8 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT,
         )
-        // 和窗口背景、页面背景同色（@color/ink）。纯黑的话启动时先闪一下
-        // 黑，页面画出来再变成 #151515。
+        // 和窗口背景、页面背景同色（@color/ink）。不同步的话启动时先闪一下
+        // 旧底色，页面画出来再跳成新的。
         w.setBackgroundColor(getColor(R.color.ink))
 
         w.settings.apply {
@@ -639,7 +683,7 @@ class MainActivity : Activity() {
         box.addView(
             TextView(this).apply {
                 text = "「$name」\n$why"
-                setTextColor(Color.parseColor("#e0e0e0"))
+                setTextColor(getColor(R.color.fg))
                 textSize = 15f
             },
         )
@@ -831,10 +875,10 @@ class MainActivity : Activity() {
 
     private fun errorView(text: String): TextView = TextView(this).apply {
         this.text = text
-        setTextColor(Color.parseColor("#ff8080"))
+        setTextColor(getColor(R.color.bad))
         textSize = 13f
         setPadding(48, 160, 48, 48)
-        setBackgroundColor(Color.BLACK)
+        setBackgroundColor(getColor(R.color.ink))
     }
 
     @Deprecated("平台在 API 33 弃用了它；API 33+ 走下面的 OnBackInvokedCallback")

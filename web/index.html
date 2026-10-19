@@ -6,7 +6,10 @@
       name="viewport"
       content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1"
     />
-    <meta name="color-scheme" content="dark" />
+    <!-- dark 在前：没偏好的环境（老 WebView）拿到的就是深色，和 app.css 里
+         `@theme` 那份默认一致。有偏好的照样跟随系统（浅色在那边的
+         `@media (prefers-color-scheme: light)` 里）。 -->
+    <meta name="color-scheme" content="dark light" />
     <title>agent</title>
   </head>
   <body class="antialiased">

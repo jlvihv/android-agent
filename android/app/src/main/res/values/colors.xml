@@ -1,18 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 和 web 侧的设计令牌 ink 一致：**纯黑**（页面底色；OLED 省电）。
-         这是 windowBackground —— 冷启动时 WebView 还没画出东西的那一层，
-         不同步改就会先闪一下旧色再跳黑。 -->
-    <color name="ink">#FF000000</color>
+    <!-- 和 web 侧的设计令牌一一对应（web/src/app.css）。
 
-    <!-- 下面几个和 web/src/app.css 的设计令牌一一对应（原生面板用得到）。
-         只补需要的三个：文字、次要文字、分隔线。 -->
-    <color name="fg">#FFF9F9F7</color>
-    <color name="muted">#FF97958D</color>
-    <color name="hairline">#FF262624</color>
-    <!-- 圆形按钮 / 药丸的底（web 的 color-control 令牌）：浏览器看板的标签用 -->
-    <color name="control">#FF313131</color>
+         **两套，跟随系统**：这里是**浅色**（系统没开深色时用这套），深色在
+         `values-night/colors.xml`。资源限定符自己就跟着系统的深色开关走，
+         所以原生这边不用判、也不用重建 Activity（页面那边同理，
+         见 app.css 的 `prefers-color-scheme`）。改颜色两边都要改。 -->
 
-    <!-- 应用图标的底色：暖白（= fg），机器人是 ink（= 黑）。白底黑画。 -->
+    <!-- windowBackground：冷启动时 WebView 还未画出东西的那一层。
+         不同步改就会先闪一下旧色再跳新的。它也是 WebView 自己那层底色
+         （页面透明的地方露出来的就是它，见 MainActivity.buildWebView）。 -->
+    <color name="ink">#FFFCFCFB</color>
+
+    <!-- 下面几个原生面板用得到（浏览器看板 / 出错页）。
+         只补需要的几个：文字、次要文字、分隔线、圆形按钮的底。 -->
+    <color name="fg">#FF1C1C1B</color>
+    <color name="muted">#FF5F5E5A</color>
+    <!-- 出错文字（= web 的 bad 令牌）：出错页用得到 -->
+    <color name="bad">#FFB53333</color>
+    <color name="hairline">#FFE7E6E1</color>
+    <!-- 圆形按钮 / 药丸的底（web 的 control 令牌）：浏览器看板的标签用 -->
+    <color name="control">#FFEAE9E4</color>
+
+    <!-- 应用图标的底色：暖白（与 web 的 fg 同族，但**跟主题脱钩**，
+         机器人是写死的 #151515）。白底黑画，不跟着深浅色变。 -->
     <color name="ic_launcher_background">#FFF9F9F7</color>
 </resources>

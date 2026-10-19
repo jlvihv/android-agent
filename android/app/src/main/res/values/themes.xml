@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 不用 AndroidX/Material，就用平台自带的深色主题。
-         系统栏透明 —— 页面自己用 env(safe-area-inset-*) 留白。 -->
+    <!-- 不用 AndroidX/Material，就用平台自带那套。
+         系统栏透明 —— 页面自己用 env(safe-area-inset-*) 留白。
+
+         **主题本身不分深浅**：界面全在 WebView 里（深浅由页面自己的
+         `prefers-color-scheme` 跟系统走，见 web/src/app.css），原生只剩
+         `windowBackground` 这一层 —— 它取 `@color/ink`，而那份颜色是
+         分浅色 / `values-night/` 两份的，跟着系统资源限定符自己切。 -->
     <style name="Theme.Agent" parent="@android:style/Theme.DeviceDefault.NoActionBar">
         <item name="android:windowBackground">@color/ink</item>
         <item name="android:statusBarColor">@android:color/transparent</item>

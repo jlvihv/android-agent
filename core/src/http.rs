@@ -3025,7 +3025,22 @@ fn sandbox_error(status: StatusCode, guest: &str, reason: &str) -> Response {
             .replace('"', "&quot;")
     };
     let html = format!(
-        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>         <title>{title}</title><style>body{{font:15px/1.7 system-ui;background:#151515;color:#f9f9f7;         margin:0;padding:26px 20px}}code{{background:#262624;padding:2px 6px;border-radius:6px;         word-break:break-all}}h3{{margin:0 0 12px}}p{{color:#97958d;margin:12px 0}}         b{{color:#f9f9f7}}</style>         <h3>{title}</h3>         <p><code>{path}</code></p>         <p>{reason}</p>         <p><b>App 重装或清数据会清空沙箱内部</b>（<code>/root</code>、<code>/usr</code> 这些）；         放在 <code>/workspace</code>（手机内部存储的 Agent 文件夹）里的东西不会丢。         让 agent 重新生成一次就行。</p>",
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>\
+         <meta name=color-scheme content='dark light'>\
+         <title>{title}</title><style>body{{font:15px/1.7 system-ui;background:#000000;color:#f9f9f7;\
+         margin:0;padding:26px 20px}}code{{background:#262624;padding:2px 6px;border-radius:6px;\
+         word-break:break-all}}h3{{margin:0 0 12px}}p{{color:#97958d;margin:12px 0}}\
+         b{{color:#f9f9f7}}\
+         /* 浅色：和前端一套色（见 web/src/app.css）—— 这页开在 App 的 WebView 里，\
+            不跟就成了一整页黑压在白界面里 */\
+         @media (prefers-color-scheme:light){{body{{background:#fcfcfb;color:#1c1c1b}}\
+         code{{background:#eae9e4}}p{{color:#5f5e5a}}b{{color:#1c1c1b}}}}</style>\
+         <h3>{title}</h3>\
+         <p><code>{path}</code></p>\
+         <p>{reason}</p>\
+         <p><b>App 重装或清数据会清空沙箱内部</b>（<code>/root</code>、<code>/usr</code> 这些）；\
+         放在 <code>/workspace</code>（手机内部存储的 Agent 文件夹）里的东西不会丢。\
+         让 agent 重新生成一次就行。</p>",
         title = title,
         path = esc(guest),
         reason = esc(reason),
@@ -3195,9 +3210,13 @@ async fn dir_listing(guest: &str, host: &std::path::Path) -> Response {
     };
     let mut html = format!(
         "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>\
-         <title>{t}</title><style>body{{font:15px system-ui;background:#151515;color:#f9f9f7;\
+         <meta name=color-scheme content='dark light'>\
+         <title>{t}</title><style>body{{font:15px system-ui;background:#000000;color:#f9f9f7;\
          margin:0;padding:12px 16px}}a{{color:inherit;text-decoration:none;display:block;\
-         padding:10px 0;border-bottom:1px solid #262624}}.d{{color:#97958d}}</style>\
+         padding:10px 0;border-bottom:1px solid #262624}}.d{{color:#97958d}}\
+         /* 浅色：和前端一套色（见 web/src/app.css）*/\
+         @media (prefers-color-scheme:light){{body{{background:#fcfcfb;color:#1c1c1b}}\
+         a{{border-bottom-color:#e7e6e1}}.d{{color:#5f5e5a}}}}</style>\
          <p class=d>{t}</p>",
         t = esc(guest)
     );

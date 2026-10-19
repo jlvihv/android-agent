@@ -3,9 +3,12 @@
 /*
  * 设计令牌 → Tailwind 主题。
  *
- * 参考 Claude 移动端的手感：暖调近黑、低对比、大量留白、只有输入区
- * 一块"浮起"的卡片。**不追像素对齐** —— 换机型、换字体渲染、换状态栏
- * 高度都会漂。要的是同一套语言。
+ * 参考 Claude 的手感：暖调、低对比、大量留白、只有输入区一块"浮起"的卡片。
+ * **不追像素对齐** —— 换机型、换字体渲染、换状态栏高度都会漂。要的是同一套语言。
+ *
+ * 颜色两套：**深色是默认**（这里这一份），浅色在文件下半部分那段
+ * `@media (prefers-color-scheme: light)` 里覆盖（跟随系统，没有开关）。
+ * 两套只换颜色，尺寸/圆角/字号共用 —— 布局代码一行都不用知道有这回事。
  *
  * 尺寸一律用 Tailwind 自带的刻度（p-1=4 p-2=8 p-4=16 p-6=24, size-9=36），
  * 这里只补语义色和两个非标准值。
@@ -29,6 +32,13 @@
   --color-drawer: #111111; /* 抽屉底 */
   --color-panel: #111111; /* 底部弹出面板底（Sheet 及里面的面板） */
   --color-active: #414141; /* 选中项 / 输入框底 */
+  /* 开关的圆钮。**两套都是白的**（深色下暖白、浅色下纯白）—— 钮压在彩色轨道上，
+     它不该跟着 `fg` 翻面（浅色下 `fg` 是黑的，会变成黑钮压橙底）。
+     浅色那份在下面的 `@media` 里。 */
+  --color-knob: #f9f9f7;
+  /* 弹菜单的投影色。深色下黑压黑几乎看不见（菜单靠自己的底色浮），
+     浅色下这是菜单唯一“浮起来”的凭据 —— 60% 在浅色下是一团黑抹，浅色那份收到 16%。 */
+  --color-drop: rgb(0 0 0 / 0.6);
 
   /* 遮罩：盖在页面上的那层黑。**所有浮层共用这一个值** —— 35% 是照 Claude 那边
      实测定的（底色 #151515 被压到 #0e0e0e）。抽屉原来是 50%，没有依据，统一过来了。
@@ -50,10 +60,13 @@
   /* 删除 / 危险操作的文字。比去饱和的 bad 更实（#da6262）—— 刻意两档：
      bad 是“出错了”的提示色，danger 是“点了会删东西”的按钮色。 */
   --color-danger: #da6262;
-  /* 选中 / 链接。实测 Claude「选择模型」面板里的勾选和脚注链接都是这个蓝
-     （#6da7ec）。原来是绿（那是“连接正常”状态点的颜色，绿 = 状态），
-     已经完全收到 --color-ok 里（工具结果、diff 的 + 行），这里换成蓝。 */
-  --color-accent: #6da7ec;
+  /* 选中 / 链接 / 主行动色：**陶土橙（clay）**，Claude 唯一的那个品牌色。
+     中间换过一版蓝（当时是从截图里量出来的勾选 / 链接色），现在按 CDS 收回来：
+     `--cds-clay: #d97757`（星芒 logo、新对话、发送、勾选、链接、选中态全是它）。
+     浅色用它的深一档 `#c96442`（CDS 的 `--cds-clay-interactive`，浅底上对比才够）——
+     见文件下半部分。绿色另有用途（“设备连接正常”那个点用 `--color-ok`）——
+     绿 = 状态，橙 = 可点 / 已选。 */
+  --color-accent: #d97757;
 
   /* 只有三档圆角 */
   --radius-card: 22px;
@@ -66,12 +79,138 @@
     system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", "PingFang SC",
     "Microsoft YaHei", sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /*
+   * 字重。
+   *
+   * 标称字重（`font-weight`）不管在哪套主题下都是 400 / 500 / 600 ——
+   * 这四个是**可变字体的 wght 轴**，只有它才随深浅色变（见文件下半部分「字重逆补偿」）。
+   *
+   * 为什么不用 `font-weight` 直接写 360 / 460：静态字体会**就近取整**，
+   * 460 会被取成 400 —— 那才是真的把字变细了。而轴上的值在静态字体里根本不生效，
+   * 自动回落标称值（Apple 的 SF / Android 的 Roboto 是可变字体，吃得到）。
+   */
+  --fw-normal: "wght" 360; /* 深色：比浅色那套减薄 40 刻度 */
+  --fw-medium: "wght" 460;
+  --fw-semibold: "wght" 550; /* 减 30 —— 粗体在深色底下糊成一团 */
+  --fw-bold: "wght" 660;
+}
+
+/*
+ * 浅色 —— **跟随系统**（`prefers-color-scheme`），没有开关。
+ *
+ * 取色照 Claude 桌面端的 CDS 灰阶（open-claude-ui 逆向出的 `cds-theme.css`
+ * 及其表层分配表），**不是** claude.ai 网页版：网页版浅色还是旧的偏黄羊皮纸
+ * （`#faf9f5`），Claude 后来换成了去黄的雪花白 `#fcfcfb`（gray-10）。
+ * 我们跟新的那套 —— 它和深色那份是同一个阶梯，只是取另一端。
+ *
+ *   层             深色        浅色         CDS 里的角色
+ *   页面          `#000000`   `#fcfcfb`   surface-1 主聊天画布
+ *   抽屉 / 面板   `#111111`   `#f9f9f7`   surface-0 侧边栏 / 底层
+ *   卡片 / 输入框 `#20201f`   `#ffffff`   surface-2/3 消息卡片 / 输入框 / 浮层
+ *   气泡          `#2c2c2a`   `#f3f3f0`   灰底填充
+ *   按钮 / 药丸   `#313131`   `#eae9e4`
+ *   选中 / 开关底 `#414141`   `#e1e0d9`
+ *
+ * 浅色**不是深色的反相**：深色里“越浮起越亮”，浅色里**两头都在往白走**
+ * （卡片纯白、底层压灰），层次靠白/灰那点差 + 那条 1px 边框。
+ * 但两边共用一个事实：**"ink 是最底那层""fg 是最高对比那个"** ——
+ * 所以 21 处 `border-ink`（卡片行之间那 2px 缝）、`bg-fg text-ink`（主按钮，
+ * 深色是白底黑字、浅色就是黑底白字）那些写法一行都不用改。
+ *
+ * 语义色不照抄深色的值：深色那几个（`ok` `#7fb37f` 之类）在近白底上对比不够，
+ * 按同一色相加深到差不多的对比度（4.5:1 上下）。
+ * 改这里的任何一个值之前先想想 `docs/05-ui.md` §2 那张表 —— 那边是对照表。
+ */
+@media (prefers-color-scheme: light) {
+  :root {
+    /* 表面 */
+    --color-ink: #fcfcfb; /* 页面：雪花白（不是纯白，Claude 也不纯白）*/
+    --color-surface: #ffffff; /* 卡片 / 输入框 / 浮层 */
+    --color-bubble: #f3f3f0; /* 用户气泡 */
+    --color-control: #eae9e4; /* 圆形按钮 / 药丸（也是边框色）*/
+    --color-hairline: #e7e6e1; /* 分隔线 ≈ 黑 9%（CDS 浅色边框就是黑 10%）*/
+    --color-hairline-soft: #f3f3f0;
+    --color-drawer: #f9f9f7; /* 抽屉：比页面深一档（CDS 的侧边栏色）*/
+    --color-panel: #f9f9f7; /* 面板：同上；里面的卡片才是纯白 */
+    --color-active: #e1e0d9; /* 选中项 / 开关底 */
+    --color-knob: #ffffff; /* 开关的圆钮：浅色下纯白 */
+    --color-drop: rgb(20 20 19 / 0.16); /* 菜单投影：浅色下轻得多 */
+
+    /* 遮罩：还是压暗（浅色底下压的是内容），只是换成 Claude 那个暖黑，
+       纯黑压暖白会发灰发冷。 */
+    --color-scrim: rgb(20 20 19 / 0.35);
+
+    /* 文字 */
+    --color-fg: #1c1c1b; /* 近黑，不用纯黑（对称于深色的 #f9f9f7）*/
+    --color-muted: #5f5e5a;
+    --color-faint: #7b7974;
+
+    /* 语义色：同色相、加深，不抢主色 */
+    --color-ok: #4f7a4a;
+    --color-warn: #8a6a24;
+    --color-bad: #b53333;
+    --color-danger: #a12828; /* 比 bad 更实（点了会删东西）*/
+    /* 选中 / 链接 / 主行动：陶土橙的浅色档（CDS 的 `--cds-clay-interactive`，
+       深色那档 #d97757 压在白雪上对比不够）。 */
+    --color-accent: #c96442;
+
+    /* 字重：浅色**不补偿**，用标称值（深色那四个在 `@theme` 里）*/
+    --fw-normal: "wght" 400;
+    --fw-medium: "wght" 500;
+    --fw-semibold: "wght" 580; /* Claude 浅色的半粗就是 580，不是 600 */
+    --fw-bold: "wght" 700;
+  }
+
+  /* 抽屉搜索框里那个放大镜是**背景图**（见文件末尾），颜色写死在 SVG 里，
+     拿不到令牌 —— 所以浅色下只能再写一张：换成浅色的 muted。 */
+  .search-input {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Ccircle cx='8.7' cy='8.7' r='5.6' stroke='%237b7974' stroke-width='1.8'/%3E%3Cpath d='M13 13l4 4' stroke='%237b7974' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+  }
 }
 
 html,
 body,
 #app {
   height: 100%;
+}
+
+/*
+ * 字重逆补偿（照 Claude）： **深色下的字要更细一档**。
+ *
+ * 白字压黑底会向外发"光渗"（irradiation）—— 同样的字重，深底上看着比浅底上粗
+ * 10~15%，边缘发虚。Claude 在深色下把 wght 轴整体下调 30~40 刻度抵消掉：
+ * 正文 400→360、中等 500→460、半粗 580→550、粗体 700→660（浅色不补，用标称值）。
+ *
+ * 挂在这里而不是散到各个组件里：`body` 给没写字的正文，下面三行给写了字的。
+ * 两边都得列 —— `font-variation-settings` 是**继承**的，而且它盖过 `font-weight`：
+ * 只挂 body 的话，`.font-medium` 和 `<strong>` 会被上面继承下来的值按下去
+ * （整页一个粗细）。这也是为什么 `strong`/`b` 得跟着列：它们是 700，不列就被压成 360。
+ *
+ * 静态字体（Windows 的雅黑、安卓上的中文字体……）没有 wght 轴，这几行等于没写，
+ * 字重就是上面那个标称值 —— 所以不用做特性检测。
+ */
+body {
+  font-variation-settings: var(--fw-normal);
+}
+
+.font-normal {
+  font-variation-settings: var(--fw-normal);
+}
+
+.font-medium {
+  font-variation-settings: var(--fw-medium);
+}
+
+.font-semibold,
+th {
+  font-variation-settings: var(--fw-semibold);
+}
+
+strong,
+b,
+.font-bold {
+  font-variation-settings: var(--fw-bold);
 }
 
 /*
@@ -283,6 +422,8 @@ a:focus-visible {
  * 用背景图而不是多套一个 <div>/<span>：它是纯装饰，为它加一层 DOM 不值当
  * （而且这个 App 对层级敏感到抠过 DOM）。图形跟 Icon.svelte 一个规格
  * （20 画布、描边 1.8、圆头），颜色写死 muted —— CSS 里拿不到 currentColor。
+ * 写死就意味着**浅色下得另写一张**（同样的图、描边换成浅色的 muted），
+ * 见上面 `@media (prefers-color-scheme: light)` 里那一段。
  * 文本的左边距由 Tailwind 的 pl-10 给（12 图位 + 18 图标 + 10 间隙）。
  */
 .search-input {

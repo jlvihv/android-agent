@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色：`values/colors.xml` 那份的深色版（web 侧的 `@theme` 就是这套值）。
+         只覆盖跟着系统变的那几个 —— `ic_launcher_background` 不在这儿，
+         图标不该因为开了深色就换色。 -->
+    <color name="ink">#FF000000</color>
+    <color name="fg">#FFF9F9F7</color>
+    <color name="muted">#FF97958D</color>
+    <color name="bad">#FFD98A8A</color>
+    <color name="hairline">#FF262624</color>
+    <color name="control">#FF313131</color>
+</resources>

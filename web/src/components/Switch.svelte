@@ -39,8 +39,10 @@
   class="relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors duration-150
          {checked ? 'bg-accent' : 'bg-active'} disabled:opacity-60"
 >
+  <!-- 圆钮是白的不跟着主题翻面（见 app.css 的 `--color-knob`）：钮压在彩色轨道上，
+       浅色下跟 `fg` 走会变成“黑钮压橙底”。 -->
   <span
-    class="absolute top-[3px] left-[3px] size-5 rounded-full bg-fg transition-transform duration-150
+    class="absolute top-[3px] left-[3px] size-5 rounded-full bg-knob transition-transform duration-150
            {checked ? 'translate-x-[18px]' : ''}"
   ></span>
 </button>
