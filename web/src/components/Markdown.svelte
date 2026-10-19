@@ -187,6 +187,12 @@
                 </span>
                 {@render itemBody(it.blocks, b.tight)}
               </div>
+            {:else if it.blocks.length === 1 && it.blocks[0].t === 'p'}
+              <!-- 单段落的普通项：**不套 itemBody**。它那层只管两件事 ——
+                   复选框行的 `flex-1`、多块项之间的 `gap` —— 这里一件都用不上
+                   （拔掉测试里就是那 15 个 `li > div.flex > p` 候选）。
+                   直接渲染，`<li>` 里就是一个 `<p>`。 -->
+              {@render blocks(it.blocks)}
             {:else}
               {@render itemBody(it.blocks, b.tight)}
             {/if}
@@ -208,7 +214,13 @@
 {/snippet}
 
 <!-- 块级内容分组。在 MessageList 里父级已经是 flex-col gap-2.5，看着像多余的一层，
-     但思考面板（Sheet）里父级不是 flex 容器 —— 那里的段间距就靠这一层。 -->
-<div class="flex flex-col gap-2.5">
+     但思考面板（Sheet）里父级不是 flex 容器 —— 那里的段间距就靠这一层。
+     只有一个块时这层没有段间距可管（拔掉测试 0 像素），就不套了。 -->
+{#if doc.length > 1}
+  <div class="flex flex-col gap-2.5">
+    {@render blocks(doc)}
+  </div>
+{:else}
+  <!-- 0 个块 = 什么都不画（别留一个空 div）；1 个块 = 直接放，省掉这层分组 -->
   {@render blocks(doc)}
-</div>
+{/if}

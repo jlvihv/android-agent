@@ -97,14 +97,33 @@ if [ ! -d "$SANDBOX_ROOTFS" ]; then
   echo "  ⚠️ 没找到 rootfs（$SANDBOX_ROOTFS）—— 夹具那个 bash 调用会报错。"
   echo "     想要干净的结果：先跑 just linux-setup"
 fi
+# AGENT_MULTI：故意起第二个核心（单实例默认会拦住），审计要在你自己那个核心
+# 还开着的时候跑。它不碰锁，也不会反过来挡住你。（core/src/single.rs）
+#
+# AGENT_LINUX_HOST：从别的 shell / 工具里跑时环境里可能带着 =1（强制宿主模式），
+# 那就用不上 .dev/linux/rootfs 了，审计看到的是一台假沙箱。清掉，按脚本自己的判断来。
+#
+# AGENT_BIND / AGENT_DATA_DIR 两个都是「让它真的独立」：
+#   - 只听本机：宿主模式默认听 0.0.0.0，那就变成「局域网服务」，核心会要求凭据
+#     （`/api/health` 直接 401，脚本第一步就卡住），而审计只在这台机器上跑；
+#   - 临时数据目录：宿主模式下不给就用真的那份
+#     （`~/.local/share/android-agent/data`），审计会读到你的会话、还会往里写收藏 ——
+#     和脚本头「不读不写你的 sessions.db」相反。
+# 这三个清空：从别的 shell / 工具里跑的时候，环境里可能已经带着 AGENT_TOKEN
+# （那核心就要凭据，`/api/health` 401）和 AGENT_RELAY（会去连外面那台中继）。
+# 空字符串在两边都等于「没设」。
 AGENT_PORT="$CORE_PORT" \
+AGENT_BIND=127.0.0.1 \
+AGENT_DATA_DIR="$(mktemp -d)" \
+AGENT_TOKEN= \
+AGENT_RELAY= \
+AGENT_RELAY_KEY= \
+AGENT_LINUX_HOST= \
 AGENT_LLM_BASE_URL="http://127.0.0.1:$FIXTURE_PORT/v1" \
 AGENT_LLM_API_KEY=fixture \
 AGENT_LLM_MODEL=fixture \
 AGENT_LLM_API_STYLE=chat \
 AGENT_LLM_NAME=fixture \
-# 故意起第二个核心（单实例默认会拦住）：审计要在你自己那个核心还开着的时候跑。
-# 它不碰锁，也不会反过来挡住你。（core/src/single.rs）
 AGENT_MULTI=1 \
 AGENT_LINUX_ROOTFS="$SANDBOX_ROOTFS" \
 AGENT_LINUX_PROOT="${AGENT_LINUX_PROOT:-$(command -v proot || echo proot)}" \

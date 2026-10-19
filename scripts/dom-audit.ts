@@ -372,8 +372,40 @@ if (!QUIET_PANELS) {
   await audit('模型面板 · 模型提供商页');
   await click('遮罩关闭', CLOSE);
   await wait(600);
+  // 抽屉里「收藏的页面」那一段要有内容才审得到（临时核心的库里是空的）。
+  // 直接打接口造两行 —— 只是路径 + 标题，不碰沙箱、不花 token。
+  const seeded = await evaluate(`fetch('/api/favorites', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path: '/workspace/report/index.html', title: '季度销售报表' }),
+  }).then(r => r.text()).then(async (a) => {
+    const b = await fetch('/api/favorites', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: '/workspace/demo/index.html', title: '一个名字特别长的页面用来看看抽屉里会不会把行撑开' }),
+    }).then(r => r.text());
+    return a + ' / ' + b;
+  })`);
+  console.log(`  · 收藏种子：${String(seeded).slice(0, 200)}`);
   await click('菜单', `document.querySelector('button[aria-label="菜单"]')?.click(), 1`);
   await audit('抽屉');
+  // 点第一行收藏 → 查看器。看的是**网页那种形态**（右上角那颗星 / iframe 铺满），
+  // 顺便验证「收藏的路径 + 当前的 sandbox 钥匙」能拼成一个能开的地址。
+  await click('收藏行', BY_TEXT('季度销售报表'));
+  await wait(1200);
+  await audit('查看器 · 网页（收藏星）');
+  // 星是双向的：先取消、确认服务端真删了，再收回来（顺便走一遍「取页面标题」那条路）。
+  // 列表在界面之外，只能问接口 —— 这也是收藏真落库了的凭据。
+  const favCount = () =>
+    evaluate(`fetch('/api/favorites').then(r => r.json()).then(j => j.favorites.length)`);
+  await click('取消收藏', `document.querySelector('button[aria-label="取消收藏"]')?.click(), 1`);
+  await wait(800);
+  console.log(`  · 收藏数（取消后）：${await favCount()}`);
+  await click('重新收藏', `document.querySelector('button[aria-label="收藏页面"]')?.click(), 1`);
+  await wait(800);
+  console.log(`  · 收藏数（重新收藏后）：${await favCount()}`);
+  await click('关查看器', `document.querySelector('button[aria-label="返回"]')?.click(), 1`);
+  await wait(600);
   await click('设置', `document.querySelector('button[aria-label="设置"]')?.click(), 1`);
   await audit('设置页');
   // 设置是全屏页（z-60），附件面板 z-50 在它**下面** —— 不先关掉它，
