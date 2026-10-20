@@ -55,6 +55,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 手机系统能力（闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板…）。
         // 沙箱里的 `agent <设备命令>` 走它（见 `phone` 模块）。
         .route("/api/device", post(device_command))
+        // 特权 Android 命令（`agent shizuku`）。和 /api/device 并排但**不是一条路**：
+        // 那是 App 自己的身份，这是 adb/root 身份（见 core/src/shizuku.rs）
+        .route("/api/shizuku", post(shizuku_run))
         .route("/api/websearch", post(web_search))
         .route(
             "/api/websearch/config",
@@ -1009,6 +1012,24 @@ fn device_text(v: &Value) -> String {
         None | Some(Value::Null) => "完成".to_string(),
         Some(d) => crate::plain::render(d),
     }
+}
+
+/// `POST /api/shizuku` → 跑一条特权 Android 命令（`{"argv":["exec","id"]}`）。
+///
+/// 回 `text/plain`：整段内容已经是**排好版的纯文本**（排版在核心侧，`shizuku::reply_text`），
+/// 成功失败都看正文开头（`错误：` → 沙箱里的 CLI 非 0 退出）。
+///
+/// **恒用 200 回**：沙箱里的 `wget` 对 5xx 会重试，一次失败会变成三次请求。
+async fn shizuku_run(State(st): State<Arc<AppState>>, Json(body): Json<ShizukuBody>) -> Response {
+    let core = Core { state: st.clone() };
+    let text = core.shizuku(&body.argv).await;
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+}
+
+#[derive(Deserialize)]
+struct ShizukuBody {
+    #[serde(default)]
+    argv: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -4370,6 +4391,97 @@ mod tests {
             v["detail"].as_str().unwrap_or("").contains("没有设备"),
             "{v}"
         );
+    }
+
+    /// 假的 Shizuku 宿主：记下 argv，按脚本回话。
+    struct FakeShizuku {
+        state: String,
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl crate::shizuku::ShizukuApi for FakeShizuku {
+        fn state(&self) -> String {
+            self.state.clone()
+        }
+        fn run(&self, argv: Vec<String>) -> String {
+            self.seen.lock().unwrap().push(argv.clone());
+            match argv.first().map(|s| s.as_str()) {
+                // `exec fail` 用来走失败那条路（校验只认组的名字，兜底命令随便给）
+                Some("exec") if argv.get(1).map(|s| s.as_str()) == Some("fail") => {
+                    r#"{"ok":false,"error":{"code":"OPERATION_FAILED","message":"坏了"}}"#.into()
+                }
+                Some("exec") => r#"{"ok":true,"text":"uid=0(root)\n"}"#.into(),
+                other => format!(r#"{{"ok":false,"error":{{"code":"x","message":"{other:?}"}}}}"#),
+            }
+        }
+    }
+
+    /// `/api/shizuku` 回纯文本：成功原样打、失败 `错误：…（code）`（CLI 据此非 0 退出）。
+    #[tokio::test]
+    async fn shizuku_endpoint_answers_plain_text() {
+        let st = crate::state::AppState::new();
+        let fake = std::sync::Arc::new(FakeShizuku {
+            state: r#"{"state":"READY","version":13,"uid":0,"sui":true}"#.into(),
+            seen: Default::default(),
+        });
+        st.set_shizuku(fake.clone());
+        let (base, c) = serve(st.clone()).await;
+
+        let body = |argv: serde_json::Value| {
+            let (base, c) = (base.clone(), c.clone());
+            async move {
+                c.post(format!("{base}/api/shizuku"))
+                    .json(&serde_json::json!({ "argv": argv }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // exec：壳给的 stdout 原样回来（不过 render，不加引号）
+        let t = body(serde_json::json!(["exec", "id"])).await;
+        assert_eq!(t.trim(), "uid=0(root)");
+        assert_eq!(fake.seen.lock().unwrap()[0], vec!["exec", "id"]);
+
+        // service：核心自己答，**不走壳的 run**
+        let n = fake.seen.lock().unwrap().len();
+        let t = body(serde_json::json!(["service", "status"])).await;
+        assert!(t.contains("root"), "{t}");
+        assert!(t.contains("uid=0"), "{t}");
+        assert_eq!(
+            fake.seen.lock().unwrap().len(),
+            n,
+            "service 不该打到壳的 run"
+        );
+
+        // 失败：错误：开头（CLI 靠这个非 0 退出）。
+        // 命令自己说了原因，就不再补一个 OPERATION_FAILED（见 shizuku::envelope_text）
+        let t = body(serde_json::json!(["exec", "fail"])).await;
+        assert_eq!(t.trim(), "错误：坏了", "回包要短：{t}");
+
+        // 不带参数 / help：help + 一行状态
+        for argv in [serde_json::json!([]), serde_json::json!(["help"])] {
+            let t = body(argv.clone()).await;
+            assert!(t.contains("agent shizuku"), "{argv}: {t}");
+            assert!(t.trim_end().ends_with("uid=0"), "{argv} 最后一行是状态：{t}");
+        }
+
+        // 没有宿主（桌面上）：一句人话，不是 panic
+        let (base2, c2) = serve(crate::state::AppState::new()).await;
+        let t = c2
+            .post(format!("{base2}/api/shizuku"))
+            .json(&serde_json::json!({ "argv": ["exec", "id"] }))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(t.starts_with("错误："), "{t}");
+        assert!(t.contains("没有 Shizuku"), "{t}");
     }
 
     /// 记下收到的浏览器动作，按 `__open_uri` 的约定回话。

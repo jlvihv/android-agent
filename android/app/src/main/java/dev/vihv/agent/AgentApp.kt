@@ -6,6 +6,8 @@ import android.net.ConnectivityManager
 import android.os.Build
 import android.util.Log
 import java.io.File
+import dev.vihv.agent.shizuku.ShizukuHostImpl
+import dev.vihv.agent.shizuku.ShizukuManager
 import uniffi.agent_core.AgentCore
 import uniffi.agent_core.AndroidEnv
 import java.util.TimeZone
@@ -161,6 +163,17 @@ class AgentApp : Application() {
         runCatching {
             core.setPhone(DeviceApisImpl(this))
         }.onFailure { Log.w(TAG, "设备能力注入失败", it) }
+
+        // 1d. 接上特权命令（`agent shizuku`：以 adb / root 身份跑系统命令）。
+        //
+        //     和上面两条同理**不依赖无障碍**：Shizuku 的身份和读屏没关系。
+        //     它只取决于「用户装没装 Shizuku / 开没开」—— 那件事每次调用现问现答
+        //     （`ShizukuManager.snapshot()`），所以这里注入失败也没关系，
+        //     `agent shizuku service status` 照样会告诉他该装什么。
+        runCatching {
+            ShizukuManager.init(this)
+            core.setShizuku(ShizukuHostImpl())
+        }.onFailure { Log.w(TAG, "Shizuku 注入失败", it) }
 
 
         // 2. 配 Linux 沙箱。

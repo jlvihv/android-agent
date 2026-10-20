@@ -119,4 +119,18 @@ dependencies {
     // 所以必须带 JNA。这是选 UniFFI 的代价 —— 换来的是不用手写 JNI。
     // AAR 里带全 ABI 的 libjnidispatch.so，abiFilters 会裁掉多余的。
     implementation("net.java.dev.jna:jna:5.17.0@aar")
+
+    // Shizuku / Sui / AXManager —— 拿 adb（uid 2000）甚至 root 身份跑系统命令，
+    // 走的是 `agent shizuku exec` 那条（见 core/src/shizuku.rs）。
+    //
+    // `api` 是客户端（`Shizuku.pingBinder()` / `newProcess`），`provider` 是
+    // 那个用于接 binder 的 ContentProvider（manifest 里也要声明一个）。
+    // 只有手机上有意义：桌面宿主模式没有这一组命令。
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
+
+    // 唯一一个测试依赖（`./gradlew :app:testDebugUnitTest`）。
+    // 只给纯函数用：Shizuku 的状态机（`ShizukuManager.decideState`）——
+    // 那三条分支要靠真机把 Shizuku 装/卸/杀一遍才能验，写成纯函数就是为了这里能测。
+    testImplementation("junit:junit:4.13.2")
 }

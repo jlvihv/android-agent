@@ -45,7 +45,7 @@ object PermissionCenter {
         val intent: ((Context) -> Intent)? = null,
     )
 
-    private enum class Kind { RUNTIME, SETTINGS, INFO }
+    private enum class Kind { RUNTIME, SETTINGS, INFO, SHIZUKU }
 
     private fun pkgUri(ctx: Context) = Uri.parse("package:${ctx.packageName}")
 
@@ -103,6 +103,20 @@ object PermissionCenter {
                     },
                 ))
             }
+            // Shizuku：**不是一个系统权限**，而是「App → 另一个 App」的授权，
+            // 所以既不能走 `requestPermissions`，也没有设置页跳转：
+            // 状态从 `ShizukuManager.snapshot()` 现问，点一下就是拉起授权界面
+            // （没装 / 没运行就先把它打开，别让人对着一个永远的「未授权」）。
+            add(Item(
+                "shizuku", "Shizuku（特权命令）", "以 adb / root 身份跑系统命令（agent shizuku）",
+                {
+                    when (dev.vihv.agent.shizuku.ShizukuManager.snapshot().state) {
+                        dev.vihv.agent.shizuku.ShizukuManager.State.READY -> true
+                        else -> false
+                    }
+                },
+                Kind.SHIZUKU,
+            ))
             add(Item(
                 "notification_listener", "通知读取", "读通知栏里的通知（agent notifications）",
                 { AgentNotificationListener.enabled(it) }, Kind.SETTINGS,
@@ -169,6 +183,16 @@ object PermissionCenter {
         val prefs = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val intent = when (item.kind) {
             Kind.INFO -> return
+            // 没就绪就别弹授权框（弹了也没用）：先把管理器 App 打开，让人自己去启动 / 装
+            Kind.SHIZUKU -> {
+                val state = dev.vihv.agent.shizuku.ShizukuManager.snapshot().state
+                if (state == dev.vihv.agent.shizuku.ShizukuManager.State.NEED_PERMISSION) {
+                    dev.vihv.agent.shizuku.ShizukuManager.requestPermission()
+                    return
+                }
+                dev.vihv.agent.shizuku.ShizukuManager.openManager(activity)
+                return
+            }
             Kind.SETTINGS -> item.intent?.invoke(activity)
             Kind.RUNTIME -> {
                 val asked = prefs.getBoolean(key, false)

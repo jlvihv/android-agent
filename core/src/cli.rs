@@ -193,6 +193,21 @@ fn subcommands() -> Vec<Sub> {
         body: PHONE_BODY.to_string(),
     });
 
+    // 特权 Android 命令（adb / root 身份）。和上面那批手机系统能力是**两条不同的路**：
+    // 那批走 App 自己的身份 + 系统 API，这批走 adb 身份 + 命令行工具。
+    // 名字、用法、提示词那句都从 `shizuku::GROUPS` 来 —— 加一组只改那一处。
+    v.push(Sub {
+        name: "shizuku".to_string(),
+        help: format!(
+            "  agent shizuku <组> <子命令>…      特权 Android 命令（adb/root 身份）：{}；\n\
+             \x20   agent shizuku help 看每一组（不审批：敲了就跑）",
+            crate::shizuku::group_names().join(" | ")
+        ),
+        prompt: "",
+        on: PHONE,
+        body: SHIZUKU_BODY.to_string(),
+    });
+
     v.extend([
         // 提示词里那一句是动态的（接了哪几个服务），不在这张表里：见 `mcp::prompt_line`
         sub(
@@ -285,6 +300,11 @@ pub fn prompt_clause(m: Machine) -> String {
                 .replace("{actions}", &BROWSER_ACTIONS.join(" | "))
         })
         .collect();
+    // 特权命令那一项：只给组名（细节让它自己 `agent shizuku help`）
+    if m == Machine::Phone {
+        let at = items.len();
+        items.insert(at, crate::shizuku::prompt_clause());
+    }
     // 系统能力那一组：一项列全名（顺序和 help 一致），放在设备操作后面
     if m == Machine::Phone {
         let at = items
@@ -619,6 +639,11 @@ const SWIPE_BODY: &str = r##"    [ $# -eq 5 ] || [ $# -eq 6 ] || { echo "用法�
 const LAUNCH_BODY: &str = r##"    [ $# -eq 2 ] || { echo "用法：agent launch <包名>（比如 com.android.settings）" >&2; exit 2; }
     act "{\"type\":\"launch\",\"package\":\"$(esc "$2")\"}""##;
 
+// `agent shizuku`：参数原样交给核心，**核心侧校验 + 排版**（见 core/src/shizuku.rs）。
+// 不带参数 = 核心回 help + 状态；`help` 也是核心答（组表在那儿）。
+const SHIZUKU_BODY: &str = r##"    shift || true
+    say "$(post /api/shizuku "{\"argv\":$(json_args "$@")}")""##;
+
 const PHONE_BODY: &str = r##"    _name="$cmd"; shift || true
     # 截屏默认落到当前工作目录下面的 screenshots/（核心把它注在 ${AGENT_WORKDIR} 里）。
     # 显式给了 --path 就按给的来。
@@ -742,6 +767,12 @@ mod tests {
             for s in ["agent key", "agent tap", "agent swipe", "agent launch"] {
                 assert_eq!(help.contains(s), phone, "{m:?}：{s} 该不该列");
             }
+            // 特权命令（adb / root 身份）也只有手机上有：桌面宿主模式没有 Shizuku
+            assert_eq!(
+                help.contains("agent shizuku"),
+                phone,
+                "{m:?}：agent shizuku 该不该列"
+            );
             let proot = m != Machine::Host;
             for s in ["agent ps", "agent kill", "agent setup", "agent files"] {
                 assert_eq!(help.contains(s), proot, "{m:?}：{s} 该不该列");
@@ -756,6 +787,8 @@ mod tests {
             (Machine::Host, "sms"),
             (Machine::Host, "tap"),
             (Machine::Host, "ps"),
+            (Machine::Host, "shizuku"),
+            (Machine::Sandbox, "shizuku"),
             (Machine::Sandbox, "clipboard"),
             (Machine::Sandbox, "key"),
         ] {

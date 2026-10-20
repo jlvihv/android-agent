@@ -172,6 +172,52 @@ impl PhoneApi for PhoneAdapter {
     }
 }
 
+/// 特权 Android 命令接口，**由 Kotlin 实现**（`ShizukuHostImpl`）。
+///
+/// 第四条独立的路：前三条分别是无障碍（`DeviceHost`）、WebView（`BrowserHost`）、
+/// App 自己的系统 API（`PhoneHost`）。这条要的是**另一个身份** —— 通过 Shizuku/Sui
+/// 拿到 adb shell（uid 2000）甚至 root（uid 0），跑的是 `pm` / `am` / `settings` /
+/// `dumpsys` 这些命令行工具，和插着数据线敲 `adb shell` 是同一套。
+///
+/// 边界和 `PhoneHost` 一样用 `argv` 而不是细粒度类型：加一个子命令不用动这里的定义。
+/// 但**解析不在这里**：壳只回原始输出，dumpsys 的解析和排版在核心侧（见 `shizuku` 模块）。
+///
+/// 实现方**会阻塞**（等 binder、等远程进程），调用方走 `spawn_blocking`，
+/// 见 `Core::shizuku`。
+#[uniffi::export(callback_interface)]
+pub trait ShizukuHost: Send + Sync {
+    /// 状态快照（JSON）：`{"state":"READY","version":13,"uid":2000,"sui":false}`。
+    /// 拿不到也要回一个（`NOT_INSTALLED`），不许抛。
+    fn state(&self) -> String;
+
+    /// 跑一条命令，回 `{"ok":…}` 形状的 JSON 字符串（见 `shizuku::ShizukuApi::run`）。
+    fn run(&self, argv: Vec<String>) -> Result<String, HostError>;
+
+    /// 拉一次授权界面。返回「请求发出去了没有」。
+    fn request_permission(&self) -> bool;
+}
+
+struct ShizukuAdapter(Box<dyn ShizukuHost>);
+
+impl crate::shizuku::ShizukuApi for ShizukuAdapter {
+    fn state(&self) -> String {
+        self.0.state()
+    }
+    fn run(&self, argv: Vec<String>) -> String {
+        match self.0.run(argv) {
+            Ok(s) => s,
+            Err(e) => serde_json::json!({
+                "ok": false,
+                "error": { "code": "host_failed", "message": e.to_string() }
+            })
+            .to_string(),
+        }
+    }
+    fn request_permission(&self) -> bool {
+        self.0.request_permission()
+    }
+}
+
 fn failed(e: impl std::fmt::Display) -> CoreError {
     CoreError::Failed {
         message: format!("{e:#}"),
@@ -379,6 +425,16 @@ impl AgentCore {
         self.core
             .state
             .set_phone(std::sync::Arc::new(PhoneAdapter(host)));
+    }
+
+    /// 注入特权 Android 命令实现（Shizuku / Sui / AXManager）。
+    ///
+    /// `AgentApp.onCreate` 里调。桌面上没人调这个，于是 `state.shizuku()` 一直是
+    /// `None`，`agent shizuku` 在那边连子命令都不会生成（`cli.rs` 里 `on: PHONE`）。
+    pub fn set_shizuku(&self, host: Box<dyn ShizukuHost>) {
+        self.core
+            .state
+            .set_shizuku(std::sync::Arc::new(ShizukuAdapter(host)));
     }
 
     /// 配置 Linux 沙箱。

@@ -3336,6 +3336,38 @@ async fn drain(
     std::mem::take(&mut *lock(cap))
 }
 
+/// 把一段**已经在手上**的输出，按 `bash` 同一套规则截断成给模型看的样子。
+///
+/// 为什么要有这个公开入口：`agent shizuku exec` 的输出也是模型的上下文
+/// （`dumpsys activity` 一次 2MB，实测），而那批命令**不走 `bash` 的
+/// `Capture`**（它是特权侧另一条进程通路）。两处各写一套截断，迟早一个 2000 行
+/// 一个 20000 行 —— 模型就会从"命令入口"这层差异里学到错的东西。
+///
+/// 规则和 `Capture::render` 完全一致（同几个常量、同一条首尾各留的算法），
+/// 区别只是这里拿到的是一整份 `String`、没有"中间被扔掉"那部分。
+///
+/// 返回 `(给模型看的文本, 有没有截断)`。**没有** `spill` 落盘：`exec` 的完整输出
+/// 在特权侧，要落盘得再走一趟；截断提示里直接告诉模型怎么自己重跑带过滤的命令，
+/// 比让它去读一个 /tmp 文件更短（见 `shizuku::reply_text` 的调用处）。
+pub fn truncate_for_model(text: &str) -> (String, bool) {
+    let lines = real_lines(text);
+    if lines.len() <= MAX_OUTPUT_LINES && text.len() <= MAX_OUTPUT_BYTES {
+        return (text.to_string(), false);
+    }
+    let (head_out, head_shown) = head_part(&lines, HEAD_LINES, SIDE_BYTES);
+    let (tail_out, tail_shown) = tail_part(&lines[head_shown..], TAIL_LINES, SIDE_BYTES);
+    let omitted = lines.len() - head_shown - tail_shown;
+    let marker = if omitted > 0 {
+        format!("[省略 {omitted} 行]")
+    } else {
+        format!(
+            "[省略 {}]",
+            crate::reader::fmt_size(text.len() - head_out.len() - tail_out.len())
+        )
+    };
+    (format!("{head_out}\n{marker}\n{tail_out}"), true)
+}
+
 /// 按 `reader` 的规则拆行：结尾 `\n` 切出来的空串不算一行。
 fn real_lines(text: &str) -> Vec<&str> {
     match text.strip_suffix('\n') {

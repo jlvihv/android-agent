@@ -135,7 +135,7 @@ class MainActivity : Activity() {
         // 不要求"人在看着"（那个是 `current`）
         alive = this
 
-        WebView.setWebContentsDebuggingEnabled(isDebuggable())
+        WebView.setWebContentsDebuggingEnabled(debugBuild())
 
         val port = AgentApp.port
         localPort = port
@@ -164,6 +164,13 @@ class MainActivity : Activity() {
         // 冷启动也认这个 extra（见 onNewIntent）
         if (intent?.getBooleanExtra("browser", false) == true) {
             window.decorView.post { panel?.show() }
+        }
+
+        // 调试/验收用的口子：`am start … --es grant shizuku` 等价于点设置页那一项。
+        // 和 `--ez browser`、`files/port` 同一个思路 —— 能在 adb 里做的事，
+        // 不该靠去戳屏幕（尤其是戳用户正在用的手机）。**只在 debug 包里认。**
+        intent?.getStringExtra("grant")?.let { key ->
+            if (debugBuild()) runOnUiThread { PermissionCenter.request(this, key) }
         }
     }
 
@@ -197,6 +204,10 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (intent?.getBooleanExtra("browser", false) == true) panel?.show()
+        // 同 onCreate：`--es grant <key>`（只在 debug 包里认）
+        intent?.getStringExtra("grant")?.let { key ->
+            if (debugBuild()) runOnUiThread { PermissionCenter.request(this, key) }
+        }
     }
 
     override fun onPause() {
@@ -1071,7 +1082,7 @@ class MainActivity : Activity() {
 
     // -----------------------------------------------------------------------
 
-    private fun isDebuggable(): Boolean =
+    private fun debugBuild(): Boolean =
         (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
     /**

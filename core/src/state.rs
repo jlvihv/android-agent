@@ -17,6 +17,7 @@ use crate::db::Db;
 use crate::linux::LinuxSandbox;
 use crate::llm::Provider;
 use crate::phone::PhoneApi;
+use crate::shizuku::ShizukuApi;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -226,6 +227,10 @@ pub struct AppState {
     /// 和上面两个都分开：它不依赖无障碍（`device`），也不依赖 WebView（`browser`），
     /// 但**只有手机上才有**（见 `phone` 模块）。桌面上一直是 `None`。
     pub phone: RwLock<Option<Arc<dyn PhoneApi>>>,
+    /// 特权 Android 命令（`agent shizuku`，走 Shizuku/Sui 拿 adb/root 身份）。
+    /// 和 `phone` 分开：那是 App 自己的身份 + 系统 API，这是 adb 身份 + 命令行工具。
+    /// 桌面上一律 `None`（只有手机上有）。
+    pub shizuku: RwLock<Option<Arc<dyn ShizukuApi>>>,
     /// **正在跑的**各会话最后一次的实时状态，key = sid。
     ///
     /// 只为一件事：有人刚订阅上来时补一帧「现在在跑什么」（见 `turn_snapshot`）。
@@ -365,6 +370,7 @@ impl AppState {
             device: RwLock::new(None),
             browser: RwLock::new(None),
             phone: RwLock::new(None),
+            shizuku: RwLock::new(None),
             turn_status: Mutex::new(HashMap::new()),
             port: AtomicU16::new(0),
             mock: AtomicBool::new(false),
@@ -454,6 +460,16 @@ impl AppState {
     pub fn set_phone(&self, p: Arc<dyn PhoneApi>) {
         if let Ok(mut g) = self.phone.write() {
             *g = Some(p);
+        }
+    }
+
+    pub fn shizuku(&self) -> Option<Arc<dyn ShizukuApi>> {
+        self.shizuku.read().ok().and_then(|g| g.clone())
+    }
+
+    pub fn set_shizuku(&self, s: Arc<dyn ShizukuApi>) {
+        if let Ok(mut g) = self.shizuku.write() {
+            *g = Some(s);
         }
     }
 

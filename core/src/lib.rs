@@ -53,6 +53,8 @@ pub mod resident;
 pub mod responses;
 pub mod search;
 pub mod single;
+pub mod shizuku;
+pub mod shizuku_parse;
 pub mod skills;
 pub mod sse;
 pub mod state;
@@ -567,6 +569,70 @@ impl Core {
             Err(_) => anyhow::bail!("设备命令超时（180s 没回来）"),
         };
         Ok(crate::phone::normalize_reply(&raw))
+    }
+
+    /// 特权 Android 命令（`agent shizuku`）：以 adb / root 身份跑系统命令。
+    ///
+    /// 三层保护和 `Core::phone` 一样（同一条路：Kotlin 那边会阻塞）：
+    ///
+    /// 1. `spawn_blocking` —— 壳那边要等 binder、等远程进程退出，压着 tokio worker
+    ///    会把整个核心卡死。
+    /// 2. 300s 超时。比 `phone` 的 180s 宽：`package install` 这种真能跑几分钟，
+    ///    但再长就不该是「等一下」而是出事了。
+    /// 3. 结果一律过一遍 `shizuku::reply_text` 收敛成纯文本：壳是另一个语言写的，
+    ///    回什么都不能直接透给模型。
+    ///
+    /// `service` 组**不走壳的 run**：状态是壳的 `state()`，核心自己拼答案 ——
+    /// 这样「Shizuku 没装」也能答出「没装，去装」，而不是一句"未知子命令"。
+    pub async fn shizuku(&self, argv: &[String]) -> String {
+        let Some(host) = self.state.shizuku() else {
+            return "错误：这台机器上没有 Shizuku 支持（只有手机上才有）".to_string();
+        };
+
+        // 不带参数 = help + 状态；service = 核心自己答
+        let group = argv.first().map(|s| s.as_str()).unwrap_or("");
+        // 不带参数和 `help` 都是「help + 现在什么状态」（状态放在最后一行）
+        if group.is_empty() || matches!(group, "help" | "-h" | "--help") {
+            return crate::shizuku::banner(&host.state());
+        }
+        if let Err(e) = crate::shizuku::validate(argv) {
+            return format!("错误：{e}");
+        }
+        if crate::shizuku::is_local(group) {
+            let reply = crate::shizuku::service_reply(argv, &host.state());
+            return crate::shizuku::envelope_text(&reply);
+        }
+
+        // P1 的结构化组：先把 argv 翻成一条特权命令（顺便把参数检查做完）。
+        // `exec` 例外：它自己就是一条命令，原样交给壳。
+        let plan = if group == "exec" {
+            None
+        } else {
+            match crate::shizuku::plan(argv) {
+                Ok(p) => Some(p),
+                Err(e) => return format!("错误：{e}"),
+            }
+        };
+        // 交给壳的 argv：结构化组传拼好的 `sh -c <cmd>`，exec 传原样的
+        let argv = match &plan {
+            Some(p) => vec!["exec".to_string(), p.cmd.clone()],
+            None => argv.to_vec(),
+        };
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            tokio::task::spawn_blocking(move || host.run(argv)),
+        )
+        .await;
+        let raw = match joined {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(e)) => return format!("错误：特权命令没能跑起来（{e}）"),
+            Err(_) => return "错误：特权命令超时（300s 没回来）".to_string(),
+        };
+        match plan {
+            // exec：原样收敛
+            None => crate::shizuku::reply_text(&raw),
+            Some(p) => crate::shizuku::structured_text(&raw, &p),
+        }
     }
 
     /// 联网搜索。key 有就直连 Exa API，没有就走他们那个免 key 的公开 MCP

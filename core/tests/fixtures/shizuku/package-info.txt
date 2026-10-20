@@ -1,0 +1,206 @@
+Activity Resolver Table:
+  Non-Data Actions:
+      android.intent.action.MAIN:
+        37b512b dev.vihv.agent/.MainActivity filter bb862d0
+          Action: "android.intent.action.MAIN"
+          Category: "android.intent.category.LAUNCHER"
+
+Service Resolver Table:
+  Non-Data Actions:
+      android.service.notification.NotificationListenerService:
+        37a3f21 dev.vihv.agent/.AgentNotificationListener filter 58dbdce permission android.permission.BIND_NOTIFICATION_LISTENER_SERVICE
+          Action: "android.service.notification.NotificationListenerService"
+      android.accessibilityservice.AccessibilityService:
+        7ed988 dev.vihv.agent/.AgentAccessibilityService filter 87da2c9 permission android.permission.BIND_ACCESSIBILITY_SERVICE
+          Action: "android.accessibilityservice.AccessibilityService"
+
+Domain verification status:
+
+Registered ContentProviders:
+  dev.vihv.agent/rikka.shizuku.ShizukuProvider:
+    Provider{ecf1f46 dev.vihv.agent/rikka.shizuku.ShizukuProvider}
+
+ContentProvider Authorities:
+  [dev.vihv.agent.shizuku]:
+    Provider{ecf1f46 dev.vihv.agent/rikka.shizuku.ShizukuProvider}
+      applicationInfo=ApplicationInfo{3e165ec dev.vihv.agent}
+
+Key Set Manager:
+  [dev.vihv.agent]
+      Signing KeySets: 316
+
+Packages:
+  Package [dev.vihv.agent] (95e22c2):
+    appId=10306
+    pccId=-1
+    pkg=Package{48e7db5 dev.vihv.agent}
+    codePath=/data/app/~~KYbZazM_O4Z0pS9umOmDbA==/dev.vihv.agent-uClrWJJZuIMGlrXZqeDbjQ==
+    resourcePath=/data/app/~~KYbZazM_O4Z0pS9umOmDbA==/dev.vihv.agent-uClrWJJZuIMGlrXZqeDbjQ==
+    legacyNativeLibraryDir=/data/app/~~KYbZazM_O4Z0pS9umOmDbA==/dev.vihv.agent-uClrWJJZuIMGlrXZqeDbjQ==/lib
+    extractNativeLibs=true
+    primaryCpuAbi=arm64-v8a
+    secondaryCpuAbi=null
+    cpuAbiOverride=null
+    versionCode=1 minSdk=26 targetSdk=35
+    minExtensionVersions=[]
+    versionName=0.1.0
+    hiddenApiEnforcementPolicy=2
+    usesNonSdkApi=false
+    splits=[base]
+    apkSigningVersion=2
+    flags=[ DEBUGGABLE HAS_CODE ALLOW_CLEAR_USER_DATA ]
+    privateFlags=[ PRIVATE_FLAG_ACTIVITIES_RESIZE_MODE_RESIZEABLE_VIA_SDK_VERSION ALLOW_AUDIO_PLAYBACK_CAPTURE PRIVATE_FLAG_REQUEST_LEGACY_EXTERNAL_STORAGE PRIVATE_FLAG_ALLOW_NATIVE_HEAP_POINTER_TAGGING ]
+    forceQueryable=false
+    pageSizeCompat=0
+    queriesIntents=[Intent { act=android.speech.tts.engine.TTS_SERVICE }, Intent { act=android.intent.action.SET_ALARM }, Intent { act=android.intent.action.SET_TIMER }]
+    scannedAsStoppedSystemApp=false
+    supportsScreens=[small, medium, large, xlarge, resizeable, anyDensity]
+    timeStamp=2026-10-20 23:57:04
+    lastUpdateTime=2026-10-20 23:57:05
+    installerPackageName=null
+    installerPackageUid=-1
+    initiatingPackageName=com.android.shell
+    originatingPackageName=null
+    packageSource=1
+    appMetadataFilePath=null
+    appMetadataSource=0
+    signatures=PackageSignatures{b7d3c23 version:2, signatures:[4c75738e], past signatures:[]}
+    installPermissionsFixed=false
+    pkgFlags=[ DEBUGGABLE HAS_CODE ALLOW_CLEAR_USER_DATA ]
+    privatePkgFlags=[ PRIVATE_FLAG_ACTIVITIES_RESIZE_MODE_RESIZEABLE_VIA_SDK_VERSION ALLOW_AUDIO_PLAYBACK_CAPTURE PRIVATE_FLAG_REQUEST_LEGACY_EXTERNAL_STORAGE PRIVATE_FLAG_ALLOW_NATIVE_HEAP_POINTER_TAGGING ]
+    apexModuleName=null
+    requested permissions:
+      android.permission.READ_SMS
+      android.permission.READ_CALENDAR
+      android.permission.POST_NOTIFICATIONS
+      android.permission.ACCESS_FINE_LOCATION
+      android.permission.MODIFY_AUDIO_SETTINGS
+      android.permission.MANAGE_EXTERNAL_STORAGE
+      android.permission.ACCESS_LOCAL_NETWORK
+      android.permission.FOREGROUND_SERVICE
+      android.permission.FOREGROUND_SERVICE_SPECIAL_USE
+      android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+      com.android.alarm.permission.SET_ALARM
+      android.permission.INTERNET
+      android.permission.ACCESS_COARSE_LOCATION
+      android.permission.ACCESS_NETWORK_STATE
+      android.permission.WRITE_CALENDAR
+      android.permission.POST_PROMOTED_NOTIFICATIONS
+      moe.shizuku.manager.permission.API_V23
+      android.permission.VIBRATE
+      android.permission.ACCESS_WIFI_STATE
+      android.permission.READ_CONTACTS
+    install permissions:
+      android.permission.MODIFY_AUDIO_SETTINGS: granted=true
+      android.permission.MANAGE_EXTERNAL_STORAGE: granted=false, flags=[ USER_SET]
+      android.permission.FOREGROUND_SERVICE: granted=true
+      android.permission.FOREGROUND_SERVICE_SPECIAL_USE: granted=true
+      android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS: granted=true
+      com.android.alarm.permission.SET_ALARM: granted=true
+      android.permission.INTERNET: granted=true
+      android.permission.ACCESS_NETWORK_STATE: granted=true
+      android.permission.POST_PROMOTED_NOTIFICATIONS: granted=true
+      android.permission.VIBRATE: granted=true
+      android.permission.ACCESS_WIFI_STATE: granted=true
+    User 0: ceDataInode=1348431 deDataInode=1347501 pccCeDataInode=0 pccDeDataInode=0 installed=true hidden=false suspended=false appLockEnabled=false distractionFlags=0 stopped=false notLaunched=false enabled=0 instant=false virtual=false quarantined=false
+      installReason=0
+      dataDir=/data/user/0/dev.vihv.agent
+      firstInstallTime=2026-10-11 14:14:17
+      uninstallReason=0
+      overlay paths:
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+        /product/overlay/AmbientCueOverlay.apk
+        /data/resource-cache/com.android.systemui-neutral-FobR.frro
+        /data/resource-cache/com.android.systemui-accent-8EDw.frro
+        /data/resource-cache/com.android.systemui-dynamic-mfXL.frro
+      legacy overlay paths:
+        /product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk
+        /product/overlay/AmbientCueOverlay.apk
+      gids=[3003]
+      runtime permissions:
+        android.permission.READ_SMS: granted=true, flags=[ USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED|RESTRICTION_INSTALLER_EXEMPT]
+        android.permission.READ_CALENDAR: granted=true, flags=[ USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED]
+        android.permission.POST_NOTIFICATIONS: granted=true, flags=[ USER_SET|USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED]
+        android.permission.ACCESS_FINE_LOCATION: granted=true, flags=[ USER_SET|USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED|SELECTED_LOCATION_ACCURACY]
+        android.permission.ACCESS_LOCAL_NETWORK: granted=true, flags=[ REVOKE_WHEN_REQUESTED|USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED]
+        android.permission.ACCESS_COARSE_LOCATION: granted=true, flags=[ USER_SET|USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED]
+        android.permission.WRITE_CALENDAR: granted=true, flags=[ USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED]
+        moe.shizuku.manager.permission.API_V23: granted=true
+        android.permission.READ_CONTACTS: granted=true, flags=[ USER_SENSITIVE_WHEN_GRANTED|USER_SENSITIVE_WHEN_DENIED]
+
+Queries:
+  system apps queryable: false
+  queries via forceQueryable:
+  queries via package name:
+  queries via component:
+    com.google.android.as.oss:
+      dev.vihv.agent
+    com.google.android.apps.diagnosticstool:
+      dev.vihv.agent
+    com.google.android.apps.camera.services:
+      dev.vihv.agent
+    com.google.android.as:
+      dev.vihv.agent
+    com.google.android.settings.intelligence:
+      dev.vihv.agent
+    com.google.android.apps.pixel.subzero:
+      dev.vihv.agent
+    com.google.android.apps.accessibility.voiceaccess:
+      dev.vihv.agent
+    com.verizon.mips.services:
+      dev.vihv.agent
+    com.fitbit.FitbitMobile:
+      dev.vihv.agent
+    com.zhiliaoapp.musically:
+      dev.vihv.agent
+    dev.vihv.agent:
+      com.google.android.deskclock
+    com.bochk.app.aos:
+      dev.vihv.agent
+    com.taobao.taobao:
+      dev.vihv.agent
+    com.tencent.mm:
+      dev.vihv.agent
+    com.xingin.xhs:
+      dev.vihv.agent
+    com.autonavi.minimap:
+      dev.vihv.agent
+    com.jingdong.app.mall:
+      dev.vihv.agent
+    com.xunmeng.pinduoduo:
+      dev.vihv.agent
+    com.binance.dev:
+      dev.vihv.agent
+    com.ocbc.mobile:
+      dev.vihv.agent
+    atws.app:
+      dev.vihv.agent
+    com.zhongan.ibank:
+      dev.vihv.agent
+    com.zhihu.android:
+      dev.vihv.agent
+    com.coolapk.market:
+      dev.vihv.agent
+  queryable via interaction:
+    User 0:
+      [com.google.android.settings.future.biometrics.faceenroll,com.google.android.satellite,com.android.inputdevices,com.android.providers.settings,com.google.pixel.camera.services,com.android.keychain,com.android.location.fused,android,com.android.server.telecom,com.android.localtransport,com.google.android.iwlan,com.google.android.repairmode,com.android.qns,com.android.dynsystem,com.android.DeviceAsWebcam,com.google.SSRestartDetector,com.android.settings]:
+        dev.vihv.agent
+      com.google.android.gms:
+        dev.vihv.agent
+      dev.vihv.agent:
+        [com.google.android.settings.future.biometrics.faceenroll,com.google.android.satellite,com.android.inputdevices,com.android.providers.settings,com.google.pixel.camera.services,com.android.keychain,com.android.location.fused,android,com.android.server.telecom,com.android.localtransport,com.google.android.iwlan,com.google.android.repairmode,com.android.qns,com.android.dynsystem,com.android.DeviceAsWebcam,com.google.SSRestartDetector,com.android.settings]
+        com.android.shell
+        com.google.android.deskclock
+        com.google.android.webview
+        com.android.systemui
+      com.bytedance.android.doubaoime:
+        dev.vihv.agent
+      dev.vihv.agent:
+        com.google.android.providers.media.module
+  queryable via uses-library:
+
+Dexopt state:
+  [dev.vihv.agent]
+    path: /data/app/~~KYbZazM_O4Z0pS9umOmDbA==/dev.vihv.agent-uClrWJJZuIMGlrXZqeDbjQ==/base.apk
+      arm64: [status=run-from-apk] [reason=unknown] [primary-abi]
+        [location is error]

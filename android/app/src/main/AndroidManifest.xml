@@ -59,6 +59,14 @@
          16 及更早的系统上这是未知权限，声明了无害（会被忽略）。 -->
     <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
 
+    <!-- `agent shizuku`（以 adb / root 身份跑系统命令）。
+
+         `moe.shizuku.manager.permission.API_V23` 是 normal 权限，实际**不会**被授予 ——
+         它的用处在别的管理器上：AXManager 只给「请求过这三个哨兵权限之一」的 App 推
+         binder，不声明就永远 ping 不通（Shizuku 本体不看它，但声明了无害，
+         这也是 Magisk Manager / Brevent 等客户端的标准做法）。 -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
     <!-- Android 11+ 的包可见性：不声明这些，`queryIntentActivities` /
          `resolveActivity` 一律返回空，TextToSpeech 会以为"这台机器上没有语音引擎"。
          我们自己不查时钟 App（直接 startActivity + 捉 ActivityNotFoundException），
@@ -121,6 +129,21 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
+
+        <!-- Shizuku 的 binder 接收器。
+
+             SDK >= 12 要求客户端自己带一个 ContentProvider 来接收 binder：
+             Shizuku 服务端会 `contentResolver.call("$packageName.shizuku", …)`
+             把 binder 塞进来。没有它 `Shizuku.pingBinder()` 永远是 false。
+
+             `multiprocess="false"`：别的进程（比如以后加的 :worker）不要各起一份。 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
         <!-- 回合进行中保活。`exported="false"`：只有我们自己能起它 -->
         <service
