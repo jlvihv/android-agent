@@ -42,7 +42,9 @@ pub const COMMANDS: &[Command] = &[
         name: "alarm",
         usage: "alarm set --time HH:MM|ISO [--label L] [--repeat once|daily|weekdays]\n    | timer --duration 5m | list | cancel --id X | cancel --all",
     },
-    Command { name: "location", usage: "location [current] [--timeout 8] | geocode --lat L --lon N | forward --query Q" },
+    Command {
+        name: "location",
+        usage: "location [current] [--timeout 10] [--no-address] | geocode --lat L --lon N | forward --query Q\n    current 默认带上反查的地址（place：省/市/区/街道）" },
     Command { name: "contacts", usage: "contacts list [--max N] | search <词> | get <id>" },
     Command {
         name: "calendar",

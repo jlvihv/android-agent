@@ -105,8 +105,11 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
 有些厂商的时钟 App 仍会弹确认框）。按 id 取消系统没给接口 —— 用 `list` 打开界面让用户自己删。"""
 
         private const val LOCATION_HELP = """agent location [current|geocode|forward]
-  current [--timeout 10]              现在的位置（先试上次已知，没有再取新定位）
-  geocode --lat L --lon N             坐标 → 地址
+  current [--timeout 10] [--no-address]  现在的位置（先试上次已知，没有再取新定位）
+        默认顺手反查地址：回 place（address / province / city / district / street / poi），
+        反查不到也照回坐标，只多一个 place_error —— 别为地址失败重试。
+        --no-address：跳过反查，秒回坐标（没网 / 只想喂坐标给别的命令时用）
+  geocode --lat L --lon N             坐标 → 地址（最多 5 条）
   forward --query 地址                地址 → 坐标
 需要定位权限；第一次会弹系统权限框。
 定不到位时会退回"上次已知"，并在 note 里写清它有多旧。"""
@@ -856,7 +859,10 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
                 // 不再有 `--precise`（那是"等 60s 试 GPS"的旧路子）：现在默认
                 // 走 fused（室内也能定），超时就退上次已知 —— 慢慢等没意义。
                 val timeout = (args.int("timeout") ?: 10).coerceIn(1, 120)
-                locationNow(timeout)
+                // 默认顺手反查地址：坐标对模型没什么用，它要说的是"在哪个市哪个区"。
+                // 反查失败不影响坐标，只是少一个字段（见 putPlace）。
+                val wantPlace = args.bool("no-address") != true
+                locationNow(timeout, wantPlace)
             }
 
             "geocode" -> {
@@ -873,7 +879,7 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
                     return fail("unavailable", geocoderError(e))
                 }
                 if (list.isNullOrEmpty()) return okArray("addresses", JSONArray())
-                okArray("addresses", JSONArray(list.map { addressJson(it, lat, lon) }))
+                okArray("addresses", JSONArray(list.map { placeJson(it, lat, lon) }))
             }
 
             "forward" -> {
@@ -886,17 +892,7 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
                     return fail("unavailable", geocoderError(e))
                 }
                 if (list.isNullOrEmpty()) return okArray("places", JSONArray())
-                okArray(
-                    "places",
-                    JSONArray(
-                        list.map {
-                            JSONObject()
-                                .put("latitude", it.latitude)
-                                .put("longitude", it.longitude)
-                                .put("address", it.getAddressLine(0) ?: "")
-                        }
-                    )
-                )
+                okArray("places", JSONArray(list.map { placeJson(it, it.latitude, it.longitude) }))
             }
 
             else -> fail("invalid", "不认识的子命令「$sub」\n$LOCATION_HELP")
@@ -918,7 +914,7 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
      */
     private fun geocoderError(e: java.io.IOException): String =
         "这台机器上用不了地理编码（${e.message}）—— 多半是没有 Google 服务 / 网络不通。" +
-            "坐标→地址：换个办法（比如把坐标直接给用户，或者用 agent weather 反查不到）。" +
+            "坐标→地址：把坐标直接给用户，或者换个有网络/有 Google 服务的机器。" +
             "地址→坐标：让用户直接给坐标，或者用 agent location current 先拿到当前位置。"
 
     /**
@@ -930,7 +926,7 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
      * 2. 没有再取一次新的（API 30+ 的 `getCurrentLocation`）；
      * 3. 超时就把「有哪些 provider、是哪个超时了」结构化地说清楚。
      */
-    private fun locationNow(timeoutSec: Int): String {
+    private fun locationNow(timeoutSec: Int, wantPlace: Boolean): String {
         val lm = app.getSystemService(Context.LOCATION_SERVICE) as LocationManager
         val providers = runCatching { lm.getProviders(true) }.getOrNull().orEmpty()
         if (providers.isEmpty()) {
@@ -949,12 +945,12 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
         // 上次已知的位置：十分钟内算准（大多数时候这就够了，秒回）
         val last = newest
         if (last != null && System.currentTimeMillis() - last.time < 10 * 60_000) {
-            return ok(locationJson(last, providers, "last_known"))
+            return ok(locationJson(last, providers, "last_known", wantPlace))
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             return if (last != null) {
-                ok(locationJson(last, providers, "last_known_stale"))
+                ok(locationJson(last, providers, "last_known_stale", wantPlace))
             } else {
                 fail("unavailable", "这台系统（API < 30）上取不到新定位，也没有上次已知的位置。")
             }
@@ -990,7 +986,7 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
             // 超时。有上次已知的就退而求其次，但要**说清**它是旧的。
             if (last != null) {
                 val age = (System.currentTimeMillis() - last.time) / 1000
-                val out = locationJson(last, providers, "last_known_stale")
+                val out = locationJson(last, providers, "last_known_stale", wantPlace)
                 out.put(
                     "note",
                     "这是 ${age / 60} 分钟前的位置（新定位 ${timeoutSec}s 没定上来）。" +
@@ -1004,11 +1000,16 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
                     "也没有上次已知的位置。室内常常这样 —— 让用户走到窗边或户外再试。"
             )
         }
-        return ok(locationJson(holder[0]!!, providers, "fresh"))
+        return ok(locationJson(holder[0]!!, providers, "fresh", wantPlace))
     }
 
-    private fun locationJson(l: Location, providers: List<String>, source: String): JSONObject =
-        JSONObject()
+    private fun locationJson(
+        l: Location,
+        providers: List<String>,
+        source: String,
+        wantPlace: Boolean,
+    ): JSONObject {
+        val out = JSONObject()
             .put("latitude", l.latitude)
             .put("longitude", l.longitude)
             .put("accuracy_m", if (l.hasAccuracy()) l.accuracy.toDouble() else JSONObject.NULL)
@@ -1017,15 +1018,136 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
             .put("age_seconds", ((System.currentTimeMillis() - l.time) / 1000).toInt())
             .put("source", source)
             .put("providers_enabled", JSONArray(providers))
+        if (wantPlace) putPlace(out, l.latitude, l.longitude)
+        return out
+    }
 
-    private fun addressJson(a: android.location.Address, lat: Double, lon: Double): JSONObject =
-        JSONObject()
+    // ── 坐标 → 人话 ─────────────────────────────────────────────────────
+    //
+    // `latitude/longitude` 对模型来说几乎是噪声：它说不出"这是上海市黄浦区"，
+    // 用户问"我在哪"也接不上话。之前只有 `location geocode` 能反查，模型多半
+    // 不会自己再补一刀（多一次网络往返、多一次可能失败）。所以直接挂在
+    // `location current` 上。
+    //
+    // 但 Geocoder 是**不可靠**的：没有 GMS / 没网的机器上同步版会抛
+    // `Service not available` 或干脆卡住（模拟器上就是 `gcaa: UNAVAILABLE`）。
+    // 所以：硬预算 placeBudgetSec（6s），超时/失败只少一个 `place` + 一句
+    // `place_error`，坐标照回 —— 地址是锦上添花，不能连累定位本身。
+
+    /** 一次反查的结果（成功的地址 / 失败的原因，二选一）。 */
+    private data class PlaceLookup(
+        val lat: Double,
+        val lon: Double,
+        val at: Long,
+        val place: JSONObject?,
+        val error: String?,
+    )
+
+    /** 反查地址的等待预算（秒）。室内/弱网时 Geocoder 慢，但定位命令不该被它拖死。 */
+    private val placeBudgetSec = 6L
+
+    /** 上次反查的结果：`location current` 常被连着问两三次，别每次都走网络。 */
+    @Volatile
+    private var lastPlace: PlaceLookup? = null
+
+    /** 把地址挂到输出上；反查不到就挂 `place_error`，**绝不**让 `location` 失败。 */
+    private fun putPlace(out: JSONObject, lat: Double, lon: Double) {
+        val look = placeFor(lat, lon)
+        look.place?.let { out.put("place", it) }
+        look.error?.let { out.put("place_error", it) }
+    }
+
+    private fun placeFor(lat: Double, lon: Double): PlaceLookup {
+        val now = System.currentTimeMillis()
+        // 同一个点（经纬度差 <0.0001°，约 11 米）不重复查：成功缓存 10 分钟，
+        // 失败 2 分钟（没有 GMS 的机器上别每次白等 6 秒，但也别一辈子不再试）。
+        lastPlace?.let { c ->
+            val ttl = if (c.error == null) 10 * 60_000L else 2 * 60_000L
+            if (now - c.at < ttl && kotlin.math.abs(c.lat - lat) < 1e-4 &&
+                kotlin.math.abs(c.lon - lon) < 1e-4
+            ) {
+                return c
+            }
+        }
+        val (place, error) = lookupPlace(lat, lon)
+        val entry = PlaceLookup(lat, lon, now, place, error)
+        lastPlace = entry
+        return entry
+    }
+
+    /**
+     * 同步 Geocoder 放到自己的线程上跑，主流程只等 [placeBudgetSec] 秒。
+     *
+     * 不用 API 33 的异步版：那一版要再套一层回调，而超时照样得自己数 ——
+     * 一个带闩的线程反而更好读（`locationNow` 取新定位也是这个写法）。
+     */
+    private fun lookupPlace(lat: Double, lon: Double): Pair<JSONObject?, String?> {
+        val box = arrayOfNulls<android.location.Address>(1)
+        var failure: String? = null
+        val latch = CountDownLatch(1)
+        val worker = Thread {
+            try {
+                @Suppress("DEPRECATION")
+                box[0] = geocoder().getFromLocation(lat, lon, 1)?.firstOrNull()
+            } catch (e: Exception) {
+                // 没 GMS 的机器上是 `Service not available`，没网是别的 IOException
+                failure = "这台机器反查不了地址（${e.message ?: e.javaClass.simpleName}）——" +
+                    "多半没有 Google 服务或没网。坐标照用，别为地址重试。"
+            } finally {
+                latch.countDown()
+            }
+        }
+        worker.isDaemon = true
+        worker.start()
+        if (!latch.await(placeBudgetSec, TimeUnit.SECONDS)) {
+            return null to "反查地址超时（${placeBudgetSec}s，多半是没网）—— 坐标照用，" +
+                "要地址可以让用户直接说，或者在没有网络问题后重试。"
+        }
+        val a = box[0]
+            ?: return null to (failure ?: "这个坐标反查不到地址（海面 / 没有地图数据的区域）。")
+        return placeJson(a, lat, lon) to null
+    }
+
+    /**
+     * 一个坐标的"人话"形状：地址行 + 省/市/区/街道/POI 的分项。
+     *
+     * `getAddressLine(0)` 直接给一整行（"上海市黄浦区中山东一路1号"），够模型念；
+     * 分项是为了让"哪个市哪个区"能被单独回答（用户问"我在哪个区"时不必再切字符串）。
+     *
+     * 两处实测补丁（Pixel 10 / API 37）：
+     * - **直辖市没有 `locality`**：北京回的是 adminArea=北京市 + subLocality=东城区，
+     *   locality=null —— 不做回退的话「哪个市」就是空的，所以 city 一路回退到
+     *   adminArea（省 == 市，直辖市就是这样，不合并）。
+     * - **`featureName` 不可靠**：实测会给加号网格码（`W95W+FXQ`）、门牌号本身
+     *   （`poi=1` 同时 `number=1`）、或干脆是邮编 / 区名（`poi=100051`、`poi=西湖区`）
+     *   —— 就这么给模型，它会拿 `W95W+FXQ` 当地名说。过滤后宁可回 `-`。
+     */
+    private fun placeJson(a: android.location.Address, lat: Double, lon: Double): JSONObject {
+        val city = a.locality ?: a.subAdminArea ?: a.adminArea
+        val street = a.thoroughfare
+        val number = a.subThoroughfare
+        val district = a.subLocality
+        val poi = a.featureName?.takeIf {
+            it.isNotBlank() && it != number && it != street && it != district &&
+                !it.all(Char::isDigit) && !PLUS_CODE.matches(it)
+        }
+        val parts = listOfNotNull(a.countryName, a.adminArea, city, district, street, number)
+        val line = a.getAddressLine(0)?.takeIf { it.isNotBlank() } ?: parts.joinToString("")
+        return JSONObject()
             .put("latitude", lat)
             .put("longitude", lon)
-            .put("address", a.getAddressLine(0) ?: "")
+            .put("address", line)
+            .put("poi", poi ?: JSONObject.NULL)
             .put("country", a.countryName ?: JSONObject.NULL)
-            .put("admin", a.adminArea ?: JSONObject.NULL)
-            .put("locality", a.locality ?: JSONObject.NULL)
+            .put("province", a.adminArea ?: JSONObject.NULL)
+            .put("city", city ?: JSONObject.NULL)
+            .put("district", district ?: JSONObject.NULL)
+            .put("street", street ?: JSONObject.NULL)
+            .put("number", number ?: JSONObject.NULL)
+    }
+
+    /** 加号网格码（Open Location Code）：`W95W+FXQ` —— 不是地名，别当 poi 回。 */
+    private val PLUS_CODE = Regex("""^[0-9A-Z]{4,8}\+[0-9A-Z]{2,3}$""")
 
     // ── contacts ────────────────────────────────────────────────────────
 

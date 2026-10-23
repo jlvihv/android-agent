@@ -85,12 +85,30 @@ messages:
   2026-10-15T20:19:19 | 1 | 10086 | 验证码 123456 | inbox
   …
 
-$ agent location current
-accuracy_m: 5
-latitude: 31.2304
-longitude: 121.4737
-source: fresh
-…
+$ agent location current          # 真机实测（Pixel 10 / API 37）
+accuracy_m: 100
+age_seconds: 17
+latitude: 30.3381507
+longitude: 121.2180989
+place:
+  address: 中国浙江省宁波市慈溪市滨海大桥 邮政编码: 315327
+  city: 宁波市
+  country: 中国
+  district: 慈溪市
+  latitude: 30.3381507
+  longitude: 121.2180989
+  number: -
+  poi: -
+  province: 浙江省
+  street: 滨海大桥
+provider: fused
+providers_enabled:
+  - passive
+  - network
+  - fused
+  - gps
+source: last_known
+time: 2026-10-23T12:39:31
 ```
 
 - 壳回的是 `{"ok":…,"data":…}` / `{"ok":false,"error":{"code","message"}}`，**核心排成纯文本**
@@ -99,6 +117,11 @@ source: fresh
   —— `&&` 链因此会断，模型不会拿着空输出往下走；错误码留着，让它分得清「用户拒了权限」
   和「参数错了」。
 - `--help` 每个命令都认（用法文本由 Kotlin 回，避免两处各写一份）。
+- `location current` 的 `place` 是**默认**带的：模型拿到 `30.338/121.218` 说不出「在哪个市
+  哪个区」，而用户问「我在哪」就是问这个。一整行 `address` 够直接念，`province / city /
+  district / street / poi` 分项让「哪个区」能被单独回答。反查失败（没网 / 没 Google 服务 /
+  6 秒超时）只多一个 `place_error`，**坐标照回** —— 地址是锦上添花，不能连累定位本身；
+  `--no-address` 跳过反查（实测从 1.1s 降到 0.05s）。同一坐标点缓存 10 分钟、失败 2 分钟。
 - 参数从 shell 原样传过去（`{"cmd":"sms","argv":["list","--limit","2"]}`），
   解析在 Kotlin（`PhoneArgs`）：Rust 那边不需要懂每个命令的参数，加子命令不用动它。
 
@@ -144,8 +167,9 @@ source: fresh
 | `screenshot`                            | ✅ 真机实测：1080×2424 / 314KB PNG 落到 `/workspace`，内容就是当时的屏幕（打开无障碍服务之后）                                                                 |
 | `agent tap` / `swipe` / `key`           | ✅ 无障碍一开就跟着能用（实测 `home` 键）—— 这两件事本来就是同一只服务                                                                                         |
 | `alarm set --repeat weekdays` / `timer` | ✅ 交给系统时钟（`SKIP_UI` 只是请求）；`cancel --id` 明确说不支持                                                                                              |
-| `location current`                      | ✅ `adb emu geo fix` 之后拿到 `source:fresh` 的坐标（模拟器）；真机室内定不上，优雅降级到 `last_known_stale` + note（见下）                                    |
-| `location forward`                      | ✅ 真机（有 Google 服务）：“上海外滩” → 31.2402,121.4906；⚠️ 模拟器无 GMS 时回 `gcaa: UNAVAILABLE`（已翻成人话）                                               |
+| `location current`                      | ✅ 真机 Pixel 10 / API 37：1.1s 拿到坐标 + `place`（中国浙江省宁波市慈溪市滨海大桥：province 浙江省 / city 宁波市 / district 慈溪市）；`--no-address` 0.05s 只回坐标；同一坐标点第二次 0.04s（缓存）。模拟器无 GMS 时回坐标 + `place_error` |
+| `location geocode`                      | ✅ 真机：天安门 → 北京市 / 东城区 / 西长安街1号；嘉善县 → 浙江省 / 嘉兴市 / 嘉善县；昆山市 → 江苏省 / 苏州市 / 昆山市；东京 → Tokyo / Chiyoda City / 东京站；太平洋 (0,-160) → `（无）` |
+| `location forward`                      | ✅ 真机（有 Google 服务）：“上海外滩” → 31.2402,121.4906；“杭州西湖” → 30.2596,120.1303（杭州市 / 西湖区）；⚠️ 模拟器无 GMS 时回 `gcaa: UNAVAILABLE`（已翻成人话）                                               |
 | `contacts list/search/get`              | ✅ 造了一个联系人（张三 / 13800138000 / 邮箱）走通；不存在 id → `not_found`                                                                                    |
 | `calendar calendars/list/create/delete` | ✅ 定时事件、**全天事件**（UTC 午夜那条约定，见下）都对                                                                                                        |
 | `sms list/stats`                        | ✅ `adb emu sms send` 发的短信读得到                                                                                                                           |
@@ -157,6 +181,12 @@ source: fresh
 
 两个坑记一下：
 
+- **Google Geocoder 的字段不可信**（实测 Pixel 10 / API 37）。① 直辖市没有 `locality`：
+  北京回 `adminArea=北京市` + `subLocality=东城区`，`locality=null` —— `city` 不做回退
+  （`locality ?: subAdminArea ?: adminArea`）的话「哪个市」就是空的。② `featureName` 常
+  常不是地名：加号网格码 `W95W+FXQ`、门牌号本身、邮编 `100051`、甚至区名 `西湖区` ——
+  就这么当 `poi` 回给模型，它会拿 `W95W+FXQ` 当地名说。现在是和 number / street / district
+  相同、纯数字、加号码这四种都丢掉，宁可回 `-`。
 - **全天事件必须用 UTC 午夜**。CalendarProvider 按 UTC 解读全天事件的时间戳，
   给本地午夜的话事件会跑到前一天/后一天（实测：创建 `2026-11-05` 读回来是 `10-21`）。
   现在 `parseAllDayUtc` / `isoDateUtc` 成对处理，`EVENT_TIMEZONE` 全天时写 `"UTC"`。
