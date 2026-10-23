@@ -77,7 +77,7 @@ const host = (): BackHost | undefined =>
  * 里都没有壳。
  */
 export function hasShell(): boolean {
-  return typeof host()?.useLocal === 'function';
+  return typeof host()?.useLocal === "function";
 }
 
 /** 让壳开始 / 停止在局域网里找电脑（面板开着时才找）。桌面：什么都不做。 */
@@ -128,7 +128,7 @@ function syncHost(): void {
   host()?.setBackHandled?.(stack.length > 0);
 }
 
-export type PredictivePhase = 'start' | 'progress' | 'cancel' | 'commit';
+export type PredictivePhase = "start" | "progress" | "cancel" | "commit";
 
 declare global {
   interface Window {
@@ -142,8 +142,8 @@ declare global {
   }
 }
 
-if (typeof window !== 'undefined') {
-  addEventListener('popstate', () => {
+if (typeof window !== "undefined") {
+  addEventListener("popstate", () => {
     if (skip > 0) {
       skip--;
       return;
@@ -157,16 +157,17 @@ if (typeof window !== 'undefined') {
   window.__predictiveBack = (phase, progress = 0) => {
     const top = stack.at(-1);
     if (!top) return;
-    if (phase === 'commit') {
+    if (phase === "commit") {
       // 有跟手位移的从当前位置接着收尾；没给 peek 的（万一以后有）也要能关掉
       if (top.peek) top.peek.onEnd(true);
       else top.close();
       return;
     }
     if (!top.peek) return;
-    if (phase === 'start') top.peek.onStart();
-    else if (phase === 'progress') top.peek.onMove(Math.min(1, Math.max(0, progress)));
-    else if (phase === 'cancel') top.peek.onEnd(false);
+    if (phase === "start") top.peek.onStart();
+    else if (phase === "progress")
+      top.peek.onMove(Math.min(1, Math.max(0, progress)));
+    else if (phase === "cancel") top.peek.onEnd(false);
   };
 }
 
@@ -177,7 +178,7 @@ if (typeof window !== 'undefined') {
  * 拖拽三件套传进来）。
  */
 export function onBack(close: () => void, peek?: Peek): () => void {
-  history.pushState({ overlay: stack.length + 1 }, '');
+  history.pushState({ overlay: stack.length + 1 }, "");
   stack.push({ close, peek });
   syncHost();
   return () => {

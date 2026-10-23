@@ -14,8 +14,8 @@
    *              算好（见 `core/src/openai.rs` 的 `UsageView`），前端只读不重算。
    *              数字用 k / M 这种给人看的格式。
    */
-  import { type SessionUsage } from '../lib/sse';
-  import Sheet from './Sheet.svelte';
+  import { type SessionUsage } from "../lib/sse";
+  import Sheet from "./Sheet.svelte";
 
   let {
     usage,
@@ -53,13 +53,13 @@
     ratio == null
       ? null
       : ratio > 0 && ratio * 100 < TINY_PCT
-        ? '<1'
+        ? "<1"
         : String(Math.round(ratio * 100)),
   );
   /** 面板和 tooltip 用的百分比：一位小数（环里那个数是整数 —— 那地方小，塞不下） */
-  const pctLabel = $derived(ratio == null ? null : `${(ratio * 100).toFixed(1)}%`);
-
-
+  const pctLabel = $derived(
+    ratio == null ? null : `${(ratio * 100).toFixed(1)}%`,
+  );
 
   // —— 数字排版 ——
   //
@@ -72,7 +72,6 @@
     return String(n);
   }
   const fmtPct = (r: number) => `${(r * 100).toFixed(1)}%`;
-
 </script>
 
 <!--
@@ -86,9 +85,22 @@
 {#snippet ring(size: number, r: number, sw: number, fs: number)}
   {@const c = 2 * Math.PI * r}
   {@const half = size / 2}
-  <svg width={size} height={size} viewBox="0 0 {size} {size}" fill="none" class="text-muted">
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 {size} {size}"
+    fill="none"
+    class="text-muted"
+  >
     <!-- 轨道 -->
-    <circle cx={half} cy={half} {r} stroke="currentColor" stroke-width={sw} class="text-muted/30" />
+    <circle
+      cx={half}
+      cy={half}
+      {r}
+      stroke="currentColor"
+      stroke-width={sw}
+      class="text-muted/30"
+    />
     <!-- 用量。没有上限时只有轨道（不给假信息） -->
     {#if ratio != null}
       <circle
@@ -143,11 +155,13 @@
         {@render ring(RING_BIG.size, RING_BIG.r, RING_BIG.sw, RING_BIG.fs)}
         <div class="flex min-w-0 flex-col">
           <span class="text-[17px]">
-            {fmt(used)}{#if ctxWindow}<span class="text-muted"> / {fmt(ctxWindow)}</span>{/if}
+            {fmt(used)}{#if ctxWindow}<span class="text-muted">
+                / {fmt(ctxWindow)}</span
+              >{/if}
           </span>
           <span class="text-meta text-muted">
             {pctLabel == null
-              ? '不知道这个模型的上下文上限（models.dev 里没有）'
+              ? "不知道这个模型的上下文上限（models.dev 里没有）"
               : `用掉 ${pctLabel} 的上下文`}
           </span>
         </div>
@@ -158,30 +172,48 @@
            数字仍然用 k / M 这种给人看的格式（DSH 那边是精确值）。 -->
       <div class="overflow-hidden rounded-2xl bg-surface">
         {#if total.cache_hit_ratio != null}
-          <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
+          <div
+            class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
+          >
             <span class="text-[15px]">缓存命中</span>
             <span class="ml-auto text-[15px] text-muted">
               {fmtPct(total.cache_hit_ratio)}
             </span>
           </div>
         {/if}
-        <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
+        <div
+          class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
+        >
           <span class="text-[15px]">未缓存输入</span>
-          <span class="ml-auto text-[15px] text-muted">{fmt(total.uncached_input)} token</span>
+          <span class="ml-auto text-[15px] text-muted"
+            >{fmt(total.uncached_input)} token</span
+          >
         </div>
-        <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
+        <div
+          class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
+        >
           <span class="text-[15px]">缓存读取</span>
-          <span class="ml-auto text-[15px] text-muted">{fmt(total.cache_read)} token</span>
+          <span class="ml-auto text-[15px] text-muted"
+            >{fmt(total.cache_read)} token</span
+          >
         </div>
         {#if total.cache_write > 0}
-          <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
+          <div
+            class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
+          >
             <span class="text-[15px]">缓存写入</span>
-            <span class="ml-auto text-[15px] text-muted">{fmt(total.cache_write)} token</span>
+            <span class="ml-auto text-[15px] text-muted"
+              >{fmt(total.cache_write)} token</span
+            >
           </div>
         {/if}
-        <div class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0">
+        <div
+          class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
+        >
           <span class="text-[15px]">输出</span>
-          <span class="ml-auto text-[15px] text-muted">{fmt(total.output)} token</span>
+          <span class="ml-auto text-[15px] text-muted"
+            >{fmt(total.output)} token</span
+          >
         </div>
       </div>
     </div>

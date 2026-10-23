@@ -32,16 +32,16 @@
    * 往左拖可以跟手关掉。遮罩也在这里，跟面板一起淡入淡出。
    * 没有关闭按钮：往左拖、点遮罩、按返回键都能关。
    */
-  import { fade, slide } from 'svelte/transition';
-  import { quintOut } from 'svelte/easing';
-  import { onBack } from '../lib/overlay';
-  import { dismissable, RELEASE } from '../lib/drag';
-  import Icon from './Icon.svelte';
-  import { untrack } from 'svelte';
-  import { machines } from '../lib/machines.svelte.ts';
-  import { favorites, type Favorite } from '../lib/favorites.svelte.ts';
-  import { sandboxPath } from '../lib/markdown';
-  import { openViewer } from '../lib/viewer.svelte.ts';
+  import { fade, slide } from "svelte/transition";
+  import { quintOut } from "svelte/easing";
+  import { onBack } from "../lib/overlay";
+  import { dismissable, RELEASE } from "../lib/drag";
+  import Icon from "./Icon.svelte";
+  import { untrack } from "svelte";
+  import { machines } from "../lib/machines.svelte.ts";
+  import { favorites, type Favorite } from "../lib/favorites.svelte.ts";
+  import { sandboxPath } from "../lib/markdown";
+  import { openViewer } from "../lib/viewer.svelte.ts";
 
   export type Session = {
     id: string;
@@ -52,7 +52,13 @@
     busy?: boolean;
   };
   /** 搜索命中（GET /api/search） */
-  export type Hit = { id: string; title: string; active: boolean; role: string; snippet: string };
+  export type Hit = {
+    id: string;
+    title: string;
+    active: boolean;
+    role: string;
+    snippet: string;
+  };
 
   let {
     sessions,
@@ -129,7 +135,7 @@
   const MENU_GAP = 0.5;
 
   // —— 搜索 ——
-  let q = $state('');
+  let q = $state("");
   let hits = $state<Hit[]>([]);
   let searching = $state(false);
 
@@ -154,9 +160,9 @@
       只去强调和反引号，以及最前面那个列表项标记 —— 正文里的 `1)` `-` 是内容。 */
   function plain(s: string): string {
     return s
-      .replace(/\*\*|__|`{1,3}/g, '')
-      .replace(/^\s*(#+|\d+[.)]|[-*+])\s+/, '')
-      .replace(/\s+/g, ' ')
+      .replace(/\*\*|__|`{1,3}/g, "")
+      .replace(/^\s*(#+|\d+[.)]|[-*+])\s+/, "")
+      .replace(/\s+/g, " ")
       .trim();
   }
 
@@ -219,7 +225,7 @@
   let dragging = $state(false);
 
   const drag = {
-    axis: 'x' as const,
+    axis: "x" as const,
     dir: -1 as const,
     size: () => aside?.offsetWidth ?? 1,
     onStart: () => {
@@ -288,20 +294,26 @@
     return {
       duration: SLIDE_OUT_MS * (1 - from) + SLIDE_OUT_MIN_MS,
       easing: quintOut,
-      css: (_t: number, u: number) => `transform: translateX(${-(from + (1 - from) * u) * 100}%)`,
+      css: (_t: number, u: number) =>
+        `transform: translateX(${-(from + (1 - from) * u) * 100}%)`,
     };
   }
 
   // 长按弹出的菜单。会话两行（重命名 / 删除），收藏一行（取消收藏）
-  let menu = $state<{ kind: 'session' | 'page'; id: string; x: number; y: number } | null>(null);
+  let menu = $state<{
+    kind: "session" | "page";
+    id: string;
+    x: number;
+    y: number;
+  } | null>(null);
   // 正在重命名的行
   let renaming = $state<string | null>(null);
-  let draft = $state('');
+  let draft = $state("");
 
   let pressTimer: ReturnType<typeof setTimeout> | undefined;
   let longPressed = false;
 
-  function pressStart(e: PointerEvent, kind: 'session' | 'page', id: string) {
+  function pressStart(e: PointerEvent, kind: "session" | "page", id: string) {
     longPressed = false;
     clearTimeout(pressTimer);
     const { clientX: x, clientY: y } = e;
@@ -321,7 +333,7 @@
 
   function pick(id: string) {
     const s = sessions.find((v) => v.id === id);
-    draft = s?.title ?? '';
+    draft = s?.title ?? "";
     renaming = id;
     menu = null;
   }
@@ -335,7 +347,7 @@
   }
 
   function commitRename() {
-    if (renaming) onrename(renaming, draft.trim() || '新对话');
+    if (renaming) onrename(renaming, draft.trim() || "新对话");
     renaming = null;
   }
 </script>
@@ -374,7 +386,7 @@
       </p>
       {#each favorites.list as f (f.path)}
         <button
-          onpointerdown={(e) => pressStart(e, 'page', f.path)}
+          onpointerdown={(e) => pressStart(e, "page", f.path)}
           onpointerup={pressEnd}
           onpointercancel={pressEnd}
           oncontextmenu={(e) => e.preventDefault()}
@@ -396,7 +408,7 @@
     {#if q.trim()}
       {#if hits.length === 0}
         <p class="px-3 py-3 text-sm text-faint">
-          {searching ? '搜索中…' : '没有匹配的对话'}
+          {searching ? "搜索中…" : "没有匹配的对话"}
         </p>
       {:else}
         {#each groups as g (g.id)}
@@ -412,10 +424,11 @@
             >
               <span class="line-clamp-2 text-sm"
                 ><span class="mr-1.5 text-meta text-faint"
-                  >{h.role === 'user' ? '你' : 'agent'}</span
+                  >{h.role === "user" ? "你" : "agent"}</span
                 >{#each mark(plain(h.snippet), q) as p}{#if p.hit}<mark
                       class="bg-transparent font-medium text-fg">{p.t}</mark
-                    >{:else}<span class="text-muted">{p.t}</span>{/if}{/each}</span
+                    >{:else}<span class="text-muted">{p.t}</span
+                    >{/if}{/each}</span
               >
             </button>
           {/each}
@@ -430,12 +443,12 @@
             bind:value={draft}
             use:focusOnMount
             onblur={commitRename}
-            onkeydown={(e) => e.key === 'Enter' && commitRename()}
+            onkeydown={(e) => e.key === "Enter" && commitRename()}
             class="my-1 w-full rounded-2xl bg-active px-3 py-3 text-base text-fg outline-none"
           />
         {:else}
           <button
-            onpointerdown={(e) => pressStart(e, 'session', s.id)}
+            onpointerdown={(e) => pressStart(e, "session", s.id)}
             onpointerup={pressEnd}
             onpointercancel={pressEnd}
             oncontextmenu={(e) => e.preventDefault()}
@@ -450,7 +463,10 @@
             <span class="min-w-0 flex-1 truncate text-base">{s.title}</span>
             {#if s.busy}
               <!-- 还在跑：切走了也看得出来 -->
-              <span class="size-1.5 shrink-0 animate-pulse rounded-full bg-warn" aria-label="运行中"></span>
+              <span
+                class="size-1.5 shrink-0 animate-pulse rounded-full bg-warn"
+                aria-label="运行中"
+              ></span>
             {/if}
           </button>
         {/if}
@@ -483,15 +499,21 @@
          `text-sm` + `muted`，和输入框那个模型药丸同档。名字太长就截断：`min-w-0`
          让整块可以在需要时收窄（不写死宽度上限）。 -->
     <svelte:element
-      this={onmachine ? 'button' : 'span'}
-      type={onmachine ? 'button' : undefined}
-      role={onmachine ? undefined : 'status'}
+      this={onmachine ? "button" : "span"}
+      type={onmachine ? "button" : undefined}
+      role={onmachine ? undefined : "status"}
       onclick={onmachine ?? undefined}
-      title={onmachine ? `现在连的是${machine.name}（点一下换一台）` : `现在连的是${machine.name}`}
+      title={onmachine
+        ? `现在连的是${machine.name}（点一下换一台）`
+        : `现在连的是${machine.name}`}
       class="ml-auto flex min-w-0 items-center gap-1.5 text-sm text-muted"
     >
       <span class="truncate">{machine.name}</span>
-      <Icon name={machine.phone ? 'phone' : 'computer'} size={15} class="shrink-0" />
+      <Icon
+        name={machine.phone ? "phone" : "computer"}
+        size={15}
+        class="shrink-0"
+      />
     </svelte:element>
   </div>
 {/snippet}
@@ -504,8 +526,8 @@
        absolute + inset-inline:0，没有定位祖先就按整个视口铺 —— 会横穿对话区，
        在滚动条和正文上压出两道暗带（踩过）。窄屏那个是 fixed，不受影响。 -->
   <aside
-    in:slide|global={{ axis: 'x', duration: PIN_MS }}
-    out:slide|global={{ axis: 'x', duration: PIN_MS }}
+    in:slide|global={{ axis: "x", duration: PIN_MS }}
+    out:slide|global={{ axis: "x", duration: PIN_MS }}
     class="drawer-shell relative flex h-full w-72 shrink-0 flex-col border-r border-hairline bg-drawer
            pt-[env(safe-area-inset-top)]"
   >
@@ -515,7 +537,7 @@
   <button
     class="fixed inset-0 z-40 bg-scrim"
     style:opacity={1 - off}
-    style:transition={dragging ? 'none' : 'opacity 280ms ease-out'}
+    style:transition={dragging ? "none" : "opacity 280ms ease-out"}
     aria-label="关闭"
     onclick={onclose}
     in:scrimIn|global
@@ -526,7 +548,7 @@
     bind:this={aside}
     use:dismissable={drag}
     style:transform={off ? `translateX(${-off * 100}%)` : null}
-    style:transition={dragging ? 'none' : RELEASE}
+    style:transition={dragging ? "none" : RELEASE}
     class="drawer-shell fixed top-0 bottom-[var(--kb,0px)] left-0 z-50 flex w-[var(--drawer-w)]
            flex-col bg-drawer pt-[env(safe-area-inset-top)] will-change-transform"
     in:slideIn|global
@@ -539,13 +561,19 @@
 {#if menu}
   {@const m = menu}
   <!-- 长按菜单。点别处关掉。 -->
-  <button class="fixed inset-0 z-[60]" aria-label="关闭菜单" onclick={() => (menu = null)}></button>
+  <button
+    class="fixed inset-0 z-[60]"
+    aria-label="关闭菜单"
+    onclick={() => (menu = null)}
+  ></button>
   <div
     class="fixed z-[61] w-40 overflow-hidden rounded-2xl bg-bubble shadow-2xl shadow-drop"
     style="left: min({m.x}px, calc(var(--drawer-w) - {MENU_W + MENU_GAP}rem));
-           top: min({m.y}px, calc(100dvh - {(m.kind === 'page' ? MENU_ONE_H : MENU_H) + MENU_GAP}rem))"
+           top: min({m.y}px, calc(100dvh - {(m.kind === 'page'
+      ? MENU_ONE_H
+      : MENU_H) + MENU_GAP}rem))"
   >
-    {#if m.kind === 'page'}
+    {#if m.kind === "page"}
       <!-- 收藏行只有一件事可做：取消（重命名没做 —— 标题是页面自己的，
            真嫌长了改页面 <title> 更直接） -->
       <button

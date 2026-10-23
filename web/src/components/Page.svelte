@@ -9,11 +9,11 @@
    * 几个页面叠着开（设置 → 某个服务商）时，每页各自在 lib/overlay.ts 登记，
    * 返回键先关最上面那一页。
    */
-  import type { Snippet } from 'svelte';
-  import { quintOut } from 'svelte/easing';
-  import Icon from './Icon.svelte';
-  import { onBack } from '../lib/overlay';
-  import { dismissable, RELEASE } from '../lib/drag';
+  import type { Snippet } from "svelte";
+  import { quintOut } from "svelte/easing";
+  import Icon from "./Icon.svelte";
+  import { onBack } from "../lib/overlay";
+  import { dismissable, RELEASE } from "../lib/drag";
 
   let {
     title,
@@ -36,7 +36,7 @@
   }
 
   const drag = {
-    axis: 'x' as const,
+    axis: "x" as const,
     dir: 1 as const,
     size: () => box?.offsetWidth ?? 1,
     onStart: () => (dragging = true),
@@ -61,8 +61,11 @@
   /** 输入框拿到焦点：等键盘弹完（`--kb` 更新、底部留白撑开）再滚到中间 */
   function revealFocused(e: FocusEvent) {
     const t = e.target as HTMLElement | null;
-    if (!t || !t.matches('input, textarea')) return;
-    setTimeout(() => t.scrollIntoView({ block: 'center', behavior: 'smooth' }), 350);
+    if (!t || !t.matches("input, textarea")) return;
+    setTimeout(
+      () => t.scrollIntoView({ block: "center", behavior: "smooth" }),
+      350,
+    );
   }
 
   /** 从当前拖到的位置接着滑出去，不跳回原位再走 */
@@ -71,7 +74,8 @@
     return {
       duration: 240 * (1 - from) + 80,
       easing: quintOut,
-      css: (_t: number, u: number) => `transform: translateX(${(from + (1 - from) * u) * 100}%)`,
+      css: (_t: number, u: number) =>
+        `transform: translateX(${(from + (1 - from) * u) * 100}%)`,
     };
   }
 </script>
@@ -81,13 +85,15 @@
   use:dismissable={drag}
   class="fixed inset-0 z-[60] flex flex-col bg-ink will-change-transform"
   style:transform={off ? `translateX(${off * 100}%)` : null}
-  style:transition={dragging ? 'none' : RELEASE}
+  style:transition={dragging ? "none" : RELEASE}
   in:slideIn|global
   out:slideOut|global
   aria-label={title}
 >
   <!-- 顶栏高度和对话页 / 查看器一样（`--hdr`，含安全区；安全区当内边距扣掉） -->
-  <header class="flex h-[var(--hdr)] shrink-0 items-center gap-2 px-3 pt-[env(safe-area-inset-top)]">
+  <header
+    class="flex h-[var(--hdr)] shrink-0 items-center gap-2 px-3 pt-[env(safe-area-inset-top)]"
+  >
     <button class="p-1 text-fg" aria-label="返回" onclick={onclose}>
       <Icon name="back" size={20} />
     </button>

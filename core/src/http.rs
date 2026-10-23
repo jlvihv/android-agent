@@ -1362,7 +1362,11 @@ async fn save_favorite(
         return (StatusCode::BAD_REQUEST, "路径要是沙箱里的绝对路径").into_response();
     };
     let Some(db) = st.db() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "这台机器没有库，记不下收藏").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "这台机器没有库，记不下收藏",
+        )
+            .into_response();
     };
     let title = body.title.trim();
     let title: String = if title.is_empty() {
@@ -1376,7 +1380,11 @@ async fn save_favorite(
         title.chars().take(FAVORITE_TITLE_MAX).collect()
     };
     if let Err(e) = db.set_favorite(&path, Some(&title)) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("存不进去：{e:#}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("存不进去：{e:#}"),
+        )
+            .into_response();
     }
     match favorites_payload(&st) {
         Ok(v) => Json(v).into_response(),
@@ -4466,7 +4474,10 @@ mod tests {
         for argv in [serde_json::json!([]), serde_json::json!(["help"])] {
             let t = body(argv.clone()).await;
             assert!(t.contains("agent shizuku"), "{argv}: {t}");
-            assert!(t.trim_end().ends_with("uid=0"), "{argv} 最后一行是状态：{t}");
+            assert!(
+                t.trim_end().ends_with("uid=0"),
+                "{argv} 最后一行是状态：{t}"
+            );
         }
 
         // 没有宿主（桌面上）：一句人话，不是 panic

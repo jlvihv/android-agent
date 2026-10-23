@@ -11,19 +11,23 @@
    *
    * 每个思考、每次工具调用**各开各的面板**，面板里只有它自己。
    */
-  import { tick, untrack } from 'svelte';
-  import { wantOlder as olderWanted, wantCollapse as collapseWanted, insertNow } from '../lib/window';
-  import Img from './Img.svelte';
-  import { cubicIn } from 'svelte/easing';
-  import { fade } from 'svelte/transition';
-  import type { Message, ToolPart } from '../lib/sse';
-  import { sandboxPath } from '../lib/markdown';
-  import { describeInput, describeResult, failed } from '../lib/toolview';
-  import Icon from './Icon.svelte';
-  import { openViewer } from '../lib/viewer.svelte.ts';
-  import Markdown from './Markdown.svelte';
-  import Sheet from './Sheet.svelte';
-  import ThoughtLine from './ThoughtLine.svelte';
+  import { tick, untrack } from "svelte";
+  import {
+    wantOlder as olderWanted,
+    wantCollapse as collapseWanted,
+    insertNow,
+  } from "../lib/window";
+  import Img from "./Img.svelte";
+  import { cubicIn } from "svelte/easing";
+  import { fade } from "svelte/transition";
+  import type { Message, ToolPart } from "../lib/sse";
+  import { sandboxPath } from "../lib/markdown";
+  import { describeInput, describeResult, failed } from "../lib/toolview";
+  import Icon from "./Icon.svelte";
+  import { openViewer } from "../lib/viewer.svelte.ts";
+  import Markdown from "./Markdown.svelte";
+  import Sheet from "./Sheet.svelte";
+  import ThoughtLine from "./ThoughtLine.svelte";
 
   let {
     messages,
@@ -46,7 +50,7 @@
      */
     follow = 0,
     /** 当前会话 id：变了（切会话 / 第一次装载）就把视口落在尾部 */
-    session = '',
+    session = "",
     /** 服务端还有没有更早的（`App` 说）—— 手上这一段到顶了就自己叫 `onloadearlier` 去要 */
     hasolder = false,
     /** 往上翻到头（或这一窗还不到一屏）时去服务端要一窗更早的。返回 true = 真的拿到了 */
@@ -80,11 +84,13 @@
    * 一致，变的只有颜色，见 `userMessage` 上面那段注释。
    */
   const bubbleFrame = (queued: boolean) =>
-    `border border-dashed transition-colors duration-200 ${queued ? 'border-control bg-bubble/40' : 'border-transparent bg-bubble'}`;
+    `border border-dashed transition-colors duration-200 ${queued ? "border-control bg-bubble/40" : "border-transparent bg-bubble"}`;
 
   /** 当前打开的面板。一次只有一个。 */
   let sheet = $state<
-    { kind: 'reasoning'; part: { text: string } } | { kind: 'tool'; msg: Message; tool: ToolPart } | null
+    | { kind: "reasoning"; part: { text: string } }
+    | { kind: "tool"; msg: Message; tool: ToolPart }
+    | null
   >(null);
 
   /**
@@ -99,22 +105,24 @@
     // JSON.parse —— 模型用 edit 写一个 30KB 的文件，就是几千次 × 30KB 的反复
     // 扫描，手机上肉眼可见地卡。
     const a = summaryArgs(t);
-    const s = (v: unknown) => (typeof v === 'string' ? v : '');
+    const s = (v: unknown) => (typeof v === "string" ? v : "");
     // 只取第一行，长度交给 CSS 截断 —— 屏幕多宽就显示多少
-    const firstLine = (v: string) => v.split('\n')[0].trim();
+    const firstLine = (v: string) => v.split("\n")[0].trim();
 
     switch (t.toolName) {
-      case 'read':
-        return `读取 ${s(a.path) || '文件'}`;
-      case 'bash':
-        return firstLine(s(a.command)) || '执行命令';
-      case 'edit':
+      case "read":
+        return `读取 ${s(a.path) || "文件"}`;
+      case "bash":
+        return firstLine(s(a.command)) || "执行命令";
+      case "edit":
         // 新建还是改写：核心用 `content` / `edits` 两个参数区分（见 core 的
         // edit_mode），这里认同一个信号 —— 两个都给是报错的用法，认 `content`
         // 就行（那一行也会是红的）。摘要里也分两种说法，跟图标对得上。
-        return isNewFile(a) ? `新建 ${s(a.path) || '文件'}` : `编辑 ${s(a.path) || '文件'}`;
+        return isNewFile(a)
+          ? `新建 ${s(a.path) || "文件"}`
+          : `编辑 ${s(a.path) || "文件"}`;
       default:
-        return t.toolName || '工具调用';
+        return t.toolName || "工具调用";
     }
   }
 
@@ -130,7 +138,10 @@
    * 新建文件的那个 `content` 就在开头（path 只有几个字符），这一截里照样认得出。
    */
   const summaryArgs = (t: ToolPart) =>
-    (t.input ?? partialArgs(t.inputText.slice(0, SUMMARY_SCAN))) as Record<string, unknown>;
+    (t.input ?? partialArgs(t.inputText.slice(0, SUMMARY_SCAN))) as Record<
+      string,
+      unknown
+    >;
 
   /**
    * 从还没写完的参数 JSON 里抠出已经出现的字段。
@@ -149,28 +160,29 @@
     const out: Record<string, unknown> = {};
     for (const m of text.matchAll(/"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)/g)) {
       // 末尾可能是半个转义（`\`），去掉再解
-      const raw = m[2].replace(/\\(u[0-9a-fA-F]{0,3})?$/, '');
+      const raw = m[2].replace(/\\(u[0-9a-fA-F]{0,3})?$/, "");
       try {
         out[m[1]] = JSON.parse(`"${raw}"`);
       } catch {
         out[m[1]] = raw;
       }
     }
-    for (const m of text.matchAll(/"(\w+)"\s*:\s*(-?\d+)\s*[,}]/g)) out[m[1]] = Number(m[2]);
+    for (const m of text.matchAll(/"(\w+)"\s*:\s*(-?\d+)\s*[,}]/g))
+      out[m[1]] = Number(m[2]);
     return out;
   }
 
   /** 面板标题。要短，细节放正文。 */
   function toolTitle(t: ToolPart, args: Record<string, unknown>): string {
     switch (t.toolName) {
-      case 'read':
-        return '读取文件';
-      case 'bash':
-        return '执行命令';
-      case 'edit':
-        return isNewFile(args) ? '新建文件' : '编辑文件';
+      case "read":
+        return "读取文件";
+      case "bash":
+        return "执行命令";
+      case "edit":
+        return isNewFile(args) ? "新建文件" : "编辑文件";
       default:
-        return t.toolName || '工具调用';
+        return t.toolName || "工具调用";
     }
   }
 
@@ -178,7 +190,7 @@
   const isNewFile = (a: Record<string, unknown>) => a.content !== undefined;
 
   /** 这几个图标名字得和 Icon.svelte 里的一致（写错了下面会编译报错） */
-  type ToolIcon = 'file' | 'newfile' | 'terminal' | 'pencil' | 'clock';
+  type ToolIcon = "file" | "newfile" | "terminal" | "pencil" | "clock";
 
   /**
    * 工具那一行左边的小图标：一眼能看出这次是在读、在跑命令、还是在改文件。
@@ -188,17 +200,19 @@
    * 这里会编译报错，不会静静地画不出东西。
    */
   const TOOL_ICON: Record<string, ToolIcon> = {
-    read: 'file',
-    bash: 'terminal',
-    edit: 'pencil',
+    read: "file",
+    bash: "terminal",
+    edit: "pencil",
   };
   function toolIcon(t: ToolPart): ToolIcon {
-    if (t.toolName === 'edit') return isNewFile(summaryArgs(t)) ? 'newfile' : 'pencil';
-    return TOOL_ICON[t.toolName] ?? 'clock';
+    if (t.toolName === "edit")
+      return isNewFile(summaryArgs(t)) ? "newfile" : "pencil";
+    return TOOL_ICON[t.toolName] ?? "clock";
   }
 
   /** 参数还在流式时从半截 JSON 里抠（见 partialArgs） */
-  const argsOf = (t: ToolPart) => (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
+  const argsOf = (t: ToolPart) =>
+    (t.input ?? partialArgs(t.inputText)) as Record<string, unknown>;
 
   /**
    * 面板里那份参数。面板要**完整**的参数（不能像折叠行那样只看开头），而参数还在
@@ -209,7 +223,7 @@
   let panelArgs = $state<Record<string, unknown>>({});
   let argsRaf = 0;
   $effect(() => {
-    const t = sheet?.kind === 'tool' ? sheet.tool : null;
+    const t = sheet?.kind === "tool" ? sheet.tool : null;
     if (!t) return;
     if (t.input !== undefined) {
       panelArgs = t.input as Record<string, unknown>;
@@ -225,7 +239,7 @@
 
   function openTool(msg: Message, tool: ToolPart) {
     panelArgs = argsOf(tool);
-    sheet = { kind: 'tool', msg, tool };
+    sheet = { kind: "tool", msg, tool };
   }
 
   /**
@@ -243,7 +257,7 @@
    * 只在"本来就在底部"时跟：用户往上翻着看前面的输出，就别把他拽回去。
    */
   function followTail(node: HTMLElement) {
-    const sc = node.closest('.overflow-y-auto') as HTMLElement | null;
+    const sc = node.closest(".overflow-y-auto") as HTMLElement | null;
     if (!sc) return;
     const gap = () => sc.scrollHeight - sc.scrollTop - sc.clientHeight;
     let atBottom = gap() < NEAR_BOTTOM;
@@ -251,22 +265,23 @@
     const mo = new MutationObserver(() => {
       if (atBottom) sc.scrollTop = sc.scrollHeight;
     });
-    sc.addEventListener('scroll', onScroll, { passive: true });
+    sc.addEventListener("scroll", onScroll, { passive: true });
     mo.observe(node, { childList: true, characterData: true, subtree: true });
     return {
       destroy() {
         mo.disconnect();
-        sc.removeEventListener('scroll', onScroll);
+        sc.removeEventListener("scroll", onScroll);
       },
     };
   }
 
   /** diff 按行染色 */
   const diffLine = (l: string) => {
-    if (l.startsWith('+') && !l.startsWith('+++')) return 'text-ok';
-    if (l.startsWith('-') && !l.startsWith('---')) return 'text-bad';
-    if (l.startsWith('@@') || l.startsWith('+++') || l.startsWith('---')) return 'text-faint';
-    return 'text-muted';
+    if (l.startsWith("+") && !l.startsWith("+++")) return "text-ok";
+    if (l.startsWith("-") && !l.startsWith("---")) return "text-bad";
+    if (l.startsWith("@@") || l.startsWith("+++") || l.startsWith("---"))
+      return "text-faint";
+    return "text-muted";
   };
 
   // —— 贴底 ——
@@ -318,7 +333,10 @@
    * 但没必要让浏览器去摆弄一个几万像素的元素。
    */
   const APERTURE_MS = 200;
-  function aperture(node: HTMLElement, { inverse = false }: { inverse?: boolean } = {}) {
+  function aperture(
+    node: HTMLElement,
+    { inverse = false }: { inverse?: boolean } = {},
+  ) {
     return {
       duration: APERTURE_MS,
       easing: cubicIn,
@@ -402,7 +420,8 @@
    * 往视口上方插内容时它自己补 `scrollTop`，我们一个字都不用写 —— 滑动中也能插。
    * 见 `lib/window.ts` 的 `insertNow`。
    */
-  const ANCHORING = typeof CSS !== 'undefined' && CSS.supports('overflow-anchor', 'auto');
+  const ANCHORING =
+    typeof CSS !== "undefined" && CSS.supports("overflow-anchor", "auto");
 
   // —— 意图层：全是纯推导 ——
   /** 离底部多远（px）。除了 `pinned` 还要它：决定要不要显「回到最新」 */
@@ -422,13 +441,26 @@
    */
   let shown = $derived([...messages.slice(start), ...pending]);
   /** 观察层的那几个数（策略函数的入参，见 `lib/window.ts`） */
-  let facts = $derived({ measured, hasOlder: hasolder, start, pinned, scrollTop, contentH, viewH, extra, loadingEarlier, tailH });
+  let facts = $derived({
+    measured,
+    hasOlder: hasolder,
+    start,
+    pinned,
+    scrollTop,
+    contentH,
+    viewH,
+    extra,
+    loadingEarlier,
+    tailH,
+  });
   /** 该往前要了（手上还有没挂出来的，或服务端还有更早的，而且用户正看着顶那一带） */
   let wantOlder = $derived(olderWanted(facts));
   /** 该把往上的窗口收回去（贴底、收完还装得满一屏、没有正在跑的加载） */
   let wantCollapse = $derived(collapseWanted(facts));
   /** 现在插不会动到视口（停稳了，或者浏览器会替我们钉住） */
-  let canInsert = $derived(insertNow({ settled, scrollTop, anchoring: ANCHORING }));
+  let canInsert = $derived(
+    insertNow({ settled, scrollTop, anchoring: ANCHORING }),
+  );
 
   /**
    * 「回到最新」的显示门槛（px）。
@@ -461,7 +493,6 @@
       settled = true;
     }, IDLE_MS);
   }
-
 
   /** 量一次尺寸（挂载后、尺寸变化时）—— 只写观察层，不做决定 */
   function measure() {
@@ -501,7 +532,8 @@
     // 当「漂移」去补，就是把用户往回拽（还顺手掐掉惯性）。内容位置只有插入会改。
     const kids = [...content.children];
     const edge = scroller.getBoundingClientRect().top;
-    const offsetOf = (el: Element) => el.getBoundingClientRect().top - edge + scroller!.scrollTop;
+    const offsetOf = (el: Element) =>
+      el.getBoundingClientRect().top - edge + scroller!.scrollTop;
     const anchor = kids.find((el) => el.getBoundingClientRect().bottom > edge);
     const before = anchor ? offsetOf(anchor) : 0;
 
@@ -534,7 +566,8 @@
           // 在 0 不生效）。后者认得出来：钉住了的话 `scrollTop` 至少多了 `grown`，不可能
           // 还是 0。这两种才自己补，补的就是锚点上面多出来的那段。
           const grown = offsetOf(anchor) - before;
-          if (grown > 1 && (!ANCHORING || scroller.scrollTop < 1)) scroller.scrollTop += grown;
+          if (grown > 1 && (!ANCHORING || scroller.scrollTop < 1))
+            scroller.scrollTop += grown;
         }
         lastTop = scroller.scrollTop;
       }
@@ -582,8 +615,8 @@
       clearTimeout(idleTimer);
       settled = true;
     };
-    el.addEventListener('scrollend', on);
-    return () => el.removeEventListener('scrollend', on);
+    el.addEventListener("scrollend", on);
+    return () => el.removeEventListener("scrollend", on);
   });
 
   // `ResizeObserver` 只**量**：尺寸一变就把观察层刷新一遍，决定交给落地层。
@@ -625,7 +658,7 @@
     toBottom();
   });
 
-  let lastSession = $state('');
+  let lastSession = $state("");
   $effect(() => {
     if (session === lastSession) return;
     lastSession = session;
@@ -647,8 +680,12 @@
      贴底的列表里顶边往下一挪、文字贴着 84% 上限时还会重新折行 —— 看着就是
      「跳一下」。现在只有颜色变（虚线淡掉、底色变实），盒子一像素都不动。 -->
 {#snippet userMessage(msg: Message)}
-  {@const atts = msg.parts.filter((p) => p.type === 'image' || p.type === 'file')}
-  {@const text = msg.parts.map((p) => (p.type === 'text' ? p.text : '')).join('')}
+  {@const atts = msg.parts.filter(
+    (p) => p.type === "image" || p.type === "file",
+  )}
+  {@const text = msg.parts
+    .map((p) => (p.type === "text" ? p.text : ""))
+    .join("")}
   {@const queued = !msg.done}
   {#if atts.length === 0}
     <!-- 常见情况：只有正文，一层 <p> 就够。不为了「可能会有的附件」
@@ -666,15 +703,19 @@
       {#if queued}{@render dropBtn(msg.id)}{/if}
       <div class="flex flex-wrap justify-end gap-2">
         {#each atts as a (a.id)}
-          {#if a.type === 'image'}
+          {#if a.type === "image"}
             <!-- 点开看大图：和回复里的图片同一个查看器（Viewer.svelte） -->
             <button
               type="button"
-              onclick={() => openViewer(a.url, a.name, 'image')}
+              onclick={() => openViewer(a.url, a.name, "image")}
               aria-label="查看大图：{a.name}"
               class="block max-w-full overflow-hidden rounded-card border border-hairline"
             >
-              <Img src={a.url} alt={a.name} class="block max-h-48 max-w-full object-cover" />
+              <Img
+                src={a.url}
+                alt={a.name}
+                class="block max-h-48 max-w-full object-cover"
+              />
             </button>
           {:else}
             <span
@@ -719,67 +760,79 @@
   {onscroll}
   class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[calc(var(--hdr)+var(--fade-top))] pb-[calc(var(--composer-h,0px)+1rem)]"
 >
-<div bind:this={content} class="flex flex-col gap-6">
-  <!-- 排队中（还没发出去）的那几条**接在同一个 each 里**（`shown`），不另开一个：
+  <div bind:this={content} class="flex flex-col gap-6">
+    <!-- 排队中（还没发出去）的那几条**接在同一个 each 里**（`shown`），不另开一个：
        发出去时 App 用**同一个 id** 把它挪进 `messages`，同一个 key → Svelte 复用
        同一个节点，只是 `done` 翻了 —— 于是颜色能真的过渡（虚线淡掉、底色变实）。
        分两个 each 的话是旧节点销毁、新节点创建，什么过渡都谈不上。 -->
-  {#each shown as msg (msg.id)}
-    {#if msg.role === 'user'}
-      {@render userMessage(msg)}
-    {:else}
-      <div class="flex flex-col gap-2.5 text-base leading-relaxed">
-        {#each msg.parts as part, i (i)}
-          {#if part.type === 'text'}
-            <Markdown text={part.text} />
-          {:else if part.type === 'reasoning'}
-            <!-- 一行：它此刻在想什么。点开面板看全文 -->
-            {@const live = !msg.done && i === msg.parts.length - 1}
-            <button
-              onclick={() => (sheet = { kind: 'reasoning', part })}
-              class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
-            >
-              <Icon name="sparkle" size={16} class="shrink-0 text-faint" />
-              <ThoughtLine text={part.text} {live} />
-              <Icon name="chevron" size={15} class="ml-auto shrink-0 text-faint" />
-            </button>
-          {:else if part.type === 'tool'}
-            {@const tool = part}
-            <!-- 失败的行整行染红（图标 + 摘要）：16px 的淡灰图标单独变红，
+    {#each shown as msg (msg.id)}
+      {#if msg.role === "user"}
+        {@render userMessage(msg)}
+      {:else}
+        <div class="flex flex-col gap-2.5 text-base leading-relaxed">
+          {#each msg.parts as part, i (i)}
+            {#if part.type === "text"}
+              <Markdown text={part.text} />
+            {:else if part.type === "reasoning"}
+              <!-- 一行：它此刻在想什么。点开面板看全文 -->
+              {@const live = !msg.done && i === msg.parts.length - 1}
+              <button
+                onclick={() => (sheet = { kind: "reasoning", part })}
+                class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
+              >
+                <Icon name="sparkle" size={16} class="shrink-0 text-faint" />
+                <ThoughtLine text={part.text} {live} />
+                <Icon
+                  name="chevron"
+                  size={15}
+                  class="ml-auto shrink-0 text-faint"
+                />
+              </button>
+            {:else if part.type === "tool"}
+              {@const tool = part}
+              <!-- 失败的行整行染红（图标 + 摘要）：16px 的淡灰图标单独变红，
                  在一列工具行里扫不出来；面板里失败的标题和正文本来也是红的。
                  右边的 › 不跟着红 —— 它是“点得开”，跟成功失败无关。
                  判定走 toolview 的 `failed()`，和面板同一个函数。 -->
-            {@const bad = failed(tool)}
-            <button
-              onclick={() => openTool(msg, tool)}
-              class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
-            >
-              <Icon name={toolIcon(tool)} size={16} class="shrink-0 {bad ? 'text-bad' : 'text-faint'}" />
-              <span class="truncate text-sm {bad ? 'text-bad' : 'text-muted'}">{summarize(tool)}</span>
-              {#if tool.state !== 'output' && !msg.done}
-                <span class="shrink-0 text-meta text-faint">运行中</span>
-              {/if}
-              <Icon name="chevron" size={15} class="ml-auto shrink-0 text-faint" />
-            </button>
-          {:else if part.type === 'data'}
-            <!-- 用量不显示（Claude 没有，看着啰嗦）；警告要显示，
+              {@const bad = failed(tool)}
+              <button
+                onclick={() => openTool(msg, tool)}
+                class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
+              >
+                <Icon
+                  name={toolIcon(tool)}
+                  size={16}
+                  class="shrink-0 {bad ? 'text-bad' : 'text-faint'}"
+                />
+                <span class="truncate text-sm {bad ? 'text-bad' : 'text-muted'}"
+                  >{summarize(tool)}</span
+                >
+                {#if tool.state !== "output" && !msg.done}
+                  <span class="shrink-0 text-meta text-faint">运行中</span>
+                {/if}
+                <Icon
+                  name="chevron"
+                  size={15}
+                  class="ml-auto shrink-0 text-faint"
+                />
+              </button>
+            {:else if part.type === "data"}
+              <!-- 用量不显示（Claude 没有，看着啰嗦）；警告要显示，
                  否则「输出被长度上限截断」这种中途停下的提示是隐形的 -->
-            {#if part.name === 'warning'}
-              {@const w = part.data as { message?: string }}
-              {#if w?.message}
-                <p class="text-[13px] text-warn">⚠️ {w.message}</p>
+              {#if part.name === "warning"}
+                {@const w = part.data as { message?: string }}
+                {#if w?.message}
+                  <p class="text-[13px] text-warn">⚠️ {w.message}</p>
+                {/if}
               {/if}
+            {:else if part.type === "error"}
+              <p class="text-[13px] text-bad">错误：{part.text}</p>
             {/if}
-          {:else if part.type === 'error'}
-            <p class="text-[13px] text-bad">错误：{part.text}</p>
-          {/if}
-        {/each}
-
-      </div>
-    {/if}
-  {/each}
-
-</div>
+          {/each}
+        </div>
+      {/if}
+    {/each}
+  </div>
 </div>
 
 <!-- 「回到最新」：往上翻着看历史时，输出还在往下长 —— 给一个一步回到尾部的
@@ -831,7 +884,10 @@
   </button>
 {/if}
 
-{#snippet fields(title: string, list: { key: string; text: string; block: boolean }[])}
+{#snippet fields(
+  title: string,
+  list: { key: string; text: string; block: boolean }[],
+)}
   <div class="flex flex-col gap-1.5">
     <span class="text-meta text-faint">{title}</span>
     {#each list as f}
@@ -852,10 +908,12 @@
 {/snippet}
 
 {#if sheet}
-  {#if sheet.kind === 'reasoning'}
+  {#if sheet.kind === "reasoning"}
     <Sheet title="思考" onclose={() => (sheet = null)}>
       <!-- 存的是 part 本身而不是文本副本：思考还在流式时打开，面板里也跟着长 -->
-      <div class="text-[15px] leading-6 text-fg/90"><Markdown text={sheet.part.text} /></div>
+      <div class="text-[15px] leading-6 text-fg/90">
+        <Markdown text={sheet.part.text} />
+      </div>
     </Sheet>
   {:else}
     <!-- 存成 const：sheet 是 $state，在 onclick 闭包里 TS 收窄不了 -->
@@ -871,14 +929,14 @@
         {/if}
         {#if inp.params.length}
           <!-- 主行之外的参数（bash 的 timeout、read 的 offset/limit、edit 新建时的全文 …） -->
-          {@render fields('参数', inp.params)}
+          {@render fields("参数", inp.params)}
         {/if}
 
         {#if res}
           <!-- 结果：模型收到的原文，原样（退出码、截断、续读位置都在正文里） -->
           <div class="flex flex-col gap-2">
             <span class="text-meta {res.failed ? 'text-bad' : 'text-faint'}">
-              {t.state === 'output' ? '模型收到的结果' : '运行中…'}
+              {t.state === "output" ? "模型收到的结果" : "运行中…"}
             </span>
 
             {#each res.images as img}
@@ -894,8 +952,8 @@
               <div
                 class="overflow-x-auto rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5"
               >
-                {#each res.text.split('\n') as line}
-                  <p class="whitespace-pre {diffLine(line)}">{line || ' '}</p>
+                {#each res.text.split("\n") as line}
+                  <p class="whitespace-pre {diffLine(line)}">{line || " "}</p>
                 {/each}
               </div>
             {:else}
@@ -906,7 +964,7 @@
                   : ''}">{res.text}</pre>
             {/if}
           </div>
-        {:else if t.state === 'streaming'}
+        {:else if t.state === "streaming"}
           <p class="text-sm text-muted">执行中…</p>
         {/if}
       </div>

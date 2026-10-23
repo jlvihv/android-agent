@@ -8,17 +8,24 @@
 
 `core/src/search.rs`，思路和 pi-web-access 的 `exa.ts` 一样：
 
-| | 端点 | 凭据 | 限流 |
-|---|---|---|---|
-| **默认（没 key）** | `https://mcp.exa.ai/mcp?tools=web_search_exa` | **不需要** | 按 IP：2 次/秒、50 次/天 |
-| 配了 key | `https://api.exa.ai/search` | `x-api-key` | 按 Exa 账号额度 |
+|                    | 端点                                          | 凭据        | 限流                     |
+| ------------------ | --------------------------------------------- | ----------- | ------------------------ |
+| **默认（没 key）** | `https://mcp.exa.ai/mcp?tools=web_search_exa` | **不需要**  | 按 IP：2 次/秒、50 次/天 |
+| 配了 key           | `https://api.exa.ai/search`                   | `x-api-key` | 按 Exa 账号额度          |
 
 没 key 那条打的是一段**裸的 MCP JSON-RPC**，不做 `initialize` 握手 ——
 这个端点无状态，一次 `tools/call` 就够：
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call",
- "params":{"name":"web_search_exa","arguments":{"query":"…","numResults":5}}}
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "web_search_exa",
+    "arguments": { "query": "…", "numResults": 5 }
+  }
+}
 ```
 
 响应是 **SSE**（`event: message` + 一行 `data: {…}`）。解析要两种都认：

@@ -45,11 +45,11 @@ $ agent browser navigate https://example.com && agent browser get_backbone 3 && 
 
 ## 4. 那为什么这三个还是工具
 
-| 工具 | 为什么它必须是工具 |
-|---|---|
+| 工具   | 为什么它必须是工具                                                                                                                                                                                             |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `read` | 不是「读文件」这么简单：文本要按行截断 + 给续读提示（`offset` / `limit` / `numbered`），图片要走**缩放 → 落盘 → 作为 image 内容块发给模型**那条管线。做成 shell 命令 = 把这两套规则塞进 shell 让模型每次重新学 |
-| `bash` | 唯一的入口，其余能力都从它走 |
-| `edit` | 按原文精确替换 + 返回 unified diff + 原子写。用 shell 做就是 `sed` / `python3` 拼字符串，错一次毁一个文件；schema 逼模型把 `oldText` 给全 |
+| `bash` | 唯一的入口，其余能力都从它走                                                                                                                                                                                   |
+| `edit` | 按原文精确替换 + 返回 unified diff + 原子写。用 shell 做就是 `sed` / `python3` 拼字符串，错一次毁一个文件；schema 逼模型把 `oldText` 给全                                                                      |
 
 一句话：**这三个的 schema 本身就是提示词**（在教模型怎么用）；而浏览器 / 搜索 /
 设备操作是「动作名 + 参数」，翻译成 shell 更自然。
@@ -58,11 +58,11 @@ $ agent browser navigate https://example.com && agent browser get_backbone 3 && 
 
 加了沙箱命令就把工具删掉，别留两条。守这条规矩的测试（`core/src/agent.rs`）：
 
-| 测试 | 守什么 |
-|---|---|
-| `tool_schema_order_and_names_are_fixed` | 工具表的顺序与名单钉死（`read` / `bash` / `edit`） |
+| 测试                                                            | 守什么                                                                                                                                      |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tool_schema_order_and_names_are_fixed`                         | 工具表的顺序与名单钉死（`read` / `bash` / `edit`）                                                                                          |
 | `browser_and_search_are_only_reachable_through_the_sandbox_cli` | 表里不能有 `browser` / `search`，也不能有 `full_page` / `num_results` 这些只属于它们的参数；提示词里必须有 `agent browser` / `agent search` |
-| `cli::variables_are_braced_before_multibyte` | CLI 的写法陷阱：`$cmd（` 在 busybox ash 里会被当成变量名（见下） |
+| `cli::variables_are_braced_before_multibyte`                    | CLI 的写法陷阱：`$cmd（` 在 busybox ash 里会被当成变量名（见下）                                                                            |
 
 ## 6. 再加一个能力时怎么做
 

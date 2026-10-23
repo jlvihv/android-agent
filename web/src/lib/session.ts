@@ -12,7 +12,7 @@
  *   - 整窗：首屏那一窗，或者服务端认为我们对不上了（`from` + `hasMore`）
  */
 
-import type { Message } from './sse';
+import type { Message } from "./sse";
 
 /**
  * 手上这一窗：`messages` 是完整视图里 `[windowFrom, windowFrom + len)` 那一段。
@@ -46,9 +46,9 @@ export type SessionPayload = {
 export type PatchResult =
   | { ok: true; window: Window }
   /** 发请求之后窗口变过（用户往上翻了一页）：下标是按旧窗口翻译的，别硬套 */
-  | { ok: false; why: 'stale' }
+  | { ok: false; why: "stale" }
   /** 本地那条和服务端以为的对不上：老老实实重新要一份全量 */
-  | { ok: false; why: 'mismatch' };
+  | { ok: false; why: "mismatch" };
 
 /**
  * 能复用的旧消息对象原样留着，Svelte 就不会重新渲染它们的 DOM。
@@ -64,7 +64,8 @@ export type PatchResult =
 export function reconcile(prev: Message[], next: Message[]): Message[] {
   // 切会话 / 清空 / 换了一条会话：不能复用
   if (next.length < prev.length) return next;
-  if (prev.length > 0 && next.length > 0 && prev[0].id !== next[0].id) return next;
+  if (prev.length > 0 && next.length > 0 && prev[0].id !== next[0].id)
+    return next;
 
   const out = next.slice();
   const prevLast = prev.length - 1;
@@ -83,7 +84,12 @@ export function reconcile(prev: Message[], next: Message[]): Message[] {
  * id 对得上才算（对不上说明这是另一条会话的内容 / 被重置过）；正好接在尾巴
  * 后面（`=== messages.length`）不用对 id，下标已经说明了它是接着的。
  */
-export function spliceAt(prev: Message[], at: number, windowFrom: number, fresh: Message[]): number {
+export function spliceAt(
+  prev: Message[],
+  at: number,
+  windowFrom: number,
+  fresh: Message[],
+): number {
   if (!fresh.length) return -1;
   const i = at - windowFrom;
   if (i < 0 || i > prev.length) return -1;
@@ -98,20 +104,35 @@ export function spliceAt(prev: Message[], at: number, windowFrom: number, fresh:
  * 请求在路上时用户可能往上翻了一页（数组前面多了一段）—— 那时下标就不作数了，
  * 硬套的结果是消息重复或丢几段。这种（极少见的）情况宁可作废，下一次同步会重算。
  */
-export function applyPatch(w: Window, d: SessionPayload, base: number): PatchResult {
-  if (base !== w.windowFrom) return { ok: false, why: 'stale' };
+export function applyPatch(
+  w: Window,
+  d: SessionPayload,
+  base: number,
+): PatchResult {
+  if (base !== w.windowFrom) return { ok: false, why: "stale" };
 
   const from = Math.min(d.replaceFrom ?? 0, w.messages.length);
   const fresh = d.messages ?? [];
   const keep = d.keepParts;
   if (keep != null) {
     const old = w.messages[from];
-    if (!old || old.role !== 'assistant' || old.parts.length < keep || !fresh[0]) {
-      return { ok: false, why: 'mismatch' };
+    if (
+      !old ||
+      old.role !== "assistant" ||
+      old.parts.length < keep ||
+      !fresh[0]
+    ) {
+      return { ok: false, why: "mismatch" };
     }
-    fresh[0] = { ...fresh[0], parts: [...old.parts.slice(0, keep), ...fresh[0].parts] };
+    fresh[0] = {
+      ...fresh[0],
+      parts: [...old.parts.slice(0, keep), ...fresh[0].parts],
+    };
   }
-  return { ok: true, window: { ...w, messages: [...w.messages.slice(0, from), ...fresh] } };
+  return {
+    ok: true,
+    window: { ...w, messages: [...w.messages.slice(0, from), ...fresh] },
+  };
 }
 
 /**
@@ -120,13 +141,20 @@ export function applyPatch(w: Window, d: SessionPayload, base: number): PatchRes
  * 本地可能还留着更早的那些（用户往上翻过）：能对上就只换后面那一段，别把界面
  * 拽回尾部；对不上（`at` 落在手上这窗之外，说明中间有缝）才整份换。
  */
-export function applyWindow(w: Window, d: SessionPayload, same: boolean): Window {
+export function applyWindow(
+  w: Window,
+  d: SessionPayload,
+  same: boolean,
+): Window {
   const fresh = d.messages ?? [];
   const at = d.from ?? 0;
   const cut = same ? spliceAt(w.messages, at, w.windowFrom, fresh) : -1;
   if (cut >= 0) {
     return {
-      messages: [...w.messages.slice(0, cut), ...reconcile(w.messages.slice(cut), fresh)],
+      messages: [
+        ...w.messages.slice(0, cut),
+        ...reconcile(w.messages.slice(cut), fresh),
+      ],
       windowFrom: w.windowFrom,
     };
   }

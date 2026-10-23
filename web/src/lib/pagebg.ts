@@ -32,25 +32,46 @@ const COLOR = /^(#[0-9a-f]{3,8}|rgba?\([^)]*\)|hsla?\([^)]*\)|[a-z]+)$/i;
     否则 `background:var(--bg)` 里的 `var` 会被当成颜色名（踩过）。 */
 function isColor(v: string): boolean {
   if (!COLOR.test(v)) return false;
-  if (v.startsWith('#')) return true;
-  return typeof CSS !== 'undefined' && CSS.supports('color', v);
+  if (v.startsWith("#")) return true;
+  return typeof CSS !== "undefined" && CSS.supports("color", v);
 }
 
 /** shorthand 里混着的、不是颜色的关键字 */
 const NOT_COLOR = new Set([
-  'none', 'no-repeat', 'repeat', 'center', 'top', 'bottom', 'left', 'right',
-  'fixed', 'local', 'scroll', 'cover', 'contain', 'auto', 'border-box',
-  'padding-box', 'content-box', 'inherit', 'initial', 'unset', 'revert', 'transparent',
+  "none",
+  "no-repeat",
+  "repeat",
+  "center",
+  "top",
+  "bottom",
+  "left",
+  "right",
+  "fixed",
+  "local",
+  "scroll",
+  "cover",
+  "contain",
+  "auto",
+  "border-box",
+  "padding-box",
+  "content-box",
+  "inherit",
+  "initial",
+  "unset",
+  "revert",
+  "transparent",
 ]);
 
 /** 从一条声明的值里抠出颜色：shorthand 取第一个像颜色的记号，渐变取第一个色标 */
 function pickColor(value: string): string | null {
-  const v = value.trim().replace(/\s*!important\s*$/i, '');
+  const v = value.trim().replace(/\s*!important\s*$/i, "");
   if (!v) return null;
   if (isColor(v) && !NOT_COLOR.has(v.toLowerCase())) return v;
 
   // `url(x.png) center/cover #333` / `linear-gradient(#111, #222)` …
-  for (const tok of v.match(/#[0-9a-f]{3,8}|rgba?\([^)]*\)|hsla?\([^)]*\)|[a-z-]+/gi) ?? []) {
+  for (const tok of v.match(
+    /#[0-9a-f]{3,8}|rgba?\([^)]*\)|hsla?\([^)]*\)|[a-z-]+/gi,
+  ) ?? []) {
     const t = tok.toLowerCase();
     if (NOT_COLOR.has(t)) continue;
     if (isColor(tok)) return tok;
@@ -61,11 +82,11 @@ function pickColor(value: string): string | null {
 /** 从一个声明块（`a:b; c:d`）里取 background / background-color（后面的赢） */
 function bgFromBlock(block: string): string | null {
   let found: string | null = null;
-  for (const decl of block.split(';')) {
-    const i = decl.indexOf(':');
+  for (const decl of block.split(";")) {
+    const i = decl.indexOf(":");
     if (i < 0) continue;
     const prop = decl.slice(0, i).trim().toLowerCase();
-    if (prop !== 'background' && prop !== 'background-color') continue;
+    if (prop !== "background" && prop !== "background-color") continue;
     const c = pickColor(decl.slice(i + 1));
     if (c) found = c;
   }
@@ -79,7 +100,7 @@ function targetsRoot(sel: string): boolean {
 
 /** 从一段 CSS 里找根元素的底色（按作者顺序，最后一个赢） */
 function bgFromCss(css: string): string | null {
-  const clean = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const clean = css.replace(/\/\*[\s\S]*?\*\//g, "");
   let bg: string | null = null;
   // 粗分规则 `选择器 { 声明 }`；@media 里的也一并扫到，够用（不判断条件真假）
   for (const r of clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
@@ -92,29 +113,37 @@ function bgFromCss(css: string): string | null {
 
 /** 只认「显式写了 background」的情况 */
 function sniffExplicit(html: string): string | null {
-  const src = html.replace(/<!--[\s\S]*?-->/g, '');
+  const src = html.replace(/<!--[\s\S]*?-->/g, "");
   let bg: string | null = null;
   for (const m of src.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)) {
     bg = bgFromCss(m[1]) ?? bg;
   }
   // 内联 style 比 <style> 更晚，覆盖它
-  for (const m of src.matchAll(/<(?:html|body)\b[^>]*\bstyle=["']([^"']*)["']/gi)) {
+  for (const m of src.matchAll(
+    /<(?:html|body)\b[^>]*\bstyle=["']([^"']*)["']/gi,
+  )) {
     bg = bgFromBlock(m[1]) ?? bg;
   }
   return bg;
 }
 
 /** `<meta name="color-scheme">` / `html{color-scheme:…}` —— 没写底色时用它兜底 */
-function schemeOf(html: string): 'dark' | 'light' | null {
+function schemeOf(html: string): "dark" | "light" | null {
   const meta = /<meta[^>]+name=["']?color-scheme["']?[^>]*>/i.exec(html);
   if (meta) {
     const c = /content=["']?([^"'>]*)/i.exec(meta[0]);
-    const first = c?.[1].trim().split(/[\s,]+/)[0]?.toLowerCase();
-    if (first === 'dark' || first === 'light') return first;
+    const first = c?.[1]
+      .trim()
+      .split(/[\s,]+/)[0]
+      ?.toLowerCase();
+    if (first === "dark" || first === "light") return first;
   }
   const css = /color-scheme\s*:\s*([a-z\s,]+)/i.exec(html);
-  const first = css?.[1].trim().split(/[\s,]+/)[0]?.toLowerCase();
-  return first === 'dark' || first === 'light' ? first : null;
+  const first = css?.[1]
+    .trim()
+    .split(/[\s,]+/)[0]
+    ?.toLowerCase();
+  return first === "dark" || first === "light" ? first : null;
 }
 
 /** 外链样式表的绝对地址（同源才要；最多 3 个，够覆盖「html + 主题 css」） */
@@ -139,7 +168,7 @@ function stylesheets(html: string, base: string): string[] {
 export function sniffBackground(html: string): string | null {
   const bg = sniffExplicit(html);
   if (bg) return bg;
-  return schemeOf(html) === 'dark' ? '#121212' : null;
+  return schemeOf(html) === "dark" ? "#121212" : null;
 }
 
 const cache = new Map<string, string | null>();
@@ -148,7 +177,7 @@ async function getText(url: string): Promise<string | null> {
   try {
     // 不看状态码：沙箱 404/403 的**响应体就是**查看器里要显示的那个
     // 错误页（服务端自己生成的深色页），不取就只能按白底处理
-    return await (await fetch(url, { credentials: 'omit' })).text();
+    return await (await fetch(url, { credentials: "omit" })).text();
   } catch {
     return null;
   }
@@ -176,7 +205,7 @@ export async function probeBackground(url: string): Promise<string | null> {
     }
   }
 
-  if (!bg && html && schemeOf(html) === 'dark') bg = '#121212';
+  if (!bg && html && schemeOf(html) === "dark") bg = "#121212";
 
   cache.set(abs, bg);
   return bg;

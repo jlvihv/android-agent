@@ -10,8 +10,8 @@
    * `![](images/a.png)`）是**相对文件自己**写的，得按文件所在目录补成沙箱里的
    * 绝对路径才渲染得出来（见 lib/markdown.ts 的 resolveRelative）。
    */
-  import Markdown from './Markdown.svelte';
-  import { sandboxGuestPath } from '../lib/markdown';
+  import Markdown from "./Markdown.svelte";
+  import { sandboxGuestPath } from "../lib/markdown";
 
   let { url }: { url: string } = $props();
 
@@ -21,12 +21,12 @@
   /** 文件所在目录（沙箱内绝对路径，以 / 结尾）。取不到（非沙箱地址）就当消息那样渲染 */
   const dir = $derived.by(() => {
     const p = sandboxGuestPath(url);
-    return p ? p.replace(/[^/]*$/, '') : '';
+    return p ? p.replace(/[^/]*$/, "") : "";
   });
 
   let text = $state<string | null>(null);
-  let note = $state('');
-  let err = $state('');
+  let note = $state("");
+  let err = $state("");
   let copied = $state(false);
 
   $effect(() => {
@@ -34,8 +34,8 @@
     void url;
     let dead = false;
     text = null;
-    note = '';
-    err = '';
+    note = "";
+    err = "";
     void (async () => {
       try {
         const r = await fetch(url);
@@ -44,8 +44,8 @@
           // 这里抠出文字来，比只显示 “HTTP 404” 有用得多
           const body = await r.text();
           const plain = body
-            .replace(/<[^>]*>/g, ' ')
-            .replace(/\s+/g, ' ')
+            .replace(/<[^>]*>/g, " ")
+            .replace(/\s+/g, " ")
             .trim();
           throw new Error(plain || `HTTP ${r.status}`);
         }
@@ -79,24 +79,31 @@
 </script>
 
 <div class="flex h-full flex-col">
-  <div class="flex shrink-0 items-center gap-2 px-3 py-1.5 font-mono text-meta text-faint">
+  <div
+    class="flex shrink-0 items-center gap-2 px-3 py-1.5 font-mono text-meta text-faint"
+  >
     {#if text != null}
       <span>{(text.length / 1024).toFixed(1)}KB</span>
       {#if note}<span class="truncate text-warn">{note}</span>{/if}
-      <button class="ml-auto shrink-0 rounded-full bg-control px-3 py-1 text-fg" onclick={copy}>
-        {copied ? '已复制' : '复制'}
+      <button
+        class="ml-auto shrink-0 rounded-full bg-control px-3 py-1 text-fg"
+        onclick={copy}
+      >
+        {copied ? "已复制" : "复制"}
       </button>
     {/if}
   </div>
 
-  <div class="min-h-0 flex-1 overflow-auto px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+  <div
+    class="min-h-0 flex-1 overflow-auto px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+  >
     {#if err}
       <p class="py-6 text-sm text-bad">读不出来：{err}</p>
     {:else if text == null}
       <p class="py-6 text-sm text-faint">读取中…</p>
     {:else}
       <!-- 顶栏已经占了一行，正文自己的上边距收掉一点，别一眼看着是空的 -->
-      <div class="-mt-1 text-fg"><Markdown text={text} base={dir} /></div>
+      <div class="-mt-1 text-fg"><Markdown {text} base={dir} /></div>
     {/if}
   </div>
 </div>

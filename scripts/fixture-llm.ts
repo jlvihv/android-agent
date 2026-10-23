@@ -23,10 +23,12 @@
  *     FIXTURE_MD=./my.md bun scripts/fixture-llm.ts    # 换一份 Markdown
  *     FIXTURE_NO_TOOL=1 bun scripts/fixture-llm.ts     # 不发工具调用，只回正文
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync } from "node:fs";
 
 const PORT = Number(process.env.FIXTURE_PORT ?? 8790);
-const MODELS = (process.env.FIXTURE_MODELS ?? 'fixture,fixture-mini').split(',');
+const MODELS = (process.env.FIXTURE_MODELS ?? "fixture,fixture-mini").split(
+  ",",
+);
 const WITH_TOOL = !process.env.FIXTURE_NO_TOOL;
 
 /** 默认夹具：把 Markdown 渲染器里每一种块级结构都过一遍。 */
@@ -73,15 +75,27 @@ print("代码块")
 普通段落结尾，带 *斜体*、**粗体**、~~删除线~~ 和 [外链](https://example.com)。
 `;
 
-const REPLY = process.env.FIXTURE_MD ? readFileSync(process.env.FIXTURE_MD, 'utf8') : DEFAULT_MD;
-const REASONING = ['用户想让我渲染夹具。', '先跑个命令看看环境，', '再把内容写出来。'];
-const TOOL = { name: 'bash', arguments: JSON.stringify({ command: 'echo fixture-tool-ok && uname -m', timeout: 10 }) };
+const REPLY = process.env.FIXTURE_MD
+  ? readFileSync(process.env.FIXTURE_MD, "utf8")
+  : DEFAULT_MD;
+const REASONING = [
+  "用户想让我渲染夹具。",
+  "先跑个命令看看环境，",
+  "再把内容写出来。",
+];
+const TOOL = {
+  name: "bash",
+  arguments: JSON.stringify({
+    command: "echo fixture-tool-ok && uname -m",
+    timeout: 10,
+  }),
+};
 
 const CHUNK = 24;
 const frame = (delta: unknown, extra: Record<string, unknown> = {}) =>
   `data: ${JSON.stringify({
-    id: 'chatcmpl-fixture',
-    object: 'chat.completion.chunk',
+    id: "chatcmpl-fixture",
+    object: "chat.completion.chunk",
     created: 0,
     model: MODELS[0],
     choices: [{ index: 0, delta, ...extra }],
@@ -89,67 +103,93 @@ const frame = (delta: unknown, extra: Record<string, unknown> = {}) =>
 
 /** 第一阶段：思考 + 一个工具调用。 */
 function toolTurn(): string {
-  const out = [frame({ role: 'assistant' })];
+  const out = [frame({ role: "assistant" })];
   for (const piece of REASONING) out.push(frame({ reasoning_content: piece }));
-  out.push(frame({ tool_calls: [{ index: 0, id: 'call_fixture', type: 'function', function: TOOL }] }));
-  out.push(frame({}, { finish_reason: 'tool_calls' }));
-  out.push('data: [DONE]\n\n');
-  return out.join('');
+  out.push(
+    frame({
+      tool_calls: [
+        { index: 0, id: "call_fixture", type: "function", function: TOOL },
+      ],
+    }),
+  );
+  out.push(frame({}, { finish_reason: "tool_calls" }));
+  out.push("data: [DONE]\n\n");
+  return out.join("");
 }
 
 /** 第二阶段：正文（Markdown 夹具）。 */
 function textTurn(): string {
-  const out = [frame({ role: 'assistant' })];
-  for (let i = 0; i < REPLY.length; i += CHUNK) out.push(frame({ content: REPLY.slice(i, i + CHUNK) }));
+  const out = [frame({ role: "assistant" })];
+  for (let i = 0; i < REPLY.length; i += CHUNK)
+    out.push(frame({ content: REPLY.slice(i, i + CHUNK) }));
   out.push(
     `data: ${JSON.stringify({
-      id: 'chatcmpl-fixture',
-      object: 'chat.completion.chunk',
+      id: "chatcmpl-fixture",
+      object: "chat.completion.chunk",
       created: 0,
       model: MODELS[0],
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     })}\n\n`,
   );
-  out.push('data: [DONE]\n\n');
-  return out.join('');
+  out.push("data: [DONE]\n\n");
+  return out.join("");
 }
 
 Bun.serve({
   port: PORT,
-  hostname: '127.0.0.1',
+  hostname: "127.0.0.1",
   async fetch(req) {
     const { pathname } = new URL(req.url);
-    if (pathname.endsWith('/models')) {
-      return Response.json({ object: 'list', data: MODELS.map((id) => ({ id, object: 'model' })) });
+    if (pathname.endsWith("/models")) {
+      return Response.json({
+        object: "list",
+        data: MODELS.map((id) => ({ id, object: "model" })),
+      });
     }
-    if (!pathname.endsWith('/chat/completions')) {
-      return new Response('假 LLM 只有 /v1/models 和 /v1/chat/completions', { status: 404 });
+    if (!pathname.endsWith("/chat/completions")) {
+      return new Response("假 LLM 只有 /v1/models 和 /v1/chat/completions", {
+        status: 404,
+      });
     }
-    const body = (await req.json()) as { stream?: boolean; messages?: { role?: string }[] };
+    const body = (await req.json()) as {
+      stream?: boolean;
+      messages?: { role?: string }[];
+    };
     // 请求里已经有工具结果 → 这是第二轮，该出正文了
-    const hasToolResult = (body.messages ?? []).some((m) => m.role === 'tool');
+    const hasToolResult = (body.messages ?? []).some((m) => m.role === "tool");
     const turn = hasToolResult || !WITH_TOOL ? textTurn() : toolTurn();
     if (!body.stream) {
       return Response.json({
-        id: 'chatcmpl-fixture',
-        object: 'chat.completion',
+        id: "chatcmpl-fixture",
+        object: "chat.completion",
         choices: [
           {
             index: 0,
             message: hasToolResult
-              ? { role: 'assistant', content: REPLY }
-              : { role: 'assistant', content: '', tool_calls: [{ id: 'call_fixture', type: 'function', function: TOOL }] },
-            finish_reason: hasToolResult ? 'stop' : 'tool_calls',
+              ? { role: "assistant", content: REPLY }
+              : {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    { id: "call_fixture", type: "function", function: TOOL },
+                  ],
+                },
+            finish_reason: hasToolResult ? "stop" : "tool_calls",
           },
         ],
       });
     }
-    return new Response(turn, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } });
+    return new Response(turn, {
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      },
+    });
   },
 });
 
 console.log(
-  `假 LLM: http://127.0.0.1:${PORT}/v1（模型 ${MODELS.join(' / ')}，` +
-    `${WITH_TOOL ? '第一轮发 bash 工具调用、第二轮回' : '直接回'} ${REPLY.length} 字符 Markdown）`,
+  `假 LLM: http://127.0.0.1:${PORT}/v1（模型 ${MODELS.join(" / ")}，` +
+    `${WITH_TOOL ? "第一轮发 bash 工具调用、第二轮回" : "直接回"} ${REPLY.length} 字符 Markdown）`,
 );

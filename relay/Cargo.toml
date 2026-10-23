@@ -15,7 +15,15 @@ path = "src/main.rs"
 # 刻意只用纯 Rust 的依赖（没有 ring / C 代码）：这样在 macOS 上就能直接交叉编译出
 # Linux x86_64 的静态二进制（musl + rust-lld），扔到服务器上就能跑。
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+  "signal",
+] }
 hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"

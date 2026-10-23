@@ -9,12 +9,12 @@
 
 看 OpenCode Go 的价目表：
 
-| 模型 | 输入 | **缓存读取** | 倍差 |
-|---|---|---|---|
+| 模型                | 输入      | **缓存读取**   | 倍差    |
+| ------------------- | --------- | -------------- | ------- |
 | DeepSeek V4.1 Flash | $0.30 / M | **$0.006 / M** | **50×** |
-| GLM-5.3 | $1.40 / M | $0.26 / M | 5.4× |
-| Kimi K3 | $3.00 / M | $0.30 / M | 10× |
-| Qwen3.8 Max | $2.00 / M | $0.25 / M | 8× |
+| GLM-5.3             | $1.40 / M | $0.26 / M      | 5.4×    |
+| Kimi K3             | $3.00 / M | $0.30 / M      | 10×     |
+| Qwen3.8 Max         | $2.00 / M | $0.25 / M      | 8×      |
 
 缓存是按**前缀**命中的。只要消息数组的第一个字节变了，整个对话的缓存全部失效，
 这一轮的输入就按全价计费。
@@ -174,10 +174,10 @@ prompt cache 命中 93.4%（cached=1920 prompt=2056 completion=2  reasoning=0）
 
 同一个问题（「只回一个字：好」）在**同一台手机**上：
 
-| | prompt tokens |
-|---|---|
-| 精简前（7 个工具：5 个 `device_*` + 每轮追加整棵 UI 树） | **24995** |
-| 精简后（2 个工具、提示词 630 字符、不追加任何东西） | **1074** |
+|                                                          | prompt tokens |
+| -------------------------------------------------------- | ------------- |
+| 精简前（7 个工具：5 个 `device_*` + 每轮追加整棵 UI 树） | **24995**     |
+| 精简后（2 个工具、提示词 630 字符、不追加任何东西）      | **1074**      |
 
 差 23 倍。这里省下来的每一分都在**冷启动那一轮**（0% 命中，全价）和上下文窗口上 ——
 纯聊天这种不需要看界面的回合，之前有 96% 的输入是白给的。
@@ -186,9 +186,9 @@ prompt cache 命中 93.4%（cached=1920 prompt=2056 completion=2  reasoning=0）
 
 用量字段有**两套写法**，`core/src/openai.rs` 的 `Usage`（provider 原样）都接：
 
-| 风格 | 字段 |
-|---|---|
-| OpenAI 系 | `prompt_tokens_details.cached_tokens` |
+| 风格        | 字段                                                   |
+| ----------- | ------------------------------------------------------ |
+| OpenAI 系   | `prompt_tokens_details.cached_tokens`                  |
 | DeepSeek 系 | `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` |
 
 OpenCode Go 的 `deepseek-v4.1-flash` 走的是 **OpenAI 系**。
@@ -236,18 +236,18 @@ req["stream_options"] = json!({ "include_usage": true });
 
 `core/src/agent.rs` 里有 9 条测试专门守这些不变式：
 
-| 测试 | 守什么 |
-|---|---|
-| `message_prefix_is_stable_across_turns` | 第 2 轮的消息数组必须以第 1 轮为前缀 |
-| `a_prompt_change_is_appended_and_keeps_the_prefix` | **改了系统提示词也不动老前缀**：新提示词追加在末尾，第一条不替掉，也不重复追加 |
-| `full_request_body_is_prefix_stable_across_turns` | 不只比 `messages`，整份请求体（含 `tools` / `stream_options`）跨轮都得是前缀关系 |
-| `system_prompt_is_a_frozen_constant_with_no_interpolation` | `SYSTEM_PROMPT` 里不能有 `{`，也不能出现 `rootfs` / `/data/` / `Activity` / `1080` 这类运行期内容 |
-| `the_request_is_the_history_verbatim` | 请求体长度 == 历史长度：不拼、不前置、不插上下文块 |
-| `tool_schema_order_and_names_are_fixed` | 工具表顺序钉死（想改顺序必须先改测试） |
-| `tool_schemas_serialize_byte_identically` | schema 序列化字节确定 |
+| 测试                                                            | 守什么                                                                                                                 |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `message_prefix_is_stable_across_turns`                         | 第 2 轮的消息数组必须以第 1 轮为前缀                                                                                   |
+| `a_prompt_change_is_appended_and_keeps_the_prefix`              | **改了系统提示词也不动老前缀**：新提示词追加在末尾，第一条不替掉，也不重复追加                                         |
+| `full_request_body_is_prefix_stable_across_turns`               | 不只比 `messages`，整份请求体（含 `tools` / `stream_options`）跨轮都得是前缀关系                                       |
+| `system_prompt_is_a_frozen_constant_with_no_interpolation`      | `SYSTEM_PROMPT` 里不能有 `{`，也不能出现 `rootfs` / `/data/` / `Activity` / `1080` 这类运行期内容                      |
+| `the_request_is_the_history_verbatim`                           | 请求体长度 == 历史长度：不拼、不前置、不插上下文块                                                                     |
+| `tool_schema_order_and_names_are_fixed`                         | 工具表顺序钉死（想改顺序必须先改测试）                                                                                 |
+| `tool_schemas_serialize_byte_identically`                       | schema 序列化字节确定                                                                                                  |
 | `browser_and_search_are_only_reachable_through_the_sandbox_cli` | 浏览器和搜索只能从沙箱那个门进（工具表里不能有 `browser` / `search`，提示词里必须有 `agent browser` / `agent search`） |
-| `usage_understands_both_cache_field_styles` | 两套缓存字段都认，同时在时取大的那个 |
-| `usage_view_splits_the_disjoint_buckets_once` | 归一成互斥桶：`uncached + read + write == input`，命中率只算一份 |
+| `usage_understands_both_cache_field_styles`                     | 两套缓存字段都认，同时在时取大的那个                                                                                   |
+| `usage_view_splits_the_disjoint_buckets_once`                   | 归一成互斥桶：`uncached + read + write == input`，命中率只算一份                                                       |
 
 `full_request_body_is_prefix_stable_across_turns` 是硬的那条：它不断言中间函数，
 而是直接断言**构造好的请求体**（`build_request()`，和 `stream_one` 走同一条路）

@@ -28,14 +28,14 @@
    * 第二页没有返回箭头：安卓本来就有返回键/返回手势，再画一个纯属重复。
    * 返回键在 `Sheet` 里被接管（见它的 `onback`），按下是退回第一页。
    */
-  import { untrack } from 'svelte';
-  import Icon from './Icon.svelte';
-  import Sheet from './Sheet.svelte';
-  import { store } from '../lib/store.svelte.ts';
-  import { models, type Group, type Model } from '../lib/models.svelte.ts';
-  import { EFFORTS, effortLabel } from '../lib/effort';
-  import { PAGE_MS } from '../lib/drag';
-  import type { Peek } from '../lib/overlay';
+  import { untrack } from "svelte";
+  import Icon from "./Icon.svelte";
+  import Sheet from "./Sheet.svelte";
+  import { store } from "../lib/store.svelte.ts";
+  import { models, type Group, type Model } from "../lib/models.svelte.ts";
+  import { EFFORTS, effortLabel } from "../lib/effort";
+  import { PAGE_MS } from "../lib/drag";
+  import type { Peek } from "../lib/overlay";
 
   let {
     onclose,
@@ -49,19 +49,23 @@
     rev?: number;
   } = $props();
 
-  type Page = 'models' | 'sub';
+  type Page = "models" | "sub";
   /** 第二页放什么。两个子页共用轨道上的第二个位置（不排成三页：从第一页到
    *  第三页会把中间那页也扫一遍）。返回时不清，让它滑出去时内容还在。 */
-  type Sub = 'effort' | 'providers';
+  type Sub = "effort" | "providers";
 
-  let page = $state<Page>('models');
-  let sub = $state<Sub>('effort');
+  let page = $state<Page>("models");
+  let sub = $state<Sub>("effort");
   /** 清单正在看哪家（模型提供商页选的）。默认是当前在用的那家。 */
   let viewing = $state<string | null>(null);
-  const shown = $derived(models.groups.find((g) => g.id === viewing) ?? models.groups[0] ?? null);
+  const shown = $derived(
+    models.groups.find((g) => g.id === viewing) ?? models.groups[0] ?? null,
+  );
   /** 当前在用的是哪家（服务商 id） */
   const currentProvider = $derived(models.provider);
-  const modelCount = $derived(models.groups.reduce((n, g) => n + g.models.length, 0));
+  const modelCount = $derived(
+    models.groups.reduce((n, g) => n + g.models.length, 0),
+  );
   let busy = $state(false);
   let scroller = $state<HTMLDivElement | null>(null);
   let paneModels = $state<HTMLDivElement | null>(null);
@@ -69,7 +73,7 @@
   let hModels = $state(0);
   let hSub = $state(0);
 
-  const current = $derived(store.llm?.model ?? '');
+  const current = $derived(store.llm?.model ?? "");
   const effort = $derived(store.llm?.reasoningEffort ?? null);
   /** 预测性返回的进度（只在第二页）：0 = 原位，1 = 已完全回到第一页 */
   let peekP = $state(0);
@@ -77,15 +81,15 @@
   let peeking = $state(false);
 
   /** 0 = 在第一页，1 = 在第二页；跟手返回时介于两者之间 */
-  const at = $derived(page === 'sub' ? 1 - peekP : 0);
+  const at = $derived(page === "sub" ? 1 - peekP : 0);
   /** 视口高度跟着当前页走：切页时整个面板一起长高/变矮；跟手时按进度插值 */
   const height = $derived(hModels + (hSub - hModels) * at);
-  const ease = 'cubic-bezier(0.32,0.72,0,1)';
+  const ease = "cubic-bezier(0.32,0.72,0,1)";
 
-  const back = () => (page = 'models');
+  const back = () => (page = "models");
   const openSub = (s: Sub) => {
     sub = s;
-    page = 'sub';
+    page = "sub";
   };
 
   /** 在模型提供商页选了一家：回到清单，换成这家的模型（滚动交给下面的 effect） */
@@ -138,7 +142,8 @@
   $effect(() => {
     const gs = models.groups;
     if (gs.length === 0) return;
-    if (!gs.some((g) => g.id === viewing)) viewing = models.provider ?? gs[0].id;
+    if (!gs.some((g) => g.id === viewing))
+      viewing = models.provider ?? gs[0].id;
   });
 
   /**
@@ -153,7 +158,7 @@
     if (!s) return;
     const cur = s.querySelector('[data-current="1"]');
     // 找不到（当前模型不属于这家）：回到顶部，别停在上一家的位置
-    if (cur) cur.scrollIntoView({ block: 'center' });
+    if (cur) cur.scrollIntoView({ block: "center" });
     else s.scrollTop = 0;
   }
 
@@ -164,7 +169,8 @@
     if (modelCount) requestAnimationFrame(scrollToCurrent);
   });
 
-  const isCurrent = (g: Group, m: Model) => g.id === currentProvider && m.id === current;
+  const isCurrent = (g: Group, m: Model) =>
+    g.id === currentProvider && m.id === current;
 
   /** 换模型（可能换到另一家）：强度字段跟着一起发（空串 = 保持默认档）。 */
   async function pickModel(g: Group, m: Model) {
@@ -178,14 +184,22 @@
     await apply(current, currentProvider, value);
   }
 
-  async function apply(model: string, provider: string | null, e: string | null) {
+  async function apply(
+    model: string,
+    provider: string | null,
+    e: string | null,
+  ) {
     busy = true;
-    models.err = '';
+    models.err = "";
     try {
-      const r = await fetch('/api/model', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model, provider: provider ?? undefined, reasoningEffort: e ?? '' }),
+      const r = await fetch("/api/model", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model,
+          provider: provider ?? undefined,
+          reasoningEffort: e ?? "",
+        }),
       });
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
       models.setProvider(provider);
@@ -199,10 +213,14 @@
 </script>
 
 <Sheet
-  title={page === 'sub' ? (sub === 'effort' ? '思考强度' : '模型提供商') : '选择模型'}
-  onback={page === 'sub' ? back : undefined}
+  title={page === "sub"
+    ? sub === "effort"
+      ? "思考强度"
+      : "模型提供商"
+    : "选择模型"}
+  onback={page === "sub" ? back : undefined}
   {peek}
-  slide={page === 'sub' ? 1 : -1}
+  slide={page === "sub" ? 1 : -1}
   hug
   padClass="px-0"
   {onclose}
@@ -211,13 +229,13 @@
   <div
     class="overflow-hidden"
     style:height={hModels ? `${height}px` : undefined}
-    style:transition={peeking ? 'none' : `height ${PAGE_MS}ms ${ease}`}
+    style:transition={peeking ? "none" : `height ${PAGE_MS}ms ${ease}`}
   >
     <!-- 两页并排，整条轨道平移：位移和高度都是原生 CSS 过渡 -->
     <div
       class="flex w-[200%]"
       style:transform="translateX({-50 * at}%)"
-      style:transition={peeking ? 'none' : `transform ${PAGE_MS}ms ${ease}`}
+      style:transition={peeking ? "none" : `transform ${PAGE_MS}ms ${ease}`}
     >
       <!-- 每一页**自己**带 12px 外边距（所以 Sheet 那边传了 padClass="px-0"）。
            挂在 Sheet 内容区上的话，两页交界处没有边距 —— 切换动画滑到中间时，
@@ -227,12 +245,14 @@
         <div bind:this={paneModels} class="flex flex-col gap-3">
           <!-- 模型提供商：切到第二页，选看哪家的模型 -->
           <button
-            onclick={() => openSub('providers')}
+            onclick={() => openSub("providers")}
             class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left"
           >
             <span class="shrink-0 text-[17px]">模型提供商</span>
-            <span class="ml-auto flex min-w-0 items-center gap-0.5 text-[17px] text-muted">
-              <span class="truncate">{shown?.name ?? '未配置'}</span>
+            <span
+              class="ml-auto flex min-w-0 items-center gap-0.5 text-[17px] text-muted"
+            >
+              <span class="truncate">{shown?.name ?? "未配置"}</span>
               <Icon name="chevron" size={16} class="shrink-0" />
             </span>
           </button>
@@ -250,25 +270,33 @@
               <p class="px-3.5 py-4 text-base text-muted">载入中…</p>
             {:else if !shown}
               <!-- 一家都没配：直接带去设置页 -->
-              <button onclick={onconfig} class="flex w-full flex-col gap-0.5 px-3.5 py-4 text-left">
+              <button
+                onclick={onconfig}
+                class="flex w-full flex-col gap-0.5 px-3.5 py-4 text-left"
+              >
                 <span class="text-[17px]">还没有配置模型提供商</span>
-                <span class="text-meta text-accent">去设置里填一个 API Key</span>
+                <span class="text-meta text-accent">去设置里填一个 API Key</span
+                >
               </button>
             {:else}
               {#if shown.error}
-                <p class="border-b-2 border-ink px-3.5 py-3 text-meta leading-relaxed text-bad">
+                <p
+                  class="border-b-2 border-ink px-3.5 py-3 text-meta leading-relaxed text-bad"
+                >
                   拉不到模型：{shown.error}
                 </p>
               {/if}
               {#each shown.models as m (m.id)}
                 <button
-                  data-current={isCurrent(shown, m) ? '1' : undefined}
+                  data-current={isCurrent(shown, m) ? "1" : undefined}
                   onclick={() => pickModel(shown, m)}
                   disabled={busy}
                   class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                          text-left last:border-b-0"
                 >
-                  <span class="min-w-0 flex-1 truncate text-[17px]">{m.name}</span>
+                  <span class="min-w-0 flex-1 truncate text-[17px]"
+                    >{m.name}</span
+                  >
                   {#if isCurrent(shown, m)}
                     <Icon name="check" size={17} class="shrink-0 text-accent" />
                   {/if}
@@ -279,22 +307,23 @@
 
           <!-- 思考强度：切到第二页 -->
           <button
-            onclick={() => openSub('effort')}
+            onclick={() => openSub("effort")}
             class="flex w-full items-center rounded-2xl bg-surface px-3.5 py-4 text-left"
           >
             <span class="text-[17px]">思考强度</span>
-            <span class="ml-auto flex items-center gap-0.5 text-[17px] text-muted">
+            <span
+              class="ml-auto flex items-center gap-0.5 text-[17px] text-muted"
+            >
               {effortLabel(effort)}
               <Icon name="chevron" size={16} />
             </span>
           </button>
-
         </div>
       </div>
 
       <div class="w-1/2 shrink-0 px-3">
         <div bind:this={paneSub} class="flex flex-col gap-3">
-          {#if sub === 'providers'}
+          {#if sub === "providers"}
             <!-- 只列配好了 Key 的几家；加新的去设置页 -->
             {#if models.groups.length > 0}
               <div class="overflow-hidden rounded-2xl bg-surface">
@@ -306,12 +335,24 @@
                   >
                     <span class="min-w-0 flex-1">
                       <span class="block truncate text-[17px]">{g.name}</span>
-                      <span class="block truncate text-meta {g.error ? 'text-bad' : 'text-muted'}">
-                        {g.error ? '拉不到模型' : g.id === currentProvider ? '正在使用' : `${g.models.length} 个模型`}
+                      <span
+                        class="block truncate text-meta {g.error
+                          ? 'text-bad'
+                          : 'text-muted'}"
+                      >
+                        {g.error
+                          ? "拉不到模型"
+                          : g.id === currentProvider
+                            ? "正在使用"
+                            : `${g.models.length} 个模型`}
                       </span>
                     </span>
                     {#if g.id === shown?.id}
-                      <Icon name="check" size={17} class="shrink-0 text-accent" />
+                      <Icon
+                        name="check"
+                        size={17}
+                        class="shrink-0 text-accent"
+                      />
                     {/if}
                   </button>
                 {/each}
@@ -323,7 +364,11 @@
               class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left"
             >
               <span class="text-[17px]">管理模型提供商</span>
-              <Icon name="chevron" size={16} class="ml-auto shrink-0 text-muted" />
+              <Icon
+                name="chevron"
+                size={16}
+                class="ml-auto shrink-0 text-muted"
+              />
             </button>
           {:else}
             <div class="overflow-hidden rounded-2xl bg-surface">
@@ -334,7 +379,9 @@
                   class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                          text-left last:border-b-0"
                 >
-                  <span class="min-w-0 flex-1 truncate text-[17px]">{e.label}</span>
+                  <span class="min-w-0 flex-1 truncate text-[17px]"
+                    >{e.label}</span
+                  >
                   {#if e.value === effort}
                     <Icon name="check" size={17} class="shrink-0 text-accent" />
                   {/if}

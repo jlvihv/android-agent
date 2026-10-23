@@ -185,13 +185,13 @@ Rust status::Reporter ──Event::Turn(JSON)──▶ 总线（/api/ws、/api/t
 
 推什么（`status::Snapshot` 的 JSON）：
 
-| 字段 | 说明 |
-|---|---|
-| `phase` | `thinking` / `streaming` / `tool` / `done` |
-| `tool` `detail` | 工具名 + 一行细节（`bash` 的命令首行、`read`/`edit` 的路径、流式正文的最后一行）|
-| `title` `sid` | 哪个会话（多会话同时跑时通知栏要分得清）|
-| `started_at_ms` | 本回合开始（**wall clock**，不是 elapsedRealtime，见下）|
-| `finished_at_ms` `ok` `stopped` | 结束那一条才有 |
+| 字段                            | 说明                                                                             |
+| ------------------------------- | -------------------------------------------------------------------------------- |
+| `phase`                         | `thinking` / `streaming` / `tool` / `done`                                       |
+| `tool` `detail`                 | 工具名 + 一行细节（`bash` 的命令首行、`read`/`edit` 的路径、流式正文的最后一行） |
+| `title` `sid`                   | 哪个会话（多会话同时跑时通知栏要分得清）                                         |
+| `started_at_ms`                 | 本回合开始（**wall clock**，不是 elapsedRealtime，见下）                         |
+| `finished_at_ms` `ok` `stopped` | 结束那一条才有                                                                   |
 
 几个刻意的地方：
 
@@ -245,7 +245,7 @@ Rust status::Reporter ──Event::Turn(JSON)──▶ 总线（/api/ws、/api/t
      那时只看 rich-ongoing 特性开关。
    - **上色按版本分开写**：16 源码（`android16-release` 的 `Notification.java`）里
      `hasPromotableCharacteristics()` 最后一行是 `isColorizedRequested() &&
-     hasPromotableStyle()` —— **必须请求上色**；而 17 真机 `framework.jar` 反汇编出来是
+hasPromotableStyle()` —— **必须请求上色**；而 17 真机 `framework.jar` 反汇编出来是
      `… && !isColorizedRequested() && !isBridged()` —— **请求了上色反而不给提升**。
      两边正相反（Google 改了），所以 `setColorized(SDK_INT < 37)`。
 
@@ -375,14 +375,14 @@ adb shell cat /sys/fs/cgroup/apps/$cg/cgroup.freeze     # 1 = 冻着
 
 （Pixel 10 / Android 17）：
 
-| 状态 | `cgroup.freeze` | `/api/health` |
-|---|---|---|
-| App 是焦点 Activity（屏幕亮 / 熄屏 Dozing 都好） | 0 | 25ms |
-| 焦点被别的 App 抢走（或按 HOME 回桌面）后 60~75 秒 | **1** | 挂死 |
-| 上一条 + **加到 doze 白名单** | **1** | 挂死 |
-| 熄屏很久 → 强制深度 doze（`dumpsys deviceidle force-idle`，无白名单） | **1** | 挂死 |
-| 同上，但**有**白名单 | 0 | 24ms |
-| 冻住之后再叫到前台（`am start`） | 0 | 24ms |
+| 状态                                                                  | `cgroup.freeze` | `/api/health` |
+| --------------------------------------------------------------------- | --------------- | ------------- |
+| App 是焦点 Activity（屏幕亮 / 熄屏 Dozing 都好）                      | 0               | 25ms          |
+| 焦点被别的 App 抢走（或按 HOME 回桌面）后 60~75 秒                    | **1**           | 挂死          |
+| 上一条 + **加到 doze 白名单**                                         | **1**           | 挂死          |
+| 熄屏很久 → 强制深度 doze（`dumpsys deviceidle force-idle`，无白名单） | **1**           | 挂死          |
+| 同上，但**有**白名单                                                  | 0               | 24ms          |
+| 冻住之后再叫到前台（`am start`）                                      | 0               | 24ms          |
 
 **是两个机制，要两招分别治**（这也解释了为什么「关掉电池优化」治不好这件事）：
 
@@ -457,7 +457,7 @@ impl Drop for TurnGuard {
 `loadMessages()` 里：
 
 ```ts
-if (!busy) messages = d.messages ?? [];   // 流还在跑就别换掉正在流式的对象
+if (!busy) messages = d.messages ?? []; // 流还在跑就别换掉正在流式的对象
 ```
 
 ### 验证

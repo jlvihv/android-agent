@@ -9,7 +9,7 @@
  * 纯函数，不碰 DOM —— MessageList 只管照着画。
  */
 
-import type { ToolPart } from './sse';
+import type { ToolPart } from "./sse";
 
 /** 没有专门样式的参数：原样列出来。`block` = 多行 / 很长，用代码块显示 */
 export type Field = { key: string; text: string; block: boolean };
@@ -31,7 +31,7 @@ export type ResultView = {
   images: string[];
 };
 
-const str = (v: unknown) => (typeof v === 'string' ? v : '');
+const str = (v: unknown) => (typeof v === "string" ? v : "");
 
 /**
  * 这次工具调用是不是**失败**了 —— 只看正文里模型也看得见的信号：
@@ -43,15 +43,19 @@ const str = (v: unknown) => (typeof v === 'string' ? v : '');
 export function failed(t: ToolPart): boolean {
   const text = t.output;
   if (text === undefined) return false;
-  if (text.startsWith('错误：')) return true;
+  if (text.startsWith("错误：")) return true;
   const exit = /\[exit (-?\d+)\]\s*$/.exec(text);
-  return exit !== null && exit[1] !== '0';
+  return exit !== null && exit[1] !== "0";
 }
 
 /** 一个值怎么显示：字符串原样，别的排成 JSON */
 function field(key: string, v: unknown): Field {
-  const text = typeof v === 'string' ? v : JSON.stringify(v, null, 2) ?? String(v);
-  const block = typeof v === 'object' && v !== null ? true : text.includes('\n') || text.length > 80;
+  const text =
+    typeof v === "string" ? v : (JSON.stringify(v, null, 2) ?? String(v));
+  const block =
+    typeof v === "object" && v !== null
+      ? true
+      : text.includes("\n") || text.length > 80;
   return { key, text, block };
 }
 
@@ -74,40 +78,43 @@ function formatEdits(edits: unknown): string {
       const o = (e ?? {}) as Record<string, unknown>;
       const lines = (s: unknown, mark: string) =>
         str(s)
-          .split('\n')
+          .split("\n")
           .map((l) => `${mark} ${l}`)
-          .join('\n');
-      return `── 第 ${i + 1} 处 ──\n${lines(o.oldText, '-')}\n${lines(o.newText, '+')}`;
+          .join("\n");
+      return `── 第 ${i + 1} 处 ──\n${lines(o.oldText, "-")}\n${lines(o.newText, "+")}`;
     })
-    .join('\n');
+    .join("\n");
 }
 
-export function describeInput(t: ToolPart, args: Record<string, unknown>): InputView {
+export function describeInput(
+  t: ToolPart,
+  args: Record<string, unknown>,
+): InputView {
   const a = args;
   const used = new Set<string>();
-  let primary = '';
+  let primary = "";
   const take = (k: string) => {
     used.add(k);
     return str(a[k]);
   };
 
   switch (t.toolName) {
-    case 'read':
-      primary = take('path');
+    case "read":
+      primary = take("path");
       break;
-    case 'bash':
-      primary = take('command');
+    case "bash":
+      primary = take("command");
       break;
-    case 'edit': {
-      primary = take('path');
+    case "edit": {
+      primary = take("path");
       // 改成功了，结果里的 diff 就是同一份改动，不必再列一遍旧文 / 新文
-      if (t.output !== undefined && isDiff(t.output)) used.add('edits');
+      if (t.output !== undefined && isDiff(t.output)) used.add("edits");
       break;
     }
   }
 
   const params = rest(a, used).map((f) =>
-    f.key === 'edits' && t.toolName === 'edit'
+    f.key === "edits" && t.toolName === "edit"
       ? { key: f.key, text: formatEdits(a.edits), block: true }
       : f,
   );
@@ -120,10 +127,15 @@ export function describeInput(t: ToolPart, args: Record<string, unknown>): Input
 
 /** edit 成功时的结果就是一段 unified diff（`--- 路径` / `+++ 路径` 开头） */
 function isDiff(text: string): boolean {
-  return text.startsWith('--- ') && text.includes('\n+++ ');
+  return text.startsWith("--- ") && text.includes("\n+++ ");
 }
 
 export function describeResult(t: ToolPart): ResultView | null {
   if (t.output === undefined) return null;
-  return { text: t.output, failed: failed(t), diff: isDiff(t.output), images: t.images ?? [] };
+  return {
+    text: t.output,
+    failed: failed(t),
+    diff: isDiff(t.output),
+    images: t.images ?? [],
+  };
 }

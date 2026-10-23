@@ -9,7 +9,7 @@
    * 宿主模式（桌面）没有 Alpine，`available: false`，整栏不显示。
    */
   type Job = {
-    state: 'idle' | 'running' | 'done' | 'failed';
+    state: "idle" | "running" | "done" | "failed";
     from: string;
     to: string;
     step: string;
@@ -26,20 +26,20 @@
   };
 
   let st = $state<Status | null>(null);
-  let err = $state('');
+  let err = $state("");
   let checking = $state(false);
   /** 点了一次「升级」：再点一次才真的开始（这是个几分钟、几百 MB 的操作） */
   let confirming = $state(false);
   let starting = $state(false);
 
-  const running = $derived(st?.job.state === 'running');
+  const running = $derived(st?.job.state === "running");
 
   async function load(check = false) {
     try {
-      const r = await fetch(`/api/alpine${check ? '?check=1' : ''}`);
+      const r = await fetch(`/api/alpine${check ? "?check=1" : ""}`);
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
       st = (await r.json()) as Status;
-      err = '';
+      err = "";
     } catch (e) {
       err = String(e);
     }
@@ -59,9 +59,9 @@
     confirming = false;
     starting = true;
     try {
-      const r = await fetch('/api/alpine/upgrade', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
+      const r = await fetch("/api/alpine/upgrade", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
         body: JSON.stringify(st?.latest ? { to: st.latest } : {}),
       });
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
@@ -90,8 +90,12 @@
   <div class="overflow-hidden rounded-2xl bg-surface">
     <div class="flex items-center gap-3 px-3.5 py-3">
       <span class="min-w-0 flex-1">
-        <span class="block text-[17px]">Alpine {st.current ?? '?'}</span>
-        <span class="block truncate text-meta {st.upgradable ? 'text-accent' : 'text-muted'}">
+        <span class="block text-[17px]">Alpine {st.current ?? "?"}</span>
+        <span
+          class="block truncate text-meta {st.upgradable
+            ? 'text-accent'
+            : 'text-muted'}"
+        >
           {#if running}
             正在升级到 {st.job.to}…
           {:else if st.upgradable}
@@ -111,7 +115,7 @@
           disabled={checking}
           class="shrink-0 py-1 text-[15px] text-muted disabled:opacity-40"
         >
-          {checking ? '检查中…' : '检查更新'}
+          {checking ? "检查中…" : "检查更新"}
         </button>
       {/if}
     </div>
@@ -126,14 +130,17 @@
           {confirming ? `确认升级到 ${st.latest}？` : `升级到 ${st.latest}`}
         </button>
         {#if confirming}
-          <button onclick={() => (confirming = false)} class="w-full pt-2.5 text-[15px] text-muted">
+          <button
+            onclick={() => (confirming = false)}
+            class="w-full pt-2.5 text-[15px] text-muted"
+          >
             取消
           </button>
         {/if}
       </div>
     {/if}
 
-    {#if st.job.state !== 'idle'}
+    {#if st.job.state !== "idle"}
       <div class="border-t-2 border-ink px-3.5 py-3">
         <p
           class="text-meta {st.job.state === 'failed'
@@ -142,9 +149,9 @@
               ? 'text-accent'
               : 'text-muted'}"
         >
-          {#if st.job.state === 'failed'}
+          {#if st.job.state === "failed"}
             升级失败：{st.job.error}
-          {:else if st.job.state === 'done'}
+          {:else if st.job.state === "done"}
             已升级：{st.job.from} → {st.job.to}
           {:else}
             {st.job.step}
@@ -154,7 +161,7 @@
           <pre
             class="mt-2 max-h-48 overflow-y-auto font-mono text-[11px] leading-4 whitespace-pre-wrap break-all text-faint">{st.job.log
               .slice(-12)
-              .join('\n')}</pre>
+              .join("\n")}</pre>
         {/if}
       </div>
     {/if}

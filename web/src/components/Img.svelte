@@ -9,12 +9,12 @@
    * `class` 给的是图片本身的样式；compact 占位也用它（尺寸 / 圆角 / 边框跟着走），
    * 默认占位只认自己的样式（图片的 max-h 之类对胶囊没意义）。
    */
-  import Icon from './Icon.svelte';
+  import Icon from "./Icon.svelte";
 
   let {
     src,
-    alt = '',
-    class: cls = '',
+    alt = "",
+    class: cls = "",
     compact = false,
     loading,
   }: {
@@ -22,18 +22,22 @@
     alt?: string;
     class?: string;
     compact?: boolean;
-    loading?: 'lazy' | 'eager';
+    loading?: "lazy" | "eager";
   } = $props();
 
   /** 哪个地址加载失败过：换了地址（同一个组件复用）就重新试 */
   let failed = $state<string | null>(null);
   const broken = $derived(failed === src);
-  const label = $derived(alt ? `图片不见了：${alt}` : '图片不见了');
+  const label = $derived(alt ? `图片不见了：${alt}` : "图片不见了");
 </script>
 
 {#if broken}
   {#if compact}
-    <span role="img" aria-label={label} class="grid place-items-center bg-hairline-soft text-muted {cls}">
+    <span
+      role="img"
+      aria-label={label}
+      class="grid place-items-center bg-hairline-soft text-muted {cls}"
+    >
       <Icon name="imagebroken" size={16} />
     </span>
   {:else}

@@ -78,7 +78,8 @@
   --font-sans:
     system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", "PingFang SC",
     "Microsoft YaHei", sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --font-mono:
+    ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 
   /*
    * 字重。
@@ -252,9 +253,7 @@ b,
      抽屉本身不浮动 —— 搜索框 / 列表 / 底栏都在流里（见 docs/05-ui.md）。
      改 Drawer.svelte 里那两行的 padding 就要同步改这里（实测 4rem / 4.25rem）。 */
   --drawer-top: calc(4rem + env(safe-area-inset-top));
-  --drawer-bottom: calc(
-    3.5rem + max(0.75rem, env(safe-area-inset-bottom))
-  );
+  --drawer-bottom: calc(3.5rem + max(0.75rem, env(safe-area-inset-bottom)));
 }
 
 body {
@@ -335,7 +334,7 @@ a:focus-visible {
 .shell::after,
 .drawer-shell::before,
 .drawer-shell::after {
-  content: '';
+  content: "";
   position: absolute;
   inset-inline: 0;
   z-index: 10;

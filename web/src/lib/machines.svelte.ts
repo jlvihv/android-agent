@@ -13,8 +13,13 @@
  * 两份东西都只有几行，逻辑一行都不重复 —— 面板本身、配对、连接、选路由核心那边
  * 一份代码负责到底。
  */
-import { backToLocalShell, hasShell, navigateShell, watchDiscovery } from './overlay';
-import { store } from './store.svelte.ts';
+import {
+  backToLocalShell,
+  hasShell,
+  navigateShell,
+  watchDiscovery,
+} from "./overlay";
+import { store } from "./store.svelte.ts";
 
 /** 面板里的一行（`GET /api/machines` 的 `list`）。 */
 export type Machine = {
@@ -55,7 +60,7 @@ class Machines {
    * 的地址，隧道还开着，勾就会落在别人头上。打勾看 [here]。
    */
   current = $state<string | null>(null);
-  err = $state('');
+  err = $state("");
   /** 正在配对 / 正在连（按钮转圈，顺便防重复点） */
   busy = $state(false);
   /** 等上面那份数据（第一帧画什么） */
@@ -85,13 +90,17 @@ class Machines {
   /** 问一次核心。 */
   async load(): Promise<void> {
     try {
-      const r = await fetch('/api/machines');
+      const r = await fetch("/api/machines");
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const j = (await r.json()) as { list: Machine[]; local: LocalCore; current: string | null };
+      const j = (await r.json()) as {
+        list: Machine[];
+        local: LocalCore;
+        current: string | null;
+      };
       this.list = j.list;
       this.local = j.local;
       this.current = j.current;
-      this.err = '';
+      this.err = "";
     } catch (e) {
       this.err = String(e);
     } finally {
@@ -119,9 +128,9 @@ class Machines {
 
   /** 连上这台（配对过的直接连）。 */
   async connect(id: string): Promise<void> {
-    const j = await this.#post('connect', { id });
+    const j = await this.#post("connect", { id });
     const url = j?.url;
-    if (typeof url === 'string') this.#go(url);
+    if (typeof url === "string") this.#go(url);
   }
 
   /** 和「本机在局域网里看到过的那台」配对（输它的 6 位码），然后直接连上。 */
@@ -142,9 +151,9 @@ class Machines {
 
   /** 配对完就接上：人输那个码就是为了用它，中间多一步「再来点一下」没道理。 */
   async #pairWith(body: Record<string, unknown>): Promise<void> {
-    const j = await this.#post('pair', body);
+    const j = await this.#post("pair", body);
     const id = j?.id;
-    if (typeof id === 'string') await this.connect(id);
+    if (typeof id === "string") await this.connect(id);
   }
 
   /** 回到本机自己的核心。 */
@@ -153,7 +162,7 @@ class Machines {
     if (backToLocalShell()) return;
     this.busy = true;
     try {
-      const r = await fetch('/api/machines/local', { method: 'POST' });
+      const r = await fetch("/api/machines/local", { method: "POST" });
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
       const j = (await r.json()) as { url: string };
       this.#go(j.url);
@@ -166,17 +175,20 @@ class Machines {
 
   /** 忘掉一台（它不认我们的凭据了：电脑上换过库）。 */
   async forget(id: string): Promise<void> {
-    await this.#post('forget', { id });
+    await this.#post("forget", { id });
     await this.load();
   }
 
   /** 打一个 `POST /api/machines/<what>`，返回核心给的 JSON（出错就写进 `err`）。 */
-  async #post(what: string, body: unknown): Promise<Record<string, unknown> | null> {
+  async #post(
+    what: string,
+    body: unknown,
+  ): Promise<Record<string, unknown> | null> {
     this.busy = true;
     try {
       const r = await fetch(`/api/machines/${what}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        method: "POST",
+        headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
       const text = await r.text();
@@ -186,8 +198,11 @@ class Machines {
       } catch {
         // 不是 JSON（核心没起来 / 老核心）：下面那行把原文带上
       }
-      if (!r.ok) throw new Error(String(j.error ?? '').trim() || text.trim() || `HTTP ${r.status}`);
-      this.err = '';
+      if (!r.ok)
+        throw new Error(
+          String(j.error ?? "").trim() || text.trim() || `HTTP ${r.status}`,
+        );
+      this.err = "";
       return j;
     } catch (e) {
       this.err = String(e instanceof Error ? e.message : e);

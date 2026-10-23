@@ -2,11 +2,11 @@
 
 这里放 SVG 源 —— `res/` 不认 SVG，所以 PNG 是手动渲染出来的。
 
-| 文件 | 对应 |
-|---|---|
+| 文件                         | 对应                                                                                                               |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | `ic_launcher_foreground.svg` | 自适应图标的**前景层**。矢量版在 `res/drawable/ic_launcher_foreground.xml`（手写的 path）—— **改图形时两边都要改** |
-| `ic_launcher.svg` | 传统方形图标（PNG 兜底 + 商店截图用） |
-| `ic_launcher_round.svg` | 传统圆形图标 |
+| `ic_launcher.svg`            | 传统方形图标（PNG 兜底 + 商店截图用）                                                                              |
+| `ic_launcher_round.svg`      | 传统圆形图标                                                                                                       |
 
 重新渲染 PNG（`rsvg-convert` 来自 librsvg）：
 

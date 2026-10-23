@@ -19,11 +19,11 @@
    * 内容短也不会缩成一条；再长就在面板内滚。
    * “就几行字”的面板（附件 / 用量 / 模型）传 `hug`，贴合内容。
    */
-  import type { Snippet } from 'svelte';
-  import { fly } from 'svelte/transition';
-  import { cubicOut } from 'svelte/easing';
-  import { onBack, type Peek } from '../lib/overlay';
-  import { dismissable, RELEASE, PAGE_MS } from '../lib/drag';
+  import type { Snippet } from "svelte";
+  import { fly } from "svelte/transition";
+  import { cubicOut } from "svelte/easing";
+  import { onBack, type Peek } from "../lib/overlay";
+  import { dismissable, RELEASE, PAGE_MS } from "../lib/drag";
 
   /** 滑出 / 淡出遮罩的时长。面板的 transform 和遮罩的 opacity 必须同步，
    *  `close()` 那个 setTimeout 也用它（等动画跑完再卸载）。 */
@@ -42,7 +42,7 @@
     /** 贴合内容（`min-h-0`）：就几行数字的面板别摚到 45% 屏高。
      *  不传就是默认下限（正文类的思考/工具输出用）。 */
     hug = false,
-    padClass = 'px-3',
+    padClass = "px-3",
     children,
   }: {
     title: string;
@@ -156,14 +156,18 @@
   /** 从手指落点往上到面板，有没有哪层已经滚过了（正文、或里面单独滚的清单）。
    *  有的话往下拉是在把它滚回去，不是关面板。 */
   function scrolled(t: EventTarget | null): boolean {
-    for (let n = t as HTMLElement | null; n && n !== panel; n = n.parentElement) {
+    for (
+      let n = t as HTMLElement | null;
+      n && n !== panel;
+      n = n.parentElement
+    ) {
       if (n.scrollTop > 0) return true;
     }
     return false;
   }
 
   const drag = {
-    axis: 'y' as const,
+    axis: "y" as const,
     dir: 1 as const,
     size: () => panel?.offsetHeight ?? FALLBACK_H,
     // 正文（或里面单独滚的清单）没滚到顶时往下拉是在滚它，不接管
@@ -187,7 +191,7 @@
   use:portal
   class="fixed inset-0 z-[55] bg-scrim"
   style:opacity={1 - p}
-  style:transition={dragging ? 'none' : `opacity ${CLOSE_MS}ms ease-out`}
+  style:transition={dragging ? "none" : `opacity ${CLOSE_MS}ms ease-out`}
   aria-label="关闭"
   onclick={close}
 ></button>
@@ -201,10 +205,10 @@
   aria-label={title}
   tabindex="-1"
   style:transform="translateY({p * 100}%)"
-  style:transition={dragging ? 'none' : RELEASE}
+  style:transition={dragging ? "none" : RELEASE}
   class="fixed inset-x-0 bottom-[var(--kb,0px)] z-[56] flex max-h-[var(--sheet-max-h)] {hug
-         ? 'min-h-0'
-         : 'min-h-[var(--sheet-min-h)]'} flex-col
+    ? 'min-h-0'
+    : 'min-h-[var(--sheet-min-h)]'} flex-col
          rounded-t-4xl bg-panel pt-1 will-change-transform"
 >
   <div class="shrink-0">
@@ -215,8 +219,16 @@
       <div class="relative h-full overflow-hidden">
         {#key title}
           <h2
-            in:fly={{ x: PAGE_SHIFT * slide, duration: PAGE_MS, easing: cubicOut }}
-            out:fly={{ x: -PAGE_SHIFT * slide, duration: PAGE_MS, easing: cubicOut }}
+            in:fly={{
+              x: PAGE_SHIFT * slide,
+              duration: PAGE_MS,
+              easing: cubicOut,
+            }}
+            out:fly={{
+              x: -PAGE_SHIFT * slide,
+              duration: PAGE_MS,
+              easing: cubicOut,
+            }}
             class="absolute inset-0 flex items-center justify-center truncate px-12 text-[17px]
                    font-semibold"
           >

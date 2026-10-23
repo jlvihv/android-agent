@@ -38,9 +38,10 @@ class Favorites {
     if (this.#loading) return this.#loading;
     this.#loading = (async () => {
       try {
-        const r = await fetch('/api/favorites');
+        const r = await fetch("/api/favorites");
         if (r.ok) {
-          this.list = ((await r.json()) as { favorites?: Favorite[] }).favorites ?? [];
+          this.list =
+            ((await r.json()) as { favorites?: Favorite[] }).favorites ?? [];
           this.#loaded = true;
         }
       } catch {
@@ -60,24 +61,28 @@ class Favorites {
 
   async add(path: string, title: string): Promise<void> {
     // 先上屏（点星要立刻有反应），服务端那份回来再覆盖（排序 / 截断以它为准）
-    this.list = [{ path, title, createdAt: Date.now() }, ...this.list.filter((f) => f.path !== path)];
-    await this.#send('/api/favorites', { path, title });
+    this.list = [
+      { path, title, createdAt: Date.now() },
+      ...this.list.filter((f) => f.path !== path),
+    ];
+    await this.#send("/api/favorites", { path, title });
   }
 
   async remove(path: string): Promise<void> {
     this.list = this.list.filter((f) => f.path !== path);
-    await this.#send('/api/favorites/delete', { path });
+    await this.#send("/api/favorites/delete", { path });
   }
 
   async #send(url: string, body: unknown): Promise<void> {
     try {
       const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        method: "POST",
+        headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
       if (!r.ok) throw new Error(await r.text());
-      this.list = ((await r.json()) as { favorites?: Favorite[] }).favorites ?? this.list;
+      this.list =
+        ((await r.json()) as { favorites?: Favorite[] }).favorites ?? this.list;
       this.#loaded = true;
     } catch {
       // 没存进去：把界面拉回服务端的真实状态，别留一个假的收藏

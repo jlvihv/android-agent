@@ -12,8 +12,8 @@
   const LIMIT = 200 * 1024;
 
   let text = $state<string | null>(null);
-  let note = $state('');
-  let err = $state('');
+  let note = $state("");
+  let err = $state("");
   let copied = $state(false);
 
   $effect(() => {
@@ -21,8 +21,8 @@
     void url;
     let dead = false;
     text = null;
-    note = '';
-    err = '';
+    note = "";
+    err = "";
     void (async () => {
       try {
         const r = await fetch(url);
@@ -31,8 +31,8 @@
           // 这里抠出文字来，比只显示 “HTTP 404” 有用得多
           const body = await r.text();
           const plain = body
-            .replace(/<[^>]*>/g, ' ')
-            .replace(/\s+/g, ' ')
+            .replace(/<[^>]*>/g, " ")
+            .replace(/\s+/g, " ")
             .trim();
           throw new Error(plain || `HTTP ${r.status}`);
         }
@@ -53,7 +53,7 @@
     };
   });
 
-  const lines = $derived(text == null ? 0 : text.split('\n').length);
+  const lines = $derived(text == null ? 0 : text.split("\n").length);
 
   async function copy() {
     if (text == null) return;
@@ -68,17 +68,24 @@
 </script>
 
 <div class="flex h-full flex-col">
-  <div class="flex shrink-0 items-center gap-2 px-3 py-1.5 font-mono text-meta text-faint">
+  <div
+    class="flex shrink-0 items-center gap-2 px-3 py-1.5 font-mono text-meta text-faint"
+  >
     {#if text != null}
       <span>{lines} 行 · {(text.length / 1024).toFixed(1)}KB</span>
       {#if note}<span class="truncate text-warn">{note}</span>{/if}
-      <button class="ml-auto shrink-0 rounded-full bg-control px-3 py-1 text-fg" onclick={copy}>
-        {copied ? '已复制' : '复制'}
+      <button
+        class="ml-auto shrink-0 rounded-full bg-control px-3 py-1 text-fg"
+        onclick={copy}
+      >
+        {copied ? "已复制" : "复制"}
       </button>
     {/if}
   </div>
 
-  <div class="min-h-0 flex-1 overflow-auto px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+  <div
+    class="min-h-0 flex-1 overflow-auto px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+  >
     {#if err}
       <p class="py-6 text-sm text-bad">读不出来：{err}</p>
     {:else if text == null}

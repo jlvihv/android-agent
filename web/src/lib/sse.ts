@@ -17,29 +17,29 @@
 // ---------------------------------------------------------------------------
 
 export type UiChunk =
-  | { type: 'start'; messageId: string }
-  | { type: 'start-step' }
-  | { type: 'finish-step' }
-  | { type: 'reset-step' }
-  | { type: 'finish' }
-  | { type: 'abort'; reason?: string }
-  | { type: 'error'; errorText: string }
-  | { type: 'text-start'; id: string }
-  | { type: 'text-delta'; id: string; delta: string }
-  | { type: 'text-end'; id: string }
-  | { type: 'reasoning-start'; id: string }
-  | { type: 'reasoning-delta'; id: string; delta: string }
-  | { type: 'reasoning-end'; id: string }
-  | { type: 'tool-input-start'; toolCallId: string; toolName: string }
-  | { type: 'tool-input-delta'; toolCallId: string; inputTextDelta: string }
+  | { type: "start"; messageId: string }
+  | { type: "start-step" }
+  | { type: "finish-step" }
+  | { type: "reset-step" }
+  | { type: "finish" }
+  | { type: "abort"; reason?: string }
+  | { type: "error"; errorText: string }
+  | { type: "text-start"; id: string }
+  | { type: "text-delta"; id: string; delta: string }
+  | { type: "text-end"; id: string }
+  | { type: "reasoning-start"; id: string }
+  | { type: "reasoning-delta"; id: string; delta: string }
+  | { type: "reasoning-end"; id: string }
+  | { type: "tool-input-start"; toolCallId: string; toolName: string }
+  | { type: "tool-input-delta"; toolCallId: string; inputTextDelta: string }
   | {
-      type: 'tool-input-available';
+      type: "tool-input-available";
       toolCallId: string;
       toolName: string;
       input: unknown;
     }
   | {
-      type: 'tool-output-available';
+      type: "tool-output-available";
       toolCallId: string;
       output: string;
       /** 工具返回的图片（沙箱里的原图路径），只有读到图时才带 */
@@ -49,7 +49,7 @@ export type UiChunk =
     }
   | { type: `data-${string}`; data: unknown };
 
-const DONE = Symbol('done');
+const DONE = Symbol("done");
 
 /**
  * 一条流最多能静默多久（ms）。
@@ -74,24 +74,24 @@ const IDLE_TIMEOUT_MS = 45_000;
 
 /** 解析单个 SSE 帧（不含结尾空行）。非 data 行忽略。 */
 function parseFrame(raw: string): UiChunk | typeof DONE | null {
-  const lines = raw.split('\n');
+  const lines = raw.split("\n");
   const dataLines: string[] = [];
 
   for (const line of lines) {
-    if (!line.startsWith('data:')) continue;
+    if (!line.startsWith("data:")) continue;
     // 规范：`data:` 后紧跟一个可选空格
-    dataLines.push(line.slice(5).replace(/^ /, ''));
+    dataLines.push(line.slice(5).replace(/^ /, ""));
   }
   if (dataLines.length === 0) return null;
 
-  const payload = dataLines.join('\n');
-  if (payload === '[DONE]') return DONE;
+  const payload = dataLines.join("\n");
+  if (payload === "[DONE]") return DONE;
 
   try {
     return JSON.parse(payload) as UiChunk;
   } catch {
     // 单帧坏掉不该拖垮整条流
-    console.warn('[sse] 无法解析的帧:', payload.slice(0, 200));
+    console.warn("[sse] 无法解析的帧:", payload.slice(0, 200));
     return null;
   }
 }
@@ -104,16 +104,16 @@ function parseFrame(raw: string): UiChunk | typeof DONE | null {
 export async function* parseUiStream(
   res: Response,
 ): AsyncGenerator<UiChunk, void, undefined> {
-  if (!res.body) throw new Error('响应没有 body');
+  if (!res.body) throw new Error("响应没有 body");
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  let buf = '';
+  let buf = "";
 
   const drain = function* (flush: boolean): Generator<UiChunk> {
-    buf = buf.replace(/\r\n/g, '\n');
+    buf = buf.replace(/\r\n/g, "\n");
     for (;;) {
-      const idx = buf.indexOf('\n\n');
+      const idx = buf.indexOf("\n\n");
       if (idx === -1) break;
       const frame = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
@@ -123,7 +123,7 @@ export async function* parseUiStream(
     }
     if (flush && buf.trim()) {
       const parsed = parseFrame(buf);
-      buf = '';
+      buf = "";
       if (parsed && parsed !== DONE) return yield parsed;
     }
   };
@@ -155,15 +155,17 @@ export async function* streamFrom(
   signal?: AbortSignal,
 ): AsyncGenerator<UiChunk, void, undefined> {
   const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    method: "POST",
+    headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
     signal,
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`${res.status} ${res.statusText}${text ? `: ${text}` : ''}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `${res.status} ${res.statusText}${text ? `: ${text}` : ""}`,
+    );
   }
   yield* parseUiStream(res);
 }
@@ -275,8 +277,10 @@ export function onQueuedDelivered(fn: (ids: string[]) => void): () => void {
 }
 
 /** 这条消息排进服务端的队列了（`POST /api/chat` 的全部回应就这一帧）。 */
-export function isQueued(c: UiChunk | null): c is { type: 'data-queued'; data: { id: string } } {
-  return c?.type === 'data-queued';
+export function isQueued(
+  c: UiChunk | null,
+): c is { type: "data-queued"; data: { id: string } } {
+  return c?.type === "data-queued";
 }
 
 /**
@@ -294,13 +298,13 @@ export async function* prepend(
 }
 
 export type ToolPart = {
-  type: 'tool';
+  type: "tool";
   toolCallId: string;
   toolName: string;
   /** 流式到达的原始 JSON 文本 */
   inputText: string;
   input: unknown;
-  state: 'streaming' | 'ready' | 'output';
+  state: "streaming" | "ready" | "output";
   /** 模型收到的结果原文（还在跑时是到目前为止的输出） */
   output?: string;
   /** 工具返回的图片（read 读到图）：沙箱里的原图路径 */
@@ -308,29 +312,29 @@ export type ToolPart = {
 };
 
 export type Part =
-  | { type: 'text'; id: string; text: string }
-  | { type: 'reasoning'; id: string; text: string }
+  | { type: "text"; id: string; text: string }
+  | { type: "reasoning"; id: string; text: string }
   | ToolPart
-  | { type: 'data'; name: string; data: unknown }
-  | { type: 'error'; text: string }
+  | { type: "data"; name: string; data: unknown }
+  | { type: "error"; text: string }
   /** 用户在输入框里附的图片 / PDF。服务端 `session_view` 恢复历史时才有；
    *  刚发出去的那条是本地直接拼的（同一个形状）。 */
-  | { type: 'image'; id: string; url: string; name: string; mime: string }
-  | { type: 'file'; id: string; url: string; name: string; mime: string };
+  | { type: "image"; id: string; url: string; name: string; mime: string }
+  | { type: "file"; id: string; url: string; name: string; mime: string };
 
 /** 已上传、还没发出去的附件（输入卡片里的一个小胶囊）。 */
 export type Upload = {
   id: string;
   name: string;
   mime: string;
-  kind: 'image' | 'pdf';
+  kind: "image" | "pdf";
   /** 取回本体给缩略图/下载用的 URL */
   url: string;
 };
 
 export type Message = {
   id: string;
-  role: 'user' | 'assistant';
+  role: "user" | "assistant";
   parts: Part[];
   /** 已完成一个 LLM 调用（finish-step）的次数 */
   steps: number;
@@ -338,7 +342,7 @@ export type Message = {
 };
 
 export function newAssistantMessage(id: string): Message {
-  return { id, role: 'assistant', parts: [], steps: 0, done: false };
+  return { id, role: "assistant", parts: [], steps: 0, done: false };
 }
 
 /**
@@ -349,124 +353,122 @@ export function newAssistantMessage(id: string): Message {
  */
 export function applyChunk(msg: Message, c: UiChunk): void {
   const findText = (id: string) =>
-    msg.parts.find((p) => p.type === 'text' && p.id === id) as
-      | Extract<Part, { type: 'text' }>
-      | undefined;
+    msg.parts.find((p) => p.type === "text" && p.id === id) as
+      Extract<Part, { type: "text" }> | undefined;
   const findReasoning = (id: string) =>
-    msg.parts.find((p) => p.type === 'reasoning' && p.id === id) as
-      | Extract<Part, { type: 'reasoning' }>
-      | undefined;
+    msg.parts.find((p) => p.type === "reasoning" && p.id === id) as
+      Extract<Part, { type: "reasoning" }> | undefined;
   const findTool = (toolCallId: string) =>
-    msg.parts.find(
-      (p) => p.type === 'tool' && p.toolCallId === toolCallId,
-    ) as ToolPart | undefined;
+    msg.parts.find((p) => p.type === "tool" && p.toolCallId === toolCallId) as
+      ToolPart | undefined;
 
   switch (c.type) {
-    case 'text-start':
-      if (!findText(c.id)) msg.parts.push({ type: 'text', id: c.id, text: '' });
+    case "text-start":
+      if (!findText(c.id)) msg.parts.push({ type: "text", id: c.id, text: "" });
       break;
-    case 'text-delta': {
+    case "text-delta": {
       let p = findText(c.id);
       if (!p) {
-        p = { type: 'text', id: c.id, text: '' };
+        p = { type: "text", id: c.id, text: "" };
         msg.parts.push(p);
       }
       p.text += c.delta;
       break;
     }
-    case 'text-end':
+    case "text-end":
       break;
 
-    case 'reasoning-start':
+    case "reasoning-start":
       if (!findReasoning(c.id))
-        msg.parts.push({ type: 'reasoning', id: c.id, text: '' });
+        msg.parts.push({ type: "reasoning", id: c.id, text: "" });
       break;
-    case 'reasoning-delta': {
+    case "reasoning-delta": {
       let p = findReasoning(c.id);
       if (!p) {
-        p = { type: 'reasoning', id: c.id, text: '' };
+        p = { type: "reasoning", id: c.id, text: "" };
         msg.parts.push(p);
       }
       p.text += c.delta;
       break;
     }
-    case 'reasoning-end':
+    case "reasoning-end":
       break;
 
-    case 'tool-input-start':
+    case "tool-input-start":
       if (!findTool(c.toolCallId)) {
         msg.parts.push({
-          type: 'tool',
+          type: "tool",
           toolCallId: c.toolCallId,
           toolName: c.toolName,
-          inputText: '',
+          inputText: "",
           input: undefined,
-          state: 'streaming',
+          state: "streaming",
         });
       }
       break;
-    case 'tool-input-delta': {
+    case "tool-input-delta": {
       const p = findTool(c.toolCallId);
       if (p) p.inputText += c.inputTextDelta;
       break;
     }
-    case 'tool-input-available': {
+    case "tool-input-available": {
       let p = findTool(c.toolCallId);
       if (!p) {
         p = {
-          type: 'tool',
+          type: "tool",
           toolCallId: c.toolCallId,
           toolName: c.toolName,
-          inputText: '',
+          inputText: "",
           input: undefined,
-          state: 'ready',
+          state: "ready",
         };
         msg.parts.push(p);
       }
       p.toolName = c.toolName;
       p.input = c.input;
-      p.state = 'ready';
+      p.state = "ready";
       break;
     }
-    case 'tool-output-available': {
+    case "tool-output-available": {
       const p = findTool(c.toolCallId);
       if (p) {
         p.output = c.output;
         if (c.images) p.images = c.images;
         // 阶段性结果只刷新输出，状态留在"执行中"
-        if (!c.preliminary) p.state = 'output';
+        if (!c.preliminary) p.state = "output";
       }
       break;
     }
-    case 'start-step':
+    case "start-step":
       msg.steps += 1;
       break;
-    case 'finish-step':
-    case 'start':
-    case 'reset-step':
+    case "finish-step":
+    case "start":
+    case "reset-step":
       break;
 
-    case 'error':
-      msg.parts.push({ type: 'error', text: c.errorText });
+    case "error":
+      msg.parts.push({ type: "error", text: c.errorText });
       break;
-    case 'abort':
+    case "abort":
       msg.done = true;
       break;
-    case 'finish':
+    case "finish":
       msg.done = true;
       break;
 
     default: {
-      if (c.type.startsWith('data-')) {
+      if (c.type.startsWith("data-")) {
         msg.parts.push({
-          type: 'data',
+          type: "data",
           name: c.type.slice(5),
           data: (c as { data: unknown }).data,
         });
         // 用量单独报一声（圆环要实时的，不想让 UI 去扫 parts）
-        if (c.type === 'data-usage') for (const f of usageSinks) f(c.data as Usage);
+        if (c.type === "data-usage")
+          for (const f of usageSinks) f(c.data as Usage);
         // 排队的消息交出去了：界面把那几条从「排队中」挪进正文
-        if (c.type === 'data-queued-delivered') {
+        if (c.type === "data-queued-delivered") {
           const ids = (c.data as { ids: string[] }).ids ?? [];
           for (const f of queuedSinks) f(ids);
         }
@@ -494,7 +496,7 @@ export async function consume(
   // 第一条 `start` 对应的消息调用方已经建好了（`beginStreaming`），不换
   let started = false;
   for await (const c of stream) {
-    if (c.type === 'start') {
+    if (c.type === "start") {
       if (started && onRestart) {
         const next = onRestart(cur);
         if (next) {

@@ -114,17 +114,17 @@
 
 ## 形状
 
-| 部分 | 在哪 | 做什么 |
-|---|---|---|
-| 中继服务器 | `relay/`（独立小 crate，二进制 `agent-relay`） | 接线 + 搬字节；状态只有「谁在线」「哪些拨号在等」 |
-| 握手协议 | `relay/src/lib.rs`（`connect` / `run_host`） | 两头的核心共用这一份 |
-| 一条连接怎么服务 | `core/src/http.rs`（`serve_conn` / `accept_conn`） | 明文、局域网 TLS、中继**三种连接走同一个函数**、同一份路由；区别只在挂上的对端地址和 `Via` |
-| 被连的那头 | `core/src/remote.rs` | 证书（局域网 TLS 和中继共用）、挂在中继上、运行时换中继（别人交来的） |
-| 机器管理 | `core/src/machines.rs` | 配对过哪些电脑（库里的 `machines` 表）+ 局域网里看到的、配对（TLS）、连接、把中继交给还没配的电脑、页面上那份列表（`panel`） |
-| 隧道 | `core/src/tunnel.rs` | 本机代理：按请求挑上游、注入凭据、每条连接**选路**（先局域网 0.5 秒，不通走中继，冷却 30 秒）+ TLS（只认那个指纹） |
-| 界面（面板） | `web/src/components/MachineSheet.svelte` + `lib/machines.svelte.ts` | 问核心要那份列表（`GET /api/machines`）、配对、切换 —— 手机和电脑共用这一份 |
-| 发现 | `CoreDiscovery.kt`（手机）/ `desktop::browse`（电脑） | mDNS 浏览，报给核心（`lanFound` / `lanLost`） |
-| 壳 | `Remote.kt`（~110 行） | 只记「现在连的是哪台」；认不认页面给的那个地址（换页面时） |
+| 部分             | 在哪                                                                | 做什么                                                                                                                       |
+| ---------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| 中继服务器       | `relay/`（独立小 crate，二进制 `agent-relay`）                      | 接线 + 搬字节；状态只有「谁在线」「哪些拨号在等」                                                                            |
+| 握手协议         | `relay/src/lib.rs`（`connect` / `run_host`）                        | 两头的核心共用这一份                                                                                                         |
+| 一条连接怎么服务 | `core/src/http.rs`（`serve_conn` / `accept_conn`）                  | 明文、局域网 TLS、中继**三种连接走同一个函数**、同一份路由；区别只在挂上的对端地址和 `Via`                                   |
+| 被连的那头       | `core/src/remote.rs`                                                | 证书（局域网 TLS 和中继共用）、挂在中继上、运行时换中继（别人交来的）                                                        |
+| 机器管理         | `core/src/machines.rs`                                              | 配对过哪些电脑（库里的 `machines` 表）+ 局域网里看到的、配对（TLS）、连接、把中继交给还没配的电脑、页面上那份列表（`panel`） |
+| 隧道             | `core/src/tunnel.rs`                                                | 本机代理：按请求挑上游、注入凭据、每条连接**选路**（先局域网 0.5 秒，不通走中继，冷却 30 秒）+ TLS（只认那个指纹）           |
+| 界面（面板）     | `web/src/components/MachineSheet.svelte` + `lib/machines.svelte.ts` | 问核心要那份列表（`GET /api/machines`）、配对、切换 —— 手机和电脑共用这一份                                                  |
+| 发现             | `CoreDiscovery.kt`（手机）/ `desktop::browse`（电脑）               | mDNS 浏览，报给核心（`lanFound` / `lanLost`）                                                                                |
+| 壳               | `Remote.kt`（~110 行）                                              | 只记「现在连的是哪台」；认不认页面给的那个地址（换页面时）                                                                   |
 
 几个选择：
 

@@ -17,17 +17,17 @@
    * 同源地址（不是 /sandbox 开头的），就不给 allow-same-origin：同源再给它，
    * 页面就能拆掉自己的 sandbox。
    */
-  import { quintOut } from 'svelte/easing';
-  import Img from './Img.svelte';
-  import Icon from './Icon.svelte';
-  import { onBack } from '../lib/overlay';
-  import { dismissable, RELEASE } from '../lib/drag';
-  import { viewer, closeViewer } from '../lib/viewer.svelte.ts';
-  import { favorites } from '../lib/favorites.svelte.ts';
-  import { probeBackground } from '../lib/pagebg';
-  import { mediaKind, sandboxGuestPath, sandboxPageUrl } from '../lib/markdown';
-  import TextView from './TextView.svelte';
-  import MarkdownFile from './MarkdownFile.svelte';
+  import { quintOut } from "svelte/easing";
+  import Img from "./Img.svelte";
+  import Icon from "./Icon.svelte";
+  import { onBack } from "../lib/overlay";
+  import { dismissable, RELEASE } from "../lib/drag";
+  import { viewer, closeViewer } from "../lib/viewer.svelte.ts";
+  import { favorites } from "../lib/favorites.svelte.ts";
+  import { probeBackground } from "../lib/pagebg";
+  import { mediaKind, sandboxGuestPath, sandboxPageUrl } from "../lib/markdown";
+  import TextView from "./TextView.svelte";
+  import MarkdownFile from "./MarkdownFile.svelte";
 
   const IMAGE = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i;
   /** 明确是网页的扩展名 */
@@ -37,23 +37,26 @@
   /** markdown：渲染成文档看，而不是把源码丢进 TextView */
   const MARKDOWN = /\.(md|markdown|mdown|mkd)$/i;
 
-  const path = $derived((viewer.url ?? '').split(/[?#]/)[0]);
-  const isImage = $derived(viewer.kind === 'image' || IMAGE.test(path));
+  const path = $derived((viewer.url ?? "").split(/[?#]/)[0]);
+  const isImage = $derived(viewer.kind === "image" || IMAGE.test(path));
   const isMarkdown = $derived(!isImage && MARKDOWN.test(path));
   // 目录列表是服务端生成的 HTML：带结尾斜杠的、或者**没有扩展名**的都可能是它
   // （服务端对不带斜杠的目录会 302 到带斜杠的，fetch 会跟着走，拿回来是 HTML）。
   // 反过来，有扩展名的（.sh/.py/.json/…）才走文本视图。
   // 明说了是图片（没有扩展名的附件地址）就不是网页 —— 不然下面会白拉一次去探背景色
   const isWebPage = $derived(
-    !isImage && (HTMLISH.test(path) || path.endsWith('/') || !HAS_EXT.test(path)),
+    !isImage &&
+      (HTMLISH.test(path) || path.endsWith("/") || !HAS_EXT.test(path)),
   );
-  const media = $derived(mediaKind(viewer.url ?? ''));
+  const media = $derived(mediaKind(viewer.url ?? ""));
 
   /**
    * 这个页面对应的沙箱路径（收藏用）。不是网页 / 不是沙箱文件时为 null ——
    * 图片、音视频、文本、附件的 URL 上也没有「收藏」这回事。
    */
-  const favPath = $derived(isWebPage ? sandboxGuestPath(viewer.url ?? '') : null);
+  const favPath = $derived(
+    isWebPage ? sandboxGuestPath(viewer.url ?? "") : null,
+  );
   const faved = $derived(!!favPath && favorites.has(favPath));
 
   // 星是「亮 / 不亮」的，进来先要有一份收藏列表（模块级，抽屉那边也用这一份）
@@ -71,16 +74,16 @@
    */
   async function pageTitle(url: string, fallback: string): Promise<string> {
     try {
-      const r = await fetch(url, { credentials: 'omit' });
+      const r = await fetch(url, { credentials: "omit" });
       if (r.ok) {
         const html = await r.text();
         const raw = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1];
         if (raw) {
           // 实体（`&amp;` 之类）交给浏览器解。textarea 是 RCDATA：
           // 塞进去的标签只会当文字，不会执行 / 不会建节点。
-          const t = document.createElement('textarea');
+          const t = document.createElement("textarea");
           t.innerHTML = raw;
-          const title = t.value.replace(/\s+/g, ' ').trim();
+          const title = t.value.replace(/\s+/g, " ").trim();
           if (title) return title.slice(0, 120);
         }
       }
@@ -95,11 +98,15 @@
     const path = favPath;
     if (!path) return;
     if (favorites.has(path)) await favorites.remove(path);
-    else await favorites.add(path, await pageTitle(viewer.url ?? '', viewer.title));
+    else
+      await favorites.add(
+        path,
+        await pageTitle(viewer.url ?? "", viewer.title),
+      );
   }
 
   /** iframe 实际加载的地址（沙箱网页换到独立的源上） */
-  const frameSrc = $derived(viewer.url ? sandboxPageUrl(viewer.url) : '');
+  const frameSrc = $derived(viewer.url ? sandboxPageUrl(viewer.url) : "");
   /** 和 App 不同源才能放开 allow-same-origin（见文件头） */
   const isolated = $derived.by(() => {
     try {
@@ -119,7 +126,7 @@
    * （起点、微信这些注册了 App Links 的会直接进 App）。
    */
   const frameSandbox = $derived(
-    `allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-downloads${isolated ? ' allow-same-origin' : ''}`,
+    `allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-downloads${isolated ? " allow-same-origin" : ""}`,
   );
 
   $effect(() => onBack(closeViewer, drag));
@@ -142,7 +149,7 @@
     // iframe 立刻挂上，不阻塞加载（探测和页面加载并行跑）。
     // 探到之前是透明，所以最多是「深色底 → 页面的底色」，不会白闪。
     void probeBackground(url).then((bg) => {
-      if (alive) frameBg = bg ?? '#fff';
+      if (alive) frameBg = bg ?? "#fff";
     });
     return () => {
       alive = false;
@@ -154,7 +161,7 @@
   let dragging = $state(false);
 
   const drag = {
-    axis: 'x' as const,
+    axis: "x" as const,
     dir: 1 as const,
     size: () => box?.offsetWidth ?? 1,
     onStart: () => (dragging = true),
@@ -179,7 +186,8 @@
     return {
       duration: 240 * (1 - from) + 80,
       easing: quintOut,
-      css: (_t: number, u: number) => `transform: translateX(${(from + (1 - from) * u) * 100}%)`,
+      css: (_t: number, u: number) =>
+        `transform: translateX(${(from + (1 - from) * u) * 100}%)`,
     };
   }
 </script>
@@ -188,7 +196,7 @@
   bind:this={box}
   class="fixed inset-0 z-[70] flex flex-col bg-ink will-change-transform"
   style:transform={off ? `translateX(${off * 100}%)` : null}
-  style:transition={dragging ? 'none' : RELEASE}
+  style:transition={dragging ? "none" : RELEASE}
   in:slideIn|global
   out:slideOut|global
   aria-label={viewer.title}
@@ -213,9 +221,9 @@
     {#if favPath}
       <button
         class="ml-auto shrink-0 p-1 {faved ? 'text-accent' : 'text-muted'}"
-        aria-label={faved ? '取消收藏' : '收藏页面'}
+        aria-label={faved ? "取消收藏" : "收藏页面"}
         aria-pressed={faved}
-        title={faved ? '取消收藏' : '收藏页面'}
+        title={faved ? "取消收藏" : "收藏页面"}
         onclick={() => void toggleFavorite()}
       >
         <Icon name="star" size={20} filled={faved} />
@@ -224,18 +232,32 @@
   </header>
 
   <div class="relative min-h-0 flex-1 border-t border-hairline">
-    {#if media === 'video'}
-      <div class="grid h-full place-items-center bg-black pb-[env(safe-area-inset-bottom)]">
+    {#if media === "video"}
+      <div
+        class="grid h-full place-items-center bg-black pb-[env(safe-area-inset-bottom)]"
+      >
         <!-- svelte-ignore a11y_media_has_caption -->
-        <video src={viewer.url} controls autoplay playsinline class="max-h-full max-w-full"></video>
+        <video
+          src={viewer.url}
+          controls
+          autoplay
+          playsinline
+          class="max-h-full max-w-full"
+        ></video>
       </div>
-    {:else if media === 'audio'}
+    {:else if media === "audio"}
       <div class="grid h-full place-items-center px-6">
         <audio src={viewer.url} controls autoplay class="w-full"></audio>
       </div>
     {:else if isImage}
-      <div class="grid h-full place-items-center overflow-auto p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-        <Img src={viewer.url ?? ''} alt={viewer.title ?? ''} class="max-h-full max-w-full object-contain" />
+      <div
+        class="grid h-full place-items-center overflow-auto p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+      >
+        <Img
+          src={viewer.url ?? ""}
+          alt={viewer.title ?? ""}
+          class="max-h-full max-w-full object-contain"
+        />
       </div>
     {:else if isWebPage}
       <!-- 底色跟页面走（探不到就白底 —— 浏览器对无样式文档的默认）：
@@ -249,9 +271,9 @@
         class="absolute inset-0 size-full"
       ></iframe>
     {:else if isMarkdown}
-      <MarkdownFile url={viewer.url ?? ''} />
+      <MarkdownFile url={viewer.url ?? ""} />
     {:else}
-      <TextView url={viewer.url ?? ''} />
+      <TextView url={viewer.url ?? ""} />
     {/if}
   </div>
 </section>

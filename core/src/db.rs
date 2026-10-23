@@ -1729,8 +1729,7 @@ mod tests {
         let db = Db::in_memory().unwrap();
         db.set_favorite("/workspace/a.html", Some("第一版"))
             .unwrap();
-        db.set_favorite("/workspace/b.html", Some("B"))
-            .unwrap();
+        db.set_favorite("/workspace/b.html", Some("B")).unwrap();
 
         // 同一毫秒里收两个，`created_at` 一样 —— 不报错、也不丢行
         assert_eq!(db.favorites().unwrap().len(), 2);
@@ -1739,10 +1738,7 @@ mod tests {
             .unwrap();
         let list = db.favorites().unwrap();
         assert_eq!(list.len(), 2, "重复收藏不该多出一行");
-        let a = list
-            .iter()
-            .find(|f| f.path == "/workspace/a.html")
-            .unwrap();
+        let a = list.iter().find(|f| f.path == "/workspace/a.html").unwrap();
         assert_eq!(a.title, "改过的标题");
 
         db.set_favorite("/workspace/a.html", None).unwrap();

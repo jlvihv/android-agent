@@ -17,10 +17,10 @@
     /** 预设的协议（标「默认」用） */
     apiStyleDefault: ApiStyle;
     /** 正在用的那家：「自动」这会儿实际落在哪套上；别的家是 null */
-    transport: 'responses' | 'chat' | null;
+    transport: "responses" | "chat" | null;
   };
 
-  export type ApiStyle = 'auto' | 'responses' | 'chat';
+  export type ApiStyle = "auto" | "responses" | "chat";
 </script>
 
 <script lang="ts">
@@ -41,30 +41,30 @@
    *
    * 换机器不在这里：在侧栏底栏的机器标签（见 MachineSheet）。
    */
-  import Icon from './Icon.svelte';
-  import Page from './Page.svelte';
-  import McpSection from './McpSection.svelte';
-  import PairingSection from './PairingSection.svelte';
-  import PermissionsSection from './PermissionsSection.svelte';
-  import ProviderPage from './ProviderPage.svelte';
-  import SandboxSection from './SandboxSection.svelte';
-  import SearchSection from './SearchSection.svelte';
-  import SkillsSection from './SkillsSection.svelte';
-  import StatusSection from './StatusSection.svelte';
-  import UsageSection from './UsageSection.svelte';
-  import { store } from '../lib/store.svelte.ts';
+  import Icon from "./Icon.svelte";
+  import Page from "./Page.svelte";
+  import McpSection from "./McpSection.svelte";
+  import PairingSection from "./PairingSection.svelte";
+  import PermissionsSection from "./PermissionsSection.svelte";
+  import ProviderPage from "./ProviderPage.svelte";
+  import SandboxSection from "./SandboxSection.svelte";
+  import SearchSection from "./SearchSection.svelte";
+  import SkillsSection from "./SkillsSection.svelte";
+  import StatusSection from "./StatusSection.svelte";
+  import UsageSection from "./UsageSection.svelte";
+  import { store } from "../lib/store.svelte.ts";
 
   let { onclose }: { onclose: () => void } = $props();
 
   let rows = $state<ProviderRow[]>([]);
-  let err = $state('');
+  let err = $state("");
   /** 正在看哪一家（叠在设置页上面的那一页） */
   let open = $state<ProviderRow | null>(null);
 
   async function load() {
-    err = '';
+    err = "";
     try {
-      const r = await fetch('/api/providers');
+      const r = await fetch("/api/providers");
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
       rows = ((await r.json()) as { providers: ProviderRow[] }).providers;
     } catch (e) {
@@ -82,8 +82,10 @@
   }
 
   function status(p: ProviderRow): string {
-    if (!p.configured) return '未配置';
-    return p.current ? `正在使用 · ${p.keyHint ?? ''}` : `已配置 · ${p.keyHint ?? ''}`;
+    if (!p.configured) return "未配置";
+    return p.current
+      ? `正在使用 · ${p.keyHint ?? ""}`
+      : `已配置 · ${p.keyHint ?? ""}`;
   }
 </script>
 
@@ -98,7 +100,11 @@
       >
         <span class="min-w-0 flex-1">
           <span class="block truncate text-[17px]">{p.name}</span>
-          <span class="block truncate text-meta {p.current ? 'text-accent' : 'text-muted'}">
+          <span
+            class="block truncate text-meta {p.current
+              ? 'text-accent'
+              : 'text-muted'}"
+          >
             {status(p)}
           </span>
         </span>
@@ -118,5 +124,9 @@
 </Page>
 
 {#if open}
-  <ProviderPage provider={open} onclose={() => (open = null)} onchange={changed} />
+  <ProviderPage
+    provider={open}
+    onclose={() => (open = null)}
+    onchange={changed}
+  />
 {/if}

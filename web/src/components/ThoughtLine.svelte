@@ -20,7 +20,7 @@
    * - **结尾**：思考一结束（后面接上了正文或工具调用）就立刻换成最终那一行，不等
    *   停留、不重播亮起 —— 不然工具调用都跑完了，这一行的动画还没收住。
    */
-  import { untrack } from 'svelte';
+  import { untrack } from "svelte";
 
   let { text, live }: { text: string; live: boolean } = $props();
 
@@ -37,7 +37,7 @@
   let rowStart = 0;
   let seenLen = 0;
   let seenWidth = 0;
-  let lastRow = '';
+  let lastRow = "";
 
   /**
    * 该显示什么，以及怎么换上去：
@@ -45,11 +45,11 @@
    * - `partial`：第一行还没写满，正在写的那半行 —— 原地更新；
    * - `final`：思考结束了 —— 立刻换，原地更新。
    */
-  type Line = { text: string; kind: 'row' | 'partial' | 'final' };
+  type Line = { text: string; kind: "row" | "partial" | "final" };
 
   // 留几像素余量：canvas 量的和实际排版有细微出入，宁可早一点换行也别被省略号截掉
   const latest = $derived<Line>(
-    live ? follow(text, width - 4) : { text: finalLine(text), kind: 'final' },
+    live ? follow(text, width - 4) : { text: finalLine(text), kind: "final" },
   );
 
   // 历史消息首帧就是最终内容，直接显示、不播亮起动画
@@ -67,7 +67,7 @@
     const next = latest;
     if (next.text === shown) return;
     clearTimeout(timer);
-    if (next.kind !== 'row') {
+    if (next.kind !== "row") {
       shown = next.text;
       return;
     }
@@ -75,7 +75,7 @@
     const swap = () => {
       const now = latest; // 等的这一会儿可能又变了（甚至已经结束了）
       shown = now.text;
-      if (now.kind !== 'row') return;
+      if (now.kind !== "row") return;
       rows++;
       since = performance.now();
     };
@@ -86,21 +86,26 @@
 
   /** 流式：最近一条写满的行；一行都还没写满时是正在写的那半行 */
   function follow(t: string, w: number): Line {
-    if (w <= 0) return { text: lastParagraph(t, true), kind: 'row' };
+    if (w <= 0) return { text: lastParagraph(t, true), kind: "row" };
     // 文本变短（换了一条消息）或宽度变了：从头折
     if (t.length < seenLen || w !== seenWidth) {
       rowStart = 0;
-      lastRow = '';
+      lastRow = "";
       seenWidth = w;
     }
     seenLen = t.length;
 
     while (rowStart < t.length) {
-      const nl = t.indexOf('\n', rowStart);
+      const nl = t.indexOf("\n", rowStart);
       const end = nl === -1 ? t.length : nl;
       const starts = wrap(t.slice(rowStart, end), w);
       const rowOf = (k: number) =>
-        clean(t.slice(rowStart + starts[k], rowStart + (starts[k + 1] ?? end - rowStart)));
+        clean(
+          t.slice(
+            rowStart + starts[k],
+            rowStart + (starts[k + 1] ?? end - rowStart),
+          ),
+        );
 
       if (nl === -1) {
         // 段落还在写：除最后一行外都写满了
@@ -112,14 +117,17 @@
         break;
       }
       // 段落写完了：最后一行也算写满
-      const r = starts.length ? rowOf(starts.length - 1) : '';
+      const r = starts.length ? rowOf(starts.length - 1) : "";
       if (r) lastRow = r;
       rowStart = nl + 1;
     }
-    if (lastRow) return { text: lastRow, kind: 'row' };
+    if (lastRow) return { text: lastRow, kind: "row" };
     // 一行都还没写满：正在写的那半行（rowStart 之后、下一个换行之前）
-    const nl = t.indexOf('\n', rowStart);
-    return { text: clean(t.slice(rowStart, nl === -1 ? t.length : nl)), kind: 'partial' };
+    const nl = t.indexOf("\n", rowStart);
+    return {
+      text: clean(t.slice(rowStart, nl === -1 ? t.length : nl)),
+      kind: "partial",
+    };
   }
 
   /** 结束后：最后一段，从段首开始 */
@@ -129,33 +137,33 @@
 
   /** 从末尾往前找第一段非空的。streaming 时只看已经换行的段 */
   function lastParagraph(t: string, streaming: boolean): string {
-    let end = streaming ? t.lastIndexOf('\n') : t.length;
+    let end = streaming ? t.lastIndexOf("\n") : t.length;
     while (end > 0) {
-      const start = t.lastIndexOf('\n', end - 1) + 1;
+      const start = t.lastIndexOf("\n", end - 1) + 1;
       const l = clean(t.slice(start, end));
       if (l) return l;
       end = start - 1;
     }
-    return '';
+    return "";
   }
 
   function clean(l: string): string {
     return l
-      .replace(/^\s*(#+|[-*+]|\d+[.)])\s+/, '')
-      .replace(/\*\*|__|`/g, '')
+      .replace(/^\s*(#+|[-*+]|\d+[.)])\s+/, "")
+      .replace(/\*\*|__|`/g, "")
       .trim();
   }
 
   // —— 量字宽 ——
   let ctx: CanvasRenderingContext2D | null = null;
-  let font = '';
+  let font = "";
   // 中日韩字符一个字一个单位（可以在任意字之间断行），其他按单词
   const TOKEN = /[⺀-鿿豈-﫿＀-￯　-〿]|\s+|[^\s⺀-鿿豈-﫿＀-￯　-〿]+/g;
 
   /** 贪心折行。返回每一行在 s 里的起点 */
   function wrap(s: string, w: number): number[] {
     if (!ctx) {
-      ctx = document.createElement('canvas').getContext('2d');
+      ctx = document.createElement("canvas").getContext("2d");
       if (!ctx) return [0];
     }
     if (box && !font) font = getComputedStyle(box).font;
@@ -185,10 +193,14 @@
      取字体），内层被 {#key} 重建 —— 每换一行写满的重建一次元素，
      `.reveal` 那条亮起动画才会重播。合成一个元素就只剩“量得到”或
      “能重播”两者之一。 -->
-<span bind:this={box} bind:clientWidth={width} class="flex min-w-0 flex-1 text-sm">
+<span
+  bind:this={box}
+  bind:clientWidth={width}
+  class="flex min-w-0 flex-1 text-sm"
+>
   {#key rows}
     <span class="min-w-0 truncate text-muted" class:live class:reveal={rows > 0}
-      >{shown || (live ? '思考中…' : '思考')}</span
+      >{shown || (live ? "思考中…" : "思考")}</span
     >
   {/key}
 </span>
@@ -201,7 +213,11 @@
    * 只有这一行在动，重绘面积很小。
    */
   .reveal {
-    -webkit-mask-image: linear-gradient(90deg, #000 0 33%, transparent 66% 100%);
+    -webkit-mask-image: linear-gradient(
+      90deg,
+      #000 0 33%,
+      transparent 66% 100%
+    );
     mask-image: linear-gradient(90deg, #000 0 33%, transparent 66% 100%);
     -webkit-mask-size: 300% 100%;
     mask-size: 300% 100%;

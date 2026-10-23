@@ -16,7 +16,7 @@
  */
 
 export type DismissOpts = {
-  axis: 'x' | 'y';
+  axis: "x" | "y";
   /** 关闭方向：-1 = 往左/上，1 = 往右/下 */
   dir: -1 | 1;
   /** 被拖动的尺寸（宽或高），把位移换算成 0..1 */
@@ -40,7 +40,7 @@ const HALF = 0.4;
 
 export function dismissable(node: HTMLElement, opts: DismissOpts) {
   let o = opts;
-  let state: 'idle' | 'pending' | 'drag' | 'native' = 'idle';
+  let state: "idle" | "pending" | "drag" | "native" = "idle";
   let x0 = 0;
   let y0 = 0;
   /** 认定方向那一刻的主轴位移 —— 从这里开始算，不然一开拖就跳 SLOP 像素 */
@@ -53,7 +53,7 @@ export function dismissable(node: HTMLElement, opts: DismissOpts) {
   let swallowClick = false;
 
   function begin(x: number, y: number, t: EventTarget | null) {
-    state = 'pending';
+    state = "pending";
     x0 = x;
     y0 = y;
     target = t;
@@ -62,21 +62,23 @@ export function dismissable(node: HTMLElement, opts: DismissOpts) {
 
   /** 返回 true 表示这一下归我们，调用方要 preventDefault */
   function move(x: number, y: number, now: number): boolean {
-    if (state === 'idle' || state === 'native') return false;
+    if (state === "idle" || state === "native") return false;
     const dx = x - x0;
     const dy = y - y0;
-    const main = o.axis === 'x' ? dx : dy;
-    const cross = o.axis === 'x' ? dy : dx;
+    const main = o.axis === "x" ? dx : dy;
+    const cross = o.axis === "x" ? dy : dx;
 
-    if (state === 'pending') {
+    if (state === "pending") {
       if (Math.hypot(dx, dy) < SLOP) return false;
       const ours =
-        Math.abs(main) > Math.abs(cross) && main * o.dir > 0 && (o.canStart?.(target) ?? true);
+        Math.abs(main) > Math.abs(cross) &&
+        main * o.dir > 0 &&
+        (o.canStart?.(target) ?? true);
       if (!ours) {
-        state = 'native';
+        state = "native";
         return false;
       }
-      state = 'drag';
+      state = "drag";
       base = main;
       o.onStart?.();
     }
@@ -90,11 +92,11 @@ export function dismissable(node: HTMLElement, opts: DismissOpts) {
   }
 
   function end() {
-    if (state !== 'drag') {
-      state = 'idle';
+    if (state !== "drag") {
+      state = "idle";
       return;
     }
-    state = 'idle';
+    state = "idle";
     swallowClick = true;
     setTimeout(() => (swallowClick = false), 0);
 
@@ -110,28 +112,30 @@ export function dismissable(node: HTMLElement, opts: DismissOpts) {
 
   // —— 触摸 ——
   const ts = (e: TouchEvent) => {
-    if (e.touches.length !== 1) return void (state = 'native');
+    if (e.touches.length !== 1) return void (state = "native");
     const t = e.touches[0];
     begin(t.clientX, t.clientY, e.target);
   };
   const tm = (e: TouchEvent) => {
     const t = e.touches[0];
-    if (t && move(t.clientX, t.clientY, e.timeStamp) && e.cancelable) e.preventDefault();
+    if (t && move(t.clientX, t.clientY, e.timeStamp) && e.cancelable)
+      e.preventDefault();
   };
   const te = () => end();
 
   // —— 鼠标（桌面调试）——
   const pd = (e: PointerEvent) => {
-    if (e.pointerType !== 'mouse' || e.button !== 0) return;
+    if (e.pointerType !== "mouse" || e.button !== 0) return;
     begin(e.clientX, e.clientY, e.target);
-    const pm = (ev: PointerEvent) => void move(ev.clientX, ev.clientY, ev.timeStamp);
+    const pm = (ev: PointerEvent) =>
+      void move(ev.clientX, ev.clientY, ev.timeStamp);
     const pu = () => {
-      removeEventListener('pointermove', pm);
-      removeEventListener('pointerup', pu);
+      removeEventListener("pointermove", pm);
+      removeEventListener("pointerup", pu);
       end();
     };
-    addEventListener('pointermove', pm);
-    addEventListener('pointerup', pu);
+    addEventListener("pointermove", pm);
+    addEventListener("pointerup", pu);
   };
 
   const click = (e: MouseEvent) => {
@@ -141,29 +145,29 @@ export function dismissable(node: HTMLElement, opts: DismissOpts) {
     e.preventDefault();
   };
 
-  node.addEventListener('touchstart', ts, { passive: true });
-  node.addEventListener('touchmove', tm, { passive: false });
-  node.addEventListener('touchend', te);
-  node.addEventListener('touchcancel', te);
-  node.addEventListener('pointerdown', pd);
-  node.addEventListener('click', click, true);
+  node.addEventListener("touchstart", ts, { passive: true });
+  node.addEventListener("touchmove", tm, { passive: false });
+  node.addEventListener("touchend", te);
+  node.addEventListener("touchcancel", te);
+  node.addEventListener("pointerdown", pd);
+  node.addEventListener("click", click, true);
 
   return {
     update(next: DismissOpts) {
       o = next;
     },
     destroy() {
-      node.removeEventListener('touchstart', ts);
-      node.removeEventListener('touchmove', tm);
-      node.removeEventListener('touchend', te);
-      node.removeEventListener('touchcancel', te);
-      node.removeEventListener('pointerdown', pd);
-      node.removeEventListener('click', click, true);
+      node.removeEventListener("touchstart", ts);
+      node.removeEventListener("touchmove", tm);
+      node.removeEventListener("touchend", te);
+      node.removeEventListener("touchcancel", te);
+      node.removeEventListener("pointerdown", pd);
+      node.removeEventListener("click", click, true);
     },
   };
 }
 
 /** 松手后的回弹/收起曲线：先快后慢，接得住手指的速度 */
-export const RELEASE = 'transform 280ms cubic-bezier(0.22, 1, 0.36, 1)';
+export const RELEASE = "transform 280ms cubic-bezier(0.22, 1, 0.36, 1)";
 /** 面板内部换页（横移 + 标题飞入）的时长。300 太急，看不清是从哪页到哪页 */
 export const PAGE_MS = 450;

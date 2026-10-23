@@ -9,13 +9,18 @@
    * 从系统设置回来、弹框点完，状态是壳那边变的，页面收不到通知：回到前台时重新问一次，
    * 点了「去开启」之后再短轮询一阵（弹框不会让页面失焦）。
    */
-  import Icon from './Icon.svelte';
+  import Icon from "./Icon.svelte";
 
-  type Item = { key: string; title: string; desc: string; state: 'granted' | 'missing' | 'info' };
+  type Item = {
+    key: string;
+    title: string;
+    desc: string;
+    state: "granted" | "missing" | "info";
+  };
   type Host = { permissions?: () => string; grant?: (key: string) => void };
 
   const host = (globalThis as { AgentHost?: Host }).AgentHost;
-  const available = typeof host?.permissions === 'function';
+  const available = typeof host?.permissions === "function";
 
   let items = $state<Item[]>([]);
 
@@ -48,26 +53,26 @@
 
   $effect(() => {
     load();
-    const onVisible = () => document.visibilityState === 'visible' && load();
-    document.addEventListener('visibilitychange', onVisible);
-    window.addEventListener('focus', load);
+    const onVisible = () => document.visibilityState === "visible" && load();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", load);
     return () => {
-      document.removeEventListener('visibilitychange', onVisible);
-      window.removeEventListener('focus', load);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", load);
       if (poll) clearInterval(poll);
     };
   });
 
-  const missing = $derived(items.filter((i) => i.state === 'missing').length);
+  const missing = $derived(items.filter((i) => i.state === "missing").length);
 </script>
 
 {#if available && items.length}
   <h2 class="px-1 pt-6 pb-2 text-meta text-muted">
-    手机权限{missing ? ` · ${missing} 项没开` : ''}
+    手机权限{missing ? ` · ${missing} 项没开` : ""}
   </h2>
   <div class="overflow-hidden rounded-2xl bg-surface">
     {#each items as it (it.key)}
-      {#if it.state === 'missing'}
+      {#if it.state === "missing"}
         <button
           onclick={() => grant(it.key)}
           class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left last:border-b-0"
@@ -80,12 +85,14 @@
           <Icon name="chevron" size={16} class="shrink-0 text-muted" />
         </button>
       {:else}
-        <div class="flex items-center gap-3 border-b-2 border-ink px-3.5 py-3 last:border-b-0">
+        <div
+          class="flex items-center gap-3 border-b-2 border-ink px-3.5 py-3 last:border-b-0"
+        >
           <span class="min-w-0 flex-1">
             <span class="block text-[17px]">{it.title}</span>
             <span class="block text-meta text-muted">{it.desc}</span>
           </span>
-          {#if it.state === 'granted'}
+          {#if it.state === "granted"}
             <span class="shrink-0 text-meta text-faint">已开启</span>
           {/if}
         </div>

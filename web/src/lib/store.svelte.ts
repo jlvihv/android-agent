@@ -6,15 +6,9 @@
  * 不自己管连接。
  */
 
-import type {
-  Ack,
-  AgentEvent,
-  ClientMsg,
-  DeviceInfo,
-  Hello,
-} from './types';
-import type { Message } from './sse';
-import { uid } from './uid';
+import type { Ack, AgentEvent, ClientMsg, DeviceInfo, Hello } from "./types";
+import type { Message } from "./sse";
+import { uid } from "./uid";
 
 export type LogItem = { id: number; ts: number; level: string; msg: string };
 
@@ -42,7 +36,7 @@ class AgentStore {
    */
   computer = $state<string | null>(null);
   /** 跑这个核心的系统（`/api/health` 的 `platform`）：`android` = 手机自己的核心 */
-  platform = $state('');
+  platform = $state("");
   /**
    * 给这个页面的核心的实例 id（`/api/health` 的 `id`）。经隧道时是那台电脑的 ——
    * 「选择机器」靠它勾「现在这页是哪台」（见 `lib/machines.svelte.ts`）。
@@ -59,13 +53,13 @@ class AgentStore {
    * 自己的核心，别的都当成电脑，先拿地址撑着 —— 总比空着强，而且**不会说错**。
    */
   machine = $derived.by((): { name: string; phone: boolean } => {
-    const os = this.platform || this.hello?.platform || '';
-    if (os === 'android') return { name: '本机', phone: true };
+    const os = this.platform || this.hello?.platform || "";
+    if (os === "android") return { name: "本机", phone: true };
     if (os) return { name: this.computer ?? location.hostname, phone: false };
     // 只认 127.0.0.1：手机自己的核心就在那儿。经中继连电脑时页面来自 `localhost`
     // （壳的隧道，见 docs/12）—— 那是另一台机器，说「本机」就错了
-    return location.hostname === '127.0.0.1'
-      ? { name: '本机', phone: true }
+    return location.hostname === "127.0.0.1"
+      ? { name: "本机", phone: true }
       : { name: location.hostname, phone: false };
   });
   /** 从 /api/health 读到的 provider 信息；null = 未配置，会走演示流 */
@@ -81,7 +75,10 @@ class AgentStore {
    * `pdf` 为 false 时不显示「文件」（发了也必然 400）。
    * 未配置 provider 时给个保守默认值。
    */
-  capabilities = $state<{ vision: boolean; pdf: boolean }>({ vision: true, pdf: false });
+  capabilities = $state<{ vision: boolean; pdf: boolean }>({
+    vision: true,
+    pdf: false,
+  });
   /**
    * 沙箱文件的钥匙：URL 是 `/sandbox/<key>/…`（见 `lib/markdown.ts` 的 `sandboxUrl`）。
    *
@@ -89,7 +86,7 @@ class AgentStore {
    * 而它的 css/js/图片是相对路径 —— 钥匙放在路径上，子资源自然继承。
    * 从 `/api/health` 拿（那个接口要凭据，别的 App 拿不到）。
    */
-  sandboxKey = $state('');
+  sandboxKey = $state("");
   logs = $state<LogItem[]>([]);
   acks = $state<(Ack & { ts: number })[]>([]);
   /** 当前正在流式接收的助手消息 */
@@ -125,7 +122,7 @@ class AgentStore {
   }
 
   #open(): void {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${location.host}/api/ws`;
     const ws = new WebSocket(url);
     this.#ws = ws;
@@ -151,7 +148,10 @@ class AgentStore {
       try {
         ev = JSON.parse(e.data as string) as AgentEvent;
       } catch {
-        this.pushLog('warn', `无法解析的事件: ${String(e.data).slice(0, LOG_SNIPPET)}`);
+        this.pushLog(
+          "warn",
+          `无法解析的事件: ${String(e.data).slice(0, LOG_SNIPPET)}`,
+        );
         return;
       }
       this.#dispatch(ev);
@@ -161,7 +161,7 @@ class AgentStore {
   /** 重新拉一次 /api/health（改完模型设置后要刷新）*/
   async reloadHealth(): Promise<void> {
     try {
-      const r = await fetch('/api/health');
+      const r = await fetch("/api/health");
       if (!r.ok) return;
       const h = (await r.json()) as {
         llm?: {
@@ -189,7 +189,7 @@ class AgentStore {
 
   #dispatch(ev: AgentEvent): void {
     switch (ev.type) {
-      case 'hello':
+      case "hello":
         this.hello = {
           port: ev.port,
           version: ev.version,
@@ -198,42 +198,44 @@ class AgentStore {
         };
         break;
 
-
-      case 'device':
+      case "device":
         this.device = { connected: ev.connected, name: ev.name, mock: ev.mock };
         break;
 
-      case 'log':
+      case "log":
         this.pushLog(ev.level, ev.msg);
         break;
 
-      case 'ack':
+      case "ack":
         this.acks = [
           { id: ev.id, ok: ev.ok, detail: ev.detail, ts: Date.now() },
           ...this.acks,
         ].slice(0, MAX_ACKS);
         break;
 
-      case 'turn_active':
+      case "turn_active":
         this.turnActive = ev.active;
         break;
 
       // 逐条状态（`turn`）只喂通知栏那一行，页面不吃：正文和消息列表有自己的路
       // （正在跑的那条流 / 轮询）。这里置个位就够。
-      case 'turn':
+      case "turn":
         this.turnActive = true;
         break;
     }
   }
 
   pushLog(level: string, msg: string): void {
-    this.logs = [{ id: ++logSeq, ts: Date.now(), level, msg }, ...this.logs].slice(0, MAX_LOGS);
+    this.logs = [
+      { id: ++logSeq, ts: Date.now(), level, msg },
+      ...this.logs,
+    ].slice(0, MAX_LOGS);
   }
 
   send(msg: ClientMsg): void {
     const ws = this.#ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      this.pushLog('warn', '未连接，消息丢弃');
+      this.pushLog("warn", "未连接，消息丢弃");
       return;
     }
     ws.send(JSON.stringify(msg));
@@ -248,7 +250,7 @@ class AgentStore {
   beginStreaming(): Message {
     this.streaming = {
       id: uid(),
-      role: 'assistant',
+      role: "assistant",
       parts: [],
       steps: 0,
       done: false,

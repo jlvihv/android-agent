@@ -18,11 +18,11 @@
    * （广播工具不在、`avahi-daemon` 没跑时用）—— 手机上不给：页面能传任意地址的话，
    * 查看器里 AI 写的网页就能把界面带到别人的服务器上（见 docs/11）。
    */
-  import { slide } from 'svelte/transition';
-  import { cubicOut } from 'svelte/easing';
-  import Icon from './Icon.svelte';
-  import Sheet from './Sheet.svelte';
-  import { hasShell, machines, type Machine } from '../lib/machines.svelte.ts';
+  import { slide } from "svelte/transition";
+  import { cubicOut } from "svelte/easing";
+  import Icon from "./Icon.svelte";
+  import Sheet from "./Sheet.svelte";
+  import { hasShell, machines, type Machine } from "../lib/machines.svelte.ts";
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -32,13 +32,13 @@
   const rowIn = (node: Element, on: boolean) =>
     on ? slide(node, { duration: ROW_MS, easing: cubicOut }) : { duration: 0 };
 
-  type Page = 'list' | 'pair' | 'manual';
-  let page = $state<Page>('list');
+  type Page = "list" | "pair" | "manual";
+  let page = $state<Page>("list");
   /** 要配的那台（那一页用它显示名字）；手输地址时是 null */
   let target = $state<Machine | null>(null);
-  let code = $state('');
-  let host = $state('');
-  let port = $state('8787');
+  let code = $state("");
+  let host = $state("");
+  let port = $state("8787");
   /** 配对码输入框：进那一页就聚焦（省一次点） */
   let input = $state<HTMLInputElement | null>(null);
 
@@ -46,17 +46,18 @@
   $effect(() => machines.watch());
 
   $effect(() => {
-    if (page === 'pair') input?.focus();
+    if (page === "pair") input?.focus();
   });
 
   /** 中继说它不在线（不知道的不算；眼前这页就是它的话显然在线） */
-  const offline = (m: Machine) => m.relay && m.online === false && !machines.isHere(m.id);
+  const offline = (m: Machine) =>
+    m.relay && m.online === false && !machines.isHere(m.id);
 
   function ask(m: Machine) {
     target = m;
-    code = '';
-    machines.err = '';
-    page = 'pair';
+    code = "";
+    machines.err = "";
+    page = "pair";
   }
 
   /**
@@ -89,7 +90,7 @@
      后来冒出来 / 不见了的（局域网里刚找到一台）展开 / 收起 —— 面板高度跟着平滑地变，
      而不是一下子跳一截。 -->
 {#snippet row(
-  icon: 'phone' | 'computer' | 'globe',
+  icon: "phone" | "computer" | "globe",
   name: string,
   sub: string,
   current: boolean,
@@ -99,9 +100,9 @@
 )}
   {@const still = current || off}
   <svelte:element
-    this={still ? 'div' : 'button'}
-    type={still ? undefined : 'button'}
-    role={still ? 'group' : undefined}
+    this={still ? "div" : "button"}
+    type={still ? undefined : "button"}
+    role={still ? "group" : undefined}
     aria-disabled={off || undefined}
     onclick={still ? undefined : onpick}
     transition:rowIn={anim}
@@ -114,41 +115,49 @@
       <span class="block truncate text-[17px]">{name}</span>
       <span class="block truncate text-meta text-muted">{sub}</span>
     </span>
-    {#if current}<Icon name="check" size={16} class="shrink-0 text-accent" />{/if}
+    {#if current}<Icon
+        name="check"
+        size={16}
+        class="shrink-0 text-accent"
+      />{/if}
   </svelte:element>
 {/snippet}
 
 <!-- `hug`：就这几行，不撑到 45% 屏高（和「上下文用量」那个面板一样）。 -->
 <Sheet
-  title={page === 'pair' ? '输配对码' : page === 'manual' ? '手输地址' : '选择机器'}
+  title={page === "pair"
+    ? "输配对码"
+    : page === "manual"
+      ? "手输地址"
+      : "选择机器"}
   hug
   {onclose}
-  onback={page === 'list' ? undefined : () => (page = 'list')}
+  onback={page === "list" ? undefined : () => (page = "list")}
 >
-  {#if page === 'list'}
+  {#if page === "list"}
     <div class="overflow-hidden rounded-2xl bg-surface">
       <!-- 本机永远是第一个：它就是「另一头」，连着电脑时点它回去。 -->
       {@render row(
-        hasShell() ? 'phone' : 'computer',
-        hasShell() ? '这台手机' : '这台电脑',
+        hasShell() ? "phone" : "computer",
+        hasShell() ? "这台手机" : "这台电脑",
         machines.here
-          ? '回到自己的核心（界面、命令、文件都在这台上）'
-          : '界面、命令、文件都在这台上',
+          ? "回到自己的核心（界面、命令、文件都在这台上）"
+          : "界面、命令、文件都在这台上",
         machines.here === null,
         () => machines.useLocal(),
       )}
 
       {#each machines.list as m (m.id)}
         {@render row(
-          m.relay ? 'globe' : 'computer',
+          m.relay ? "globe" : "computer",
           m.name,
           m.relay
             ? offline(m)
-              ? '离线（它现在没连上服务器）'
-              : '经服务器连（不在同一个 Wi-Fi 里）'
+              ? "离线（它现在没连上服务器）"
+              : "经服务器连（不在同一个 Wi-Fi 里）"
             : machines.isHere(m.id)
               ? `${m.host}:${m.port}`
-              : `${m.host}:${m.port} · ${m.paired ? '已配对' : '第一次连要输配对码'}`,
+              : `${m.host}:${m.port} · ${m.paired ? "已配对" : "第一次连要输配对码"}`,
           machines.isHere(m.id),
           () => (m.paired ? machines.connect(m.id) : ask(m)),
           offline(m),
@@ -160,11 +169,11 @@
         <button
           type="button"
           onclick={() => {
-            machines.err = '';
-            host = '';
-            port = '8787';
-            code = '';
-            page = 'manual';
+            machines.err = "";
+            host = "";
+            port = "8787";
+            code = "";
+            page = "manual";
           }}
           class="flex w-full items-center gap-3 px-3.5 py-3 text-left"
         >
@@ -175,13 +184,15 @@
     </div>
 
     {#if machines.err}
-      <p class="px-3.5 pt-3 text-meta leading-relaxed text-bad">{machines.err}</p>
+      <p class="px-3.5 pt-3 text-meta leading-relaxed text-bad">
+        {machines.err}
+      </p>
     {/if}
-
-  {:else if page === 'pair'}
+  {:else if page === "pair"}
     <div class="rounded-2xl bg-surface p-3.5">
       <p class="text-meta leading-relaxed text-muted">
-        在「{target?.name}」上看那个 6 位码（终端启动那几行，或者它设置页里的「连接手机」）。
+        在「{target?.name}」上看那个 6
+        位码（终端启动那几行，或者它设置页里的「连接手机」）。
       </p>
       <input
         bind:this={input}
@@ -190,7 +201,8 @@
         maxlength="6"
         placeholder="6 位配对码"
         class="mt-3 w-full rounded-xl bg-ink px-3 py-2 text-center font-mono text-[22px] tracking-[0.3em]"
-        onkeydown={(e) => e.key === 'Enter' && code.trim().length >= 6 && submit()}
+        onkeydown={(e) =>
+          e.key === "Enter" && code.trim().length >= 6 && submit()}
       />
       {#if machines.err}
         <p class="pt-2 text-meta leading-relaxed text-bad">{machines.err}</p>
@@ -201,7 +213,7 @@
         onclick={submit}
         class="mt-3 w-full rounded-xl bg-accent py-2.5 text-[17px] font-medium text-ink disabled:opacity-40"
       >
-        {machines.busy ? '配对中…' : '配对并连上'}
+        {machines.busy ? "配对中…" : "配对并连上"}
       </button>
     </div>
     <p class="px-1 pt-3 text-meta leading-relaxed text-faint">
@@ -210,8 +222,8 @@
   {:else}
     <div class="rounded-2xl bg-surface p-3.5">
       <p class="text-meta leading-relaxed text-muted">
-        能被找到就不用走这里。地址是那台电脑上核心的地址（<code class="font-mono"
-          >just dev-host</code
+        能被找到就不用走这里。地址是那台电脑上核心的地址（<code
+          class="font-mono">just dev-host</code
         > 启动时打过），配对码在它终端里。
       </p>
       <div class="space-y-3 pt-3">
@@ -244,7 +256,7 @@
             maxlength="6"
             placeholder="6 位"
             class="w-full rounded-xl bg-ink px-3 py-2 font-mono text-[17px]"
-            onkeydown={(e) => e.key === 'Enter' && submitManual()}
+            onkeydown={(e) => e.key === "Enter" && submitManual()}
           />
         </label>
       </div>
@@ -253,11 +265,14 @@
       {/if}
       <button
         type="button"
-        disabled={!host.trim() || !Number(port) || code.trim().length < 6 || machines.busy}
+        disabled={!host.trim() ||
+          !Number(port) ||
+          code.trim().length < 6 ||
+          machines.busy}
         onclick={submitManual}
         class="mt-3 w-full rounded-xl bg-accent py-2.5 text-[17px] font-medium text-ink disabled:opacity-40"
       >
-        {machines.busy ? '配对中…' : '配对并连上'}
+        {machines.busy ? "配对中…" : "配对并连上"}
       </button>
     </div>
   {/if}

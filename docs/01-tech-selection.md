@@ -17,17 +17,17 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ## 1. 环境现状
 
-| 项 | 状态 |
-|---|---|
-| rustc / cargo | 1.98.0 ✅ |
-| Rust Android targets | `aarch64` / `armv7` / `i686` / `x86_64-linux-android` 全已装 ✅ |
-| `cargo-ndk` | ❌ **未安装**，需 `cargo install cargo-ndk`（4.1.2） |
-| Android SDK | `/home/vihv/Android/Sdk`，platform `android-36`，build-tools 34/35/36 ✅ |
-| NDK | **r27.0.12077973** ✅（注意：r27 的 16KB page size 是**选开**，见风险 R1） |
-| Java | OpenJDK 21.0.12 ✅（AGP 8.x 可用） |
-| Gradle | ❌ 系统无，用 wrapper 即可 |
-| Node / Bun | v26.11.1 / 1.4.2 ✅ |
-| 连接设备 | 无（`adb devices` 空） |
+| 项                   | 状态                                                                       |
+| -------------------- | -------------------------------------------------------------------------- |
+| rustc / cargo        | 1.98.0 ✅                                                                  |
+| Rust Android targets | `aarch64` / `armv7` / `i686` / `x86_64-linux-android` 全已装 ✅            |
+| `cargo-ndk`          | ❌ **未安装**，需 `cargo install cargo-ndk`（4.1.2）                       |
+| Android SDK          | `/home/vihv/Android/Sdk`，platform `android-36`，build-tools 34/35/36 ✅   |
+| NDK                  | **r27.0.12077973** ✅（注意：r27 的 16KB page size 是**选开**，见风险 R1） |
+| Java                 | OpenJDK 21.0.12 ✅（AGP 8.x 可用）                                         |
+| Gradle               | ❌ 系统无，用 wrapper 即可                                                 |
+| Node / Bun           | v26.11.1 / 1.4.2 ✅                                                        |
+| 连接设备             | 无（`adb devices` 空）                                                     |
 
 ---
 
@@ -35,15 +35,15 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ### D1 — Rust 核心以什么形式跑在设备上？
 
-| | A. 进程内 `.so`（JNI 加载） | B. 进程外可执行文件 |
-|---|---|---|
-| 做法 | Kotlin `System.loadLibrary("agent_core")`，Rust 在后台线程起 tokio runtime + axum | Rust 编成可执行文件改名 `libagent_core.so` 放 jniLibs，`Runtime.exec()` 拉起，走 localhost socket |
-| 启动/延迟 | 快，无 IPC | 慢一点，毫秒级 IPC |
-| 体积 | 小 | +5~10MB（Go 更明显） |
-| 权限 | 无额外 | 必须 `android:extractNativeLibs="true"`（Android 10+ 禁止从可写目录 exec） |
-| 崩溃影响 | native panic 会带走 App | 核心崩了 App 还活着，可重启核心 |
-| 调试 | 需 lldb 跨语言 | 最好：独立进程、可单独跑、可热替换 `.so` |
-| 省电 | 单进程 | 多一个常驻进程 |
+|           | A. 进程内 `.so`（JNI 加载）                                                       | B. 进程外可执行文件                                                                               |
+| --------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| 做法      | Kotlin `System.loadLibrary("agent_core")`，Rust 在后台线程起 tokio runtime + axum | Rust 编成可执行文件改名 `libagent_core.so` 放 jniLibs，`Runtime.exec()` 拉起，走 localhost socket |
+| 启动/延迟 | 快，无 IPC                                                                        | 慢一点，毫秒级 IPC                                                                                |
+| 体积      | 小                                                                                | +5~10MB（Go 更明显）                                                                              |
+| 权限      | 无额外                                                                            | 必须 `android:extractNativeLibs="true"`（Android 10+ 禁止从可写目录 exec）                        |
+| 崩溃影响  | native panic 会带走 App                                                           | 核心崩了 App 还活着，可重启核心                                                                   |
+| 调试      | 需 lldb 跨语言                                                                    | 最好：独立进程、可单独跑、可热替换 `.so`                                                          |
+| 省电      | 单进程                                                                            | 多一个常驻进程                                                                                    |
 
 **定了：A（进程内）**。理由：单进程省电、不需要 `extractNativeLibs`、日志统一、启动快。
 
@@ -71,13 +71,13 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ### D2 — Rust 怎么反向调用 Kotlin（执行设备指令）？
 
-| | A. UniFFI callback interface | B. Kotlin 侧跑 localhost HTTP server | C. 手写反向 JNI |
-|---|---|---|---|
-| 做法 | Rust 定义 `trait DeviceApi`，`#[uniffi::export(callback_interface)]`，Kotlin 实现它 | Rust `reqwest` POST 到 Kotlin 的 NanoHTTPD/Ktor | `ndk-context` 拿 JavaVM + 缓存 GlobalRef + `GetMethodID` |
-| 代码量 | 最少（自动生成） | ~120 行 Kotlin + 双向 JSON | 最多，且易错 |
-| 延迟 | 最低（同进程调用） | 毫秒级 | 低 |
-| 对称性 | 单向调用 + 回调 | 双向都是 HTTP/JSON，心智最统一 | 差 |
-| 风险 | uniffi Kotlin 后端的 JNA/JNI 模式需确认（见 R4） | Kotlin 要维护一个 server | JNI 全局引用/线程 attach 易踩坑 |
+|        | A. UniFFI callback interface                                                        | B. Kotlin 侧跑 localhost HTTP server            | C. 手写反向 JNI                                          |
+| ------ | ----------------------------------------------------------------------------------- | ----------------------------------------------- | -------------------------------------------------------- |
+| 做法   | Rust 定义 `trait DeviceApi`，`#[uniffi::export(callback_interface)]`，Kotlin 实现它 | Rust `reqwest` POST 到 Kotlin 的 NanoHTTPD/Ktor | `ndk-context` 拿 JavaVM + 缓存 GlobalRef + `GetMethodID` |
+| 代码量 | 最少（自动生成）                                                                    | ~120 行 Kotlin + 双向 JSON                      | 最多，且易错                                             |
+| 延迟   | 最低（同进程调用）                                                                  | 毫秒级                                          | 低                                                       |
+| 对称性 | 单向调用 + 回调                                                                     | 双向都是 HTTP/JSON，心智最统一                  | 差                                                       |
+| 风险   | uniffi Kotlin 后端的 JNA/JNI 模式需确认（见 R4）                                    | Kotlin 要维护一个 server                        | JNI 全局引用/线程 attach 易踩坑                          |
 
 **定了：A**。这是 UniFFI 设计出来就是为了干这个的，且避免手写反向 JNI（你明确不想）。
 若你偏好"两端都说同一种协议"的对称美，选 B。
@@ -86,13 +86,13 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ### D3 — WebView 从哪加载前端？
 
-| | A. Rust 内置 axum 服务，指向 `http://127.0.0.1:PORT` | B. `WebViewAssetLoader` + Rust 只做 API | C. 前端放 assets，`file://` |
-|---|---|---|---|
-| 前端资源 | `rust-embed` 编进 `.so` | Android assets 目录 | Android assets 目录 |
-| 同源 | ✅ 前端与 API 同源，无 CORS | ❌ 跨源，需 CORS 头 | — |
-| secure context | ✅（能用 `crypto.subtle`、SW） | ✅ `https://appassets.androidplatform.net` | ❌ opaque origin，很多 API 不可用 |
-| 明文流量 | 需加 localhost 例外 XML | 需加 localhost 例外 + CORS | 不需要 |
-| 开发期 | 代理到 Vite dev server（`adb reverse`）即可热更 | 一样 | 麻烦 |
+|                | A. Rust 内置 axum 服务，指向 `http://127.0.0.1:PORT` | B. `WebViewAssetLoader` + Rust 只做 API    | C. 前端放 assets，`file://`       |
+| -------------- | ---------------------------------------------------- | ------------------------------------------ | --------------------------------- |
+| 前端资源       | `rust-embed` 编进 `.so`                              | Android assets 目录                        | Android assets 目录               |
+| 同源           | ✅ 前端与 API 同源，无 CORS                          | ❌ 跨源，需 CORS 头                        | —                                 |
+| secure context | ✅（能用 `crypto.subtle`、SW）                       | ✅ `https://appassets.androidplatform.net` | ❌ opaque origin，很多 API 不可用 |
+| 明文流量       | 需加 localhost 例外 XML                              | 需加 localhost 例外 + CORS                 | 不需要                            |
+| 开发期         | 代理到 Vite dev server（`adb reverse`）即可热更      | 一样                                       | 麻烦                              |
 
 **定了：A**。同源 + secure context + 开发期可代理 Vite，三件事一次解决。
 明文例外约 10 行 XML，成本可忽略。
@@ -119,26 +119,27 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ### D6 — 前端框架
 
-| | A. React 19 + Vite + TS | B. Svelte 5 + Vite + TS | C. 无框架 |
-|---|---|---|---|
-| 聊天 UI | **assistant-ui** 开箱（流式、tool call 渲染、中断、附件） | 要自己写 | 自己写 |
-| AI SDK 支持 | `@ai-sdk/react` 一等公民 | `@ai-sdk/svelte` 有 | — |
-| 生态/组件 | shadcn/ui、Radix 海量 | 少一些 | — |
-| 体积 | 较大 | 小 | 最小 |
+|             | A. React 19 + Vite + TS                                   | B. Svelte 5 + Vite + TS | C. 无框架 |
+| ----------- | --------------------------------------------------------- | ----------------------- | --------- |
+| 聊天 UI     | **assistant-ui** 开箱（流式、tool call 渲染、中断、附件） | 要自己写                | 自己写    |
+| AI SDK 支持 | `@ai-sdk/react` 一等公民                                  | `@ai-sdk/svelte` 有     | —         |
+| 生态/组件   | shadcn/ui、Radix 海量                                     | 少一些                  | —         |
+| 体积        | 较大                                                      | 小                      | 最小      |
 
 **选 B（Svelte 5 + Vite + TS）**。手机 WebView 里体积和启动都值钱，而聊天 UI 就那么几个
 组件，自己写（见 docs/05）比拖进 React + assistant-ui 那一串便宜。
 
 ### D7 — 前端 ↔ Rust 的流式协议
 
-| | A. 采用 Vercel AI SDK 7 的 **UI Message Stream** 协议 | B. 自定义 SSE JSON |
-|---|---|---|
-| Rust 侧 | 手写一个 SSE 编码器（~150 行），按规范吐 `data: {...}` | 自己设计事件类型 |
-| 前端 | `useChat` / assistant-ui 直接吃，零状态机 | 自己写流式状态机 |
-| 现成语义 | text / reasoning / tool-input / tool-output / step / error / data-* 全都有 | 全要自己定义 |
-| 规范 | 公开文档化，其他语言后端已有先例（FastAPI 示例） | — |
+|          | A. 采用 Vercel AI SDK 7 的 **UI Message Stream** 协议                      | B. 自定义 SSE JSON |
+| -------- | -------------------------------------------------------------------------- | ------------------ |
+| Rust 侧  | 手写一个 SSE 编码器（~150 行），按规范吐 `data: {...}`                     | 自己设计事件类型   |
+| 前端     | `useChat` / assistant-ui 直接吃，零状态机                                  | 自己写流式状态机   |
+| 现成语义 | text / reasoning / tool-input / tool-output / step / error / data-* 全都有 | 全要自己定义       |
+| 规范     | 公开文档化，其他语言后端已有先例（FastAPI 示例）                           | —                  |
 
 规范要点（已核实）：
+
 - Header：`x-vercel-ai-ui-message-stream: v1`
 - SSE 行：`data: {"type":"text-delta","id":"...","delta":"Hello"}`
 - 结尾：`data: [DONE]`
@@ -153,23 +154,23 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 ### D8 — Rust ↔ Gradle 怎么串
 
-| | A. 脚本驱动（justfile 调 `cargo ndk` → jniLibs） | B. 自定义 Gradle `Exec` task | C. `mozilla/rust-android-gradle` 插件 |
-|---|---|---|---|
-| 魔法 | 无 | 中 | 高 |
-| 兼容风险 | 无 | 低 | ⚠️ 插件久未更新，AGP 8/9 兼容性未知 |
-| CI | 最好写 | 一般 | 一般 |
-| 增量构建 | 靠 cargo 自身 | 靠 cargo 自身 | 插件管 |
+|          | A. 脚本驱动（justfile 调 `cargo ndk` → jniLibs） | B. 自定义 Gradle `Exec` task | C. `mozilla/rust-android-gradle` 插件 |
+| -------- | ------------------------------------------------ | ---------------------------- | ------------------------------------- |
+| 魔法     | 无                                               | 中                           | 高                                    |
+| 兼容风险 | 无                                               | 低                           | ⚠️ 插件久未更新，AGP 8/9 兼容性未知   |
+| CI       | 最好写                                           | 一般                         | 一般                                  |
+| 增量构建 | 靠 cargo 自身                                    | 靠 cargo 自身                | 插件管                                |
 
 **定了：A 为主 + B 作为 release 时的可选挂钩**。Gradle 只负责把 `jniLibs/` 打进去，不感知 Rust。
 
 ### D9 — 编译哪些 ABI
 
-| ABI | 用途 | 建议 |
-|---|---|---|
-| `arm64-v8a` | 现代真机 | ✅ 必做 |
-| `x86_64` | 模拟器 | ✅ 做（否则没法本地调） |
-| `armeabi-v7a` | 老设备 | ⬜ 可跳过 |
-| `x86` | 老模拟器 | ⬜ 跳过 |
+| ABI           | 用途     | 建议                    |
+| ------------- | -------- | ----------------------- |
+| `arm64-v8a`   | 现代真机 | ✅ 必做                 |
+| `x86_64`      | 模拟器   | ✅ 做（否则没法本地调） |
+| `armeabi-v7a` | 老设备   | ⬜ 可跳过               |
+| `x86`         | 老模拟器 | ⬜ 跳过                 |
 
 **现在只出 arm64-v8a**（真机）。模拟器要 x86_64 时：
 `AGENT_ABIS=arm64-v8a,x86_64 just emu-install` —— 多带一个 ABI 就是白送几 MB。
@@ -179,38 +180,38 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 读 UI 树的能力目前不在（见 D2 那节：native 侧只做不读界面的设备操作）。以后要做的话
 就是「Kotlin 把无障碍树拍平成扁平 JSON 推给 Rust」，格式选型的结论在下面这张表。
 
-| | A. JSON（serde_json） | B. CBOR（ciborium） | C. Protobuf |
-|---|---|---|---|
-| 调试 | 最好（logcat 直接看） | 要工具 | 要工具 |
-| 体积 | 大（节点几百个时明显） | 小 ~30% | 最小 |
-| 代码 | 零成本 | 低 | 要 codegen |
+|      | A. JSON（serde_json）  | B. CBOR（ciborium） | C. Protobuf |
+| ---- | ---------------------- | ------------------- | ----------- |
+| 调试 | 最好（logcat 直接看）  | 要工具              | 要工具      |
+| 体积 | 大（节点几百个时明显） | 小 ~30%             | 最小        |
+| 代码 | 零成本                 | 低                  | 要 codegen  |
 
 **定了：A + 剪枝**（只发可交互节点 + 文本 + 关键属性），先 JSON。
 压测后再决定是否换 CBOR——接口留成 `serde` 泛型就能无痛切换。
 
 ### D11 — 本地推理（llama.cpp）现在做吗？
 
-| | A. 现在不做，只留 trait | B. 现在就接 llama-cpp-2 |
-|---|---|---|
-| 体积 | 0 | +几十 MB |
-| 编译时间 | 0 | 交叉编译 llama.cpp 很慢 |
-| 风险 | 无 | `llama-cpp-rs` 明确声明**不遵守 semver**，要 pin 死版本 |
+|          | A. 现在不做，只留 trait | B. 现在就接 llama-cpp-2                                 |
+| -------- | ----------------------- | ------------------------------------------------------- |
+| 体积     | 0                       | +几十 MB                                                |
+| 编译时间 | 0                       | 交叉编译 llama.cpp 很慢                                 |
+| 风险     | 无                      | `llama-cpp-rs` 明确声明**不遵守 semver**，要 pin 死版本 |
 
 **定了：A**。先跑通"云 LLM + 设备操作"，本地推理作为 `trait LlmBackend` 的一个实现后补。
 （`llama-cpp-sys-2` 确实支持 Android NDK 交叉编译，有 `android-shared-stdcxx` feature，路是通的。）
 
 ### D12 — 其它小项
 
-| 项 | 选项 | 定了哪个 |
-|---|---|---|
-| 包管理 | bun（已装）/ npm | bun |
-| 样式 | Tailwind v4 / CSS Modules | Tailwind v4 |
-| 组件 | shadcn/ui / 手写 | **手写**（Svelte 侧，shadcn 是 React 的） |
-| Markdown 渲染 | 现成库 / 自己写 | 自己写（`lib/markdown.ts`） |
-| 事件推送 | WebSocket / SSE | 两个都用：`/api/ws`（事件、日志、设备状态）+ SSE（回合流） |
-| 日志 | `tracing` + `android_logger` | 同一套宏同时输出 logcat 与 stdout |
-| API key 存储 | 明文私有目录 / Android Keystore | 明文私有目录（库里的 `providers` 表） |
-| 错误处理 | `thiserror`(lib) + `anyhow`(bin) | 惯例 |
+| 项            | 选项                             | 定了哪个                                                   |
+| ------------- | -------------------------------- | ---------------------------------------------------------- |
+| 包管理        | bun（已装）/ npm                 | bun                                                        |
+| 样式          | Tailwind v4 / CSS Modules        | Tailwind v4                                                |
+| 组件          | shadcn/ui / 手写                 | **手写**（Svelte 侧，shadcn 是 React 的）                  |
+| Markdown 渲染 | 现成库 / 自己写                  | 自己写（`lib/markdown.ts`）                                |
+| 事件推送      | WebSocket / SSE                  | 两个都用：`/api/ws`（事件、日志、设备状态）+ SSE（回合流） |
+| 日志          | `tracing` + `android_logger`     | 同一套宏同时输出 logcat 与 stdout                          |
+| API key 存储  | 明文私有目录 / Android Keystore  | 明文私有目录（库里的 `providers` 表）                      |
+| 错误处理      | `thiserror`(lib) + `anyhow`(bin) | 惯例                                                       |
 
 ---
 
@@ -250,14 +251,14 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 
 **"少量原生模块"到底是多少**——这些省不掉，因为是 Android 框架要求（系统靠反射实例化）：
 
-| 必须存在 | 原因 |
-|---|---|
-| `MainActivity` | 入口；`requestPermissions` 只能在 Activity 发起 |
-| `AgentAccessibilityService` | 操控其他 App 的**唯一**途径，必须继承该基类 |
-| `DeviceHostImpl` | 实现 Rust 定义的 callback trait |
-| `AgentForegroundService` + 通知渠道 | 回合期间保活；Android 14+ 要 `foregroundServiceType` |
-| `Application` | 把 `JavaVM`/`Context` 存进 native 全局 |
-| `AndroidManifest.xml` + `accessibility_service_config.xml` | 组件与权限声明 |
+| 必须存在                                                   | 原因                                                 |
+| ---------------------------------------------------------- | ---------------------------------------------------- |
+| `MainActivity`                                             | 入口；`requestPermissions` 只能在 Activity 发起      |
+| `AgentAccessibilityService`                                | 操控其他 App 的**唯一**途径，必须继承该基类          |
+| `DeviceHostImpl`                                           | 实现 Rust 定义的 callback trait                      |
+| `AgentForegroundService` + 通知渠道                        | 回合期间保活；Android 14+ 要 `foregroundServiceType` |
+| `Application`                                              | 把 `JavaVM`/`Context` 存进 native 全局               |
+| `AndroidManifest.xml` + `accessibility_service_config.xml` | 组件与权限声明                                       |
 
 **设计铁律**：native 侧**不写任何反调 Java 的代码**。跨语言边界只有 JSON 字符串：
 Rust 回传指令（`tap_xy` / `swipe` / `key` / `launch`），Kotlin 执行。
@@ -276,32 +277,32 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 
 ## 5. 版本锁定候选
 
-| 组件 | 候选版本 | 备注 |
-|---|---|---|
-| rust | 1.98.0 | 已装 |
-| cargo-ndk | 4.1.2 | 已装 |
-| NDK | r27.0.12077973 | 已装；见 R1 |
-| AGP | 8.x 最新 | 配 Java 21 |
-| Kotlin | 2.x 最新 | |
-| axum | 0.8 | |
-| tokio | 1.x | |
-| rusqlite | 0.3x（`bundled`） | 会话库 / 配置表；`.so` 多 ~50 KB |
-| uniffi | 0.30+ | Kotlin 后端只有 JNA（R4） |
-| llama-cpp-2 | pin 死 | 仅 D11 选 B 时；上游声明不遵守 semver |
-| Svelte | 5 | 前端 |
-| Vite | 7 | |
-| Tailwind | 4 | |
+| 组件        | 候选版本          | 备注                                  |
+| ----------- | ----------------- | ------------------------------------- |
+| rust        | 1.98.0            | 已装                                  |
+| cargo-ndk   | 4.1.2             | 已装                                  |
+| NDK         | r27.0.12077973    | 已装；见 R1                           |
+| AGP         | 8.x 最新          | 配 Java 21                            |
+| Kotlin      | 2.x 最新          |                                       |
+| axum        | 0.8               |                                       |
+| tokio       | 1.x               |                                       |
+| rusqlite    | 0.3x（`bundled`） | 会话库 / 配置表；`.so` 多 ~50 KB      |
+| uniffi      | 0.30+             | Kotlin 后端只有 JNA（R4）             |
+| llama-cpp-2 | pin 死            | 仅 D11 选 B 时；上游声明不遵守 semver |
+| Svelte      | 5                 | 前端                                  |
+| Vite        | 7                 |                                       |
+| Tailwind    | 4                 |                                       |
 
 ---
 
 ## 6. 曾经的风险项，现在的结论
 
-| # | 结论 |
-|---|---|
-| R1 | ✅ NDK r27 的 16KB 对齐：`cargo-ndk` 4.x + NDK r27 默认就对齐到 `0x4000`，不用手动加 flag（docs/04 §8） |
-| R2 | ✅ Android 9+ 禁明文 HTTP：`network_security_config.xml` 只给 loopback 开例外，真机验证通过（docs/04） |
-| R4 | ✅ uniffi 0.32 的 Kotlin 后端**只有 JNA**（没 JNI 模式，也没开关）：多一个 `net.java.dev.jna:jna` 依赖 |
-| R7 | ⚠️ Play 对 `AccessibilityService` 审核极严 —— 自用/侧载无影响；要上架得准备用途说明 |
+| #   | 结论                                                                                                    |
+| --- | ------------------------------------------------------------------------------------------------------- |
+| R1  | ✅ NDK r27 的 16KB 对齐：`cargo-ndk` 4.x + NDK r27 默认就对齐到 `0x4000`，不用手动加 flag（docs/04 §8） |
+| R2  | ✅ Android 9+ 禁明文 HTTP：`network_security_config.xml` 只给 loopback 开例外，真机验证通过（docs/04）  |
+| R4  | ✅ uniffi 0.32 的 Kotlin 后端**只有 JNA**（没 JNI 模式，也没开关）：多一个 `net.java.dev.jna:jna` 依赖  |
+| R7  | ⚠️ Play 对 `AccessibilityService` 审核极严 —— 自用/侧载无影响；要上架得准备用途说明                     |
 
 ---
 
@@ -309,23 +310,23 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 
 指导原则：**依赖越少越好**。
 
-| # | 决策 | 结果 |
-|---|---|---|
-| D1 | Rust 运行形式 | **A 进程内 `.so`** |
-| D2 | 反向通道 | **A UniFFI callback** |
-| D3 | WebView 加载 | **A Rust axum + `127.0.0.1`** |
-| D4+D5 | LLM / Agent | **协议自研（`openai.rs` / `responses.rs`）+ loop 自研（`agent.rs`）** |
-| D6 | 前端 | **B Svelte 5**（不用 React / assistant-ui） |
-| D7 | 流式协议 | **A AI SDK UI Message Stream**（保留规范；客户端见 §10） |
-| D8 | Gradle 集成 | 脚本驱动 |
-| D9 | ABI | **arm64-v8a**（真机）；模拟器要 x86_64 就 `AGENT_ABIS=arm64-v8a,x86_64 just emu-install` |
-| D10 | UI 快照 | **没有**（读 UI 树那套随设备工具一起移除了） |
-| D11 | 本地推理 | 先不做 |
-| D12 | 其余 | bun / Tailwind v4 / **不用 shadcn** / markdown 后补 |
-| — | `async-openai` | **砍掉**：协议自研（见 D4+D5） |
-| — | `genai` | **砍掉** |
-| — | `rig` | **砍掉** |
-| — | `rmcp` / MCP | **砍掉** |
+| #     | 决策           | 结果                                                                                     |
+| ----- | -------------- | ---------------------------------------------------------------------------------------- |
+| D1    | Rust 运行形式  | **A 进程内 `.so`**                                                                       |
+| D2    | 反向通道       | **A UniFFI callback**                                                                    |
+| D3    | WebView 加载   | **A Rust axum + `127.0.0.1`**                                                            |
+| D4+D5 | LLM / Agent    | **协议自研（`openai.rs` / `responses.rs`）+ loop 自研（`agent.rs`）**                    |
+| D6    | 前端           | **B Svelte 5**（不用 React / assistant-ui）                                              |
+| D7    | 流式协议       | **A AI SDK UI Message Stream**（保留规范；客户端见 §10）                                 |
+| D8    | Gradle 集成    | 脚本驱动                                                                                 |
+| D9    | ABI            | **arm64-v8a**（真机）；模拟器要 x86_64 就 `AGENT_ABIS=arm64-v8a,x86_64 just emu-install` |
+| D10   | UI 快照        | **没有**（读 UI 树那套随设备工具一起移除了）                                             |
+| D11   | 本地推理       | 先不做                                                                                   |
+| D12   | 其余           | bun / Tailwind v4 / **不用 shadcn** / markdown 后补                                      |
+| —     | `async-openai` | **砍掉**：协议自研（见 D4+D5）                                                           |
+| —     | `genai`        | **砍掉**                                                                                 |
+| —     | `rig`          | **砍掉**                                                                                 |
+| —     | `rmcp` / MCP   | **砍掉**                                                                                 |
 
 ---
 
@@ -368,8 +369,8 @@ webpki-roots = "1"
     "typescript": "^5",
     "svelte-check": "^4",
     "tailwindcss": "^4",
-    "@tailwindcss/vite": "^4"
-  }
+    "@tailwindcss/vite": "^4",
+  },
 }
 ```
 
@@ -386,21 +387,21 @@ Tailwind v4 不需要 postcss config、不需要 autoprefixer。
 
 ## 9. 这一版砍掉了什么，代价是什么
 
-| 砍掉 | 收益 | 代价 | 能否后补 |
-|---|---|---|---|
-| `genai` | −1 个大依赖 | 只剩 OpenAI 协议 | 可加回，或加 provider adapter |
-| `rig` | −1 个大框架 | loop 自己写（~400 行） | 不需要 |
-| `rmcp` | −1 个依赖 | 没有 MCP | ✅ `Tool` trait 留口子，后补 ~200 行 |
-| React + assistant-ui | −10 个以上的包，bundle 小很多 | 聊天 UI 自己写（~400 行 Svelte） | 不需要 |
-| shadcn/ui + Radix | −20 个以上的包 | 组件自己写 | 可随时复制进来 |
+| 砍掉                 | 收益                          | 代价                             | 能否后补                             |
+| -------------------- | ----------------------------- | -------------------------------- | ------------------------------------ |
+| `genai`              | −1 个大依赖                   | 只剩 OpenAI 协议                 | 可加回，或加 provider adapter        |
+| `rig`                | −1 个大框架                   | loop 自己写（~400 行）           | 不需要                               |
+| `rmcp`               | −1 个依赖                     | 没有 MCP                         | ✅ `Tool` trait 留口子，后补 ~200 行 |
+| React + assistant-ui | −10 个以上的包，bundle 小很多 | 聊天 UI 自己写（~400 行 Svelte） | 不需要                               |
+| shadcn/ui + Radix    | −20 个以上的包                | 组件自己写                       | 可随时复制进来                       |
 
 ### 代价：非 OpenAI 兼容的原生协议要自己写
 
 协议层自研只讲 **OpenAI 协议**（Chat Completions + Responses）加自定义 base URL，
 所以提供 **OpenAI 兼容端点**的都能用：
 
-| ✅ 能用 | ❌ 不能用（要另写一个 transport） |
-|---|---|
+| ✅ 能用                                                                                                                                                            | ❌ 不能用（要另写一个 transport）                                          |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
 | OpenAI、DeepSeek、Kimi/Moonshot、通义 DashScope、智谱、SiliconFlow、OpenRouter、Groq、xAI、Together、Fireworks、vLLM、LM Studio、Ollama(`/v1`)、以及绝大多数中转站 | **Anthropic Claude**（原生 Messages API）<br>**Google Gemini**（原生 API） |
 
 想用 Claude / Gemini：走 OpenRouter 等中转（OpenAI 兼容，最省事），或者给 `llm.rs`

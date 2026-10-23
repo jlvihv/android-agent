@@ -153,16 +153,16 @@ src/android/app/src/main/
 
 逐个说：
 
-| 参数 | 为什么 |
-|---|---|
-| `-0` | 假装 uid 0。`fake_id0` 扩展把 guest 看到的 uid/gid 都改写成 root，否则 `apk` 装包会因为不是 root 而失败 |
-| `--link2symlink` | **Android 必需**。Android 的 `/data`（zygote 挂的 ext4/F2FS）拒绝 app uid 跨目录 `link()`。而 Alpine 的 `apk` 装 busybox-applet 包（binutils、gcc 依赖）时全靠硬链接 `ar/ld/nm/strip → busybox`，不加这个参数每次装包都 EPERM |
-| `-r <rootfs>` | 设根目录 |
-| `-b /dev -b /proc -b /sys` | 绑定伪文件系统 |
-| `-w /root` | 工作目录 |
-| `-b host:linux` | 用户挂载。他们用 `/var/minis/{soul,skills,shared,attachments,offloads,workspace,browser}` 这些前缀把宿主目录暴露给沙箱 |
-| `--native-offload` | **OpenMinis 自己的扩展**。走 abstract unix socket，把沙箱内某个命令名的 `execve` 拦截下来，转交给宿主侧 Kotlin/原生实现（设备集成、浏览器自动化等）。他们在 rootfs 里为每个 handler 放一个 stub 文件，stub 内容无所谓 —— proot 在它跑起来之前就改写了 execve |
-| `--fake-netlink` | **OpenMinis 自己的扩展**。`untrusted_app` 不能建 `AF_NETLINK/NETLINK_ROUTE` socket，而 Go 的 `net.Interfaces()` 一启动就调它，报 `route ip+net: netlinkrib: permission denied`，tailscale 这类工具直接起不来。加这个参数后 proot 自己回答 rtnetlink，返回**空接口列表** |
+| 参数                       | 为什么                                                                                                                                                                                                                                                                  |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-0`                       | 假装 uid 0。`fake_id0` 扩展把 guest 看到的 uid/gid 都改写成 root，否则 `apk` 装包会因为不是 root 而失败                                                                                                                                                                 |
+| `--link2symlink`           | **Android 必需**。Android 的 `/data`（zygote 挂的 ext4/F2FS）拒绝 app uid 跨目录 `link()`。而 Alpine 的 `apk` 装 busybox-applet 包（binutils、gcc 依赖）时全靠硬链接 `ar/ld/nm/strip → busybox`，不加这个参数每次装包都 EPERM                                           |
+| `-r <rootfs>`              | 设根目录                                                                                                                                                                                                                                                                |
+| `-b /dev -b /proc -b /sys` | 绑定伪文件系统                                                                                                                                                                                                                                                          |
+| `-w /root`                 | 工作目录                                                                                                                                                                                                                                                                |
+| `-b host:linux`            | 用户挂载。他们用 `/var/minis/{soul,skills,shared,attachments,offloads,workspace,browser}` 这些前缀把宿主目录暴露给沙箱                                                                                                                                                  |
+| `--native-offload`         | **OpenMinis 自己的扩展**。走 abstract unix socket，把沙箱内某个命令名的 `execve` 拦截下来，转交给宿主侧 Kotlin/原生实现（设备集成、浏览器自动化等）。他们在 rootfs 里为每个 handler 放一个 stub 文件，stub 内容无所谓 —— proot 在它跑起来之前就改写了 execve            |
+| `--fake-netlink`           | **OpenMinis 自己的扩展**。`untrusted_app` 不能建 `AF_NETLINK/NETLINK_ROUTE` socket，而 Go 的 `net.Interfaces()` 一启动就调它，报 `route ip+net: netlinkrib: permission denied`，tailscale 这类工具直接起不来。加这个参数后 proot 自己回答 rtnetlink，返回**空接口列表** |
 
 > 他们自己在代码里标注 `--fake-netlink` 是「⚠️ INTERNAL TESTING ONLY」：
 > 这是对 guest 程序撒谎 —— 只做枚举的调用方能启动，但要挑源接口或 bind 本地地址的
@@ -215,7 +215,7 @@ deps/build_rclone_android.sh → gomobile 绑 rclone 成 .aar
   - OpenMinis 又加了 `native_offload`、`fake_netlink`
 - 产物**不入库**（gitignored），脚本现编
 - 可复现性说明：`these artifacts are NOT byte-identical across NDK releases —
-  the loader's .text differs between toolchain generations`。功能等价，别指望 checksum 一致
+the loader's .text differs between toolchain generations`。功能等价，别指望 checksum 一致
 - Gradle：**8.11.1 / AGP 8.7.3 / Kotlin 2.1.0 / JDK 17**，CMake 3.22.1
 - 小 JNI 库（`pty_bridge`、crash handler、jieba）由 CMake 在正常 Gradle 构建里编
 
@@ -235,28 +235,28 @@ deps/build_rclone_android.sh → gomobile 绑 rclone 成 .aar
 
 ## 5. 值得抄的坑清单
 
-| # | 坑 | 症状 | 解法 |
-|---|---|---|---|
-| 1 | rootfs 里的二进制不能 exec | `execve("/bin/sh"): Permission denied`，但 proot 本身启动正常 | loader 放 `nativeLibraryDir`，mmap 而非 execve |
-| 2 | 启动竞态 | 第二个调用者在 loader 路径还是空的时候就起 shell → SELinux 拒 | `bootMutex.withLock` 串行化，锁内**再检查一次** `isBooted` |
-| 3 | 硬链接被拒 | `apk add` 任何 busybox-applet 包都 EPERM | `--link2symlink` |
-| 4 | rtnetlink 被拒 | Go 程序 `netlinkrib: permission denied` | `--fake-netlink`（有副作用，慎用） |
-| 5 | musl 的 TZ 解析器 | 时间不对 | `TZ` 用 POSIX 格式 `LCL-8` 而不是 `GMT+8` |
-| 6 | uv 装包 EPERM | `.l2s.*` 哨兵文件被二次 link | `UV_LINK_MODE=symlink` |
-| 7 | AAPT 改文件名 | `.tar.gz` 变 `.tar` | 两种都试 |
-| 8 | `openFd()` 对 0 长度文件失败 | 解压崩 | 按压缩/未压缩长度分别处理 |
-| 9 | 只解压 `lib/**/*.so` | 可执行文件被忽略 | 一律用 `lib*.so` 命名 |
+| #   | 坑                           | 症状                                                          | 解法                                                       |
+| --- | ---------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------- |
+| 1   | rootfs 里的二进制不能 exec   | `execve("/bin/sh"): Permission denied`，但 proot 本身启动正常 | loader 放 `nativeLibraryDir`，mmap 而非 execve             |
+| 2   | 启动竞态                     | 第二个调用者在 loader 路径还是空的时候就起 shell → SELinux 拒 | `bootMutex.withLock` 串行化，锁内**再检查一次** `isBooted` |
+| 3   | 硬链接被拒                   | `apk add` 任何 busybox-applet 包都 EPERM                      | `--link2symlink`                                           |
+| 4   | rtnetlink 被拒               | Go 程序 `netlinkrib: permission denied`                       | `--fake-netlink`（有副作用，慎用）                         |
+| 5   | musl 的 TZ 解析器            | 时间不对                                                      | `TZ` 用 POSIX 格式 `LCL-8` 而不是 `GMT+8`                  |
+| 6   | uv 装包 EPERM                | `.l2s.*` 哨兵文件被二次 link                                  | `UV_LINK_MODE=symlink`                                     |
+| 7   | AAPT 改文件名                | `.tar.gz` 变 `.tar`                                           | 两种都试                                                   |
+| 8   | `openFd()` 对 0 长度文件失败 | 解压崩                                                        | 按压缩/未压缩长度分别处理                                  |
+| 9   | 只解压 `lib/**/*.so`         | 可执行文件被忽略                                              | 一律用 `lib*.so` 命名                                      |
 
 ---
 
 ## 6. ⚠️ 许可证
 
-| 组件 | 许可证 |
-|---|---|
-| OpenMinis | **GPL-3.0** |
-| `OpenMinis/proot` / `termux/proot` / 上游 proot | **GPL-2.0** |
-| iSH | GPL-3.0 |
-| Alpine rootfs | 各包各自（大多是 MIT/BSD/GPL 混合） |
+| 组件                                            | 许可证                              |
+| ----------------------------------------------- | ----------------------------------- |
+| OpenMinis                                       | **GPL-3.0**                         |
+| `OpenMinis/proot` / `termux/proot` / 上游 proot | **GPL-2.0**                         |
+| iSH                                             | GPL-3.0                             |
+| Alpine rootfs                                   | 各包各自（大多是 MIT/BSD/GPL 混合） |
 
 **把 proot 二进制捆绑进 APK 并分发 → GPL 传染**（proot 是独立进程，
 通常算「聚合」而非「衍生」，但 loader 是被链接进 proot 的，且 fork 本身是 GPL）。
@@ -300,7 +300,10 @@ Rust core                     ▼
   "description": "在设备上的 Alpine Linux 沙箱里执行 shell 命令。可以装包(apk add)、跑 python/node、读写文件。",
   // timeout 可选，默认 60s；长任务模型显式给（上限 24h）。超时被杀时结果里
   // 会提醒它下次给足（见 agent.rs 的 timeout_hint）。超时 exit_code = 124。
-  "schema": { "command": "string", "timeout": "number (seconds, optional, default 60)" }
+  "schema": {
+    "command": "string",
+    "timeout": "number (seconds, optional, default 60)",
+  },
 }
 ```
 
@@ -389,11 +392,11 @@ hold-back 缓冲把短输出吞了、超时命令继续污染下一条命令的 
 
 用户视角的规则（工具描述里就是这么写的）：
 
-| 写法 | 这次调用正常结束后 | 这次调用超时 / 被停止时 |
-|---|---|---|
-| `cmd &`（裸的） | 活着 | 连它一起杀 |
-| `setsid cmd &` / `nohup cmd &` | 活着 | 活着（刻意脱离，不动它） |
-| `cmd`（前台） | 跟着命令结束 | 杀掉 |
+| 写法                           | 这次调用正常结束后 | 这次调用超时 / 被停止时  |
+| ------------------------------ | ------------------ | ------------------------ |
+| `cmd &`（裸的）                | 活着               | 连它一起杀               |
+| `setsid cmd &` / `nohup cmd &` | 活着               | 活着（刻意脱离，不动它） |
+| `cmd`（前台）                  | 跟着命令结束       | 杀掉                     |
 
 判据在内核（进程组），不是对命令文本找 `&` —— `&` 在 `curl 'a?x=1&y=2'`、
 `grep 'a & b'`、heredoc 里都是普通文本，正则判不出来（`ForegroundCommandGroup.kt`
@@ -514,14 +517,14 @@ APK 里带的 minirootfs 只在**第一次安装**时解压（`RootfsInstaller` 
 界面是 设置 → Linux 沙箱（`SandboxSection.svelte`），接口是
 `GET /api/alpine[?check=1]`、`POST /api/alpine/upgrade`。
 
-| 步骤 | 做什么 | 为什么这样 |
-|---|---|---|
-| 前置 | proot 沙箱才有；没有回合在跑；剩余空间 ≥ rootfs + 600MB | 宿主模式没有 Alpine；快照要一整份空间 |
-| 快照 | 在**沙箱外面**把 rootfs 复制成 `alpine-rootfs.upgrade-bak`，复制完才写标记 | 在沙箱里 tar 不行：升级把 musl 弄坏的话沙箱里什么都跑不了，tar 也解不回来；换目录不依赖沙箱还能不能用 |
-| 改源 | 只换 `/v<数字>.<数字>/` 这一段，镜像域名、注释不动 | 一行都没换到（`edge` / 自定义源）就拒绝，交给人 |
-| 升级 | `apk update && apk upgrade --available`，输出实时进进度日志 | 3.21 → 3.24：178 个包、3 分 20 秒 |
-| 验收 | `/etc/alpine-release` 到了目标分支且不比目标旧；`sh` / `apk` / `bash` 真能跑 | **不看 apk 的退出码**：proot 下 trigger 常报非零（降级那次就是 `1 error`，包都装好了） |
-| 收尾 | 过了删快照；没过：升坏的先挪开（瞬间）、快照换回去、再删 | |
+| 步骤 | 做什么                                                                       | 为什么这样                                                                                            |
+| ---- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| 前置 | proot 沙箱才有；没有回合在跑；剩余空间 ≥ rootfs + 600MB                      | 宿主模式没有 Alpine；快照要一整份空间                                                                 |
+| 快照 | 在**沙箱外面**把 rootfs 复制成 `alpine-rootfs.upgrade-bak`，复制完才写标记   | 在沙箱里 tar 不行：升级把 musl 弄坏的话沙箱里什么都跑不了，tar 也解不回来；换目录不依赖沙箱还能不能用 |
+| 改源 | 只换 `/v<数字>.<数字>/` 这一段，镜像域名、注释不动                           | 一行都没换到（`edge` / 自定义源）就拒绝，交给人                                                       |
+| 升级 | `apk update && apk upgrade --available`，输出实时进进度日志                  | 3.21 → 3.24：178 个包、3 分 20 秒                                                                     |
+| 验收 | `/etc/alpine-release` 到了目标分支且不比目标旧；`sh` / `apk` / `bash` 真能跑 | **不看 apk 的退出码**：proot 下 trigger 常报非零（降级那次就是 `1 error`，包都装好了）                |
+| 收尾 | 过了删快照；没过：升坏的先挪开（瞬间）、快照换回去、再删                     |                                                                                                       |
 
 两个兜底：
 
@@ -535,15 +538,15 @@ APK 里带的 minirootfs 只在**第一次安装**时解压（`RootfsInstaller` 
 
 ### 决策点
 
-| # | 决策 | 选项 | 定了 |
-|---|---|---|---|
-| **D13** | proot 从哪来 | A 复用 `OpenMinis/proot` fork 自编（含 Android 必需补丁）<br>B 上游 `termux/proot` 自编<br>C 先直接用本机已编好的产物跑通 | **C 先跑通 → A 固化**。上游没有 loader/link2symlink 的 Android 处理 |
-| **D14** | rootfs 分发 | A 内置 assets（APK +3.9 MB，离线可用）<br>B 首次启动下载 | **A**。4 MB 换离线可用和启动速度，值 |
-| **D15** | 接受 GPL 吗 | — | **需要你确认** |
-| **D16** | 谁执行 proot | A Rust<br>B Kotlin | **A**，可桌面测试 |
-| **D17** | 要不要 `--native-offload` 那种机制 | A 要（把沙箱内的命令名路由回宿主能力）<br>B 不要 | 先不要。我们的设备能力已经走 `DeviceApi` 了，不需要第二条路 |
-| **D18** | `--fake-netlink` | A 开<br>B 不开 | **不开**。它是对 guest 撒谎，会让失败点后移 |
-| **D19** | 进程模型 | A 保留 `--kill-on-exit`：命令一退整棵树 SIGKILL（简单，但后台常驻服务全死，而且我们杀 proot 时它根本不跑 → 漏孤儿）<br>B 命令跑在自己的进程组里 + 状态文件当完成信号（后台常驻可用；超时/停止按组杀，proot 留着） | **B**（已实现）。见上面「进程模型」。代价是 completion 不再等于 proot 退出，多一个 runner + 状态文件 |
+| #       | 决策                               | 选项                                                                                                                                                                                                              | 定了                                                                                                 |
+| ------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **D13** | proot 从哪来                       | A 复用 `OpenMinis/proot` fork 自编（含 Android 必需补丁）<br>B 上游 `termux/proot` 自编<br>C 先直接用本机已编好的产物跑通                                                                                         | **C 先跑通 → A 固化**。上游没有 loader/link2symlink 的 Android 处理                                  |
+| **D14** | rootfs 分发                        | A 内置 assets（APK +3.9 MB，离线可用）<br>B 首次启动下载                                                                                                                                                          | **A**。4 MB 换离线可用和启动速度，值                                                                 |
+| **D15** | 接受 GPL 吗                        | —                                                                                                                                                                                                                 | **需要你确认**                                                                                       |
+| **D16** | 谁执行 proot                       | A Rust<br>B Kotlin                                                                                                                                                                                                | **A**，可桌面测试                                                                                    |
+| **D17** | 要不要 `--native-offload` 那种机制 | A 要（把沙箱内的命令名路由回宿主能力）<br>B 不要                                                                                                                                                                  | 先不要。我们的设备能力已经走 `DeviceApi` 了，不需要第二条路                                          |
+| **D18** | `--fake-netlink`                   | A 开<br>B 不开                                                                                                                                                                                                    | **不开**。它是对 guest 撒谎，会让失败点后移                                                          |
+| **D19** | 进程模型                           | A 保留 `--kill-on-exit`：命令一退整棵树 SIGKILL（简单，但后台常驻服务全死，而且我们杀 proot 时它根本不跑 → 漏孤儿）<br>B 命令跑在自己的进程组里 + 状态文件当完成信号（后台常驻可用；超时/停止按组杀，proot 留着） | **B**（已实现）。见上面「进程模型」。代价是 completion 不再等于 proot 退出，多一个 runner + 状态文件 |
 
 ### 前置依赖
 
@@ -568,15 +571,15 @@ APK 里带的 minirootfs 只在**第一次安装**时解压（`RootfsInstaller` 
 
 几个细节：
 
-| | |
-|---|---|
-| 名字怎么来 | 会话 id 走一遍 FNV-1a + splitmix64 收尾，取 6 个字符（字母表去掉 `i l o 0 1`）。**不是** `DefaultHasher` —— 它的算法 Rust 不保证跳版本还是同一套，而这个目录名必须跳重启、跳升级都是同一个 |
-| 什么时候建 | 每次跑命令前 `create_dir_all`（已经在了就是一次 stat）。proot 的 `-w` 指向不存在的目录会**直接失败** |
-| 两个门得一致 | `bash` 的 cwd 和 `read` / `edit` 的相对路径基准都走 `LinuxSandbox::session_cwd`（`agent.rs::in_cwd`）。不一样就是最难查的那种坑：同一个相对路径、两个工具两个结果 |
-| 没挂存储时 | 退回 `/workspace` 根 —— 那时会话目录根本建不出来 |
-| `AGENT_WORKDIR` | 每次跑命令注入（沙箱里是会话目录的 guest 路径，宿主模式下是 workspace 的真路径）。`agent screenshot` 靠它把图落到本会话目录的 `screenshots/` 下 |
-| 终端页 | `/api/linux` 没有会话概念，传 `None` → 还是 `/workspace` 根 |
-| 宿主模式 | **不分会话目录**，cwd 就是 `AGENT_HOST_WORKSPACE`（启动核心的那个目录，提示词里也是这么说的）。那里通常是用户的项目，模型要改的就是它：以前一视同仁套一层 `<短名>/`，`read core/src/x.rs` 就落到 `<项目>/ph7ah4/core/src/x.rs` 去 —— 找不到，还在项目里建出空目录 |
-| **提示词里不写具体目录名** | 每个会话的目录都不一样，写进提示词就等于给每个会话一份不同的 system prompt —— 前缀缓存全废（[docs/03](03-prompt-cache.md)）。所以只说「cwd 是你这个会话自己的目录（`pwd` 看名字）」 |
+|                            |                                                                                                                                                                                                                                                                   |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 名字怎么来                 | 会话 id 走一遍 FNV-1a + splitmix64 收尾，取 6 个字符（字母表去掉 `i l o 0 1`）。**不是** `DefaultHasher` —— 它的算法 Rust 不保证跳版本还是同一套，而这个目录名必须跳重启、跳升级都是同一个                                                                        |
+| 什么时候建                 | 每次跑命令前 `create_dir_all`（已经在了就是一次 stat）。proot 的 `-w` 指向不存在的目录会**直接失败**                                                                                                                                                              |
+| 两个门得一致               | `bash` 的 cwd 和 `read` / `edit` 的相对路径基准都走 `LinuxSandbox::session_cwd`（`agent.rs::in_cwd`）。不一样就是最难查的那种坑：同一个相对路径、两个工具两个结果                                                                                                 |
+| 没挂存储时                 | 退回 `/workspace` 根 —— 那时会话目录根本建不出来                                                                                                                                                                                                                  |
+| `AGENT_WORKDIR`            | 每次跑命令注入（沙箱里是会话目录的 guest 路径，宿主模式下是 workspace 的真路径）。`agent screenshot` 靠它把图落到本会话目录的 `screenshots/` 下                                                                                                                   |
+| 终端页                     | `/api/linux` 没有会话概念，传 `None` → 还是 `/workspace` 根                                                                                                                                                                                                       |
+| 宿主模式                   | **不分会话目录**，cwd 就是 `AGENT_HOST_WORKSPACE`（启动核心的那个目录，提示词里也是这么说的）。那里通常是用户的项目，模型要改的就是它：以前一视同仁套一层 `<短名>/`，`read core/src/x.rs` 就落到 `<项目>/ph7ah4/core/src/x.rs` 去 —— 找不到，还在项目里建出空目录 |
+| **提示词里不写具体目录名** | 每个会话的目录都不一样，写进提示词就等于给每个会话一份不同的 system prompt —— 前缀缓存全废（[docs/03](03-prompt-cache.md)）。所以只说「cwd 是你这个会话自己的目录（`pwd` 看名字）」                                                                               |
 
 旧的 `/workspace` 根目录里那些东西不会动（用户的文件）—— 新会话只是不再往那儿堆了。

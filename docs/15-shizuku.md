@@ -14,12 +14,12 @@
 
 两批能力互补，不重叠：
 
-| | `agent contacts` 那批 | `agent shizuku` |
-|---|---|---|
-| 身份 | 应用自己 | adb（2000）/ root（0） |
-| 依据 | 运行时权限 + 公开 API | 命令行工具 |
-| 能做到 | 读联系人 / 发短信 / 定位 | 停别的 App / 改系统设置 / 模拟点击 / 看 dumpsys |
-| 做不到 | 碰别的 App、改系统设置 | 没有 App 自己的 API（要发短信得走 `am`/`content`） |
+|        | `agent contacts` 那批    | `agent shizuku`                                    |
+| ------ | ------------------------ | -------------------------------------------------- |
+| 身份   | 应用自己                 | adb（2000）/ root（0）                             |
+| 依据   | 运行时权限 + 公开 API    | 命令行工具                                         |
+| 能做到 | 读联系人 / 发短信 / 定位 | 停别的 App / 改系统设置 / 模拟点击 / 看 dumpsys    |
+| 做不到 | 碰别的 App、改系统设置   | 没有 App 自己的 API（要发短信得走 `am`/`content`） |
 
 ## 2. 分层：表在 Rust，判断也在 Rust
 
@@ -108,19 +108,19 @@ case（宿主模式也没有 —— 不打 adb），模型在电脑上看不到�
 
 ## 7. 验收现状
 
-| 项 | 状态 |
-|---|---|
-| `service status` / `ping` | ✅ 模拟器：READY / NOT_RUNNING / NEED_PERMISSION 三态现场跑过 |
-| `exec`（含管道、重定向、`;`） | ✅ `dumpsys battery \| grep level`、`getprop` 都对 |
-| 失败带输出、非 0 | ✅ `错误：…（OPERATION_FAILED）`，CLI 据此非 0 退出 |
-| 超时 124 | ✅ 且**不再带**超时之后才产生的输出 |
-| Rust 单测 | ✅ 450 passed（13 条 shizuku 相关） |
-| Kotlin 单测 | ✅ `decideState` 五条 |
-| uid 2000（真机 / 无线调试启动） | ✅ Pixel 10 / Android 17：`uid=2000(shell) ... context=u:r:shell:s0` |
-| **沙箱里敲 `agent shizuku`**（最后一跳） | ✅ Pixel 10 真机：`agent shizuku exec id` → `uid=2000(shell)…` |
-| P1 的 11 组（真机） | ✅ battery / top / info / display / package info / settings 读写删 / input tap / 各种参数错 |
-| **release 包**（R8 混淆后） | ✅ 签名与 debug 一致、覆盖安装不丢数据；`exec id` 仍拿到 uid 2000 |
-| `&&` 链在失败处断开（CLI 非 0） | ✅ `exec echo A && exec ls /nope && echo 不该出现` → 只出 A + 错误，exit 1 |
+| 项                                       | 状态                                                                                        |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `service status` / `ping`                | ✅ 模拟器：READY / NOT_RUNNING / NEED_PERMISSION 三态现场跑过                               |
+| `exec`（含管道、重定向、`;`）            | ✅ `dumpsys battery \| grep level`、`getprop` 都对                                          |
+| 失败带输出、非 0                         | ✅ `错误：…（OPERATION_FAILED）`，CLI 据此非 0 退出                                         |
+| 超时 124                                 | ✅ 且**不再带**超时之后才产生的输出                                                         |
+| Rust 单测                                | ✅ 450 passed（13 条 shizuku 相关）                                                         |
+| Kotlin 单测                              | ✅ `decideState` 五条                                                                       |
+| uid 2000（真机 / 无线调试启动）          | ✅ Pixel 10 / Android 17：`uid=2000(shell) ... context=u:r:shell:s0`                        |
+| **沙箱里敲 `agent shizuku`**（最后一跳） | ✅ Pixel 10 真机：`agent shizuku exec id` → `uid=2000(shell)…`                              |
+| P1 的 11 组（真机）                      | ✅ battery / top / info / display / package info / settings 读写删 / input tap / 各种参数错 |
+| **release 包**（R8 混淆后）              | ✅ 签名与 debug 一致、覆盖安装不丢数据；`exec id` 仍拿到 uid 2000                           |
+| `&&` 链在失败处断开（CLI 非 0）          | ✅ `exec echo A && exec ls /nope && echo 不该出现` → 只出 A + 错误，exit 1                  |
 
 ## 8. 组（P1 已做完）
 
@@ -161,14 +161,14 @@ activities / getprop）。解析器的单测直接喂这些文件 —— 换系�
 模型每一轮都要重读整段上下文，所以**工具的每一行输出都是持续成本**。这套命令的
 输出按「一行能说完就一行」来定，下面每条都是实测改出来的，不是感觉：
 
-| 改前 | 改后 | 为什么 |
-|---|---|---|
-| `service status` 5 行（状态/来源/版本/身份/uid） | 1 行 `Shizuku 13，adb uid=2000` | 「身份: adb」和「uid: 2000」是同一件事；能跑通时「状态: READY」是废话 |
-| 同样内容另有一套 5 行 JSON 排版 | 只有这一行 | 两条命令给了两套状态格式，本身就是冗余 |
-| `错误：ls: /nope: …（OPERATION_FAILED）` | `错误：ls: /nope: …` | 命令原文已说清；这个码零信息量 |
-| `错误：命令失败（exitCode=1，没有任何输出）（OPERATION_FAILED）` | `错误：exitCode=1，没有输出` | 三个括号一个意思 |
-| `OK Shizuku 就绪（adb uid=2000）` | `OK` | ping 是给脚本判断的 |
-| help 里还有一句「不审批：敲了就跑」 | 删（信息在组名和「会改东西」里） | 元信息，不是能力 |
+| 改前                                                             | 改后                             | 为什么                                                                |
+| ---------------------------------------------------------------- | -------------------------------- | --------------------------------------------------------------------- |
+| `service status` 5 行（状态/来源/版本/身份/uid）                 | 1 行 `Shizuku 13，adb uid=2000`  | 「身份: adb」和「uid: 2000」是同一件事；能跑通时「状态: READY」是废话 |
+| 同样内容另有一套 5 行 JSON 排版                                  | 只有这一行                       | 两条命令给了两套状态格式，本身就是冗余                                |
+| `错误：ls: /nope: …（OPERATION_FAILED）`                         | `错误：ls: /nope: …`             | 命令原文已说清；这个码零信息量                                        |
+| `错误：命令失败（exitCode=1，没有任何输出）（OPERATION_FAILED）` | `错误：exitCode=1，没有输出`     | 三个括号一个意思                                                      |
+| `OK Shizuku 就绪（adb uid=2000）`                                | `OK`                             | ping 是给脚本判断的                                                   |
+| help 里还有一句「不审批：敲了就跑」                              | 删（信息在组名和「会改东西」里） | 元信息，不是能力                                                      |
 
 保留的两处「不精简」是刻意的：
 

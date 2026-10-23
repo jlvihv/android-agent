@@ -45,8 +45,8 @@ POST /api/browser ───────────────────┤  
   改一行 JS 就能立刻验。
 - **模型只有一个门：沙箱里的 `agent browser`**（`core/src/cli.rs`）。
   动作是 `navigate / get_backbone / get_readable / get_text / click / type / press /
-  find_elements / scroll / screenshot / set_user_agent / back / wait_for_dom_stable /
-  js / new_tab / list_tabs / switch_tab / close_tab`。
+find_elements / scroll / screenshot / set_user_agent / back / wait_for_dom_stable /
+js / new_tab / list_tabs / switch_tab / close_tab`。
 
   唯一入口是沙箱里的 `agent browser`（为什么不做成工具、以及截图不进上下文怎么补的，
   见 [docs/10](10-tools-vs-sandbox.md)）；CLI 对每个动作的参数个数上下限都校验
@@ -93,10 +93,10 @@ ImageReader(RGBA) ──surface──> VirtualDisplay ──> Presentation 窗�
 
 **A/B**（模拟器，往页面里注入一块 WebGL 纯红画布）：
 
-| 走哪条 | 画布区域的平均 RGB | 结果 |
-|---|---|---|
-| GPU 合成 | `254,0,0` | 红色看到了 ✓ |
-| 软件绘制（面板开着，WebView 挂在真窗口上 → 只能走这条） | `21,21,21` | 就是背景色，WebGL 层不可见 |
+| 走哪条                                                  | 画布区域的平均 RGB | 结果                       |
+| ------------------------------------------------------- | ------------------ | -------------------------- |
+| GPU 合成                                                | `254,0,0`          | 红色看到了 ✓               |
+| 软件绘制（面板开着，WebView 挂在真窗口上 → 只能走这条） | `21,21,21`         | 就是背景色，WebGL 层不可见 |
 
 耗时 149ms（建宿主 14ms、2 帧、安静）—— 比想象的便宜。
 
@@ -153,14 +153,14 @@ HTML；抽正文、排版在 `Core::browser` 里做一次。所以两端、两�
   省略闭合（`<p>` 碰到块级元素、`<li>` 碰到 `<li>`…），几十个常用实体。按标准解析的
   html5ever 加上 CSS 选择器引擎会让 `.so` 胖 1.47MB（试过：dom_smoothie，即 Readability.js
   的 Rust 移植）；这一套只多 62KB。
-- **找正文**用两个浅层文本特征（Kohlschütter 等，*Boilerplate Detection using Shallow Text
-  Features*，WSDM 2010，即 boilerpipe）：每块的**字数**和**链接密度**。长而链接少的块加分、
+- **找正文**用两个浅层文本特征（Kohlschütter 等，_Boilerplate Detection using Shallow Text
+  Features_，WSDM 2010，即 boilerpipe）：每块的**字数**和**链接密度**。长而链接少的块加分、
   链接密集的扣分，取**分最高的子树**当正文容器（树上的最大子段和 —— 正好是「正文都包进来、
   导航尽量没带上」的最紧那一层），再剃掉容器里开头结尾的链接块和成串的链接（相关阅读）。
   字数按「一个汉字 = 一个英文词」算，中英文一个门槛。
 - 不像文章（正文太少，或者正文段落七成以上不在容器里 —— 门户首页的摘要散在各处）：退回
   整页文字，第一行注明「没认出正文」。
-- 排版：`## 标题`、代码块、空行分段、只有一个链接的段落附去处、相邻重复去掉；另外照顾到 h4–h6、数据表格（一行一条、` | ` 分格；排版用的表照普通块读）、`<br><br>`
+- 排版：`## 标题`、代码块、空行分段、只有一个链接的段落附去处、相邻重复去掉；另外照顾到 h4–h6、数据表格（一行一条、`|` 分格；排版用的表照普通块读）、`<br><br>`
   分段的老网页。
 - 只收 UTF-8：GBK 页面报错并给出 `iconv -f gbk -t utf-8 | agent readable`（转码表几百
   KB，iconv 两边都现成）。一个字都没有（JS 渲染的空壳）也报错，指向 `agent browser`。
@@ -257,9 +257,10 @@ View 临时拉高到全文档高度、画完再恢复。高度封顶 **8000px**�
 「标签 3」会悄悄落到新开的那只上（在那之前用它，报的是「空闲太久，已自动关掉」）。
 
 **两端一字不差**：标签那四个动作，两个后端都只回数据（`opened` / `list` / `closed`
-+ `url` / `title`），文字在 `Core::browser` 里排一份（`lib.rs` 的 `tab_reply`）。以前
-各写一套，同一个动作模型在两种机器上看到两个样子；电脑那边还不回 `tab` / `tabs`、
-不认别的动作上的 `tab` 参数（静默忽略）。
+
+- `url` / `title`），文字在 `Core::browser` 里排一份（`lib.rs` 的 `tab_reply`）。以前
+  各写一套，同一个动作模型在两种机器上看到两个样子；电脑那边还不回 `tab` / `tabs`、
+  不认别的动作上的 `tab` 参数（静默忽略）。
 
 **开新窗口一律在当前标签打开**：`target=_blank` 的链接和 `window.open(url)` 都掰成
 当前标签里跳转（`browser_js.rs` 的 `target_fix`，两端共用）。手机的 WebView 不开多窗口，
@@ -383,9 +384,9 @@ agent 在动作时右边一行小字「agent 操作中」；内容区上沿一�
   别的页面上。电脑上同一只标签串行、不同标签并行（见第 11 节）。
 - **整页截图没有 GPU 层**（虚拟显示单边上限 4096px），视口截图有（见第 5 节）。
 - **后台可能被回收 —— 已经摆平一半**：回合进行中会挂一个前台服务
-（`docs/06`），所以“接个电话回来发现没跑完”不发生了：切到桌面后
-浏览器动作照常跑完。但不能保证永远不被杀（用户手动强行停止、系统内存极端紧张），
-所以动作仍尽量幂等，进度靠会话历史恢复。
+  （`docs/06`），所以“接个电话回来发现没跑完”不发生了：切到桌面后
+  浏览器动作照常跑完。但不能保证永远不被杀（用户手动强行停止、系统内存极端紧张），
+  所以动作仍尽量幂等，进度靠会话历史恢复。
 - **吞掉的弹窗**只报"页面弹窗已自动关闭"，不做交互。
 
 ## 13. 打开沙箱里的网页（以及它们的存储）
@@ -462,11 +463,11 @@ just phone                       # 交互模式
 
 **为什么是 CDP**（而不是嵌一个 WebView）：
 
-| 方案 | 为什么不 |
-|---|---|
-| WebKitGTK | 要把 GTK/glib 链进 `.so` + GLib 主循环；而且它是 **WebKit**，安卓那边是 **Chromium** —— 注入的 JS 不保证同一种行为 |
-| CEF / Electron / QtWebEngine | 几十上百 MB 的运行时 / 构建链，桌面开发不值 |
-| **无头 Chrome + CDP** | 引擎和安卓同为 Chromium；`tungstenite` 早就因为 axum 在依赖树里了（**零新依赖**）；`scripts/dom-audit.ts` 已经在用 CDP 干真事 |
+| 方案                         | 为什么不                                                                                                                      |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| WebKitGTK                    | 要把 GTK/glib 链进 `.so` + GLib 主循环；而且它是 **WebKit**，安卓那边是 **Chromium** —— 注入的 JS 不保证同一种行为            |
+| CEF / Electron / QtWebEngine | 几十上百 MB 的运行时 / 构建链，桌面开发不值                                                                                   |
+| **无头 Chrome + CDP**        | 引擎和安卓同为 Chromium；`tungstenite` 早就因为 axum 在依赖树里了（**零新依赖**）；`scripts/dom-audit.ts` 已经在用 CDP 干真事 |
 
 这也和既有取舍一致：LLM 协议自己写（不用 SDK），CDP 也自己写。
 

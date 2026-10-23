@@ -10,10 +10,10 @@
  *
  * 读 `wide.on` 就够了，它跟着窗口大小变。
  */
-const mq = window.matchMedia('(min-width: 56rem)');
+const mq = window.matchMedia("(min-width: 56rem)");
 
 let on = $state(mq.matches);
-mq.addEventListener('change', (e) => {
+mq.addEventListener("change", (e) => {
   on = e.matches;
 });
 

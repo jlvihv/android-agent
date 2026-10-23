@@ -16,9 +16,18 @@
  * 和缓存上记的对不上就强制重拉 —— 这是唯一需要「真的再拉一次」的场合。
  */
 
-export type Model = { id: string; name: string; context_window?: number | null };
+export type Model = {
+  id: string;
+  name: string;
+  context_window?: number | null;
+};
 /** 一家服务商的模型（`GET /api/models` 的 `groups`） */
-export type Group = { id: string; name: string; models: Model[]; error?: string };
+export type Group = {
+  id: string;
+  name: string;
+  models: Model[];
+  error?: string;
+};
 
 /** 和后端 `AppState::models_of` 的 TTL 一致 */
 const TTL = 10 * 60 * 1000;
@@ -32,7 +41,7 @@ class ModelCache {
    * 不然每次打开都先闪一下载入中，又回到老问题。
    */
   loaded = $state(false);
-  err = $state('');
+  err = $state("");
 
   #at = 0;
   /** 这份清单是对着哪个配置版本拉的（`rev`，见 ModelSheet 的 props） */
@@ -54,7 +63,12 @@ class ModelCache {
   #fresh(rev: number): boolean {
     // 上次失败过就不算新鲜：面板下次打开再试一次，别把一次网络抖动
     // 缓存成 10 分钟的「拉不到模型」
-    return this.loaded && this.err === '' && this.#rev === rev && Date.now() - this.#at < TTL;
+    return (
+      this.loaded &&
+      this.err === "" &&
+      this.#rev === rev &&
+      Date.now() - this.#at < TTL
+    );
   }
 
   /** 面板里切了服务商：本地先认了，不为一个字段重拉整张清单
@@ -81,12 +95,15 @@ class ModelCache {
 
   async #fetch(rev: number): Promise<void> {
     try {
-      const r = await fetch('/api/models');
+      const r = await fetch("/api/models");
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const d = (await r.json()) as { groups?: Group[]; provider?: string | null };
+      const d = (await r.json()) as {
+        groups?: Group[];
+        provider?: string | null;
+      };
       this.groups = d.groups ?? [];
       this.provider = d.provider ?? null;
-      this.err = '';
+      this.err = "";
       this.#at = Date.now();
       this.#rev = rev;
     } catch (e) {

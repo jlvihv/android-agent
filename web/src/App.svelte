@@ -6,8 +6,8 @@
    *
    * 没有魔法数字：尺寸走 Tailwind 刻度，顶部/底部由安全区给。
    */
-  import { untrack } from 'svelte';
-  import { store } from './lib/store.svelte.ts';
+  import { untrack } from "svelte";
+  import { store } from "./lib/store.svelte.ts";
   import {
     consume,
     isQueued,
@@ -23,32 +23,32 @@
     type SessionUsage,
     type UsageTotals,
     totalsOf,
-  } from './lib/sse';
-  import { uid } from './lib/uid';
-import {
-  applyPatch,
-  applyWindow,
-  prependPage,
-  trimOlder,
-  type SessionPayload,
-  type Window,
-} from './lib/session';
+  } from "./lib/sse";
+  import { uid } from "./lib/uid";
+  import {
+    applyPatch,
+    applyWindow,
+    prependPage,
+    trimOlder,
+    type SessionPayload,
+    type Window,
+  } from "./lib/session";
 
-  import Icon from './components/Icon.svelte';
-  import Composer from './components/Composer.svelte';
-  import MessageList from './components/MessageList.svelte';
-  import Drawer, { type Session } from './components/Drawer.svelte';
-  import MachineSheet from './components/MachineSheet.svelte';
-  import ModelSheet from './components/ModelSheet.svelte';
-  import Settings from './components/Settings.svelte';
-  import Viewer from './components/Viewer.svelte';
-  import { viewer } from './lib/viewer.svelte.ts';
-  import { models } from './lib/models.svelte.ts';
-  import { agentHasBrowser, openAgentBrowser } from './lib/overlay';
-  import { wide } from './lib/wide.svelte.ts';
-  import { dismissable } from './lib/drag';
+  import Icon from "./components/Icon.svelte";
+  import Composer from "./components/Composer.svelte";
+  import MessageList from "./components/MessageList.svelte";
+  import Drawer, { type Session } from "./components/Drawer.svelte";
+  import MachineSheet from "./components/MachineSheet.svelte";
+  import ModelSheet from "./components/ModelSheet.svelte";
+  import Settings from "./components/Settings.svelte";
+  import Viewer from "./components/Viewer.svelte";
+  import { viewer } from "./lib/viewer.svelte.ts";
+  import { models } from "./lib/models.svelte.ts";
+  import { agentHasBrowser, openAgentBrowser } from "./lib/overlay";
+  import { wide } from "./lib/wide.svelte.ts";
+  import { dismissable } from "./lib/drag";
 
-  let input = $state('');
+  let input = $state("");
   /** 当前看着的这个会话，本地正连着它的流。 */
   let busy = $state(false);
   /** 服务端说当前会话还在跑。App 切到后台、或者从别的会话切回来时，
@@ -102,11 +102,16 @@ import {
    * `insertNow`），那就不应该连网络也一起等 —— 滚动中先把内容拿到手，停下的那一刻
    * 直接插。常态（有 anchoring、没贴顶）根本不等停：拿到就插。
    */
-  let pending: { sid: string; base: number; page: Message[]; from: number; hasMore: boolean } | null =
-    null;
+  let pending: {
+    sid: string;
+    base: number;
+    page: Message[];
+    from: number;
+    hasMore: boolean;
+  } | null = null;
 
   /** 正在路上的那份 `loadMessages` 是哪一份（会话|窗口|rev）；空 = 没有 */
-  let inflight = '';
+  let inflight = "";
   /** 路上这份还在跑的时候又有调用被合并掉了：回来后必须再补一次（见下面的注释） */
   let inflightAgain = false;
   /** 正在拉更早的一窗（插入那一次），别重入 */
@@ -118,7 +123,6 @@ import {
    * **等它**就行 —— 以前是另发一份一模一样的请求，等于白白多一个来回。
    */
   let prefetching: Promise<void> | null = null;
-
 
   /**
    * 排队等着交给模型的消息 —— 它是**服务端**那份队列的本地镜子。
@@ -331,7 +335,7 @@ import {
       // 已经不在列表里的对象里写，界面上就是「没回复」。丢掉，下一次再拉。
       if (busy || at !== sent) return;
       serverBusy = !!d.busy;
-      rev = d.rev ?? '';
+      rev = d.rev ?? "";
       // 排队那几条按服务端**整份重来**（`unchanged` 时也要）：它们的变化不进
       // `rev`（那是消息的版本号），光看 rev 看不出「排队里少了一条」。
       // `pending` 的那几条是刚发出去、还没听到回话的，留着 —— 服务端下一份就会
@@ -350,19 +354,25 @@ import {
       if (d.unchanged) return;
       // 用量整份换成服务端的：它数的是这个会话的**全部**调用，而我们手上
       // 那份只从页面加载后开始算。`last` 没有 = 这个会话还没跑过
-      usage = d.usage?.last ? { last: d.usage.last, total: totalsOf(d.usage) } : null;
+      usage = d.usage?.last
+        ? { last: d.usage.last, total: totalsOf(d.usage) }
+        : null;
       // 会话 id 变了（切会话 / 重置）就不能按 id 复用旧消息 ——
       // `u1` 这种 id 每条会话都会有。`sid` 在上面算过了。
       //
       // 补丁 / 整窗两条路的规则在 `lib/session.ts` 里（有测试盯着，见 `bun test`）。
       const same = sid === sessionId;
       if (d.append && same) {
-        const r = applyPatch({ messages, windowFrom }, d as SessionPayload, winAt);
+        const r = applyPatch(
+          { messages, windowFrom },
+          d as SessionPayload,
+          winAt,
+        );
         if (!r.ok) {
-          if (r.why === 'mismatch') {
+          if (r.why === "mismatch") {
             // 本地那条和服务端以为的对不上：老老实实重新要一份全量
             //（`rev = ''` → 下一份是尾部窗口，回来时会按 `from` 接在旧的那段后面）
-            rev = '';
+            rev = "";
             return loadMessages();
           }
           // 'stale'：这一路上窗口变过（用户往上翻了一页），补丁的下标是按旧窗口
@@ -371,7 +381,9 @@ import {
         }
         setWindow(r.window);
       } else {
-        setWindow(applyWindow({ messages, windowFrom }, d as SessionPayload, same));
+        setWindow(
+          applyWindow({ messages, windowFrom }, d as SessionPayload, same),
+        );
       }
       if (d.turnError) showTurnError(d.turnError);
       sessionId = sid;
@@ -379,7 +391,7 @@ import {
       /* 拉不到就算了 */
     } finally {
       if (inflight === key) {
-        inflight = '';
+        inflight = "";
         // 被合并掉的那次在这里补上（新的一份 key 不一样，不会自己把自己的门堵上）
         if (inflightAgain) {
           inflightAgain = false;
@@ -398,13 +410,13 @@ import {
    */
   function showTurnError(text: string) {
     const last = messages.at(-1);
-    if (last?.parts.some((p) => p.type === 'error' && p.text === text)) return;
+    if (last?.parts.some((p) => p.type === "error" && p.text === text)) return;
     messages.push({
       id: uid(),
-      role: 'assistant',
+      role: "assistant",
       steps: 0,
       done: true,
-      parts: [{ type: 'error', text }],
+      parts: [{ type: "error", text }],
     });
   }
 
@@ -414,7 +426,7 @@ import {
    * **切会话 / 新建 / 删除后必须清掉** —— 否则会拿旧会话的 rev 去比对新会话，
    * 服务端一旦碰巧返回 unchanged，界面就卡在上一个会话的内容上。
    */
-  let rev = '';
+  let rev = "";
 
   /**
    * 本地往消息列表里加过东西的次数（`send` / 开跑）。`loadMessages` 发请求前记一下，
@@ -437,7 +449,7 @@ import {
    * `$state`：**队列要跟着它走**（输入框上面那几条「排队中」只看当前会话的，
    * 切回去才轮到它发）。
    */
-  let sessionId = $state('');
+  let sessionId = $state("");
 
   /**
    * 把算好的三个值写回去（`$state` 得逐个赋值才触发更新）。
@@ -461,9 +473,18 @@ import {
    *
    * 接不上就整页丢掉（`prependPage` 给 null）：宁可少一窗，也不能在中间留个洞。
    */
-  function insertOlder(p: { page: Message[]; from: number; hasMore: boolean }): boolean {
+  function insertOlder(p: {
+    page: Message[];
+    from: number;
+    hasMore: boolean;
+  }): boolean {
     if (!p.page.length) return false; // 空页：什么都不用做，下次再要
-    const next = prependPage(currentWindow(), { messages: p.page, from: p.from, hasMore: p.hasMore });    if (!next) return false;
+    const next = prependPage(currentWindow(), {
+      messages: p.page,
+      from: p.from,
+      hasMore: p.hasMore,
+    });
+    if (!next) return false;
     setWindow(next);
     // 插进去之后窗口起点变了：手上那份预取（如果有）的基准点也跟着过时 ——
     // 丢掉，下一次贴到顶时按新的起点重新预取（不然会拿着一份对不上的干等）。
@@ -474,7 +495,9 @@ import {
   /**
    * 翻页请求本身（预取和插都用它）。返回 null = 这一份不能用了。
    */
-  async function fetchOlder(base: number): Promise<Omit<NonNullable<typeof pending>, 'sid' | 'base'> | null> {
+  async function fetchOlder(
+    base: number,
+  ): Promise<Omit<NonNullable<typeof pending>, "sid" | "base"> | null> {
     const sid = sessionId;
     try {
       const r = await fetch(
@@ -483,8 +506,13 @@ import {
       if (!r.ok) return null;
       const d = (await r.json()) as SessionPayload;
       // 这一路走的过程中会话切走了 / 窗口又变了一页 / 已经没有更早的了：这份不要了
-      if (sid !== sessionId || base !== windowFrom || windowFrom === 0) return null;
-      return { page: d.messages ?? [], from: d.from ?? 0, hasMore: !!d.hasMore };
+      if (sid !== sessionId || base !== windowFrom || windowFrom === 0)
+        return null;
+      return {
+        page: d.messages ?? [],
+        from: d.from ?? 0,
+        hasMore: !!d.hasMore,
+      };
     } catch {
       return null;
     }
@@ -496,7 +524,8 @@ import {
    * 失败不算事 —— 真要的时候 `loadOlder` 会重拉一次。
    */
   function prefetchOlder(): void {
-    if (!hasOlder || !sessionId || pending || prefetching || loadingOlder) return;
+    if (!hasOlder || !sessionId || pending || prefetching || loadingOlder)
+      return;
     const base = windowFrom;
     const p = (async () => {
       const got = await fetchOlder(base);
@@ -551,8 +580,9 @@ import {
 
   async function loadSessions() {
     try {
-      const r = await fetch('/api/sessions');
-      if (r.ok) sessions = ((await r.json()) as { sessions: Session[] }).sessions ?? [];
+      const r = await fetch("/api/sessions");
+      if (r.ok)
+        sessions = ((await r.json()) as { sessions: Session[] }).sessions ?? [];
     } catch {
       /* 同上 */
     }
@@ -563,8 +593,8 @@ import {
     // **不请求服务端**：新会话到第一句话才建（`ensureSession`），
     // 这里只把本地视图清空 —— 点了不发就不会攒出一堆空会话。
     fresh = true;
-    rev = '';
-    sessionId = '';
+    rev = "";
+    sessionId = "";
     messages = [];
     // 新会话还没跑过，手上这一窗的起点和「还有没有更早的」都从头算
     windowFrom = 0;
@@ -579,14 +609,14 @@ import {
 
   async function switchSession(id: string) {
     detach();
-    await fetch('/api/sessions/activate', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+    await fetch("/api/sessions/activate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ id }),
     });
     fresh = false;
-    rev = '';
-    sessionId = '';
+    rev = "";
+    sessionId = "";
     windowFrom = 0;
     pending = null;
     await Promise.all([loadSessions(), loadMessages()]);
@@ -594,9 +624,9 @@ import {
   }
 
   async function renameSession(id: string, title: string) {
-    await fetch('/api/sessions/rename', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+    await fetch("/api/sessions/rename", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ id, title }),
     });
     await loadSessions();
@@ -606,14 +636,14 @@ import {
     if (id === sessionId) detach();
     // 这个会话没了，它排着的队也没地方发了
     queue = queue.filter((q) => q.sid !== id);
-    await fetch('/api/sessions/delete', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+    await fetch("/api/sessions/delete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ id }),
     });
     fresh = false;
-    rev = '';
-    sessionId = '';
+    rev = "";
+    sessionId = "";
     windowFrom = 0;
     pending = null;
     await Promise.all([loadSessions(), loadMessages()]);
@@ -672,20 +702,20 @@ import {
   let lastSync = 0;
   $effect(() => {
     const sync = () => {
-      if (document.visibilityState !== 'visible') return;
+      if (document.visibilityState !== "visible") return;
       const now = Date.now();
       if (now - lastSync < SYNC_GAP_MS) return;
       lastSync = now;
       void loadMessages();
       void loadSessions();
     };
-    document.addEventListener('visibilitychange', sync);
-    window.addEventListener('focus', sync);
-    window.addEventListener('pageshow', sync);
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("focus", sync);
+    window.addEventListener("pageshow", sync);
     return () => {
-      document.removeEventListener('visibilitychange', sync);
-      window.removeEventListener('focus', sync);
-      window.removeEventListener('pageshow', sync);
+      document.removeEventListener("visibilitychange", sync);
+      window.removeEventListener("focus", sync);
+      window.removeEventListener("pageshow", sync);
     };
   });
 
@@ -718,7 +748,13 @@ import {
       const moved = queue.filter((q) => ids.includes(q.id));
       if (moved.length) queue = queue.filter((q) => !ids.includes(q.id));
       for (const q of moved) {
-        messages.push({ id: q.id, role: 'user', parts: q.parts, steps: 0, done: true });
+        messages.push({
+          id: q.id,
+          role: "user",
+          parts: q.parts,
+          steps: 0,
+          done: true,
+        });
       }
     }),
   );
@@ -729,9 +765,13 @@ import {
   // 它们按「**还没发出去**的用户消息」渲染（`done: false`）—— 消息列表里就是
   // 普通用户气泡的样子，只多一圈虚线和左边一个 ×（详见上面 Queued 的注释）。
   let queuedMsgs = $derived(
-    queued.map(
-      (q): Message => ({ id: q.id, role: 'user', parts: q.parts, steps: 0, done: false }),
-    ),
+    queued.map((q): Message => ({
+      id: q.id,
+      role: "user",
+      parts: q.parts,
+      steps: 0,
+      done: false,
+    })),
   );
 
   // 左上角那个菜单按钮：窄屏是开抽屉；宽屏是**收 / 展**侧边栏
@@ -768,12 +808,17 @@ import {
   /** 拖着打开时抽屉拉出来的比例（交给 Drawer 的 `peek`）；null = 不在跟手 */
   let peek = $state<number | null>(null);
   /** 触屏才开：桌面上用鼠标往右拖是在选字，不是想开抽屉 */
-  const touch = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+  const touch =
+    typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
 
   /** 这一下能不能当成「开抽屉」：输入框里是拖光标；能横着滚、又没在最左的内容（代码块、
    *  宽表格）是想把它往回滚 */
   function swipeable(t: EventTarget | null): boolean {
-    for (let el = t instanceof Element ? t : null; el && el !== document.body; el = el.parentElement) {
+    for (
+      let el = t instanceof Element ? t : null;
+      el && el !== document.body;
+      el = el.parentElement
+    ) {
       if (el.matches('input, textarea, [contenteditable="true"]')) return false;
       if (el.scrollLeft > 0) return false;
     }
@@ -781,11 +826,12 @@ import {
   }
 
   const openDrag = {
-    axis: 'x' as const,
+    axis: "x" as const,
     dir: 1 as const,
     // 抽屉宽 92%（app.css 的 --drawer-w）：手指走完这么远就是整个拉出来了
     size: () => innerWidth * 0.92,
-    canStart: (t: EventTarget | null) => touch && !wide.on && !drawer && swipeable(t),
+    canStart: (t: EventTarget | null) =>
+      touch && !wide.on && !drawer && swipeable(t),
     onStart: () => {
       peek = 0;
       drawer = true;
@@ -811,7 +857,11 @@ import {
    * 服务端把排队的消息交给模型时会再来一个 `start`，那时换**新的一条**写
    * （见下面 `onRestart`），和服务端历史的形状一致。
    */
-  async function run(me: Run, msg: Message, stream: AsyncGenerator<UiChunk, void, undefined>) {
+  async function run(
+    me: Run,
+    msg: Message,
+    stream: AsyncGenerator<UiChunk, void, undefined>,
+  ) {
     live = me;
     busy = true;
     let cur = msg;
@@ -824,7 +874,7 @@ import {
       });
     } catch (e) {
       if (!me.controller.signal.aborted) {
-        cur.parts.push({ type: 'error', text: String(e) });
+        cur.parts.push({ type: "error", text: String(e) });
       }
     } finally {
       cur.done = true;
@@ -843,12 +893,12 @@ import {
   async function ensureSession(): Promise<string | null> {
     if (!fresh && sessionId) return sessionId;
     try {
-      const r = await fetch('/api/sessions', { method: 'POST' });
+      const r = await fetch("/api/sessions", { method: "POST" });
       if (!r.ok) return null;
       const { id } = (await r.json()) as { id: string };
       fresh = false;
       sessionId = id;
-      rev = '';
+      rev = "";
       return id;
     } catch {
       return null;
@@ -872,7 +922,7 @@ import {
   async function send(attachments: Upload[]) {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
-    input = '';
+    input = "";
     sent++;
     ownSend++;
 
@@ -880,8 +930,14 @@ import {
     const parts = userParts(text, attachments);
     const sid = await ensureSession();
     if (!sid) {
-      messages.push({ id, role: 'user', parts, steps: 0, done: true });
-      messages.push({ id: uid(), role: 'assistant', steps: 0, done: true, parts: [{ type: 'error', text: '建会话失败，再试一次' }] });
+      messages.push({ id, role: "user", parts, steps: 0, done: true });
+      messages.push({
+        id: uid(),
+        role: "assistant",
+        steps: 0,
+        done: true,
+        parts: [{ type: "error", text: "建会话失败，再试一次" }],
+      });
       return;
     }
     queue = [...queue, { id, sid, parts, pending: true }];
@@ -896,12 +952,23 @@ import {
    */
   function userParts(text: string, attachments: Upload[]): Part[] {
     return [
-      { type: 'text', id: 'u', text },
-      ...attachments.map(
-        (a, i): Part =>
-          a.kind === 'image'
-            ? { type: 'image', id: `a${i}`, url: a.url, name: a.name, mime: a.mime }
-            : { type: 'file', id: `a${i}`, url: a.url, name: a.name, mime: a.mime },
+      { type: "text", id: "u", text },
+      ...attachments.map((a, i): Part =>
+        a.kind === "image"
+          ? {
+              type: "image",
+              id: `a${i}`,
+              url: a.url,
+              name: a.name,
+              mime: a.mime,
+            }
+          : {
+              type: "file",
+              id: `a${i}`,
+              url: a.url,
+              name: a.name,
+              mime: a.mime,
+            },
       ),
     ];
   }
@@ -909,10 +976,16 @@ import {
   /**
    * 真的把一条消息交给服务端（首帧决定它是「开跑」还是「排队」）。
    */
-  async function deliver(id: string, sid: string, text: string, attachments: Upload[], parts: Part[]) {
+  async function deliver(
+    id: string,
+    sid: string,
+    text: string,
+    attachments: Upload[],
+    parts: Part[],
+  ) {
     const me: Run = { controller: new AbortController() };
     const stream = streamFrom(
-      '/api/chat',
+      "/api/chat",
       { text, id, session: sid, attachments: attachments.map((a) => a.id) },
       me.controller.signal,
     );
@@ -922,13 +995,13 @@ import {
     } catch (e) {
       // 连请求都没发出去：把那条虚线气泡撤了，用一条错误消息说清楚（字不能丢）
       queue = queue.filter((q) => q.id !== id);
-      messages.push({ id, role: 'user', parts, steps: 0, done: true });
+      messages.push({ id, role: "user", parts, steps: 0, done: true });
       messages.push({
         id: uid(),
-        role: 'assistant',
+        role: "assistant",
         steps: 0,
         done: true,
-        parts: [{ type: 'error', text: String(e) }],
+        parts: [{ type: "error", text: String(e) }],
       });
       return;
     }
@@ -948,7 +1021,7 @@ import {
     // 开跑了：那条虚线气泡翻进正文（换了个 id 的影子都没有 —— 就是同一个 id）
     queue = queue.filter((q) => q.id !== id);
     sent++;
-    messages.push({ id, role: 'user', parts, steps: 0, done: true });
+    messages.push({ id, role: "user", parts, steps: 0, done: true });
     const msg = store.beginStreaming();
     messages.push(msg);
     await run(me, msg, prepend(first, stream));
@@ -965,9 +1038,9 @@ import {
     const item = queue.find((q) => q.id === id);
     queue = queue.filter((q) => q.id !== id);
     if (!item) return;
-    void fetch('/api/sessions/unqueue', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+    void fetch("/api/sessions/unqueue", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ session: item.sid, id }),
     }).catch(() => {
       /* 撤不掉就算了：它已经落进正文，或者下次轮询会纠正 */
@@ -978,9 +1051,9 @@ import {
     // 服务端循环看不到 SSE 断连（tx.send 失败会被忽略），得显式告诉它停。
     // 否则前端显示停了，agent 还在后台一轮轮跑工具、烧 token。
     // 只停**这个**会话的回合：别的会话在跑的不受影响。
-    void fetch('/api/stop', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+    void fetch("/api/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(sessionId ? { session: sessionId } : {}),
     });
     const r = live;
@@ -1023,7 +1096,9 @@ import {
          z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
     <main class="absolute inset-0">
       {#if messages.length === 0 && queuedMsgs.length === 0}
-        <h1 class="grid h-full place-items-center text-2xl font-normal">来思考些什么?</h1>
+        <h1 class="grid h-full place-items-center text-2xl font-normal">
+          来思考些什么?
+        </h1>
       {:else}
         <MessageList
           {messages}
@@ -1054,7 +1129,7 @@ import {
       <button
         onclick={toggleSidebar}
         aria-label="菜单"
-        title={wide.on ? '收起 / 展开侧边栏' : '菜单'}
+        title={wide.on ? "收起 / 展开侧边栏" : "菜单"}
         class="pointer-events-auto p-1 text-fg"
       >
         <Icon name="menu" size={20} />
@@ -1075,7 +1150,12 @@ import {
             <Icon name="globe" size={20} />
           </button>
         {/if}
-        <button onclick={newSession} aria-label="新对话" title="新对话" class="p-1 text-fg">
+        <button
+          onclick={newSession}
+          aria-label="新对话"
+          title="新对话"
+          class="p-1 text-fg"
+        >
           <Icon name="newchat" size={20} />
         </button>
       </div>
@@ -1114,7 +1194,11 @@ import {
   {/if}
 </div>
 
-{#if sheet}<ModelSheet onclose={close} onconfig={() => (settings = true)} rev={settingsRev} />{/if}
+{#if sheet}<ModelSheet
+    onclose={close}
+    onconfig={() => (settings = true)}
+    rev={settingsRev}
+  />{/if}
 
 {#if machineSheet}<MachineSheet onclose={() => (machineSheet = false)} />{/if}
 

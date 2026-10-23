@@ -10,9 +10,9 @@
    * 目前只有相机 / 照片 / 文件。以后要加 Skills 之类，就往下面再放一行，
    * 不改这个三段式。
    */
-  import Icon from './Icon.svelte';
-  import Sheet from './Sheet.svelte';
-  import { store } from '../lib/store.svelte.ts';
+  import Icon from "./Icon.svelte";
+  import Sheet from "./Sheet.svelte";
+  import { store } from "../lib/store.svelte.ts";
 
   let {
     onclose,
@@ -20,14 +20,14 @@
   }: {
     onclose: () => void;
     /** 用户选了哪一个入口。选完的收尾（关面板 / 拉起选择器）交给 Composer */
-    onpick: (kind: 'camera' | 'photo' | 'file') => void;
+    onpick: (kind: "camera" | "photo" | "file") => void;
   } = $props();
 </script>
 
 <Sheet title="添加到会话" {onclose} hug>
   <div class="flex gap-3">
     <button
-      onclick={() => onpick('camera')}
+      onclick={() => onpick("camera")}
       class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
              text-sm text-fg"
     >
@@ -38,7 +38,7 @@
     </button>
 
     <button
-      onclick={() => onpick('photo')}
+      onclick={() => onpick("photo")}
       class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
              text-sm text-fg"
     >
@@ -51,7 +51,7 @@
     <!-- 只在模型吃 PDF 时出现：能力自动判定（models.dev），发了也必然 400 -->
     {#if store.capabilities.pdf}
       <button
-        onclick={() => onpick('file')}
+        onclick={() => onpick("file")}
         class="flex flex-1 flex-col items-center gap-2.5 rounded-2xl bg-surface py-5
                text-sm text-fg"
       >

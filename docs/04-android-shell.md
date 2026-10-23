@@ -6,20 +6,20 @@
 
 ## 1. 真机验证结果
 
-| 能力 | 结果 |
-|---|---|
-| Rust 交叉编译 arm64-v8a（模拟器另加 x86_64） | ✅ |
-| JNA 加载 `libagent_core.so`（D1） | ✅ |
-| UniFFI 正向调用（Kotlin → Rust） | ✅ |
-| UniFFI 反向 callback（Rust → Kotlin，D2） | ✅ |
+| 能力                                         | 结果                       |
+| -------------------------------------------- | -------------------------- |
+| Rust 交叉编译 arm64-v8a（模拟器另加 x86_64） | ✅                         |
+| JNA 加载 `libagent_core.so`（D1）            | ✅                         |
+| UniFFI 正向调用（Kotlin → Rust）             | ✅                         |
+| UniFFI 反向 callback（Rust → Kotlin，D2）    | ✅                         |
 | WebView 加载 `http://127.0.0.1:<port>`（D3） | ✅ 明文例外够用（R2 解决） |
-| 无障碍坐标点击 / 滑动 / 系统按键 / 启动应用 | ✅ |
-| **Alpine 沙箱跑起来**（proot + W^X 绕过） | ✅ 87ms 启动 |
-| `apk add` 联网装包（jq + python3） | ✅ 32s / 50 MiB |
-| `edit` 工具（unified diff） | ✅ |
-| 真实 LLM（TLS + 流式 + reasoning） | ✅ |
-| Prompt cache 命中率 | ✅ 73–87% |
-| 完整 agent 循环（读界面 → 跑命令 → 汇报） | ✅ |
+| 无障碍坐标点击 / 滑动 / 系统按键 / 启动应用  | ✅                         |
+| **Alpine 沙箱跑起来**（proot + W^X 绕过）    | ✅ 87ms 启动               |
+| `apk add` 联网装包（jq + python3）           | ✅ 32s / 50 MiB            |
+| `edit` 工具（unified diff）                  | ✅                         |
+| 真实 LLM（TLS + 流式 + reasoning）           | ✅                         |
+| Prompt cache 命中率                          | ✅ 73–87%                  |
+| 完整 agent 循环（读界面 → 跑命令 → 汇报）    | ✅                         |
 
 真机上 agent 自己汇报的输出：
 
@@ -73,6 +73,7 @@ Kotlin 总量 **~5600 行**（`android/app/src/main/java/dev/vihv/agent/*.kt`，
 ### 坑 1 — `PROOT_LOADER` 不设，proot 直接拒绝执行
 
 **症状**
+
 ```
 proot error: '/bin/sh' is not executable
 ```
@@ -96,6 +97,7 @@ env.insert("PROOT_LOADER_32".into(), "<nativeLibDir>/libproot-loader32.so");
 ### 坑 2 — proot 只认 `PROOT_TMP_DIR`，不认 `TMPDIR`
 
 **症状**
+
 ```
 proot warning: Unable to create temp directory for f2fs bug probe: Permission denied
 ```
@@ -165,6 +167,7 @@ Android 12+ 禁止从后台起前台服务。`Application.onCreate` 时 uid 状�
 `CEM`，所以被拒。而 `onCreate` 里抛异常是致命的。
 
 **解法**（两条都要）：
+
 1. `Application.onCreate` 里**每一步都包 `runCatching`** —— 任何一步失败只降级，不致命
 2. 前台服务改到 **`MainActivity.onResume`** 起（那时才真的进了前台）
 
@@ -240,6 +243,7 @@ Ok(Client::with_config(cfg).with_http_client(http))
 ### 坑 9 — `tls_backend_preconfigured` 自己会包一层 `Some`
 
 **症状**：
+
 ```
 builder error: Unknown TLS backend passed to `use_preconfigured_tls`
 ```
@@ -370,13 +374,13 @@ start / progress(0..1) / cancel / commit  →  window.__predictiveBack(...)
 用 `adb shell input swipe` 从屏幕左边缘往里划（系统把它当真手势），
 页面里装探针记录 `__predictiveBack` 的入参，壳里打了 logcat：
 
-| 场景 | 结果 |
-|---|---|
-| 开抽屉 | `setBackHandled(true)` → logcat「注册系统返回回调」 |
-| 抽屉上手势 | `start` + progress 0→0.71 共 60 帧 → `commit` → 抽屉关掉 |
-| 查看器上手势 | progress 0→0.78 共 180 帧，中途截图：查看器被推出 45% 露出后面的对话 |
-| 划出去再退回原处 | `cancel` → 查看器弹回原位，仍然开着 |
-| 没有覆盖层时按返回 | 回到桌面（回调已注销，整个手势交给系统） |
+| 场景               | 结果                                                                 |
+| ------------------ | -------------------------------------------------------------------- |
+| 开抽屉             | `setBackHandled(true)` → logcat「注册系统返回回调」                  |
+| 抽屉上手势         | `start` + progress 0→0.71 共 60 帧 → `commit` → 抽屉关掉             |
+| 查看器上手势       | progress 0→0.78 共 180 帧，中途截图：查看器被推出 45% 露出后面的对话 |
+| 划出去再退回原处   | `cancel` → 查看器弹回原位，仍然开着                                  |
+| 没有覆盖层时按返回 | 回到桌面（回调已注销，整个手势交给系统）                             |
 
 `input swipe` 无论多短都会 commit（合成手势没有真正的手势取消），所以
 cancel 那行是用 `input motionevent DOWN/MOVE…/UP` 划出去再退回原处验的。
@@ -388,13 +392,13 @@ cancel 那行是用 `input motionevent DOWN/MOVE…/UP` 划出去再退回原处
 
 ## 6. 设备操控的实现选择
 
-| 指令 | 做法 | 为什么 |
-|---|---|---|
-| `tap_node` | 先按 `viewId` 找节点 `performAction(CLICK)`，失败退回**坐标手势** | `performAction` 不受滚动位置/状态栏高度影响；但很多控件没有 viewId |
-| `tap_xy` / `swipe` | `dispatchGesture` | 需要 `canPerformGestures="true"` |
-| `set_text` | `ACTION_FOCUS` + `ACTION_SET_TEXT` | 有些输入法要焦点才认 |
-| `key` | `performGlobalAction` | back/home/recents |
-| `launch` | `getLaunchIntentForPackage` + `FLAG_ACTIVITY_NEW_TASK` | 从 Service 启动必须带这个 flag |
+| 指令               | 做法                                                              | 为什么                                                             |
+| ------------------ | ----------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `tap_node`         | 先按 `viewId` 找节点 `performAction(CLICK)`，失败退回**坐标手势** | `performAction` 不受滚动位置/状态栏高度影响；但很多控件没有 viewId |
+| `tap_xy` / `swipe` | `dispatchGesture`                                                 | 需要 `canPerformGestures="true"`                                   |
+| `set_text`         | `ACTION_FOCUS` + `ACTION_SET_TEXT`                                | 有些输入法要焦点才认                                               |
+| `key`              | `performGlobalAction`                                             | back/home/recents                                                  |
+| `launch`           | `getLaunchIntentForPackage` + `FLAG_ACTIVITY_NEW_TASK`            | 从 Service 启动必须带这个 flag                                     |
 
 ### 线程模型
 

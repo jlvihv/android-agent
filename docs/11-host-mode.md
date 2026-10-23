@@ -6,20 +6,20 @@
 `bash` / `read` / `edit` 三个工具作用在**这台 Linux / Mac 本身** —— 没有 proot、
 没有 Alpine rootfs、没有 `/workspace` 那层映射。
 
-| | `just dev`（沙箱） | `just dev-host`（宿主） |
-|---|---|---|
-| `bash` 跑在哪 | proot 里的 Alpine | 本机（`/bin/sh -c <runner>` → 宿主的 bash） |
-| cwd | rootfs 的 `/workspace` | 启动核心时的目录（`/workspace` 只是工具路径里的别名，shell 里没有） |
-| `read` / `edit` 的路径 | rootfs 里的路径 | 本机路径（rootfs＝`/`） |
-| 工具 | Alpine 那套（要 `apk add`） | 你的 PATH（node/cargo/python…都在） |
-| 装东西 | `apk add` / `agent-setup` | 系统包管理器 / venv |
-| 系统提示词 / 工具表 | `Platform::Android` 那份 | `Platform::Linux` / `Platform::Macos` 那份（见下面「按平台拼」） |
-| 进程模型 | runner + 状态文件 + `CommandGuard` | **同一套**（只是不套 proot） |
-| `agent ps` | 列常驻进程（靠 proot 的 `TracerPid` 归因） | 只回一句「用真的 `ps` / `pgrep`」 |
-| `agent kill <pid>` | ✅ | ✅ |
-| 设备（`agent open`） | mock | **这台电脑**（`desktop::HostDevice`）：`open` 用默认程序打开，macOS 上 `launch` = `open -a`；点 / 滑 / 按键明说没有 |
-| `agent browser` | ✅ 核心自己起的无头 Chrome + CDP（[docs/08](08-browser.md) 第 15 节） | ✅ 同一个后端 |
-| `agent search` | ✅ | ✅ |
+|                        | `just dev`（沙箱）                                                    | `just dev-host`（宿主）                                                                                             |
+| ---------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `bash` 跑在哪          | proot 里的 Alpine                                                     | 本机（`/bin/sh -c <runner>` → 宿主的 bash）                                                                         |
+| cwd                    | rootfs 的 `/workspace`                                                | 启动核心时的目录（`/workspace` 只是工具路径里的别名，shell 里没有）                                                 |
+| `read` / `edit` 的路径 | rootfs 里的路径                                                       | 本机路径（rootfs＝`/`）                                                                                             |
+| 工具                   | Alpine 那套（要 `apk add`）                                           | 你的 PATH（node/cargo/python…都在）                                                                                 |
+| 装东西                 | `apk add` / `agent-setup`                                             | 系统包管理器 / venv                                                                                                 |
+| 系统提示词 / 工具表    | `Platform::Android` 那份                                              | `Platform::Linux` / `Platform::Macos` 那份（见下面「按平台拼」）                                                    |
+| 进程模型               | runner + 状态文件 + `CommandGuard`                                    | **同一套**（只是不套 proot）                                                                                        |
+| `agent ps`             | 列常驻进程（靠 proot 的 `TracerPid` 归因）                            | 只回一句「用真的 `ps` / `pgrep`」                                                                                   |
+| `agent kill <pid>`     | ✅                                                                    | ✅                                                                                                                  |
+| 设备（`agent open`）   | mock                                                                  | **这台电脑**（`desktop::HostDevice`）：`open` 用默认程序打开，macOS 上 `launch` = `open -a`；点 / 滑 / 按键明说没有 |
+| `agent browser`        | ✅ 核心自己起的无头 Chrome + CDP（[docs/08](08-browser.md) 第 15 节） | ✅ 同一个后端                                                                                                       |
+| `agent search`         | ✅                                                                    | ✅                                                                                                                  |
 
 ## 怎么做到的：只加了「一种沙箱形态」，没加第二条路
 
@@ -84,15 +84,15 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 `just dev-host`，其它都一样。核心本来就只用 POSIX 那一套（进程组、`kill(-pgid)`、
 状态文件），能直接编过、测试全绿；真正要补的是「Linux 才成立」的几处假设：
 
-| 地方 | Linux 上的做法 | macOS 上不成立的原因 | 现在 |
-|---|---|---|---|
-| `setsid` | util-linux 自带 | macOS 没有 `setsid(1)`；退到 `nohup` 不换进程组，超时会被连组杀掉 | 宿主 bin 目录里垫一个（`SETSID_SHIM`：系统 perl 调 `POSIX::setsid()`，组长先 fork，跟 util-linux 一致）。PATH 里有真的就不垫 |
-| bash | `/bin/bash` | `/bin/bash` 是 3.2（没有关联数组 / `${x,,}` / `mapfile`） | 用 **PATH 里第一个** bash（装了 Homebrew bash 就是它），找不到才退回 `/bin/bash` |
-| 系统提示词 / 工具表 | `ss -ltnp` / `pgrep -af` / `xdg-open` | 这三样 macOS 上都不对 | `Platform::Macos`：`lsof -nP -iTCP -sTCP:LISTEN` / `pgrep -fl` / `agent open`（→ `open`），并点名 BSD 用户态（`sed -i ''` 等） |
-| Chrome 在哪 | PATH / `/opt/google/chrome` | `.app` 包从不在 PATH 里 | 查 `/Applications`（和 `~/Applications`）下的 Chrome / Chromium / Canary / Edge / Brave |
-| Chrome 钥匙串 | — | 新 profile 存 cookie 时会弹「Chrome Safe Storage」授权框，无头那边一直等 | 加 `--use-mock-keychain` |
-| 孤儿 Chrome 回收 | 扫 `/proc` | 没有 `/proc`（扫不了）；临时 profile 也不在 `/tmp` 而在 `/var/folders/…` | 问 `ps -axww -o pid=,ppid=,command=`；临时 profile 前缀跟着 `temp_dir()` 走 |
-| 找局域网里的核心 | `avahi-browse -rp _agent-core._tcp` | `dns-sd` 要两个进程才问得全（`-B` 只给名字，地址和 TXT 还得再 `-L`），没验过的代码不写 | 这一侧没有自动发现：面板里**手输地址**（`desktop::browse` 直接返回 `None`，日志里说一句为什么） |
+| 地方                | Linux 上的做法                        | macOS 上不成立的原因                                                                   | 现在                                                                                                                           |
+| ------------------- | ------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `setsid`            | util-linux 自带                       | macOS 没有 `setsid(1)`；退到 `nohup` 不换进程组，超时会被连组杀掉                      | 宿主 bin 目录里垫一个（`SETSID_SHIM`：系统 perl 调 `POSIX::setsid()`，组长先 fork，跟 util-linux 一致）。PATH 里有真的就不垫   |
+| bash                | `/bin/bash`                           | `/bin/bash` 是 3.2（没有关联数组 / `${x,,}` / `mapfile`）                              | 用 **PATH 里第一个** bash（装了 Homebrew bash 就是它），找不到才退回 `/bin/bash`                                               |
+| 系统提示词 / 工具表 | `ss -ltnp` / `pgrep -af` / `xdg-open` | 这三样 macOS 上都不对                                                                  | `Platform::Macos`：`lsof -nP -iTCP -sTCP:LISTEN` / `pgrep -fl` / `agent open`（→ `open`），并点名 BSD 用户态（`sed -i ''` 等） |
+| Chrome 在哪         | PATH / `/opt/google/chrome`           | `.app` 包从不在 PATH 里                                                                | 查 `/Applications`（和 `~/Applications`）下的 Chrome / Chromium / Canary / Edge / Brave                                        |
+| Chrome 钥匙串       | —                                     | 新 profile 存 cookie 时会弹「Chrome Safe Storage」授权框，无头那边一直等               | 加 `--use-mock-keychain`                                                                                                       |
+| 孤儿 Chrome 回收    | 扫 `/proc`                            | 没有 `/proc`（扫不了）；临时 profile 也不在 `/tmp` 而在 `/var/folders/…`               | 问 `ps -axww -o pid=,ppid=,command=`；临时 profile 前缀跟着 `temp_dir()` 走                                                    |
+| 找局域网里的核心    | `avahi-browse -rp _agent-core._tcp`   | `dns-sd` 要两个进程才问得全（`-B` 只给名字，地址和 TXT 还得再 `-L`），没验过的代码不写 | 这一侧没有自动发现：面板里**手输地址**（`desktop::browse` 直接返回 `None`，日志里说一句为什么）                                |
 
 数据目录仍是 `~/.local/share/android-agent`（`$XDG_DATA_HOME` 优先），**故意没用**
 `~/Library/Application Support`：截图路径会原样出现在 `read` / `![](preview:…)`
@@ -216,12 +216,12 @@ AGENT_BIND=127.0.0.1 just dev-host
 
 为了这条路改的四处（都是「只给本机用」的假设）：
 
-| | 只在手机核心上 | 电脑上的核心 |
-|---|---|---|
-| 听在哪 | 写死 `127.0.0.1` | `AGENT_BIND`（`Core::serve_on`）；手机上照旧只听 loopback |
-| 凭据 | 桌面上默认不设防 | **听在非 loopback 上就必须有**：`AGENT_TOKEN`，没给就用库里那把（宿主模式有库，重启不变，收藏的地址一直能用）；本机来的免（对端地址靠 `into_make_service_with_connect_info`） |
-| WebSocket 来源 | 只放本机来源 | 另外放**同源**（`Origin` 和 `Host` 对得上）—— 从手机开时来源是 `http://192.168.x.x:8787`；`sandbox.localhost`、`null` 照样挡 |
-| AI 写的网页 | 放到 `sandbox.localhost` 这个独立的源上开 | 不是从本机访问时 `sandbox.localhost` 解析到的是**手机自己**，所以回落到同源：服务端给同源的沙箱文件加 CSP sandbox，iframe 也不给 `allow-same-origin` —— 照样碰不到凭据，只是页面用不了 localStorage |
+|                | 只在手机核心上                            | 电脑上的核心                                                                                                                                                                                        |
+| -------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 听在哪         | 写死 `127.0.0.1`                          | `AGENT_BIND`（`Core::serve_on`）；手机上照旧只听 loopback                                                                                                                                           |
+| 凭据           | 桌面上默认不设防                          | **听在非 loopback 上就必须有**：`AGENT_TOKEN`，没给就用库里那把（宿主模式有库，重启不变，收藏的地址一直能用）；本机来的免（对端地址靠 `into_make_service_with_connect_info`）                       |
+| WebSocket 来源 | 只放本机来源                              | 另外放**同源**（`Origin` 和 `Host` 对得上）—— 从手机开时来源是 `http://192.168.x.x:8787`；`sandbox.localhost`、`null` 照样挡                                                                        |
+| AI 写的网页    | 放到 `sandbox.localhost` 这个独立的源上开 | 不是从本机访问时 `sandbox.localhost` 解析到的是**手机自己**，所以回落到同源：服务端给同源的沙箱文件加 CSP sandbox，iframe 也不给 `allow-same-origin` —— 照样碰不到凭据，只是页面用不了 localStorage |
 
 打印的地址是**各网卡上私有网段**（192.168/16、10/8、172.16/12）的 IPv4。不用「往外
 连时系统挑哪张网卡」那个办法：开着 Clash 之类 TUN 模式的机器上挑中的是虚拟网卡
@@ -314,6 +314,7 @@ AGENT_BIND=127.0.0.1 just dev-host
 
 代价：**用手机浏览器**开电脑上的核心时还是明文 HTTP，`t=` 就是钥匙，Wi-Fi 上能抓包的人能
 拿到它（等于拿到这台电脑的 shell）。只在自己信得过的网络里那样用；App 走的是 TLS（docs/12）。
+
 ## 该知道的代价（是真的）
 
 - **没有审批环节**（铁律 7）：模型的所有命令直接执行，等于把这台机器交出去。

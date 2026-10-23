@@ -22,7 +22,7 @@
   $effect(() => {
     void (async () => {
       try {
-        const r = await fetch('/api/usage');
+        const r = await fetch("/api/usage");
         if (!r.ok) return;
         const d = (await r.json()) as { byModel: Row[]; byDay: Row[] };
         byModel = d.byModel;
@@ -41,7 +41,8 @@
     if (n >= KILO) return `${(n / KILO).toFixed(n >= KILO * 10 ? 0 : 1)}k`;
     return String(n);
   }
-  const pct = (r: number | null) => (r == null ? '-' : `${Math.round(r * 100)}%`);
+  const pct = (r: number | null) =>
+    r == null ? "-" : `${Math.round(r * 100)}%`;
   /** 一行的第二行字：次数 · 输入 · 输出 · 命中 */
   const line = (r: Row) =>
     `${r.calls} 次 · 输入 ${fmt(r.input)} · 输出 ${fmt(r.output)} · 缓存命中 ${pct(r.hitRatio)}`;
@@ -58,8 +59,11 @@
     {/each}
   </div>
   {#if byDay.length}
-    <button onclick={() => (showDays = !showDays)} class="px-1 pt-2 text-meta text-accent">
-      {showDays ? '收起' : '最近 14 天每天'}
+    <button
+      onclick={() => (showDays = !showDays)}
+      class="px-1 pt-2 text-meta text-accent"
+    >
+      {showDays ? "收起" : "最近 14 天每天"}
     </button>
     {#if showDays}
       <div class="mt-2 overflow-hidden rounded-2xl bg-surface">

@@ -28,7 +28,17 @@ required-features = ["uniffi-bindgen"]
 uniffi-bindgen = ["uniffi/cli"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "process", "io-util", "fs"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "net",
+  "signal",
+  "process",
+  "io-util",
+  "fs",
+] }
 tokio-stream = "0.1"
 # 沙箱文件按块流式返回（音视频、大文件），不整个读进内存
 tokio-util = { version = "0.7", features = ["io"] }
@@ -53,9 +63,16 @@ http = "1"
 #
 # rustls-no-provider 而不是 rustls：后者硬编码 aws-lc-rs（AWS-LC 是个大 C 库）。
 # crypto provider 由我们自己的 rustls 依赖选（ring，更小）。
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls-no-provider",
+  "json",
+  "stream",
+] }
 # ring 而不是 aws-lc-rs：体积小不少（aws-lc 是个完整的 C 库）。
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+] }
 webpki-roots = "1"
 
 # `read` 工具读图片：解码 → 按 EXIF 转正 → 缩到 2000×2000 → 重编码。
@@ -67,7 +84,11 @@ webpki-roots = "1"
 #   - gif / bmp 两个解码器在 .text 里占 ~90KB（cargo bloat）
 #   - 收到这两种格式不是“静默不支持”：`imaging` 会带着一句人话 400（见
 #     `upload_attachment` 的 Err 分支），界面把原因原样显示出来
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+  "webp",
+] }
 # 图片以 data URL 发出，直接 base64
 base64 = "0.22"
 
@@ -96,14 +117,22 @@ log = "0.4"
 agent-relay = { path = "../relay" }
 # 手机 ↔ 家里电脑之间的端到端 TLS（中继只搬加密后的字节）。ring 而不是 aws-lc，
 # 和上面的 rustls 同一个 provider。
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "ring",
+  "tls12",
+] }
 sha2 = "0.10"
 # 每条连接自己服务（`http::serve_conn`）：明文 / 局域网 TLS / 中继三种连接走同一个
 # 函数。这几个本来就经 axum 编进来了（axum::serve 底下就是它们），这里只是变成直接依赖。
 # 隧道（`tunnel.rs`）也用它们：按请求选路的 HTTP/1 代理，上游连接进池复用（`client`、
 # `client-legacy`）。reqwest 底下就是这套 client，不多编新东西。
 hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service", "client-legacy", "http1"] }
+hyper-util = { version = "0.1", features = [
+  "tokio",
+  "service",
+  "client-legacy",
+  "http1",
+] }
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
@@ -112,9 +141,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 用**同步**那个（tokio-tungstenite 依赖的），因为 `BrowserApi::execute` 本来就
 # 是阻塞接口、跑在 spawn_blocking 上。**不引新代码** —— 同一个版本早就在依赖树里
 # 了（axum 带进来的），这里只是把它变成直接依赖。
-tungstenite = { version = "0.29", default-features = false, features = ["handshake", "url"] }
+tungstenite = { version = "0.29", default-features = false, features = [
+  "handshake",
+  "url",
+] }
 # 「家里那台」的自签证书（`remote.rs`）。只有电脑会当家里那台，手机不需要。
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = [
+  "crypto",
+  "ring",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # default-features = false：它的默认 feature 是 "regex"（env_filter，给

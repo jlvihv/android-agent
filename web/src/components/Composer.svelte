@@ -1,14 +1,14 @@
 <script lang="ts">
-  import Icon from './Icon.svelte';
-  import Img from './Img.svelte';
-  import AttachSheet from './AttachSheet.svelte';
-  import ContextMeter from './ContextMeter.svelte';
-  import { store } from '../lib/store.svelte.ts';
-  import { effortLabel } from '../lib/effort';
-  import type { Upload, SessionUsage } from '../lib/sse';
+  import Icon from "./Icon.svelte";
+  import Img from "./Img.svelte";
+  import AttachSheet from "./AttachSheet.svelte";
+  import ContextMeter from "./ContextMeter.svelte";
+  import { store } from "../lib/store.svelte.ts";
+  import { effortLabel } from "../lib/effort";
+  import type { Upload, SessionUsage } from "../lib/sse";
 
   let {
-    value = $bindable(''),
+    value = $bindable(""),
     busy = false,
     usage = null,
     ctxWindow = null,
@@ -33,9 +33,9 @@
    * 上传中给转圈，失败给红条 + 原因，成功才显示缩略图/文件名。
    */
   type Chip =
-    | { key: string; state: 'uploading'; name: string }
-    | { key: string; state: 'error'; name: string; error: string }
-    | ({ key: string; state: 'ready' } & Upload);
+    | { key: string; state: "uploading"; name: string }
+    | { key: string; state: "error"; name: string; error: string }
+    | ({ key: string; state: "ready" } & Upload);
 
   let ta: HTMLTextAreaElement | null = $state(null);
   let attach = $state(false);
@@ -43,10 +43,13 @@
 
   /** 已上传成功、等着随这条消息发出去的附件 */
   const ready = $derived(
-    chips.filter((c) => c.state === 'ready') as Extract<Chip, { state: 'ready' }>[],
+    chips.filter((c) => c.state === "ready") as Extract<
+      Chip,
+      { state: "ready" }
+    >[],
   );
-  const uploading = $derived(chips.some((c) => c.state === 'uploading'));
-  const failed = $derived(chips.filter((c) => c.state === 'error'));
+  const uploading = $derived(chips.some((c) => c.state === "uploading"));
+  const failed = $derived(chips.filter((c) => c.state === "error"));
 
   // 三个隐藏的文件输入。相机的 `capture="environment"` 让 WebView 直接
   // 拉起后置摄像头；照片和文件都交给系统选择器（壳里的 onShowFileChooser）。
@@ -67,14 +70,14 @@
   $effect(() => {
     void value;
     if (!ta) return;
-    ta.style.height = 'auto';
+    ta.style.height = "auto";
     ta.style.height = `${ta.scrollHeight}px`;
   });
 
   export const focus = () => ta?.focus();
 
   function onkeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey) {
       // 中文 / 日文输入法：拼音打完按回车是**选词**，不是「发送」。
       // 那一下浏览器照样发 keydown（合成期间 isComposing=true，
       // 部分输入法走 keyCode 229）—— 不拦的话半截话就被发出去了。
@@ -94,9 +97,14 @@
   }
 
   /** 在底部面板里选了入口：先收起面板，再拉起对应的文件选择器 */
-  function onAttachPick(kind: 'camera' | 'photo' | 'file') {
+  function onAttachPick(kind: "camera" | "photo" | "file") {
     attach = false;
-    const input = kind === 'camera' ? cameraInput : kind === 'photo' ? photoInput : fileInput;
+    const input =
+      kind === "camera"
+        ? cameraInput
+        : kind === "photo"
+          ? photoInput
+          : fileInput;
     input?.click();
   }
 
@@ -108,30 +116,34 @@
   async function onPick(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
     const files = Array.from(input.files ?? []);
-    input.value = '';
+    input.value = "";
     if (files.length === 0) return;
 
     for (const f of files) {
       const key = `${f.name}-${f.size}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      chips = [...chips, { key, state: 'uploading', name: f.name }];
+      chips = [...chips, { key, state: "uploading", name: f.name }];
       try {
         const up = await upload(f);
-        chips = chips.map((c) => (c.key === key ? { key, state: 'ready', ...up } : c));
+        chips = chips.map((c) =>
+          c.key === key ? { key, state: "ready", ...up } : c,
+        );
       } catch (err) {
         chips = chips.map((c) =>
-          c.key === key ? { key, state: 'error', name: f.name, error: String(err) } : c,
+          c.key === key
+            ? { key, state: "error", name: f.name, error: String(err) }
+            : c,
         );
       }
     }
   }
 
   async function upload(f: File): Promise<Upload> {
-    const r = await fetch('/api/attachment', {
-      method: 'POST',
+    const r = await fetch("/api/attachment", {
+      method: "POST",
       headers: {
-        'content-type': f.type || 'application/octet-stream',
+        "content-type": f.type || "application/octet-stream",
         // 文件名可能带中文：HTTP 头只能是 ISO-8859-1，先编码
-        'x-filename': encodeURIComponent(f.name),
+        "x-filename": encodeURIComponent(f.name),
       },
       body: f,
     });
@@ -159,8 +171,8 @@
     <div class="flex flex-wrap gap-2 px-1">
       {#each chips as c (c.key)}
         <div class="relative">
-          {#if c.state === 'ready'}
-            {#if c.kind === 'image'}
+          {#if c.state === "ready"}
+            {#if c.kind === "image"}
               <Img
                 src={c.url}
                 alt={c.name}
@@ -183,7 +195,7 @@
                 ? 'border-bad/50 bg-hairline-soft text-bad'
                 : 'border-hairline bg-hairline-soft text-muted'}"
             >
-              {#if c.state === 'uploading'}
+              {#if c.state === "uploading"}
                 <span
                   class="size-4 shrink-0 animate-spin rounded-full border-2 border-control
                          border-t-fg"
@@ -213,16 +225,15 @@
     bind:value
     rows="1"
     placeholder="与 agent 对话…"
-    onkeydown={onkeydown}
+    {onkeydown}
     spellcheck="false"
     class="max-h-[8rem] resize-none overflow-y-auto bg-transparent px-1 py-1 text-base leading-6
-           text-fg placeholder:text-muted outline-none"
-  ></textarea>
+           text-fg placeholder:text-muted outline-none"></textarea>
 
   {#if failed.length > 0}
     <!-- 失败原因放一行完整显示：缩略胶囊里塞不下，而「为什么没加进去」正是此刻最该看到的 -->
     <p class="px-1 text-xs text-bad">
-      {failed.map((f) => `${f.name}：${f.error}`).join('；')}
+      {failed.map((f) => `${f.name}：${f.error}`).join("；")}
     </p>
   {/if}
 
@@ -247,9 +258,11 @@
       class="flex h-9 max-w-[52%] shrink-0 items-center rounded-full bg-control px-4 text-sm
              text-fg"
     >
-      <span class="min-w-0 truncate">{store.llm?.model ?? '未配置模型'}</span>
+      <span class="min-w-0 truncate">{store.llm?.model ?? "未配置模型"}</span>
       {#if store.llm}
-        <span class="ml-1.5 shrink-0 text-muted">· {effortLabel(store.llm.reasoningEffort)}</span>
+        <span class="ml-1.5 shrink-0 text-muted"
+          >· {effortLabel(store.llm.reasoningEffort)}</span
+        >
       {/if}
     </button>
 
@@ -275,8 +288,8 @@
         <button
           onclick={send}
           disabled={!canSend}
-          aria-label={busy ? '排队发送（模型一空下来就交给它）' : '发送'}
-          title={busy ? '排队发送：模型一空下来就把这条交给它' : '发送'}
+          aria-label={busy ? "排队发送（模型一空下来就交给它）" : "发送"}
+          title={busy ? "排队发送：模型一空下来就把这条交给它" : "发送"}
           class="grid size-9 shrink-0 place-items-center rounded-full transition-colors
                  {canSend ? 'bg-fg text-ink' : 'bg-control text-faint'}"
         >
@@ -294,7 +307,14 @@
     onchange={onPick}
     class="hidden"
   />
-  <input bind:this={photoInput} type="file" accept="image/*" multiple onchange={onPick} class="hidden" />
+  <input
+    bind:this={photoInput}
+    type="file"
+    accept="image/*"
+    multiple
+    onchange={onPick}
+    class="hidden"
+  />
   <input
     bind:this={fileInput}
     type="file"

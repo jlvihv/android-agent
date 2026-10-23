@@ -10,14 +10,14 @@
  * 端点不认识就忽略 —— 我们只负责把用户选的递过去。
  */
 export const EFFORTS = [
-  { value: null, label: '默认' },
-  { value: 'minimal', label: '极低' },
-  { value: 'low', label: '低' },
-  { value: 'medium', label: '中等' },
-  { value: 'high', label: '高' },
+  { value: null, label: "默认" },
+  { value: "minimal", label: "极低" },
+  { value: "low", label: "低" },
+  { value: "medium", label: "中等" },
+  { value: "high", label: "高" },
 ] as const;
 
-export type EffortValue = (typeof EFFORTS)[number]['value'];
+export type EffortValue = (typeof EFFORTS)[number]["value"];
 
 /** 值 → 显示名。认不出来的（比如 CLI 手填的）原样显示，别显示成「默认」骗人。 */
 export function effortLabel(v: string | null | undefined): string {

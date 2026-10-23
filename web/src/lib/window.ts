@@ -9,13 +9,19 @@
 /** 「还有没有更早的」的一半事实：`start` 是手上没挂出来的，`hasOlder` 是服务端的 */
 export type OlderFacts = Pick<
   WindowFacts,
-  'measured' | 'hasOlder' | 'start' | 'pinned' | 'scrollTop' | 'contentH' | 'viewH'
+  | "measured"
+  | "hasOlder"
+  | "start"
+  | "pinned"
+  | "scrollTop"
+  | "contentH"
+  | "viewH"
 >;
 
 /** 收窗口要的那几个数 */
 export type CollapseFacts = Pick<
   WindowFacts,
-  'pinned' | 'extra' | 'loadingEarlier' | 'tailH' | 'viewH'
+  "pinned" | "extra" | "loadingEarlier" | "tailH" | "viewH"
 >;
 
 /** 观察层交给策略的那些数（`MessageList` 里的同名 `$state`） */
