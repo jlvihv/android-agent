@@ -187,6 +187,8 @@ async fn run() -> anyhow::Result<()> {
     // 必须**在 serve 之后**：隧道要把 `/api/machines*` 转回本机核心，那时端口才定下来。
     if let Some(m) = core.state.machines() {
         let m = m.clone();
+        // 本机自己跑完的回合也要提醒（连着别的机器时它自己不发，见 `watch_own_turns`）
+        m.watch_own_turns();
         tokio::spawn(async move {
             if let Some(c) = m.resume().await {
                 println!("  → 接着连「{}」：http://localhost:{}", c.name, c.port);

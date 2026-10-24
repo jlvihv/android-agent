@@ -44,6 +44,7 @@
   import Icon from "./Icon.svelte";
   import Page from "./Page.svelte";
   import McpSection from "./McpSection.svelte";
+  import NotifySection from "./NotifySection.svelte";
   import PairingSection from "./PairingSection.svelte";
   import PermissionsSection from "./PermissionsSection.svelte";
   import ProviderPage from "./ProviderPage.svelte";
@@ -117,6 +118,7 @@
   <McpSection />
   <SkillsSection />
   <SearchSection />
+  <NotifySection />
   <UsageSection />
   <PairingSection />
   <SandboxSection />

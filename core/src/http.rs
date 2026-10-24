@@ -63,6 +63,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/websearch/config",
             get(search_config).post(set_search_config),
         )
+        // 回合跑完弹不弹系统通知（桌面宿主模式）。手机上这个开关没有意义
+        // （壳自己会发），`available()` 为假时 POST 会明确拒绝
+        .route("/api/notify", get(notify_config).post(set_notify_config))
         .route("/api/edit", post(edit_file))
         .route("/api/llm", post(set_llm))
         .route("/api/models", get(get_models))
@@ -372,6 +375,9 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         // 沙箱文件的 URL 前缀要它（`/sandbox/<key>/…`）。这个接口本身要凭据，
         // 所以只有 App 自己的页面拿得到。
         "sandboxKey": st.auth().sandbox_key,
+        // 回合跑完时弹不弹系统通知（设置页那个开关）。手机上**永远 false**：
+        // 那边是壳的前台服务在发，核心再发一次就是同一个任务响两下
+        "notifyDone": crate::notify::available() && crate::notify::enabled(st.db().as_deref()),
     }))
 }
 
@@ -1526,6 +1532,41 @@ async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) ->
 struct SearchConfigBody {
     #[serde(default)]
     exa_api_key: String,
+}
+
+/// `GET /api/notify` → 这台机器会不会在回合跑完时弹系统通知。
+///
+/// `available: false` = 这个平台根本不发（手机：壳在发；沙箱模式：调试用的）。
+/// `reason` 是给人看的一句，设置页直接显示它。
+async fn notify_config(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let available = crate::notify::available();
+    Json(json!({
+        "available": available,
+        "enabled": available && crate::notify::enabled(st.db().as_deref()),
+        "reason": if available {
+            Value::Null
+        } else {
+            json!("手机上完成通知由 App 自己发；这里只在电脑上有")
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+struct NotifyBody {
+    #[serde(default)]
+    enabled: bool,
+}
+
+/// `POST /api/notify {enabled}` → 开 / 关。关掉是给「跑批量脚本」那种场景的
+/// （见 `notify::enabled` 的说明）。
+async fn set_notify_config(State(st): State<Arc<AppState>>, Json(b): Json<NotifyBody>) -> Response {
+    if !crate::notify::available() {
+        return (StatusCode::BAD_REQUEST, "这台机器不发系统通知").into_response();
+    }
+    match crate::notify::set_enabled(st.db().as_deref(), b.enabled) {
+        Ok(()) => Json(json!({ "enabled": b.enabled })).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
+    }
 }
 
 /// `GET /api/websearch/config` → 配没配 Exa key（设置页用）。key 本身不回，只回末尾几位；

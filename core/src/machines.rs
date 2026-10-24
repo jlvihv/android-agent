@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
+use tokio_stream::StreamExt;
 
 use crate::db::Db;
 use crate::state::{AppState, RelayAddr};
@@ -128,6 +129,10 @@ pub struct Machines {
     presence_at: Mutex<Option<Instant>>,
     /// 同一时刻只有一个在问：面板 1.5 秒轮询一次，别同时打出好几个
     presence_asking: tokio::sync::Mutex<()>,
+    /// 正在订阅「那台机器」回合状态的那个后台任务（`watch_turns`）。
+    ///
+    /// 换机器 / 断开时要先 abort 它，不然会留着一个往旧机器要事件的循环。
+    watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// 「谁在线」问一次管多久。面板开着时 1.5 秒轮询一次，不能每次都去连中继。
@@ -150,6 +155,7 @@ impl Machines {
             presence: Mutex::new(HashMap::new()),
             presence_at: Mutex::new(None),
             presence_asking: tokio::sync::Mutex::new(()),
+            watcher: Mutex::new(None),
         })
     }
 
@@ -523,8 +529,106 @@ impl Machines {
             });
         }
         self.remember(&conn);
+        // 订阅那台机器的「回合完事」，收到就在**本机**发一条系统通知。
+        //
+        // 这一点是这套东西的关键：发通知的那台核心，不一定就是跑任务的那台。
+        // 你在 Mac 的浏览器里（经隧道）操作这台 Linux 上的 agent，人却坐在 Mac 前 ——
+        // 该弹通知的是 Mac，而 Mac 的核心只是「页面宿主」，它自己不知道 Linux 上
+        // 的回合什么时候完。所以由**页面连的那台核心**去订阅对端的回合流（凭据由
+        // 隧道带上，见 `tunnel.rs`），收到就发本机通知。
+        self.start_watcher(conn.port, conn.token.clone());
         tokio::spawn(self.clone().sync(m.id.clone(), conn.port, m.token.clone()));
         Ok(conn)
+    }
+
+    /// 停了那个订阅循环（换机器、断开、退出）。
+    fn stop_watcher(&self) {
+        if let Ok(mut g) = self.watcher.lock() {
+            if let Some(h) = g.take() {
+                h.abort();
+            }
+        }
+    }
+
+    /// 在后台订阅「正连着的那台」的回合状态（`/api/turns/stream`），收到「完事」
+    /// 就在本机发一条系统通知。
+    ///
+    /// 为什么不直接听本机总线：这条隧道那头的回合发生在**另一台机器**上，它的事件
+    /// 不会到本机的 `st.tx`（那是本进程内的事）。而这条 SSE 就是手机壳订阅通知栏
+    /// 用的同一个接口（见 `http::turns_stream`），形状一模一样。
+    ///
+    /// 断了自己重连：电脑重启、网络换、笔记本合盖 —— 都断，但都不该永久失效。
+    /// 连接走的是我们自己的隧道端口，凭据是那台机器的 token（不经页面）。
+    fn start_watcher(self: &Arc<Self>, port: u16, token: String) {
+        self.stop_watcher();
+        // 手机上不发通知：那边是**壳**订阅对端的回合流并发的（`TurnStream.kt`），
+        // 核心再订一遍就是同一个任务响两下、还白占一条连接
+        if !crate::notify::available() {
+            return;
+        }
+        let me = self.clone();
+        let h = tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                match watch_turns(port, &token).await {
+                    Ok(()) => {
+                        // 对端把流关了（重启 / 掉线）：隔一会儿再连
+                        backoff = Duration::from_secs(1);
+                    }
+                    Err(e) => {
+                        tracing::debug!("订阅那台机器的回合状态失败：{e}");
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                // 连着的那台换了：这个循环该退了
+                let still = me.current_id();
+                if still.is_none() {
+                    return;
+                }
+            }
+        });
+        if let Ok(mut g) = self.watcher.lock() {
+            *g = Some(h);
+        }
+    }
+
+    /// 本机自己跑完一个回合时发一条通知（**没连着别的机器**的那一半）。
+    ///
+    /// 连着别人的时候这里不该说话：那时本机是「页面宿主」，该发通知的是页面连的
+    /// 那台；本机自己的回合（比如脚本 `agentctl.py` 直接打本机 `/api/chat`）也不该
+    /// 弹在别人的屏幕上。所以两种情况都由 `watch_own_turns` 自己判。
+    ///
+    /// 只在宿主模式（桌面上）有用：手机上是壳的前台服务在发（见 docs/06）。
+    pub fn watch_own_turns(self: &Arc<Self>) {
+        // 手机上什么都不做：那是壳的活儿（见 `notify::available`）
+        if !crate::notify::available() {
+            return;
+        }
+        let Some(st) = self.state.upgrade() else {
+            return; // 没有核心上下文（测试）
+        };
+        // 沙箱形态（`just dev`，在电脑上复现手机）也不发：那是调试用的
+        if st.linux().is_none_or(|s| !s.is_host()) {
+            return;
+        }
+        let me = self.clone();
+        let mut rx = st.tx.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                let crate::state::Event::Turn { status } = ev else {
+                    continue;
+                };
+                // 连着别的机器：不归本机发（见函数注释）
+                if me.current_id().is_some() {
+                    continue;
+                }
+                let Some(n) = crate::notify::compose(&status) else {
+                    continue;
+                };
+                notify_in_background(n);
+            }
+        });
     }
 
     /// 上一次连的那台，接着连（隧道端口每次不一样，地址得重新算）。
@@ -581,6 +685,8 @@ impl Machines {
 
     /// 断开（回到本机自己的核心）。下次启动不再自动连它。
     pub fn disconnect(&self) {
+        // 订阅着那台的回合状态的循环要停：不然它会一直接着往旧机器要事件
+        self.stop_watcher();
         if let Ok(mut g) = self.current.lock() {
             *g = None;
         }
@@ -648,6 +754,99 @@ impl Machines {
             self.save(&m);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 订阅对端的回合状态（为了发通知）
+// ---------------------------------------------------------------------------
+
+/// 订阅「经隧道连着的那台」的 `/api/turns/stream`，每收到一条「完事」就在本机发通知。
+///
+/// `port` 是本机那条隧道的端口（`127.0.0.1:<port>`），`token` 是那台机器的凭据
+/// （隧道直接收它，见 `tunnel::credential_ok`）—— 两者都不经过页面。
+///
+/// 返回 `Ok(())` = 对端把流关了（该重连）；`Err` = 连不上（同样该重连，只是记个日志）。
+async fn watch_turns(port: u16, token: &str) -> Result<(), String> {
+    // reqwest 已经在依赖里（llm 用它），流式响应也开着 —— 不必自己拼一回 hyper。
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60 * 60)) // 长连接：一小时没动静就算死了
+        .build()
+        .map_err(|e| format!("建不了客户端：{e}"))?;
+    let res = client
+        .get(format!("http://127.0.0.1:{port}/api/turns/stream"))
+        .header("x-agent-token", token)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .map_err(|e| format!("连不上隧道端口 {port}：{e}"))?;
+    if !res.status().is_success() {
+        return Err(format!("对端回了 {}", res.status()));
+    }
+
+    // SSE 一行一行地读：`data: {...}` 里是一个 `Event`，空行结束一帧
+    // （形状和手机壳读的一模一样，见 `http::turns_stream`）。
+    let mut stream = res.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读流失败：{e}"))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(idx) = buf.find("\n\n") {
+            let frame = buf[..idx].to_string();
+            buf.drain(..idx + 2);
+            handle_sse_frame(&frame);
+        }
+        // 一条状态最多几 KB：一直攒着说明对面没在发空行，丢了重来
+        if buf.len() > 1 << 20 {
+            buf.clear();
+        }
+    }
+    Ok(())
+}
+
+/// 一帧 SSE（`data: {...}`）里如果是一条「回合完事」，返回该发的那条通知。
+///
+/// **解析不了就丢**：这条流是附带的（拿不到通知不影响 agent 干活），不该因为一个
+/// 不认识的帧就把订阅循环弄死。
+fn notice_of_frame(raw: &str) -> Option<crate::notify::Notice> {
+    for line in raw.lines() {
+        let Some(json) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(ev) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
+            continue;
+        };
+        // `turn_active` / `hello` 这些都不是我们要的：只有逐条的 `turn` 带结束状态
+        if ev["type"] != "turn" {
+            continue;
+        }
+        let Ok(status) = serde_json::from_value::<crate::status::Snapshot>(ev["status"].clone())
+        else {
+            continue;
+        };
+        if let Some(n) = crate::notify::compose(&status) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// 收到一帧就发（真发的那一步；解析在 `notice_of_frame` 里）。
+fn handle_sse_frame(raw: &str) {
+    let Some(n) = notice_of_frame(raw) else {
+        return;
+    };
+    notify_in_background(n);
+}
+
+/// 真发一条，**不等它**：这条路径都在收尾/读流的循环里，`osascript` 要几十毫秒、
+/// `notify-send` 遇上卡住的桌面环境可能更久 —— 一条通知不该拖住别的。
+fn notify_in_background(n: crate::notify::Notice) {
+    tokio::spawn(async move {
+        let r = tokio::task::spawn_blocking(move || crate::notify::send(&n)).await;
+        if let Err(e) = r.map_err(|e| e.to_string()).and_then(|r| r) {
+            tracing::debug!("本机通知没发出去：{e}");
+        }
+    });
 }
 
 /// `IP:端口`，IPv6 加方括号。
@@ -733,6 +932,65 @@ mod tests {
         // 配对过、但现在不在局域网里、也没配中继：列出来点了也连不上
         m.upsert(machine("gone", "出门的", false));
         assert!(m.panel().is_empty());
+    }
+
+    /// 那台机器发过来的 SSE（形状照 `http::turns_stream`：`data: {...}\n\n`）
+    fn sse(ev: &serde_json::Value) -> String {
+        format!("data: {ev}")
+    }
+
+    #[test]
+    fn a_finished_turn_on_the_other_machine_becomes_a_local_notice() {
+        let ev = json!({
+            "type": "turn",
+            "status": {
+                "sid": "s1", "title": "FizzBuzz", "phase": "done",
+                "detail": "跑完了", "started_at_ms": 1, "active": false,
+                "finished_at_ms": 2, "ok": true, "stopped": false
+            }
+        });
+        let n = notice_of_frame(&sse(&ev)).expect("该发一条通知");
+        assert_eq!(n.title, "完成 · FizzBuzz");
+        assert_eq!(n.body, "跑完了");
+    }
+
+    #[test]
+    fn only_finished_turns_notify() {
+        // 还在跑：不发（不然每步都弹一条）
+        let running = json!({
+            "type": "turn",
+            "status": {
+                "sid": "s1", "title": "T", "phase": "tool", "tool": "bash",
+                "started_at_ms": 1, "active": true, "ok": true, "stopped": false
+            }
+        });
+        assert!(notice_of_frame(&sse(&running)).is_none());
+        // 有回合在跑的那个「有没有」信号：不是逐条状态，发不出通知
+        assert!(notice_of_frame(&sse(&json!({"type": "turn_active", "active": false}))).is_none());
+        // 用户自己停的：他就在那儿看着
+        let stopped = json!({
+            "type": "turn",
+            "status": {
+                "sid": "s1", "title": "T", "phase": "done", "started_at_ms": 1,
+                "active": false, "finished_at_ms": 2, "ok": false, "stopped": true
+            }
+        });
+        assert!(notice_of_frame(&sse(&stopped)).is_none());
+    }
+
+    #[test]
+    fn junk_frames_are_ignored_not_fatal() {
+        // 心跳注释、坏 JSON、不认识的类型、缺 status —— 都不该让订阅循环炸掉
+        for raw in [
+            "",
+            ": keep-alive",
+            "data: {不是 JSON",
+            "data: {\"type\":\"hello\"}",
+            "data: {\"type\":\"turn\"}",
+            "data: {\"type\":\"turn\",\"status\":{}}",
+        ] {
+            assert!(notice_of_frame(raw).is_none(), "不该发：{raw}");
+        }
     }
 
     #[test]

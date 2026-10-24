@@ -49,7 +49,7 @@ const ARGS_SCAN: usize = 2048;
 /// 和 OpenMinis 的 `AgentPhase` 一一对应（COMPLETED/TOOL/THINKING/GENERATING/IDLE）——
 /// 少一个 IDLE：我们这边没有「服务活着但什么都没跑」的状态（回合结束就停服务，
 /// 见 `AgentForegroundService`）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
     /// 模型在输出思考，还没有可见正文
@@ -64,7 +64,7 @@ pub enum Phase {
 
 /// 推给壳的一份快照。字段刻意全是「原样的事实」，文案在壳那边（`strings.xml`）——
 /// 通知栏的话术是界面的事，而这里的字段是 agent loop 的事实。
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     /// 哪个会话（多会话同时跑时，壳要能分清谁是谁）
     pub sid: String,

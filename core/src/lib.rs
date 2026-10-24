@@ -39,6 +39,7 @@ pub mod machines;
 pub mod mcp;
 pub mod mock;
 pub mod models;
+pub mod notify;
 pub mod openai;
 pub mod phone;
 pub mod plain;
