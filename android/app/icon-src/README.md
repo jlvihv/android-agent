@@ -8,6 +8,10 @@
 | `ic_launcher.svg`            | 传统方形图标（PNG 兜底 + 商店截图用）                                                                              |
 | `ic_launcher_round.svg`      | 传统圆形图标                                                                                                       |
 
+同一份图形在 web 侧也有一份：`web/public/favicon.svg` + 两张 PNG（`favicon-32.png`、
+`apple-touch-icon.png`）—— 那是桌面浏览器标签页上的站点图标。**改机器人要三处一起改**：
+这里的两个 SVG、`res/` 里的矢量、还有 `web/public/`。
+
 重新渲染 PNG（`rsvg-convert` 来自 librsvg）：
 
 ```sh
@@ -33,3 +37,10 @@ done
   点和眼睛的间距都是照这个尺寸留的。
 - 系统开了「主题图标」（壁纸取色）时，桌面上的图标会被染成单色 —— 用的是上面那个
   `monochrome` 层。应用信息页里看到的才是本色（深底 + 暖白脑袋 + **蓝点天线**）。
+
+渲染 favicon（在仓库根）：
+
+```sh
+rsvg-convert -w 32  -h 32  web/public/favicon.svg -o web/public/favicon-32.png
+rsvg-convert -w 180 -h 180 web/public/favicon.svg -o web/public/apple-touch-icon.png
+```

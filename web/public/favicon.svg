@@ -1,0 +1,16 @@
+<!-- 站点图标（favicon）：**就是 App 图标那个机器人**，图形一个字节都不改 —— 桌面浏览器
+     的标签页 / 书签上认得出这是哪个 App（电脑上连核心时看到的就是这张脸）。
+
+     **别在这里改图形**：源是 `android/app/icon-src/ic_launcher.svg`，改完照抄过来，
+     PNG 也重出一遍（`rsvg-convert`，见 android/app/icon-src/README.md）。
+     两份画得不一样时，App 和标签页会长成两个东西。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+  <rect width="108" height="108" rx="22" fill="#151515"/>
+  <g transform="translate(54,54) scale(1.15) translate(-54,-54)">
+    <path d="M54 41 V33" stroke="#f9f9f7" stroke-width="4.5" stroke-linecap="round"/>
+    <circle cx="54" cy="29" r="4" fill="#6da7ec"/>
+    <rect x="27" y="41" width="54" height="45" rx="16" fill="#f9f9f7"/>
+    <circle cx="44" cy="62" r="6" fill="#151515"/>
+    <circle cx="64" cy="62" r="6" fill="#151515"/>
+  </g>
+</svg>
