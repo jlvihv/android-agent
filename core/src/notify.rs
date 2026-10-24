@@ -116,6 +116,10 @@ const PREF_KEY: &str = "notify_done";
 /// **默认开**：手机上的完成通知也是总发（见 `AgentNotifications.showDone`），
 /// 人放下电脑去干别的时那就该响。关掉它是给「跑批量脚本」这种场景的 —— 一晚上
 /// 几十个回合，屏幕上会一直跳。
+///
+/// 读一次就是一次 SQLite 查询，而这条判断在**每个回合结束**时都要问一遍 ——
+/// 一次几微秒，相对于一个回合（几十秒到几分钟）不重要。不做内存缓存：缓存要
+/// 跟着 `set_enabled` 失效，多一处可能忘的地方，换回来的那点时间不值。
 pub fn enabled(db: Option<&crate::db::Db>) -> bool {
     !matches!(
         db.and_then(|d| d.get_meta(PREF_KEY).ok().flatten())

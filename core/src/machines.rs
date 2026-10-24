@@ -159,6 +159,11 @@ impl Machines {
         })
     }
 
+    /// 这台机器的库（开关之类「跟着机器走」的偏好存在里面）。
+    pub fn db(&self) -> Option<&Db> {
+        Some(&self.db)
+    }
+
     /// 测试用：没有本机核心上下文（连不了机器，记账和配对照旧）。
     #[cfg(test)]
     pub fn with_db(db: Arc<Db>) -> Arc<Self> {
@@ -570,7 +575,7 @@ impl Machines {
         let h = tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match watch_turns(port, &token).await {
+                match watch_turns(port, &token, me.db()).await {
                     Ok(()) => {
                         // 对端把流关了（重启 / 掉线）：隔一会儿再连
                         backoff = Duration::from_secs(1);
@@ -615,7 +620,15 @@ impl Machines {
         let me = self.clone();
         let mut rx = st.tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(ev) = rx.recv().await {
+            loop {
+                let ev = match rx.recv().await {
+                    Ok(ev) => ev,
+                    // 跟不上总线：这条流只是「通知」的附带品，丢了就丢了 —— 但
+                    // **不能就这么退出**（一次卡顿之后再也不发通知，而且没有任何
+                    // 迹象）。继续等下一条，和 `/api/turns/stream` 同一个规矩。
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
                 let crate::state::Event::Turn { status } = ev else {
                     continue;
                 };
@@ -626,6 +639,11 @@ impl Machines {
                 let Some(n) = crate::notify::compose(&status) else {
                     continue;
                 };
+                // 开关关着就不发。**在 compose 之后**判：compose 是纯函数不值钱，
+                // 而绑定数据库的查询留到真要发的时候（还在跑的回合根本走不到这儿）
+                if !crate::notify::enabled(me.db()) {
+                    continue;
+                }
                 notify_in_background(n);
             }
         });
@@ -766,7 +784,7 @@ impl Machines {
 /// （隧道直接收它，见 `tunnel::credential_ok`）—— 两者都不经过页面。
 ///
 /// 返回 `Ok(())` = 对端把流关了（该重连）；`Err` = 连不上（同样该重连，只是记个日志）。
-async fn watch_turns(port: u16, token: &str) -> Result<(), String> {
+async fn watch_turns(port: u16, token: &str, db: Option<&crate::db::Db>) -> Result<(), String> {
     // reqwest 已经在依赖里（llm 用它），流式响应也开着 —— 不必自己拼一回 hyper。
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60 * 60)) // 长连接：一小时没动静就算死了
@@ -793,7 +811,7 @@ async fn watch_turns(port: u16, token: &str) -> Result<(), String> {
         while let Some(idx) = buf.find("\n\n") {
             let frame = buf[..idx].to_string();
             buf.drain(..idx + 2);
-            handle_sse_frame(&frame);
+            handle_sse_frame_with(&frame, db);
         }
         // 一条状态最多几 KB：一直攒着说明对面没在发空行，丢了重来
         if buf.len() > 1 << 20 {
@@ -836,6 +854,14 @@ fn handle_sse_frame(raw: &str) {
         return;
     };
     notify_in_background(n);
+}
+
+/// 同上，但先问一句本机开关：`db` 为空（没有库）时当开。
+fn handle_sse_frame_with(raw: &str, db: Option<&crate::db::Db>) {
+    if !crate::notify::enabled(db) {
+        return;
+    }
+    handle_sse_frame(raw);
 }
 
 /// 真发一条，**不等它**：这条路径都在收尾/读流的循环里，`osascript` 要几十毫秒、
