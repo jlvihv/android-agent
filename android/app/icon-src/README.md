@@ -8,9 +8,18 @@
 | `ic_launcher.svg`            | 传统方形图标（PNG 兜底 + 商店截图用）                                                                              |
 | `ic_launcher_round.svg`      | 传统圆形图标                                                                                                       |
 
-同一份图形在 web 侧也有一份：`web/public/favicon.svg` + 两张 PNG（`favicon-32.png`、
-`apple-touch-icon.png`）—— 那是桌面浏览器标签页上的站点图标。**改机器人要三处一起改**：
-这里的两个 SVG、`res/` 里的矢量、还有 `web/public/`。
+同一个机器人在 web 侧也有一份：`web/public/favicon.svg` + 两张 PNG（`favicon-32.png`、
+`apple-touch-icon.png`），那是桌面浏览器标签页 / 书签上的站点图标。**改机器人要三处
+一起改**：这里的两个 SVG、`res/` 里的矢量、还有 `web/public/`。
+
+但 favicon **不是**照抄 App 图标：那边是「深底 + 白脑袋 + 底色方块」，标签页上没有
+那个方块（透明底，标签栏什么颜色就透什么），白脑袋放浅色标签栏上会消失。所以：
+
+- 脑袋改成 `#151515` 填充 + `#f9f9f7` 一圈描边 —— 浅色底上描边融进底色，深色底上
+  正好把轮廓勾出来，一套配色两种底都立得住（白、浅灰、深灰、近黑都试过）。
+- 机器人放大到几乎撑满画布（没有方块衬托，得自己占满）。
+- 只有 `apple-touch-icon.png` 铺了暖白底：iOS 不吃透明，透明处会填黑，深色脑袋
+  直接消失。
 
 重新渲染 PNG（`rsvg-convert` 来自 librsvg）：
 
@@ -41,6 +50,8 @@ done
 渲染 favicon（在仓库根）：
 
 ```sh
-rsvg-convert -w 32  -h 32  web/public/favicon.svg -o web/public/favicon-32.png
-rsvg-convert -w 180 -h 180 web/public/favicon.svg -o web/public/apple-touch-icon.png
+# 32 那张要透明（标签栏自己上色）
+rsvg-convert -w 32 -h 32 web/public/favicon.svg -o web/public/favicon-32.png
+# 180 那张铺暖白底（= ic_launcher_background），iOS 不吃透明
+rsvg-convert -w 180 -h 180 -b '#f9f9f7' web/public/favicon.svg -o web/public/apple-touch-icon.png
 ```

@@ -10,10 +10,10 @@
          `@theme` 那份默认一致。有偏好的照样跟随系统（浅色在那边的
          `@media (prefers-color-scheme: light)` 里）。 -->
     <meta name="color-scheme" content="dark light" />
-    <!-- 站点图标 = App 图标那个机器人（图形源在 android/app/icon-src/）。
-         SVG 一份给认得的浏览器，PNG 两份兜底：32 是标签页/书签，180 是
-         iOS 加到主屏（电脑上连核心时用 Safari 的话）。手机上 WebView 不看这些，
-         桌面图标走 mipmap，不冲突。 -->
+    <!-- 站点图标 = **只有机器人那个形象**，透明底（不带 App 图标那个底色方块，
+         标签栏自己什么底色就透什么）。SVG 一份给认得的浏览器，PNG 兜底：32 是
+         标签页/书签；180 那张是 iOS 加到主屏，iOS 不吃透明底（会填黑），所以它
+         单独铺了一层暖白。手机上 WebView 不看这些，桌面图标走 mipmap，不冲突。 -->
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />

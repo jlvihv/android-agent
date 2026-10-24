@@ -1,16 +1,29 @@
-<!-- 站点图标（favicon）：**就是 App 图标那个机器人**，图形一个字节都不改 —— 桌面浏览器
-     的标签页 / 书签上认得出这是哪个 App（电脑上连核心时看到的就是这张脸）。
+<!-- 站点图标：**只有机器人这个形象**，没有底色方块 —— 导出来就是透明底，贴在
+     标签栏 / 书签栏自己的底色上（浅色、深色、灰色都试过）。
 
-     **别在这里改图形**：源是 `android/app/icon-src/ic_launcher.svg`，改完照抄过来，
-     PNG 也重出一遍（`rsvg-convert`，见 android/app/icon-src/README.md）。
-     两份画得不一样时，App 和标签页会长成两个东西。 -->
+     所以配色跟 App 图标正好反过来：那边是「深底 + 白脑袋」，这边没有底，
+     白脑袋放在浅色标签栏上会消失，于是脑袋改成 `#151515`、眼睛白。
+     **外圈那层浅色描边是给深色标签栏用的**（`#f9f9f7` 描边 + 深色填充）：
+     浅色底上它跟底色一样，看不出来；深色底上正好把轮廓勾出来。
+
+     图形本身别在这里改 —— 机器人出自 `android/app/icon-src/`（不透明底的
+     应用图标）；这里只派生这一个透明版本。PNG 用 rsvg-convert 重出，见
+     android/app/icon-src/README.md。 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
-  <rect width="108" height="108" rx="22" fill="#151515"/>
-  <g transform="translate(54,54) scale(1.15) translate(-54,-54)">
-    <path d="M54 41 V33" stroke="#f9f9f7" stroke-width="4.5" stroke-linecap="round"/>
-    <circle cx="54" cy="29" r="4" fill="#6da7ec"/>
-    <rect x="27" y="41" width="54" height="45" rx="16" fill="#f9f9f7"/>
-    <circle cx="44" cy="62" r="6" fill="#151515"/>
-    <circle cx="64" cy="62" r="6" fill="#151515"/>
+  <!-- 内容框（含天线）x 27–81、y 23–86，中心 (54, 54.5)。
+       没有底色衬托，就把机器人放大到几乎撑满画布（1.58 倍，留一点描边的余量）。 -->
+  <g transform="translate(54,54) scale(1.58) translate(-54,-54.5)">
+    <!-- 天线：先一道浅色光晕，再压一道深色杆。光晕在浅色底上看不见，
+         在深色底上正好把杆从背景里托出来（不然整根杆都没了）。 -->
+    <path d="M54 41 V33" stroke="#f9f9f7" stroke-width="8.4" stroke-linecap="round" />
+    <path d="M54 41 V33" stroke="#151515" stroke-width="4.6" stroke-linecap="round" />
+    <!-- 天线顶上的点：浅色垫一圈，深色底上也有边 -->
+    <circle cx="54" cy="29" r="6" fill="#f9f9f7" />
+    <circle cx="54" cy="29" r="4.6" fill="#6da7ec" />
+    <!-- 脑袋：54×45 的圆角方，r=16，深色填充 + 浅色描边 -->
+    <rect x="27" y="41" width="54" height="45" rx="16" fill="#151515" stroke="#f9f9f7" stroke-width="4.2" />
+    <!-- 眼睛 -->
+    <circle cx="44" cy="62" r="6" fill="#f9f9f7" />
+    <circle cx="64" cy="62" r="6" fill="#f9f9f7" />
   </g>
 </svg>
