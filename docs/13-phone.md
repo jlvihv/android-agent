@@ -119,7 +119,7 @@ time: 2026-10-23T12:39:31
 - `--help` 每个命令都认（用法文本由 Kotlin 回，避免两处各写一份）。
 - `location current` 的 `place` 是**默认**带的：模型拿到 `30.338/121.218` 说不出「在哪个市
   哪个区」，而用户问「我在哪」就是问这个。一整行 `address` 够直接念，`province / city /
-  district / street / poi` 分项让「哪个区」能被单独回答。反查失败（没网 / 没 Google 服务 /
+district / street / poi` 分项让「哪个区」能被单独回答。反查失败（没网 / 没 Google 服务 /
   6 秒超时）只多一个 `place_error`，**坐标照回** —— 地址是锦上添花，不能连累定位本身；
   `--no-address` 跳过反查（实测从 1.1s 降到 0.05s）。同一坐标点缓存 10 分钟、失败 2 分钟。
 - 参数从 shell 原样传过去（`{"cmd":"sms","argv":["list","--limit","2"]}`），
@@ -155,29 +155,29 @@ time: 2026-10-23T12:39:31
 
 模拟器（sdk_gphone64_x86_64 / Android 15）+ 桌面 host 模式，都跑过：
 
-| 命令                                    | 结果                                                                                                                                                           |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `device info`（默认）/ `--help`         | ✅ 型号 / 电池 / 存储，用法文本；真机 Pixel 10 / Android 17                                                                                                    |
-| `clipboard set/get/status`              | ✅ 写进去读得回来                                                                                                                                              |
-| `volume get/set --percent/down`         | ✅ 真机上 7/25 → 8/25 → 7/25（带百分比），测完恢复原值；超量程与错 stream 都报错                                                                               |
-| `torch on/off`                          | ✅ 真机上手电筒真的开关                                                                                                                                        |
-| `vibrate --pattern tap`                 | ✅ 真机上振了 50ms                                                                                                                                             |
-| `radios`                                | ✅ 真机上：WiFi 开着 / 走的是 WiFi / 飞行模式关。**撞出一个漏声明的权限**：读 `isWifiEnabled()` 要 `ACCESS_WIFI_STATE`，不加直接抛 SecurityException（已补上） |
-| `brightness get`                        | ✅ 真机 auto=true, level=6；`set` 没授权时回 `no_write_settings` + 去哪开                                                                                      |
-| `screenshot`                            | ✅ 真机实测：1080×2424 / 314KB PNG 落到 `/workspace`，内容就是当时的屏幕（打开无障碍服务之后）                                                                 |
-| `agent tap` / `swipe` / `key`           | ✅ 无障碍一开就跟着能用（实测 `home` 键）—— 这两件事本来就是同一只服务                                                                                         |
-| `alarm set --repeat weekdays` / `timer` | ✅ 交给系统时钟（`SKIP_UI` 只是请求）；`cancel --id` 明确说不支持                                                                                              |
+| 命令                                    | 结果                                                                                                                                                                                                                                        |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `device info`（默认）/ `--help`         | ✅ 型号 / 电池 / 存储，用法文本；真机 Pixel 10 / Android 17                                                                                                                                                                                 |
+| `clipboard set/get/status`              | ✅ 写进去读得回来                                                                                                                                                                                                                           |
+| `volume get/set --percent/down`         | ✅ 真机上 7/25 → 8/25 → 7/25（带百分比），测完恢复原值；超量程与错 stream 都报错                                                                                                                                                            |
+| `torch on/off`                          | ✅ 真机上手电筒真的开关                                                                                                                                                                                                                     |
+| `vibrate --pattern tap`                 | ✅ 真机上振了 50ms                                                                                                                                                                                                                          |
+| `radios`                                | ✅ 真机上：WiFi 开着 / 走的是 WiFi / 飞行模式关。**撞出一个漏声明的权限**：读 `isWifiEnabled()` 要 `ACCESS_WIFI_STATE`，不加直接抛 SecurityException（已补上）                                                                              |
+| `brightness get`                        | ✅ 真机 auto=true, level=6；`set` 没授权时回 `no_write_settings` + 去哪开                                                                                                                                                                   |
+| `screenshot`                            | ✅ 真机实测：1080×2424 / 314KB PNG 落到 `/workspace`，内容就是当时的屏幕（打开无障碍服务之后）                                                                                                                                              |
+| `agent tap` / `swipe` / `key`           | ✅ 无障碍一开就跟着能用（实测 `home` 键）—— 这两件事本来就是同一只服务                                                                                                                                                                      |
+| `alarm set --repeat weekdays` / `timer` | ✅ 交给系统时钟（`SKIP_UI` 只是请求）；`cancel --id` 明确说不支持                                                                                                                                                                           |
 | `location current`                      | ✅ 真机 Pixel 10 / API 37：1.1s 拿到坐标 + `place`（中国浙江省宁波市慈溪市滨海大桥：province 浙江省 / city 宁波市 / district 慈溪市）；`--no-address` 0.05s 只回坐标；同一坐标点第二次 0.04s（缓存）。模拟器无 GMS 时回坐标 + `place_error` |
-| `location geocode`                      | ✅ 真机：天安门 → 北京市 / 东城区 / 西长安街1号；嘉善县 → 浙江省 / 嘉兴市 / 嘉善县；昆山市 → 江苏省 / 苏州市 / 昆山市；东京 → Tokyo / Chiyoda City / 东京站；太平洋 (0,-160) → `（无）` |
-| `location forward`                      | ✅ 真机（有 Google 服务）：“上海外滩” → 31.2402,121.4906；“杭州西湖” → 30.2596,120.1303（杭州市 / 西湖区）；⚠️ 模拟器无 GMS 时回 `gcaa: UNAVAILABLE`（已翻成人话）                                               |
-| `contacts list/search/get`              | ✅ 造了一个联系人（张三 / 13800138000 / 邮箱）走通；不存在 id → `not_found`                                                                                    |
-| `calendar calendars/list/create/delete` | ✅ 定时事件、**全天事件**（UTC 午夜那条约定，见下）都对                                                                                                        |
-| `sms list/stats`                        | ✅ `adb emu sms send` 发的短信读得到                                                                                                                           |
-| `notify`                                | ✅                                                                                                                                                             |
-| `speak`                                 | ✅ 念完才返回                                                                                                                                                  |
-| 权限被拒                                | ✅ 25s 后回 `permission_denied` + 「去哪开」；第二次瞬间返回                                                                                                   |
-| 电脑上 `agent sms list`                 | ✅ 当场拒绝（exit 2）；`/api/device` 回 `unavailable`；`help` 里 0 条                                                                                          |
-| 电脑上 `agent weather`                  | ✅ 真联网拿到上海天气                                                                                                                                          |
+| `location geocode`                      | ✅ 真机：天安门 → 北京市 / 东城区 / 西长安街1号；嘉善县 → 浙江省 / 嘉兴市 / 嘉善县；昆山市 → 江苏省 / 苏州市 / 昆山市；东京 → Tokyo / Chiyoda City / 东京站；太平洋 (0,-160) → `（无）`                                                     |
+| `location forward`                      | ✅ 真机（有 Google 服务）：“上海外滩” → 31.2402,121.4906；“杭州西湖” → 30.2596,120.1303（杭州市 / 西湖区）；⚠️ 模拟器无 GMS 时回 `gcaa: UNAVAILABLE`（已翻成人话）                                                                          |
+| `contacts list/search/get`              | ✅ 造了一个联系人（张三 / 13800138000 / 邮箱）走通；不存在 id → `not_found`                                                                                                                                                                 |
+| `calendar calendars/list/create/delete` | ✅ 定时事件、**全天事件**（UTC 午夜那条约定，见下）都对                                                                                                                                                                                     |
+| `sms list/stats`                        | ✅ `adb emu sms send` 发的短信读得到                                                                                                                                                                                                        |
+| `notify`                                | ✅                                                                                                                                                                                                                                          |
+| `speak`                                 | ✅ 念完才返回                                                                                                                                                                                                                               |
+| 权限被拒                                | ✅ 25s 后回 `permission_denied` + 「去哪开」；第二次瞬间返回                                                                                                                                                                                |
+| 电脑上 `agent sms list`                 | ✅ 当场拒绝（exit 2）；`/api/device` 回 `unavailable`；`help` 里 0 条                                                                                                                                                                       |
+| 电脑上 `agent weather`                  | ✅ 真联网拿到上海天气                                                                                                                                                                                                                       |
 
 两个坑记一下：
 

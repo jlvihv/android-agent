@@ -86,8 +86,9 @@
     </div>
   </div>
   <p class="px-1 pt-2 text-meta leading-relaxed text-faint">
-    通知由**你面前这台电脑的核心**发：在 Mac 的浏览器里连着另一台机器时，跑完会在
-    Mac 上提醒你（那台机器跑完了，本机去通知你）。页关着也照样能收到。
+    通知由**你面前这台电脑的核心**发：在 Mac
+    的浏览器里连着另一台机器时，跑完会在 Mac
+    上提醒你（那台机器跑完了，本机去通知你）。页关着也照样能收到。
   </p>
   {#if err}<p class="px-1 pt-2 text-xs text-bad">{err}</p>{/if}
 {/if}
