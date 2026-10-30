@@ -108,7 +108,7 @@
         class="flex items-center gap-3 border-b-2 border-ink px-3.5 py-3 last:border-b-0"
       >
         <span class="min-w-0 flex-1">
-          <span class="block text-[15px]">{r.label}</span>
+          <span class="block text-ui">{r.label}</span>
           <span
             class="block text-meta break-all {r.bad
               ? 'text-bad'

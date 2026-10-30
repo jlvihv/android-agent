@@ -73,7 +73,7 @@
         onclick={() => (open = s)}
         class="min-w-0 flex-1 py-3 pl-3.5 text-left"
       >
-        <span class="block truncate text-[17px] {s.enabled ? '' : 'text-muted'}"
+        <span class="block truncate text-row {s.enabled ? '' : 'text-muted'}"
           >{s.name}</span
         >
         <span
@@ -97,7 +97,7 @@
     onclick={() => (open = "new")}
     class="flex w-full items-center gap-3 px-3.5 py-3 text-left"
   >
-    <span class="flex-1 text-[17px] text-accent">添加 MCP 服务</span>
+    <span class="flex-1 text-row text-accent">添加 MCP 服务</span>
   </button>
 </div>
 <p class="px-1 pt-2 text-meta leading-relaxed text-faint">

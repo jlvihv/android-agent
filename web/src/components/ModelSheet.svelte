@@ -248,9 +248,9 @@
             onclick={() => openSub("providers")}
             class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left"
           >
-            <span class="shrink-0 text-[17px]">模型提供商</span>
+            <span class="shrink-0 text-row">模型提供商</span>
             <span
-              class="ml-auto flex min-w-0 items-center gap-0.5 text-[17px] text-muted"
+              class="ml-auto flex min-w-0 items-center gap-0.5 text-row text-muted"
             >
               <span class="truncate">{shown?.name ?? "未配置"}</span>
               <Icon name="chevron" size={16} class="shrink-0" />
@@ -274,7 +274,7 @@
                 onclick={onconfig}
                 class="flex w-full flex-col gap-0.5 px-3.5 py-4 text-left"
               >
-                <span class="text-[17px]">还没有配置模型提供商</span>
+                <span class="text-row">还没有配置模型提供商</span>
                 <span class="text-meta text-accent">去设置里填一个 API Key</span
                 >
               </button>
@@ -294,7 +294,7 @@
                   class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                          text-left last:border-b-0"
                 >
-                  <span class="min-w-0 flex-1 truncate text-[17px]"
+                  <span class="min-w-0 flex-1 truncate text-row"
                     >{m.name}</span
                   >
                   {#if isCurrent(shown, m)}
@@ -310,9 +310,9 @@
             onclick={() => openSub("effort")}
             class="flex w-full items-center rounded-2xl bg-surface px-3.5 py-4 text-left"
           >
-            <span class="text-[17px]">思考强度</span>
+            <span class="text-row">思考强度</span>
             <span
-              class="ml-auto flex items-center gap-0.5 text-[17px] text-muted"
+              class="ml-auto flex items-center gap-0.5 text-row text-muted"
             >
               {effortLabel(effort)}
               <Icon name="chevron" size={16} />
@@ -334,7 +334,7 @@
                            text-left last:border-b-0"
                   >
                     <span class="min-w-0 flex-1">
-                      <span class="block truncate text-[17px]">{g.name}</span>
+                      <span class="block truncate text-row">{g.name}</span>
                       <span
                         class="block truncate text-meta {g.error
                           ? 'text-bad'
@@ -363,7 +363,7 @@
               onclick={onconfig}
               class="flex w-full items-center gap-3 rounded-2xl bg-surface px-3.5 py-4 text-left"
             >
-              <span class="text-[17px]">管理模型提供商</span>
+              <span class="text-row">管理模型提供商</span>
               <Icon
                 name="chevron"
                 size={16}
@@ -379,7 +379,7 @@
                   class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                          text-left last:border-b-0"
                 >
-                  <span class="min-w-0 flex-1 truncate text-[17px]"
+                  <span class="min-w-0 flex-1 truncate text-row"
                     >{e.label}</span
                   >
                   {#if e.value === effort}

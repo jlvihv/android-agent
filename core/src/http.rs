@@ -3202,7 +3202,7 @@ fn sandbox_error(status: StatusCode, guest: &str, reason: &str) -> Response {
          <meta name=color-scheme content='dark light'>\
          <title>{title}</title><style>body{{font:15px/1.7 system-ui;background:#000000;color:#f9f9f7;\
          margin:0;padding:26px 20px}}code{{background:#262624;padding:2px 6px;border-radius:6px;\
-         word-break:break-all}}h3{{margin:0 0 12px}}p{{color:#97958d;margin:12px 0}}\
+         word-break:break-all}}h3{{margin:0 0 12px}}p{{color:#9c9a92;margin:12px 0}}\
          b{{color:#f9f9f7}}\
          /* 浅色：和前端一套色（见 web/src/app.css）—— 这页开在 App 的 WebView 里，\
             不跟就成了一整页黑压在白界面里 */\
@@ -3386,7 +3386,7 @@ async fn dir_listing(guest: &str, host: &std::path::Path) -> Response {
          <meta name=color-scheme content='dark light'>\
          <title>{t}</title><style>body{{font:15px system-ui;background:#000000;color:#f9f9f7;\
          margin:0;padding:12px 16px}}a{{color:inherit;text-decoration:none;display:block;\
-         padding:10px 0;border-bottom:1px solid #262624}}.d{{color:#97958d}}\
+         padding:10px 0;border-bottom:1px solid #262624}}.d{{color:#9c9a92}}\
          /* 浅色：和前端一套色（见 web/src/app.css）*/\
          @media (prefers-color-scheme:light){{body{{background:#fcfcfb;color:#1c1c1b}}\
          a{{border-bottom-color:#e7e6e1}}.d{{color:#5f5e5a}}}}</style>\

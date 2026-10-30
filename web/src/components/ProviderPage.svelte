@@ -121,7 +121,7 @@
           autocorrect="off"
           spellcheck="false"
           inputmode="url"
-          class="rounded-2xl bg-surface px-4 py-3.5 text-[17px] outline-none placeholder:text-faint"
+          class="rounded-2xl bg-surface px-4 py-3.5 text-row outline-none placeholder:text-faint"
         />
         <span class="px-1 text-meta text-faint"
           >任何 OpenAI 兼容的端点：Ollama、中转站、公司网关…</span
@@ -141,7 +141,7 @@
         autocorrect="off"
         spellcheck="false"
         onkeydown={(e) => e.key === "Enter" && save()}
-        class="rounded-2xl bg-surface px-4 py-3.5 text-[17px] outline-none placeholder:text-faint"
+        class="rounded-2xl bg-surface px-4 py-3.5 text-row outline-none placeholder:text-faint"
       />
       {#if provider.keyUrl}
         <!-- 外链：WebView 会把它交给系统浏览器（MainActivity.shouldOverrideUrlLoading） -->
@@ -156,7 +156,7 @@
     <button
       onclick={save}
       disabled={!canSave}
-      class="rounded-full bg-fg py-3.5 text-[15px] font-medium text-ink disabled:opacity-40"
+      class="rounded-full bg-fg py-3.5 text-ui font-medium text-ink disabled:opacity-40"
     >
       {busy ? "验证中…" : "保存"}
     </button>
@@ -165,7 +165,7 @@
       <button
         onclick={remove}
         disabled={busy}
-        class="py-2 text-[15px] text-bad disabled:opacity-40"
+        class="py-2 text-ui text-bad disabled:opacity-40"
       >
         删除这个 Key
       </button>
@@ -187,7 +187,7 @@
             class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left last:border-b-0"
           >
             <span class="min-w-0 flex-1">
-              <span class="block text-[17px]">
+              <span class="block text-row">
                 {s.label}{s.value === provider.apiStyleDefault
                   ? "（默认）"
                   : ""}

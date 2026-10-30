@@ -51,13 +51,13 @@
   }
 
   const input =
-    "min-w-0 flex-1 rounded-2xl bg-surface px-4 py-3.5 text-[17px] outline-none placeholder:text-faint";
+    "min-w-0 flex-1 rounded-2xl bg-surface px-4 py-3.5 text-row outline-none placeholder:text-faint";
 </script>
 
 {#if cfg}
   <h2 class="px-1 pt-6 pb-2 text-meta text-muted">联网搜索</h2>
   {#if cfg.fromEnv}
-    <p class="rounded-2xl bg-surface px-3.5 py-3 text-[15px] text-muted">
+    <p class="rounded-2xl bg-surface px-3.5 py-3 text-ui text-muted">
       Exa key 由环境变量 <code>EXA_API_KEY</code> 提供{cfg.keyHint
         ? `（${cfg.keyHint}）`
         : ""}，这里改不了。
@@ -79,7 +79,7 @@
       <button
         onclick={() => save(key.trim())}
         disabled={busy || !key.trim()}
-        class="shrink-0 rounded-full bg-fg px-5 text-[15px] font-medium text-ink disabled:opacity-40"
+        class="shrink-0 rounded-full bg-fg px-5 text-ui font-medium text-ink disabled:opacity-40"
       >
         保存
       </button>

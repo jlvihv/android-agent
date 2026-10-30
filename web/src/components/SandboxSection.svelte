@@ -90,7 +90,7 @@
   <div class="overflow-hidden rounded-2xl bg-surface">
     <div class="flex items-center gap-3 px-3.5 py-3">
       <span class="min-w-0 flex-1">
-        <span class="block text-[17px]">Alpine {st.current ?? "?"}</span>
+        <span class="block text-row">Alpine {st.current ?? "?"}</span>
         <span
           class="block truncate text-meta {st.upgradable
             ? 'text-accent'
@@ -113,7 +113,7 @@
         <button
           onclick={check}
           disabled={checking}
-          class="shrink-0 py-1 text-[15px] text-muted disabled:opacity-40"
+          class="shrink-0 py-1 text-ui text-muted disabled:opacity-40"
         >
           {checking ? "检查中…" : "检查更新"}
         </button>
@@ -125,14 +125,14 @@
         <button
           onclick={upgrade}
           disabled={starting}
-          class="w-full rounded-full bg-fg py-3 text-[15px] font-medium text-ink disabled:opacity-40"
+          class="w-full rounded-full bg-fg py-3 text-ui font-medium text-ink disabled:opacity-40"
         >
           {confirming ? `确认升级到 ${st.latest}？` : `升级到 ${st.latest}`}
         </button>
         {#if confirming}
           <button
             onclick={() => (confirming = false)}
-            class="w-full pt-2.5 text-[15px] text-muted"
+            class="w-full pt-2.5 text-ui text-muted"
           >
             取消
           </button>

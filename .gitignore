@@ -30,6 +30,10 @@ android/app/src/main/assets/
 web/node_modules/
 web/dist/
 
+# impeccable 的评审快照（`impeccable critique` 写的）。是本地跑出来的报告，
+# 随代码变动而失效，不进版本库 —— 需要看的时候重跑一次就是。
+.impeccable/
+
 # misc
 .DS_Store
 

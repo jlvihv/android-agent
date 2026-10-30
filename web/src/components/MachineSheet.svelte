@@ -112,7 +112,7 @@
   >
     <Icon name={icon} size={18} class="shrink-0 text-muted" />
     <span class="min-w-0 flex-1">
-      <span class="block truncate text-[17px]">{name}</span>
+      <span class="block truncate text-row">{name}</span>
       <span class="block truncate text-meta text-muted">{sub}</span>
     </span>
     {#if current}<Icon
@@ -178,7 +178,7 @@
           class="flex w-full items-center gap-3 px-3.5 py-3 text-left"
         >
           <Icon name="plus" size={18} class="shrink-0 text-muted" />
-          <span class="text-[17px] text-muted">手输地址…</span>
+          <span class="text-row text-muted">手输地址…</span>
         </button>
       {/if}
     </div>
@@ -211,7 +211,7 @@
         type="button"
         disabled={code.trim().length < 6 || machines.busy}
         onclick={submit}
-        class="mt-3 w-full rounded-xl bg-accent py-2.5 text-[17px] font-medium text-ink disabled:opacity-40"
+        class="mt-3 w-full rounded-xl bg-accent py-2.5 text-row font-medium text-ink disabled:opacity-40"
       >
         {machines.busy ? "配对中…" : "配对并连上"}
       </button>
@@ -236,7 +236,7 @@
             autocapitalize="off"
             autocomplete="off"
             spellcheck="false"
-            class="w-full rounded-xl bg-ink px-3 py-2 font-mono text-[17px]"
+            class="w-full rounded-xl bg-ink px-3 py-2 font-mono text-row"
           />
         </label>
         <label class="block">
@@ -245,7 +245,7 @@
             bind:value={port}
             inputmode="numeric"
             placeholder="8787"
-            class="w-full rounded-xl bg-ink px-3 py-2 font-mono text-[17px]"
+            class="w-full rounded-xl bg-ink px-3 py-2 font-mono text-row"
           />
         </label>
         <label class="block">
@@ -255,7 +255,7 @@
             inputmode="numeric"
             maxlength="6"
             placeholder="6 位"
-            class="w-full rounded-xl bg-ink px-3 py-2 font-mono text-[17px]"
+            class="w-full rounded-xl bg-ink px-3 py-2 font-mono text-row"
             onkeydown={(e) => e.key === "Enter" && submitManual()}
           />
         </label>
@@ -270,7 +270,7 @@
           code.trim().length < 6 ||
           machines.busy}
         onclick={submitManual}
-        class="mt-3 w-full rounded-xl bg-accent py-2.5 text-[17px] font-medium text-ink disabled:opacity-40"
+        class="mt-3 w-full rounded-xl bg-accent py-2.5 text-row font-medium text-ink disabled:opacity-40"
       >
         {machines.busy ? "配对中…" : "配对并连上"}
       </button>

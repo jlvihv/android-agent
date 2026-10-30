@@ -67,7 +67,7 @@
       class="flex items-center gap-3 border-b-2 border-ink px-3.5 py-3 last:border-b-0"
     >
       <span class="min-w-0 flex-1">
-        <span class="block truncate text-[17px]">任务完成时通知我</span>
+        <span class="block truncate text-row">任务完成时通知我</span>
         <span class="block truncate text-meta text-muted">
           {#if cfg.reason}
             {cfg.reason}

@@ -229,7 +229,7 @@
               duration: PAGE_MS,
               easing: cubicOut,
             }}
-            class="absolute inset-0 flex items-center justify-center truncate px-12 text-[17px]
+            class="absolute inset-0 flex items-center justify-center truncate px-12 text-row
                    font-semibold"
           >
             {title}

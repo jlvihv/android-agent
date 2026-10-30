@@ -93,7 +93,7 @@
   }
 
   const input =
-    "rounded-2xl bg-surface px-4 py-3.5 text-[17px] outline-none placeholder:text-faint disabled:text-muted";
+    "rounded-2xl bg-surface px-4 py-3.5 text-row outline-none placeholder:text-faint disabled:text-muted";
 </script>
 
 <Page bind:this={page} title={server ? server.name : "添加 MCP 服务"} {onclose}>
@@ -155,7 +155,7 @@
     <button
       onclick={save}
       disabled={!canSave}
-      class="rounded-full bg-fg py-3.5 text-[15px] font-medium text-ink disabled:opacity-40"
+      class="rounded-full bg-fg py-3.5 text-ui font-medium text-ink disabled:opacity-40"
     >
       {busy ? "连接中…" : "保存"}
     </button>
@@ -164,7 +164,7 @@
       <button
         onclick={remove}
         disabled={busy}
-        class="py-2 text-[15px] text-bad disabled:opacity-40"
+        class="py-2 text-ui text-bad disabled:opacity-40"
       >
         删除这个服务
       </button>

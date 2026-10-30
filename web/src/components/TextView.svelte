@@ -92,7 +92,7 @@
       <p class="py-6 text-sm text-faint">读取中…</p>
     {:else}
       <pre
-        class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-words text-fg">{text}</pre>
+        class="font-mono text-code leading-5 whitespace-pre-wrap break-words text-fg">{text}</pre>
     {/if}
   </div>
 </div>

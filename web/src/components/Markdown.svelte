@@ -177,7 +177,7 @@
           </button>
         </div>
         <pre
-          class="overflow-x-auto px-3 py-2.5 font-mono text-[13px] leading-5">{b.v}</pre>
+          class="overflow-x-auto px-3 py-2.5 font-mono text-code leading-5">{b.v}</pre>
       </div>
     {:else if b.t === "table"}
       <!-- 宽表格在自己的框里横向滚动，不撑破页面 -->

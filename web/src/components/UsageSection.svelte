@@ -53,7 +53,7 @@
   <div class="overflow-hidden rounded-2xl bg-surface">
     {#each byModel as r (r.key)}
       <div class="border-b-2 border-ink px-3.5 py-3 last:border-b-0">
-        <span class="block truncate text-[17px]">{r.key}</span>
+        <span class="block truncate text-row">{r.key}</span>
         <span class="block text-meta text-muted">{line(r)}</span>
       </div>
     {/each}
@@ -69,7 +69,7 @@
       <div class="mt-2 overflow-hidden rounded-2xl bg-surface">
         {#each byDay as r (r.key)}
           <div class="border-b-2 border-ink px-3.5 py-2.5 last:border-b-0">
-            <span class="block text-[15px]">{r.key}</span>
+            <span class="block text-ui">{r.key}</span>
             <span class="block text-meta text-muted">{line(r)}</span>
           </div>
         {/each}

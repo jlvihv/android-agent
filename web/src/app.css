@@ -48,10 +48,12 @@
      背景本来就最黑了。所以「面板看得出边界」这件事不再靠它，靠面板自己的底色。 */
   --color-scrim: rgb(0 0 0 / 0.35);
 
-  /* 文字 */
+  /* 文字。三档都按 WCAG AA 校准过（2026-10，见文件末尾「对比度账本」）：
+     faint 原来 #6f6d66 压在卡片(#20201f)上只有 3.15:1、压在代码块(#1c1c1b)上 3.29:1，
+     而它扛的是「代码块是什么语言」「能不能复制」这类**状态信息** —— 太淡就读没了。 */
   --color-fg: #f9f9f7; /* 暖白，不用纯白 */
-  --color-muted: #97958d;
-  --color-faint: #6f6d66;
+  --color-muted: #9c9a92; /* 药丸里「· 默认」压在 control 上 4.62:1（原来 4.34）*/ 
+  --color-faint: #8a8880; /* 卡片 4.59 / 代码块 4.80 / 页面 5.63；在 control 上当图标 3.66 */
 
   /* 语义色：刻意去饱和，不抢主色 */
   --color-ok: #7fb37f;
@@ -70,6 +72,16 @@
 
   /* 只有三档圆角 */
   --radius-card: 22px;
+
+  /* 三档 Tailwind 刻度里没有、但界面里反复用的字号。
+
+     **刻意不写 `--line-height`**：这些值原来散在 19 个文件里写成 `text-[17px]`，
+     行高全部落在 Tailwind 的默认值上（`text-base` 那套 1.5 / 1.25）。这里不声明行高，
+     计算值就与原写法逐像素一致 —— 换 token 不该顺手动布局。
+     哪天要给某一档单独收行高，再补 `--text-row--line-height`，那时是**改设计**，另说。 */
+  --text-row: 17px; /* 列表行 / 输入框 / 主按钮 */
+  --text-ui: 15px; /* 次级按钮 / 明细行 */
+  --text-code: 13px; /* 工具输出 / 代码块 / 错误行（配 leading-5）*/
 
   /* 补一个 Tailwind 没有的字号档（日志/元信息用） */
   --text-meta: 11px;
@@ -142,19 +154,31 @@
        纯黑压暖白会发灰发冷。 */
     --color-scrim: rgb(20 20 19 / 0.35);
 
-    /* 文字 */
+    /* 文字。同样按 AA 校准（原来的 faint #7b7974 在气泡上只有 3.91:1，
+       而 drawer 里「还没有对话」、路径这些小字全用它）。 */
     --color-fg: #1c1c1b; /* 近黑，不用纯黑（对称于深色的 #f9f9f7）*/
     --color-muted: #5f5e5a;
-    --color-faint: #7b7974;
+    --color-faint: #6f6d67; /* 白卡 5.17 / 气泡 4.65 / 页 5.04 */
 
     /* 语义色：同色相、加深，不抢主色 */
     --color-ok: #4f7a4a;
     --color-warn: #8a6a24;
     --color-bad: #b53333;
     --color-danger: #a12828; /* 比 bad 更实（点了会删东西）*/
-    /* 选中 / 链接 / 主行动：陶土橙的浅色档（CDS 的 `--cds-clay-interactive`，
-       深色那档 #d97757 压在白雪上对比不够）。 */
-    --color-accent: #c96442;
+    /* 选中 / 链接 / 主行动：陶土橙的浅色档。
+
+       原来 #c96442（CDS 的 `--cds-clay-interactive`）当**文字**用时只有 3.8:1 —— 
+       「正在使用 · …abcd」「去开启」「去设置里填一个 API Key」全是 11px 的它。
+       这个 token 同时被 `bg-accent`（按钮底）用，两件事必须一起算：
+
+         颜色      压白卡(当字)   当底、上面压 --color-ink(#fcfcfb)
+         #c96442      3.80                3.80      ← 两边都不够
+         #b55534      4.74                4.74
+         #ad5133      5.11                5.17      ← 选这个
+
+       #ad5133 还顺带修好了 MachineSheet 那两个「保存」按钮：它们是 `bg-accent 
+       text-ink`，而浅色下 `text-ink` 是 #fcfcfb —— 原来的 3.8:1 属于按钮文字也读不清。 */
+    --color-accent: #ad5133;
 
     /* 字重：浅色**不补偿**，用标称值（深色那四个在 `@theme` 里）*/
     --fw-normal: "wght" 400;
@@ -164,9 +188,9 @@
   }
 
   /* 抽屉搜索框里那个放大镜是**背景图**（见文件末尾），颜色写死在 SVG 里，
-     拿不到令牌 —— 所以浅色下只能再写一张：换成浅色的 muted。 */
+     拿不到令牌 —— 所以浅色下只能再写一张：换成浅色的 faint（#6f6d67，跟着 token 走）。 */
   .search-input {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Ccircle cx='8.7' cy='8.7' r='5.6' stroke='%237b7974' stroke-width='1.8'/%3E%3Cpath d='M13 13l4 4' stroke='%237b7974' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Ccircle cx='8.7' cy='8.7' r='5.6' stroke='%236f6d67' stroke-width='1.8'/%3E%3Cpath d='M13 13l4 4' stroke='%236f6d67' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
   }
 }
 
@@ -421,13 +445,40 @@ a:focus-visible {
  * 用背景图而不是多套一个 <div>/<span>：它是纯装饰，为它加一层 DOM 不值当
  * （而且这个 App 对层级敏感到抠过 DOM）。图形跟 Icon.svelte 一个规格
  * （20 画布、描边 1.8、圆头），颜色写死 muted —— CSS 里拿不到 currentColor。
- * 写死就意味着**浅色下得另写一张**（同样的图、描边换成浅色的 muted），
+ * 写死就意味着**浅色下得另写一张**（同样的图、描边换成浅色的 faint），
  * 见上面 `@media (prefers-color-scheme: light)` 里那一段。
+ * 改 token 时记得这里也要跟：图里的 `%239c9a92` 就是深色的 `--color-muted`。
  * 文本的左边距由 Tailwind 的 pl-10 给（12 图位 + 18 图标 + 10 间隙）。
  */
 .search-input {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Ccircle cx='8.7' cy='8.7' r='5.6' stroke='%2397958d' stroke-width='1.8'/%3E%3Cpath d='M13 13l4 4' stroke='%2397958d' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Ccircle cx='8.7' cy='8.7' r='5.6' stroke='%239c9a92' stroke-width='1.8'/%3E%3Cpath d='M13 13l4 4' stroke='%239c9a92' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: 0.75rem center;
   background-size: 1.125rem 1.125rem;
 }
+
+/*
+ * 对比度账本（2026-10 校准）
+ *
+ * 为什么要留这一张表：对比度靠眼睛看不出来。`--color-faint` 原来压在卡片上
+ * 只有 3.15:1 —— 截图里"看着有点淡"，真机在户外直接读不见。改色时按这张表核对
+ * 一遍，别凭感觉。
+ *
+ * 目标：正文/小字 ≥ 4.5:1（WCAG AA），图形/图标 ≥ 3:1。
+ *
+ *                       深色                     浅色
+ *   色值       ink   surface  control | ink   surface  bubble  control
+ *   fg       19.92    14.9      —   | 17.6    18.1     —       —
+ *   muted     7.0     5.6     4.62  |  6.3     6.5    5.84     —
+ *   faint     5.63    4.59    3.66* |  5.04    5.17   4.65    4.26*
+ *   accent    6.73    5.22      —   |  5.11    5.17    4.72     —
+ *
+ *   * faint 在 control 上只当图标用（发送键的暗态箭头、勾选框），3.66 / 4.26 都过 3:1。
+ *   * 浅色 accent 是新算的 #ad5133：它同时是「正在使用」的文字色和 bg-accent 的底，
+ *     两种用法都要过，原 #c96442 当文字只有 3.8:1。深色 accent #d97757 本来就够。
+ *   * 浅色的 muted(#5f5e5a) 和 fg 都未动 —— 它们本来就达标，只是没人算过。
+ *
+ * 校准方法：在渲染后的真实页面上遍历每个带文字的节点，算 前景/最近不透明背景 的
+ * 亮度比（含字体大小与粗细判定），再 `impeccable detect --cdp` 交叉验证 —— 两套主题
+ * 均 0 条。自定义脚本跑完记得跟一遍文本节点的几何：换 token 不该顺手动布局。
+ */

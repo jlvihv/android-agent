@@ -822,11 +822,11 @@
               {#if part.name === "warning"}
                 {@const w = part.data as { message?: string }}
                 {#if w?.message}
-                  <p class="text-[13px] text-warn">⚠️ {w.message}</p>
+                  <p class="text-code text-warn">⚠️ {w.message}</p>
                 {/if}
               {/if}
             {:else if part.type === "error"}
-              <p class="text-[13px] text-bad">错误：{part.text}</p>
+              <p class="text-code text-bad">错误：{part.text}</p>
             {/if}
           {/each}
         </div>
@@ -895,10 +895,10 @@
         <div class="flex flex-col gap-1">
           <span class="font-mono text-meta text-muted">{f.key}</span>
           <pre
-            class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5 whitespace-pre-wrap break-all">{f.text}</pre>
+            class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-code leading-5 whitespace-pre-wrap break-all">{f.text}</pre>
         </div>
       {:else}
-        <p class="font-mono text-[13px] leading-5 break-all">
+        <p class="font-mono text-code leading-5 break-all">
           <span class="text-muted">{f.key}</span>
           {f.text}
         </p>
@@ -911,7 +911,7 @@
   {#if sheet.kind === "reasoning"}
     <Sheet title="思考" onclose={() => (sheet = null)}>
       <!-- 存的是 part 本身而不是文本副本：思考还在流式时打开，面板里也跟着长 -->
-      <div class="text-[15px] leading-6 text-fg/90">
+      <div class="text-ui leading-6 text-fg/90">
         <Markdown text={sheet.part.text} />
       </div>
     </Sheet>
@@ -925,7 +925,7 @@
       <div class="flex flex-col gap-4">
         {#if inp.primary}
           <pre
-            class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5 whitespace-pre-wrap break-all">{inp.primary}</pre>
+            class="rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-code leading-5 whitespace-pre-wrap break-all">{inp.primary}</pre>
         {/if}
         {#if inp.params.length}
           <!-- 主行之外的参数（bash 的 timeout、read 的 offset/limit、edit 新建时的全文 …） -->
@@ -950,7 +950,7 @@
 
             {#if res.diff}
               <div
-                class="overflow-x-auto rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-[13px] leading-5"
+                class="overflow-x-auto rounded-xl bg-hairline-soft px-3 py-2.5 font-mono text-code leading-5"
               >
                 {#each res.text.split("\n") as line}
                   <p class="whitespace-pre {diffLine(line)}">{line || " "}</p>
@@ -959,7 +959,7 @@
             {:else}
               <pre
                 use:followTail
-                class="font-mono text-[13px] leading-5 whitespace-pre-wrap break-all {res.failed
+                class="font-mono text-code leading-5 whitespace-pre-wrap break-all {res.failed
                   ? 'text-bad'
                   : ''}">{res.text}</pre>
             {/if}

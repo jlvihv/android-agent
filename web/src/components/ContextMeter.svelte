@@ -154,7 +154,7 @@
       <div class="flex items-center gap-4 rounded-2xl bg-surface px-4 py-4">
         {@render ring(RING_BIG.size, RING_BIG.r, RING_BIG.sw, RING_BIG.fs)}
         <div class="flex min-w-0 flex-col">
-          <span class="text-[17px]">
+          <span class="text-row">
             {fmt(used)}{#if ctxWindow}<span class="text-muted">
                 / {fmt(ctxWindow)}</span
               >{/if}
@@ -175,8 +175,8 @@
           <div
             class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
           >
-            <span class="text-[15px]">缓存命中</span>
-            <span class="ml-auto text-[15px] text-muted">
+            <span class="text-ui">缓存命中</span>
+            <span class="ml-auto text-ui text-muted">
               {fmtPct(total.cache_hit_ratio)}
             </span>
           </div>
@@ -184,16 +184,16 @@
         <div
           class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
         >
-          <span class="text-[15px]">未缓存输入</span>
-          <span class="ml-auto text-[15px] text-muted"
+          <span class="text-ui">未缓存输入</span>
+          <span class="ml-auto text-ui text-muted"
             >{fmt(total.uncached_input)} token</span
           >
         </div>
         <div
           class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
         >
-          <span class="text-[15px]">缓存读取</span>
-          <span class="ml-auto text-[15px] text-muted"
+          <span class="text-ui">缓存读取</span>
+          <span class="ml-auto text-ui text-muted"
             >{fmt(total.cache_read)} token</span
           >
         </div>
@@ -201,8 +201,8 @@
           <div
             class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
           >
-            <span class="text-[15px]">缓存写入</span>
-            <span class="ml-auto text-[15px] text-muted"
+            <span class="text-ui">缓存写入</span>
+            <span class="ml-auto text-ui text-muted"
               >{fmt(total.cache_write)} token</span
             >
           </div>
@@ -210,8 +210,8 @@
         <div
           class="flex items-baseline gap-3 border-t-2 border-ink px-3.5 py-3 first:border-t-0"
         >
-          <span class="text-[15px]">输出</span>
-          <span class="ml-auto text-[15px] text-muted"
+          <span class="text-ui">输出</span>
+          <span class="ml-auto text-ui text-muted"
             >{fmt(total.output)} token</span
           >
         </div>

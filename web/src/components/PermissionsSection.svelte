@@ -78,7 +78,7 @@
           class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3 text-left last:border-b-0"
         >
           <span class="min-w-0 flex-1">
-            <span class="block text-[17px]">{it.title}</span>
+            <span class="block text-row">{it.title}</span>
             <span class="block text-meta text-muted">{it.desc}</span>
           </span>
           <span class="shrink-0 text-meta text-accent">去开启</span>
@@ -89,7 +89,7 @@
           class="flex items-center gap-3 border-b-2 border-ink px-3.5 py-3 last:border-b-0"
         >
           <span class="min-w-0 flex-1">
-            <span class="block text-[17px]">{it.title}</span>
+            <span class="block text-row">{it.title}</span>
             <span class="block text-meta text-muted">{it.desc}</span>
           </span>
           {#if it.state === "granted"}

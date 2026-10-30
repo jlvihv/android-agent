@@ -42,7 +42,7 @@
   <div class="overflow-hidden rounded-2xl bg-surface">
     <div class="flex items-center gap-3 px-3.5 py-3">
       <span class="min-w-0 flex-1">
-        <span class="block text-[17px]">配对码</span>
+        <span class="block text-row">配对码</span>
         <span
           class="block truncate text-meta {locked ? 'text-bad' : 'text-muted'}"
         >
@@ -50,7 +50,7 @@
         </span>
       </span>
       {#if locked}
-        <span class="shrink-0 py-1 text-[15px] text-bad">重启核心换新码</span>
+        <span class="shrink-0 py-1 text-ui text-bad">重启核心换新码</span>
       {:else}
         <span
           class="shrink-0 font-mono text-[26px] leading-none tracking-[0.14em] text-fg"

@@ -61,7 +61,7 @@
         >
           <span class="min-w-0 flex-1">
             <span
-              class="block truncate text-[17px] {s.enabled ? '' : 'text-muted'}"
+              class="block truncate text-row {s.enabled ? '' : 'text-muted'}"
               >{s.name}</span
             >
             <span

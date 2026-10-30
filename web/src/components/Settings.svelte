@@ -100,7 +100,7 @@
                last:border-b-0"
       >
         <span class="min-w-0 flex-1">
-          <span class="block truncate text-[17px]">{p.name}</span>
+          <span class="block truncate text-row">{p.name}</span>
           <span
             class="block truncate text-meta {p.current
               ? 'text-accent'
