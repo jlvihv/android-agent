@@ -75,9 +75,11 @@ const blank = (l: string) => !l.trim();
 
 /** 行首的 HTML 开口：`<div>` / `</div>` / `<!…` 这类完整标签 */
 const HTML_BLOCK = /^ {0,3}(?:<!|<\/?[a-zA-Z][\w:-]*(?:\s[^<>]*)?>)/;
-/** 自己就是完整的，不计层数 */
+/** 自己就是完整的，不算一层：HTML 的空元素 + SVG 里没子节点的那些（可以不写 `/`） */
 const VOID =
-  /^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i;
+  /^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr|path|rect|circle|ellipse|line|polyline|polygon|stop|use|animate|set)$/i;
+/** 一个标签：可选 `/` + 标签名 + 属性 + `>` */
+const TAG = /<(\/?)([a-zA-Z][\w:-]*)([^<>]*)>/g;
 
 /** 收一个 HTML 块：容器没闭合时空行不算完，按标签层数判闭合 */
 function htmlBlock(
@@ -86,22 +88,26 @@ function htmlBlock(
 ): { body: string[]; end: number } {
   const body: string[] = [];
   let depth = 0;
+  /** 上一行末尾那段还没等到 `>` 的标签：属性多了会换行，一个 `<path` 能跨三行 */
+  let rest = "";
   while (i < lines.length) {
-    const l = lines[i];
-    if (blank(l)) {
-      if (depth <= 0) break;
-      body.push("");
-      i++;
-      continue;
+    const s = rest + lines[i];
+    let end = 0;
+    for (const m of s.matchAll(TAG)) {
+      end = m.index + m[0].length;
+      if (m[3].trimEnd().endsWith("/") || VOID.test(m[2])) continue;
+      depth += m[1] ? -1 : 1;
     }
-    for (const m of l.matchAll(/<(\/?)([a-zA-Z][\w:-]*)/g)) {
-      if (!VOID.test(m[2])) depth += m[1] ? -1 : 1;
-    }
-    body.push(l);
+    const lt = s.indexOf("<", end);
+    rest = lt !== -1 && /[a-zA-Z/!]/.test(s[lt + 1] ?? "") ? s.slice(lt) : "";
+    // 一直等不到 `>` 的 `<`（比如正文里一句 `x<b 没有右括号`）会让 `rest` 每行都
+    // 变长一点，拼接就是 O(n²)：实测 8000 行要 560ms，而它跑在流式渲染的每一帧上。
+    // 真标签没有这么长的，超了就当普通文字。
+    if (rest.length > 2000) rest = "";
+    body.push(lines[i]);
     i++;
-    // 这一行把标签都闭合了：只有下一行也是标签时才并进同一块（连着写几个卡片
-    // 是常见写法），否则回车就是段落。
-    if (depth <= 0 && !HTML_BLOCK.test(lines[i] ?? "")) break;
+    // 层数见底、标签也写完了，下一行又不是标签 —— 这块收完了
+    if (!rest && depth <= 0 && !HTML_BLOCK.test(lines[i] ?? "")) break;
   }
   return { body, end: i };
 }
