@@ -758,7 +758,7 @@ async fn machines_forget(State(st): State<Arc<AppState>>, Json(b): Json<MachineB
 fn no_store() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        "这台机器没有会话库，机器记账没地方放（桌面：AGENT_DATA_DIR / 宿主模式的数据目录）",
+        "这台机器没有会话库，机器记账没地方放（桌面：~/.local/share/android-agent/data）",
     )
         .into_response()
 }
@@ -1569,17 +1569,12 @@ async fn set_notify_config(State(st): State<Arc<AppState>>, Json(b): Json<Notify
     }
 }
 
-/// `GET /api/websearch/config` → 配没配 Exa key（设置页用）。key 本身不回，只回末尾几位；
-/// `fromEnv` = 环境变量 `EXA_API_KEY` 给的（桌面开发），设置页里改不了它。
+/// `GET /api/websearch/config` → 配没配 Exa key（设置页用）。key 本身不回，只回末尾几位。
 async fn search_config(State(st): State<Arc<AppState>>) -> Json<Value> {
-    let env = std::env::var("EXA_API_KEY")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
     let key = crate::search::read_key(&st);
     Json(json!({
         "configured": key.is_some(),
         "keyHint": key.as_deref().map(crate::providers::key_hint),
-        "fromEnv": env.is_some(),
     }))
 }
 
