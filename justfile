@@ -212,9 +212,13 @@ android-bindings:
       --language kotlin --out-dir ../{{mod}}/src/main/java "${fmt[@]}"
 
 # 2) 交叉编译 Rust 核心 → jniLibs。只出 arm64-v8a（模拟器要 x86_64：`just emu-install`）。
+#
+#    profile 决定 LTO 档，实测（M 系 Mac，改一行 → 出 .so）：
+#      release（fat LTO）        46s，.so 8.10MB —— 发版用
+#      release-thin（thin LTO）  27s，.so 8.37MB —— debug 包用，快 40%，大 261KB
 #    编完验 16KB 对齐（Play 对 targetSdk 35+ 有要求，R1）—— 这个检查很便宜，别省：
 #      llvm-readelf -l {{jni}}/arm64-v8a/libagent_core.so | awk '/LOAD/{print $NF}'
-android-libs:
+android-libs profile="release":
     #!/usr/bin/env bash
     set -eu
     # cargo-ndk 同样要 cwd 在 crate 目录里
@@ -234,7 +238,7 @@ android-libs:
     # 去命中上一次的产物是纯赚（cargo 在 RUSTC_WRAPPER 存在时会关掉增量，对 release
     # 无损）。没装 sccache 就照旧走。
     if command -v sccache >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi
-    cargo ndk "${ts[@]}" -o ../{{jni}} build --release --lib
+    cargo ndk "${ts[@]}" -o ../{{jni}} build --profile {{profile}} --lib
     echo "--- 16KB 对齐检查（Play 对 targetSdk 35+ 有要求，R1）---"
     # NDK 的预编译工具目录：Linux 是 linux-x86_64，macOS（含 Apple 芯片）是 darwin-x86_64
     host=linux-x86_64; [ "$(uname)" = Darwin ] && host=darwin-x86_64
@@ -274,7 +278,7 @@ android-assets:
 # 反过来装上去的永远是上一次的前端。
 # assemble 前删掉上一版 APK / 中间产物：AGP 增量打包在 .so 变动时会留一块全零
 # 空洞（实测 9.0MB → 12.6MB），从零打一遍不到 1 秒。
-android-debug: android-bindings (web "build") android-libs
+android-debug: android-bindings (web "build") (android-libs "release-thin")
     #!/usr/bin/env bash
     set -eu
     . scripts/jdk.sh
@@ -289,7 +293,7 @@ android-install: android-debug
     cd {{and}} && ./gradlew :app:installDebug
 
 # release APK：R8 混淆/压缩 + 签名（见 app/build.gradle.kts 里的 signingConfigs）。
-# 原生核心两者都是 release（android-libs 里的 `--release`），区别只在
+# 原生核心用 fat LTO 的 release（debug 包那边是 release-thin，见 android-libs），区别只在
 # Kotlin/dex 那层和签名。
 #
 # assemble 前同样删一遍（理由见 android-debug 上面那段）。
