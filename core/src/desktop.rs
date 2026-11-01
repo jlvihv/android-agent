@@ -143,23 +143,6 @@ fn probe_computer_name() -> String {
     "电脑".into()
 }
 
-/// 广播用哪个名字：默认是这台电脑的名字（`computer_name`），`AGENT_ADVERT_NAME` 可以换。
-///
-/// 为什么需要这个开关：同一台机器上跑**两个**核心时（比如在另一个端口上验新构建），
-/// 两个同名服务在 mDNS 里没法共存 —— 先起的那个报「本地名称冲突」静默死掉，
-/// 手机上只剩下后起的那个。给第二个实例换个名字：
-///
-/// ```sh
-/// AGENT_ADVERT_NAME="jl 测试" AGENT_PORT=8789 ./core/target/release/agent-dev
-/// ```
-pub fn advert_name() -> String {
-    std::env::var("AGENT_ADVERT_NAME")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(computer_name)
-}
-
 /// 广播进程起来之后，隔多久去确认它还活着（见 `Advert::failure`）。
 ///
 /// `avahi-publish-service` 跟 daemon 说上话要几十毫秒；这个值取得比它宽裕，

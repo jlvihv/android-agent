@@ -106,7 +106,7 @@ async fn run() -> anyhow::Result<()> {
         if let Ok(mut g) = core.state.pairing.write() {
             *g = Some(pairing.clone());
         }
-        let name = agent_core::desktop::advert_name();
+        let name = agent_core::desktop::computer_name();
         let mut advert = agent_core::desktop::advertise(&name, actual, &core.state.instance_id());
         // 广播进程起来后**立刻退出**是常事（avahi-daemon 没跑、这个名字已经被这台
         // 机器上另一个核心占了），而它只往 stderr 说一句就不再出声 —— 不确认一下
@@ -136,7 +136,7 @@ async fn run() -> anyhow::Result<()> {
                 println!(
                     "     起好系统的 mDNS 服务再重启核心（Linux: systemctl enable --now avahi-daemon）；"
                 );
-                println!("     这台机器上已经有另一个核心在广播的话，给新的换个名字：AGENT_ADVERT_NAME=…");
+                println!("     这台机器上已经有另一个核心在广播的话，同名服务在 mDNS 里只能留一个 —— 别同时开两个。");
             }
         }
         // 出门在外：证书一直有（配对时手机就记下指纹，之后配上中继不用重新配对）。

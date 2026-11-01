@@ -249,8 +249,8 @@ AGENT_BIND=127.0.0.1 just dev
     广播一直是死的，而终端一直在说「手机上点「jl」」。）
   - 前提是系统的 mDNS 服务真在跑：Linux 要 `systemctl enable --now avahi-daemon`
     （Arch 装完 avahi 默认不 enable，这里就撞过）。同名服务在 mDNS 里没法共存
-    —— 先起的那个静默死掉、别的机器上只剩后起的 —— 同一台机器上跑第二个核心就
-    给它换个名字：`AGENT_ADVERT_NAME="jl 测试" AGENT_PORT=8789 …`（默认取 `computer_name()`）。
+    —— 先起的那个静默死掉、别的机器上只剩后起的，所以**同一台机器上别同时开两个核心**
+    （广播名恒等于电脑名，没有改名开关）。
 - **找别的核心**：一份发现，两个宿主。
   - 电脑上是核心自己起的 `avahi-browse -rp _agent-core._tcp`（`desktop::browse`，
     跟着核心一直挂着）：一行一行读，出现／解出／消失分别对应面板上多一行／补上地址／
