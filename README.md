@@ -10,12 +10,12 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 
 | 部分                 | 状态                                                                                                                                                                                                                                                                                                             |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `core/` Rust         | ✅ 320 个测试全过，clippy 干净                                                                                                                                                                                                                                                                                   |
+| `core/` Rust         | ✅ 47 个测试（只留不变量级别的），clippy 干净                                                                                                                                                                                                                                                                                   |
 | `web/` Svelte        | ✅ 构建通过（169 KB JS / 61 KB gzip）                                                                                                                                                                                                                                                                            |
 | `android/` 壳        | ✅ **真机验证通过**                                                                                                                                                                                                                                                                                              |
 | LLM                  | ✅ OpenCode Go / `deepseek-v4.1-flash`，真机跑通                                                                                                                                                                                                                                                                 |
 | Linux 沙箱           | ✅ **Alpine 3.24 aarch64 在真机上跑起来**，`apk add` 可用；设置里能一键原地升级 Alpine                                                                                                                                                                                                                           |
-| 桌面宿主模式         | ✅ `just dev-host`：不套沙箱，`bash`/`read`/`edit` 直接作用在这台机器上；**Linux 和 macOS** 都行（[docs/11](docs/11-host-mode.md)）                                                                                                                                                                              |
+| 桌面（原生）         | ✅ `just dev`：`bash`/`read`/`edit` 直接作用在这台机器上；**Linux 和 macOS** 都是这一种形态（没有沙箱可切，[docs/11](docs/11-host-mode.md)）                                                                                                                                                                   |
 | 出门在外连家里电脑   | ✅ 一台有公网 IP 的服务器当中继（`just relay-deploy root@IP`）；端到端 TLS，中继看不到内容（[docs/12](docs/12-relay.md)）                                                                                                                                                                                        |
 | 换机器（谁连谁都行） | ✅ 侧栏底栏那个标签点开就是「选择机器」：**手机和电脑浏览器是同一份面板**，电脑也能连另一台电脑（手机连、电脑连都走核心里同一条隧道；页面拿不到任何机器的凭据；[docs/12](docs/12-relay.md)）                                                                                                                     |
 | 桌面浏览器           | ✅ 核心**自己起**无头 Chrome（CDP），`agent browser` 在桌面上也能用（[docs/08](docs/08-browser.md) 第 15 节）                                                                                                                                                                                                    |
@@ -32,35 +32,22 @@ Agent 拿到的能力：**读界面 / 操作界面 / 跑 Linux 命令 / 改文�
 ## 快速开始（桌面）
 
 ```sh
-# 1. 准备 Linux 沙箱（x86_64，用于桌面开发）
-mkdir -p .dev/linux && cd .dev/linux
-curl -sSL -o alpine-minirootfs.tar.gz \
-  https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.2-x86_64.tar.gz
-mkdir -p rootfs && tar xzf alpine-minirootfs.tar.gz -C rootfs
-cd ../..
-
-# 2. 配 LLM（.env.local 已在 .gitignore 里）
-cat > .env.local <<'EOF'
-OPENCODE_BASE_URL=https://opencode.ai/zen/go/v1
-OPENCODE_API_KEY=oc_sk_...
-OPENCODE_MODEL=deepseek-v4.1-flash
-EOF
-chmod 600 .env.local
-
-# 3. 构建前端 + 起核心
+# 1. 构建前端 + 起核心
 just web-build
-just dev        # 沙箱里跑：bash 在 Alpine rootfs 里，改不到你的机器
-# just dev-host  # 宿主模式：没有沙箱，bash / read / edit 直接作用在这台机器上（macOS 只有这个）
+just dev        # 桌面：bash / read / edit 直接作用在这台机器上（没有沙箱）
 
-# 4. 另开一个终端，让 agent 干活
-python3 scripts/agentctl.py "在沙箱里建一个 FizzBuzz 脚本，跑一下"
+# 2. 配 LLM：打开 http://127.0.0.1:8787 → 设置 → 模型提供商，填 base URL / key / 模型。
+#    配置写进**库**（`~/.local/share/android-agent/data/sessions.db`）。
+#    **没有 LLM 环境变量**：库是唯一来源。
+
+# 3. 另开一个终端，让 agent 干活
+python3 scripts/agentctl.py "建一个 FizzBuzz 脚本，跑一下"
 ```
 
 打开 <http://127.0.0.1:8787> 就是完整 App —— 和手机上 WebView 看到的是同一份东西。
 
-**想直接用这台机器**（不套沙箱）：`just dev-host` —— `bash` / `read` / `edit`
-改的就是本机真文件；cwd（`/workspace` 的落点）默认是这个仓库，
-`AGENT_HOST_WORKSPACE="$PWD" just dev-host` 可以换成现在这个目录。
+`bash` / `read` / `edit` 改的就是本机真文件；cwd（`/workspace` 的落点）是
+**启动核心时的当前目录**，也就是这个仓库（要换：`cd` 过去再跑）。
 **这台机器上只跑一个核心**：已经有一个在跑时，新起的那个会直接拒绝并告诉你它的
 pid（同时跑两个会静默地互相干扰），要两个就 `AGENT_MULTI=1`。
 差别、代价和实现见 [docs/11-host-mode.md](docs/11-host-mode.md)。
@@ -72,9 +59,7 @@ pid（同时跑两个会静默地互相干扰），要两个就 `AGENT_MULTI=1`�
 # ~/.config/systemd/user/android-agent.service
 [Service]
 WorkingDirectory=%h/Code/project/android-agent
-EnvironmentFile=-%h/Code/project/android-agent/.env.local   # 模型 / 中继都从这来
-Environment=AGENT_LINUX_HOST=1
-Environment=AGENT_HOST_WORKSPACE=%h/Code/project/android-agent
+EnvironmentFile=-%h/Code/project/android-agent/.env.local   # 中继密钥这类（模型在库里）
 Environment=AGENT_PORT=8787
 ExecStart=%h/Code/project/android-agent/core/target/release/agent-dev
 Restart=always
@@ -87,10 +72,9 @@ WantedBy=default.target
 systemctl --user enable --now android-agent     # 开机自启（配上 loginctl enable-linger）
 ```
 
-unit 里**不写模型配置**：核心自己认 `OPENCODE_*`（`AGENT_LLM_*` 优先、回退它，见
-`core/src/llm.rs` 的 `from_env`），真实来源只有 `.env.local` 一个。要跑的是 release
-二进制，所以改完代码先 `scripts/restart-core.sh`（它发现核心归 systemd 管时会用
-`systemctl --user restart`）。
+unit 里**不写模型配置**：模型在库里（设置页写进去的，`llm` + `providers` 表），核心不读
+任何 `AGENT_LLM_*` 环境变量。unit 只管进程和环境（`AGENT_PORT` / 中继密钥）。要跑的是 release 二进制，所以改完代码先 `scripts/restart-core.sh`（它发现核心
+归 systemd 管时会用 `systemctl --user restart`）。
 
 对**手机上**跑着的那个（不用重装 APK、也不用手点手机屏幕）：
 
@@ -150,7 +134,7 @@ just phone                                   # 交互模式，/help 看命令
 | 工具   | 作用                                                                                                                                                                                        |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `read` | 读文件：文本带 `offset` / `limit` / `numbered`（`numbered=true` 加 `cat -n` 同款行号；截断到 2000 行或 50KB），没读完时末尾写明整个文件多少行、多大、从哪续读；**图片缩放后直接发给模型看** |
-| `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`），cwd 是 `/workspace`                                                                                                                                 |
+| `bash` | 在 Alpine 沙箱里跑命令（可 `apk add`），cwd 是 `/workspace`；桌面上就是本机的 bash，cwd 是启动核心的目录                                                                                    |
 | `edit` | 改文件：按原文精确替换，返回 unified diff；新建文件：只给 `content`                                                                                                                         |
 
 设备操作（读界面 / 点 / 输入 / 按键 / 启动应用）**不作为工具**暴露给模型 ——
@@ -193,7 +177,7 @@ App 随时被杀都没关系。
 | [docs/08-browser.md](docs/08-browser.md)                                       | agent 的浏览器：无头 WebView、看板、截图                                                                                  |
 | [docs/09-search.md](docs/09-search.md)                                         | 联网搜索：Exa 的两种接口、为什么不要钱                                                                                    |
 | [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md)                     | **工具表为什么只有三个**：判据、代价、加能力的步骤                                                                        |
-| [docs/11-host-mode.md](docs/11-host-mode.md)                                   | **宿主模式**：桌面上不套沙箱，直接用这台机器（怎么做的、代价）                                                            |
+| [docs/11-host-mode.md](docs/11-host-mode.md)                                   | **桌面**：桌面上不套沙箱，直接用这台机器（怎么做的、代价）                                                            |
 | [docs/12-relay.md](docs/12-relay.md)                                           | **换机器**：手机/电脑连到另一台机器上的核心（隧道、局域网/中继、页面不拿凭据、部署与验证）                                |
 | [docs/15-shizuku.md](docs/15-shizuku.md)                                       | **特权命令** `agent shizuku`：binder 优先的状态机、反射调隐藏 API、为什么判断留在 Rust 侧、以及「不审批」的代价           |
 | [docs/13-phone.md](docs/13-phone.md)                                           | **手机系统能力**：闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板 / 通知 / 朗读，以及「按机器显示不同子命令」与权限那套阻塞桥 |
@@ -203,8 +187,7 @@ App 随时被杀都没关系。
 
 | 命令                              | 作用                                                                                                                                                                                                                      |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `just dev`                        | 起核心（桌面，mock 设备 + 本地 rootfs）                                                                                                                                                                                   |
-| `just dev-host`                   | 起核心（桌面**宿主模式**：没有沙箱，直接跑在这台机器上）                                                                                                                                                                  |
+| `just dev`                        | 起核心（桌面 = 这台电脑：没有沙箱，`bash` / `read` / `edit` 直接作用在本机）                                                                                                                                               |
 | `just web-dev`                    | 起 Vite（`/api` 代理到核心）                                                                                                                                                                                              |
 | `just test`                       | Rust 测试                                                                                                                                                                                                                 |
 | `just smoke`                      | 端到端：一句话 → 工具执行 → 复述                                                                                                                                                                                          |
@@ -243,7 +226,7 @@ just android-log        # 看 agent 的日志
 . scripts/dev.sh
 dev_restart      # 重装 + 重启 + 转发端口
 dev_a11y_on      # 开无障碍（保留已有的其它服务）
-dev_llm          # 注入 .env.local 里的 LLM 配置
+dev_llm          # 把 .env.local 的 AGENT_LLM_* 推给手机（写进它的库）
 dev_shell 'uname -m'
 ```
 

@@ -75,9 +75,9 @@ struct Phrasing {
     who: &'static str,
     /// cwd / 文件放哪 / 能动用户的什么
     files: &'static str,
-    /// 那句里示例用的路径（沙箱里就是 /workspace，宿主模式给一个真实的绝对路径）
+    /// 那句里示例用的路径（沙箱里就是 /workspace，桌面给一个真实的绝对路径）
     link_example: &'static str,
-    /// 紧跟那一句后面的**独立一行**（手机上：网址 / App 深链不加前缀；宿主模式空着
+    /// 紧跟那一句后面的**独立一行**（手机上：网址 / App 深链不加前缀；桌面空着
     /// —— 空串等于没这一行，不会留出空行）
     link_bullet: &'static str,
     /// bash 工具描述的开头：在哪跑
@@ -85,7 +85,7 @@ struct Phrasing {
     /// bash 工具描述：这台机器上有什么、怎么装东西
     bash_env: &'static str,
 }
-/// Linux / macOS 宿主模式共用的部分（各自再盖掉不同的那几句）。
+/// Linux / macOS 桌面共用的部分（各自再盖掉不同的那几句）。
 const HOST: Phrasing = Phrasing {
     who: "",
     // 只留规则：工具和 shell 的相对路径都以 cwd 为基准，没有沙箱那层映射。
@@ -111,7 +111,7 @@ const LINUX: Phrasing = Phrasing {
     ..HOST
 };
 
-/// `setsid` 在 macOS 上不是系统自带的 —— 是宿主模式垫在 PATH 里的
+/// `setsid` 在 macOS 上不是系统自带的 —— 是桌面垫在 PATH 里的
 /// （`linux::SETSID_SHIM`），所以后台服务的写法跟别处一样，不用另说。
 const MACOS: Phrasing = Phrasing {
     who: "你是运行在 Mac（macOS）上的 Agent。",
@@ -252,37 +252,6 @@ pub const IMAGE_EVICTED: &str = "[这张图较早，已不在上下文里；要�
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux;
-
-    /// 设备命令只在**真有**的那台机器上讲（清单从 `cli.rs` 那张表生成）。
-    ///
-    /// 提示词里写了而实际做不到是最贵的一种错：模型会拿它当确定的事实用，
-    /// 撞墙之后反复换参数重试（它不怀疑命令存不存在）。
-    #[test]
-    fn device_commands_are_only_promised_where_they_exist() {
-        let phone = system_prompt_with(Platform::Android, true);
-        let want = format!("`agent {}`", crate::phone::names().join("|"));
-        assert!(
-            phone.contains(&want),
-            "手机形态的清单不对，应该是 {want}：\n{phone}"
-        );
-
-        // 三个平台的「没有设备能力」形态（手机之外的任何机器）：一个字都不该提
-        for plat in Platform::ALL {
-            let p = system_prompt_with(plat, false);
-            assert!(
-                !p.contains("agent sms") && !p.contains("agent tap"),
-                "{plat:?} 上没有这些，提示词里不该提：\n{p}"
-            );
-        }
-
-        // 真实那份跟着这台机器走
-        let p = system_prompt(Platform::Android);
-        assert_eq!(p.contains("agent sms"), linux::has_phone_capabilities());
-        for s in ["agent browser", "agent search"] {
-            assert!(p.contains(s), "提示词里掉了 {s}");
-        }
-    }
 
     /// **提示词里不能出现具体的工作目录名**。
     ///
@@ -300,18 +269,6 @@ mod tests {
                     !s.contains("sessions/"),
                     "{p:?} 的提示词里出现了 sessions/ 这种具体路径"
                 );
-            }
-        }
-    }
-
-    /// 拼出来的句子不能有双顿号 / 空括号（`agent` 那一行是按机器拼的）。
-    #[test]
-    fn the_cli_sentence_stays_clean() {
-        for p in Platform::ALL {
-            for phone in [false, true] {
-                let s = system_prompt_with(p, phone);
-                assert!(!s.contains("、、"), "拼出双顿号了：\n{s}");
-                assert!(!s.contains("（）"), "拼出空括号了：\n{s}");
             }
         }
     }

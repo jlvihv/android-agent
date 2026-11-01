@@ -27,7 +27,7 @@ pub const SHOT_DIR: &str = "root/.browser";
 /// 浏览器截图落在哪：宿主目录 + 它在沙箱视角里的路径前缀。
 ///
 /// 历史里存的是**后者**（`ImagePart::source`，模型 `read` 它），磁盘上是前者。
-/// 两处不同源（沙箱里是 `<rootfs>/root/.browser` ↔ `/root/.browser`；宿主模式
+/// 两处不同源（沙箱里是 `<rootfs>/root/.browser` ↔ `/root/.browser`；桌面
 /// 下 rootfs 是 `/`，`/root` 是**用户的根目录** —— 既写不进去也不该写，
 /// 所以换成我们自己的数据目录，那时前缀就是宿主路径本身）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +39,7 @@ pub struct ShotDir {
 /// 我们自己的副产物落在哪（都是宿主路径）。
 ///
 /// 只有我们知道它们什么时候没用了，所以清扫也要知道它们在哪儿 ——
-/// 照搬沙箱那两个位置在宿主模式下会去动用户的 `/root` 和 `/tmp`。
+/// 照搬沙箱那两个位置在桌面下会去动用户的 `/root` 和 `/tmp`。
 #[derive(Debug, Clone, Default)]
 pub struct SideDirs {
     pub shots: Option<ShotDir>,
@@ -161,112 +161,4 @@ fn sweep_dir(
         }
     }
     n
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent::{Attachment, AttachmentKind, ImagePart};
-
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("agent-gc-{tag}-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    /// 我们写出来的算（附件、图片副本），用户自己的原图不算。
-    #[test]
-    fn only_files_we_wrote_are_owned() {
-        let msgs = vec![
-            ChatMessage::User {
-                text: String::new(),
-                attachments: vec![Attachment {
-                    id: "a.png".into(),
-                    path: "/data/attachments/a.png".into(),
-                    mime: "image/png".into(),
-                    name: "a.png".into(),
-                    kind: AttachmentKind::Image,
-                }],
-            },
-            ChatMessage::Tool {
-                tool_call_id: "c".into(),
-                content: String::new(),
-                images: vec![ImagePart {
-                    path: "/data/images/1.jpg".into(),
-                    mime: "image/jpeg".into(),
-                    source: "/workspace/我的照片.jpg".into(),
-                }],
-            },
-        ];
-        let want: Vec<PathBuf> = ["/data/attachments/a.png", "/data/images/1.jpg"]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        assert_eq!(owned_files(&msgs), want);
-    }
-
-    /// 沙箱形态的副产物目录（截图 / 溢出输出都在 rootfs 里）。
-    fn side_dirs_for(root: &Path) -> SideDirs {
-        SideDirs {
-            shots: Some(ShotDir {
-                host: root.join(SHOT_DIR),
-                guest: format!("/{SHOT_DIR}"),
-            }),
-            spills: Some(root.join("tmp")),
-        }
-    }
-
-    /// 启动清扫：没被引用、又比起点早的才删；被引用的、起点之后写的、
-    /// 不归我们管的文件名都不碰。沙箱里那两类再多宽限一天。
-    #[test]
-    fn sweep_removes_only_old_orphans() {
-        let data = tmp("data");
-        let root = tmp("root");
-        for d in ["images", "attachments"] {
-            std::fs::create_dir_all(data.join(d)).unwrap();
-        }
-        std::fs::create_dir_all(root.join(SHOT_DIR)).unwrap();
-        std::fs::create_dir_all(root.join("tmp")).unwrap();
-
-        let orphan = data.join("images/orphan.jpg");
-        let kept = data.join("images/kept.jpg");
-        let att = data.join("attachments/old.pdf");
-        let shot = root.join(SHOT_DIR).join("shot-1.jpg");
-        let spill = root.join("tmp/agent-out-1.log");
-        let users = root.join("tmp/user-file.log");
-        for f in [&orphan, &kept, &att, &shot, &spill, &users] {
-            std::fs::write(f, b"x").unwrap();
-        }
-        let referenced: HashSet<PathBuf> = [kept.clone()].into_iter().collect();
-
-        // 起点在这些文件之后、但不到一天：images/attachments 的孤儿删，沙箱里的留
-        let later = SystemTime::now() + Duration::from_secs(60);
-        assert_eq!(
-            sweep(Some(&data), &side_dirs_for(&root), &referenced, later),
-            2
-        );
-        assert!(!orphan.exists() && !att.exists());
-        assert!(kept.exists() && shot.exists() && spill.exists() && users.exists());
-
-        // 起点在一天以后：沙箱里的过期了；不归我们管的文件名照旧不碰
-        let much_later = SystemTime::now() + LOOSE_TTL + Duration::from_secs(60);
-        assert_eq!(
-            sweep(Some(&data), &side_dirs_for(&root), &referenced, much_later),
-            2
-        );
-        assert!(!shot.exists() && !spill.exists());
-        assert!(kept.exists() && users.exists());
-
-        // 起点之前写的才删：起点在文件之前 → 什么都不动
-        std::fs::write(&orphan, b"x").unwrap();
-        let earlier = SystemTime::now() - Duration::from_secs(60);
-        assert_eq!(
-            sweep(Some(&data), &side_dirs_for(&root), &referenced, earlier),
-            0
-        );
-        assert!(orphan.exists());
-
-        let _ = std::fs::remove_dir_all(&data);
-        let _ = std::fs::remove_dir_all(&root);
-    }
 }

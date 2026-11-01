@@ -69,5 +69,5 @@ echo
 echo "  中继在 $host:$port 跑起来了。家里那台电脑启动核心前设上："
 echo "    export AGENT_RELAY=$host:$port"
 echo "    export AGENT_RELAY_KEY=$key"
-echo "  （写进仓库根目录的 .env.local，just dev-host 会自动读）"
+echo "  （写进仓库根目录的 .env.local，just dev 会自动读）"
 echo "  云服务器的安全组 / 防火墙要放行 TCP $port。"

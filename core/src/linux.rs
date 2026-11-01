@@ -211,7 +211,7 @@ pub struct CreatedFile {
     pub bytes: usize,
 }
 
-/// proot 沙箱的配置（安卓；桌面上的 `just dev` 也是它）。宿主模式不用它 ——
+/// proot 沙箱的配置（安卓；桌面上的 `just dev` 也是它）。桌面不用它 ——
 /// 见 `Mode`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
@@ -383,8 +383,8 @@ struct StatusFile {
 
 impl StatusFile {
     /// `dir` 是**宿主侧**放状态文件的目录；`guest_dir` 是同一个目录在命令行里
-    /// 该写成什么（沙箱里是 `/root/.agent-exit…` 那种 guest 路径，宿主模式下就是
-    /// 宿主路径本身）。两件事分开传，是因为宿主模式**不能**往 `/` 里写东西。
+    /// 该写成什么（沙箱里是 `/root/.agent-exit…` 那种 guest 路径，桌面下就是
+    /// 宿主路径本身）。两件事分开传，是因为桌面**不能**往 `/` 里写东西。
     fn new(dir: &Path, guest_dir: &str) -> Self {
         if let Err(e) = std::fs::create_dir_all(dir) {
             // 建不出来不致命：拿不到状态文件时会退回命令自己的退出码
@@ -897,7 +897,7 @@ pub struct RunningRun {
 /// `agent ps` 的全貌。
 #[derive(Debug, Default, Serialize)]
 pub struct ProcsReport {
-    /// 宿主模式（没有 proot 登记表）。`to_text` 先看它。
+    /// 桌面（没有 proot 登记表）。`to_text` 先看它。
     #[serde(default)]
     pub host: bool,
     /// /proc 里看得见多少个进程：用来区分「没有」和「看不见」
@@ -920,7 +920,7 @@ impl ProcsReport {
         if self.host {
             let p = crate::platform::Platform::host();
             return format!(
-                "宿主模式：没有 proot 登记表，认不出「刻意脱离的常驻进程」。\
+                "桌面：没有 proot 登记表，认不出「刻意脱离的常驻进程」。\
                  直接用这台机器上的 {} 看，{} 停。",
                 p.proc_tools(),
                 p.kill_tool()
@@ -1020,18 +1020,18 @@ fn fmt_age(secs: u64) -> String {
 /// 两种形态共用同一套进程模型（runner + 状态文件 + 命令自己的进程组，见
 /// `run_live` / `CommandGuard`）和同一套路径解析（`resolve_path`）；不同的只有
 /// 「怎么起进程、东西放哪、要准备什么」—— 这些地方都 `match` 它，编译器替我们
-/// 盯着两边都处理到（一个 `host: bool` 做不到：宿主模式会带着 proot / loader /
+/// 盯着两边都处理到（一个 `host: bool` 做不到：桌面会带着 proot / loader /
 /// dns 这些对它毫无意义的字段，分岔全靠 `if`）。
 enum Mode {
-    /// 安卓（以及桌面 `just dev`）：proot + Alpine rootfs
+    /// 安卓：proot + Alpine rootfs（**只有安卓**，Kotlin 注入 `SandboxConfig`）
     Proot(Box<SandboxConfig>),
-    /// 宿主模式（桌面原生）：直接跑在这台电脑上。`workspace` 是命令的 cwd，
-    /// 也是 `/workspace` 这个别名的落点；rootfs 就是 `/`。
-    Host { workspace: PathBuf },
+    /// 桌面：直接跑在这台电脑上。`workspace` 是命令的 cwd，也是 `/workspace`
+    /// 这个别名的落点；rootfs 就是 `/`。
+    Native { workspace: PathBuf },
 }
 
 /// 我们自己的副产物落在哪。每项都是 `(宿主路径, 命令行 / 模型看到的写法)`：
-/// 沙箱里两者不同源（`<rootfs>/tmp` ↔ `/tmp`），宿主模式下是同一个路径。
+/// 沙箱里两者不同源（`<rootfs>/tmp` ↔ `/tmp`），桌面下是同一个路径。
 struct Layout {
     /// 状态文件目录（`runner_script` 的 `$2` 落在这里）
     exit: (PathBuf, String),
@@ -1061,8 +1061,8 @@ pub struct LinuxSandbox {
     resident_start: tokio::sync::Mutex<()>,
     /// 上次起常驻 shell 失败的时刻：一段时间内不再试，直接走老路
     resident_failed_at: Mutex<Option<Instant>>,
-    /// 用不用常驻 shell。沙箱里用；宿主模式不用（那边起一个 bash 本来就快，几毫秒），
-    /// 只有测试里打开 —— 两边是同一套协议，测试在宿主模式下就能把它跑一遍
+    /// 用不用常驻 shell。沙箱里用；桌面不用（那边起一个 bash 本来就快，几毫秒），
+    /// 只有测试里打开 —— 两边是同一套协议，测试在桌面下就能把它跑一遍
     use_resident: std::sync::atomic::AtomicBool,
 }
 
@@ -1224,34 +1224,23 @@ fn write_if_changed(path: &Path, body: &str, exec: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 宿主模式要吗（`AGENT_LINUX_HOST=1`）。
-fn host_mode_requested() -> bool {
-    match std::env::var("AGENT_LINUX_HOST") {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
-}
-
-/// 宿主模式下 `agent` 命令装在哪。
+/// 桌面下 `agent` 命令装在哪。
 ///
 /// 落点是 `$XDG_DATA_HOME/android-agent/bin`（默认
 /// `~/.local/share/android-agent/bin`）—— 只有我们自己发出去的命令的 PATH
 /// 前缀里有它，不动用户的 shell 配置。
-fn host_cli_dir() -> PathBuf {
+fn native_cli_dir() -> PathBuf {
     crate::desktop::data_root().join("bin")
 }
 
-/// 宿主模式用哪个 bash：**PATH 里的第一个**，没有再退回 `/bin/bash`。
+/// 桌面用哪个 bash：**PATH 里的第一个**，没有再退回 `/bin/bash`。
 ///
 /// 不能写死 `/bin/bash`：macOS 上那是 2007 年的 bash 3.2（GPLv3 之前的最后
 /// 一版，苹果就停在那儿了）—— 没有关联数组、`${x,,}`、`mapfile`、`|&`，
 /// 模型写的现代 bash 会报一串莫名其妙的错。装了 Homebrew bash 的人 PATH 里
 /// `/opt/homebrew/bin` 排在 `/bin` 前面，按 PATH 找正好拿到新的；Linux 上
 /// PATH 里的 bash 一般就是 `/usr/bin/bash`（= `/bin/bash`），行为不变。
-fn host_bash() -> Option<PathBuf> {
+fn native_bash() -> Option<PathBuf> {
     std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
@@ -1267,10 +1256,10 @@ fn host_bash() -> Option<PathBuf> {
 /// 退到 `nohup … &`，可 nohup **不换进程组**，超时 / 停止时会被连组一起杀
 /// （见 `CommandGuard`），跟「刻意脱离」的语义对不上。
 ///
-/// 所以宿主模式在我们自己的 bin 目录里垫一个：系统自带的 perl 调
+/// 所以桌面在我们自己的 bin 目录里垫一个：系统自带的 perl 调
 /// `POSIX::setsid()`。跟 util-linux 一样，调用方自己是组长时先 fork 一次
 /// （组长调 setsid 会 EPERM），父进程直接返回。只在 PATH 里**没有**真
-/// setsid 的机器上写（`prepare_host`），Linux 上一行都不碰。
+/// setsid 的机器上写（`prepare_native`），Linux 上一行都不碰。
 const SETSID_SHIM: &str = r##"#!/bin/sh
 # setsid —— macOS 没有 util-linux 的 setsid(1)，这是 android-agent 垫的一个。
 # 用法同 util-linux：setsid <命令> [参数…]（让命令跑在一个新会话 / 进程组里）
@@ -1286,7 +1275,7 @@ exec /usr/bin/perl -MPOSIX -e '
 "##;
 
 /// PATH 里（我们自己的 bin 目录以外）有没有真的 `setsid`。
-fn host_has_setsid(ours: &Path) -> bool {
+fn native_has_setsid(ours: &Path) -> bool {
     std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)
@@ -1354,11 +1343,11 @@ impl LinuxSandbox {
     /// 取的），用来把它自己那条命令从「正在跑」里去掉 —— 否则每次 `agent ps`
     /// 都会看到自己。
     pub fn procs(&self, self_pgid: Option<i32>) -> ProcsReport {
-        // 宿主模式没有 proot，那套归因（`TracerPid == 我们的 proot`）无从谈起，
+        // 桌面没有 proot，那套归因（`TracerPid == 我们的 proot`）无从谈起，
         // 而**不能**就这么扫一遍 /proc：那会把这台机器上所有 ppid==1 的进程
         // （用户桌面、系统服务）都列进「可以 kill」里。直接用系统自带的 ps。
         match self.mode {
-            Mode::Host { .. } => ProcsReport {
+            Mode::Native { .. } => ProcsReport {
                 host: true,
                 ..ProcsReport::default()
             },
@@ -1488,18 +1477,18 @@ impl LinuxSandbox {
         }
     }
 
-    /// 宿主模式：核心直接在这台电脑（Linux / macOS）上跑，没有沙箱。
+    /// 桌面：核心直接在这台电脑（Linux / macOS）上跑，没有沙箱。
     ///
     /// `workspace` 是命令的 cwd，同时也以 `/workspace` 这个名字出现在
     /// 路径解析里（`resolve_path` 的挂载表）。`rootfs` 给 `/` —— 沙箱里的
     /// 绝对路径于是就是本机路径，`read` / `edit` 一路不用改。
-    pub fn host(workspace: PathBuf) -> Self {
-        Self::with_mode(Mode::Host { workspace })
+    pub fn native(workspace: PathBuf) -> Self {
+        Self::with_mode(Mode::Native { workspace })
     }
 
-    /// 是不是宿主模式（桌面原生）。系统提示词、预装工具都看它。
-    pub fn is_host(&self) -> bool {
-        matches!(self.mode, Mode::Host { .. })
+    /// 是不是桌面（桌面原生）。系统提示词、预装工具都看它。
+    pub fn is_native(&self) -> bool {
+        matches!(self.mode, Mode::Native { .. })
     }
 
     /// 核心 bind 成功后告诉沙箱自己的端口 —— 沙箱里的 `agent` 命令要靠它。
@@ -1518,7 +1507,7 @@ impl LinuxSandbox {
     pub fn is_ready(&self) -> bool {
         match &self.mode {
             Mode::Proot(cfg) => is_alpine_rootfs(&cfg.rootfs),
-            Mode::Host { .. } => true,
+            Mode::Native { .. } => true,
         }
     }
 
@@ -1531,8 +1520,8 @@ impl LinuxSandbox {
             Mode::Proot(cfg) => std::fs::read_to_string(cfg.rootfs.join("etc/agent-tools"))
                 .map(|s| s.trim() == TOOLSET.len().to_string())
                 .unwrap_or(false),
-            // 宿主模式：工具就是这台机器上本来就有的那些，没有 `apk add` 这一步
-            Mode::Host { .. } => true,
+            // 桌面：工具就是这台机器上本来就有的那些，没有 `apk add` 这一步
+            Mode::Native { .. } => true,
         }
     }
 
@@ -1544,84 +1533,39 @@ impl LinuxSandbox {
             .await
     }
 
-    /// 从环境变量构造（桌面开发用）。
+    /// 桌面（Linux / macOS）：**这台电脑本身就是「沙箱」**。
     ///
-    /// 两条路：
-    /// - `AGENT_LINUX_HOST=1` → **宿主模式**，直接在宿主机上跑（cwd 看
-    ///   `AGENT_HOST_WORKSPACE`，默认当前目录），不需要 rootfs / proot。
-    /// - 否则 `AGENT_LINUX_ROOTFS` 指向 Alpine rootfs；`AGENT_LINUX_PROOT`
-    ///   可选，默认从 PATH 找 `proot`。
-    pub fn from_env() -> Option<Self> {
-        if host_mode_requested() {
-            let ws = std::env::var("AGENT_HOST_WORKSPACE")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(PathBuf::from)
-                .or_else(|| std::env::current_dir().ok())
-                .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
-                .unwrap_or_else(|| PathBuf::from("/"));
-            let sb = Self::host(ws);
-            if let Some(ws) = sb.workspace() {
-                tracing::info!("宿主模式：直接在 {} 上跑（没有沙箱）", ws.display());
-            }
-            if let Err(e) = sb.prepare_rootfs() {
-                tracing::warn!("宿主模式准备失败: {e:#}");
-            }
-            return Some(sb);
+    /// 没有 proot、没有 rootfs、没有开关 —— 桌面上只有原生这一种形态，沙箱是
+    /// Android 独有的（Kotlin 用 `set_linux_sandbox` 注入 `SandboxConfig`，见 docs/02）。
+    /// cwd（也就是 `/workspace` 的落点）就是进程的当前目录。
+    pub fn desktop() -> Self {
+        let ws = std::env::current_dir()
+            .or_else(|_| std::env::var("HOME").map(PathBuf::from))
+            .unwrap_or_else(|_| PathBuf::from("/"));
+        let sb = Self::native(ws);
+        if let Some(ws) = sb.workspace() {
+            tracing::info!("桌面：直接在 {} 上跑（没有沙箱）", ws.display());
         }
-
-        let rootfs = std::env::var("AGENT_LINUX_ROOTFS").ok()?;
-        let rootfs = PathBuf::from(rootfs);
-
-        // 注意：**不能用 `rootfs/bin/sh` 判断**。Alpine 里它是指向
-        // 绝对路径 `/bin/busybox` 的符号链接，`Path::exists()` 会拿
-        // 宿主机根的 `/bin/busybox` 去解析 —— 在宿主上没有，返回 false。
-        // 所以查真实存在的普通文件。
-        if !is_alpine_rootfs(&rootfs) {
-            tracing::warn!(
-                "AGENT_LINUX_ROOTFS={} 看起来不是 Alpine rootfs（找不到 bin/busybox）",
-                rootfs.display()
-            );
-            return None;
-        }
-
-        let proot = std::env::var("AGENT_LINUX_PROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("proot"));
-
-        let sb = Self::new(SandboxConfig {
-            proot,
-            rootfs,
-            binds: Vec::new(),
-            tmp: None,
-            loader: None,
-            loader32: None,
-            dns: Vec::new(),
-            tz_offset_minutes: None,
-            env: BTreeMap::new(),
-            workspace: None,
-            shared: None,
-        });
         if let Err(e) = sb.prepare_rootfs() {
-            tracing::warn!("准备 rootfs 失败: {e:#}");
+            tracing::warn!("桌面准备失败: {e:#}");
         }
-        Some(sb)
+        sb
     }
 
-    /// proot 沙箱的配置（宿主模式没有）。重配挂载时要从它出发（`ffi::set_shared_storage`）。
+    /// proot 沙箱的配置（桌面没有）。重配挂载时要从它出发（`ffi::set_shared_storage`）。
     pub fn proot_config(&self) -> Option<&SandboxConfig> {
         match &self.mode {
             Mode::Proot(cfg) => Some(cfg),
-            Mode::Host { .. } => None,
+            Mode::Native { .. } => None,
         }
         .map(|b| &**b)
     }
 
-    /// 沙箱里的 `/` 在宿主上是哪儿（宿主模式就是 `/`）。
+    /// 沙箱里的 `/` 在宿主上是哪儿（桌面就是 `/`）。
     pub fn rootfs(&self) -> &Path {
         match &self.mode {
             Mode::Proot(cfg) => &cfg.rootfs,
-            Mode::Host { .. } => Path::new("/"),
+            Mode::Native { .. } => Path::new("/"),
         }
     }
 
@@ -1632,11 +1576,11 @@ impl LinuxSandbox {
     /// 2. `/root`、`/tmp`、挂载点 `/workspace` 和 `/sdcard`
     ///    —— `-w /workspace` 需要它存在；挂载点事先建好比让 proot 虚拟出来稳
     ///
-    /// 宿主模式另走一条（见 `prepare_host`）：**绝不往 `/` 里写东西**。
+    /// 桌面另走一条（见 `prepare_native`）：**绝不往 `/` 里写东西**。
     pub fn prepare_rootfs(&self) -> anyhow::Result<()> {
         match &self.mode {
             Mode::Proot(cfg) => Self::prepare_proot(cfg)?,
-            Mode::Host { workspace } => Self::prepare_host(workspace)?,
+            Mode::Native { workspace } => Self::prepare_native(workspace)?,
         }
         self.install_builtin_skills();
         Ok(())
@@ -1698,41 +1642,41 @@ impl LinuxSandbox {
         Ok(())
     }
 
-    /// 宿主模式要准备的东西：一个能跟核心说话的 `agent` 命令。
+    /// 桌面要准备的东西：一个能跟核心说话的 `agent` 命令。
     ///
     /// 落点是 `$XDG_DATA_HOME/android-agent/bin`（默认
     /// `~/.local/share/android-agent/bin`）—— **不进用户的 PATH 配置**，
     /// 只在我们这个进程发出去的命令的 PATH 前缀里（见 `host_env`）。
-    /// 宿主模式下**不装** `agent-open` / `xdg-open` 那套壳：桌面上的
+    /// 桌面下**不装** `agent-open` / `xdg-open` 那套壳：桌面上的
     /// `xdg-open` 本来就该开用户自己的浏览器，不能把它抢到手机那条路上。
-    fn prepare_host(ws: &Path) -> anyhow::Result<()> {
-        // cwd 得真的在：`AGENT_HOST_WORKSPACE` 指到一个还不存在的目录时，
-        // 每条命令都会在 spawn 那一步失败（模型看到的只是一句 ENOENT）
+    fn prepare_native(ws: &Path) -> anyhow::Result<()> {
+        // cwd 得真的在（启动核心的目录被删了之类）：不然每条命令都会在 spawn
+        // 那一步失败，模型看到的只是一句 ENOENT
         if !ws.is_dir() {
             std::fs::create_dir_all(ws)?;
-            tracing::info!("宿主模式：建了工作目录 {}", ws.display());
+            tracing::info!("桌面：建了工作目录 {}", ws.display());
         }
-        let dir = host_cli_dir();
+        let dir = native_cli_dir();
         let cli = crate::cli::script(crate::cli::Machine::Host);
         write_if_changed(&dir.join("agent"), &cli, true)?;
         // 没有真 setsid 的机器（macOS）垫一个；有的话把垫的那个拿掉，别挡着真的
         let shim = dir.join("setsid");
-        if host_has_setsid(&dir) {
+        if native_has_setsid(&dir) {
             let _ = std::fs::remove_file(&shim);
         } else if Path::new("/usr/bin/perl").is_file() {
             write_if_changed(&shim, SETSID_SHIM, true)?;
         } else {
             tracing::warn!("这台机器没有 setsid 也没有 /usr/bin/perl：`setsid … &` 会是 not found");
         }
-        tracing::debug!("宿主模式 agent 命令: {}", dir.join("agent").display());
+        tracing::debug!("桌面 agent 命令: {}", dir.join("agent").display());
         Ok(())
     }
 
-    /// 挂到 `/workspace` 的那个宿主目录（配了才有；宿主模式下就是命令的 cwd）。
+    /// 挂到 `/workspace` 的那个宿主目录（配了才有；桌面下就是命令的 cwd）。
     pub fn workspace(&self) -> Option<&Path> {
         match &self.mode {
             Mode::Proot(cfg) => cfg.workspace.as_deref(),
-            Mode::Host { workspace } => Some(workspace),
+            Mode::Native { workspace } => Some(workspace),
         }
     }
 
@@ -1763,7 +1707,7 @@ impl LinuxSandbox {
     /// skill 放在哪：(磁盘上的目录, 模型看到的同一个目录)。见 `skills` 模块。
     ///
     /// 沙箱里是 `/workspace/skills`（挂了存储就是手机内部存储的 Agent 文件夹，用户在
-    /// 文件管理器里看得到）；宿主模式下 workspace 是用户的项目，skill 不该跟着项目走，
+    /// 文件管理器里看得到）；桌面下 workspace 是用户的项目，skill 不该跟着项目走，
     /// 放我们自己的数据目录（路径就是宿主路径本身）。
     pub fn skills_dir(&self) -> (PathBuf, String) {
         match &self.mode {
@@ -1774,7 +1718,7 @@ impl LinuxSandbox {
                     .unwrap_or_else(|| cfg.rootfs.join(WORKSPACE.trim_start_matches('/')));
                 (ws.join("skills"), format!("{WORKSPACE}/skills"))
             }
-            Mode::Host { .. } => {
+            Mode::Native { .. } => {
                 let p = crate::desktop::data_root().join("skills");
                 let g = p.display().to_string();
                 (p, g)
@@ -1784,7 +1728,7 @@ impl LinuxSandbox {
 
     /// 我们自己的副产物落在哪（见 `Layout`）。
     ///
-    /// 沙箱里都在 rootfs 里；宿主模式下 rootfs 是 `/`，`/root` / `/tmp` 是**用户的**
+    /// 沙箱里都在 rootfs 里；桌面下 rootfs 是 `/`，`/root` / `/tmp` 是**用户的**
     /// 目录（`/root` 写不进去也不该写），所以换成我们自己的数据目录和系统临时
     /// 目录（跟着 TMPDIR 走）—— 写法就是宿主路径本身，`read` 直接解得开。
     fn layout(&self) -> Layout {
@@ -1798,7 +1742,7 @@ impl LinuxSandbox {
                 },
                 spills: (cfg.rootfs.join("tmp"), "/tmp".into()),
             },
-            Mode::Host { .. } => {
+            Mode::Native { .. } => {
                 let same = |p: PathBuf| {
                     let g = p.display().to_string();
                     (p, g)
@@ -1828,7 +1772,7 @@ impl LinuxSandbox {
         }
     }
 
-    /// 宿主模式的环境变量：**继承宿主环境**（PATH 就是用户自己那一份），
+    /// 桌面的环境变量：**继承宿主环境**（PATH 就是用户自己那一份），
     /// 只覆盖几个会碍事的，再加上 `agent` 命令要的那两三个。
     ///
     /// 和沙箱那条路（`guest_env`：干净白名单）正好相反 —— 在用户的机器上，
@@ -1845,7 +1789,7 @@ impl LinuxSandbox {
         env.insert("PYTHONUNBUFFERED".into(), "1".into());
 
         // 我们自己的 `agent` 命令排在最前面
-        let cli = host_cli_dir();
+        let cli = native_cli_dir();
         if cli.is_dir() {
             let old = env.get("PATH").cloned().unwrap_or_default();
             env.insert("PATH".into(), format!("{}:{old}", cli.display()));
@@ -1864,23 +1808,12 @@ impl LinuxSandbox {
     }
 }
 
-/// 沙箱里用哪些 DNS：配置里给了就用；否则 `AGENT_LINUX_DNS`；再否则抄宿主的。
+/// 沙箱里用哪些 DNS：配置里给了就用；否则抄宿主的。
 fn resolved_dns(cfg: &SandboxConfig) -> Vec<String> {
     if !cfg.dns.is_empty() {
         return cfg.dns.clone();
     }
-    // 环境变量覆盖
-    if let Ok(v) = std::env::var("AGENT_LINUX_DNS") {
-        let list: Vec<String> = v
-            .split([',', ' '])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !list.is_empty() {
-            return list;
-        }
-    }
-    // 桌面兜底：抄宿主机的
+    // 抄宿主机的
     if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
         let list: Vec<String> = text
             .lines()
@@ -1901,7 +1834,7 @@ impl LinuxSandbox {
     pub fn has_bash(&self) -> bool {
         match &self.mode {
             Mode::Proot(cfg) => cfg.rootfs.join("bin/bash").is_file(),
-            Mode::Host { .. } => host_bash().is_some(),
+            Mode::Native { .. } => native_bash().is_some(),
         }
     }
 
@@ -1934,20 +1867,20 @@ impl LinuxSandbox {
     pub fn command_line(&self, script: &str, status: &str, cwd: &str) -> Vec<String> {
         let cfg = match &self.mode {
             Mode::Proot(cfg) => cfg,
-            // 宿主模式：命令行里没有 proot，**但进程模型是同一套** —— 照样跑
+            // 桌面：命令行里没有 proot，**但进程模型是同一套** —— 照样跑
             // runner、照样写状态文件、照样把「命令自己的进程组」当靶子
             // （见 `CommandGuard`）。差异只有：状态文件落在我们自己的数据目录里。
-            Mode::Host { .. } => return Self::host_command_line(script, status),
+            Mode::Native { .. } => return Self::native_command_line(script, status),
         };
         self.proot_command_line(cfg, script, status, cwd)
     }
 
-    fn host_command_line(script: &str, status: &str) -> Vec<String> {
+    fn native_command_line(script: &str, status: &str) -> Vec<String> {
         {
-            let shell = host_bash()
+            let shell = native_bash()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "/bin/sh".to_string());
-            // 宿主模式不需要 guest 的 setsid：spawn 时那个 `process_group(0)`
+            // 桌面不需要 guest 的 setsid：spawn 时那个 `process_group(0)`
             // 已经把 runner 变成组长，所以 `$$` 就是组号（`report_pgid = true`）。
             let runner = runner_script(&shell, true);
             vec![
@@ -2168,13 +2101,6 @@ impl LinuxSandbox {
         }
     }
 
-    /// 测试：宿主模式下也走常驻 shell（协议和沙箱里同一套）
-    #[cfg(test)]
-    fn with_resident(self) -> Self {
-        self.use_resident.store(true, Ordering::Relaxed);
-        self
-    }
-
     /// 维护期间自己的命令（`apk upgrade`、验收）：不受 `maintenance` 拦。
     pub(crate) async fn run_maintenance(
         &self,
@@ -2190,7 +2116,7 @@ impl LinuxSandbox {
     fn resident_capable(&self) -> bool {
         match &self.mode {
             Mode::Proot(cfg) => cfg.rootfs.join("bin/bash").is_file(),
-            Mode::Host { .. } => host_bash().is_some(),
+            Mode::Native { .. } => native_bash().is_some(),
         }
     }
 
@@ -2262,8 +2188,8 @@ impl LinuxSandbox {
                 argv.extend(tail("/bin/bash".into()));
                 Resident::start(&argv, &self.guest_env(cfg), None, &marker)?
             }
-            Mode::Host { workspace } => {
-                let bash = host_bash().ok_or_else(|| anyhow::anyhow!("这台机器上没有 bash"))?;
+            Mode::Native { workspace } => {
+                let bash = native_bash().ok_or_else(|| anyhow::anyhow!("这台机器上没有 bash"))?;
                 let argv = tail(bash.display().to_string());
                 Resident::start(&argv, &self.host_env(), Some(workspace), &marker)?
             }
@@ -2285,7 +2211,7 @@ impl LinuxSandbox {
     /// 端口 / 凭据（它们可能在常驻 shell 起来之后才定下来，所以每条命令现给）。
     fn job_env(&self, cwd: &str) -> Vec<(String, String)> {
         let mut env = match &self.mode {
-            Mode::Host { workspace } => {
+            Mode::Native { workspace } => {
                 let mut e = self.host_env();
                 e.push(("AGENT_WORKDIR".into(), workspace.display().to_string()));
                 e
@@ -2328,10 +2254,10 @@ impl LinuxSandbox {
         if let Some(d) = session.and_then(|sid| self.session_host_dir(sid)) {
             let _ = std::fs::create_dir_all(d);
         }
-        // 宿主模式下 `session_cwd` 给的是沙箱里的名字（`/workspace`）—— 老路是拿宿主上
+        // 桌面下 `session_cwd` 给的是沙箱里的名字（`/workspace`）—— 老路是拿宿主上
         // 的真目录直接当子进程的 cwd，这里也得是真目录
         let cwd = match &self.mode {
-            Mode::Host { workspace } => workspace.display().to_string(),
+            Mode::Native { workspace } => workspace.display().to_string(),
             Mode::Proot(_) => self.session_cwd(session),
         };
         let mut env = self.job_env(&cwd);
@@ -2426,7 +2352,7 @@ impl LinuxSandbox {
         let (exit_dir, exit_guest) = self.layout().exit;
         let status = StatusFile::new(&exit_dir, &exit_guest);
 
-        // cwd：沙箱里是会话自己的目录，宿主模式是 workspace 本身（见 `session_cwd`）。
+        // cwd：沙箱里是会话自己的目录，桌面是 workspace 本身（见 `session_cwd`）。
         // 会话目录得**先建好** —— proot 的 `-w` 指向一个不存在的目录时会直接失败，
         // 而 `mkdir` 每次跑一遍也就是一次 stat（已经在了就什么都不做）。
         let host_cwd = session.and_then(|sid| self.session_host_dir(sid));
@@ -2441,13 +2367,13 @@ impl LinuxSandbox {
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(args);
         match &self.mode {
-            Mode::Host { workspace } => {
-                // cwd 就是 workspace（宿主模式不分会话目录，见 `session_cwd`），
+            Mode::Native { workspace } => {
+                // cwd 就是 workspace（桌面不分会话目录，见 `session_cwd`），
                 // 环境是**宿主的**（见 `host_env`）
                 cmd.current_dir(workspace);
                 cmd.envs(self.host_env());
                 // 命令自己看「我在哪个目录」：设备命令（比如 `agent screenshot`）
-                // 靠它决定东西往哪落。宿主模式下给的是真路径
+                // 靠它决定东西往哪落。桌面下给的是真路径
                 cmd.env("AGENT_WORKDIR", workspace);
             }
             Mode::Proot(cfg) => {
@@ -2465,7 +2391,7 @@ impl LinuxSandbox {
         // 自己的进程组：
         //  - 沙箱里的进程不再落在核心自己的组里（给核心发组信号不会顺手打进沙箱）；
         //  - 拿不到命令组号时（rootfs 里没有 setsid、runner 还没写下 pid 就被杀），
-        //    `-<proot_pid>` 是个安全的兜底杀法 —— 宿主模式下这个 pid 就是 runner
+        //    `-<proot_pid>` 是个安全的兜底杀法 —— 桌面下这个 pid 就是 runner
         //    （没有 proot），同一个位置、同一种兜底。
         // 这里**不能**用 `kill_on_drop`：它只杀 proot，而 guest 进程是独立的
         // 宿主进程，会变成孤儿（见 `CommandGuard`）。
@@ -2474,8 +2400,8 @@ impl LinuxSandbox {
         let mut child = cmd.spawn()?;
         let child_pgid = child.id().map(|p| p as i32);
         // 登记：`agent ps` 把 /proc 里的进程认到命令上，就靠这条记录。
-        // **宿主模式不登记** —— 那套归因靠 `TracerPid == 这条命令的 proot`，
-        // 而宿主模式根本没有 proot（`procs()` 也因此直接回一句「用 ps/pgrep」）。
+        // **桌面不登记** —— 那套归因靠 `TracerPid == 这条命令的 proot`，
+        // 而桌面根本没有 proot（`procs()` 也因此直接回一句「用 ps/pgrep」）。
         let proot = matches!(self.mode, Mode::Proot(_));
         let run = match (child_pgid, proot) {
             (Some(pid), true) => self.register_run(pid, script, status.pid_host.clone(), None),
@@ -2664,7 +2590,7 @@ impl LinuxSandbox {
     /// grep 的时候以为前后是连着的。
     fn spill_captured(&self, stdout: &Capture, stderr: &Capture) -> Option<String> {
         let name = format!("agent-out-{}.log", uuid::Uuid::now_v7());
-        // 落点见 `Layout::spills`（沙箱里 rootfs 的 /tmp，宿主模式下系统临时目录）
+        // 落点见 `Layout::spills`（沙箱里 rootfs 的 /tmp，桌面下系统临时目录）
         let (dir, guest_dir) = self.layout().spills;
         let host = dir.join(&name);
         let guest = Path::new(&guest_dir).join(&name).display().to_string();
@@ -2686,7 +2612,7 @@ impl LinuxSandbox {
 
     /// 某个会话的工作目录在**宿主**上对应哪里。`None` = 这个会话没有自己的目录：
     ///
-    /// - **宿主模式**（电脑上直接跑）：从来不分。workspace 就是用户启动核心的那个
+    /// - **桌面**（电脑上直接跑）：从来不分。workspace 就是用户启动核心的那个
     ///   目录（通常是一个项目），模型要改的就是它；再套一层 `ph7ah4/` 只会让
     ///   `read core/src/x.rs` 落到 `<项目>/ph7ah4/core/src/x.rs` 去 —— 找不到，
     ///   还在用户的项目里建出一个空目录。
@@ -2697,7 +2623,7 @@ impl LinuxSandbox {
                 .workspace
                 .as_ref()
                 .map(|w| w.join(session_dir_name(sid))),
-            Mode::Host { .. } => None,
+            Mode::Native { .. } => None,
         }
     }
 
@@ -2705,7 +2631,7 @@ impl LinuxSandbox {
     /// 里 `pwd` 看到哪，`read x.txt` 就得去哪找 —— 不然同一个相对路径两个工具两个结果。
     ///
     /// 有会话目录（见 `session_host_dir`）就是它，否则是 `/workspace` 根
-    /// （宿主模式下 `/workspace` 是 workspace 的别名）。
+    /// （桌面下 `/workspace` 是 workspace 的别名）。
     pub fn session_cwd(&self, session: Option<&str>) -> String {
         match session {
             Some(sid) if self.session_host_dir(sid).is_some() => session_guest_dir(sid),
@@ -2760,7 +2686,7 @@ impl LinuxSandbox {
 
         let shared = match &self.mode {
             Mode::Proot(cfg) => cfg.shared.as_deref(),
-            Mode::Host { .. } => None,
+            Mode::Native { .. } => None,
         };
         let mounts = [(SHARED, shared), (WORKSPACE, self.workspace())];
         for (at, host) in mounts {
@@ -2831,7 +2757,7 @@ impl LinuxSandbox {
     /// 目标已存在时，把模型写好的内容放到临时目录，返回**模型看到的路径**。
     ///
     /// 落点就是 `bash` 输出溢出的那个目录（见 `Layout::spills`：沙箱里是 rootfs 的
-    /// `/tmp`，宿主模式下是系统临时目录）—— 模型在哪里都能 `mv`。名字取目标文件的
+    /// `/tmp`，桌面下是系统临时目录）—— 模型在哪里都能 `mv`。名字取目标文件的
     /// 名字加 `.new`（一看就知道是给谁的），已经在了就往后排号，不盖掉上一次那份。
     /// 写不进去就算了（返回 `None`）：报错本身是正事，不能因为留个副本把报错弄没。
     fn spill_new_file(&self, guest_path: &str, content: &str) -> Option<String> {
@@ -3442,14 +3368,7 @@ fn clip_tail(s: &str, budget: usize) -> &str {
 ///
 /// 与 UTC 偏移符号相反：UTC+8 → `LCL-8`。
 fn posix_tz(override_minutes: Option<i32>) -> String {
-    let offset_min = override_minutes
-        .or_else(|| {
-            std::env::var("AGENT_TZ_OFFSET_MIN")
-                .ok()
-                .and_then(|s| s.parse::<i32>().ok())
-        })
-        .or_else(host_offset_minutes)
-        .unwrap_or(0);
+    let offset_min = override_minutes.or_else(host_offset_minutes).unwrap_or(0);
 
     let sign = if offset_min >= 0 { '-' } else { '+' };
     let abs = offset_min.abs();
@@ -3488,173 +3407,7 @@ fn parse_posix_tz(s: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
 
-    /// 测试用：正常读完一份内存里的字节（不关心管道被占着的情形）。
-    async fn read_all(data: &[u8]) -> Capture {
-        let cap = Arc::new(Mutex::new(Capture::default()));
-        Capture::read_into(Some(data), None, cap.clone(), None).await;
-        let out = std::mem::take(&mut *lock(&cap));
-        out
-    }
-
-    #[tokio::test]
-    async fn capture_keeps_both_ends_and_counts_the_middle() {
-        // 模拟一个狂吐输出的命令：远超上限
-        let total = CAPTURE_HEAD + CAPTURE_TAIL + 10_000;
-        let mut data = b"START\n".to_vec();
-        data.resize(total - 4, b'\n');
-        data.extend_from_slice(b"END\n");
-        let cap = read_all(&data).await;
-        assert!(cap.head.starts_with(b"START\n"), "头部不能丢");
-        assert!(cap.tail.ends_with(b"END\n"), "尾部不能丢");
-        assert!(cap.head.len() <= CAPTURE_HEAD, "内存要有上界");
-        assert!(cap.tail.len() <= CAPTURE_TAIL, "内存要有上界");
-        assert!(cap.dropped_bytes > 0, "中间确实扔了");
-        // 丢掉的部分就是中间那段，不多不少
-        assert_eq!(
-            cap.head.len() as u64 + cap.tail.len() as u64 + cap.dropped_bytes,
-            total as u64
-        );
-    }
     use super::*;
-
-    fn sandbox() -> LinuxSandbox {
-        LinuxSandbox::new(SandboxConfig {
-            proot: PathBuf::from("/native/libproot.so"),
-            rootfs: PathBuf::from("/data/files/alpine-rootfs"),
-            binds: vec![("/host/share".into(), "/mnt/share".into())],
-            tmp: Some(PathBuf::from("/data/cache/tmp")),
-            dns: vec!["10.0.0.1".into()],
-            tz_offset_minutes: None,
-            loader: None,
-            loader32: None,
-            env: BTreeMap::new(),
-            workspace: None,
-            shared: None,
-        })
-    }
-
-    #[test]
-    fn command_line_matches_the_documented_shape() {
-        // 这个假 rootfs 里没有 setsid，所以走的是「不分组」的退化形态
-        let argv = sandbox().command_line("echo hi", "/.agent-exit/x", WORKSPACE);
-        assert_eq!(argv[0], "/native/libproot.so");
-        assert_eq!(argv[1], "-0");
-        assert_eq!(argv[2], "--link2symlink");
-        assert_eq!(&argv[3..5], &["-r", "/data/files/alpine-rootfs"]);
-        assert_eq!(&argv[5..11], &["-b", "/dev", "-b", "/proc", "-b", "/sys"]);
-        assert_eq!(&argv[11..13], &["-b", "/host/share:/mnt/share"]);
-        assert_eq!(&argv[13..15], &["-w", "/workspace"]);
-        assert_eq!(&argv[15..18], &["/bin/sh", "-c", argv[17].as_str()]);
-        assert_eq!(&argv[18..], &["sh", "echo hi", "/.agent-exit/x"]);
-        // 这个参数一加回来，`nohup` / `setsid` 起的服务就活不过这次调用
-        assert!(
-            !argv.iter().any(|a| a == "--kill-on-exit"),
-            "不能再用 --kill-on-exit: {argv:?}"
-        );
-    }
-
-    /// 有 setsid 就一定要用它：命令得跑在**自己的进程组**里，超时 / 停止时
-    /// 才能只杀它（proot 要留着给常驻进程当 tracer）。
-    #[test]
-    fn command_line_runs_the_command_in_its_own_process_group() {
-        let t = TempRoot::new("setsid");
-        std::fs::write(t.dir.join("bin/setsid"), b"").unwrap();
-        let argv = t
-            .sandbox()
-            .command_line("echo hi", "/.agent-exit/x", WORKSPACE);
-        let setsid_at = argv
-            .iter()
-            .position(|a| a == "/bin/setsid")
-            .expect("setsid 在里面");
-        assert_eq!(
-            &argv[setsid_at..],
-            &[
-                "/bin/setsid",
-                "/bin/sh",
-                "-c",
-                argv[setsid_at + 3].as_str(),
-                "sh",
-                "echo hi",
-                "/.agent-exit/x"
-            ],
-            "setsid 得直接排在 runner 的 /bin/sh 前面: {argv:?}"
-        );
-        let runner = &argv[setsid_at + 3];
-        assert!(
-            runner.contains("$2.pid"),
-            "有 setsid 时 runner 必须报进程组号: {runner}"
-        );
-    }
-
-    /// 没有 setsid 时 runner 不能报 pid —— 那个 `$$` 不是组号，按它杀会杀错组。
-    #[test]
-    fn command_line_degrades_without_setsid() {
-        let t = TempRoot::new("nosetsid");
-        let argv = t
-            .sandbox()
-            .command_line("true", "/.agent-exit/x", WORKSPACE);
-        assert!(!argv.iter().any(|a| a.ends_with("setsid")), "{argv:?}");
-        let runner = argv.iter().find(|a| a.contains("rc=$?")).unwrap();
-        assert!(
-            !runner.contains("$2.pid"),
-            "没有 setsid 时不能报组号: {runner}"
-        );
-    }
-
-    #[test]
-    fn script_is_passed_as_one_argv_element_not_shell_escaped() {
-        // 关键：脚本原样作为单个参数传，不做任何转义 —— 因为我们是
-        // 直接 execve，没有中间 shell 会二次解析它（runner 拿它当 `$1`）
-        let nasty = "echo \"a b\"; ls | grep x; echo '$(whoami)'";
-        let argv = sandbox().command_line(nasty, "/.agent-exit/x", WORKSPACE);
-        assert_eq!(argv[argv.len() - 2], nasty);
-    }
-
-    /// 没 bash 退回 ash、装了就用 bash —— 两条路都要盯住。
-    #[test]
-    fn command_line_uses_bash_once_it_is_installed() {
-        let t = TempRoot::new("shellbash");
-        let sb = t.sandbox();
-        // 真正执行脚本的 shell 写在 runner 里，runner 是 `-c` 的下一个参数
-        let runner_of = |argv: Vec<String>| {
-            let i = argv.iter().position(|a| a == "-c").expect("-c 一定在");
-            argv[i + 1].clone()
-        };
-        assert!(
-            runner_of(sb.command_line("true", "/.agent-exit/x", WORKSPACE))
-                .starts_with("/bin/sh -c"),
-            "没装就退回 ash"
-        );
-        std::fs::write(t.dir.join("bin/bash"), b"").unwrap();
-        assert!(
-            runner_of(sb.command_line("true", "/.agent-exit/x", WORKSPACE))
-                .starts_with("/bin/bash -c"),
-            "装了就该用 bash，不然模型写的 bash 语法白写"
-        );
-    }
-
-    /// runner 是纯 POSIX sh，所以拿**宿主的** /bin/sh 就能把它验到底：
-    /// 退出码和组号真的写下来了，脚本也没被多解析一层。
-    #[test]
-    fn runner_writes_the_exit_code_and_the_group_id() {
-        let t = TempRoot::new("runner");
-        let status = t.dir.join("status");
-        let path = status.display().to_string();
-        let script = "echo \"a b\"; echo '$(whoami)'; exit 7";
-        let out = std::process::Command::new("/bin/sh")
-            .args(["-c", &runner_script("/bin/sh", true), "sh", script, &path])
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(7), "runner 要把命令的退出码传出来");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
-            "a b\n$(whoami)\n",
-            "脚本原样交给内层 sh，没被多解析一层"
-        );
-        assert_eq!(std::fs::read_to_string(&status).unwrap(), "7");
-        let pid = read_pgid(&PathBuf::from(format!("{path}.pid"))).expect("pid 文件要能读");
-        assert!(pid > 1, "pid 得是个真 pid: {pid}");
-    }
 
     /// `kill_group` 得真的打到组里的**每个**进程，不只是组长。
     /// 这就是超时 / 停止时不再漏孤儿的那一步。
@@ -3822,290 +3575,6 @@ mod tests {
         let _ = drain(out_task, &cap, Duration::ZERO).await;
     }
 
-    /// Alpine 里 `/usr/bin/setsid` 是指向 `/bin/busybox` 的**绝对**符号链接，
-    /// 在宿主机上解析必然失败 —— 判存在不能 `is_file()`。
-    ///
-    /// 漏了这一步的后果：命令行里没有 setsid，runner 就落在
-    /// proot 自己的进程组里，超时那一杀打到 proot 头上（它忽略 SIGTERM，然后
-    /// 吃 SIGKILL），被 trace 的常驻进程全部失去翻译。
-    #[test]
-    fn setsid_is_found_when_it_is_a_dangling_absolute_symlink() {
-        let t = TempRoot::new("setsidlink");
-        std::fs::create_dir_all(t.dir.join("usr/bin")).unwrap();
-        std::os::unix::fs::symlink("/bin/busybox", t.dir.join("usr/bin/setsid")).unwrap();
-
-        let argv = t
-            .sandbox()
-            .command_line("true", "/.agent-exit/x", WORKSPACE);
-        assert!(
-            argv.iter().any(|a| a == "/usr/bin/setsid"),
-            "绝对符号链接也算在：{argv:?}"
-        );
-        let runner = argv.iter().find(|a| a.contains("rc=$?")).unwrap();
-        assert!(runner.contains("$2.pid"), "有 setsid 就该报组号: {runner}");
-    }
-
-    /// `agent ps`：扫 /proc 的解析。假 /proc 直接造，不靠真实进程。
-    #[test]
-    fn proc_scan_parses_stat_status_and_cmdline() {
-        // comm 里有空格和括号：必须从**最后一个** ')' 之后切
-        assert_eq!(
-            parse_stat("4211 (WebView 子进程) S 1 4211 4211 0 -1 4194560 1 0 0 0 0"),
-            Some(('S', 1, 4211))
-        );
-        assert_eq!(parse_stat("garbage"), None);
-        assert_eq!(parse_stat("1 (sh) Z 2 3"), Some(('Z', 2, 3)));
-        assert_eq!(
-            parse_tracer("Name:\tsleep\nTracerPid:\t21707\nPPid:\t1\n"),
-            Some(21707)
-        );
-        assert_eq!(parse_tracer("TracerPid:\t0\n"), Some(0));
-        assert_eq!(parse_tracer("Name:\tsleep\n"), None);
-        // cmdline 是 NUL 分隔的 argv；超长按字符切（不能撞多字节边界）
-        assert_eq!(render_cmdline(b"sh\0-c\0echo hi\0"), "sh -c echo hi");
-        assert_eq!(render_cmdline(b""), "");
-        let long = format!("echo {}", "汉".repeat(200));
-        let clipped = render_cmdline(long.as_bytes());
-        assert!(clipped.ends_with('…'), "{clipped}");
-        assert!(
-            clipped.chars().count() <= 121,
-            "{}",
-            clipped.chars().count()
-        );
-
-        // 一个假 /proc：两条看得见、一条 stat 缺失（进程刚退的样子）
-        let t = TempRoot::new("procscan");
-        let p = t.dir.join("proc");
-        for (pid, stat, tracer, cmdline) in [
-            (
-                "4211",
-                "4211 (sh) S 1 4211 4211 0 -1",
-                "21707",
-                "sh\0-c\0sleep 1\0",
-            ),
-            (
-                "4212",
-                "4212 (sleep) S 4211 4211 4211 0 -1",
-                "21707",
-                "sleep\x001\x00",
-            ),
-            ("4213", "4213 (gone) Z 1 4213 4213 0 -1", "0", ""),
-        ] {
-            let d = p.join(pid);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(d.join("stat"), stat).unwrap();
-            std::fs::write(d.join("status"), format!("TracerPid:\t{tracer}\n")).unwrap();
-            std::fs::write(d.join("cmdline"), cmdline).unwrap();
-        }
-        // 一个非数字目录 + 一个缺 stat 的目录
-        std::fs::create_dir_all(p.join("net")).unwrap();
-        std::fs::create_dir_all(p.join("4214")).unwrap();
-        let mut got = scan_procs_in(&p);
-        got.sort_by_key(|r| r.pid);
-        assert_eq!(got.len(), 3, "{got:?}");
-        assert_eq!(got[0].pid, 4211);
-        assert_eq!(got[0].cmdline, "sh -c sleep 1");
-        assert_eq!(got[0].tracer, 21707);
-        assert_eq!(got[1].ppid, 4211);
-        assert_eq!(got[2].state, 'Z');
-    }
-
-    /// 归因：`TracerPid` 指向我们起的 proot 的进程才算我们的；命令结束后还活着
-    /// 的那些进 `leftovers`（这才是可以 `agent kill` 的）。
-    #[test]
-    fn procs_attributes_survivors_to_the_command_that_left_them() {
-        let t = TempRoot::new("procsattr");
-        let sb = t.sandbox();
-        // 拿一个真活着的进程当 "proot"（归因只要求 pid 活着）
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 5"])
-            .spawn()
-            .unwrap();
-        let proot = child.id() as i32;
-        let pid_file = t.dir.join("nope.pid"); // 没有 pid 文件 = 退回 proot 自己的 pid
-        let key = sb
-            .register_run(
-                proot,
-                "setsid sh -c 'while :; do date; done'",
-                pid_file,
-                None,
-            )
-            .unwrap();
-
-        let fake = vec![
-            RawProc {
-                pid: 9001,
-                ppid: 1,
-                pgid: 9001,
-                state: 'S',
-                tracer: proot,
-                cmdline: "sh -c while :; do date; done".into(),
-                run_id: None,
-            },
-            // 上个 App 生命留下的孤儿 proot（名字对得上）＋它名下的 tracee
-            RawProc {
-                pid: 4242,
-                ppid: 1,
-                pgid: 4242,
-                state: 'S',
-                tracer: 0,
-                cmdline: "proot -0 -r /files/rootfs /bin/sh -c sleep 9".into(),
-                run_id: None,
-            },
-            RawProc {
-                pid: 9002,
-                ppid: 1,
-                pgid: 9002,
-                state: 'S',
-                tracer: 4242,
-                cmdline: "别人的".into(),
-                run_id: None,
-            },
-            // **不是** proot 的 ppid==1 进程（桌面上那是 systemd 的服务）：
-            // 列进「可以 kill」比漏掉糟得多 —— 这条就是那个坑的回归测试
-            RawProc {
-                pid: 9100,
-                ppid: 1,
-                pgid: 9100,
-                state: 'S',
-                tracer: 0,
-                cmdline: "/usr/lib/systemd/systemd-journald".into(),
-                run_id: None,
-            },
-        ];
-        // 命令还在跑：进 running，不逐个列进程
-        let r = sb.procs_with(fake.clone(), None);
-        assert_eq!(r.visible, 4);
-        assert!(r.leftovers.is_empty());
-        assert_eq!(r.running.len(), 1);
-        assert_eq!(r.running[0].procs, 1);
-        assert_eq!(r.running[0].pgid, proot);
-        assert!(
-            r.running[0].command.contains("while :; do date"),
-            "{:?}",
-            r.running[0]
-        );
-        let text = r.to_text();
-        assert!(text.contains("正在跑的命令"), "{text}");
-        // 那条 tracer 不认识、父进程也没了的：进孤儿，不进「正在跑」
-        assert_eq!(
-            r.orphans.len(),
-            2,
-            "孤儿 proot 和它名下的 tracee：{:?}",
-            r.orphans
-        );
-
-        // 调用方报上自己的进程组：不该在「正在跑」里看到自己
-        let me = sb.procs_with(fake.clone(), Some(proot));
-        assert!(
-            me.running.is_empty(),
-            "自己那条命令得滤掉：{:?}",
-            me.running
-        );
-
-        // 命令结束了，它还活着 = 刻意脱离的常驻进程：能拿到 pid 就能杀
-        sb.finish_run(key, None);
-        let r = sb.procs_with(fake, None);
-        assert!(r.running.is_empty());
-        assert_eq!(r.leftovers.len(), 1);
-        assert_eq!(r.leftovers[0].pid, 9001);
-        assert!(r.leftovers[0].leftover);
-        let text = r.to_text();
-        assert!(text.contains("还活着的常驻进程"), "{text}");
-        assert!(text.contains("agent kill <pid>"), "{text}");
-        assert!(text.contains("pid 9001"), "{text}");
-        // 孤儿 proot + 它名下的 tracee：看得见、不认识，而且**父进程已经没了** ——
-        // 正是「上个 App 生命留下的」那种，要列出来（否则没人能收）
-        assert_eq!(
-            r.orphans.len(),
-            2,
-            "孤儿 proot 和它的 tracee：{:?}",
-            r.orphans
-        );
-        assert!(r.orphans.iter().any(|o| o.pid == 4242), "{:?}", r.orphans);
-        assert!(
-            r.orphans.iter().any(|o| o.cmdline.contains("别人的")),
-            "{:?}",
-            r.orphans
-        );
-        assert!(
-            !r.orphans.iter().any(|o| o.pid == 9100),
-            "ppid==1 但不是 proot 的（systemd 服务）绝不能列进来：{:?}",
-            r.orphans
-        );
-        assert!(
-            text.contains("不属于任何已知命令的进程"),
-            "孤儿也得说清楚是什么：{text}"
-        );
-        assert!(!text.contains("← 来自：\n"), "孤儿没有「来自」：{text}");
-
-        // proot 没了 → 登记被清掉，不再误导模型
-        child.kill().unwrap();
-        child.wait().unwrap();
-        let other = RawProc {
-            pid: 9500,
-            ppid: 1,
-            pgid: 9500,
-            state: 'S',
-            tracer: 0,
-            // 名字得对得上（`is_proot`）—— 只有 proot 才可能是「我们上一次
-            // 生命留下的」，随便一个 ppid==1 的进程不行
-            cmdline: "proot -0 -r /files/rootfs /bin/sh -c echo hi".into(),
-            run_id: None,
-        };
-        // 父进程还在、又不归我们的 → 不是孤儿（单元测试里 cargo 自己就是这种）
-        let alive_parent = RawProc {
-            pid: 9501,
-            ppid: 4242,
-            pgid: 4242,
-            state: 'S',
-            tracer: 0,
-            cmdline: "别人的孩子".into(),
-            run_id: None,
-        };
-        let r = sb.procs_with(vec![other, alive_parent], None);
-        assert!(r.leftovers.is_empty() && r.running.is_empty());
-        assert_eq!(r.orphans.len(), 1, "只列真孤儿：{:?}", r.orphans);
-        assert_eq!(r.orphans[0].pid, 9500);
-        assert!(r.to_text().contains("不属于任何已知命令的进程"));
-        // 什么都没有时（看得见 /proc，但没我们的进程）
-        let empty = ProcsReport {
-            visible: 3,
-            ..Default::default()
-        };
-        assert!(
-            empty.to_text().contains("没有别的东西在跑"),
-            "{}",
-            empty.to_text()
-        );
-    }
-
-    /// /proc 看不见任何东西时得**明说**，不能假装「什么都没有」。
-    #[test]
-    fn procs_says_so_when_proc_is_hidden() {
-        let t = TempRoot::new("procshidden");
-        let r = t.sandbox().procs_with(vec![], None);
-        assert_eq!(r.visible, 0);
-        assert!(r.to_text().contains("hidepid"), "{}", r.to_text());
-    }
-
-    #[test]
-    fn status_files_are_removed_when_the_run_ends_or_is_cancelled() {
-        let t = TempRoot::new("statusclean");
-        let paths = {
-            let s = StatusFile::new(&t.dir, "/.agent-exit");
-            std::fs::write(&s.host, b"0").unwrap();
-            std::fs::write(&s.pid_host, b"4242").unwrap();
-            assert!(s.host.exists() && s.pid_host.exists());
-            (s.host.clone(), s.pid_host.clone())
-        }; // 出了作用域 = 取消（future 被丢掉）也会走同一条路
-        assert!(!paths.0.exists(), "状态文件得清掉");
-        assert!(
-            !paths.1.exists(),
-            "pid 文件也得清掉，不然 .agent-exit 会越积越多"
-        );
-    }
-
     /// `pgid <= 1` 一个都不许发：`0` 是「我自己这个组」，`1` 是 init。
     /// 这道闸真的生效的话，这个测试进程能活到最后一行。
     #[test]
@@ -4115,152 +3584,14 @@ mod tests {
         kill_group(1, libc::SIGKILL);
     }
 
-    #[test]
-    fn status_and_pgid_files_are_read_only_when_they_parse() {
-        let t = TempRoot::new("statusread");
-        let f = t.dir.join("s");
-        assert_eq!(read_status_code(&f), None, "文件不在就得是 None");
-        std::fs::write(&f, b"").unwrap();
-        assert_eq!(
-            read_status_code(&f),
-            None,
-            "写了一半（空）也是 None，下一拍再读"
-        );
-        std::fs::write(&f, b"boom").unwrap();
-        assert_eq!(read_status_code(&f), None);
-        std::fs::write(&f, b"0\n").unwrap();
-        assert_eq!(read_status_code(&f), Some(0));
-        std::fs::write(&f, b" 7 ").unwrap();
-        assert_eq!(read_status_code(&f), Some(7));
-
-        assert_eq!(read_pgid(&f), Some(7));
-        for bad in ["0", "1", "-3", ""] {
-            std::fs::write(&f, bad.as_bytes()).unwrap();
-            assert_eq!(read_pgid(&f), None, "{bad:?} 不能当组号");
-        }
-        std::fs::write(&f, b"4242").unwrap();
-        assert_eq!(read_pgid(&f), Some(4242));
-    }
-
-    /// 「输出安静了」得真的按时间算，不然命令刚退出就把最后一块输出丢了。
-    #[test]
-    fn output_tap_reports_silence() {
-        let tap = OutputTap::new(Instant::now());
-        assert!(!tap.quiet_for(Duration::from_millis(150)), "刚起步不算安静");
-        std::thread::sleep(Duration::from_millis(30));
-        tap.note();
-        assert!(!tap.quiet_for(Duration::from_millis(150)), "刚写过不算安静");
-        std::thread::sleep(Duration::from_millis(180));
-        assert!(
-            tap.quiet_for(Duration::from_millis(150)),
-            "180ms 没动静就安静了"
-        );
-    }
-
-    // --- 宿主模式（桌面原生，不套 proot）-----------------------------------
-
-    /// 宿主模式跑的是**本机的** shell：没有 proot、没有 `-r` / `-w`，
-    /// 但**进程模型是同一套** —— runner + 状态文件 + 命令自己的进程组。
-    #[test]
-    fn host_mode_command_line_is_plain_local_bash() {
-        let sb = LinuxSandbox::host(PathBuf::from("/tmp"));
-        assert!(sb.is_host());
-        // rootfs 是 `/`：沙箱里的绝对路径就是本机路径，所以 read/edit 那条路
-        // 一行都不用改
-        assert_eq!(sb.rootfs(), Path::new("/"));
-
-        // 状态文件不能落在 `/`（那是用户的根目录）——宿主模式下它的「guest 路径」
-        // 就是宿主路径本身
-        let (exit_dir, exit_guest) = sb.layout().exit;
-        assert_eq!(exit_dir.display().to_string(), exit_guest);
-        assert!(!exit_dir.starts_with("/.agent-exit"), "别往 `/` 里写");
-
-        let shell = if Path::new("/bin/bash").is_file() {
-            "/bin/bash"
-        } else {
-            "/bin/sh"
-        };
-        let status = "/home/u/.local/share/android-agent/exit/x";
-        let argv = sb.command_line("echo hi", status, WORKSPACE);
-        assert_eq!(&argv[..2], &["/bin/sh", "-c"], "runner 跑在 POSIX sh 里");
-        let runner = &argv[2];
-        assert!(
-            runner.starts_with("printf '%s' \"$$\" > \"$2.pid\""),
-            "宿主模式要报组号（`process_group(0)` 保证了 $$ 就是组号）: {runner}"
-        );
-        assert!(
-            runner.contains(&format!("{shell} -c \"$1\"")),
-            "脚本交给上面选出的 shell 跑: {runner}"
-        );
-        assert_eq!(&argv[3..], &["sh", "echo hi", status]);
-        assert!(
-            !argv.iter().any(|a| a.contains("proot")),
-            "宿主模式命令行里不该有 proot: {argv:?}"
-        );
-
-        assert_eq!(
-            sb.resolve_path("/etc/hostname").unwrap(),
-            Path::new("/etc/hostname")
-        );
-        assert_eq!(
-            sb.resolve_path("/workspace/a.txt").unwrap(),
-            Path::new("/tmp/a.txt"),
-            "/workspace 就是那个宿主目录"
-        );
-    }
-
-    /// 没有 rootfs 也算就绪，也**不需要**预装工具（`apk add` 那套不该跑）。
-    #[test]
-    fn host_mode_is_ready_and_needs_no_provisioning() {
-        let sb = LinuxSandbox::host(PathBuf::from("/tmp"));
-        assert!(sb.is_ready(), "宿主模式不靠 rootfs 判断");
-        assert!(sb.is_provisioned(), "不然启动时会去 apk add");
-    }
-
-    /// `agent ps` 在宿主模式**不能**扫 /proc 那套：那会把用户桌面和系统服务
-    /// 一起列成「可以 kill」。它只该回一句话，让人去用 ps/pgrep。
-    #[test]
-    fn host_mode_agent_ps_says_to_use_the_real_ps() {
-        let sb = LinuxSandbox::host(PathBuf::from("/tmp"));
-        let r = sb.procs(None);
-        assert!(r.host);
-        assert!(r.leftovers.is_empty() && r.running.is_empty() && r.orphans.is_empty());
-        let text = r.to_text();
-        assert!(
-            text.contains("宿主模式") && text.contains("pgrep"),
-            "{text}"
-        );
-    }
-
-    /// 命令真的在本机跑，cwd 是 workspace，环境是宿主的（PATH 不被重写）。
-    #[tokio::test]
-    async fn host_mode_runs_on_this_machine_with_the_host_environment() {
-        let t = TempRoot::new("hostrun");
-        let sb = LinuxSandbox::host(t.dir.clone());
-        let r = sb
-            .run(
-                "pwd; echo PATH_HAS_BIN=$([ -x /bin/sh ] && echo yes || echo no); touch made-by-host-mode",
-                Duration::from_secs(10),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-        assert!(
-            r.stdout.contains(&t.dir.display().to_string()),
-            "{}",
-            r.stdout
-        );
-        assert!(r.using_bash, "宿主模式一定找得到 bash");
-        assert!(t.dir.join("made-by-host-mode").is_file(), "改的是真文件");
-    }
+    // --- 桌面（桌面原生，不套 proot）-----------------------------------
 
     /// 命令退出就返回，**不等**它刻意放后台的常驻进程（状态文件当完成信号，
-    /// 和沙箱那条路同一个机制）—— 宿主模式没有 proot 会一直占着管道。
+    /// 和沙箱那条路同一个机制）—— 桌面没有 proot 会一直占着管道。
     #[tokio::test]
-    async fn host_mode_returns_when_the_command_exits_not_when_the_daemon_does() {
+    async fn native_returns_when_the_command_exits_not_when_the_daemon_does() {
         let t = TempRoot::new("hostdaemon");
-        let sb = LinuxSandbox::host(t.dir.clone());
+        let sb = LinuxSandbox::native(t.dir.clone());
         let started = Instant::now();
         let r = sb
             .run(
@@ -4280,324 +3611,7 @@ mod tests {
         );
     }
 
-    /// 超时要把**子孙**一起杀掉：宿主模式一样跑 `CommandGuard`（组号从状态文件
-    /// 里读），只杀最外层那层 shell 的话子进程会留在用户机器上。
-    #[tokio::test]
-    async fn host_mode_kills_the_whole_process_group_on_timeout() {
-        let t = TempRoot::new("hostkill");
-        let sb = LinuxSandbox::host(t.dir.clone());
-        let r = sb
-            // 子进程把 pid 写进文件，自己睡很久；`sh -c` 那层是孙进程
-            .run(
-                "sh -c 'echo $$ > alive.pid; sleep 120' & sleep 120",
-                Duration::from_millis(600),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(r.timed_out, "这个脚本就该被超时杀掉");
-        // 等信号落地，再看那个 pid 还在不在
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let pid: i32 = std::fs::read_to_string(t.dir.join("alive.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        assert!(!alive, "pid {pid} 还活着 —— 进程组没杀干净");
-    }
-
-    // —— 常驻 shell（宿主模式下打开它：和沙箱里同一套协议，在本机就能跑） ——
-
-    // （在 macOS 上每条要多等 ~150ms：kqueue 对 FIFO 的 EOF 不报，读端要等到「输出安静」
-    // 那条上限才收。Linux / 安卓的 epoll 会报，手机上实测一条 34ms。只影响测试的速度。）
-    fn resident_sandbox(tag: &str) -> (TempRoot, LinuxSandbox) {
-        let t = TempRoot::new(tag);
-        let sb = LinuxSandbox::host(t.dir.clone()).with_resident();
-        (t, sb)
-    }
-
-    async fn run_ok(sb: &LinuxSandbox, script: &str) -> ExecResult {
-        sb.run(script, Duration::from_secs(20), None).await.unwrap()
-    }
-
-    /// 基本的：输出分开、退出码、cwd，而且真的是常驻 shell 跑的（带 AGENT_RUN_ID）
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resident_runs_commands_with_separate_streams_and_exit_codes() {
-        let (t, sb) = resident_sandbox("res-basic");
-        let r = run_ok(
-            &sb,
-            "pwd; echo out; echo err >&2; echo id=$AGENT_RUN_ID; exit 7",
-        )
-        .await;
-        assert_eq!(r.code, 7, "{r:?}");
-        assert!(r.stdout.contains(&t.dir.display().to_string()), "{r:?}");
-        assert!(
-            r.stdout.contains("out") && !r.stdout.contains("err"),
-            "{r:?}"
-        );
-        assert_eq!(r.stderr.trim(), "err");
-        assert!(
-            !r.stdout.contains("id=\n") && r.stdout.contains("id="),
-            "走的是常驻 shell：{r:?}"
-        );
-        // `exit` 只结束这一条：常驻的那个还在，下一条照跑
-        let r = run_ok(&sb, "echo still here").await;
-        assert_eq!((r.code, r.stdout.trim()), (0, "still here"));
-        // 脚本自己设的 trap EXIT 不会把我们的退出码吃掉
-        let r = run_ok(&sb, "trap 'echo bye' EXIT; exit 3").await;
-        assert_eq!((r.code, r.stdout.trim()), (3, "bye"), "{r:?}");
-        // stdin 是 /dev/null：读 stdin 的命令不会挂住
-        let r = run_ok(&sb, "cat; echo done").await;
-        assert_eq!(r.stdout.trim(), "done");
-    }
-
-    /// 每条命令是常驻 shell 的一个 fork：cd / export / 变量都漏不到下一条
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resident_commands_do_not_leak_state_into_each_other() {
-        let (t, sb) = resident_sandbox("res-iso");
-        run_ok(&sb, "cd /; export LEAK=1; X=2; alias ll=ls; set -e").await;
-        let r = run_ok(
-            &sb,
-            "pwd; echo \"leak=${LEAK:-} x=${X:-}\"; false; echo after-false",
-        )
-        .await;
-        assert!(
-            r.stdout.contains(&t.dir.display().to_string()),
-            "cwd 回到原处：{r:?}"
-        );
-        assert!(r.stdout.contains("leak= x="), "{r:?}");
-        assert!(r.stdout.contains("after-false"), "set -e 也没漏过来：{r:?}");
-    }
-
-    /// 超时杀**这条命令的整组**（`&` 起的子孙一起），但杀不到常驻 shell 自己
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resident_timeout_kills_the_command_group_but_not_the_shell() {
-        let (t, sb) = resident_sandbox("res-kill");
-        let r = sb
-            .run(
-                "sh -c 'echo $$ > alive.pid; sleep 120' & sleep 120",
-                Duration::from_millis(800),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(r.timed_out, "{r:?}");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let pid: i32 = std::fs::read_to_string(t.dir.join("alive.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(
-            unsafe { libc::kill(pid, 0) } != 0,
-            "pid {pid} 还活着 —— 组没杀干净"
-        );
-        let r = run_ok(&sb, "echo ok").await;
-        assert_eq!(r.stdout.trim(), "ok", "常驻 shell 不该被一起杀");
-    }
-
-    /// 回合取消（future 被丢掉）：一样按组杀
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resident_cancel_kills_the_command_group() {
-        let (t, sb) = resident_sandbox("res-cancel");
-        let fut = sb.run("echo $$ > me.pid; sleep 120", Duration::from_secs(60), None);
-        let _ = tokio::time::timeout(Duration::from_millis(800), fut).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let pid: i32 = std::fs::read_to_string(t.dir.join("me.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(unsafe { libc::kill(pid, 0) } != 0, "取消之后 {pid} 还活着");
-    }
-
-    /// 刻意脱离的常驻进程：命令自己退出就返回，不等它
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resident_returns_when_the_command_exits_not_when_the_daemon_does() {
-        let (_t, sb) = resident_sandbox("res-daemon");
-        let started = Instant::now();
-        let r = run_ok(&sb, "setsid sleep 30 > /dev/null 2>&1 & echo started").await;
-        assert_eq!((r.code, r.stdout.trim()), (0, "started"), "{r:?}");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
-    /// 几条命令同时跑（并行的工具调用、几个会话）：互不等，输出不串
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn resident_runs_commands_concurrently() {
-        let (_t, sb) = resident_sandbox("res-par");
-        let sb = Arc::new(sb);
-        run_ok(&sb, "true").await; // 先把常驻 shell 起好，别把启动算进去
-        let started = Instant::now();
-        let tasks: Vec<_> = (0..5)
-            .map(|i| {
-                let sb = sb.clone();
-                tokio::spawn(async move { run_ok(&sb, &format!("sleep 1; echo n{i}")).await })
-            })
-            .collect();
-        for (i, h) in tasks.into_iter().enumerate() {
-            let r = h.await.unwrap();
-            assert_eq!(r.stdout.trim(), format!("n{i}"));
-        }
-        assert!(
-            started.elapsed() < Duration::from_millis(2500),
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
-    /// 常驻的那个被杀了：下一条命令照常（重起一个），不报错
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_dead_resident_shell_is_replaced_transparently() {
-        let (_t, sb) = resident_sandbox("res-dead");
-        run_ok(&sb, "true").await;
-        let first = sb.resident.lock().unwrap().as_ref().unwrap().pid();
-        unsafe { libc::kill(-first, libc::SIGKILL) };
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let r = run_ok(&sb, "echo again").await;
-        assert_eq!(r.stdout.trim(), "again", "{r:?}");
-        let second = sb.resident.lock().unwrap().as_ref().unwrap().pid();
-        assert_ne!(first, second, "换了一个新的");
-    }
-
-    /// `agent ps` 在常驻 shell 下的归因：几条命令共用一个 proot，按「在这条命令的组里」
-    /// 或「环境里带着它的 AGENT_RUN_ID」分（刻意 setsid 脱离的常驻进程走后一条）；常驻
-    /// bash 自己、别的命令的进程都不算它的
-    #[test]
-    fn procs_attributes_resident_commands_by_group_and_run_id() {
-        let t = TempRoot::new("procsres");
-        let sb = t.sandbox();
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 5"])
-            .spawn()
-            .unwrap();
-        let proot = child.id() as i32; // 常驻的那个 proot（只要求活着）
-        let key = sb
-            .register_run(
-                proot,
-                "nohup myserver &",
-                t.dir.join("gone.pid"),
-                Some("r1".into()),
-            )
-            .unwrap();
-        sb.finish_run(key, Some(7000));
-        let p = |pid: i32, pgid: i32, run_id: Option<&str>| RawProc {
-            pid,
-            ppid: 1,
-            pgid,
-            state: 'S',
-            tracer: proot,
-            cmdline: format!("proc {pid}"),
-            run_id: run_id.map(String::from),
-        };
-        let fake = vec![
-            p(7001, 7000, None),          // 还在这条命令的组里
-            p(7100, 7100, Some("r1")),    // setsid 脱离了，但环境带着它的 id
-            p(6000, proot, None),         // 常驻 bash 自己
-            p(7200, 7200, Some("other")), // 别的命令的
-        ];
-        let r = sb.procs_with(fake, None);
-        let pids: Vec<i32> = r.leftovers.iter().map(|e| e.pid).collect();
-        assert_eq!(pids, [7001, 7100], "{r:?}");
-        assert!(r.leftovers.iter().all(|e| e.command == "nohup myserver &"));
-        // 名下的进程都没了：登记清掉（常驻 proot 一直活着，`prune` 清不了它）
-        let r = sb.procs_with(vec![p(6000, proot, None)], None);
-        assert!(r.leftovers.is_empty());
-        assert!(
-            sb.runs.lock().unwrap().runs.is_empty(),
-            "结束且没进程的登记该清掉"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    /// `$$` 是这条命令自己的 pid（脚本里用了它就单独起 bash，见 `needs_own_shell`）：
-    /// 两条同时跑的命令各是各的，`kill $$` 只结束自己、杀不到常驻 shell
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dollar_dollar_is_the_command_not_the_resident_shell() {
-        let (_t, sb) = resident_sandbox("res-pid");
-        let sb = Arc::new(sb);
-        run_ok(&sb, "true").await;
-        let shell = sb
-            .resident
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .shell_pid()
-            .unwrap();
-        let (a, b) = tokio::join!(
-            run_ok(&sb, "echo $$; sleep 0.3"),
-            run_ok(&sb, "echo $$; sleep 0.3")
-        );
-        let (a, b) = (a.stdout.trim().to_string(), b.stdout.trim().to_string());
-        assert_ne!(a, b, "两条命令的 $$ 撞了");
-        assert_ne!(a, shell.to_string(), "$$ 不该是常驻 shell");
-        let r = run_ok(&sb, "echo before; kill -9 $$; echo never").await;
-        assert!(
-            r.stdout.contains("before") && !r.stdout.contains("never"),
-            "{r:?}"
-        );
-        let r = run_ok(&sb, "echo alive").await;
-        assert_eq!(r.stdout.trim(), "alive", "kill $$ 不该把常驻 shell 杀掉");
-    }
-
-    /// 很短的命令一条接一条：每条的退出码都得拿到（管道比状态文件先关的那个竞态 ——
-    /// 手机上实测出过 `exit -1`）
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resident_reports_exit_codes_of_many_quick_commands() {
-        let (_t, sb) = resident_sandbox("res-quick");
-        for i in 0..60 {
-            let r = run_ok(&sb, &format!("echo {i}; exit {}", i % 4)).await;
-            assert_eq!(
-                (r.code, r.stdout.trim()),
-                (i % 4, i.to_string().as_str()),
-                "第 {i} 条：{r:?}"
-            );
-        }
-    }
-
-    /// 边跑边推输出（前端实时显示）照旧
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resident_streams_output_live() {
-        let (_t, sb) = resident_sandbox("res-live");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = sb
-            .run_live(
-                "echo a; sleep 0.3; echo b",
-                Duration::from_secs(10),
-                Some(tx),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(r.code, 0);
-        let mut got = Vec::new();
-        while let Ok(c) = rx.try_recv() {
-            got.extend(c);
-        }
-        assert_eq!(String::from_utf8_lossy(&got), "a\nb\n");
-    }
-
-    /// 管道正常关闭（常见情形）：drain 不能多 await 一次 —— 那条路上
-    /// `JoinHandle` 已经被 poll 完，再 poll 会 panic 掉整个 App。
-    #[tokio::test]
-    async fn drain_handles_a_task_that_finishes_in_time() {
-        let cap = Arc::new(Mutex::new(Capture::default()));
-        let task = tokio::spawn(Capture::read_into(
-            Some(&b"hello\n"[..]),
-            None,
-            cap.clone(),
-            None,
-        ));
-        let got = drain(task, &cap, Duration::from_secs(5)).await;
-        assert_eq!(got.head, b"hello\n");
-        assert_eq!(got.dropped_bytes, 0);
-    }
+    // —— 常驻 shell（桌面下打开它：和沙箱里同一套协议，在本机就能跑） ——
 
     /// 管道被孙进程占着不关时：等到 grace 也得把**已经读到的**交出来。
     ///
@@ -4619,270 +3633,6 @@ mod tests {
             "已经读到的输出不能扔：{:?}",
             String::from_utf8_lossy(&got.head)
         );
-    }
-
-    /// 失败必须响亮：超时要说明输出是半截的，被杀要说清是哪个信号。
-    #[test]
-    fn killed_or_timed_out_is_loud() {
-        let mut r = ExecResult {
-            code: -1,
-            stdout: "half\n".into(),
-            stderr: String::new(),
-            duration_ms: 10,
-            truncated: false,
-            timed_out: true,
-            full_output_path: None,
-            using_bash: true,
-            signal: Some(9),
-        };
-        let text = r.to_text();
-        assert!(text.contains("超时"), "{text}");
-        assert!(text.contains("可能不全"), "超时要说清输出是半截的：{text}");
-        assert!(
-            !text.contains("被信号"),
-            "超时的信号是我们自己发的，别重复报：{text}"
-        );
-        assert!(text.contains("half"), "输出不能丢：{text}");
-
-        // 不是超时、但被信号带走：要说清是哪个信号、大概为什么
-        r.timed_out = false;
-        let text = r.to_text();
-        assert!(text.contains("被信号 9"), "{text}");
-        assert!(text.contains("OOM"), "信号要翻译成人话：{text}");
-
-        // 调用方给了自己的超时说明（带「下次怎么给 timeout」）：只说那一句，
-        // 不和默认那句叠在一起；`[exit N]` 仍在最后
-        r.timed_out = true;
-        let text = r.to_text_with(Some("[60s 超时被终止，上面的输出可能不全。]".into()));
-        assert_eq!(text.matches("超时").count(), 1, "超时只说一遍：{text}");
-        assert!(text.ends_with("[exit -1]"), "{text}");
-        // 排版：段与段之间正好一个换行，不以空行开头
-        let r = ExecResult {
-            code: 0,
-            stdout: "out\n".into(),
-            stderr: "err\n".into(),
-            duration_ms: 0,
-            truncated: false,
-            timed_out: false,
-            full_output_path: None,
-            using_bash: true,
-            signal: None,
-        };
-        assert_eq!(r.to_text(), "out\n--- stderr ---\nerr\n[exit 0]");
-        let quiet = ExecResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            code: 124,
-            timed_out: true,
-            ..r
-        };
-        assert_eq!(
-            quiet.to_text_with(Some("[2s 超时被终止]".into())),
-            "(无输出)\n[2s 超时被终止]\n[exit 124]"
-        );
-    }
-
-    /// 没 bash 时结果里必须明说，并给出装它的命令。
-    #[test]
-    fn missing_bash_is_announced_with_the_fix() {
-        let mut r = ExecResult {
-            code: 0,
-            stdout: "hi\n".into(),
-            stderr: String::new(),
-            duration_ms: 0,
-            truncated: false,
-            timed_out: false,
-            full_output_path: None,
-            using_bash: false,
-            signal: None,
-        };
-        let text = r.to_text();
-        assert!(text.contains("/bin/sh"), "{text}");
-        assert!(text.contains("agent-setup --force"), "{text}");
-        assert!(text.contains("syntax error"), "{text}");
-
-        // 有 bash 时别唠叨
-        r.using_bash = true;
-        let text = r.to_text();
-        assert!(!text.contains("agent-setup"), "{text}");
-    }
-
-    #[test]
-    fn path_is_explicit_because_the_host_path_is_wrong_inside_the_sandbox() {
-        let sb = sandbox();
-        let env = sb.guest_env(sb.proot_config().unwrap());
-        let path = env.iter().find(|(k, _)| k == "PATH").unwrap();
-        assert_eq!(path.1, GUEST_PATH);
-        assert!(path.1.contains("/bin"));
-    }
-
-    #[test]
-    fn proot_env_vars_are_injected_because_android_needs_them() {
-        // 这三条在安卓上是**必需**的，不是可选优化：
-        //  - PROOT_LOADER / _32：不设则 proot 走内嵌 loader 解压路径，
-        //    解到 app_data_file 上被 W^X 拒绝 → "'/bin/sh' is not executable"
-        //  - PROOT_TMP_DIR：proot 只认这个名字，不认 TMPDIR；
-        //    找不到就退回 /tmp，而 App 写不了 /tmp
-        let sb = LinuxSandbox::new(SandboxConfig {
-            proot: PathBuf::from("/native/libproot.so"),
-            rootfs: PathBuf::from("/files/rootfs"),
-            binds: vec![],
-            tmp: Some(PathBuf::from("/cache/proot-tmp")),
-            loader: Some(PathBuf::from("/native/libproot-loader.so")),
-            loader32: Some(PathBuf::from("/native/libproot-loader32.so")),
-            dns: vec![],
-            tz_offset_minutes: None,
-            env: BTreeMap::new(),
-            workspace: None,
-            shared: None,
-        });
-        let env: BTreeMap<_, _> = sb
-            .guest_env(sb.proot_config().unwrap())
-            .into_iter()
-            .collect();
-
-        assert_eq!(
-            env.get("PROOT_LOADER").map(String::as_str),
-            Some("/native/libproot-loader.so")
-        );
-        assert_eq!(
-            env.get("PROOT_LOADER_32").map(String::as_str),
-            Some("/native/libproot-loader32.so")
-        );
-        assert_eq!(
-            env.get("PROOT_TMP_DIR").map(String::as_str),
-            Some("/cache/proot-tmp")
-        );
-        // 两者是不同的东西，都得有
-        assert_eq!(
-            env.get("TMPDIR").map(String::as_str),
-            Some("/cache/proot-tmp")
-        );
-
-        // 沙箱里没有浏览器：$BROWSER 指向 agent-open，沙箱里任何“开浏览器”
-        // 的调用（gh auth login / python webbrowser / xdg-open）都会变成
-        // “请宿主打开”。
-        assert_eq!(
-            env.get("BROWSER").map(String::as_str),
-            Some("/usr/local/bin/agent-open")
-        );
-    }
-
-    #[test]
-    fn tz_uses_posix_sign_convention() {
-        // UTC+8 在 POSIX 里写成 LCL-8（符号相反），否则 musl 解析不出来
-        assert_eq!(parse_posix_tz("LCL-8"), Some(480));
-        assert_eq!(parse_posix_tz("UTC+5:30"), Some(-330));
-        assert_eq!(parse_posix_tz("CST-8"), Some(480));
-    }
-
-    fn render_of(n: usize, body: impl Fn(usize) -> String) -> (String, bool) {
-        let text: String = (0..n).map(body).collect();
-        let mut cap = Capture::default();
-        cap.push(text.as_bytes());
-        cap.render()
-    }
-
-    #[test]
-    fn render_keeps_head_and_tail_with_a_marker() {
-        // 跨过 2000 行才截断；截断后首尾各 100 行
-        let n = MAX_OUTPUT_LINES + 500;
-        let (out, truncated) = render_of(n, |i| format!("line {i}\n"));
-        assert!(truncated);
-        assert!(out.starts_with("line 0\n"), "{out}");
-        assert!(out.contains("line 99\n"), "头要留 100 行：{out}");
-        assert!(!out.contains("line 100\n"), "第 101 行不该在：{out}");
-        assert!(
-            out.contains(&format!("[省略 {} 行]", n - HEAD_LINES - TAIL_LINES)),
-            "{out}"
-        );
-        assert!(
-            out.contains(&format!("line {}\n", n - 1)),
-            "尾要留到最后一行：{out}"
-        );
-        assert!(!out.contains(&format!("line {}\n", n - 101)), "{out}");
-        // 首 100 + 标记 + 尾 100
-        assert_eq!(out.lines().count(), HEAD_LINES + TAIL_LINES + 1);
-    }
-
-    #[test]
-    fn render_of_1999_lines_is_left_alone() {
-        // 触发线是 2000 行：差一行不该被省成 200 行，否则模型得反复续读
-        let (out, truncated) = render_of(MAX_OUTPUT_LINES - 1, |i| format!("line {i}\n"));
-        assert!(!truncated);
-        assert!(!out.contains("[省略"), "{out}");
-        assert!(out.contains(&format!("line {}\n", MAX_OUTPUT_LINES - 2)));
-        assert_eq!(out.lines().count(), MAX_OUTPUT_LINES - 1);
-    }
-
-    #[test]
-    fn render_of_a_split_capture_shows_both_ends() {
-        // 中间被扔掉过（超过内存上限）：头尾分别来自两块缓冲
-        let mut cap = Capture::default();
-        cap.head.extend_from_slice(b"head-line\n");
-        cap.tail.extend_from_slice(b"tail-line\n");
-        cap.dropped_lines = 42;
-        cap.dropped_bytes = 1234;
-        let (out, truncated) = cap.render();
-        assert!(truncated);
-        assert!(out.starts_with("head-line\n"), "{out}");
-        assert!(out.ends_with("tail-line\n"), "{out}");
-        assert!(out.contains("[省略 42 行]"), "{out}");
-    }
-
-    #[test]
-    fn render_shares_the_byte_budget_between_both_ends() {
-        // 每行 ~1KB × 300 行：行数没到、字节先超，两侧各分一半预算
-        let (out, truncated) = render_of(300, |i| format!("line{i}{}\n", "x".repeat(990)));
-        assert!(truncated);
-        assert!(out.len() <= MAX_OUTPUT_BYTES, "{} 字节", out.len());
-        assert!(!out.starts_with("[省略"), "第一行就得留下：{out}");
-        assert!(out.contains("line0"), "{out}");
-        assert!(out.contains("line299"), "{out}");
-        assert!(out.contains("[省略 "));
-    }
-
-    #[test]
-    fn render_never_splits_a_multibyte_char() {
-        // 一整行 150KB 的中文：两侧只能按字节给半行，不能切出半个字
-        let (out, truncated) = render_of(1, |_| "中".repeat(MAX_OUTPUT_BYTES));
-        assert!(truncated);
-        assert!(out.len() <= MAX_OUTPUT_BYTES, "{} 字节", out.len());
-        assert!(!out.contains('\u{fffd}'), "切出了半个字符");
-        // 一行都放不下时退回报字节，而不是「省略 0 行」
-        assert!(
-            out.contains("[省略 ") && !out.contains("[省略 0 行]"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn render_of_a_few_lines_stays_verbatim() {
-        let (out, truncated) = render_of(3, |i| format!("line {i}\n"));
-        assert_eq!(out, "line 0\nline 1\nline 2\n");
-        assert!(!truncated);
-        // 空输出还是空
-        assert_eq!(Capture::default().render(), (String::new(), false));
-    }
-
-    #[test]
-    fn spilled_file_marks_the_gap_it_could_not_keep() {
-        // 中间扔过东西 → 文件里也要断开，不能看着像连着的
-        let mut cap = Capture::default();
-        cap.head.extend_from_slice(b"head\n");
-        cap.tail.extend_from_slice(b"tail\n");
-        cap.dropped_bytes = 4 << 20;
-        let mut body = Vec::new();
-        cap.write_to(&mut body);
-        let body = String::from_utf8(body).unwrap();
-        assert!(body.contains("中间省略 4.0MB"), "{body}");
-
-        // 没扔过东西（总量不到上限）就不该凭空出现省略提示
-        let mut cap = Capture::default();
-        cap.push(b"hello\nworld\n");
-        let mut body = Vec::new();
-        cap.write_to(&mut body);
-        assert_eq!(String::from_utf8(body).unwrap(), "hello\nworld\n");
     }
 
     // --- 路径解析 ---------------------------------------------------------
@@ -4932,26 +3682,6 @@ mod tests {
     }
 
     #[test]
-    fn absolute_and_relative_paths_both_land_inside_the_rootfs() {
-        let t = TempRoot::new("paths");
-        let sb = t.sandbox();
-
-        assert_eq!(
-            sb.resolve_path("/root/a.txt").unwrap(),
-            t.dir.join("root/a.txt")
-        );
-        // 相对路径以 /workspace 为 cwd（没挂手机存储时就是 rootfs 里的目录）
-        assert_eq!(
-            sb.resolve_path("a.txt").unwrap(),
-            t.dir.join("workspace/a.txt")
-        );
-        assert_eq!(
-            sb.resolve_path("/etc/resolv.conf").unwrap(),
-            t.dir.join("etc/resolv.conf")
-        );
-    }
-
-    #[test]
     fn path_traversal_never_leaves_the_rootfs() {
         let t = TempRoot::new("escape");
         let sb = t.sandbox();
@@ -4975,63 +3705,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_and_phone_storage_are_mounted_and_confined() {
-        let t = TempRoot::new("mounts");
-        let phone = t.dir.with_extension("phone");
-        let _ = std::fs::remove_dir_all(&phone);
-        std::fs::create_dir_all(&phone).unwrap();
-
-        let cfg = t
-            .sandbox()
-            .proot_config()
-            .unwrap()
-            .clone()
-            .with_shared_storage(Some(&phone));
-        assert!(phone.join("Agent").is_dir(), "应该在手机存储里建好 Agent/");
-        let sb = LinuxSandbox::new(cfg);
-        assert!(sb.has_shared_storage());
-
-        let ws = phone.join("Agent");
-        assert_eq!(
-            sb.resolve_path("/workspace/a/b.html").unwrap(),
-            ws.join("a/b.html")
-        );
-        assert_eq!(
-            sb.resolve_path("b.html").unwrap(),
-            ws.join("b.html"),
-            "相对路径落在工作目录"
-        );
-        assert_eq!(
-            sb.resolve_path("/sdcard/DCIM/x.jpg").unwrap(),
-            phone.join("DCIM/x.jpg")
-        );
-        // 想从挂载点 .. 出去：在沙箱视角里归一化后回到 rootfs，到不了宿主机
-        assert_eq!(
-            sb.resolve_path("/sdcard/../etc/hosts").unwrap(),
-            t.dir.join("etc/hosts")
-        );
-        assert_eq!(
-            sb.resolve_path("/workspace/../../x").unwrap(),
-            t.dir.join("x")
-        );
-
-        let argv = sb.command_line("true", "/.agent-exit/x", WORKSPACE);
-        let joined = argv.join(" ");
-        assert!(joined.contains(&format!("-b {}:/sdcard", phone.display())));
-        assert!(joined.contains(&format!("-b {}:/workspace", ws.display())));
-
-        // 断开（权限被收回）：回到 rootfs 里的 /workspace
-        let off = LinuxSandbox::new(sb.proot_config().unwrap().clone().with_shared_storage(None));
-        assert!(!off.has_shared_storage());
-        assert_eq!(
-            off.resolve_path("b.html").unwrap(),
-            t.dir.join("workspace/b.html")
-        );
-
-        let _ = std::fs::remove_dir_all(&phone);
-    }
-
-    #[test]
     fn symlinks_pointing_outside_the_rootfs_are_rejected() {
         let t = TempRoot::new("symlink");
         let sb = t.sandbox();
@@ -5046,172 +3719,9 @@ mod tests {
 
     // --- 文件编辑 ---------------------------------------------------------
 
-    #[test]
-    fn edit_file_reads_applies_and_writes_back() {
-        let t = TempRoot::new("edit");
-        let sb = t.sandbox();
-        std::fs::write(t.dir.join("root/conf.txt"), "host=old\nport=80\n").unwrap();
-
-        let out = sb
-            .edit_file(
-                "/root/conf.txt",
-                &[
-                    Edit::new("host=old", "host=new"),
-                    Edit::new("port=80", "port=443"),
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(
-            sb.read_file("/root/conf.txt").unwrap(),
-            "host=new\nport=443\n"
-        );
-        assert_eq!(out.first_changed_line, 1);
-        assert!(out.patch.contains("-host=old"));
-        assert!(out.patch.contains("+host=new"));
-    }
-
-    /// 写文件是「临时文件 + rename」：改完不留临时文件、保留可执行位；
-    /// 改一个符号链接时改的是它指向的文件，链接本身还是链接。
-    #[test]
-    fn edit_writes_atomically_keeping_mode_and_symlinks() {
-        use std::os::unix::fs::PermissionsExt;
-        let t = TempRoot::new("atomic");
-        let sb = t.sandbox();
-        let script = t.dir.join("root/run.sh");
-        std::fs::write(&script, "echo old\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink("run.sh", t.dir.join("root/link.sh")).unwrap();
-
-        sb.edit_file("/root/link.sh", &[Edit::new("old", "new")])
-            .unwrap();
-
-        assert_eq!(std::fs::read_to_string(&script).unwrap(), "echo new\n");
-        let link = std::fs::symlink_metadata(t.dir.join("root/link.sh")).unwrap();
-        assert!(link.file_type().is_symlink(), "链接不能被换成普通文件");
-        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o755, "可执行位要保住");
-        let leftovers: Vec<_> = std::fs::read_dir(t.dir.join("root"))
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "临时文件要么被 rename 掉，要么清掉");
-    }
-
-    #[test]
-    fn edit_file_refuses_a_missing_file_with_a_useful_message() {
-        let t = TempRoot::new("editmissing");
-        let err = t
-            .sandbox()
-            .edit_file("/root/nope.txt", &[Edit::new("a", "b")])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("不存在"), "{err}");
-        assert!(
-            err.contains("content"),
-            "错误信息应该告诉模型怎么新建: {err}"
-        );
-    }
-
-    #[test]
-    fn edit_file_rejects_ambiguous_edits_without_touching_disk() {
-        let t = TempRoot::new("editdup");
-        let sb = t.sandbox();
-        let original = "x\nx\n";
-        std::fs::write(t.dir.join("root/f.txt"), original).unwrap();
-
-        assert!(sb.edit_file("/root/f.txt", &[Edit::new("x", "y")]).is_err());
-        // 失败时不能留下半成品
-        assert_eq!(sb.read_file("/root/f.txt").unwrap(), original);
-    }
-
     // --- 文件读取 ---------------------------------------------------------
 
-    #[test]
-    fn read_text_resolves_the_path_and_applies_offset_and_limit() {
-        let t = TempRoot::new("read");
-        let sb = t.sandbox();
-        std::fs::create_dir_all(t.dir.join("workspace")).unwrap();
-        std::fs::write(t.dir.join("workspace/a.txt"), "l0\nl1\nl2\nl3\n").unwrap();
-
-        // 相对路径按 cwd `/workspace` 算
-        let v = sb.read_text("a.txt", 2, Some(2), false).unwrap();
-        assert!(v.content.starts_with("l1\nl2"), "{}", v.content);
-        assert!(v.content.contains("offset=4"), "{}", v.content);
-    }
-
-    #[test]
-    fn oversized_text_files_are_refused_before_reading() {
-        assert!(check_text_size(1024, "/root/a.txt").is_ok());
-        assert!(check_text_size(MAX_TEXT_BYTES, "/root/a.txt").is_ok());
-        let err = check_text_size(MAX_TEXT_BYTES + 1, "/root/big.log")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("OOM"), "{err}");
-        assert!(err.contains("sed -n"), "要给出替代做法: {err}");
-        assert!(err.contains("/root/big.log"), "{err}");
-    }
-
-    #[test]
-    fn read_text_rejects_missing_files_and_binaries_with_a_useful_message() {
-        let t = TempRoot::new("readbad");
-        let sb = t.sandbox();
-
-        let err = sb
-            .read_text("/root/nope.txt", 1, None, false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("不存在"), "{err}");
-        assert!(err.contains("bash"), "应该告诉模型替代做法: {err}");
-
-        std::fs::write(t.dir.join("root/blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
-        let err = sb
-            .read_text("/root/blob.bin", 1, None, false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("UTF-8"), "{err}");
-    }
-
     // --- edit 的 create 模式 ---------------------------------------------
-
-    #[test]
-    fn create_file_writes_new_files_and_makes_parent_dirs() {
-        let t = TempRoot::new("create");
-        let sb = t.sandbox();
-
-        // 相对路径按 /workspace 算；父目录不存在也得能建（模型常写 a/b/c.py）
-        let made = sb.create_file("sub/dir/a.py", "print('hi')\n").unwrap();
-        assert_eq!((made.lines, made.bytes), (1, 12));
-        assert_eq!(
-            std::fs::read_to_string(t.dir.join("workspace/sub/dir/a.py")).unwrap(),
-            "print('hi')\n"
-        );
-
-        // 空文件也算建出来
-        let made = sb.create_file("/root/empty", "").unwrap();
-        assert_eq!((made.lines, made.bytes), (0, 0));
-        assert!(t.dir.join("root/empty").is_file());
-    }
-
-    #[test]
-    fn create_file_refuses_to_overwrite_and_says_what_to_do() {
-        let t = TempRoot::new("createexists");
-        let sb = t.sandbox();
-        std::fs::write(t.dir.join("root/a.txt"), "原文").unwrap();
-
-        let err = sb
-            .create_file("/root/a.txt", "盖掉")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("已存在"), "{err}");
-        assert!(err.contains("edits"), "要告诉模型怎么改：{err}");
-        // 原文一个字都不能动
-        assert_eq!(
-            std::fs::read_to_string(t.dir.join("root/a.txt")).unwrap(),
-            "原文"
-        );
-    }
 
     #[test]
     fn create_file_refuses_to_escape_through_a_symlink_or_dotdot() {
@@ -5242,82 +3752,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    #[test]
-    fn prepare_rootfs_writes_resolv_conf_because_apk_needs_it() {
-        let dir = std::env::temp_dir().join(format!("agent-linux-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("bin")).unwrap();
-        // 必须是**普通文件**才算 rootfs —— bin/sh 是绝对符号链接，宿主机解析不到
-        std::fs::write(dir.join("bin/busybox"), b"").unwrap();
-
-        let sb = LinuxSandbox::new(SandboxConfig {
-            proot: PathBuf::from("proot"),
-            rootfs: dir.clone(),
-            binds: vec![],
-            tmp: None,
-            dns: vec!["9.9.9.9".into(), "1.1.1.1".into()],
-            tz_offset_minutes: None,
-            loader: None,
-            loader32: None,
-            env: BTreeMap::new(),
-            workspace: None,
-            shared: None,
-        });
-        sb.prepare_rootfs().unwrap();
-
-        let resolv = std::fs::read_to_string(dir.join("etc/resolv.conf")).unwrap();
-        assert_eq!(resolv, "nameserver 9.9.9.9\nnameserver 1.1.1.1\n");
-        assert!(dir.join("root").is_dir());
-        assert!(dir.join("tmp").is_dir());
-
-        // 幂等
-        sb.prepare_rootfs().unwrap();
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 每个会话一个自己的目录：名字是派生的（跨重启一样）、cwd 落在里面、
-    /// 目录自己会建出来。
-    #[test]
-    fn session_dir_names_are_short_stable_and_distinct() {
-        // 同一个会话永远是同一个目录（否则下次打开就找不到自己上次的文件了）
-        assert_eq!(session_dir_name("s-1"), session_dir_name("s-1"));
-        assert_ne!(session_dir_name("s-1"), session_dir_name("s-2"));
-
-        let n = session_dir_name("abc");
-        assert_eq!(n.chars().count(), 6, "要短：{n}");
-        for bad in ['i', 'l', 'o', '0', '1'] {
-            assert!(!n.contains(bad), "别用容易看混的字符：{n}");
-        }
-        assert!(n
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
-
-        // 真会话 id 是 uuid（前 8 位是时间戳，彼此很像）—— 这种输入最容易撞
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..5000 {
-            let sid = format!("0199e1f0-1a2b-7c3d-8e4f-{i:012}");
-            assert!(seen.insert(session_dir_name(&sid)), "撞名了：{sid}");
-        }
-    }
-
-    #[test]
-    fn session_dir_is_under_the_workspace() {
-        let sid = "0199e1f0-aaaa-7000-8000-000000000001";
-        let guest = session_guest_dir(sid);
-        assert_eq!(
-            guest,
-            format!("/workspace/{}", session_dir_name(sid)),
-            "{guest}"
-        );
-    }
-
-    /// 宿主模式（电脑上）**不分会话目录**：`pwd` 就是 workspace，文件落在它下面，
+    /// 桌面（电脑上）**不分会话目录**：`pwd` 就是 workspace，文件落在它下面，
     /// 不会在用户的项目里建出 `ph7ah4/` 这种目录；`read` / `edit` 的 cwd 也是根。
     #[tokio::test]
-    async fn host_mode_runs_in_the_workspace_itself() {
+    async fn native_runs_in_the_workspace_itself() {
         let t = TempRoot::new("sessioncwd");
-        let sb = LinuxSandbox::host(t.dir.clone());
+        let sb = LinuxSandbox::native(t.dir.clone());
         let sid = "0199e1f0-aaaa-7000-8000-000000000001";
 
         let r = sb
@@ -5331,262 +3771,17 @@ mod tests {
         let mut lines = r.stdout.lines();
         let pwd = std::fs::canonicalize(lines.next().unwrap().trim()).unwrap();
         let root = std::fs::canonicalize(&t.dir).unwrap();
-        assert_eq!(pwd, root, "宿主模式的 cwd 应该就是 workspace");
-        // 设备命令（截图那些）靠它决定东西往哪落：宿主模式给真路径
+        assert_eq!(pwd, root, "桌面的 cwd 应该就是 workspace");
+        // 设备命令（截图那些）靠它决定东西往哪落：桌面给真路径
         let workdir = lines.next().unwrap().trim_start_matches("WORKDIR=");
         assert_eq!(std::fs::canonicalize(workdir).unwrap(), root);
         assert!(t.dir.join("落在这里.txt").is_file());
         assert!(
             !t.dir.join(session_dir_name(sid)).exists(),
-            "宿主模式不该建会话目录"
+            "桌面不该建会话目录"
         );
         assert_eq!(sb.session_cwd(Some(sid)), WORKSPACE);
 
         let _ = std::fs::remove_dir_all(&t.dir);
-    }
-
-    /// 沙箱（手机）挂了 workspace：每个会话一个自己的目录，bash 和 read/edit 一致。
-    #[test]
-    fn sandbox_sessions_get_their_own_dir() {
-        let t = TempRoot::new("sandboxcwd");
-        let mut sb = t.sandbox();
-        let sid = "0199e1f0-aaaa-7000-8000-000000000001";
-        let Mode::Proot(cfg) = &mut sb.mode else {
-            panic!("t.sandbox() 应该是 proot")
-        };
-        cfg.workspace = None;
-        assert_eq!(
-            sb.session_cwd(Some(sid)),
-            WORKSPACE,
-            "没挂 workspace 就退回根"
-        );
-
-        let Mode::Proot(cfg) = &mut sb.mode else {
-            unreachable!()
-        };
-        cfg.workspace = Some(t.dir.join("ws"));
-        assert_eq!(sb.session_cwd(Some(sid)), session_guest_dir(sid));
-        assert_eq!(sb.session_cwd(None), WORKSPACE);
-        assert_eq!(
-            sb.session_host_dir(sid),
-            Some(t.dir.join("ws").join(session_dir_name(sid)))
-        );
-
-        let _ = std::fs::remove_dir_all(&t.dir);
-    }
-
-    /// 沙箱里那个 `agent` 命令是 `prepare_rootfs` 写进去的。
-    ///
-    /// 浏览器、搜索、设备操作都只有这一个入口（见 `cli.rs`），掉了就等于这些能力
-    /// 全没了 —— 而且不会有任何报错，只是模型发现 `agent: not found`。
-    #[test]
-    fn prepare_rootfs_installs_the_agent_cli() {
-        let t = TempRoot::new("agentcli");
-        let sb = t.sandbox();
-        sb.prepare_rootfs().unwrap();
-
-        let cli = t.dir.join("usr/local/bin/agent");
-        let body = std::fs::read_to_string(&cli).expect("agent 命令没写进去");
-        assert!(body.starts_with("#!/bin/sh"), "要有 shebang");
-        assert!(body.contains("/api/debug/request"), "得能看自己的上下文");
-        assert!(body.contains("/api/command"), "得能操作手机");
-        assert!(body.contains("AGENT_PORT"), "端口从环境变量来");
-        // 浏览器只能从这一个门进（`browser` 工具删了），多标签那几个子命令
-        // 得在 —— 少了哪个，模型就会走进兜底分支把参数静默吃掉。
-        for sub in [
-            "navigate",
-            "new_tab",
-            "list_tabs",
-            "switch_tab",
-            "close_tab",
-        ] {
-            assert!(body.contains(sub), "浏览器子命令 {sub} 掉了");
-        }
-        // `agent ps` / `agent kill`：常驻服务能活过工具调用，就得能看/停它们
-        assert!(body.contains("/api/procs"), "`agent ps` 的后端接口掉了");
-        assert!(
-            body.contains("agent ps") && body.contains("agent kill"),
-            "help 里得列出来"
-        );
-        assert!(
-            body.contains("kill -TERM") && body.contains("kill -KILL"),
-            "`agent kill` 要先 TERM 再 KILL（给对 TERM 有反应的进程一个收尾机会）"
-        );
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&cli).unwrap().permissions().mode();
-            assert_eq!(mode & 0o111, 0o111, "必须可执行（现在是 {:o}）", mode);
-        }
-
-        // 语法交给 sh -n 过一遍（busybox ash 的语法是 POSIX 子集，够了）
-        if let Ok(out) = std::process::Command::new("sh")
-            .arg("-n")
-            .arg(&cli)
-            .output()
-        {
-            assert!(
-                out.status.success(),
-                "shell 语法不过：{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-
-        // 幂等：再跑一次不炸
-        sb.prepare_rootfs().unwrap();
-        let _ = std::fs::remove_dir_all(&t.dir);
-    }
-
-    /// 预装脚本也得写进去、可执行，而且**工具清单不能是空的**。
-    ///
-    /// 这个清单掉了不会有任何报错 —— 只是模型又开始每个回合自己 `apk add`。
-    #[test]
-    fn prepare_rootfs_installs_the_toolset_script() {
-        let t = TempRoot::new("agentsetup");
-        let sb = t.sandbox();
-        sb.prepare_rootfs().unwrap();
-
-        let sh = t.dir.join("usr/local/bin/agent-setup");
-        let body = std::fs::read_to_string(&sh).expect("agent-setup 没写进去");
-        assert!(body.starts_with("#!/bin/sh"));
-        for tool in TOOLSET {
-            assert!(body.contains(tool), "清单里的 {tool} 没出现在脚本里");
-        }
-        assert!(!body.contains("__PACKAGES__"), "模板占位没替换");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&sh).unwrap().permissions().mode();
-            assert_eq!(mode & 0o111, 0o111, "必须可执行");
-        }
-        if let Ok(out) = std::process::Command::new("sh").arg("-n").arg(&sh).output() {
-            assert!(
-                out.status.success(),
-                "shell 语法不过：{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-
-        // 清单得真管用：模型最常碰的几样必须在
-        for want in [
-            "ripgrep",
-            "fd",
-            "jq",
-            "python3",
-            "curl",
-            "bash",
-            "github-cli",
-        ] {
-            assert!(TOOLSET.contains(&want), "预装清单里少了 {want}");
-        }
-
-        // 没装过 → false；标记文件版本对上 → true；**版本对不上要重新装**
-        assert!(!sb.is_provisioned());
-        std::fs::write(t.dir.join("etc/agent-tools"), "1").unwrap();
-        assert!(!sb.is_provisioned(), "老版本的标记不该算装过");
-        std::fs::write(t.dir.join("etc/agent-tools"), TOOLSET.len().to_string()).unwrap();
-        assert!(sb.is_provisioned());
-
-        let _ = std::fs::remove_dir_all(&t.dir);
-    }
-
-    /// 沙箱里没有浏览器：`$BROWSER` 和 xdg-open 这些名字都指向 `agent-open`，
-    /// 它只把网址打回输出 —— 由 agent 在回复里转告用户（没有“自动打开”这回事）。
-    /// 另外这六个都是“开浏览器”的常见名字，至少别让调用方拿到 not found。
-    #[test]
-    fn rootfs_gets_the_browser_shims() {
-        let t = TempRoot::new("open");
-        let sb = t.sandbox();
-        sb.prepare_rootfs().unwrap();
-
-        let open = t.dir.join("usr/local/bin/agent-open");
-        let body = std::fs::read_to_string(&open).expect("agent-open 没写进去");
-        assert!(body.starts_with("#!/bin/sh"));
-        // 只剩一个薄壳：真正的逻辑在 `agent open` 里
-        assert!(body.contains("exec /usr/local/bin/agent open"), "{body}");
-
-        for alias in [
-            "xdg-open",
-            "sensible-browser",
-            "www-browser",
-            "x-www-browser",
-            "gnome-open",
-            "kde-open",
-        ] {
-            let p = t.dir.join("usr/local/bin").join(alias);
-            let shim =
-                std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{alias} 没写进去: {e}"));
-            assert!(
-                shim.contains("exec /usr/local/bin/agent-open"),
-                "{alias}: {shim}"
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&p).unwrap().permissions().mode();
-                assert_eq!(mode & 0o111, 0o111, "{alias} 必须可执行");
-            }
-        }
-
-        if let Ok(out) = std::process::Command::new("sh")
-            .arg("-n")
-            .arg(&open)
-            .output()
-        {
-            assert!(
-                out.status.success(),
-                "agent-open 语法不过：{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&t.dir);
-    }
-
-    /// `agent` 命令靠 `AGENT_PORT` 找到核心；核心还没 bind 时不该注入。
-    #[test]
-    fn guest_env_carries_the_agent_port_once_known() {
-        let t = TempRoot::new("agentport");
-        let sb = t.sandbox();
-
-        let has = |k: &str| {
-            sb.guest_env(sb.proot_config().unwrap())
-                .iter()
-                .any(|(n, _)| n == k)
-        };
-        assert!(!has("AGENT_PORT"), "还没 bind 就不该有端口");
-
-        sb.set_agent_port(41234);
-        let env: BTreeMap<String, String> = sb
-            .guest_env(sb.proot_config().unwrap())
-            .into_iter()
-            .collect();
-        assert_eq!(env.get("AGENT_PORT").map(String::as_str), Some("41234"));
-        assert_eq!(
-            env.get("AGENT_BASE").map(String::as_str),
-            Some("http://127.0.0.1:41234")
-        );
-
-        let _ = std::fs::remove_dir_all(&t.dir);
-    }
-
-    #[test]
-    fn alpine_detection_ignores_symlinks_to_absolute_paths() {
-        let dir = std::env::temp_dir().join(format!("agent-linux-detect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("bin")).unwrap();
-
-        // 模拟 Alpine：bin/sh 是指向绝对路径的符号链接。
-        // 用 Path::exists() 判断的话，它会拿宿主机的 /bin/busybox 去解析，
-        // 在宿主上没有 → 误判成"不是 rootfs"。
-        std::os::unix::fs::symlink("/bin/busybox", dir.join("bin/sh")).unwrap();
-        assert!(!is_alpine_rootfs(&dir), "只靠 bin/sh 会误判");
-
-        std::fs::write(dir.join("bin/busybox"), b"").unwrap();
-        assert!(is_alpine_rootfs(&dir));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

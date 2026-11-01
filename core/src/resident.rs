@@ -69,7 +69,7 @@ while IFS= read -r id; do
 done
 "#;
 
-/// 常驻的那个进程（宿主上看是 proot；宿主模式的测试里直接是 bash）。
+/// 常驻的那个进程（宿主上看是 proot；桌面的测试里直接是 bash）。
 pub struct Resident {
     stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,
     /// 宿主上那个进程的 pid（`spawn` 时 `process_group(0)`，所以也是组号）

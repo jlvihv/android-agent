@@ -223,7 +223,7 @@
     <div class="rounded-2xl bg-surface p-3.5">
       <p class="text-meta leading-relaxed text-muted">
         能被找到就不用走这里。地址是那台电脑上核心的地址（<code
-          class="font-mono">just dev-host</code
+          class="font-mono">just dev</code
         > 启动时打过），配对码在它终端里。
       </p>
       <div class="space-y-3 pt-3">

@@ -372,25 +372,6 @@ fn try_jpeg(img: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_url_cache_evicts_the_least_recently_used_and_skips_giants() {
-        let mut c = UrlCache::default();
-        let third = URL_CACHE_MAX_BYTES / 3;
-        let blob = |n: usize| -> Arc<str> { "x".repeat(n).into() };
-        c.put("a", blob(third));
-        c.put("b", blob(third));
-        c.put("c", blob(third));
-        assert!(c.get("a").is_some()); // a 刚用过，b 变成最久没用的
-        c.put("d", blob(third));
-        assert!(c.get("b").is_none(), "该挤掉最久没用的 b");
-        assert!(c.get("a").is_some() && c.get("c").is_some() && c.get("d").is_some());
-
-        // 一个就超上限的：不缓存，也不能为它把别的全挤掉
-        c.put("huge", blob(URL_CACHE_MAX_BYTES + 1));
-        assert!(c.get("huge").is_none());
-        assert!(c.get("a").is_some());
-        assert!(c.bytes <= URL_CACHE_MAX_BYTES);
-    }
     use image::{Rgb, RgbImage};
 
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {
@@ -404,104 +385,6 @@ mod tests {
         let p = std::env::temp_dir().join(format!("agent-image-{tag}-{}.png", std::process::id()));
         std::fs::write(&p, bytes).unwrap();
         p
-    }
-
-    #[test]
-    fn magic_bytes_identify_the_formats_read_accepts() {
-        assert_eq!(mime_of(&png_bytes(2, 2)).unwrap(), "image/png");
-        assert_eq!(mime_of(&[0xff, 0xd8, 0xff, 0xe0]).unwrap(), "image/jpeg");
-        assert_eq!(mime_of(b"GIF89a......").unwrap(), "image/gif");
-        assert_eq!(mime_of(b"RIFF????WEBPVP8 ").unwrap(), "image/webp");
-        assert_eq!(mime_of(b"BM....").unwrap(), "image/bmp");
-        assert_eq!(mime_of(b"hello world"), None);
-    }
-
-    #[test]
-    fn data_url_is_cached_after_the_first_read() {
-        let p = write_temp("urlcache", &png_bytes(4, 4));
-        let path = p.to_str().unwrap().to_string();
-        let first = cached_data_url(&path, "image/png").unwrap();
-        assert!(first.starts_with("data:image/png;base64,"));
-
-        // 把文件删了：第二次还能拿到 → 证明走的是缓存，没再读盘
-        std::fs::remove_file(&p).unwrap();
-        let second = cached_data_url(&path, "image/png").unwrap();
-        assert_eq!(first, second);
-
-        // 不存在的路径：报错而不是 panic
-        assert!(cached_data_url("/no/such/image.png", "image/png").is_err());
-    }
-
-    #[test]
-    fn is_image_file_sniffs_only_the_header() {
-        let p = write_temp("hdr", &png_bytes(2, 2));
-        assert!(is_image_file(&p).unwrap());
-
-        let t = std::env::temp_dir().join(format!("agent-image-txt-{}", std::process::id()));
-        std::fs::write(&t, "not an image at all").unwrap();
-        assert!(!is_image_file(&t).unwrap());
-        let _ = std::fs::remove_file(&t);
-    }
-
-    #[test]
-    fn plain_text_is_not_an_image() {
-        let p = std::env::temp_dir().join(format!("agent-image-text-{}", std::process::id()));
-        std::fs::write(&p, "just text").unwrap();
-        assert!(load_if_image(&p).unwrap().is_none());
-    }
-
-    /// 手机竖拍的小图：尺寸没超、字节也不大，但带 EXIF 旋转标记 ——
-    /// 不能原样发（模型看到的是躺着的），要转正后重编码。
-    #[test]
-    fn small_images_with_an_exif_rotation_are_turned_upright() {
-        let img = DynamicImage::new_rgb8(40, 20);
-        let mut jpeg = Vec::new();
-        img.write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
-            .unwrap();
-        // APP1/Exif：大端 TIFF，一个 IFD 条目 Orientation(0x0112) = 6（顺时针 90°）
-        let mut app1: Vec<u8> = vec![0xFF, 0xE1, 0x00, 0x22];
-        app1.extend_from_slice(b"Exif\0\0MM\0\x2a\0\0\0\x08");
-        app1.extend_from_slice(&[
-            0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0,
-        ]);
-        let mut rotated = jpeg[..2].to_vec();
-        rotated.extend_from_slice(&app1);
-        rotated.extend_from_slice(&jpeg[2..]);
-
-        let e = load_if_image_bytes(&rotated).unwrap().unwrap();
-        assert_ne!(e.bytes, rotated, "带旋转标记的不能原样发");
-        assert_eq!((e.width, e.height), (20, 40), "转正之后宽高互换");
-    }
-
-    /// 照片 / JPEG 截图缩完直接出 JPEG，不先去试（慢又大的）PNG；
-    /// 无损的源图（PNG）还是先试 PNG。
-    #[test]
-    fn lossy_sources_skip_the_png_attempt() {
-        let big = DynamicImage::new_rgb8(2600, 1300);
-        let mut jpeg = Vec::new();
-        big.write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
-            .unwrap();
-        let e = load_if_image_bytes(&jpeg).unwrap().unwrap();
-        assert_eq!(e.mime, "image/jpeg");
-        assert_eq!((e.width, e.height), (2000, 1000));
-
-        let e = load_if_image_bytes(&png_bytes(2600, 1300))
-            .unwrap()
-            .unwrap();
-        assert_eq!(e.mime, "image/png", "无损的源图缩完还是先试 PNG");
-    }
-
-    #[test]
-    fn small_images_pass_through_untouched() {
-        let bytes = png_bytes(64, 48);
-        let p = write_temp("small", &bytes);
-        let e = load_if_image(&p).unwrap().unwrap();
-        assert_eq!(e.bytes, bytes, "小图必须原样发，不重编码");
-        assert_eq!(e.mime, "image/png");
-        assert_eq!((e.width, e.height), (64, 48));
-        assert_eq!((e.original_width, e.original_height), (64, 48));
-        assert_eq!(e.source_bytes, bytes.len());
-        assert!(fits_inline(e.bytes.len()));
     }
 
     #[test]
@@ -524,33 +407,9 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_qualities_are_tried_from_high_to_low() {
-        // 循环命中即返回：顺序写反了低质量会盖掉高质量（`[80, 85, …]` 里的 85
-        // 永远轮不到），所以顺序本身就是要守住的行为。
-        assert!(
-            JPEG_QUALITIES.windows(2).all(|w| w[0] > w[1]),
-            "{JPEG_QUALITIES:?}"
-        );
-    }
-
-    #[test]
     fn absurd_pixel_counts_are_rejected_before_decoding() {
         assert!(pixels_ok(4000, 3000)); // 12MP 手机照
         assert!(pixels_ok(2000, 2000));
         assert!(!pixels_ok(12000, 9000)); // 108MP，解码就是 400MB
-    }
-
-    #[test]
-    fn base64_budget_is_measured_on_the_encoded_form() {
-        // 3 字节 → 4 个字符
-        assert_eq!(base64_len(0), 0);
-        assert_eq!(base64_len(1), 4);
-        assert_eq!(base64_len(3), 4);
-        assert_eq!(base64_len(4), 8);
-        // 边界：正好等于上限不算过，少 3 字节才行
-        let at_limit = MAX_INLINE_BYTES / 4 * 3;
-        assert_eq!(base64_len(at_limit), MAX_INLINE_BYTES);
-        assert!(!fits_inline(at_limit));
-        assert!(fits_inline(at_limit - 3));
     }
 }

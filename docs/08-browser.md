@@ -491,7 +491,7 @@ just phone                       # 交互模式
 `AGENT_CDP=off` 是不要浏览器。找不到 Chrome 时用 `AGENT_CHROME` 指可执行文件。
 
 ```sh
-just dev-host                    # 或者 just dev —— 沙箱/宿主模式都能用它
+just dev                    # 桌面（本机）
 agent browser navigate https://example.com
 ```
 
@@ -521,7 +521,7 @@ agent browser navigate https://example.com
 - **截图一条路**：`Page.captureScreenshot` 直接给 JPEG，不需要「GPU 合成 +
   软件绘制」那两条（第 5 节）—— 那是 Android 无窗口 WebView 的坑。
 - **`js` 不用 kick + 轮询**：CDP 的 `awaitPromise` 会等 Promise。
-- **截图落哪**：手机上是 `<rootfs>/root/.browser/`；宿主模式下 `/root` 是**用户的
+- **截图落哪**：手机上是 `<rootfs>/root/.browser/`；桌面下 `/root` 是**用户的
   根目录**（写不进去也不该写），换成 `$XDG_DATA_HOME/android-agent/browser/`
   —— 前缀就是宿主路径本身，`read` 直接解得开。两边都由 `gc` 清扫
   （`gc::SideDirs`）。

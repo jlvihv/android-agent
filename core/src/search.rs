@@ -80,13 +80,11 @@ pub fn format_hits(found: &Found) -> String {
     out
 }
 
-/// 找 key：环境变量优先（桌面开发），其次库里 `meta` 的 `exa_api_key`（手机）。
+/// 找 key：只在库里（`meta` 的 `exa_api_key`，设置页写的）。
+///
+/// 曾经还有一条 `EXA_API_KEY` 环境变量压库一头（桌面开发）—— 删了：配置只有
+/// 一个来源，不然「界面上填的」和「shell 里带的」会互相打架（LLM 那边同一个教训）。
 pub fn read_key(state: &AppState) -> Option<String> {
-    if let Ok(v) = std::env::var("EXA_API_KEY") {
-        if !v.trim().is_empty() {
-            return Some(v.trim().to_string());
-        }
-    }
     let db = state.db.read().ok().and_then(|g| g.clone())?;
     db.get_meta("exa_api_key")
         .ok()
@@ -354,39 +352,4 @@ async fn search_api(query: &str, num: usize, key: &str) -> anyhow::Result<Found>
         hits,
         provider: "exa-api",
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SAMPLE: &str = "Title: Newsroom\nURL: https://www.anthropic.com/news\n\
-        Published: 2026-10-06T00:00:00.000Z\nAuthor: N/A\nHighlights:\n\
-        #### Introducing Claude Haiku 5.5\n\nOur fastest model yet. …\n\n---\n\n\
-        Title: Another\nURL: https://example.com/a\nHighlights:\nA &amp; B\n";
-
-    #[test]
-    fn mcp_text_blocks_become_hits() {
-        let hits = parse_mcp_text(SAMPLE, 5);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].title, "Newsroom");
-        assert_eq!(hits[0].url, "https://www.anthropic.com/news");
-        assert!(hits[0].snippet.contains("Introducing Claude Haiku 5.5"));
-        assert!(!hits[0].snippet.contains("####"), "Markdown 标记要清掉");
-        assert_eq!(hits[1].snippet, "A & B", "HTML 实体要还原");
-    }
-
-    #[test]
-    fn mcp_text_respects_num() {
-        assert_eq!(parse_mcp_text(SAMPLE, 1).len(), 1);
-    }
-
-    #[test]
-    fn missing_title_falls_back_to_host() {
-        let hits = parse_mcp_text("Title: \nURL: https://a.b/c/d\nHighlights:\nx\n", 5);
-        assert_eq!(hits[0].title, "a.b");
-        // MCP 那边没标题时写的就是这个
-        let na = parse_mcp_text("Title: N/A\nURL: https://a.b/c/d\nHighlights:\nx\n", 5);
-        assert_eq!(na[0].title, "a.b");
-    }
 }

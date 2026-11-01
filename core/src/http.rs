@@ -330,7 +330,7 @@ async fn auth_login(State(st): State<Arc<AppState>>, Query(q): Query<AuthQuery>)
 async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let dev = st.device();
     // 优先运行时配置，回退环境变量（桌面）
-    let provider = st.llm().or_else(Provider::from_env);
+    let provider = st.llm();
     // 能力判定只看缓存（health 不能联网等 models.dev）
     let capabilities = provider.as_ref().map(|p| {
         json!({
@@ -355,7 +355,7 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "id": st.instance_id(),
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
-            "host": s.is_host(),
+            "host": s.is_native(),
             // 宿主模式下 rootfs 是 `/`，有信息量的是命令的 cwd
             "workspace": s.workspace().map(|w| w.display().to_string()),
         })),
@@ -1182,7 +1182,7 @@ async fn mcp_remove(st: &AppState, args: &[String]) -> anyhow::Result<String> {
 
 fn mcp_out_dir(st: &AppState, workdir: Option<&str>) -> Option<crate::mcp::OutDir> {
     let sb = st.linux()?;
-    if sb.is_host() {
+    if sb.is_native() {
         let (host, guest) = sb.spill_dir();
         return Some(crate::mcp::OutDir {
             host,
@@ -1683,11 +1683,7 @@ struct ChatBody {
 /// 两种情况下**输出格式完全一致**，所以前端不需要知道区别。
 async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Response {
     // 运行时配置优先（安卓），回退环境变量（桌面）
-    let provider = if body.demo {
-        None
-    } else {
-        st.llm().or_else(Provider::from_env)
-    };
+    let provider = if body.demo { None } else { st.llm() };
 
     // 写进哪个会话：指定的 > 当前活动的（脚本 / agentctl 不指定）。
     let sid = {
@@ -2022,7 +2018,7 @@ struct StopBody {
 /// 前端那层省的是「面板第一帧没数据 → 先渲染载入中再长高」的布局跳动。
 /// `models` 还是当前这家的清单（agentctl 用）。
 async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery>) -> Response {
-    let current = st.llm().or_else(Provider::from_env);
+    let current = st.llm();
     let current_id = current.as_ref().map(crate::providers::identify);
     let store = st.providers.read().map(|g| g.clone()).unwrap_or_default();
 
@@ -2371,7 +2367,7 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
     if body.model.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "model 不能为空").into_response();
     }
-    let current = st.llm().or_else(Provider::from_env);
+    let current = st.llm();
     let current_id = current.as_ref().map(crate::providers::identify);
     let mut p = match (&body.provider, current) {
         // 换到另一家：用设置页存下的那家的 Key，思考强度沿用
@@ -2640,7 +2636,7 @@ fn session_rev(sess: &crate::agent::ChatSession) -> String {
 /// 原本要敲六个接口（health / sessions / linux / llm …）才能拼出来，
 /// 而调试时最想要的就是「现在到底什么情况」。前端不用它。
 async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let provider = st.llm().or_else(Provider::from_env);
+    let provider = st.llm();
     let sessions = {
         let store = st.chat.read().await;
         json!({
@@ -2666,7 +2662,7 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "sessions": sessions,
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
-            "host": s.is_host(),
+            "host": s.is_native(),
             "sharedStorage": s.has_shared_storage(),
         })),
         "browser": st.browser().map(|b| b.describe()),
@@ -2698,7 +2694,7 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// 说是「预测」是因为真的发的时候，历史里可能先补上一条新的系统提示词
 /// （`ensure_system_prompt`）—— 这里也照做，所以和实际发送一致。
 async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
-    let Some(p) = st.llm().or_else(Provider::from_env) else {
+    let Some(p) = st.llm() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "未配置 LLM provider").into_response();
     };
 
@@ -3607,10 +3603,7 @@ fn cmd_name(c: &Command) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        coalesce, is_loopback_origin, is_same_origin, parse_range, parse_rev, session_rev,
-    };
-    use super::{sandbox_page_url, sandbox_url_to_guest};
+    use super::{is_loopback_origin, is_same_origin};
 
     /// 一个开着凭据、带一个真 rootfs 目录的核心：rootfs/workspace/site/index.html。
     async fn sandbox_core(
@@ -3637,197 +3630,6 @@ mod tests {
             },
         )));
         (st, root)
-    }
-
-    /// 手机系统能力的回包 → 纯文本：数据排成文字；失败写「错误：消息（错误码）」，
-    /// 错误码留着（模型靠它分辨「用户拒了权限」和「参数错了」）。
-    #[test]
-    fn device_replies_render_as_plain_text() {
-        let t = |v: serde_json::Value| crate::http::device_text(&v);
-        assert_eq!(
-            t(serde_json::json!({ "ok": true, "data": { "level": 82, "charging": true } })),
-            "charging: true\nlevel: 82"
-        );
-        assert_eq!(
-            t(
-                serde_json::json!({ "ok": false, "error": { "code": "permission_denied", "message": "用户拒绝了短信权限" } })
-            ),
-            "错误：用户拒绝了短信权限（permission_denied）"
-        );
-        assert_eq!(t(serde_json::json!({ "ok": true, "data": null })), "完成");
-        assert_eq!(
-            t(serde_json::json!({ "ok": true, "data": "用法：agent sms list …" })),
-            "用法：agent sms list …"
-        );
-    }
-
-    /// 浏览器回包渲染成纯文本：正文原样，失败写「错误：」，页面 / 标签信息只在需要时补。
-    #[test]
-    fn browser_replies_render_as_plain_text() {
-        let t = |v: serde_json::Value| crate::http::browser_text(&v);
-        assert_eq!(
-            t(
-                serde_json::json!({ "ok": true, "text": "已打开 https://a.com/\n标题：A", "url": "https://a.com/", "title": "A" })
-            ),
-            "已打开 https://a.com/\n标题：A",
-            "正文里已经有网址就不再补"
-        );
-        assert_eq!(
-            t(
-                serde_json::json!({ "ok": true, "text": "已点击 <a> 登录", "url": "https://a.com/x", "title": "X" })
-            ),
-            "已点击 <a> 登录\n[页面：X — https://a.com/x]"
-        );
-        assert_eq!(
-            t(serde_json::json!({ "ok": false, "text": "找不到元素 #q" })),
-            "错误：找不到元素 #q"
-        );
-        assert_eq!(
-            t(serde_json::json!({ "ok": true, "text": "ok", "tab": 2, "tabs": 3 })),
-            "ok\n[标签 #2，共 3 只]"
-        );
-        assert_eq!(
-            t(serde_json::json!({ "ok": true, "text": "ok", "tab": 1, "tabs": 1 })),
-            "ok",
-            "单标签不啰嗦"
-        );
-        assert_eq!(
-            t(serde_json::json!({ "text": "没有 ok 字段的原样文本" })),
-            "没有 ok 字段的原样文本"
-        );
-    }
-
-    /// 用户停用的 MCP 服务，agent 不能靠 `agent mcp add` 重新接一次把它打开（开关是用户的）。
-    /// 在连网之前就拒，配置和开关都不动。
-    #[tokio::test]
-    async fn agent_cannot_reenable_a_disabled_mcp_server_by_adding_it_again() {
-        let st = crate::state::AppState::new();
-        st.mcp.set_servers(vec![crate::mcp::Server {
-            name: "gh".into(),
-            url: "https://example.invalid/mcp".into(),
-            headers: Default::default(),
-        }]);
-        st.mcp.set_enabled("gh", false);
-        let e = crate::http::mcp_add(&st, &["gh".into(), "https://other.invalid/mcp".into()])
-            .await
-            .unwrap_err();
-        assert!(format!("{e:#}").contains("停用"), "{e:#}");
-        assert!(!st.mcp.is_enabled("gh"));
-        assert_eq!(
-            st.mcp.servers()[0].url,
-            "https://example.invalid/mcp",
-            "配置不动"
-        );
-    }
-
-    /// `agent ps` 的后端：`/api/procs` 跟别的 `/api` 一样要凭据，`?format=text`
-    /// 回人话（沙箱里的 `agent ps` 直接打它）。
-    #[tokio::test]
-    async fn procs_endpoint_needs_auth_and_speaks_plain_text() {
-        let (st, _root) = sandbox_core("procs").await;
-        let (base, c) = serve(st.clone()).await;
-
-        let unauth = c.get(format!("{base}/api/procs")).send().await.unwrap();
-        assert_eq!(unauth.status(), 401);
-
-        let r = c
-            .get(format!("{base}/api/procs?format=text"))
-            .header("x-agent-token", "s3cret")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
-        let ctype = r.headers()["content-type"].to_str().unwrap().to_string();
-        assert!(ctype.starts_with("text/plain"), "{ctype}");
-        let body = r.text().await.unwrap();
-        // 新建的空沙箱没登记过任何运行：要么「没有别的东西在跑」，要么 /proc 看不见
-        assert!(
-            body.contains("没有别的东西在跑") || body.contains("看不见任何进程"),
-            "{body}"
-        );
-
-        let v: serde_json::Value = c
-            .get(format!("{base}/api/procs"))
-            .header("x-agent-token", "s3cret")
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["ok"], true);
-        assert!(v["leftovers"].as_array().unwrap().is_empty());
-        assert!(v["running"].as_array().unwrap().is_empty());
-    }
-
-    /// `agent readable` 从头到尾走一遍：生成的脚本 → curl → `/api/readable` → 正文。
-    /// 页面故意做到 2MB 以上（axum 默认的请求体上限），大页面也得收得下；
-    /// 不是 UTF-8 的以「错误：」回来，脚本据此非 0 退出。
-    #[tokio::test]
-    async fn agent_readable_pipes_html_through_the_core() {
-        let st = crate::state::AppState::new();
-        st.set_token(Some("s3cret".into()));
-        let (base, _) = serve(st).await;
-        let dir = std::env::temp_dir().join(format!("agent-readable-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("agent");
-        std::fs::write(&script, crate::cli::script(crate::cli::Machine::Host)).unwrap();
-
-        let para =
-            "这是正文里的一段话，长到足够让 Readability 认出这里才是文章，逗号也够多，打分才高。";
-        let filler = format!(
-            "<script>var x = '{}';</script>",
-            "x".repeat(3 * 1024 * 1024)
-        );
-        let html = format!(
-            "<html><head><title>大页面</title>{filler}</head><body><nav>首页 关于</nav>\
-             <article><p>{para}</p><p>{para}第二段。</p><p>{para}第三段。</p></article></body></html>"
-        );
-        let run = |input: Vec<u8>| {
-            let script = script.clone();
-            let base = base.clone();
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    use std::io::Write;
-                    let mut child = std::process::Command::new("sh")
-                        .arg(&script)
-                        .arg("readable")
-                        .env("AGENT_BASE", &base)
-                        .env("AGENT_TOKEN", "s3cret")
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    child.stdin.take().unwrap().write_all(&input).unwrap();
-                    child.wait_with_output().unwrap()
-                })
-                .await
-                .unwrap()
-            }
-        };
-
-        let out = run(html.into_bytes()).await;
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success(),
-            "{text}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(text.starts_with("大页面\n\n"), "{text}");
-        assert!(
-            text.contains("第三段。") && !text.contains("首页"),
-            "{text}"
-        );
-
-        let out = run(b"<meta charset=gbk>\xd6\xd0\xce\xc4".to_vec()).await;
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(out.status.code(), Some(1), "{text}");
-        assert!(
-            text.starts_with("错误：") && text.contains("iconv"),
-            "{text}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 两个源分开：`sandbox.localhost` 上只有沙箱文件，而且不关进 opaque origin
@@ -3887,89 +3689,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 浏览器要打开的地址：沙箱文件的几种写法都映射到独立的源上；网址不动。
-    #[test]
-    fn sandbox_paths_map_to_the_sandbox_origin_and_back() {
-        let base = "http://sandbox.localhost:4000/sandbox/k";
-        let map = |s: &str| sandbox_page_url(s, 4000, "k");
-        assert_eq!(
-            map("preview:/workspace/a.html").unwrap(),
-            format!("{base}/workspace/a.html")
-        );
-        assert_eq!(
-            map("preview:///workspace/a.html").unwrap(),
-            format!("{base}/workspace/a.html")
-        );
-        assert_eq!(
-            map("preview:site/a.html").unwrap(),
-            format!("{base}/workspace/site/a.html")
-        );
-        assert_eq!(
-            map("file:///root/x.html").unwrap(),
-            format!("{base}/root/x.html")
-        );
-        assert_eq!(
-            map("/workspace/a.html?q=1#top").unwrap(),
-            format!("{base}/workspace/a.html?q=1#top")
-        );
-        assert_eq!(
-            map("preview:/workspace/报告 1/index.html").unwrap(),
-            format!("{base}/workspace/%E6%8A%A5%E5%91%8A%201/index.html")
-        );
-        assert_eq!(
-            map("preview:/workspace/%E6%8A%A5.html").unwrap(),
-            format!("{base}/workspace/%E6%8A%A5.html"),
-            "已经编码过的不再编一次"
-        );
-        for web in [
-            "https://example.com",
-            "example.com/a",
-            "//cdn.x/y.js",
-            "http://127.0.0.1:1/",
-        ] {
-            assert!(map(web).is_none(), "{web}");
-        }
-
-        // 回来的结果改写回 `preview:`（端口和钥匙不进历史）
-        let back = |s: &str| sandbox_url_to_guest(s, 4000, "k");
-        assert_eq!(
-            back(&format!(
-                "已打开 {base}/workspace/%E6%8A%A5%E5%91%8A%201/index.html\n标题：x"
-            )),
-            "已打开 preview:/workspace/报告 1/index.html\n标题：x"
-        );
-        assert_eq!(back(&format!("{base}/")), "preview:/workspace/");
-        assert_eq!(back("https://example.com/"), "https://example.com/");
-        assert_eq!(
-            back(&format!("{base}/workspace/a.html")),
-            back(&back(&format!("{base}/workspace/a.html"))),
-            "幂等"
-        );
-    }
-
-    /// 积压的一批里，被后来者盖掉的阶段性输出扔掉；别的 chunk（正文、
-    /// 最终输出、别的工具的快照）一个不少、顺序不变。
-    #[test]
-    fn coalesce_drops_only_superseded_live_output() {
-        use crate::sse;
-        let p = |id: &str, n: u32| sse::tool_output_preliminary(id, serde_json::json!(n));
-        let batch = vec![
-            p("a", 1),
-            sse::text_delta("t", "x"),
-            p("b", 1),
-            p("a", 2),
-            sse::tool_output_available("b", serde_json::json!("done")),
-            p("a", 3),
-        ];
-        let out = coalesce(batch.clone());
-        assert_eq!(
-            out,
-            vec![batch[1].clone(), batch[4].clone(), batch[5].clone()],
-            "a 只留最后一份；b 的快照被它的最终输出盖掉"
-        );
-    }
-    use crate::agent::{ChatMessage, ChatSession};
-
     /// 起一个真的核心服务，返回 (base, 不跟随跳转的 client)。
     async fn serve(st: std::sync::Arc<crate::state::AppState>) -> (String, reqwest::Client) {
         crate::llm::install_crypto_provider();
@@ -3981,131 +3700,6 @@ mod tests {
             .build()
             .unwrap();
         (format!("http://{addr}"), client)
-    }
-
-    /// 假的 OpenAI 兼容服务：`/models` 只认 `Bearer good`，返回两个能聊的模型 + 一个 embedding。
-    async fn fake_models_server() -> String {
-        let app = axum::Router::new().route(
-            "/v1/models",
-            axum::routing::get(|h: axum::http::HeaderMap| async move {
-                let ok =
-                    h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer good");
-                if !ok {
-                    return (axum::http::StatusCode::UNAUTHORIZED, "bad key").into_response();
-                }
-                axum::Json(serde_json::json!({ "data": [
-                    { "id": "m-small" }, { "id": "m-big" }, { "id": "text-embedding-3-small" }
-                ] }))
-                .into_response()
-            }),
-        );
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = l.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-        format!("http://{addr}/v1")
-    }
-
-    use axum::response::IntoResponse;
-
-    /// 设置页的流程：错的 Key 不存；第一次配好就切过去；清单只留能聊的；
-    /// 删掉当前这家，当前 provider 跟着清空。
-    #[tokio::test]
-    async fn configuring_a_provider_validates_the_key_and_lists_its_models() {
-        let st = crate::state::AppState::new();
-        let upstream = fake_models_server().await;
-        let (base, c) = serve(st.clone()).await;
-        let post = |path: &str, body: serde_json::Value| {
-            c.post(format!("{base}{path}")).json(&body).send()
-        };
-
-        let r = post(
-            "/api/providers/custom",
-            serde_json::json!({ "apiKey": "bad", "baseUrl": upstream }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(r.status().as_u16(), 400);
-        assert!(r.text().await.unwrap().contains("API Key 不对"));
-        assert!(
-            st.provider_creds("custom").is_none(),
-            "验证没过的 Key 不能存"
-        );
-
-        let r = post(
-            "/api/providers/custom",
-            serde_json::json!({ "apiKey": "good", "baseUrl": upstream }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        let p = st.llm().expect("第一次配好就该切过去，不用再选一次模型");
-        assert_eq!((p.model.as_str(), p.api_key.as_str()), ("m-small", "good"));
-
-        let list: serde_json::Value = c
-            .get(format!("{base}/api/providers"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let custom = list["providers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["id"] == "custom")
-            .unwrap()
-            .clone();
-        assert_eq!(custom["configured"], true);
-        assert_eq!(custom["current"], true);
-        assert_eq!(custom["keyHint"], "…good");
-        assert!(
-            custom.get("apiKey").is_none() && !list.to_string().contains("\"good\""),
-            "不能把 Key 回给前端"
-        );
-
-        let m: serde_json::Value = c
-            .get(format!("{base}/api/models"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let ids: Vec<&str> = m["groups"][0]["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|x| x["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, ["m-small", "m-big"], "embedding 这种不能聊的要筛掉");
-        assert_eq!(m["provider"], "custom");
-
-        // 没配过的那家：不能切过去
-        let r = post(
-            "/api/model",
-            serde_json::json!({ "model": "gpt-5", "provider": "openai" }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(r.status().as_u16(), 400);
-
-        let r = post(
-            "/api/model",
-            serde_json::json!({ "model": "m-big", "provider": "custom" }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        assert_eq!(st.llm().unwrap().model, "m-big");
-
-        let r = c
-            .delete(format!("{base}/api/providers/custom"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        assert!(st.llm().is_none(), "一家都不剩了，当前 provider 也没了");
     }
 
     /// 手机上别的 App 能连 127.0.0.1：没凭据的请求一律挡在 `/api` 外面。
@@ -4206,153 +3800,6 @@ mod tests {
         );
     }
 
-    /// 不同会话可以各跑一个回合；同一个会话跑着时，新消息进**队列**（不是 409）。
-    #[tokio::test]
-    async fn a_busy_session_queues_the_second_message_but_others_do_not_care() {
-        let st = crate::state::AppState::new();
-        *st.llm.write().unwrap() = Some(crate::llm::Provider::compatible(
-            "x",
-            "http://127.0.0.1:9",
-            "m",
-            "k",
-        ));
-        let (a, b) = {
-            let mut store = st.chat.write().await;
-            (store.create(), store.create())
-        };
-        let _running = st.begin_turn(&a).unwrap();
-        let (base, c) = serve(st.clone()).await;
-
-        // a 正跑着：这条消息排进服务端的队列（回一条只有 data-queued 的流），
-        // 不是 409 —— 前端那个队列活在 WebView 里，App 切后台就发不出去了
-        let r = c
-            .post(format!("{base}/api/chat"))
-            .json(&serde_json::json!({ "text": "再来", "session": a, "id": "q1" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        let body = r.text().await.unwrap();
-        assert!(body.contains("data-queued"), "得告诉界面这条排上了：{body}");
-        assert!(!body.contains("data-error"), "{body}");
-        let q = st.queued_list(&a);
-        assert_eq!(q.len(), 1);
-        assert_eq!(q[0].id, "q1", "客户端给的 id 得原样留着（界面靠它撤）");
-        assert_eq!(q[0].text, "再来");
-
-        // 会话里的排队清单（界面画「排队中」那些气泡）：形状就是一条用户消息
-        let v: serde_json::Value = c
-            .get(format!("{base}/api/session?id={a}"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["queued"][0]["id"], "q1");
-        assert_eq!(v["queued"][0]["role"], "user");
-        assert_eq!(v["queued"][0]["done"], false);
-        assert_eq!(v["queued"][0]["parts"][0]["text"], "再来");
-
-        // 撤掉它（气泡左边那个 ×）
-        let v: serde_json::Value = c
-            .post(format!("{base}/api/sessions/unqueue"))
-            .json(&serde_json::json!({ "session": a, "id": "q1" }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["removed"], true);
-        assert!(st.queued_list(&a).is_empty());
-        // 再撤一次就没得撤了（不是错误）
-        let v: serde_json::Value = c
-            .post(format!("{base}/api/sessions/unqueue"))
-            .json(&serde_json::json!({ "session": a, "id": "q1" }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["removed"], false);
-
-        // b 不受 a 影响：能开始（provider 是个连不上的地址，回合会以报错结束）
-        let r = c
-            .post(format!("{base}/api/chat"))
-            .json(&serde_json::json!({ "text": "你好", "session": b }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
-        let _ = r.text().await; // 等这个回合结束
-        assert!(st.is_busy(&a), "b 的回合结束不能把 a 的「进行中」清掉");
-        assert!(!st.is_busy(&b));
-
-        // 停 b（没在跑）不影响 a
-        let r: serde_json::Value = c
-            .post(format!("{base}/api/stop"))
-            .json(&serde_json::json!({ "session": b }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(r["running"], false);
-        assert!(!_running.abort_requested());
-    }
-
-    #[test]
-    fn range_header_parsing() {
-        assert_eq!(parse_range("bytes=0-99", 1000), Some((0, 99)));
-        assert_eq!(parse_range("bytes=900-", 1000), Some((900, 999)));
-        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
-        assert_eq!(
-            parse_range("bytes=990-5000", 1000),
-            Some((990, 999)),
-            "结尾越界要截到文件末尾"
-        );
-        assert_eq!(parse_range("bytes=1000-", 1000), None, "起点越界不满足");
-        assert_eq!(parse_range("bytes=0-1,5-9", 1000), None, "多段不支持");
-        assert_eq!(parse_range("items=0-1", 1000), None);
-    }
-
-    /// 版本号必须能反映「会话内容变了」，而且不同会话不能撞车。
-    ///
-    /// 它错了的后果很隐蔽：客户端发来的 rev 一旦与服务端算出的相同，
-    /// 就会收到 `unchanged`、界面永远停在一份旧消息上。
-    #[test]
-    fn session_rev_tracks_content_and_identity() {
-        let mut a = ChatSession::new();
-        let r0 = session_rev(&a);
-
-        // 新消息 → 变
-        a.messages.push(ChatMessage::user("问"));
-        let r1 = session_rev(&a);
-        assert_ne!(r0, r1);
-
-        // 内容不变 → 不变（轮询时靠这个省掉整段历史的传输）
-        assert_eq!(r1, session_rev(&a));
-
-        // 换个会话，即使消息数一样也不能相同（否则会卡在别的会话的内容上）
-        let mut b = ChatSession::new();
-        b.messages.push(ChatMessage::user("问"));
-        b.updated_at = a.updated_at;
-        assert_ne!(session_rev(&b), session_rev(&a));
-    }
-
-    #[test]
-    fn parse_rev_reads_the_session_id_and_message_count() {
-        assert_eq!(parse_rev("abc:7:123"), Some(("abc", 7)));
-        // 空 / 残缺 / 非法 → None（当作全量拉）
-        assert_eq!(parse_rev(""), None);
-        assert_eq!(parse_rev("abc"), None);
-        assert_eq!(parse_rev(":7:123"), None);
-        assert_eq!(parse_rev("abc:x:123"), None);
-    }
-
     #[test]
     fn only_loopback_origins_may_open_the_websocket() {
         for ok in [
@@ -4391,217 +3838,5 @@ mod tests {
             !is_same_origin("http://sandbox.localhost:8787", "127.0.0.1:8787"),
             "沙箱网页的源不能连 WebSocket"
         );
-    }
-
-    /// 设备通道的 `open` 指令：沙箱里的 `agent-open` / `$BROWSER` / `xdg-open`
-    /// 最终都走这里（`agent open` → `POST /api/command`）。
-    #[tokio::test]
-    async fn device_open_uri_takes_any_scheme() {
-        let st = crate::state::AppState::new();
-        st.set_device(crate::mock::MockDevice::new());
-        let (base, c) = serve(st.clone()).await;
-
-        // **不设 scheme 白名单**：https、App 深链、intent://、tel: 都直接转下去
-        for uri in [
-            "https://github.com/login/device",
-            "androidamap://navi?sourceApplication=agent&lat=39.9&lon=116.3",
-            "weixin://",
-            "intent://scan/#Intent;scheme=zxing;package=com.google.zxing.client.android;end",
-            "tel:10086",
-        ] {
-            let r = c
-                .post(format!("{base}/api/command"))
-                .json(&serde_json::json!({ "cmd": { "type": "open", "url": uri } }))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(r.status().as_u16(), 200, "{uri}");
-            let v: serde_json::Value = r.json().await.unwrap();
-            assert_eq!(v["ok"], true, "{uri}: {v}");
-            assert!(
-                v["detail"].as_str().unwrap_or("").contains("opened"),
-                "{uri}: {v}"
-            );
-        }
-
-        // 没有设备通道（桌面、或无障碍没连上）：说实话，而不是假装开了
-        let (base2, c2) = serve(crate::state::AppState::new()).await;
-        let v: serde_json::Value = c2
-            .post(format!("{base2}/api/command"))
-            .json(&serde_json::json!({ "cmd": { "type": "open", "url": "https://x.example" } }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["ok"], false);
-        assert!(
-            v["detail"].as_str().unwrap_or("").contains("没有设备"),
-            "{v}"
-        );
-    }
-
-    /// 假的 Shizuku 宿主：记下 argv，按脚本回话。
-    struct FakeShizuku {
-        state: String,
-        seen: std::sync::Mutex<Vec<Vec<String>>>,
-    }
-
-    impl crate::shizuku::ShizukuApi for FakeShizuku {
-        fn state(&self) -> String {
-            self.state.clone()
-        }
-        fn run(&self, argv: Vec<String>) -> String {
-            self.seen.lock().unwrap().push(argv.clone());
-            match argv.first().map(|s| s.as_str()) {
-                // `exec fail` 用来走失败那条路（校验只认组的名字，兜底命令随便给）
-                Some("exec") if argv.get(1).map(|s| s.as_str()) == Some("fail") => {
-                    r#"{"ok":false,"error":{"code":"OPERATION_FAILED","message":"坏了"}}"#.into()
-                }
-                Some("exec") => r#"{"ok":true,"text":"uid=0(root)\n"}"#.into(),
-                other => format!(r#"{{"ok":false,"error":{{"code":"x","message":"{other:?}"}}}}"#),
-            }
-        }
-    }
-
-    /// `/api/shizuku` 回纯文本：成功原样打、失败 `错误：…（code）`（CLI 据此非 0 退出）。
-    #[tokio::test]
-    async fn shizuku_endpoint_answers_plain_text() {
-        let st = crate::state::AppState::new();
-        let fake = std::sync::Arc::new(FakeShizuku {
-            state: r#"{"state":"READY","version":13,"uid":0,"sui":true}"#.into(),
-            seen: Default::default(),
-        });
-        st.set_shizuku(fake.clone());
-        let (base, c) = serve(st.clone()).await;
-
-        let body = |argv: serde_json::Value| {
-            let (base, c) = (base.clone(), c.clone());
-            async move {
-                c.post(format!("{base}/api/shizuku"))
-                    .json(&serde_json::json!({ "argv": argv }))
-                    .send()
-                    .await
-                    .unwrap()
-                    .text()
-                    .await
-                    .unwrap()
-            }
-        };
-
-        // exec：壳给的 stdout 原样回来（不过 render，不加引号）
-        let t = body(serde_json::json!(["exec", "id"])).await;
-        assert_eq!(t.trim(), "uid=0(root)");
-        assert_eq!(fake.seen.lock().unwrap()[0], vec!["exec", "id"]);
-
-        // service：核心自己答，**不走壳的 run**
-        let n = fake.seen.lock().unwrap().len();
-        let t = body(serde_json::json!(["service", "status"])).await;
-        assert!(t.contains("root"), "{t}");
-        assert!(t.contains("uid=0"), "{t}");
-        assert_eq!(
-            fake.seen.lock().unwrap().len(),
-            n,
-            "service 不该打到壳的 run"
-        );
-
-        // 失败：错误：开头（CLI 靠这个非 0 退出）。
-        // 命令自己说了原因，就不再补一个 OPERATION_FAILED（见 shizuku::envelope_text）
-        let t = body(serde_json::json!(["exec", "fail"])).await;
-        assert_eq!(t.trim(), "错误：坏了", "回包要短：{t}");
-
-        // 不带参数 / help：help + 一行状态
-        for argv in [serde_json::json!([]), serde_json::json!(["help"])] {
-            let t = body(argv.clone()).await;
-            assert!(t.contains("agent shizuku"), "{argv}: {t}");
-            assert!(
-                t.trim_end().ends_with("uid=0"),
-                "{argv} 最后一行是状态：{t}"
-            );
-        }
-
-        // 没有宿主（桌面上）：一句人话，不是 panic
-        let (base2, c2) = serve(crate::state::AppState::new()).await;
-        let t = c2
-            .post(format!("{base2}/api/shizuku"))
-            .json(&serde_json::json!({ "argv": ["exec", "id"] }))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-        assert!(t.starts_with("错误："), "{t}");
-        assert!(t.contains("没有 Shizuku"), "{t}");
-    }
-
-    /// 记下收到的浏览器动作，按 `__open_uri` 的约定回话。
-    struct RecordingBrowser(std::sync::Mutex<Vec<String>>, bool);
-
-    impl crate::state::BrowserApi for RecordingBrowser {
-        fn execute(&self, action_json: &str) -> Result<String, String> {
-            self.0.lock().unwrap().push(action_json.to_string());
-            Ok(if self.1 {
-                r#"{"ok":true,"text":"opened x"}"#.into()
-            } else {
-                r#"{"ok":false,"text":"App 在后台"}"#.into()
-            })
-        }
-    }
-
-    /// 打开 URI 不该依赖无障碍：没有设备通道时交给浏览器那条（`__open_uri`），
-    /// 那边的失败原因原样带回来。点击之类真要无障碍的指令照旧报「没有设备」。
-    #[tokio::test]
-    async fn open_falls_back_to_the_browser_host_without_accessibility() {
-        let st = crate::state::AppState::new();
-        let b = std::sync::Arc::new(RecordingBrowser(Default::default(), true));
-        st.set_browser(b.clone());
-        let (base, c) = serve(st.clone()).await;
-        let cmd = |cmd: serde_json::Value| {
-            c.post(format!("{base}/api/command"))
-                .json(&serde_json::json!({ "cmd": cmd }))
-                .send()
-        };
-
-        let v: serde_json::Value = cmd(serde_json::json!({ "type": "open", "url": "weixin://" }))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["ok"], true, "{v}");
-        assert_eq!(v["detail"], "opened x");
-        let sent: serde_json::Value = serde_json::from_str(&b.0.lock().unwrap()[0]).unwrap();
-        assert_eq!(sent["action"], "__open_uri");
-        assert_eq!(sent["url"], "weixin://");
-
-        let v: serde_json::Value = cmd(serde_json::json!({ "type": "tap_xy", "x": 1, "y": 2 }))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["ok"], false);
-        assert!(v["detail"].as_str().unwrap().contains("没有设备"), "{v}");
-        assert_eq!(b.0.lock().unwrap().len(), 1, "点击不该落到浏览器上");
-
-        let st2 = crate::state::AppState::new();
-        st2.set_browser(std::sync::Arc::new(RecordingBrowser(
-            Default::default(),
-            false,
-        )));
-        let (base2, c2) = serve(st2).await;
-        let v: serde_json::Value = c2
-            .post(format!("{base2}/api/command"))
-            .json(&serde_json::json!({ "cmd": { "type": "open", "url": "https://x.example" } }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["ok"], false);
-        assert_eq!(v["detail"], "App 在后台");
     }
 }

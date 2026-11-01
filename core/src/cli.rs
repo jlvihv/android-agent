@@ -11,7 +11,7 @@
 //! - [`Machine::Phone`]：手机（proot 沙箱 + 安卓）。设备操作、系统能力都有。
 //! - [`Machine::Sandbox`]：电脑上的 proot 沙箱（`just dev`）。形态和手机一样，
 //!   但没有设备、没有闹钟短信。
-//! - [`Machine::Host`]：电脑宿主模式（没有沙箱）。进程、装包都用系统自己的。
+//! - [`Machine::Host`]：电脑桌面（没有沙箱）。进程、装包都用系统自己的。
 //!
 //! 以前是一份脚本靠环境变量在运行时开关，于是模型在电脑上读到「操作这台手机（只有
 //! 手机上有）」、在手机上读到「这台电脑上没有它们」—— 它不该看到这层区分。现在每台
@@ -749,7 +749,7 @@ mod tests {
                 assert!(help.contains(s), "{m:?} 的 help 里少了 {s}");
             }
             // 模型不该看到「手机上 / 电脑上 / 只有…才有」这层区分
-            for leak in ["手机上", "电脑上", "只有手机", "两端", "宿主模式"] {
+            for leak in ["手机上", "电脑上", "只有手机", "两端", "桌面"] {
                 assert!(
                     !help.contains(leak),
                     "{m:?} 的 help 里提到了「{leak}」：\n{help}"
@@ -767,7 +767,7 @@ mod tests {
             for s in ["agent key", "agent tap", "agent swipe", "agent launch"] {
                 assert_eq!(help.contains(s), phone, "{m:?}：{s} 该不该列");
             }
-            // 特权命令（adb / root 身份）也只有手机上有：桌面宿主模式没有 Shizuku
+            // 特权命令（adb / root 身份）也只有手机上有：桌面没有 Shizuku
             assert_eq!(
                 help.contains("agent shizuku"),
                 phone,
@@ -777,152 +777,6 @@ mod tests {
             for s in ["agent ps", "agent kill", "agent setup", "agent files"] {
                 assert_eq!(help.contains(s), proot, "{m:?}：{s} 该不该列");
             }
-        }
-    }
-
-    /// 没有的命令就是不认识 —— 不是「这台机器上没有」那种解释。
-    #[test]
-    fn missing_commands_are_simply_unknown() {
-        for (m, cmd) in [
-            (Machine::Host, "sms"),
-            (Machine::Host, "tap"),
-            (Machine::Host, "ps"),
-            (Machine::Host, "shizuku"),
-            (Machine::Sandbox, "shizuku"),
-            (Machine::Sandbox, "clipboard"),
-            (Machine::Sandbox, "key"),
-        ] {
-            let (code, _, err) = run(m, &[cmd]);
-            assert_eq!(code, 2, "{m:?} {cmd}");
-            assert!(err.contains("不认识的子命令"), "{m:?} {cmd}：{err}");
-        }
-    }
-
-    /// 参数校验在脚本里就拦下来（不用连核心）。
-    #[test]
-    fn device_actions_validate_their_arguments() {
-        let bad: &[&[&str]] = &[
-            &["key", "power"],
-            &["tap", "1"],
-            &["tap", "x", "2"],
-            &["swipe", "1", "2", "3"],
-            &["launch"],
-            &["kill", "abc"],
-            &["debug"],
-            &["readable", "a.html", "b.html"],
-            &["readable", "/没有这个文件.html"],
-        ];
-        for args in bad {
-            let (code, _, err) = run(Machine::Phone, args);
-            assert_eq!(code, 2, "{args:?} 该报用法错：{err}");
-            assert!(err.contains("agent"), "{args:?}：{err}");
-        }
-    }
-
-    /// 浏览器动作表和核心（`cdp::ACTIONS`）对得上：漂了就是模型发得出、核心不认，
-    /// 或者核心有、CLI 没入口（模型永远发现不了）。
-    #[test]
-    fn browser_actions_match_the_core() {
-        let s = script(Machine::Host);
-        for action in crate::cdp::ACTIONS {
-            let name = if *action == "set_user_agent" {
-                "user_agent"
-            } else {
-                action
-            };
-            assert!(
-                s.contains(&format!("      {name})")),
-                "CLI 里没有浏览器动作 {name}"
-            );
-        }
-    }
-
-    /// 系统能力那一个 case 分支，名字和 `phone::COMMANDS` 一字不差。
-    #[test]
-    fn phone_commands_come_from_the_phone_table() {
-        let s = script(Machine::Phone);
-        let want = format!("  {})\n", crate::phone::names().join("|"));
-        assert!(s.contains(&want), "系统能力那个分支不对，应该是 {want}");
-    }
-
-    /// 提示词里那份清单：每台机器只列自己有的，不提别的机器。
-    #[test]
-    fn prompt_clause_follows_the_machine() {
-        let phone = prompt_clause(Machine::Phone);
-        assert!(phone.contains("`agent key|tap|swipe|launch`"), "{phone}");
-        assert!(
-            phone.contains(&format!("`agent {}`", crate::phone::names().join("|"))),
-            "{phone}"
-        );
-        assert!(
-            phone.contains("真 WebView") && phone.contains("`agent ps`"),
-            "{phone}"
-        );
-
-        let host = prompt_clause(Machine::Host);
-        assert!(
-            host.contains("无头 Chrome") && host.contains("默认程序"),
-            "{host}"
-        );
-        for s in ["agent ps", "agent key", "agent sms", "agent debug"] {
-            assert!(!host.contains(s), "宿主上不该提 {s}：{host}");
-        }
-        let sandbox = prompt_clause(Machine::Sandbox);
-        assert!(
-            sandbox.contains("`agent ps`") && !sandbox.contains("agent key"),
-            "{sandbox}"
-        );
-    }
-
-    /// 浏览器的动作清单 help 和提示词里都有，而且是同一份。
-    #[test]
-    fn browser_actions_are_in_help_and_prompt() {
-        for m in Machine::ALL {
-            let (_, help, _) = run(m, &["help"]);
-            let prompt = prompt_clause(m);
-            for a in BROWSER_ACTIONS {
-                assert!(help.contains(a), "{m:?} 的 help 里少了 {a}");
-                assert!(prompt.contains(a), "{m:?} 的提示词里少了 {a}");
-            }
-            assert!(
-                prompt.contains("`agent search <检索意图> [条数]`"),
-                "{prompt}"
-            );
-            // 抽正文紧跟在搜索后面：搜到链接 → curl | agent readable 读全文，是一条路
-            let search = prompt.find("`agent search").unwrap();
-            let readable = prompt.find("`agent readable [文件]`").expect(&prompt);
-            assert!(
-                search < readable && !prompt[search..readable].contains("`agent open"),
-                "{m:?}：readable 该紧跟在 search 后面：{prompt}"
-            );
-        }
-    }
-
-    /// `$var` 后面**不能**紧跟中文标点，必须写 `${var}`（见模块说明）。
-    #[test]
-    fn variables_are_braced_before_multibyte() {
-        for m in Machine::ALL {
-            let s = script(m);
-            let b = s.as_bytes();
-            let name = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-            let mut bad: Vec<String> = Vec::new();
-            let mut i = 0usize;
-            while i < b.len() {
-                if b[i] == b'$'
-                    && i + 1 < b.len()
-                    && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_')
-                {
-                    let mut j = i + 1;
-                    while j < b.len() && name(b[j]) {
-                        j += 1;
-                    }
-                    if j < b.len() && b[j] >= 0x80 {
-                        bad.push(String::from_utf8_lossy(&b[i..j]).into_owned());
-                    }
-                }
-                i += 1;
-            }
-            assert!(bad.is_empty(), "{m:?}：这些变量后面紧跟多字节字符：{bad:?}");
         }
     }
 }

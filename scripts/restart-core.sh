@@ -75,7 +75,7 @@ if [ -z "${PID:-}" ] || ! kill -0 "$PID" 2>/dev/null; then
     PID="$(pgrep -f 'release/agent[-]dev' | head -1 || true)"
 fi
 if [ -z "${PID:-}" ]; then
-    echo "没找到跑着的核心 —— 直接起一个就行（比如 just dev-host）。" >&2
+    echo "没找到跑着的核心 —— 直接起一个就行（比如 just dev）。" >&2
     exit 1
 fi
 
@@ -279,7 +279,7 @@ PY
         if try_start "$BACKUP" "旧的（备份）"; then
             log "⚠️ 退回到旧二进制了：现在是能用的状态，但跑的是老代码"
         else
-            log "❌❌ 都起不来 —— 到终端里手动跑：just dev-host"
+            log "❌❌ 都起不来 —— 到终端里手动跑：just dev"
             exit 1
         fi
     fi

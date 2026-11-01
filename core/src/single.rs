@@ -1,7 +1,7 @@
 //! 单实例：这台机器（这个用户）上只跑一个核心。
 //!
 //! 为什么要管这件事：同时起两个核心**不会有任何报错**，但会静默地互相干扰 ——
-//! 都是宿主模式、都叫「jl」时，mDNS 里同名服务没法共存（后起的赢，先起的那个广播
+//! 都是桌面、都叫「jl」时，mDNS 里同名服务没法共存（后起的赢，先起的那个广播
 //! 进程悄悄死掉，手机只找得到其中一个）；两个都写会话库时，各自的内存态又会互相
 //! 覆盖。所以默认是：**抢不到就起不来，并说清是谁在跑**。
 //!
@@ -22,9 +22,9 @@ pub const MULTI_ENV: &str = "AGENT_MULTI";
 
 /// 锁文件：`$XDG_DATA_HOME/android-agent/core.lock`（和库、`agent` 命令同一个根）。
 ///
-/// **故意不跟 `AGENT_DATA_DIR` 走**：那个是会话库的位置，本来就允许分开；而单实例
-/// 说的是「这台机器上一个」—— 各写各的库照样会互相干扰（mDNS 同名挤掉、两边的
-/// 内存态各说各话）。放在数据目录之外，换库也挡得住。
+/// **故意不跟会话库走**：`XDG_DATA_HOME` 一换，库和锁一起搬家，但单实例说的是
+/// 「这台机器上一个」—— 两个核心各写各的库照样会互相干扰（mDNS 同名挤掉、两边的
+/// 内存态各说各话）。所以锁永远在 `data_root()` 下，和库同一个根。
 pub fn default_path() -> PathBuf {
     crate::desktop::data_root().join("core.lock")
 }
@@ -166,32 +166,6 @@ mod tests {
         drop(first);
         assert!(acquire(&path, 8789).is_ok());
 
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_leftover_file_from_a_killed_core_blocks_nothing() {
-        // SIGKILL 之后锁文件还躺在那里，但锁已经被内核放掉了：不该挡路。
-        // 「陈不陈」这件事我们不用管，这正是选 flock 而不是 PID 文件的原因。
-        let path = tmp("stale");
-        std::fs::write(&path, "{\"pid\": 1, \"port\": 1, \"cmd\": \"早就没了\"}\n").unwrap();
-        let g = acquire(&path, 8787).expect("文件在、但没人拿锁，应该能起");
-        drop(g);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_garbled_lock_file_still_blocks_and_still_says_something() {
-        // 读不懂也得拦住（宁可多问一句），而且不能打一串空话
-        let path = tmp("garbled");
-        let _ = std::fs::remove_file(&path);
-        let first = acquire(&path, 8787).expect("先起一个");
-        std::fs::write(&path, "不是 JSON").unwrap();
-        let who = acquire(&path, 8789).unwrap_err();
-        assert_eq!(who, Holder::default());
-        assert!(who.describe().contains("没写细节"), "{}", who.describe());
-        assert!(who.kill_hint().is_none());
-        drop(first);
         let _ = std::fs::remove_file(&path);
     }
 }

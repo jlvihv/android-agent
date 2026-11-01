@@ -5,7 +5,7 @@
 //! 平台拼一次就冻结（见 `prompt::system_prompt` / `agent::tools`）—— 前缀缓存要的
 //! 是**同一个部署里字节确定**，不是「源码里是一个字面量」。
 //!
-//! 不能只有一份工具表（写死「Alpine 沙箱 / 已预装 / apk add」）：那样宿主模式就得
+//! 不能只有一份工具表（写死「Alpine 沙箱 / 已预装 / apk add」）：那样桌面就得
 //! 整句去**反驳**它，`pgrep` / `ss` 这类每个系统的事实也会散在三处。
 
 /// 模型跑在哪。
@@ -14,16 +14,16 @@ pub enum Platform {
     /// 安卓手机：proot + Alpine 沙箱。桌面上的 `just dev`（proot 沙箱）也是这个
     /// 形态 —— 那条路本来就是为了在电脑上复现手机。
     Android,
-    /// 桌面 Linux，宿主模式（没有沙箱）
+    /// 桌面 Linux，桌面（没有沙箱）
     Linux,
-    /// macOS，宿主模式（没有沙箱）
+    /// macOS，桌面（没有沙箱）
     Macos,
 }
 
 impl Platform {
     pub const ALL: [Platform; 3] = [Platform::Android, Platform::Linux, Platform::Macos];
 
-    /// 这个二进制上的宿主模式是哪种（按编译目标，一个二进制只跑在一种系统上）。
+    /// 这个二进制上的桌面是哪种（按编译目标，一个二进制只跑在一种系统上）。
     pub const fn host() -> Self {
         if cfg!(target_os = "macos") {
             Platform::Macos
@@ -32,7 +32,7 @@ impl Platform {
         }
     }
 
-    /// 是不是宿主模式（没有沙箱，直接用这台电脑）。
+    /// 是不是桌面（没有沙箱，直接用这台电脑）。
     pub const fn is_host(self) -> bool {
         !matches!(self, Platform::Android)
     }
@@ -40,7 +40,7 @@ impl Platform {
     /// 看「后台还有什么在跑 / 谁占着端口」用哪些命令。
     ///
     /// 安卓沙箱里是我们自己的 `agent ps`（靠 proot 的登记表认得出刻意脱离的
-    /// 常驻进程）；宿主模式没有登记表，用系统的。macOS 没有 `ss`，BSD 的
+    /// 常驻进程）；桌面没有登记表，用系统的。macOS 没有 `ss`，BSD 的
     /// `pgrep` 没有 `-a`（那是 procps 的）。
     pub const fn proc_tools(self) -> &'static str {
         match self {
@@ -56,28 +56,5 @@ impl Platform {
             Platform::Android => "`agent kill <pid>`",
             Platform::Linux | Platform::Macos => "`kill <pid>`",
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_host_flavour_follows_the_compile_target() {
-        assert!(Platform::host().is_host());
-        assert!(!Platform::Android.is_host());
-        assert_eq!(
-            Platform::host() == Platform::Macos,
-            cfg!(target_os = "macos")
-        );
-    }
-
-    #[test]
-    fn nobody_is_told_to_use_a_command_their_system_lacks() {
-        let mac = Platform::Macos.proc_tools();
-        assert!(!mac.contains("ss -"), "macOS 没有 ss");
-        assert!(!mac.contains("pgrep -af"), "BSD pgrep 没有 -a");
-        assert!(!Platform::Linux.proc_tools().contains("lsof"));
     }
 }

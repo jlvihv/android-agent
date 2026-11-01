@@ -5,8 +5,8 @@
 # 起四个进程，跑完自动收：
 #
 #   假 LLM   :8790   scripts/fixture-llm.ts        —— 给界面提供**受控内容**
-#   核心     :8791   cargo run --bin agent-dev     —— 独立实例，LLM 走环境变量（只在内存里，
-#                                                    不读不写你的 sessions.db，也不动 8787 那个）
+#   核心     :8791   cargo run --bin agent-dev     —— 独立实例，假 LLM 用 `POST /api/llm` 注进
+#                                                    一次性库（不读不写你的 sessions.db，也不动 8787 那个）
 #   vite     :5173   web/                          —— 代理 /api 到 8791；改前端源码不用重编 Rust
 #   Chrome   :9222   headless + CDP                —— 真正被审计的那个渲染树
 #
@@ -89,47 +89,43 @@ if [ ! -d web/dist ]; then
   (cd web && bun install --frozen-lockfile && bun run build)
 fi
 
-echo "→ 核心 :$CORE_PORT（独立实例，LLM 走环境变量，只在内存里）"
-# Linux 沙箱：夹具第一轮会发一个真的 bash 工具调用，要真跑就得有沙箱。
-# 没装（没跑过 `just linux-setup`）也能跑，只是那个工具调用会报错、工具行长得难看。
-SANDBOX_ROOTFS="${AGENT_LINUX_ROOTFS:-$PWD/.dev/linux/rootfs}"
-if [ ! -d "$SANDBOX_ROOTFS" ]; then
-  echo "  ⚠️ 没找到 rootfs（$SANDBOX_ROOTFS）—— 夹具那个 bash 调用会报错。"
-  echo "     想要干净的结果：先跑 just linux-setup"
-fi
+echo "→ 核心 :$CORE_PORT（独立实例，一次性库，只在内存里）"
+# 夹具第一轮会发一个真的 bash 工具调用（`echo fixture-tool-ok && uname -m`）。
+# 桌面就是这台机器本身（没有沙箱），它在这里直接跑 —— 就一句 echo，不碰别的。
 # AGENT_MULTI：故意起第二个核心（单实例默认会拦住），审计要在你自己那个核心
 # 还开着的时候跑。它不碰锁，也不会反过来挡住你。（core/src/single.rs）
 #
-# AGENT_LINUX_HOST：从别的 shell / 工具里跑时环境里可能带着 =1（强制宿主模式），
-# 那就用不上 .dev/linux/rootfs 了，审计看到的是一台假沙箱。清掉，按脚本自己的判断来。
-#
-# AGENT_BIND / AGENT_DATA_DIR 两个都是「让它真的独立」：
-#   - 只听本机：宿主模式默认听 0.0.0.0，那就变成「局域网服务」，核心会要求凭据
+# AGENT_BIND / XDG_DATA_HOME 两个都是「让它真的独立」：
+#   - 只听本机：桌面默认听 0.0.0.0，那就变成「局域网服务」，核心会要求凭据
 #     （`/api/health` 直接 401，脚本第一步就卡住），而审计只在这台机器上跑；
-#   - 临时数据目录：宿主模式下不给就用真的那份
-#     （`~/.local/share/android-agent/data`），审计会读到你的会话、还会往里写收藏 ——
-#     和脚本头「不读不写你的 sessions.db」相反。
+#   - 临时 `XDG_DATA_HOME`：不给就用真的那份（`~/.local/share/android-agent/data`），
+#     审计会读到你的会话、还会往里写收藏 —— 和脚本头「不读不写你的 sessions.db」相反。
 # 这三个清空：从别的 shell / 工具里跑的时候，环境里可能已经带着 AGENT_TOKEN
 # （那核心就要凭据，`/api/health` 401）和 AGENT_RELAY（会去连外面那台中继）。
 # 空字符串在两边都等于「没设」。
 AGENT_PORT="$CORE_PORT" \
 AGENT_BIND=127.0.0.1 \
-AGENT_DATA_DIR="$(mktemp -d)" \
+XDG_DATA_HOME="$(mktemp -d)" \
 AGENT_TOKEN= \
 AGENT_RELAY= \
 AGENT_RELAY_KEY= \
-AGENT_LINUX_HOST= \
-AGENT_LLM_BASE_URL="http://127.0.0.1:$FIXTURE_PORT/v1" \
-AGENT_LLM_API_KEY=fixture \
-AGENT_LLM_MODEL=fixture \
-AGENT_LLM_API_STYLE=chat \
-AGENT_LLM_NAME=fixture \
 AGENT_MULTI=1 \
-AGENT_LINUX_ROOTFS="$SANDBOX_ROOTFS" \
-AGENT_LINUX_PROOT="${AGENT_LINUX_PROOT:-$(command -v proot || echo proot)}" \
   cargo run --quiet --manifest-path core/Cargo.toml --bin agent-dev >/tmp/dom-audit-core.log 2>&1 &
 PIDS+=($!)
 wait_http "http://127.0.0.1:$CORE_PORT/api/health" "核心" 300
+
+# 假 LLM 的配置写进这个临时核心的**库**（`POST /api/llm`）。
+# 以前是拿 `AGENT_LLM_*` 环境变量灌的 —— 那条路已经删了（库是唯一来源，
+# 见 core/src/llm.rs），否则「界面上配的」和「shell 里带的」会互相打架。
+# XDG_DATA_HOME 是 mktemp 出来的，所以写进的是个一次性库。
+if ! curl -sS -m 30 -X POST "http://127.0.0.1:$CORE_PORT/api/llm" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"fixture\",\"baseUrl\":\"http://127.0.0.1:$FIXTURE_PORT/v1\",\"model\":\"fixture\",\"apiKey\":\"fixture\",\"apiStyle\":\"chat\"}" \
+  >/dev/null; then
+  echo "  ⚠️  假 LLM 注入失败（POST /api/llm）—— 审计会拿不到受控内容" >&2
+  echo "     核心日志：/tmp/dom-audit-core.log" >&2
+  exit 1
+fi
 
 echo "→ vite :$VITE_PORT（代理 /api → :$CORE_PORT）"
 (cd web && AGENT_CORE="http://127.0.0.1:$CORE_PORT" bun run dev --port "$VITE_PORT" --strictPort) \

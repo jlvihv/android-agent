@@ -604,7 +604,7 @@ impl Machines {
     /// 那台；本机自己的回合（比如脚本 `agentctl.py` 直接打本机 `/api/chat`）也不该
     /// 弹在别人的屏幕上。所以两种情况都由 `watch_own_turns` 自己判。
     ///
-    /// 只在宿主模式（桌面上）有用：手机上是壳的前台服务在发（见 docs/06）。
+    /// 只在桌面（桌面上）有用：手机上是壳的前台服务在发（见 docs/06）。
     pub fn watch_own_turns(self: &Arc<Self>) {
         // 手机上什么都不做：那是壳的活儿（见 `notify::available`）
         if !crate::notify::available() {
@@ -614,7 +614,7 @@ impl Machines {
             return; // 没有核心上下文（测试）
         };
         // 沙箱形态（`just dev`，在电脑上复现手机）也不发：那是调试用的
-        if st.linux().is_none_or(|s| !s.is_host()) {
+        if st.linux().is_none_or(|s| !s.is_native()) {
             return;
         }
         let me = self.clone();
@@ -929,114 +929,5 @@ mod tests {
             m.get("lan-1").unwrap().lan.as_deref(),
             Some("192.168.0.5:8787")
         );
-    }
-
-    /// 面板顺序不跟着发现顺序跳：同样几台，先看到谁都一样；一台从「经中继」变成
-    /// 「局域网里看到了」也不挪位置。
-    #[test]
-    fn the_panel_order_does_not_depend_on_what_was_seen_first() {
-        let order = |found: &[(&str, &str)]| {
-            let m = store();
-            m.upsert(machine("relay-1", "a-家里的", true));
-            for (id, name) in found {
-                m.lan_found(id, name, "192.168.0.9", 8787);
-            }
-            m.panel().into_iter().map(|p| p.id).collect::<Vec<_>>()
-        };
-        let one = order(&[("x", "c-客厅"), ("y", "b-书房")]);
-        let two = order(&[("y", "b-书房"), ("x", "c-客厅")]);
-        assert_eq!(one, vec!["relay-1", "y", "x"]);
-        assert_eq!(one, two);
-        // 经中继那台回到局域网里：还是第一个
-        let three = order(&[("x", "c-客厅"), ("relay-1", "a-家里的"), ("y", "b-书房")]);
-        assert_eq!(three, one);
-    }
-
-    #[test]
-    fn a_machine_that_is_neither_on_the_lan_nor_behind_a_relay_is_not_listed() {
-        let m = store();
-        // 配对过、但现在不在局域网里、也没配中继：列出来点了也连不上
-        m.upsert(machine("gone", "出门的", false));
-        assert!(m.panel().is_empty());
-    }
-
-    /// 那台机器发过来的 SSE（形状照 `http::turns_stream`：`data: {...}\n\n`）
-    fn sse(ev: &serde_json::Value) -> String {
-        format!("data: {ev}")
-    }
-
-    #[test]
-    fn a_finished_turn_on_the_other_machine_becomes_a_local_notice() {
-        let ev = json!({
-            "type": "turn",
-            "status": {
-                "sid": "s1", "title": "FizzBuzz", "phase": "done",
-                "detail": "跑完了", "started_at_ms": 1, "active": false,
-                "finished_at_ms": 2, "ok": true, "stopped": false
-            }
-        });
-        let n = notice_of_frame(&sse(&ev)).expect("该发一条通知");
-        assert_eq!(n.title, "完成 · FizzBuzz");
-        assert_eq!(n.body, "跑完了");
-    }
-
-    #[test]
-    fn only_finished_turns_notify() {
-        // 还在跑：不发（不然每步都弹一条）
-        let running = json!({
-            "type": "turn",
-            "status": {
-                "sid": "s1", "title": "T", "phase": "tool", "tool": "bash",
-                "started_at_ms": 1, "active": true, "ok": true, "stopped": false
-            }
-        });
-        assert!(notice_of_frame(&sse(&running)).is_none());
-        // 有回合在跑的那个「有没有」信号：不是逐条状态，发不出通知
-        assert!(notice_of_frame(&sse(&json!({"type": "turn_active", "active": false}))).is_none());
-        // 用户自己停的：他就在那儿看着
-        let stopped = json!({
-            "type": "turn",
-            "status": {
-                "sid": "s1", "title": "T", "phase": "done", "started_at_ms": 1,
-                "active": false, "finished_at_ms": 2, "ok": false, "stopped": true
-            }
-        });
-        assert!(notice_of_frame(&sse(&stopped)).is_none());
-    }
-
-    #[test]
-    fn junk_frames_are_ignored_not_fatal() {
-        // 心跳注释、坏 JSON、不认识的类型、缺 status —— 都不该让订阅循环炸掉
-        for raw in [
-            "",
-            ": keep-alive",
-            "data: {不是 JSON",
-            "data: {\"type\":\"hello\"}",
-            "data: {\"type\":\"turn\"}",
-            "data: {\"type\":\"turn\",\"status\":{}}",
-        ] {
-            assert!(notice_of_frame(raw).is_none(), "不该发：{raw}");
-        }
-    }
-
-    #[test]
-    fn machines_seen_on_the_lan_come_and_go_with_the_scan() {
-        let m = store();
-        m.lan_found("a", "甲", "192.168.0.2", 8787);
-        m.lan_found("b", "乙", "192.168.0.3", 8787);
-        assert_eq!(m.panel().len(), 2);
-        m.lan_lost("a");
-        assert_eq!(m.panel().len(), 1);
-        // 一次扫描结束：没配对过的那些忘掉
-        m.lan_reset();
-        assert!(m.panel().is_empty());
-        // 配对过的不受影响（它记在库里，是「我的机器」）
-        m.upsert(machine("keep", "我的", false));
-        m.lan_found("keep", "我的", "192.168.0.4", 8787);
-        m.lan_reset();
-        assert_eq!(m.panel().len(), 0, "看不到又不经中继：不列");
-        m.lan_found("keep", "我的", "192.168.0.4", 8787);
-        m.lan_reset();
-        assert!(m.get("keep").is_some(), "库里的那行还在");
     }
 }

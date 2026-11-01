@@ -341,7 +341,8 @@ JS 在后台会被系统挂起；电脑上的核心更是只能从 HTTP 拿。�
 就是核心自己的 token，它在会话库里、跨重启不变（换的只是新设备用的那个 6 位码）。
 
 这台电脑上核心是**常驻服务**（`android-agent.service`，systemd 用户服务、开机自启，unit 在
-`~/Code/project/config/systemd/user/`，模型 / 中继只写在仓库根目录的 `.env.local` 里）。
+`~/Code/project/config/systemd/user/`，模型在库（`sessions.db`）里，中继密钥在仓库根目录的
+`.env.local` 里）。
 核心归它管时，`restart-core.sh` **只用 `systemctl --user restart`**，不自己 kill / 起 ——
 手动那套会和它抢端口和单实例锁（它有 `Restart=always`，会先把旧的核心拉回来）。
 想让脚本自己起（临时换一个二进制试）先 `systemctl --user stop android-agent`。

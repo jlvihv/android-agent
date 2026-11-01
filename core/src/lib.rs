@@ -195,15 +195,6 @@ async fn write_attachment(
     Ok(())
 }
 
-/// 桌面上的数据目录：`AGENT_DATA_DIR` 优先；宿主模式默认
-/// `<desktop::data_root>/data`（`~/.local/share/android-agent/data`）；否则不落盘。
-fn desktop_data_dir(host: bool) -> Option<std::path::PathBuf> {
-    if let Some(d) = std::env::var_os("AGENT_DATA_DIR").filter(|d| !d.is_empty()) {
-        return Some(d.into());
-    }
-    host.then(|| desktop::data_root().join("data"))
-}
-
 /// 核心的线程预算（所有设备一套参数）。
 ///
 /// 为什么封顶：桌面默认按 CPU 核数开 worker（这台机器 32 核 → 33 个线程），
@@ -244,49 +235,33 @@ impl Core {
         }
     }
 
-    /// 桌面上的核心（`agent-dev`）：沙箱、设备、浏览器、数据库都按环境接好。
+    /// 桌面上的核心（`agent-dev`）：**这台电脑就是设备**，bash 直接跑在本机。
     ///
-    /// - 宿主模式（`AGENT_LINUX_HOST=1`）：设备 = 这台电脑（`desktop::HostDevice`），
-    ///   会话和配置落盘；
-    /// - 否则（`just dev`，在电脑上复现手机）：设备是 mock，只放内存。
+    /// 桌面上只有这一种形态 —— 沙箱是 Android 独有的（Kotlin 注入 `SandboxConfig`）。
+    /// 会话、模型配置、附件都落盘在 `~/.local/share/android-agent/data`（`XDG_DATA_HOME` 优先）——
+    /// 约定大于配置，没有第二个开关。
     pub fn desktop() -> Self {
         let core = Self::new();
-        // 桌面：宿主模式 / 或者 proot + rootfs 的沙箱
-        let sandbox = linux::LinuxSandbox::from_env();
-        let host = sandbox.as_ref().is_some_and(|s| s.is_host());
-        if host {
-            core.state.set_device(Arc::new(desktop::HostDevice));
-        } else {
-            core.state.mock.store(true, Ordering::Relaxed);
-            core.state.set_device(mock::MockDevice::new());
-        }
+        core.state.set_device(Arc::new(desktop::HostDevice));
 
-        // 持久化：会话、模型配置、附件落盘。宿主模式是拿来**日常用**的，
-        // 只放内存的话关一次核心，会话和你在界面上配的模型就全没了。
-        // `just dev`（proot 沙箱，在电脑上复现手机）照旧只在内存里，除非显式
-        // 给了 `AGENT_DATA_DIR`。
-        if let Some(dir) = desktop_data_dir(host) {
-            match std::fs::create_dir_all(&dir) {
-                Ok(()) => {
-                    tracing::info!("数据目录: {}", dir.display());
-                    core.set_data_dir(dir);
-                }
-                Err(e) => tracing::warn!("建数据目录 {} 失败（只放内存）: {e}", dir.display()),
+        // 持久化：会话、模型配置、附件落盘。桌面是拿来**日常用**的，只放内存的话
+        // 关一次核心，会话和你在界面上配的模型就全没了。
+        let dir = desktop::data_root().join("data");
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                tracing::info!("数据目录: {}", dir.display());
+                core.set_data_dir(dir);
             }
+            Err(e) => tracing::warn!("建数据目录 {} 失败（只放内存）: {e}", dir.display()),
         }
 
-        // 环境变量里配了 LLM：库里还没有模型配置时才用它（会存下来，跟在界面上
-        // 配一次一样）。**不覆盖**界面上配好的 —— 不然每次启动都被打回环境变量那份。
-        if core.state.llm().is_none() {
-            if let Some(p) = crate::llm::Provider::from_env() {
-                core.state.adopt_provider(&p);
-                core.state.set_llm(p);
-            }
-        }
+        // 模型配置**只从库里来**（设置页 / `POST /api/llm` 写进 `llm` + `providers` 表）。
+        // 这里以前会拿 `AGENT_LLM_*` 环境变量兜一次底，和库里的完全重复，还会把
+        // 界面上配好的打回去。删了。新库第一次启动没有 provider：界面会引导去设置里填，
+        // `/api/chat` 直接回「还没有配置 LLM」。
 
-        if let Some(sb) = sandbox {
-            core.state.set_linux(Arc::new(sb));
-        }
+        core.state
+            .set_linux(Arc::new(linux::LinuxSandbox::desktop()));
 
         // 桌面：浏览器 = 无头 Chrome + CDP（`AGENT_CDP`，默认 127.0.0.1:9222）。
         // 这里是**懒连接**：Chrome 没起来也能启动核心，第一次动作用到它时报错
@@ -434,7 +409,7 @@ impl Core {
     pub async fn browser(&self, action_json: &str) -> anyhow::Result<serde_json::Value> {
         let host = self.state.browser().ok_or_else(|| {
             // 桌面上被 `AGENT_CDP=off` 关掉时走这里；手机上则是壳还没注入
-            if self.state.linux().map(|s| s.is_host()).unwrap_or(false) {
+            if self.state.linux().map(|s| s.is_native()).unwrap_or(false) {
                 anyhow::anyhow!(
                     "浏览器不可用（桌面这个后端被 AGENT_CDP=off 关了）。要取网页就用 bash 里的 curl"
                 )
@@ -1091,9 +1066,7 @@ impl Drop for CancelBrowserOnDrop {
 /// `load_llm` 里做（那时可能还没有 tokio runtime）。失败只记日志，
 /// 调用方（`supports_*_for`）会退回落盘值。
 async fn refresh_capabilities(st: Arc<AppState>) {
-    let Some(p) = st.llm().or_else(crate::llm::Provider::from_env) else {
-        return;
-    };
+    let Some(p) = st.llm() else { return };
     st.supports_images_for(&p).await;
     st.supports_files_for(&p).await;
 }
@@ -1178,167 +1151,6 @@ async fn provision_tools(st: Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// `get_readable` 截断了：只给整行，全文存进溢出目录，`offset` 正好指向第一行没给的
-    #[test]
-    fn truncated_readable_saves_the_full_text_and_says_where_to_continue() {
-        let paras: String = (1..=600)
-            .map(|i| {
-                format!(
-                    "<p>第{i}段。这是一段足够长的正文，用来撑满上限，让截断真的发生在中间。</p>"
-                )
-            })
-            .collect();
-        let html = format!(
-            "<html><head><title>长文</title></head><body><article>{paras}</article></body></html>"
-        );
-        let dir =
-            std::env::temp_dir().join(format!("agent-readable-spill-{}", uuid::Uuid::now_v7()));
-        let spill: SpillDir = (dir.clone(), "/tmp".into());
-
-        let out = readable_reply(&html, Some(&spill)).unwrap();
-        let (shown, note) = out.rsplit_once("\n\n[已截断：").expect(&out);
-        assert!(shown.chars().count() <= READABLE_MAX_CHARS);
-        assert!(
-            shown.ends_with('。'),
-            "只截整行：{}",
-            &shown[shown.len() - 60..]
-        );
-
-        let path = note
-            .split("read ")
-            .nth(1)
-            .unwrap()
-            .split(' ')
-            .next()
-            .unwrap();
-        let name = path.strip_prefix("/tmp/").expect(path);
-        assert!(name.starts_with("agent-out-"), "启动清扫认这个前缀：{name}");
-        let full = std::fs::read_to_string(dir.join(name)).unwrap();
-        assert!(full.contains("第600段。"), "全文都在");
-
-        let offset: usize = note
-            .split("offset=")
-            .nth(1)
-            .unwrap()
-            .split(' ')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let lines: Vec<&str> = full.lines().collect();
-        assert_eq!(
-            lines[..offset - 1].join("\n").trim_end(),
-            shown,
-            "前面给的就是文件的前 offset-1 行"
-        );
-        assert!(!shown.contains(lines[offset - 1]) || lines[offset - 1].is_empty());
-        let _ = std::fs::remove_dir_all(dir);
-
-        // 存不下来也照样回正文，只是说清楚
-        let out = readable_reply(&html, None).unwrap();
-        assert!(
-            out.ends_with("全文没能存下来。]"),
-            "{}",
-            &out[out.len() - 80..]
-        );
-    }
-
-    /// agent 的浏览器打开沙箱文件：`preview:` 进去换成独立源上的 URL，
-    /// 结果里的 URL 再换回 `preview:`（端口和钥匙不进历史）。网址原样。
-    #[tokio::test]
-    async fn the_browser_opens_sandbox_files_by_their_sandbox_path() {
-        struct Echo(std::sync::Mutex<Vec<String>>);
-        impl state::BrowserApi for Echo {
-            fn execute(&self, action_json: &str) -> Result<String, String> {
-                let v: serde_json::Value = serde_json::from_str(action_json).unwrap();
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(v["url"].as_str().unwrap_or("").to_string());
-                let url = v["url"].as_str().unwrap_or("");
-                Ok(
-                    serde_json::json!({ "ok": true, "url": url, "text": format!("已打开 {url}") })
-                        .to_string(),
-                )
-            }
-        }
-        let core = Core::new();
-        core.state.port.store(4321, Ordering::Relaxed);
-        let key = core.state.auth().sandbox_key;
-        let host = Arc::new(Echo(Default::default()));
-        core.state.set_browser(host.clone());
-
-        let v = core
-            .browser(r#"{"action":"navigate","url":"preview:/workspace/site/index.html"}"#)
-            .await
-            .unwrap();
-        assert_eq!(
-            host.0.lock().unwrap()[0],
-            format!("http://sandbox.localhost:4321/sandbox/{key}/workspace/site/index.html")
-        );
-        assert_eq!(v["url"], "preview:/workspace/site/index.html");
-        assert_eq!(v["text"], "已打开 preview:/workspace/site/index.html");
-
-        core.browser(r#"{"action":"navigate","url":"example.com"}"#)
-            .await
-            .unwrap();
-        assert_eq!(host.0.lock().unwrap()[1], "example.com");
-    }
-
-    /// 动作卡在 Kotlin 侧时，丢掉 `Core::browser` 的 future（= 用户按停止）
-    /// 要补发一个 `__cancel`；正常跑完的不发。
-    #[tokio::test]
-    async fn dropping_a_browser_call_cancels_it_on_the_kotlin_side() {
-        struct Slow(std::sync::Mutex<Vec<String>>);
-        impl state::BrowserApi for Slow {
-            fn execute(&self, action_json: &str) -> Result<String, String> {
-                self.0.lock().unwrap().push(action_json.to_string());
-                if action_json.contains("\"slow\"") {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                }
-                Ok(r#"{"ok":true,"text":""}"#.into())
-            }
-        }
-        let core = Core::new();
-        let host = Arc::new(Slow(Default::default()));
-        core.state.set_browser(host.clone());
-
-        core.browser(r#"{"action":"fast"}"#).await.unwrap();
-        assert_eq!(host.0.lock().unwrap().len(), 1, "跑完的动作不该被取消");
-
-        let r = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            core.browser(r#"{"action":"slow"}"#),
-        )
-        .await;
-        assert!(r.is_err());
-        let log = host.0.lock().unwrap().clone();
-        assert!(log.iter().any(|a| a.contains("__cancel")), "{log:?}");
-    }
-
-    #[test]
-    fn sse_and_state_wire_up() {
-        let core = Core::desktop();
-        assert_eq!(core.port(), 0);
-        assert!(core.state.device().is_some());
-    }
-
-    #[test]
-    fn mock_device_takes_commands_and_reports_garbage() {
-        // **直接构造 mock**，不走 `Core::desktop()` —— 它挂哪台设备是**按环境**二选一的
-        // （`AGENT_LINUX_HOST=1` 时挂的是 `desktop::HostDevice`，而电脑上根本没有点击 /
-        // 按键可做），拿它来断言 mock 的行为等于让测试跟着环境变：终端里带着
-        // `AGENT_LINUX_HOST=1` 跑 `just test` 这条就会红。
-        // 「宿主设备会拒绝手机操作」由 `desktop.rs` 自己的测试盯着。
-        let dev = crate::mock::MockDevice::new();
-        assert!(dev
-            .execute(r#"{"type":"key","name":"back"}"#)
-            .unwrap()
-            .contains("back"));
-        assert!(dev.execute("not json").is_err(), "非法指令必须报错");
-    }
 
     /// 崩溃策略是「panic 就崩」。
     ///

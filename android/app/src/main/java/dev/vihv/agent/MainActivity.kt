@@ -36,7 +36,7 @@ import android.widget.TextView
  * 明文流量由 `res/xml/network_security_config.xml` 放行，
  * 否则 Android 9+ 会直接报 ERR_CLEARTEXT_NOT_PERMITTED。
  *
- * **也能连电脑上的核心**（侧栏底栏的机器标签 →「选择机器」）：电脑上 `just dev-host`，
+ * **也能连电脑上的核心**（侧栏底栏的机器标签 →「选择机器」）：电脑上 `just dev`，
  * 手机在局域网里找到它，点一下这个 WebView 就改加载那台电脑 —— 界面一样，命令跑在电脑上。
  * 那份面板和电脑浏览器上的**是同一份**（问核心的 `GET /api/machines`，见 docs/12）：
  * 壳只负责 mDNS 发现（`lanFound` 报给核心）和换页面（`AgentHost.navigate`）。

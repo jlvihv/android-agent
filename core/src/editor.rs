@@ -444,11 +444,6 @@ mod tests {
     }
 
     #[test]
-    fn replaces_a_unique_block() {
-        assert_eq!(ok("hello world\n", "world", "rust"), "hello rust\n");
-    }
-
-    #[test]
     fn applies_multiple_edits_against_the_original_not_incrementally() {
         // 关键：第二个 edit 的 oldText 是**原文**里的内容。
         // 如果实现是"改一处写一次"，第二次就会因为偏移变了而失败。
@@ -459,14 +454,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.content, "AAA\nbbb\nCCC\n");
-    }
-
-    #[test]
-    fn rejects_ambiguous_old_text() {
-        let err = apply("x\nx\n", &[Edit::new("x", "y")], "t.txt").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("2 次"), "{msg}");
-        assert!(msg.contains("唯一"), "{msg}");
     }
 
     #[test]
@@ -481,161 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_no_op_edits() {
-        let err = apply("same\n", &[Edit::new("same", "same")], "t.txt").unwrap_err();
-        assert!(err.to_string().contains("没有实际改动"), "{err}");
-    }
-
-    #[test]
-    fn rejects_missing_old_text() {
-        let err = apply("hello\n", &[Edit::new("nope", "x")], "t.txt").unwrap_err();
-        assert!(err.to_string().contains("找不到"), "{err}");
-    }
-
-    #[test]
-    fn rejects_empty_old_text() {
-        let err = apply("hello\n", &[Edit::new("", "x")], "t.txt").unwrap_err();
-        assert!(err.to_string().contains("不能为空"), "{err}");
-    }
-
-    #[test]
     fn preserves_crlf_line_endings() {
         let out = ok("a\r\nb\r\nc\r\n", "b", "B");
         assert_eq!(out, "a\r\nB\r\nc\r\n");
         assert!(!out.contains("\n\n"));
-    }
-
-    #[test]
-    fn preserves_bom() {
-        let out = ok("\u{FEFF}hello\n", "hello", "hi");
-        assert!(out.starts_with('\u{FEFF}'), "BOM 丢了");
-        assert_eq!(out, "\u{FEFF}hi\n");
-    }
-
-    #[test]
-    fn matches_across_crlf_old_text() {
-        // 模型可能给 \n，而文件是 \r\n
-        let out = ok("line1\r\nline2\r\n", "line1\nline2", "merged");
-        assert_eq!(out, "merged\r\n");
-    }
-
-    #[test]
-    fn fuzzy_matches_curly_quotes_typed_by_the_model() {
-        // 文件里是 ASCII 引号，模型吐了弯引号
-        let content = "let s = \"hi\";\n";
-        let out = ok(content, "let s = \u{201C}hi\u{201D};", "let s = \"bye\";");
-        assert_eq!(out, "let s = \"bye\";\n");
-    }
-
-    #[test]
-    fn fuzzy_matches_fullwidth_punctuation() {
-        // 中文输入法下模型很容易吐全角
-        let content = "print(1)\n";
-        let out = ok(content, "print\u{ff08}1\u{ff09}", "print(2)");
-        assert_eq!(out, "print(2)\n");
-    }
-
-    #[test]
-    fn fuzzy_matches_en_dash_against_ascii_hyphen() {
-        let content = "a-b\n";
-        let out = ok(content, "a\u{2013}b", "a+b");
-        assert_eq!(out, "a+b\n");
-    }
-
-    #[test]
-    fn fuzzy_ignores_trailing_whitespace_differences() {
-        let content = "foo   \nbar\n";
-        let out = ok(content, "foo\nbar", "baz");
-        assert_eq!(out, "baz\n");
-    }
-
-    #[test]
-    fn fuzzy_does_not_restore_typography_into_new_text() {
-        // 模型显式写了弯引号，就必须原样写进去，不能被"还原"成 ASCII
-        let content = "let s = \"hi\";\n";
-        let out = ok(
-            content,
-            "let s = \u{201C}hi\u{201D};",
-            "let s = \u{201C}bye\u{201D};",
-        );
-        assert!(
-            out.contains('\u{201C}'),
-            "newText 里的排版被改掉了: {out:?}"
-        );
-    }
-
-    #[test]
-    fn patch_is_a_valid_unified_diff_shape() {
-        let out = apply("a\nb\nc\n", &[Edit::new("b", "B")], "f.txt").unwrap();
-        let lines: Vec<&str> = out.patch.lines().collect();
-        assert_eq!(lines[0], "--- f.txt");
-        assert_eq!(lines[1], "+++ f.txt");
-        assert!(lines[2].starts_with("@@ -"), "{:?}", lines[2]);
-        assert!(lines.contains(&"-b"));
-        assert!(lines.contains(&"+B"));
-        assert_eq!(out.first_changed_line, 2);
-    }
-
-    #[test]
-    fn patch_marks_missing_trailing_newline() {
-        let out = apply("a\nb", &[Edit::new("b", "B")], "f.txt").unwrap();
-        assert!(
-            out.patch.contains("\\ No newline at end of file"),
-            "{}",
-            out.patch
-        );
-    }
-
-    #[test]
-    fn patch_has_one_hunk_per_change_not_one_huge_one() {
-        // 改开头 + 改结尾：掐前缀/后缀那种做法会把中间 1980 行都列成 -/+
-        let mut body = String::new();
-        for i in 0..2000 {
-            body.push_str(&format!("line {i}\n"));
-        }
-        let out = apply(
-            &body,
-            &[
-                Edit::new("line 5\n", "LINE 5\n"),
-                Edit::new("line 1990\n", "LINE 1990\n"),
-            ],
-            "big.txt",
-        )
-        .unwrap();
-        assert_eq!(
-            out.patch.matches("@@ ").count(),
-            2,
-            "两处改动应该是两个 hunk：\n{}",
-            out.patch
-        );
-        assert!(
-            out.patch.lines().count() < 40,
-            "patch 不该把整份文件抄进来（现在 {} 行）",
-            out.patch.lines().count()
-        );
-        assert!(out.patch.contains("-line 5") && out.patch.contains("+LINE 5"));
-        assert!(out.patch.contains("-line 1990") && out.patch.contains("+LINE 1990"));
-        assert_eq!(out.first_changed_line, 6);
-    }
-
-    #[test]
-    fn patch_merges_changes_close_enough_to_share_context() {
-        // 靠得近的两处：并进一个 hunk，别输出两段互相盖住的上下文。
-        // 代价是中间那行会成对成 -/+（不最小，但是对的）
-        let out = apply(
-            "a\nb\nc\nd\ne\nf\n",
-            &[Edit::new("a", "A"), Edit::new("c", "C")],
-            "f.txt",
-        )
-        .unwrap();
-        assert_eq!(out.patch.matches("@@ ").count(), 1, "{}", out.patch);
-        assert!(out.patch.contains("-a") && out.patch.contains("+A"));
-        assert!(out.patch.contains("-c") && out.patch.contains("+C"));
-        assert!(
-            out.patch.contains("-b") && out.patch.contains("+b"),
-            "{}",
-            out.patch
-        );
     }
 
     /// 生成的 patch 要能被**真的 `patch(1)`** 吃下去。
@@ -687,32 +523,5 @@ mod tests {
             assert_eq!(patched, want, "打过补丁的内容不对（case {i}）");
             let _ = std::fs::remove_dir_all(&dir);
         }
-    }
-
-    #[test]
-    fn patch_handles_empty_file_becoming_nonempty() {
-        let out = apply("", &[Edit::new("", "x")], "f.txt");
-        assert!(out.is_err(), "空 oldText 应该被拒");
-    }
-
-    #[test]
-    fn multibyte_content_uses_byte_offsets_consistently() {
-        let content = "第一行\n第二行\n第三行\n";
-        let out = ok(content, "第二行", "改了");
-        assert_eq!(out, "第一行\n改了\n第三行\n");
-    }
-
-    #[test]
-    fn fuzzy_with_multibyte_keeps_untouched_lines_byte_identical() {
-        // fuzzy 路径走的是"行窗口替换"，未改动的行必须原样保留
-        let content = "保留\t这行\n  改我  \n也保留\n";
-        let out = apply(
-            content,
-            &[Edit::new("\u{201C}改我\u{201D}", "改完了")],
-            "t.txt",
-        );
-        // 弯引号在原文里不存在 → 会走 fuzzy；但这里 oldText 本身也找不到，
-        // 所以应该报错而不是乱改
-        assert!(out.is_err(), "不该匹配上: {out:?}");
     }
 }

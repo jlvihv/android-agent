@@ -97,6 +97,11 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 **定了：A**。同源 + secure context + 开发期可代理 Vite，三件事一次解决。
 明文例外约 10 行 XML，成本可忽略。
 
+**例外（2026-11）**：debug 构建（`just dev` / `just dev`）**不嵌入**，直接从磁盘
+读 `web/dist`。嵌入是编译期的，改一行前端就要重编整个 core（`rust-embed` 的 derive
+甚至会在 dist 缺失时让编译失败）—— 开发时前端改得比 Rust 勤，那条路走不通。
+发版（`release` / `release-thin`）照旧嵌入。见 `core/src/assets.rs`。
+
 ---
 
 ## 3. 库级决策

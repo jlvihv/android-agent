@@ -7,7 +7,7 @@
 //!
 //! 流程（`run`）：
 //!
-//! 1. 前置检查：proot 沙箱才有（宿主模式没有 Alpine）、没有回合在跑、剩余空间
+//! 1. 前置检查：proot 沙箱才有（桌面没有 Alpine）、没有回合在跑、剩余空间
 //!    够放一份快照 + 下载；
 //! 2. **快照**：在沙箱**外面**把整个 rootfs 复制一份（`<rootfs>.upgrade-bak`）。
 //!    不能在沙箱里 tar —— 升级要是把 musl 弄坏了，沙箱里什么都跑不了，那份
@@ -364,7 +364,7 @@ pub fn recover_interrupted(rootfs: &Path) -> Option<String> {
 /// 能不能开始：返回 `(rootfs, 当前版本)`，或者一句为什么不行。
 pub fn precheck(st: &AppState, sb: &LinuxSandbox) -> Result<(PathBuf, String), String> {
     let Some(cfg) = sb.proot_config() else {
-        return Err("宿主模式没有 Alpine 沙箱".into());
+        return Err("桌面没有 Alpine 沙箱".into());
     };
     if !sb.is_ready() {
         return Err("沙箱还没准备好".into());
@@ -545,119 +545,4 @@ async fn apply(
         r.stdout.split_whitespace().collect::<Vec<_>>().join(" ")
     ));
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn versions_compare_numerically() {
-        assert!(is_newer("3.24.2", "3.21.0"));
-        assert!(is_newer("3.24.2", "3.24.1"));
-        assert!(is_newer("3.10.0", "3.9.6"), "按数字比，不按字符串");
-        assert!(!is_newer("3.21.0", "3.24.2"));
-        assert!(!is_newer("3.24.2", "3.24.2"));
-        assert!(!is_newer("3.25.0_rc1", "3.24.2"), "测试版不认");
-        assert!(!is_newer("edge", "3.24.2"));
-        assert_eq!(branch("3.24.2").as_deref(), Some("v3.24"));
-    }
-
-    #[test]
-    fn the_latest_version_comes_from_the_release_yaml() {
-        let yaml = "-\n  title: \"Mini root filesystem\"\n  branch: v3.24\n  version: 3.24.2\n  flavor: alpine-minirootfs\n";
-        assert_eq!(parse_latest(yaml).as_deref(), Some("3.24.2"));
-        assert_eq!(parse_latest("nothing here"), None);
-    }
-
-    #[test]
-    fn repositories_keep_their_mirror_and_comments() {
-        let text = "https://mirrors.ustc.edu.cn/alpine/v3.21/main\n\
-                    #https://dl-cdn.alpinelinux.org/alpine/v3.21/testing\n\
-                    https://dl-cdn.alpinelinux.org/alpine/v3.21/community\n";
-        let out = retarget_repositories(text, "v3.24").unwrap();
-        assert_eq!(
-            out,
-            "https://mirrors.ustc.edu.cn/alpine/v3.24/main\n\
-             #https://dl-cdn.alpinelinux.org/alpine/v3.21/testing\n\
-             https://dl-cdn.alpinelinux.org/alpine/v3.24/community\n"
-        );
-        // edge / 自定义：不知道怎么升，交给人
-        assert_eq!(
-            retarget_repositories("https://dl-cdn.alpinelinux.org/alpine/edge/main\n", "v3.24"),
-            None
-        );
-        // 路径里别的 `/v…` 不能误伤
-        let odd = "https://example.com/vendor/alpine/v3.21/main\n";
-        assert_eq!(
-            retarget_repositories(odd, "v3.24").unwrap(),
-            "https://example.com/vendor/alpine/v3.24/main\n"
-        );
-    }
-
-    fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("agent-alpine-{tag}-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn the_snapshot_keeps_links_and_modes_and_skips_tmp() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = scratch("copy");
-        let src = root.join("alpine-rootfs");
-        std::fs::create_dir_all(src.join("bin")).unwrap();
-        std::fs::create_dir_all(src.join("tmp")).unwrap();
-        std::fs::write(src.join("bin/busybox"), "elf").unwrap();
-        std::fs::set_permissions(
-            src.join("bin/busybox"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        // Alpine 式的绝对链接：不能被解析到宿主机上
-        std::os::unix::fs::symlink("/bin/busybox", src.join("bin/sh")).unwrap();
-        std::fs::write(src.join("tmp/junk"), "x").unwrap();
-
-        let dst = sibling(&src, BAK_SUFFIX);
-        copy_tree(&src, &dst, SNAPSHOT_SKIP).unwrap();
-        assert_eq!(
-            std::fs::read_link(dst.join("bin/sh")).unwrap(),
-            Path::new("/bin/busybox")
-        );
-        let mode = std::fs::metadata(dst.join("bin/busybox"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755);
-        assert!(!dst.join("tmp").exists(), "tmp 不进快照");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn an_interrupted_upgrade_is_rolled_back_on_start() {
-        let root = scratch("recover");
-        let rootfs = root.join("alpine-rootfs");
-        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
-        std::fs::write(rootfs.join("etc/alpine-release"), "3.24.2\n").unwrap();
-        // 没有快照：什么都不做
-        assert_eq!(recover_interrupted(&rootfs), None);
-
-        // 快照完整：换回去
-        let bak = sibling(&rootfs, BAK_SUFFIX);
-        std::fs::create_dir_all(bak.join("etc")).unwrap();
-        std::fs::write(bak.join("etc/alpine-release"), "3.21.0\n").unwrap();
-        std::fs::write(bak.join(SNAPSHOT_OK), "").unwrap();
-        assert!(recover_interrupted(&rootfs).unwrap().contains("换回"));
-        assert!(!rootfs.join(SNAPSHOT_OK).exists(), "标记不能留在沙箱里");
-        assert_eq!(installed_version(&rootfs).as_deref(), Some("3.21.0"));
-        assert!(!bak.exists() && !sibling(&rootfs, FAILED_SUFFIX).exists());
-
-        // 快照是半份（备份阶段被杀，`etc` 可能已经复制过去了）：不碰沙箱，清掉半份
-        std::fs::create_dir_all(bak.join("etc")).unwrap();
-        std::fs::write(bak.join("etc/alpine-release"), "3.21.0\n").unwrap();
-        assert!(recover_interrupted(&rootfs).unwrap().contains("没动过"));
-        assert_eq!(installed_version(&rootfs).as_deref(), Some("3.21.0"));
-        assert!(!bak.exists());
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }

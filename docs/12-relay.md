@@ -64,7 +64,7 @@
 1. 服务器上装中继：`just relay-deploy`（不带参数 = 自己那台 `vihv@129.211.71.14`；
    换服务器：`AGENT_RELAY_HOST=user@ip just relay-deploy`。交叉编译 + scp + systemd，见下）。
    最后会打印两行 `AGENT_RELAY=…` / `AGENT_RELAY_KEY=…`。
-2. **只在一台**电脑上配：把这两行写进仓库根目录的 `.env.local`，重启 `just dev-host`。
+2. **只在一台**电脑上配：把这两行写进仓库根目录的 `.env.local`，重启 `just dev`。
    终端里会说「出门在外：经中继 …」，日志里有「已连上中继」。
 3. 任何一台机器**在家里的 Wi-Fi 里**连一次这台电脑（配对过的点一下就行）—— 它记下这台
    电脑的证书指纹和中继。

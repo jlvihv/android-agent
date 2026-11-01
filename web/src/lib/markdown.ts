@@ -428,7 +428,7 @@ export function sandboxPath(guestPath: string): string {
  */
 export function sandboxPageUrl(url: string): string {
   if (!url.startsWith("/sandbox/")) return url;
-  // 局域网里用手机浏览器开电脑上的核心（`just dev-host`）时，`sandbox.localhost`
+  // 局域网里用手机浏览器开电脑上的核心（`just dev`）时，`sandbox.localhost`
   // 解析到的是**手机自己** —— 打不开。那就留在同源：服务端给同源的沙箱文件
   // 加了 CSP sandbox（opaque origin），照样碰不到 App 的凭据，只是页面用不了
   // localStorage 之类。

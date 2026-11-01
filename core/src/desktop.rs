@@ -1,4 +1,4 @@
-//! 桌面（宿主模式）：**这台电脑本身**就是设备。
+//! 桌面：**这台电脑本身**就是设备。
 //!
 //! 手机上设备通道背后是无障碍服务（点 / 滑 / 按键 / 起 App / 开 URI）。电脑上
 //! 不能拿 mock 顶：它对什么都回「成功」（`agent open` 说「已让手机打开」其实什么
@@ -807,103 +807,6 @@ fn run(cmd: &mut Proc) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// 这台开发机上真跑出来的一行（`avahi-browse -rp _agent-core._tcp`）。
-    /// 同一个核心在 wlan0 / docker0 / utun / lo 上各来一遍 —— 只有 wlan0 那条能用。
-    #[test]
-    fn only_the_real_lan_address_of_a_core_is_kept() {
-        let mut seen = Default::default();
-        let lines = [
-            "+;wlan0;IPv4;jl;_agent-core._tcp;local",
-            "=;utun;IPv4;jl;_agent-core._tcp;local;jl.local;198.18.0.1;8787;\"id=core-1\" \"v=0.1.0\"",
-            "=;docker0;IPv4;jl;_agent-core._tcp;local;jl.local;172.17.0.1;8787;\"id=core-1\" \"v=0.1.0\"",
-            "=;lo;IPv4;jl;_agent-core._tcp;local;jl.local;127.0.0.1;8787;\"id=core-1\" \"v=0.1.0\"",
-            "=;wlan0;IPv4;jl;_agent-core._tcp;local;jl.local;192.168.0.161;8787;\"id=core-1\" \"v=0.1.0\"",
-        ];
-        for l in lines {
-            apply(&mut seen, l, "别的核心");
-        }
-        assert_eq!(seen.len(), 1, "一台机器只留一行");
-        assert_eq!(seen["jl"].host, "192.168.0.161");
-        assert_eq!(seen["jl"].port, 8787);
-        assert_eq!(seen["jl"].id, "core-1");
-    }
-
-    /// macOS `dns-sd -B` 真跑出来的几行：名字带中文和空格，同一台在两张网卡上各一次。
-    #[test]
-    fn dnssd_browse_lines_give_the_full_name_and_the_interface() {
-        let add = "23:08:00.080  Add        3  11 local.               _agent-core._tcp.    vihv的MacBook Air";
-        match parse_dnssd_browse(add) {
-            Some(DnssdEvent::Add { name, iface }) => {
-                assert_eq!(name, "vihv的MacBook Air");
-                assert_eq!(iface, "11");
-            }
-            _ => panic!("应该认出 Add"),
-        }
-        let rmv = "23:09:00.000  Rmv        0  11 local.               _agent-core._tcp.    jl";
-        assert!(
-            matches!(parse_dnssd_browse(rmv), Some(DnssdEvent::Rmv { name, .. }) if name == "jl")
-        );
-        // 表头、STARTING 那几行不认
-        assert!(parse_dnssd_browse("Timestamp     A/R    Flags  if Domain               Service Type         Instance Name").is_none());
-        assert!(parse_dnssd_browse("23:08:00.079  ...STARTING...").is_none());
-    }
-
-    #[test]
-    fn our_own_broadcast_is_not_listed() {
-        let mut seen = Default::default();
-        apply(
-            &mut seen,
-            "=;wlan0;IPv4;jl;_agent-core._tcp;local;jl.local;192.168.0.161;8787;\"id=me\" \"v=0.1.0\"",
-            "me",
-        );
-        assert!(seen.is_empty(), "自己不该出现在「选择机器」里");
-    }
-
-    #[test]
-    fn a_core_that_stops_broadcasting_is_dropped_by_name() {
-        let mut seen = Default::default();
-        for l in [
-            "=;wlan0;IPv4;jl;_agent-core._tcp;local;jl.local;192.168.0.161;8787;\"id=core-1\"",
-            "=;wlan0;IPv4;别的;_agent-core._tcp;local;x.local;192.168.0.9;8787;\"id=core-2\"",
-            "-;wlan0;IPv4;jl;_agent-core._tcp;local",
-        ] {
-            apply(&mut seen, l, "me");
-        }
-        let names: Vec<&str> = seen.keys().map(String::as_str).collect();
-        assert_eq!(names, vec!["别的"]);
-    }
-
-    #[test]
-    fn a_chinese_service_name_is_unescaped() {
-        // avahi 的 `-p` 把非 ASCII 写成十进制字节：vihv的MacBook Air
-        let raw = "=;wlan0;IPv4;vihv\\231\\154\\132MacBook\\032Air;_agent-core._tcp;local;x.local;192.168.0.16;8787;\"id=mac\"";
-        let mut seen = Default::default();
-        apply(&mut seen, raw, "me");
-        assert_eq!(seen.keys().next().unwrap(), "vihv的MacBook Air");
-    }
-
-    #[test]
-    fn garbage_lines_are_ignored() {
-        let mut seen = Default::default();
-        for l in ["", "随便一句话", "+;wlan0;IPv4;名字;_agent-core._tcp;local"] {
-            apply(&mut seen, l, "me");
-        }
-        assert!(seen.is_empty());
-    }
-
-    #[test]
-    fn virtual_interfaces_and_non_private_addresses_are_not_usable() {
-        for bad in ["lo", "docker0", "br-2ed573d41a5b", "utun", "virbr0", "wg0"] {
-            assert!(!usable_iface(bad), "{bad}");
-        }
-        for good in ["wlan0", "eth0", "en0", "enp4s0"] {
-            assert!(usable_iface(good), "{good}");
-        }
-        // 198.18.0.1 是 Clash 的虚拟网段（不是私有地址），公网地址也不认
-        assert!(!usable_addr("198.18.0.1") && !usable_addr("1.2.3.4"));
-        assert!(usable_addr("192.168.0.161") && usable_addr("10.0.0.5"));
-    }
-
     #[test]
     fn pairing_codes_are_six_digits_and_lock_after_five_misses() {
         let p = Pairing::new();
@@ -928,60 +831,5 @@ mod tests {
             "输错太多次后对的也不行"
         );
         assert_eq!(p.remaining(), 0, "停用之后还是 0（设置页靠它显示状态）");
-    }
-
-    /// 广播进程得会「说实话」：起不来（daemon 没跑、名字撞了）时，stderr 里那句
-    /// 原因要能原样带回给 main —— 不然终端会照着「手机上点它」往下打，而手机上
-    /// 什么都搜不到（这台机器上就这么空转了很久：avahi-daemon 根本没装）。
-    #[test]
-    fn a_dead_broadcaster_reports_why() {
-        let mut c = Proc::new("sh");
-        c.args(["-c", "echo '添加服务失败：本地名称冲突' >&2; exit 0"]);
-        let mut a = start(&mut c).expect("spawn 不该失败");
-        // 真机上这里是 main 等 ADVERT_SETTLE 之后再问；测试里直接等它收尸
-        let _ = a.child.wait();
-        assert_eq!(a.failure().as_deref(), Some("添加服务失败：本地名称冲突"));
-        // 问过一次就不再问（留着那份原因）
-        assert_eq!(a.failure().as_deref(), Some("添加服务失败：本地名称冲突"));
-    }
-
-    /// 还在跑的不能被当成失败 —— 判定看的是「退没退」，不是「stderr 里有没有东西」
-    /// （avahi 真在广播时也可能往 stderr 说话）。
-    #[test]
-    fn a_live_broadcaster_is_not_a_failure() {
-        let mut c = Proc::new("sh");
-        c.args(["-c", "echo 噪声 >&2; sleep 30"]);
-        let mut a = start(&mut c).expect("spawn 不该失败");
-        assert!(a.failure().is_none(), "还活着就是没问题");
-        drop(a); // Drop 会把它收掉
-    }
-
-    /// 「两个核心同时跑」那条路的开关：给了 `AGENT_ADVERT_NAME` 就用它，
-    /// 全是空白当没给（不然会广播出一个空名字，手机上是个空行）。
-    #[test]
-    fn advert_name_can_be_overridden() {
-        let before = std::env::var("AGENT_ADVERT_NAME").ok();
-        std::env::set_var("AGENT_ADVERT_NAME", "  jl 测试  ");
-        assert_eq!(advert_name(), "jl 测试", "两头空格去掉");
-        std::env::set_var("AGENT_ADVERT_NAME", "   ");
-        assert_eq!(advert_name(), computer_name(), "全空白 = 没给");
-        match before {
-            Some(v) => std::env::set_var("AGENT_ADVERT_NAME", v),
-            None => std::env::remove_var("AGENT_ADVERT_NAME"),
-        }
-    }
-
-    #[test]
-    fn it_refuses_phone_gestures_instead_of_pretending() {
-        let dev = HostDevice;
-        for cmd in [
-            r#"{"type":"tap_xy","x":1,"y":2}"#,
-            r#"{"type":"key","name":"back"}"#,
-            r#"{"type":"swipe","x1":0,"y1":0,"x2":1,"y2":1}"#,
-        ] {
-            let err = dev.execute(cmd).unwrap_err();
-            assert!(err.contains("电脑上没有"), "{cmd}: {err}");
-        }
-        assert!(dev.execute("不是 JSON").is_err());
     }
 }

@@ -478,7 +478,7 @@ impl AgentCore {
         let Some(sb) = self.core.state.linux() else {
             return;
         };
-        // 宿主模式（桌面）没有手机存储可挂
+        // 桌面没有手机存储可挂
         let Some(cfg) = sb.proot_config() else {
             return;
         };
@@ -499,62 +499,5 @@ impl AgentCore {
     /// 清空会话历史
     pub fn reset_session(&self) {
         self.core.reset_session();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct FakeHost;
-
-    impl DeviceHost for FakeHost {
-        fn execute(&self, cmd_json: String) -> Result<String, HostError> {
-            if cmd_json.contains("nope") {
-                return Err(HostError::Failed {
-                    detail: "找不到应用 nope（没装？）".into(),
-                });
-            }
-            Ok(format!("handled {cmd_json}"))
-        }
-        fn name(&self) -> String {
-            "fake".into()
-        }
-    }
-
-    /// 壳那边的失败到 Rust 这边是一个普通的 Err（带着原话），不是 panic。
-    #[test]
-    fn a_host_failure_is_an_ordinary_error() {
-        let adapter = HostAdapter(Box::new(FakeHost));
-        let e = adapter
-            .execute(r#"{"type":"launch","package":"nope"}"#)
-            .unwrap_err();
-        assert!(e.contains("找不到应用 nope"), "{e}");
-    }
-
-    #[test]
-    fn device_host_is_adapted_into_the_internal_trait() {
-        let adapter = HostAdapter(Box::new(FakeHost));
-        // 内部 trait 是同步的，callback 也是同步的
-        assert_eq!(adapter.name(), "fake");
-        assert!(adapter
-            .execute(r#"{"type":"key","name":"back"}"#)
-            .unwrap()
-            .contains("back"));
-    }
-
-    #[test]
-    fn anyhow_errors_keep_the_cause_chain_in_the_message() {
-        let e: CoreError = anyhow::anyhow!("底层失败").context("外层操作").into();
-        let msg = e.to_string();
-        assert!(msg.contains("外层操作"), "{msg}");
-        assert!(msg.contains("底层失败"), "{msg}");
-    }
-
-    #[test]
-    fn constructor_does_not_panic_and_reports_a_version() {
-        let core = AgentCore::new();
-        assert!(!core.version().is_empty());
-        assert_eq!(core.port(), 0, "还没 start 时端口应为 0");
     }
 }

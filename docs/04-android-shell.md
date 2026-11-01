@@ -433,7 +433,7 @@ just android-debug       # bindings → 交叉编译 → web → APK
 . scripts/dev.sh
 dev_restart      # 重装 + 重启 + 转发端口
 dev_a11y_on      # 开无障碍（保留已有的其它服务）
-dev_llm          # 注入 .env.local 里的 LLM 配置
+dev_llm          # 把 .env.local 的 AGENT_LLM_* 推给手机（写进它的库）
 dev_shell 'uname -m'
 ```
 

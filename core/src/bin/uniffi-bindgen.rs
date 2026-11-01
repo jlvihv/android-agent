@@ -3,8 +3,9 @@
 //! 用法（见 justfile 的 `android-bindings`）：
 //!
 //! ```sh
-//! cargo run --features uniffi-bindgen --bin uniffi-bindgen -- \
-//!   generate --library target/debug/libagent_core.so \
+//! CARGO_TARGET_DIR=target/bindgen \
+//!   cargo run --features uniffi-bindgen --bin uniffi-bindgen -- \
+//!   generate --library target/bindgen/debug/libagent_core.so \
 //!   --language kotlin --out-dir ../android/app/src/main/java
 //! ```
 //!

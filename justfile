@@ -50,6 +50,14 @@ export NDK_HOME := ndk_home
 check:
     cargo clippy --manifest-path {{core}}/Cargo.toml --all-targets -- -D warnings
 
+# 清掉 7 天没用过的编译产物。
+#
+# 为什么需要：宿主 dev / bindgen / NDK 交叉各一份 target，实测 target/ 已经 55GB
+# （其中 debug/incremental 14GB）。攒满之后 APFS 自己的压力也会拖慢编译。
+# 需要一次 `cargo install cargo-sweep`。
+sweep:
+    cargo sweep --time 7 --manifest-path {{core}}/Cargo.toml
+
 # 后端 + 前端（`web/tests/` 那几个纯函数）。
 #
 # 为什么前端也得跑：窗口 / 下标对齐这种不变式（注意：下标是**完整视图**的，而客户端
@@ -63,52 +71,33 @@ test:
 web-test:
     cd {{web}} && bun test
 
-# 起核心：mock 设备 + 本地 Linux 沙箱（桌面）
+# 起核心：**桌面 = 这台电脑本身**
 #
-# 需要先 `just web-build`（rust-embed 在编译期嵌入 web/dist）。
-dev:
-    #!/usr/bin/env bash
-    set -a; [ -f .env.local ] && . ./.env.local; set +a
-    export AGENT_LLM_API_KEY="${AGENT_LLM_API_KEY:-${OPENCODE_API_KEY:-}}"
-    export AGENT_LLM_BASE_URL="${AGENT_LLM_BASE_URL:-${OPENCODE_BASE_URL:-}}"
-    export AGENT_LLM_MODEL="${AGENT_LLM_MODEL:-${OPENCODE_MODEL:-}}"
-    export AGENT_LLM_NAME="${AGENT_LLM_NAME:-opencode-go}"
-    export AGENT_LINUX_ROOTFS="${AGENT_LINUX_ROOTFS:-$PWD/.dev/linux/rootfs}"
-    export AGENT_LINUX_PROOT="${AGENT_LINUX_PROOT:-$(command -v proot || echo proot)}"
-    cargo run --manifest-path {{core}}/Cargo.toml --bin agent-dev
-
-# 起核心：**宿主模式**（桌面原生，没有沙箱）
+# 设备、`bash`、`read` / `edit` 都直接作用在这台机器上：**没有沙箱，也没有「模式」
+# 可切**。沙箱只存在于 Android（proot + Alpine，Kotlin 那边注入，见 docs/02）。
 #
-# 和 `just dev` 同一份东西，区别只在 `bash` 跑在哪：这里是**这台机器本身**——
-# `read` / `edit` 改的是真文件，`bash` 用的是你的 PATH / 你的工具。
+# 需要先 `just web-build`（debug 从磁盘读 web/dist，见 core/src/assets.rs）。
 #
-# cwd（＝ /workspace 的落点）默认是 justfile 所在的目录（`just` 会把 cwd
-# 设到这里），也就是这个仓库。换成别处：
-#
-#   AGENT_HOST_WORKSPACE="$PWD" just dev-host     # 你当前那个目录
-#   AGENT_HOST_WORKSPACE=~/work just dev-host      # 或直接给绝对路径
-#
-# 模型的改动是**真的**，没有回收站；要原地验证大改动就用 `just dev`（沙箱，仅 Linux）。
-# macOS 上只有这一种（docs/11 的「macOS」一节）。
+# cwd（＝ /workspace 的落点）就是仓库根（just 会把 cwd 设到这里）。要换目录：
+# 直接 cd 过去再跑。
 #
 # **默认对局域网开放**：同一个 Wi-Fi 里的手机 App（设置 → 连接电脑）能自动找到
 # 这台，第一次连输终端里打出来的配对码；手机浏览器也能开打出来的那个地址。
 # 局域网来的都要凭据，这台电脑自己（127.0.0.1）照旧免登录。只想自己用：
 #
-#   AGENT_BIND=127.0.0.1 just dev-host
-# 依赖 web-build：前端是**编译时**嵌进核心的（rust-embed）。不先构建的话，拉了新代码的
-# 机器会把旧的 web/dist 编进去 —— 手机连过来看到的就是旧界面（实测踩到：jl 上的核心是新的，
-# 页面却还是旧的，「选择机器」里手机和电脑同时打勾）。
-dev-host: web-build
+#   AGENT_BIND=127.0.0.1 just dev
+#
+# 日常用 dev-fast：opt-level 1、不 LTO，改一行仍是秒级增量（release 是分钟级）。
+# 要真性能（验 release 行为）：`AGENT_PROFILE=release-thin just dev`
+#
+# 模型的改动是**真的**，没有回收站。
+dev: web-build
     #!/usr/bin/env bash
-    set -a; [ -f .env.local ] && . ./.env.local; set +a
-    export AGENT_LLM_API_KEY="${AGENT_LLM_API_KEY:-${OPENCODE_API_KEY:-}}"
-    export AGENT_LLM_BASE_URL="${AGENT_LLM_BASE_URL:-${OPENCODE_BASE_URL:-}}"
-    export AGENT_LLM_MODEL="${AGENT_LLM_MODEL:-${OPENCODE_MODEL:-}}"
-    export AGENT_LLM_NAME="${AGENT_LLM_NAME:-opencode-go}"
-    export AGENT_LINUX_HOST=1
-    export AGENT_HOST_WORKSPACE="${AGENT_HOST_WORKSPACE:-$PWD}"
-    cargo run --release --manifest-path {{core}}/Cargo.toml --bin agent-dev
+    set -eu
+    # 模型配置**不在这里给**：核心只认库（设置页 / `POST /api/llm`）。
+    # `.env.local` 只剩中继密钥这类东西（AGENT_RELAY* / AGENT_TOKEN）。
+    if [ -f .env.local ]; then set -a; . ./.env.local; set +a; fi
+    cargo run --profile "${AGENT_PROFILE:-dev-fast}" --manifest-path {{core}}/Cargo.toml --bin agent-dev
 
 # --- 中继（出门在外连家里的电脑，见 docs/12-relay.md） ----------------------
 
@@ -264,19 +253,6 @@ open:
     echo "$base"
     (xdg-open "$url" >/dev/null 2>&1 || open "$url" >/dev/null 2>&1 || true) &
 
-# --- 桌面沙箱 --------------------------------------------------------------
-
-linux-setup:
-    #!/usr/bin/env bash
-    set -eu
-    d=.dev/linux
-    mkdir -p "$d"
-    [ -f "$d/alpine-minirootfs.tar.gz" ] || curl -sSL -o "$d/alpine-minirootfs.tar.gz" \
-      https://dl-cdn.alpinelinux.org/alpine/{{alpine_branch}}/releases/x86_64/alpine-minirootfs-{{alpine}}-x86_64.tar.gz
-    [ -d "$d/rootfs" ] || { mkdir -p "$d/rootfs"; tar xzf "$d/alpine-minirootfs.tar.gz" -C "$d/rootfs"; }
-    echo "rootfs 就绪: $d/rootfs"
-    command -v proot >/dev/null || echo "⚠️  没装 proot（Arch: sudo pacman -S proot-git）"
-
 # --- Android ---------------------------------------------------------------
 
 # 1) 生成 Kotlin 绑定（uniffi，proc-macro + library 模式，不需要 .udl）
@@ -287,6 +263,9 @@ android-bindings:
     set -eu
     # bindgen 会调 `cargo metadata`，必须在 crate 目录里跑
     cd {{core}}
+    # 这一步带 `--features uniffi-bindgen`，feature 集一变 cargo 就把依赖树重编一遍
+    # （实测 ~60s），和 `just dev` 的产物互相踩。给个单独的 target 目录，两边各自稳定。
+    export CARGO_TARGET_DIR=target/bindgen
     cargo build --lib
     # 宿主动态库的扩展名：Linux .so / macOS .dylib
     ext=so; [ "$(uname)" = Darwin ] && ext=dylib
@@ -296,7 +275,7 @@ android-bindings:
     # 排版无关紧要），装了的话照旧让它排。
     fmt=(); command -v ktlint >/dev/null || fmt=(--no-format)
     cargo run --features uniffi-bindgen --bin uniffi-bindgen -- \
-      generate --library "target/debug/libagent_core.$ext" \
+      generate --library "target/bindgen/debug/libagent_core.$ext" \
       --language kotlin --out-dir ../{{mod}}/src/main/java "${fmt[@]}"
 
 # 2) 交叉编译 Rust 核心 → jniLibs
@@ -330,6 +309,10 @@ android-libs:
       [ "$keep" = 1 ] || { echo "  清掉不在 ABI 清单里的 \"$a\"（见 docs/01 的 ABI 说明）"; rm -rf "$d"; }
     done
 
+    # release + fat LTO 是这里最慢的一步。release 本来就没有增量编译，让 sccache
+    # 去命中上一次的产物是纯赚（cargo 在 RUSTC_WRAPPER 存在时会关掉增量，对 release
+    # 无损）。没装 sccache 就照旧走。
+    if command -v sccache >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi
     cargo ndk "${ts[@]}" -o ../{{jni}} build --release --lib
     echo "--- 16KB 对齐检查（Play 对 targetSdk 35+ 有要求，R1）---"
     # NDK 的预编译工具目录：Linux 是 linux-x86_64，macOS（含 Apple 芯片）是 darwin-x86_64

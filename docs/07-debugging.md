@@ -351,7 +351,7 @@ exit=0 0.31s
 
 模型平时只看得到自己的上下文和历史，看不到「自己现在什么状态」。所以沙箱里放了
 一个 `agent` 命令（`core/src/cli.rs` 按机器生成，`prepare_rootfs` 写进
-`/usr/local/bin/agent`；宿主模式写进 PATH 里那个目录），它就是核心那个 HTTP 服务的
+`/usr/local/bin/agent`；桌面写进 PATH 里那个目录），它就是核心那个 HTTP 服务的
 薄包装 —— 只用 busybox 的 `wget`，没有别的依赖。调试用的那几个收在 `agent debug` 下面
 （提示词里不提，`agent help` 里占一行）：
 
@@ -448,7 +448,7 @@ just dom-audit --no-panels      # 只看会话区
 | 进程   | 端口  | 干什么                                                                                                                                                                    |
 | ------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 假 LLM | 8790  | `scripts/fixture-llm.ts`：给界面提供**受控内容**（先发一个真 `bash` 工具调用，再回一段 Markdown 夹具）                                                                    |
-| 核心   | 8791  | 独立实例，LLM 走 `AGENT_LLM_*` 环境变量（**只在内存里**，不读不写你的 sessions.db，也不动 8787 那个）。宿主核心在跑也允许它起：`AGENT_MULTI=1`（见 docs/11 的「单实例」） |
+| 核心   | 8791  | 独立实例，假 LLM 用 `POST /api/llm` 注进一个一次性库（**只在内存里**，不读不写你的 sessions.db，也不动 8787 那个）。宿主核心在跑也允许它起：`AGENT_MULTI=1`（见 docs/11 的「单实例」） |
 | vite   | 5173+ | 代理 `/api` 到核心；**改前端源码不用重编 Rust**                                                                                                                           |
 | Chrome | 9222  | headless + CDP，被审的就是它这份渲染树                                                                                                                                    |
 
@@ -493,7 +493,7 @@ just dom-audit --diff /tmp/before.json       # 改之后
   `border-style` 设成 `solid`（宽度 0，不渲染），Chrome 的 `outline-width` 恒为 `3px`
   （`outline-style` 是 `none`，也不渲染）。带上这两个，**所有**元素都会被判成「有副作用」，
   报告直接归零。
-- 夹具那个 `bash` 调用要真跑，得有 rootfs（`just linux-setup`）。没装也能跑完，
-  只是工具行会显示执行失败。
+- 夹具那个 `bash` 调用（`echo fixture-tool-ok && uname -m`）在桌面上直接跑 ——
+  就是一句 echo，不碰别的（桌面没有沙箱）。
 
 ---

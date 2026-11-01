@@ -1,65 +1,67 @@
-# 宿主模式：桌面上不套沙箱，直接用这台机器
+# 桌面（Linux / macOS）：这台电脑就是设备
 
-> 落地日期：2026-10-13
+> 2026-11 简化：桌面上**只有一种形态** —— 原生。沙箱是 Android 独有的东西，
+> 桌面不再有「沙箱 / 宿主」两种模式可切（`AGENT_LINUX_HOST` / `AGENT_LINUX_ROOTFS`
+> / `AGENT_HOST_WORKSPACE` 这些环境变量都已删掉）。
 
-一句话：`just dev-host` 起核心，浏览器开 <http://127.0.0.1:8787>，
-`bash` / `read` / `edit` 三个工具作用在**这台 Linux / Mac 本身** —— 没有 proot、
-没有 Alpine rootfs、没有 `/workspace` 那层映射。
+一句话：`just dev` 起核心，浏览器开 <http://127.0.0.1:8787>，`bash` / `read` /
+`edit` 三个工具作用在**这台 Linux / Mac 本身** —— 没有 proot、没有 Alpine rootfs、
+没有 `/workspace` 那层映射。
 
-|                        | `just dev`（沙箱）                                                    | `just dev-host`（宿主）                                                                                             |
-| ---------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `bash` 跑在哪          | proot 里的 Alpine                                                     | 本机（`/bin/sh -c <runner>` → 宿主的 bash）                                                                         |
-| cwd                    | rootfs 的 `/workspace`                                                | 启动核心时的目录（`/workspace` 只是工具路径里的别名，shell 里没有）                                                 |
-| `read` / `edit` 的路径 | rootfs 里的路径                                                       | 本机路径（rootfs＝`/`）                                                                                             |
-| 工具                   | Alpine 那套（要 `apk add`）                                           | 你的 PATH（node/cargo/python…都在）                                                                                 |
-| 装东西                 | `apk add` / `agent-setup`                                             | 系统包管理器 / venv                                                                                                 |
-| 系统提示词 / 工具表    | `Platform::Android` 那份                                              | `Platform::Linux` / `Platform::Macos` 那份（见下面「按平台拼」）                                                    |
-| 进程模型               | runner + 状态文件 + `CommandGuard`                                    | **同一套**（只是不套 proot）                                                                                        |
-| `agent ps`             | 列常驻进程（靠 proot 的 `TracerPid` 归因）                            | 只回一句「用真的 `ps` / `pgrep`」                                                                                   |
-| `agent kill <pid>`     | ✅                                                                    | ✅                                                                                                                  |
-| 设备（`agent open`）   | mock                                                                  | **这台电脑**（`desktop::HostDevice`）：`open` 用默认程序打开，macOS 上 `launch` = `open -a`；点 / 滑 / 按键明说没有 |
-| `agent browser`        | ✅ 核心自己起的无头 Chrome + CDP（[docs/08](08-browser.md) 第 15 节） | ✅ 同一个后端                                                                                                       |
-| `agent search`         | ✅                                                                    | ✅                                                                                                                  |
+| 项                     | 桌面（Linux / macOS）                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `bash` 跑在哪          | 本机（`/bin/sh -c <runner>` → 宿主的 bash）                                                                         |
+| cwd                    | 启动核心时的目录（`/workspace` 只是工具路径里的别名，shell 里没有）                                                 |
+| `read` / `edit` 的路径 | 本机路径（rootfs＝`/`）                                                                                             |
+| 工具                   | 你的 PATH（node/cargo/python…都在）                                                                                 |
+| 装东西                 | 系统包管理器 / venv                                                                                                 |
+| 系统提示词 / 工具表    | `Platform::Linux` / `Platform::Macos` 那份（见下面「按平台拼」）                                                    |
+| 进程模型               | runner + 状态文件 + `CommandGuard`（不套 proot）                                                                    |
+| `agent ps`             | 只回一句「用真的 `ps` / `pgrep`」                                                                                   |
+| `agent kill <pid>`     | ✅                                                                                                                  |
+| 设备（`agent open`）   | **这台电脑**（`desktop::HostDevice`）：`open` 用默认程序打开，macOS 上 `launch` = `open -a`；点 / 滑 / 按键明说没有 |
+| `agent browser`        | ✅ 核心自己起的无头 Chrome + CDP（[docs/08](08-browser.md) 第 15 节）                                               |
+| `agent search`         | ✅                                                                                                                  |
 
-## 怎么做到的：只加了「一种沙箱形态」，没加第二条路
+## 怎么做到的：`LinuxSandbox` 的另一种形态
 
-三个工具全都走 `LinuxSandbox`（`core/src/linux.rs`）同一个入口，所以宿主模式
-是这个类型的**另一种形态**，**没有第二套执行器**：
+三个工具全都走 `LinuxSandbox`（`core/src/linux.rs`）同一个入口，桌面是这个类型的
+**原生形态**，没有第二套执行器：
 
 ```rust
 enum Mode {
-    Proot(Box<SandboxConfig>),       // 安卓（以及 `just dev`）
-    Host { workspace: PathBuf },     // 宿主模式：cwd = workspace，rootfs = `/`
+    Proot(Box<SandboxConfig>),     // 只有安卓：Kotlin 注入 SandboxConfig
+    Native { workspace: PathBuf }, // 桌面：cwd = workspace，rootfs = `/`
 }
 ```
 
 进程模型（runner + 状态文件 + 命令自己的进程组）和路径解析是共用的；随形态
 变的地方都 `match` 它，编译器替我们盯着两边都处理到：
 
-1. `command_line()`：宿主模式不给 proot，直接 `[/bin/sh, -c, <runner>, sh, <script>, <status>]`。
+1. `command_line()`：桌面不给 proot，直接 `[/bin/sh, -c, <runner>, sh, <script>, <status>]`。
 2. `run_live()`：cwd 换成 workspace，**继承宿主环境**（`guest_env` 那套干净
    白名单正好相反：在家里电脑上，PATH / 代理 / `CARGO_HOME` 都得是用户自己的）。
-   宿主模式不登记命令（`agent ps` 那套靠 proot 归因）。
+   桌面不登记命令（`agent ps` 那套靠 proot 归因）。
 3. `resolve_path()`：`rootfs()` 是 `/`，于是沙箱内的绝对路径就是本机路径 ——
    `read` / `edit` / `preview:` 链接那条路**一行都没改**；
    `/workspace` 仍是 workspace 目录的别名。
 4. `prepare_rootfs()` / `is_ready()` / `is_provisioned()` / `has_bash()`：不往 `/`
    里写东西，不跑 `apk`；bash 用 PATH 里的。
-5. `layout()`：我们自己的副产物落哪（状态文件、截图、溢出输出）。宿主模式下是
+5. `layout()`：我们自己的副产物落哪（状态文件、截图、溢出输出）。桌面下是
    `~/.local/share/android-agent/{exit,browser}` 和系统临时目录，而不是 rootfs 的
    `/.agent-exit`、`/root/.browser`、`/tmp`（那些是用户的目录）。
 
-不能用 `SandboxConfig` 里挂一个 `host: bool`：那样宿主模式也得带着 `proot` / `loader` /
+不能用 `SandboxConfig` 里挂一个 `host: bool`：那样桌面也得带着 `proot` / `loader` /
 `dns` / `shared` 这些对它毫无意义的字段，十几处分岔全靠 `if`。proot 专属的方法
 （`guest_env`、`proot_command_line`、`prepare_proot`、`resolved_dns`）直接拿
-`&SandboxConfig` 当参数 —— 类型上就不可能在宿主模式下被调到。
+`&SandboxConfig` 当参数 —— 类型上就不可能在桌面下被调到。
 
 ### 进程模型是**共用**的，不是另写一套
 
 上游那套「命令自带进程组 + 状态文件当完成信号」（见 [docs/02](02-linux-sandbox.md)
-的「进程模型」）在宿主模式同样成立，而且**更需要**：`setsid <命令> &` 起的常驻
+的「进程模型」）在桌面同样成立，而且**更需要**：`setsid <命令> &` 起的常驻
 服务会一直拿着 stdout，靠「管道 EOF」当完成信号的话，一条 `setsid python3 -m
-http.server &` 就得等到超时（默认 60s）才回来。所以宿主模式照样跑 runner、照样
+http.server &` 就得等到超时（默认 60s）才回来。所以桌面照样跑 runner、照样
 写状态文件、照样用 `CommandGuard` 收尾 —— 只是命令行里没有 proot 那一串，
 状态文件落在我们自己的数据目录里。
 
@@ -70,7 +72,7 @@ http.server &` 就得等到超时（默认 60s）才回来。所以宿主模式�
   systemd 的服务、用户会话的 daemon 全都是 ppid 1（一次能扫出 40 个：
   journald / NetworkManager / sshd…），而输出里写的是「`agent kill <pid>` 可以
   停掉」。所以多一道闸：**得真的是 proot**（argv[0] 的文件名对得上）才算孤儿，
-  它名下的 tracee 照旧收；宿主模式则干脆不扫 /proc，`agent ps` 回一句「用真的
+  它名下的 tracee 照旧收；桌面则干脆不扫 /proc，`agent ps` 回一句「用真的
   `ps` / `pgrep`」。回归测试在 `linux.rs` 的
   `procs_attributes_survivors_to_the_command_that_left_them`。
 - **`agent` 命令的取数**：`get` / `post` 两个都留（沙箱里只有 busybox 的 `wget`，
@@ -80,13 +82,12 @@ http.server &` 就得等到超时（默认 60s）才回来。所以宿主模式�
 
 > 落地日期：2026-10-13
 
-macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要沙箱）：
-`just dev-host`，其它都一样。核心本来就只用 POSIX 那一套（进程组、`kill(-pgid)`、
+macOS 和 Linux 走同一条路（proot 是 Android 的事）：`just dev`，两边一模一样。核心本来就只用 POSIX 那一套（进程组、`kill(-pgid)`、
 状态文件），能直接编过、测试全绿；真正要补的是「Linux 才成立」的几处假设：
 
 | 地方                | Linux 上的做法                        | macOS 上不成立的原因                                                                   | 现在                                                                                                                           |
 | ------------------- | ------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `setsid`            | util-linux 自带                       | macOS 没有 `setsid(1)`；退到 `nohup` 不换进程组，超时会被连组杀掉                      | 宿主 bin 目录里垫一个（`SETSID_SHIM`：系统 perl 调 `POSIX::setsid()`，组长先 fork，跟 util-linux 一致）。PATH 里有真的就不垫   |
+| `setsid`            | util-linux 自带                       | macOS 没有 `setsid(1)`；退到 `nohup` 不换进程组，超时会被连组杀掉                      | 桌面 bin 目录里垫一个（`SETSID_SHIM`：系统 perl 调 `POSIX::setsid()`，组长先 fork，跟 util-linux 一致）。PATH 里有真的就不垫   |
 | bash                | `/bin/bash`                           | `/bin/bash` 是 3.2（没有关联数组 / `${x,,}` / `mapfile`）                              | 用 **PATH 里第一个** bash（装了 Homebrew bash 就是它），找不到才退回 `/bin/bash`                                               |
 | 系统提示词 / 工具表 | `ss -ltnp` / `pgrep -af` / `xdg-open` | 这三样 macOS 上都不对                                                                  | `Platform::Macos`：`lsof -nP -iTCP -sTCP:LISTEN` / `pgrep -fl` / `agent open`（→ `open`），并点名 BSD 用户态（`sed -i ''` 等） |
 | Chrome 在哪         | PATH / `/opt/google/chrome`           | `.app` 包从不在 PATH 里                                                                | 查 `/Applications`（和 `~/Applications`）下的 Chrome / Chromium / Canary / Edge / Brave                                        |
@@ -104,19 +105,18 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
   打开」其实什么都没开，点击回一句假的 `mock: tapped`。宿主
   模式的设备就是这台电脑（`core/src/desktop.rs` 的 `HostDevice`）：`open` 交给
   `open` / `xdg-open`，做不到的（点、滑、按键）明说做不到。`agent` 脚本里不需要
-  任何宿主模式的特判 —— 走的还是同一条 `/api/command`。mock 只留给 `just dev`
-  和测试。
+  任何桌面的特判 —— 走的还是同一条 `/api/command`。mock 只在测试里用。
 - **提示词要如实写宿主能干什么**：桌面上有核心自己起的无头 Chrome，提示词不能说
   「没有 `agent browser`」—— 那样模型会白白放弃浏览器。
 
 ## 系统提示词和工具表：按平台拼，不是抄几份
 
 前缀缓存要求系统提示词和工具表**在同一个部署里字节不变**（[docs/03](03-prompt-cache.md)），
-所以宿主模式**不是**在提示词里插「你现在在 `/home/xxx`」。但「不插运行时数据」
+所以桌面**不是**在提示词里插「你现在在 `/home/xxx`」。但「不插运行时数据」
 不等于「只能写字面量」：
 
 - `Platform`（`core/src/platform.rs`）：`Android` / `Linux` / `Macos`。
-  `AppState::platform()` 看沙箱形态定：宿主模式是这个二进制的桌面系统
+  `AppState::platform()` 看沙箱形态定：桌面是这个二进制的桌面系统
   （`Platform::host()`，按编译目标），proot 沙箱或还没有沙箱都按手机算。
 - `prompt::Phrasing`：提示词和 `bash` 工具描述里**随平台变**的那几句（你是谁、
   cwd 规则、设备那一门、浏览器背后是谁、这台机器上有什么）。三份是三个
@@ -134,21 +134,19 @@ macOS 上**只有宿主模式**（proot 是 Linux 专属的，Mac 上也不要�
 安卓那份重构前后**逐字节一致**（`cargo run -q --example dump_prompt` 前后 diff 过），
 老会话的缓存不受影响；宿主那两份变了，`ensure_system_prompt` 会把新版本追加进老会话。
 测试 `every_platform_gets_a_frozen_prompt_that_matches_its_machine` 盯着：每个平台
-拿到的是同一串字节、没有机器相关的路径、宿主模式里没有一个手机上的词。
+拿到的是同一串字节、没有机器相关的路径、桌面里没有一个手机上的词。
 
 ## 用起来
 
 ```sh
-just dev-host                                # cwd = 这个仓库（just 会把 cwd 设到 justfile 那儿）
-AGENT_HOST_WORKSPACE="$PWD" just dev-host    # 换成你当前那个目录
-AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
+just dev        # cwd = 这个仓库（just 会把 cwd 设到 justfile 那儿）
 ```
 
-（`AGENT_LINUX_HOST=1` 是开关；不用 `just` 的话自己 `export` 它就行。）
+工作目录就是**启动核心时的当前目录**（要换：`cd` 过去再跑）。
 
 其它都跟 `just dev` 一样：`just web-dev`（Vite 热更）、
 `python3 scripts/agentctl.py "…"`、`--doctor` 里会显示
-「宿主模式（无沙箱）」。
+「桌面（无沙箱）」。
 
 `agent` 命令装在 `$XDG_DATA_HOME/android-agent/bin`（默认
 `~/.local/share/android-agent/bin`），只在我们发出去的命令的 PATH 前缀里 ——
@@ -156,21 +154,20 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
 
 ## 会话和模型配置落盘
 
-宿主模式是拿来**日常用**的，所以会话、模型配置、附件都落盘：默认
-`~/.local/share/android-agent/data/sessions.db`（`$XDG_DATA_HOME` 优先），
-`AGENT_DATA_DIR` 可以换。**只放内存不行**：关一次核心，你在界面上配的模型和所有
-会话就没了（`just dev` 那种临时用法除外）。
+桌面是拿来**日常用**的，所以会话、模型配置、附件都落盘：
+`~/.local/share/android-agent/data/sessions.db`（`XDG_DATA_HOME` 优先）。约定大于配置 ——
+没有 `AGENT_DATA_DIR` 这种第二个开关；要换位置就换 `XDG_DATA_HOME`（标准约定，
+`agent` 命令、Chrome profile、单实例锁也跟着一起走）。
 
-- `just dev`（proot 沙箱，在电脑上复现手机）**照旧只在内存里**，除非显式给了
-  `AGENT_DATA_DIR`。
-- `.env.local` / `AGENT_LLM_*` 里的模型只在**库里还没有模型配置**时采用（会存下来，
-  跟在界面上配一次一样），不会每次启动都把界面上配好的覆盖掉。
+- 模型配置**只在库里**（设置页 → 模型提供商，或 `POST /api/llm` 写进去，跟手机上一样）。
+  核心不读任何 `AGENT_LLM_*` 环境变量 —— 以前那条兜底和库里的配置重复，还会把界面上
+  改好的打回去（重启一次就变回 shell 里那份）。
 - 访问凭据：这台电脑自己（127.0.0.1）来的不要；局域网来的要（见下一节）。
   设了 `AGENT_TOKEN` 就是本机也要。
 
 ## 单实例：这台机器上只跑一个核心
 
-`agent-dev`（`just dev` 和 `just dev-host` 都是它）起来先抢一把 `flock`
+`agent-dev`（`just dev` 和 `just dev` 都是它）起来先抢一把 `flock`
 （`$XDG_DATA_HOME/android-agent/core.lock`），抢不到就**不起**，把现在跑着的那个
 （pid / 端口 / 命令行，是它自己写在锁文件里的）打出来：
 
@@ -196,12 +193,12 @@ AGENT_HOST_WORKSPACE=~/work just dev-host    # 或者给绝对路径
 
 ## 局域网：用手机（或另一台电脑）上的界面操控这台电脑
 
-**宿主模式默认就对局域网开放**（听在 `0.0.0.0`）—— 不用另起一个特殊命令：
-`just dev-host` 起来，别的机器（手机 App、另一台电脑上的浏览器）侧栏底栏的
+**桌面默认就对局域网开放**（听在 `0.0.0.0`）—— 不用另起一个特殊命令：
+`just dev` 起来，别的机器（手机 App、另一台电脑上的浏览器）侧栏底栏的
 「选择机器」就能找到它。只想自己用：
 
 ```sh
-AGENT_BIND=127.0.0.1 just dev-host
+AGENT_BIND=127.0.0.1 just dev
 ```
 
 （`just dev` 那条沙箱模式是在电脑上复现手机，默认只听本机。）
@@ -219,7 +216,7 @@ AGENT_BIND=127.0.0.1 just dev-host
 |                | 只在手机核心上                            | 电脑上的核心                                                                                                                                                                                        |
 | -------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 听在哪         | 写死 `127.0.0.1`                          | `AGENT_BIND`（`Core::serve_on`）；手机上照旧只听 loopback                                                                                                                                           |
-| 凭据           | 桌面上默认不设防                          | **听在非 loopback 上就必须有**：`AGENT_TOKEN`，没给就用库里那把（宿主模式有库，重启不变，收藏的地址一直能用）；本机来的免（对端地址靠 `into_make_service_with_connect_info`）                       |
+| 凭据           | 桌面上默认不设防                          | **听在非 loopback 上就必须有**：`AGENT_TOKEN`，没给就用库里那把（桌面有库，重启不变，收藏的地址一直能用）；本机来的免（对端地址靠 `into_make_service_with_connect_info`）                       |
 | WebSocket 来源 | 只放本机来源                              | 另外放**同源**（`Origin` 和 `Host` 对得上）—— 从手机开时来源是 `http://192.168.x.x:8787`；`sandbox.localhost`、`null` 照样挡                                                                        |
 | AI 写的网页    | 放到 `sandbox.localhost` 这个独立的源上开 | 不是从本机访问时 `sandbox.localhost` 解析到的是**手机自己**，所以回落到同源：服务端给同源的沙箱文件加 CSP sandbox，iframe 也不给 `allow-same-origin` —— 照样碰不到凭据，只是页面用不了 localStorage |
 
@@ -231,7 +228,7 @@ AGENT_BIND=127.0.0.1 just dev-host
 
 **自动发现 + 一次性配对**（参照安卓「无线调试」），一套实现两个宿主（见 [docs/12](12-relay.md)）：
 
-- 电脑：`just dev-host` 起来就用系统自带的工具广播 mDNS 服务 `_agent-core._tcp`
+- 电脑：`just dev` 起来就用系统自带的工具广播 mDNS 服务 `_agent-core._tcp`
   （macOS `dns-sd`、Linux `avahi-publish-service`，`desktop::advertise`），终端里
   打一个 6 位配对码。TXT 记录里只有实例 id 和版本 —— **没有凭据**：自动发现只该
   给出「地址」，把 token 放进广播等于告诉局域网里所有人。用系统工具而不是自己

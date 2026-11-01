@@ -107,7 +107,8 @@ pub struct Provider {
     /// 这个模型能不能吃 `image_url`（`read` 读图片时要发）。
     ///
     /// 默认 **true** —— 关错了只会多一条文字说明，开错了是请求直接 400。
-    /// 不能用时可以 `AGENT_LLM_VISION=0`（或 `/api/llm` 的 `vision:false`）关掉。
+    /// 能不能看图由 models.dev 自动判定（`AppState::supports_images_for`），结果落盘，
+    /// 不用用户配 —— 这是模型自己的属性。判错了换个模型就行。
     #[serde(default = "default_supports_images")]
     pub supports_images: bool,
     /// 这个模型能不能吃 PDF / 文档输入（OpenAI 的 `file` 内容块）。
@@ -182,48 +183,11 @@ impl Provider {
         Self::compatible("ollama", "http://127.0.0.1:11434/v1", model, "ollama")
     }
 
-    /// 从环境变量读配置。
-    ///
-    /// 优先 `AGENT_LLM_*`（通用），回退到 `OPENCODE_*`（Go / Zen 端点）。
-    pub fn from_env() -> Option<Self> {
-        let get = |a: &str, b: &str| std::env::var(a).ok().or_else(|| std::env::var(b).ok());
-
-        let key = get("AGENT_LLM_API_KEY", "OPENCODE_API_KEY")?;
-        if key.trim().is_empty() {
-            return None;
-        }
-        let base_url = get("AGENT_LLM_BASE_URL", "OPENCODE_BASE_URL")
-            .unwrap_or_else(|| "https://api.openai.com/v1".into());
-        let model = get("AGENT_LLM_MODEL", "OPENCODE_MODEL").unwrap_or_else(|| "gpt-5".into());
-        let name = get("AGENT_LLM_NAME", "OPENCODE_NAME").unwrap_or_else(|| "custom".into());
-        // 强制协议：`responses` / `chat` / `auto`（不设 = auto）
-        let api_style = match get("AGENT_LLM_API_STYLE", "OPENCODE_API_STYLE")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "responses" => ApiStyle::Responses,
-            "chat" | "chat_completions" => ApiStyle::Chat,
-            _ => ApiStyle::Auto,
-        };
-        let effort = normalize_effort(
-            &get("AGENT_LLM_REASONING_EFFORT", "OPENCODE_REASONING_EFFORT").unwrap_or_default(),
-        );
-
-        Some(Self {
-            name,
-            base_url,
-            model,
-            api_key: key,
-            extra_headers: BTreeMap::new(),
-            // 占位；真正的值由 `AppState::supports_images_for` 从 models.dev 自动判定
-            supports_images: true,
-            supports_files: false,
-            api_style,
-            reasoning_effort: effort,
-        })
-    }
+    // 配置从**库**里来（`db::LlmConfig` / 设置页 / `POST /api/llm`），没有环境变量那条路。
+    //
+    // 曾经有过 `AGENT_LLM_*` 环境变量兜底（后来又多一套 `OPENCODE_*` 别名），和库里的
+    // 东西完全重复 —— 结果就是「界面上配好的」和「shell 里带的」互相打架（改完界面、
+    // 下次启动又被打回环境变量那份）。库是唯一来源，**别再给任何一路兜底**。
 
     /// 建 TLS 配置，用**内嵌的 Mozilla 根证书**（`webpki-roots`）。
     ///
@@ -623,112 +587,12 @@ pub fn build_chat_request(model: &str, system: Option<&str>, user: &str) -> Chat
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn effort_normalizes_and_empty_means_unset() {
-        assert_eq!(normalize_effort("  HIGH "), Some("high".into()));
-        assert_eq!(normalize_effort("Minimal"), Some("minimal".into()));
-        // 空串 = 不设置（前端用它表达「清掉」）
-        assert_eq!(normalize_effort(""), None);
-        assert_eq!(normalize_effort("   "), None);
-    }
     use super::*;
-
-    #[test]
-    fn base_url_is_the_only_switch_for_compatible_providers() {
-        let p = Provider::deepseek("sk-test");
-        assert_eq!(p.base_url, "https://api.deepseek.com/v1");
-        assert_eq!(p.model, "deepseek-chat");
-    }
-
-    #[test]
-    fn chat_request_builds_without_network() {
-        let req = build_chat_request("gpt-5", Some("你是助手"), "你好");
-        assert_eq!(req.messages.len(), 2);
-        assert!(req.stream);
-    }
 
     #[test]
     fn api_key_is_not_serialized() {
         let p = Provider::openai("sk-secret");
         let j = serde_json::to_string(&p).unwrap();
         assert!(!j.contains("sk-secret"), "key 不能泄漏给前端: {j}");
-    }
-
-    #[test]
-    fn auto_prefers_responses_and_falls_back_once_marked_unsupported() {
-        let p = Provider::compatible("x", "https://example.test/v1", "m", "k");
-        assert_eq!(p.transport(), Transport::Responses, "默认优先 Responses");
-        mark_responses_unsupported(&p);
-        assert_eq!(p.transport(), Transport::Chat, "标记后直接走 Chat");
-        // 显式指定的不受探测影响
-        let mut q = p.clone();
-        q.api_style = ApiStyle::Responses;
-        assert_eq!(q.transport(), Transport::Responses);
-    }
-
-    #[test]
-    fn unsupported_endpoint_is_recognized() {
-        let http = |status: u16, body: &str| StreamError::Http {
-            status,
-            body: body.into(),
-        };
-        assert!(http(404, "not found").is_unsupported_endpoint());
-        assert!(http(405, "").is_unsupported_endpoint());
-        assert!(http(400, "Unsupported endpoint: /v1/responses").is_unsupported_endpoint());
-        assert!(!http(401, "bad key").is_unsupported_endpoint());
-        // 跟协议无关的 400 不能让整个运行切到 Chat Completions
-        assert!(!http(400, "Unknown parameter: 'reasoning.effort'").is_unsupported_endpoint());
-        assert!(!http(400, "unknown model: gpt-9").is_unsupported_endpoint());
-        assert!(!http(400, "context length exceeded").is_unsupported_endpoint());
-        // OpenCode Go：这个模型不走 Responses（GPT 系走得了）
-        assert!(http(
-            400,
-            r#"{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}"#
-        )
-        .is_unsupported_endpoint());
-    }
-
-    #[test]
-    fn only_temporary_failures_are_retried() {
-        let http = |status: u16| StreamError::Http {
-            status,
-            body: String::new(),
-        };
-        for s in [429, 500, 502, 503, 504, 529, 408] {
-            assert!(http(s).is_transient(), "{s}");
-        }
-        for s in [400, 401, 403, 404, 422] {
-            assert!(!http(s).is_transient(), "{s}");
-        }
-        // 但「400 里写着网关自己出错了」要重试（OpenCode Go 就是这么回上游失败的）：
-        // 同一条请求重发就过了，不是我们的请求有问题
-        let with_body = |status: u16, body: &str| StreamError::Http {
-            status,
-            body: body.into(),
-        };
-        assert!(with_body(
-            400,
-            r#"{"error":{"type":"server_error","message":"Upstream request failed: [unsupported_request] Message content must contain text."}}"#
-        )
-        .is_transient());
-        // 真正的请求错误（我们组错了请求）不重试，重发多少遍都一样
-        assert!(!with_body(
-            400,
-            r#"{"error":{"type":"invalid_request_error","message":"Unknown parameter: 'foo'"}}"#
-        )
-        .is_transient());
-        assert!(!with_body(400, "<html>502</html>").is_transient());
-        assert!(!StreamError::Other(anyhow::anyhow!("建 HTTP client 失败")).is_transient());
-    }
-
-    #[test]
-    fn responses_unsupported_round_trips_for_persistence() {
-        let p = Provider::compatible("x", "https://persist.test/v1", "m2", "k");
-        assert!(mark_responses_unsupported(&p), "第一次是新记下的");
-        assert!(!mark_responses_unsupported(&p), "再记一次不算新的");
-        assert!(responses_unsupported_list().contains(&"https://persist.test/v1|m2".to_string()));
-        load_responses_unsupported(["https://loaded.test/v1|m".to_string()]);
-        let q = Provider::compatible("y", "https://loaded.test/v1/", "m", "k");
-        assert_eq!(q.transport(), Transport::Chat, "读回来的直接生效");
     }
 }

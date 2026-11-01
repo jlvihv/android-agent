@@ -5,7 +5,7 @@
 #   dev_pick          # 选中设备（结果放 $DEV）
 #   dev_restart       # 重装 + 重启 App + 转发端口（结果放 $PORT）
 #   dev_a11y_on       # 开启无障碍（保留已有的其它服务）
-#   dev_llm           # 把 .env.local 里的 LLM 配置注入设备
+#   dev_llm           # 把 .env.local 的 AGENT_LLM_* 推给手机（写进它的库）
 #   dev_shell '<cmd>' # 在设备的 Linux 沙箱里跑命令
 #
 # 用法示例：
@@ -87,19 +87,29 @@ dev_a11y_on() {
     || echo "device = ?（没拿到 /api/health，跑 just doctor 看）"
 }
 
-# 安卓上 App 不继承 shell 环境变量，所以运行时注入。
+# 手机上 App 不继承 shell 环境变量，所以配置要**推**过去：`POST /api/llm` 写进
+# 手机的库（和设置页里填一次一样，之后重启也还在）。
+#
+# 值从 `.env.local` 读，**只有一套名字**：`AGENT_LLM_BASE_URL` / `_MODEL` / `_API_KEY`。
+# 缺哪个就报哪个，不去猜别的名字（名字用完了，`_NAME` 也不给 —— 后端有缺省）。
+# **只是这个脚本读** —— 核心自己不再认任何 LLM 环境变量（库是唯一来源）。
 dev_llm() {
-  set -a; . ./.env.local; set +a
+  if [ -f .env.local ]; then set -a; . ./.env.local; set +a; fi
+  local missing=""
+  for v in AGENT_LLM_BASE_URL AGENT_LLM_MODEL AGENT_LLM_API_KEY; do
+    [ -n "${!v:-}" ] || missing="$missing $v"
+  done
+  if [ -n "$missing" ]; then
+    echo "dev_llm: .env.local 里缺：$missing" >&2
+    return 1
+  fi
   curl -sS -m 20 -X POST "http://127.0.0.1:$HOST_PORT/api/llm" \
     -H 'content-type: application/json' \
     -d "$(python3 -c "
-import json,os
-print(json.dumps({
-  'name': os.environ.get('AGENT_LLM_NAME','opencode-go'),
-  'baseUrl': os.environ['OPENCODE_BASE_URL'],
-  'model': os.environ['OPENCODE_MODEL'],
-  'apiKey': os.environ['OPENCODE_API_KEY'],
-}))")"
+import json,sys
+print(json.dumps({'baseUrl': sys.argv[1], 'model': sys.argv[2],
+                  'apiKey': sys.argv[3]}))" \
+      "$AGENT_LLM_BASE_URL" "$AGENT_LLM_MODEL" "$AGENT_LLM_API_KEY")"
   echo
 }
 
