@@ -58,14 +58,14 @@ test:
 #
 # 默认对局域网开放（手机 App 能发现这台、输一次配对码就能用）；只想自己用：
 #   AGENT_BIND=127.0.0.1 just dev
-# 要验 release 行为：`AGENT_PROFILE=release-thin just dev`（默认 dev-fast）。
+# 走 dev-fast（opt-level 1、不 LTO，改一行秒级）。要 release 二进制就用服务那套。
 dev: (web "build")
     #!/usr/bin/env bash
     set -eu
     # 模型配置**不在这里给**：核心只认库（设置页 / `POST /api/llm`）。
     # `.env.local` 只剩中继密钥这类东西（AGENT_RELAY* / AGENT_TOKEN）。
     if [ -f .env.local ]; then set -a; . ./.env.local; set +a; fi
-    cargo run --profile "${AGENT_PROFILE:-dev-fast}" --manifest-path {{core}}/Cargo.toml --bin agent-dev
+    cargo run --profile dev-fast --manifest-path {{core}}/Cargo.toml --bin agent-dev
 
 # --- 中继（出门在外连家里的电脑，见 docs/12-relay.md） ----------------------
 
@@ -221,12 +221,9 @@ android-bindings:
 
 # 2) 交叉编译 Rust 核心 → jniLibs。只出 arm64-v8a（模拟器要 x86_64：`just emu-install`）。
 #
-#    profile 决定 LTO 档，实测（M 系 Mac，改一行 → 出 .so）：
-#      release（fat LTO）        46s，.so 8.10MB —— 发版用
-#      release-thin（thin LTO）  27s，.so 8.37MB —— debug 包用，快 40%，大 261KB
 #    编完验 16KB 对齐（Play 对 targetSdk 35+ 有要求，R1）—— 这个检查很便宜，别省：
 #      llvm-readelf -l {{jni}}/arm64-v8a/libagent_core.so | awk '/LOAD/{print $NF}'
-android-libs profile="release":
+android-libs:
     #!/usr/bin/env bash
     set -eu
     # cargo-ndk 同样要 cwd 在 crate 目录里
@@ -246,7 +243,7 @@ android-libs profile="release":
     # 去命中上一次的产物是纯赚（cargo 在 RUSTC_WRAPPER 存在时会关掉增量，对 release
     # 无损）。没装 sccache 就照旧走。
     if command -v sccache >/dev/null 2>&1; then export RUSTC_WRAPPER=sccache; fi
-    cargo ndk "${ts[@]}" -o ../{{jni}} build --profile {{profile}} --lib
+    cargo ndk "${ts[@]}" -o ../{{jni}} build --release --lib
     echo "--- 16KB 对齐检查（Play 对 targetSdk 35+ 有要求，R1）---"
     # NDK 的预编译工具目录：Linux 是 linux-x86_64，macOS（含 Apple 芯片）是 darwin-x86_64
     host=linux-x86_64; [ "$(uname)" = Darwin ] && host=darwin-x86_64
@@ -286,7 +283,7 @@ android-assets:
 # 反过来装上去的永远是上一次的前端。
 # assemble 前删掉上一版 APK / 中间产物：AGP 增量打包在 .so 变动时会留一块全零
 # 空洞（实测 9.0MB → 12.6MB），从零打一遍不到 1 秒。
-android-debug: android-bindings (web "build") (android-libs "release-thin")
+android-debug: android-bindings (web "build") android-libs
     #!/usr/bin/env bash
     set -eu
     . scripts/jdk.sh
@@ -301,7 +298,7 @@ android-install: android-debug
     cd {{and}} && ./gradlew :app:installDebug
 
 # release APK：R8 混淆/压缩 + 签名（见 app/build.gradle.kts 里的 signingConfigs）。
-# 原生核心用 fat LTO 的 release（debug 包那边是 release-thin，见 android-libs），区别只在
+# 原生核心也是 release（thin LTO，见 core/Cargo.toml），区别只在
 # Kotlin/dex 那层和签名。
 #
 # assemble 前同样删一遍（理由见 android-debug 上面那段）。

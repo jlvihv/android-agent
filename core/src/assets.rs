@@ -4,7 +4,7 @@
 //!
 //! 理由：嵌入是编译期的，改一行前端就要重编整个 core（`rust-embed` 的 derive
 //! 甚至会在 dist 缺失时让编译失败）。开发时前端改得比 Rust 勤得多，那条路走不通。
-//! 发版（release / release-thin）照旧嵌入，`.so` 自带一份完整前端。
+//! 发版（release）照旧嵌入，`.so` 自带一份完整前端。
 
 use std::borrow::Cow;
 

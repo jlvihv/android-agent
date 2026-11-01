@@ -162,10 +162,9 @@ android_logger = { version = "0.14", default-features = false }
 # --- 编译档位 -------------------------------------------------------------
 #
 # 三档，别混用：
-#   dev（默认）        `just dev` / `cargo test`：增量最快（实测改一行 3s）
-#   dev-fast           `just dev` 的默认：opt-level 1，跑得动且仍是秒级增量
-#   release-thin       要真性能但**不打 APK**：thin LTO，比 release 快 2~3 倍
-#   release            **只给发版**：fat LTO + CU 1 + panic=abort，体积优先，改一行就是分钟级
+#   dev（默认）   `cargo test` / 调试：增量最快
+#   dev-fast      `just dev`：opt-level 1，跑得动且仍是秒级增量
+#   release       服务、发版、打 APK：thin LTO（**只有一个 release**）
 
 # 默认 debug = 2（完整调试信息）。实测增量目录涨到 14GB，编译也慢一截；
 # 1 仍然有行号、变量名和栈帧，够定位问题。
@@ -173,8 +172,8 @@ android_logger = { version = "0.14", default-features = false }
 debug = 1
 
 # 日常开发档（`just dev`）。为什么不是直接开 opt：
-#   - `just dev` 的 dev 档已经够快，但 unoptimized 跑图像解码/长流式会话偏慢；
-#   - release 档的 lto = true + codegen-units = 1 会让「改一行」变成重链整个 crate。
+#   - dev 档已经够快，但 unoptimized 跑图像解码/长流式会话偏慢；
+#   - release 档开了 LTO，改一行要重链整个 crate（几十秒）。
 # **故意不设 panic**：继承 dev 的 unwind —— 别让这个档把「release 会 abort」这件事
 # 在本地抹平（lib.rs 有个测试专门盯着 release 的 panic = "abort"）。
 [profile.dev-fast]
@@ -184,8 +183,15 @@ debug = 1
 codegen-units = 16
 
 [profile.release]
-lto = true
-codegen-units = 1
+# **只留一个 release 档**：服务、发版、打 APK 都是它。
+#
+# thin LTO 而不是 fat（实测，改一行 → 出 Android .so）：
+#   fat + CU1     46s   8.10MB
+#   thin + CU4    27s   8.37MB（+3%）
+# 差 3% 的体积换掉一半的等待，值。CU 用 4 不用默认的 16：速度一样（26.8s vs 27.5s），
+# 但 thin LTO 跨 CGU 做死代码消除，CU 少一点体积明显小（CU16 的 .so 是 8.62MB）。
+lto = "thin"
+codegen-units = 4
 strip = true
 opt-level = "s"
 # **panic 就崩**，不兜。
@@ -211,13 +217,3 @@ opt-level = "s"
 # 别以为测试过了就等于 release 也会 abort。`lib.rs` 里有一个测试专门
 # 盯着这一行配置，防止它被无声改回去。
 panic = "abort"
-
-# 「要性能、但不发版」的档：`AGENT_PROFILE=release-thin just dev`。
-#
-# 和 release 的唯一区别是 lto = "thin" + codegen-units = 4：体积/性能只差几个
-# 百分点，编译快 2~3 倍。**打 APK 仍然用 release**（那边体积优先，见 docs/01 的 R1）。
-# panic = "abort" 继承自 release —— 这个档就是用来验「release 行为」的，不能差。
-[profile.release-thin]
-inherits = "release"
-lto = "thin"
-codegen-units = 4
