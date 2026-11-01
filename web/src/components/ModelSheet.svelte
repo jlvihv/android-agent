@@ -294,9 +294,7 @@
                   class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                          text-left last:border-b-0"
                 >
-                  <span class="min-w-0 flex-1 truncate text-row"
-                    >{m.name}</span
-                  >
+                  <span class="min-w-0 flex-1 truncate text-row">{m.name}</span>
                   {#if isCurrent(shown, m)}
                     <Icon name="check" size={17} class="shrink-0 text-accent" />
                   {/if}
@@ -311,9 +309,7 @@
             class="flex w-full items-center rounded-2xl bg-surface px-3.5 py-4 text-left"
           >
             <span class="text-row">思考强度</span>
-            <span
-              class="ml-auto flex items-center gap-0.5 text-row text-muted"
-            >
+            <span class="ml-auto flex items-center gap-0.5 text-row text-muted">
               {effortLabel(effort)}
               <Icon name="chevron" size={16} />
             </span>
@@ -379,8 +375,7 @@
                   class="flex w-full items-center gap-3 border-b-2 border-ink px-3.5 py-3
                          text-left last:border-b-0"
                 >
-                  <span class="min-w-0 flex-1 truncate text-row"
-                    >{e.label}</span
+                  <span class="min-w-0 flex-1 truncate text-row">{e.label}</span
                   >
                   {#if e.value === effort}
                     <Icon name="check" size={17} class="shrink-0 text-accent" />
