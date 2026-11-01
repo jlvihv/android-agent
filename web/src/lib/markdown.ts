@@ -80,7 +80,10 @@ const VOID =
   /^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i;
 
 /** 收一个 HTML 块：容器没闭合时空行不算完，按标签层数判闭合 */
-function htmlBlock(lines: string[], i: number): { body: string[]; end: number } {
+function htmlBlock(
+  lines: string[],
+  i: number,
+): { body: string[]; end: number } {
   const body: string[] = [];
   let depth = 0;
   while (i < lines.length) {

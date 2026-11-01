@@ -52,7 +52,7 @@
      faint 原来 #6f6d66 压在卡片(#20201f)上只有 3.15:1、压在代码块(#1c1c1b)上 3.29:1，
      而它扛的是「代码块是什么语言」「能不能复制」这类**状态信息** —— 太淡就读没了。 */
   --color-fg: #f9f9f7; /* 暖白，不用纯白 */
-  --color-muted: #9c9a92; /* 药丸里「· 默认」压在 control 上 4.62:1（原来 4.34）*/ 
+  --color-muted: #9c9a92; /* 药丸里「· 默认」压在 control 上 4.62:1（原来 4.34）*/
   --color-faint: #8a8880; /* 卡片 4.59 / 代码块 4.80 / 页面 5.63；在 control 上当图标 3.66 */
 
   /* 语义色：刻意去饱和，不抢主色 */
@@ -461,34 +461,125 @@ a:focus-visible {
  * 裸 HTML（`Markdown.svelte` 里那个 `{@html}`）：把 Tailwind preflight 抹平的语义
  * 标签还回浏览器默认样子。不提供组件类，颜色从 `currentColor` 混透明度，深浅两套自动跟。
  */
-.raw > :first-child { margin-top: 0 }
-.raw > :last-child { margin-bottom: 0 }
-.raw :is(h1, h2, h3, h4, h5, h6) { margin: .75em 0 .35em; font-weight: 600; line-height: 1.35 }
-.raw h1 { font-size: 1.25em }
-.raw h2 { font-size: 1.15em }
-.raw :is(h3, h4, h5, h6) { font-size: 1em }
-.raw :is(p, pre, blockquote, ul, ol, dl, table, details, figure) { margin: .5em 0 0 }
-.raw :is(ul, ol) { padding-left: 1.35em }
-.raw ul { list-style: disc }
-.raw ol { list-style: decimal }
-.raw li + li { margin-top: .2em }
-.raw :is(strong, b) { font-weight: 600 }
-.raw a { color: inherit; text-decoration: underline; text-decoration-color: color-mix(in oklab, currentColor 45%, transparent); text-underline-offset: 2px; overflow-wrap: anywhere }
-.raw :is(code, pre, kbd, samp) { font-family: var(--font-mono); font-size: .88em }
-.raw code { padding: .05em .3em; border-radius: .35em; background: color-mix(in oklab, currentColor 12%, transparent) }
-.raw pre { overflow-x: auto; padding: .6em .75em; border-radius: 12px; background: color-mix(in oklab, currentColor 8%, transparent) }
-.raw pre code { padding: 0; background: none }
-.raw kbd { padding: .05em .35em; border: 1px solid color-mix(in oklab, currentColor 28%, transparent); border-bottom-width: 2px; border-radius: .35em }
-.raw mark { background: color-mix(in oklab, currentColor 18%, transparent); color: inherit }
-.raw :is(small, figcaption) { font-size: .86em; opacity: .72 }
-.raw blockquote { padding-left: .75em; border-left: 2px solid color-mix(in oklab, currentColor 28%, transparent); opacity: .85 }
-.raw hr { margin: .6em 0; border: 0; border-top: 1px solid color-mix(in oklab, currentColor 15%, transparent) }
-.raw table { display: block; width: max-content; min-width: 100%; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: .93em; line-height: 1.4 }
-.raw :is(th, td) { padding: .3em .6em; border-bottom: 1px solid color-mix(in oklab, currentColor 15%, transparent); text-align: left; vertical-align: top }
-.raw tr:last-child :is(th, td) { border-bottom: 0 }
-.raw :is(thead th, tr:first-child > th) { border-bottom-color: color-mix(in oklab, currentColor 30%, transparent); font-weight: 600 }
-.raw :is(img, video, svg) { max-width: 100%; height: auto }
-.raw summary { cursor: pointer; font-weight: 500 }
+.raw > :first-child {
+  margin-top: 0;
+}
+.raw > :last-child {
+  margin-bottom: 0;
+}
+.raw :is(h1, h2, h3, h4, h5, h6) {
+  margin: 0.75em 0 0.35em;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.raw h1 {
+  font-size: 1.25em;
+}
+.raw h2 {
+  font-size: 1.15em;
+}
+.raw :is(h3, h4, h5, h6) {
+  font-size: 1em;
+}
+.raw :is(p, pre, blockquote, ul, ol, dl, table, details, figure) {
+  margin: 0.5em 0 0;
+}
+.raw :is(ul, ol) {
+  padding-left: 1.35em;
+}
+.raw ul {
+  list-style: disc;
+}
+.raw ol {
+  list-style: decimal;
+}
+.raw li + li {
+  margin-top: 0.2em;
+}
+.raw :is(strong, b) {
+  font-weight: 600;
+}
+.raw a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, currentColor 45%, transparent);
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+}
+.raw :is(code, pre, kbd, samp) {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+.raw code {
+  padding: 0.05em 0.3em;
+  border-radius: 0.35em;
+  background: color-mix(in oklab, currentColor 12%, transparent);
+}
+.raw pre {
+  overflow-x: auto;
+  padding: 0.6em 0.75em;
+  border-radius: 12px;
+  background: color-mix(in oklab, currentColor 8%, transparent);
+}
+.raw pre code {
+  padding: 0;
+  background: none;
+}
+.raw kbd {
+  padding: 0.05em 0.35em;
+  border: 1px solid color-mix(in oklab, currentColor 28%, transparent);
+  border-bottom-width: 2px;
+  border-radius: 0.35em;
+}
+.raw mark {
+  background: color-mix(in oklab, currentColor 18%, transparent);
+  color: inherit;
+}
+.raw :is(small, figcaption) {
+  font-size: 0.86em;
+  opacity: 0.72;
+}
+.raw blockquote {
+  padding-left: 0.75em;
+  border-left: 2px solid color-mix(in oklab, currentColor 28%, transparent);
+  opacity: 0.85;
+}
+.raw hr {
+  margin: 0.6em 0;
+  border: 0;
+  border-top: 1px solid color-mix(in oklab, currentColor 15%, transparent);
+}
+.raw table {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.93em;
+  line-height: 1.4;
+}
+.raw :is(th, td) {
+  padding: 0.3em 0.6em;
+  border-bottom: 1px solid color-mix(in oklab, currentColor 15%, transparent);
+  text-align: left;
+  vertical-align: top;
+}
+.raw tr:last-child :is(th, td) {
+  border-bottom: 0;
+}
+.raw :is(thead th, tr:first-child > th) {
+  border-bottom-color: color-mix(in oklab, currentColor 30%, transparent);
+  font-weight: 600;
+}
+.raw :is(img, video, svg) {
+  max-width: 100%;
+  height: auto;
+}
+.raw summary {
+  cursor: pointer;
+  font-weight: 500;
+}
 
 /*
  * 对比度账本（2026-10 校准）

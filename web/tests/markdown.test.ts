@@ -17,7 +17,7 @@
 import { describe, expect, test } from "bun:test";
 
 // @ts-expect-error 运行时补的桩，Svelte 编译时才有这两个 rune
-globalThis.$state = <T,>(v: T) => v;
+globalThis.$state = <T>(v: T) => v;
 // @ts-expect-error 同上
 globalThis.$derived = { by: (f: () => unknown) => f() };
 // @ts-expect-error store 构造时读 location.hostname（判「本机」）
@@ -39,17 +39,27 @@ function kinds(src: string): string[] {
 
 describe("裸 HTML 块", () => {
   test("容器没闭合时，空行不结束块", () => {
-    const src = ["<div class=\"card\">", "", "里面 **不加粗**", "", "第二段", "</div>"].join("\n");
+    const src = [
+      '<div class="card">',
+      "",
+      "里面 **不加粗**",
+      "",
+      "第二段",
+      "</div>",
+    ].join("\n");
     expect(kinds(src)).toEqual([`html:${src}`]);
   });
 
   test("闭合之后，紧跟的标签并进同一块，否则回车就是段落", () => {
     expect(kinds("<div>a</div>\n\n后面")).toEqual(["html:<div>a</div>", "p"]);
-    expect(kinds("<div>a</div>\n<b>b</b>")).toEqual(["html:<div>a</div>\n<b>b</b>"]);
+    expect(kinds("<div>a</div>\n<b>b</b>")).toEqual([
+      "html:<div>a</div>\n<b>b</b>",
+    ]);
   });
 
   test("嵌套 + 空行都在里面", () => {
-    const src = "<details>\n<summary>标题</summary>\n\n内容\n\n- 列表项\n</details>";
+    const src =
+      "<details>\n<summary>标题</summary>\n\n内容\n\n- 列表项\n</details>";
     expect(kinds(src)).toEqual([`html:${src}`]);
   });
 
@@ -68,33 +78,49 @@ describe("裸 HTML 块", () => {
   });
 
   test("相邻的 HTML 块和段落互不影响", () => {
-    expect(kinds("段落\n\n<div>x</div>\n\n段落二")).toEqual(["p", "html:<div>x</div>", "p"]);
+    expect(kinds("段落\n\n<div>x</div>\n\n段落二")).toEqual([
+      "p",
+      "html:<div>x</div>",
+      "p",
+    ]);
   });
 });
 
 describe("交了一整页 HTML 时剥回片段", () => {
   const texts = (src: string) =>
-    parse(src).filter((b) => b.t === "html").map((b) => (b as { v: string }).v);
+    parse(src)
+      .filter((b) => b.t === "html")
+      .map((b) => (b as { v: string }).v);
 
   test("DOCTYPE / html / head / body 外壳全剥掉", () => {
-    expect(texts("<!DOCTYPE html>\n<html>\n<body>\n<div>内容</div>\n</body>\n</html>")).toEqual([
+    expect(
+      texts(
+        "<!DOCTYPE html>\n<html>\n<body>\n<div>内容</div>\n</body>\n</html>",
+      ),
+    ).toEqual(["<div>内容</div>"]);
+    expect(texts("<!doctype html>\n<div>内容</div>")).toEqual([
       "<div>内容</div>",
     ]);
-    expect(texts("<!doctype html>\n<div>内容</div>")).toEqual(["<div>内容</div>"]);
   });
 
   test("`<style>` / `<script>` 必须剥 —— 它们是全局作用域", () => {
     // 实测：一条 `body{display:none}` 在 .raw 里能把**整个 App** 弄成白屏，
     // 一条 `*{color:red}` 能把所有文字染色。剥掉只是「样式没了」，不会整页崩。
-    expect(texts("<style>body{display:none}</style>\n<div>内容</div>")).toEqual(["<div>内容</div>"]);
-    expect(texts("<div><script>alert(1)</script>内容</div>")).toEqual(["<div>内容</div>"]);
-    expect(texts("<div><style>.a{color:red}</style>x</div>")).toEqual(["<div>x</div>"]);
+    expect(texts("<style>body{display:none}</style>\n<div>内容</div>")).toEqual(
+      ["<div>内容</div>"],
+    );
+    expect(texts("<div><script>alert(1)</script>内容</div>")).toEqual([
+      "<div>内容</div>",
+    ]);
+    expect(texts("<div><style>.a{color:red}</style>x</div>")).toEqual([
+      "<div>x</div>",
+    ]);
   });
 
   test("普通片段一点不动（含 inline style）", () => {
-    expect(texts('<div style="display:grid">\n<span>a</span>\n</div>')).toEqual([
-      '<div style="display:grid">\n<span>a</span>\n</div>',
-    ]);
+    expect(texts('<div style="display:grid">\n<span>a</span>\n</div>')).toEqual(
+      ['<div style="display:grid">\n<span>a</span>\n</div>'],
+    );
   });
 });
 
@@ -102,13 +128,19 @@ describe("行内不认 HTML（那是块的事）", () => {
   test("代码里的尖括号不会被当成标签吞掉", () => {
     // 这两条是实测出来的：以前行内认标签，`Array<T>` 的 `<T>` 被当标签渲染成空，
     // `x<y>z` 直接吞掉 x 和 z —— 对天天聊代码的助手来说是每天都踩的坑
-    expect(inline("Array<T> 泛型")).toEqual([{ t: "text", v: "Array<T> 泛型" }]);
+    expect(inline("Array<T> 泛型")).toEqual([
+      { t: "text", v: "Array<T> 泛型" },
+    ]);
     expect(inline("x<y>z")).toEqual([{ t: "text", v: "x<y>z" }]);
   });
 
   test("`<https://…>` 自动链接照旧是链接", () => {
     expect(inline("<https://a.com/x>")).toEqual([
-      { t: "link", href: "https://a.com/x", c: [{ t: "text", v: "https://a.com/x" }] },
+      {
+        t: "link",
+        href: "https://a.com/x",
+        c: [{ t: "text", v: "https://a.com/x" }],
+      },
     ]);
   });
 
