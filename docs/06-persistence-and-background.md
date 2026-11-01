@@ -334,11 +334,14 @@ JS 在后台会被系统挂起；电脑上的核心更是只能从 HTTP 拿。�
 
 验证（模拟器当客户端 + 本机另起一个临时核心当「电脑」，独立数据目录，互不干扰）：
 
-重启核心时用 `scripts/restart-core.sh`：它按「先编译（编不动就什么都不动）→ 等 `busy=false`
-（等你这句话答完、消息已经发到手机上、并且**落盘**）→ 才杀 → 起新的 → 验健康（起不来就用
-备份的旧二进制兜回去）→ 顺手用 adb 把手机上的 App 重开一次」的顺序做，从 agent 的 bash 里跑会
-自己 `setsid` 脱离会话（agent 的进程树挂在被杀的核心里）。手机**不用重新配对**：配对给手机的
-就是核心自己的 token，它在会话库里、跨重启不变（换的只是新设备用的那个 6 位码）。
+重启核心时用 `scripts/restart-core.sh`：先编译（编不动就什么都不动）→ 等 `busy=false`
+（等你这句话答完、并且**落盘**）→ 让系统服务重启它（`launchctl kickstart -k` /
+`systemctl --user restart`）→ 验健康。从 agent 的 bash 里跑会自己 `setsid` 脱离会话
+（agent 的进程树挂在被重启的核心里）。
+
+它**只管核心**：手机 App 那边不用动（前台服务自己会重连），也不碰 adb。手机**不用重新
+配对**：配对给手机的就是核心自己的 token，它在会话库里、跨重启不变（换的只是新设备用的
+那个 6 位码）。
 
 这台电脑上核心是**常驻服务**（开机自启）：Linux 是 systemd 用户服务
 （`android-agent.service`，unit 在 `~/Code/project/config/systemd/user/`），macOS 是
