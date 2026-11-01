@@ -458,6 +458,39 @@ a:focus-visible {
 }
 
 /*
+ * 裸 HTML（`Markdown.svelte` 里那个 `{@html}`）：把 Tailwind preflight 抹平的语义
+ * 标签还回浏览器默认样子。不提供组件类，颜色从 `currentColor` 混透明度，深浅两套自动跟。
+ */
+.raw > :first-child { margin-top: 0 }
+.raw > :last-child { margin-bottom: 0 }
+.raw :is(h1, h2, h3, h4, h5, h6) { margin: .75em 0 .35em; font-weight: 600; line-height: 1.35 }
+.raw h1 { font-size: 1.25em }
+.raw h2 { font-size: 1.15em }
+.raw :is(h3, h4, h5, h6) { font-size: 1em }
+.raw :is(p, pre, blockquote, ul, ol, dl, table, details, figure) { margin: .5em 0 0 }
+.raw :is(ul, ol) { padding-left: 1.35em }
+.raw ul { list-style: disc }
+.raw ol { list-style: decimal }
+.raw li + li { margin-top: .2em }
+.raw :is(strong, b) { font-weight: 600 }
+.raw a { color: inherit; text-decoration: underline; text-decoration-color: color-mix(in oklab, currentColor 45%, transparent); text-underline-offset: 2px; overflow-wrap: anywhere }
+.raw :is(code, pre, kbd, samp) { font-family: var(--font-mono); font-size: .88em }
+.raw code { padding: .05em .3em; border-radius: .35em; background: color-mix(in oklab, currentColor 12%, transparent) }
+.raw pre { overflow-x: auto; padding: .6em .75em; border-radius: 12px; background: color-mix(in oklab, currentColor 8%, transparent) }
+.raw pre code { padding: 0; background: none }
+.raw kbd { padding: .05em .35em; border: 1px solid color-mix(in oklab, currentColor 28%, transparent); border-bottom-width: 2px; border-radius: .35em }
+.raw mark { background: color-mix(in oklab, currentColor 18%, transparent); color: inherit }
+.raw :is(small, figcaption) { font-size: .86em; opacity: .72 }
+.raw blockquote { padding-left: .75em; border-left: 2px solid color-mix(in oklab, currentColor 28%, transparent); opacity: .85 }
+.raw hr { margin: .6em 0; border: 0; border-top: 1px solid color-mix(in oklab, currentColor 15%, transparent) }
+.raw table { display: block; width: max-content; min-width: 100%; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: .93em; line-height: 1.4 }
+.raw :is(th, td) { padding: .3em .6em; border-bottom: 1px solid color-mix(in oklab, currentColor 15%, transparent); text-align: left; vertical-align: top }
+.raw tr:last-child :is(th, td) { border-bottom: 0 }
+.raw :is(thead th, tr:first-child > th) { border-bottom-color: color-mix(in oklab, currentColor 30%, transparent); font-weight: 600 }
+.raw :is(img, video, svg) { max-width: 100%; height: auto }
+.raw summary { cursor: pointer; font-weight: 500 }
+
+/*
  * 对比度账本（2026-10 校准）
  *
  * 为什么要留这一张表：对比度靠眼睛看不出来。`--color-faint` 原来压在卡片上

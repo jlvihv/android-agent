@@ -1,13 +1,13 @@
 /**
- * 极简 Markdown 解析。
- *
- * 故意不引 marked / markdown-it —— 依赖越少越好，而 LLM 实际吐出来的
- * 就那几种结构。解析成结构化的块交给 Svelte 渲染，**不用 `{@html}`**：
- * 既没有 XSS 面，也能让 Tailwind 直接管样式。
+ * 极简 Markdown 解析：解析成结构化的块交给 Svelte 渲染，样式全在 Tailwind 里；
+ * 只有裸 HTML 那一种块走 `{@html}`。
  *
  * 块级：段落、标题、分隔线、围栏代码块、表格、引用（可嵌套）、
- *       有序/无序/任务列表（可嵌套、可续行、项之间可空行）
+ *       有序/无序/任务列表（可嵌套、可续行、项之间可空行）、裸 HTML 块
  * 行内：粗体、斜体、粗斜体、删除线、行内代码、链接、图片、裸链接、转义
+ *
+ * HTML 只有块级：行内 markdown 已经够用，而正文里的 `Array<T>`、`x<y>z` 这类
+ * 尖括号一旦被当成标签就会吞内容。
  *
  * 几个刻意的行为：
  *   - **没闭合的围栏也当代码块收**。流式输出时经常只有前半截，这时候
@@ -44,6 +44,8 @@ export type Block =
   | { t: "code"; lang: string; v: string }
   | { t: "table"; align: Align[]; head: Span[][]; rows: Span[][][] }
   | { t: "quote"; blocks: Block[] }
+  /** 裸 HTML 块：不解析 markdown */
+  | { t: "html"; v: string }
   | {
       t: "list";
       ordered: boolean;
@@ -67,6 +69,53 @@ const indentOf = (l: string) =>
   l.match(/^\s*/)![0].replace(/\t/g, "    ").length;
 const blank = (l: string) => !l.trim();
 
+// ---------------------------------------------------------------------------
+// 裸 HTML
+// ---------------------------------------------------------------------------
+
+/** 行首的 HTML 开口：`<div>` / `</div>` / `<!…` 这类完整标签 */
+const HTML_BLOCK = /^ {0,3}(?:<!|<\/?[a-zA-Z][\w:-]*(?:\s[^<>]*)?>)/;
+/** 自己就是完整的，不计层数 */
+const VOID =
+  /^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i;
+
+/** 收一个 HTML 块：容器没闭合时空行不算完，按标签层数判闭合 */
+function htmlBlock(lines: string[], i: number): { body: string[]; end: number } {
+  const body: string[] = [];
+  let depth = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (blank(l)) {
+      if (depth <= 0) break;
+      body.push("");
+      i++;
+      continue;
+    }
+    for (const m of l.matchAll(/<(\/?)([a-zA-Z][\w:-]*)/g)) {
+      if (!VOID.test(m[2])) depth += m[1] ? -1 : 1;
+    }
+    body.push(l);
+    i++;
+    // 这一行把标签都闭合了：只有下一行也是标签时才并进同一块（连着写几个卡片
+    // 是常见写法），否则回车就是段落。
+    if (depth <= 0 && !HTML_BLOCK.test(lines[i] ?? "")) break;
+  }
+  return { body, end: i };
+}
+
+/**
+ * 整页 HTML → 片段：剥掉 `<style>`/`<script>`（全局作用域，容器关不住）和
+ * `<html>`/`<head>`/`<body>`/`<!DOCTYPE>` 外壳（DOM 里放不进单层包裹）。
+ */
+function tidy(html: string): string {
+  return html
+    .replace(/<!doctype[^>]*>/gi, "")
+    .replace(/<\/?(?:html|head|body)\b[^>]*>/gi, "")
+    .replace(/<(style|script)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
+    .replace(/<(?:style|script)\b[^>]*\/?>/gi, "")
+    .trim();
+}
+
 function isTableStart(lines: string[], i: number): boolean {
   return (
     i + 1 < lines.length &&
@@ -84,6 +133,7 @@ function isBlockStart(lines: string[], i: number): boolean {
     HR.test(l) ||
     QUOTE.test(l) ||
     ITEM.test(l) ||
+    HTML_BLOCK.test(l) ||
     isTableStart(lines, i)
   );
 }
@@ -170,6 +220,15 @@ function blocks(lines: string[], dir: string): Block[] {
     if (HR.test(line)) {
       out.push({ t: "hr" });
       i++;
+      continue;
+    }
+
+    // 裸 HTML 块（放在表格之前：`<table>` 那一行没有 `|`，不会互相抢）
+    if (HTML_BLOCK.test(line)) {
+      const r = htmlBlock(lines, i);
+      const v = tidy(r.body.join("\n"));
+      if (v) out.push({ t: "html", v });
+      i = r.end;
       continue;
     }
 
@@ -312,7 +371,6 @@ function list(lines: string[], i: number, out: Block[], dir: string): number {
 const PUNCT = /[!-/:-@[-`{-~]/;
 const WORD = /[\p{L}\p{N}]/u;
 const URL_RE = /^https?:\/\/[^\s<>()（）「」，。；：！？、]+/;
-
 /** 只放行这些协议。javascript: 等一律当文字 */
 export function safeHref(href: string): string | null {
   const h = href.trim();

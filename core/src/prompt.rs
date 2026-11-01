@@ -130,6 +130,9 @@ impl Phrasing {
     }
 }
 
+/// 正文内嵌 HTML 的说法（三个平台共用）。
+const HTML_BULLET: &str = "可以直接写 HTML 片段提供更好的展示效果（不用整页，不写 style/script 标签）；样式用 inline style。";
+
 fn compose_prompt(p: Platform, phone: bool) -> String {
     let t = Phrasing::of(p);
     format!(
@@ -137,6 +140,7 @@ fn compose_prompt(p: Platform, phone: bool) -> String {
          \n\
          - {files}\n\
          - 想让用户看链接时：写 `preview:` 链接，如 `[打开](preview:{link_example})`，图片/音频/视频都用图片语法，能渲染 `![说明](preview:…)`。{link_bullet}\n\
+         - {html}\n\
          - `agent` 命令（已在 PATH 里）：{cli}，`agent help` 看全部。\n\
          - 一次回复里可以带多个工具调用：互不依赖的操作（比如一次新建好几个文件、跑几条互不相干的命令）合并到同一条回复里一起发，有依赖关系的才分成多轮。\n\
          \n\
@@ -145,6 +149,7 @@ fn compose_prompt(p: Platform, phone: bool) -> String {
         files = t.files,
         link_example = t.link_example,
         link_bullet = t.link_bullet,
+        html = HTML_BULLET,
         // 这台机器上有的子命令（和沙箱里那份 `agent` 同一张表，见 `cli.rs`）
         cli = crate::cli::prompt_clause(crate::cli::Machine::of(p, phone)),
     )

@@ -211,6 +211,9 @@
       >
         {@render blocks(b.blocks)}
       </blockquote>
+    {:else if b.t === "html"}
+      <!-- 裸 HTML：原样进 DOM，样式见 app.css 的 .raw -->
+      <div class="raw">{@html b.v}</div>
     {:else if b.t === "list"}
       {@const tag = b.ordered ? "ol" : "ul"}
       <svelte:element
