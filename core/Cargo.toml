@@ -185,12 +185,18 @@ codegen-units = 16
 [profile.release]
 # **只留一个 release 档**：服务、发版、打 APK 都是它。
 #
-# thin LTO 而不是 fat（实测，改一行 → 出 Android .so）：
-#   fat + CU1     46s   8.10MB
-#   thin + CU4    27s   8.37MB（+3%）
-# 差 3% 的体积换掉一半的等待，值。CU 用 4 不用默认的 16：速度一样（26.8s vs 27.5s），
-# 但 thin LTO 跨 CGU 做死代码消除，CU 少一点体积明显小（CU16 的 .so 是 8.62MB）。
-lto = "thin"
+# fat LTO + CU4。实测（改一行 → 出产物）：
+#
+#   档            桌面二进制   改一行   Android .so   改一行
+#   fat + CU1      6.65MB       ~1.5m      8.10MB        46s
+#   fat + CU4      6.77MB       1m23s       ~8.1MB        ~40s
+#   thin + CU4     9.15MB         53s      8.37MB        27s
+#
+# thin 快三成，但桌面二进制胖 2.4MB（thin LTO 的跨 CGU 死代码消除弱）。日常改代码
+# 走 `just dev`（dev-fast，2 秒），release 只在「要更新服务 / 发版」时才编 —— 那就
+# 选体积。CU 用 4 而不是 1：fat 会在链接时合并所有 CGU，CU 只影响合并前的并行度，
+# 体积几乎不变、时间省一截。
+lto = "fat"
 codegen-units = 4
 strip = true
 opt-level = "s"
