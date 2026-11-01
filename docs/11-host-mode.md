@@ -144,7 +144,7 @@ just dev        # cwd = 这个仓库（just 会把 cwd 设到 justfile 那儿）
 
 工作目录就是**启动核心时的当前目录**（要换：`cd` 过去再跑）。
 
-其它都跟 `just dev` 一样：`just web-dev`（Vite 热更）、
+其它都跟 `just dev` 一样：`just web dev`（Vite 热更）、
 `python3 scripts/agentctl.py "…"`、`--doctor` 里会显示
 「桌面（无沙箱）」。
 

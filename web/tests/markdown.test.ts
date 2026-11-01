@@ -11,7 +11,7 @@
  * 在 bun 里不存在 —— 所以下面先给三个同名全局，再动态 import。
  * 纯前端、不上 DOM，毫秒级，跟 `tests/` 里另外两个一个待遇。
  *
- *     bun test            # 或者 `just web-test`
+ *     bun test            # 或者 `just web test`
  */
 
 import { describe, expect, test } from "bun:test";

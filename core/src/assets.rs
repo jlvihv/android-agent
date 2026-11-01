@@ -72,7 +72,7 @@ pub async fn serve(uri: Uri) -> Response {
             .into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            "web/dist 是空的 —— 先跑 `just web-build`",
+            "web/dist 是空的 —— 先跑 `just web build`",
         )
             .into_response(),
     }

@@ -1,7 +1,7 @@
 //! 桌面开发用二进制。
 //!
 //! ```sh
-//! just web-build   # 先构建前端（rust-embed 在编译期嵌入）
+//! just web build   # 先构建前端（debug 从磁盘读，release 才嵌进 .so）
 //! just dev         # cargo run --bin agent-dev
 //! ```
 //!

@@ -1,7 +1,7 @@
 /**
  * `session.ts` 的测试：这几条规则的不变式（以前只靠手测 —— 连着栽了两次）。
  *
- *     bun test            # 或者 `just web-test`
+ *     bun test            # 或者 `just web test`
  */
 
 import { describe, expect, test } from "bun:test";

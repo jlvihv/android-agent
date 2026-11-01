@@ -5,9 +5,7 @@
 
 set shell := ["bash", "-uc"]
 
-# 没有这行的话，带 `*ARGS` 的 recipe 里 `"$@"` 是空的 —— just 默认只做
-# `{{...}}` 插值，不把参数传给 shell 的位置参数。踩过一次：`just phone --json "…"`
-# 静默地什么都没发出去（agentctl 收到空参数 → 进交互模式 → stdin 是管道 → 直接退出）。
+# 没有这行，带 `*ARGS` 的 recipe 里 `"$@"` 是空的（踩过：`just phone --json "…"` 静默什么都没发）。
 set positional-arguments
 
 core  := "core"
@@ -30,13 +28,8 @@ sdk_home := env_var_or_default("ANDROID_HOME", `for d in "$HOME/Android/Sdk" "$H
 export ANDROID_HOME := sdk_home
 ndk_home := env_var_or_default("AGENT_NDK_HOME", `ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/*/ "$HOME"/Android/Sdk/ndk/*/ "$HOME"/Library/Android/sdk/ndk/*/ 2>/dev/null | sort -V | tail -1`)
 export ANDROID_NDK_HOME := ndk_home
-# `NDK_HOME` 也指到同一个地方。
-#
-# 为什么要多这一行：cargo-ndk 会**比对这两个变量**，不一致就骂一句
-# （`Environment variable ANDROID_NDK_HOME = … doesn't match NDK_HOME = …`）。
-# 而 Arch 的 android-ndk 包会把 `/opt/android-ndk` 写进 NDK_HOME，我们只认 SDK
-# 里那个（上面那行就是「不依赖环境变量」的意思）—— 于是每台装过包的机器都吃这条警告。
-# 只影响 recipe 自己的环境，不动用户的 shell。
+# cargo-ndk 会比对 NDK_HOME 和 ANDROID_NDK_HOME，不一致就骂（Arch 的 android-ndk
+# 包会把 /opt/android-ndk 写进前者）。指到同一个地方，只影响 recipe 自己的环境。
 export NDK_HOME := ndk_home
 
 # JAVA_HOME 不在这里设。
@@ -50,48 +43,23 @@ export NDK_HOME := ndk_home
 check:
     cargo clippy --manifest-path {{core}}/Cargo.toml --all-targets -- -D warnings
 
-# 清掉 7 天没用过的编译产物。
-#
-# 为什么需要：宿主 dev / bindgen / NDK 交叉各一份 target，实测 target/ 已经 55GB
-# （其中 debug/incremental 14GB）。攒满之后 APFS 自己的压力也会拖慢编译。
+# 清掉 7 天没用过的产物（dev / bindgen / NDK 各一份 target，实测 55GB）。
 # 需要一次 `cargo install cargo-sweep`。
 sweep:
     cargo sweep --time 7 --manifest-path {{core}}/Cargo.toml
 
-# 后端 + 前端（`web/tests/` 那几个纯函数）。
-#
-# 为什么前端也得跑：窗口 / 下标对齐这种不变式（注意：下标是**完整视图**的，而客户端
-# 手上只有一窗）手测抓不住 —— 连续两个 bug 都出在这里。那边只跑纯逻辑，不上 DOM，
-# 毫秒级。
+# 后端 + 前端。前端那几个纯函数测的是窗口 / 下标对齐（连续两个 bug 都出在这），毫秒级。
 test:
     cargo test --manifest-path {{core}}/Cargo.toml
     cd {{web}} && bun test
 
-# 只跑前端那几个（改 `lib/session.ts` 时快）
-web-test:
-    cd {{web}} && bun test
-
-# 起核心：**桌面 = 这台电脑本身**
+# 起核心：**桌面 = 这台电脑本身**（设备、bash、read/edit 都作用在本机；沙箱只属于
+# Android，见 docs/02）。cwd 就是仓库根，模型的改动是**真的**，没有回收站。
 #
-# 设备、`bash`、`read` / `edit` 都直接作用在这台机器上：**没有沙箱，也没有「模式」
-# 可切**。沙箱只存在于 Android（proot + Alpine，Kotlin 那边注入，见 docs/02）。
-#
-# 需要先 `just web-build`（debug 从磁盘读 web/dist，见 core/src/assets.rs）。
-#
-# cwd（＝ /workspace 的落点）就是仓库根（just 会把 cwd 设到这里）。要换目录：
-# 直接 cd 过去再跑。
-#
-# **默认对局域网开放**：同一个 Wi-Fi 里的手机 App（设置 → 连接电脑）能自动找到
-# 这台，第一次连输终端里打出来的配对码；手机浏览器也能开打出来的那个地址。
-# 局域网来的都要凭据，这台电脑自己（127.0.0.1）照旧免登录。只想自己用：
-#
+# 默认对局域网开放（手机 App 能发现这台、输一次配对码就能用）；只想自己用：
 #   AGENT_BIND=127.0.0.1 just dev
-#
-# 日常用 dev-fast：opt-level 1、不 LTO，改一行仍是秒级增量（release 是分钟级）。
-# 要真性能（验 release 行为）：`AGENT_PROFILE=release-thin just dev`
-#
-# 模型的改动是**真的**，没有回收站。
-dev: web-build
+# 要验 release 行为：`AGENT_PROFILE=release-thin just dev`（默认 dev-fast）。
+dev: (web "build")
     #!/usr/bin/env bash
     set -eu
     # 模型配置**不在这里给**：核心只认库（设置页 / `POST /api/llm`）。
@@ -122,44 +90,23 @@ relay-deploy target=relay_host: relay-build
     scripts/deploy-relay.sh {{target}}
 
 # 在本机跑一个中继（试用 / 调试）
-relay-local:
-    cd relay && cargo run --release
-
 # --- Web -------------------------------------------------------------------
 
+# `just web build` / `dev` / `check` / `test` —— 都是 package.json 里的脚本。
+web *ARGS:
+    cd {{web}} && bun run {{ARGS}}
+
+# 装依赖（`bun install` 不是 package.json 脚本，单独一个）。
 web-install:
     cd {{web}} && bun install
 
-web-dev:
-    cd {{web}} && bun run dev
-
-web-build:
-    cd {{web}} && bun run build
-
-web-check:
-    cd {{web}} && bun run check
-
 # --- 前端 DOM 审计 --------------------------------------------------------
 #
-# 用**真实渲染树**找「多余的 HTML 层级」。全本地：假 LLM（受控内容）+ 一个独立的核心
-# 实例 + vite + headless Chrome —— 不碰手机、不碰 adb、不花 token。
-#
-# 判据两道：静态筛候选（只有一个子元素、无自有文字、盒子与子元素完全重合、无视觉副作用），
-# 再对每个做**拔掉测试**（改成 display:contents 后比对整页每个元素的盒子）。
-#
-# 为什么不能只读源码：静态看着「盒子完全重合」的层，可能是父级 flex 的 item（被拉伸）、
-# 或者子元素靠它的 flex-1 撑宽 —— 删了就变（实测 359 → 335.5px）。
-#
-#   just dom-audit                  # 全量（会话区 + 各个面板）
-#   just dom-audit --no-panels      # 只看会话区
-#   just dom-audit --snapshot /tmp/a.json   # 导几何快照
-#   just dom-audit --diff /tmp/a.json       # 改完前端验证「布局一个像素都没动」
-#
+# 用**真实渲染树**找「多余的 HTML 层级」：假 LLM + 独立核心 + vite + headless Chrome，
+# 全本地、不碰手机不花 token。判据是「拔掉这一层，整页每个元素的盒子都没动」。
 # 细节见 docs/07-debugging.md。
 dom-audit *ARGS:
-    #!/usr/bin/env bash
-    set -eu
-    scripts/dom-audit.sh "$@"
+    scripts/dom-audit.sh {{ARGS}}
 
 # --- 对着真机调试 ----------------------------------------------------------
 #
@@ -203,18 +150,9 @@ restart:
 forward:
     scripts/phone-forward.sh
 
-# 手机那头会不会被系统冻住 —— 远程回合挂死十有八九是它（不是 WebView）。
-#
-# App 一旦失去焦点，Android 的 cached app freezer 会在 60~75 秒后把它的**整个
-# 进程**冻住：Rust 核心收不到请求、沙箱跑不了、WebView 也不动，而症状是
-# 「不报错、不超时，就是挂住」，一碰手机瞬间全通。
-#
-#   just wake          # 看现在什么情况（焦点 / doze 白名单 / 冻没冻）
-#   just wake on       # doze 白名单 + 叫到前台（开工前跑一次）
-#   just wake off      # 摘掉 doze 白名单
-#
-# `just phone` / `just doctor` 走 phone-forward.sh，会自己跑 `wake auto`
-# （已经在前台就什么都不做）。实测与两个机制的细节见 scripts/phone-wake.sh。
+# 手机那头会不会被系统冻住 —— 远程回合挂死十有八九是它：失去焦点 60~75 秒后
+# 整个进程被冻住，症状是「不报错不超时，就是挂住」，一碰手机全通。
+#   just wake / just wake on / just wake off。细节见 scripts/phone-wake.sh。
 wake *ARGS:
     scripts/phone-wake.sh {{ARGS}}
 
@@ -255,9 +193,7 @@ open:
 
 # --- Android ---------------------------------------------------------------
 
-# 1) 生成 Kotlin 绑定（uniffi，proc-macro + library 模式，不需要 .udl）
-#
-#    先编一个**宿主**版本的 cdylib —— bindgen 要 dlopen 它读元数据。
+# 1) 生成 Kotlin 绑定（uniffi library 模式，不需要 .udl）：先编一个宿主版 cdylib 给它 dlopen。
 android-bindings:
     #!/usr/bin/env bash
     set -eu
@@ -269,22 +205,14 @@ android-bindings:
     cargo build --lib
     # 宿主动态库的扩展名：Linux .so / macOS .dylib
     ext=so; [ "$(uname)" = Darwin ] && ext=dylib
-    # bindgen 生成完会用 ktlint 排一下版；没装 ktlint 时它会打一条
-    # 「Unable to auto-format … No such file or directory」的警告 —— 看着像出错了，
-    # 其实只是它试了一下没找到工具。没装就告诉它别试（生成物在 .gitignore 里，
-    # 排版无关紧要），装了的话照旧让它排。
+    # 没装 ktlint 时它会打一条「Unable to auto-format」的警告（不是错误），直接让它别试。
     fmt=(); command -v ktlint >/dev/null || fmt=(--no-format)
     cargo run --features uniffi-bindgen --bin uniffi-bindgen -- \
       generate --library "target/bindgen/debug/libagent_core.$ext" \
       --language kotlin --out-dir ../{{mod}}/src/main/java "${fmt[@]}"
 
-# 2) 交叉编译 Rust 核心 → jniLibs
-#
-#    只出 arm64-v8a（真机）。要跑模拟器就把 -t x86_64 加回来。
-#
-#    编完务必验 16KB 对齐（R1）—— Play 对 targetSdk 35+ 有要求。
-#    实测 cargo-ndk 4.x + NDK r27 已经默认对齐到 0x4000，但这个检查
-#    很便宜，别省：
+# 2) 交叉编译 Rust 核心 → jniLibs。只出 arm64-v8a（模拟器要 x86_64：`just emu-install`）。
+#    编完验 16KB 对齐（Play 对 targetSdk 35+ 有要求，R1）—— 这个检查很便宜，别省：
 #      llvm-readelf -l {{jni}}/arm64-v8a/libagent_core.so | awk '/LOAD/{print $NF}'
 android-libs:
     #!/usr/bin/env bash
@@ -293,15 +221,8 @@ android-libs:
     cd {{core}}
     ts=(); IFS=',' read -ra arr <<< "{{abis}}"; for a in "${arr[@]}"; do ts+=(-t "$a"); done
 
-    # 先清掉不在本次 ABI 清单里的目录。
-    #
-    # 为什么必须清：`abiFilters` 只在**打包那一步**过滤，
-    # `mergeDebugNativeLibs` 照样把 jniLibs/ 里别的 ABI 合进来。
-    # jniLibs/ 是生成物，`git status` 看不出来，`packaging.jniLibs.excludes`
-    # 也排不掉（试过）。这里是唯一的源头。
-    #
-    # 注：这只能防「多带了一个 ABI」。APK 里那块 ~3.5MB 全零空洞还有第二个
-    # 成因（增量打包），见 `android-debug` / `android-release` 里的 `rm -rf`。
+    # 清掉不在本次 ABI 清单里的目录：`abiFilters` 只在打包那一步过滤，
+    # `mergeDebugNativeLibs` 照样把别的 ABI 合进来（jniLibs 是生成物，git 看不出来）。
     for d in ../{{jni}}/*/; do
       [ -d "$d" ] || continue
       a=$(basename "$d"); keep=0
@@ -321,23 +242,16 @@ android-libs:
       -l "../{{jni}}/arm64-v8a/libagent_core.so" \
       | awk '/LOAD/{print "  align: " $NF}' | sort -u
 
-# 3) 取 proot 二进制 + Alpine rootfs
-#
-#    ⚠️ proot 目前是**从本地 OpenMinis checkout 复制的**（NDK r27 编的，
-#       和本机一致）。正式发布前必须自己编 —— 见 docs/02-linux-sandbox.md：
-#       上游 proot 没有 Android 必需的 loader 处理，要用
-#       OpenMinis/proot 或 termux/proot 的 fork。
+# 3) 取 proot 二进制 + Alpine rootfs。
+#    ⚠️ proot 是从本地 OpenMinis checkout 复制的，发布前必须自己编（见 docs/02）。
 android-assets:
     #!/usr/bin/env bash
     set -eu
     OM="${OPENMINIS_DIR:-$HOME/Code/lib/OpenMinis}/src/android/app/src/main"
     mkdir -p "{{assets}}" "{{jni}}/arm64-v8a"
 
-    # Alpine rootfs：从官方源下载（aarch64）。
-    #
-    # 版本戳放在 assets/ **外面**（assets/ 里的东西都会被打进 APK）：只判文件
-    # 在不在的话，改了上面的 `alpine` 也永远是旧包。顺手清掉别的名字的旧包
-    # （AAPT 解过一层的 `.tar`）—— 两份都在的话 APK 里就带了两个 rootfs。
+    # Alpine rootfs 从官方源下载。版本戳放在 assets/ **外面**（里面的都会被打进 APK），
+    # 否则改了上面的 `alpine` 也永远是旧包；顺手清掉别的名字的旧包（否则 APK 里两份）。
     stamp=.dev/alpine-asset-version
     if [ ! -f "{{assets}}/alpine-minirootfs.tar.gz" ] || [ "$(cat "$stamp" 2>/dev/null)" != "{{alpine}}" ]; then
       rm -f "{{assets}}"/alpine-minirootfs.tar*
@@ -347,8 +261,7 @@ android-assets:
       echo "Alpine minirootfs {{alpine}} 已下载"
     fi
 
-    # proot + ELF loader：必须住在 nativeLibraryDir（Android 10+ 的 W^X
-    # 只允许那里可执行）。伪装成 lib*.so 才能被 APK 安装器解压出来。
+    # proot + ELF loader 必须住在 nativeLibraryDir（Android 10+ 的 W^X），伪装成 lib*.so。
     if [ ! -f "{{jni}}/arm64-v8a/libproot.so" ]; then
       [ -d "$OM" ] || { echo "找不到 OpenMinis checkout（设 OPENMINIS_DIR）"; exit 1; }
       cp "$OM/jniLibs/arm64-v8a/libproot.so" \
@@ -357,16 +270,11 @@ android-assets:
       echo "⚠️  proot 是从 $OM 复制的 —— 发布前需自建"
     fi
 
-# 顺序不能反：`android-libs` 会把 `web/dist` **在编译期嵌进 .so**
-# （rust-embed，见 core/src/assets.rs），所以必须先跑 web-build ——
-# 反过来写的话每次装上去的都是**上一次**的前端（踩过：Kotlin 改动生效了，
-# 但页面里 `window.__predictiveBack` 还是 undefined）。
-#
-# 下面是 assemble 前先删掉上一版的 APK / 打包中间产物 —— **不是**多此一举：
-# AGP 的**增量打包**在原生 .so 变动时会留一块全零空洞。实测连着构建两次，
-# debug 包从 9.0MB 涨到 12.6MB，多出来的 ~3.5MB 全是 0（入口在 `git status`
-# 里完全看不出来）。每次从零打一遍的代价不到 1 秒。
-android-debug: android-bindings web-build android-libs
+# 顺序不能反：`android-libs` 在编译期把 `web/dist` 嵌进 .so（rust-embed），
+# 反过来装上去的永远是上一次的前端。
+# assemble 前删掉上一版 APK / 中间产物：AGP 增量打包在 .so 变动时会留一块全零
+# 空洞（实测 9.0MB → 12.6MB），从零打一遍不到 1 秒。
+android-debug: android-bindings (web "build") android-libs
     #!/usr/bin/env bash
     set -eu
     . scripts/jdk.sh
@@ -385,7 +293,7 @@ android-install: android-debug
 # Kotlin/dex 那层和签名。
 #
 # assemble 前同样删一遍（理由见 android-debug 上面那段）。
-android-release: android-bindings web-build android-libs
+android-release: android-bindings (web "build") android-libs
     #!/usr/bin/env bash
     set -eu
     . scripts/jdk.sh
@@ -404,18 +312,12 @@ android-log:
 
 # --- 模拟器（x86_64）------------------------------------------------------
 #
-# 真机是无线调试：手机一睡、用户一用、VPN 一抖，链路就掉，而且**不能在用户
-# 正用手机时拿 input tap 去戳界面**。所以"改完就看"的 UI 验收放模拟器上。
-#
-# 限制：**沙箱跑不了**（proot + rootfs 都是 aarch64）。能验 UI / 浏览器 /
-# 搜索 / LLM，不能验 bash / edit / read。见 scripts/emu.sh 顶部。
+# 「改完就看」的 UI 验收放模拟器（真机是无线调试，会掉线，也不能在用户用手机时去戳）。
+# 限制：**沙箱跑不了**（proot/rootfs 都是 aarch64），验不了 bash / edit / read。
 emu *ARGS:
     scripts/emu.sh {{ARGS}}
 
-# 模拟器上装 **debug** 包，不是 release：
-#   - WebView DevTools 开着（debug 才开）→ 可以用 CDP 精确驱动页面，
-#     不用拿 `input tap` 盲戳坐标
-#   - debug 可以用 `run-as` 读 App 私有文件（token / 会话库 / 截图）
+# 装 debug 包：WebView DevTools 开着（能用 CDP 精确驱动），`run-as` 也能读私有文件。
 emu-install:
     #!/usr/bin/env bash
     set -eu
@@ -433,6 +335,3 @@ emu-install:
 
 smoke:
     python3 -u scripts/smoke.py
-
-all: test web-check web-build check android-debug
-    @echo "✅ 全部通过"
