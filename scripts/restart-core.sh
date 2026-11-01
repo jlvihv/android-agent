@@ -205,7 +205,29 @@ if systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null &&
     SYSTEMD_MANAGED=1
 fi
 
-if [ "$SYSTEMD_MANAGED" = 1 ]; then
+# macOS 那边同理：归 launchd（`scripts/service.sh install` 装的）管就只 kickstart。
+# 它有 KeepAlive，手动 kill 之后会先把旧的核心拉回来，我们手动起的那个死在单实例锁上。
+LAUNCHD_LABEL=dev.vihv.android-agent
+LAUNCHD_MANAGED=0
+if [ "$(uname)" = Darwin ] && command -v launchctl >/dev/null 2>&1; then
+    ld_pid="$(launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null |
+        awk '/^[[:space:]]*pid = /{print $3; exit}' || true)"
+    if [ -n "${ld_pid:-}" ] && [ "$ld_pid" = "$PID" ]; then
+        LAUNCHD_MANAGED=1
+    fi
+fi
+
+if [ "$LAUNCHD_MANAGED" = 1 ]; then
+    # --- 3/4. 重启：交给 launchd（环境在 plist 里，不抄 /proc） --------------
+    log "核心归 launchd（$LAUNCHD_LABEL）管 —— launchctl kickstart -k（不手动 kill / 起）"
+    launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL"
+    if healthy; then
+        log "✅ 新核心起来了（launchctl kickstart，$BASE）"
+    else
+        log "❌ kickstart 之后健康检查一直不过 —— scripts/service.sh logs"
+        exit 1
+    fi
+elif [ "$SYSTEMD_MANAGED" = 1 ]; then
     # --- 3/4. 重启：交给 systemd（环境在 unit 里，不抄 /proc） ---------------
     log "核心归 $SYSTEMD_UNIT 管 —— systemctl --user restart（不手动 kill / 起）"
     systemctl --user restart "$SYSTEMD_UNIT"

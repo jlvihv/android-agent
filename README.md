@@ -52,15 +52,24 @@ python3 scripts/agentctl.py "建一个 FizzBuzz 脚本，跑一下"
 pid（同时跑两个会静默地互相干扰），要两个就 `AGENT_MULTI=1`。
 差别、代价和实现见 [docs/11-host-mode.md](docs/11-host-mode.md)。
 
-**让核心常驻**（开机就在，不用手动开终端）：它是普通的 HTTP 服务，扔给 systemd
-用户服务最省事 ——
+**让核心常驻**（开机就在，不用手动开终端）：
+
+```sh
+just service install     # macOS: launchd 用户代理 / Linux: systemd 用户服务
+just service status      # 在跑吗、端口、健康
+just service logs        # 跟日志（macOS 是 ~/Library/Logs/android-agent.log）
+just service uninstall   # 停掉并取消自启（二进制和会话库都不动）
+```
+
+跑的是 `core/target/release/agent-dev`（先编一次：`cargo build --release --bin agent-dev`）。
+装好之后 `scripts/restart-core.sh` **只**走系统那套重启（`launchctl kickstart` /
+`systemctl --user restart`）—— 手动 kill + 手动起会和它抢端口、抢单实例锁。
+
+Linux 的 unit 不在仓库里（放在 `~/Code/project/config/systemd/user/`），大致是：
 
 ```ini
-# ~/.config/systemd/user/android-agent.service
 [Service]
 WorkingDirectory=%h/Code/project/android-agent
-EnvironmentFile=-%h/Code/project/android-agent/.env.local   # 中继密钥这类（模型在库里）
-Environment=AGENT_PORT=8787
 ExecStart=%h/Code/project/android-agent/core/target/release/agent-dev
 Restart=always
 
@@ -68,13 +77,9 @@ Restart=always
 WantedBy=default.target
 ```
 
-```sh
-systemctl --user enable --now android-agent     # 开机自启（配上 loginctl enable-linger）
-```
-
-unit 里**不写模型配置**：模型在库里（设置页写进去的，`llm` + `providers` 表），核心不读
-任何 `AGENT_LLM_*` 环境变量。unit 只管进程和环境（`AGENT_PORT` / 中继密钥）。要跑的是 release 二进制，所以改完代码先 `scripts/restart-core.sh`（它发现核心
-归 systemd 管时会用 `systemctl --user restart`）。
+unit / plist 里**不写模型配置**：模型在库里（设置页写进去的，`llm` + `providers` 表），
+核心不读任何 `AGENT_LLM_*` 环境变量。macOS 那边 plist 里只多给一个 `PATH`
+（launchd 不继承 shell 环境，不给的话核心里的 bash 会落到 `/bin/bash` 3.2）。
 
 对**手机上**跑着的那个（不用重装 APK、也不用手点手机屏幕）：
 

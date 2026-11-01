@@ -65,13 +65,15 @@ async fn run() -> anyhow::Result<()> {
     // 电脑上跑命令（桌面下就是你的真机器）。没给的话用库里那把（桌面
     // 有库，重启不变，手机上收藏的地址一直能用），没库就现编一把。
     let env_token = std::env::var("AGENT_TOKEN").ok().filter(|t| !t.is_empty());
-    // 凭据是给局域网的；电脑自己（loopback）照旧免登录。自己给了 AGENT_TOKEN 的
-    // 意思是「本机也要」，那就不放行
-    if lan && env_token.is_none() {
-        core.state
-            .trust_loopback
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
+    // 凭据是给局域网的；电脑自己（loopback）照旧免登录 —— 自己给了 AGENT_TOKEN
+    // 的意思是「本机也要」，那就不放行。
+    //
+    // 只听本机（`AGENT_BIND=127.0.0.1`）时更是必须放行：那时**谁都进不来**，
+    // 又不会有 token（下面 `(None, false)` 那条），不放行的话这个核心自己就把
+    // 自己锁在外面了 —— 所有请求 401，连 `/api/health` 都过不去（实测踩到）。
+    core.state
+        .trust_loopback
+        .store(env_token.is_none(), std::sync::atomic::Ordering::Relaxed);
     let token = match (env_token, lan) {
         (Some(t), _) => Some(t),
         (None, true) => Some(

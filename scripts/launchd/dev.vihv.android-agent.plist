@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS 的「开机就在」：launchd 用户代理（LaunchAgent）。
+
+  `scripts/service.sh install` 把 __ROOT__ / __HOME__ 换成真实路径，写进
+  ~/Library/LaunchAgents/，再 launchctl bootstrap 加载。
+
+  PATH 必须显式给：launchd **不继承你 shell 的环境**。不给的话核心里的 bash 工具
+  会落到 /bin/bash（macOS 那个 2007 年的 3.2，没有 mapfile / ${x,,}），homebrew 装的
+  node / rg / ffmpeg 在模型那儿也全都「找不到」。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.vihv.android-agent</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ROOT__/core/target/release/agent-dev</string>
+  </array>
+
+  <!-- 核心的 cwd 就是模型的 /workspace（`read` / `edit` / `bash` 的相对路径基准） -->
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- 崩了（panic = "abort"）就拉回来；自己退干净（exit 0）就别再起 -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/android-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/android-agent.log</string>
+</dict>
+</plist>

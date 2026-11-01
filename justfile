@@ -143,6 +143,14 @@ restart:
     . scripts/dev.sh
     dev_restart && dev_a11y_on
 
+# 常驻服务（开机就在）：install / uninstall / status / restart / logs
+#
+# macOS 走 launchd（~/Library/LaunchAgents/dev.vihv.android-agent.plist，日志在
+# ~/Library/Logs/android-agent.log）；Linux 走 systemd 用户服务（android-agent.service）。
+# 装成服务之后 `scripts/restart-core.sh` 只走系统那套重启，别手动 kill。
+service *ARGS:
+    scripts/service.sh {{ARGS}}
+
 # 把手机上核心的端口转发到本机（固定 18787；设备侧端口每次都变）
 #
 # 顺手做一件事：App 不在前台就把它叫到前台（**这是防冻的唯一办法**，见下）。
