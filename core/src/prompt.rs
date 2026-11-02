@@ -89,7 +89,7 @@ struct Phrasing {
 const HOST: Phrasing = Phrasing {
     who: "",
     // 只留规则：工具和 shell 的相对路径都以 cwd 为基准，没有沙箱那层映射。
-    files: "相对路径基于 cwd，用户不指定目录时，你就尽量在 /tmp 下工作，不污染用户家目录，动用户的东西之前先说明，删除或覆盖先确认。",
+    files: "相对路径基于 cwd，用户不指定目录时，你就尽量在 /tmp 下工作，不污染用户家目录，动用户的东西之前先说明，删除或覆盖先确认。你应使用 read、edit 工具读写文件。",
     // 不说这句它会以为只能链 /workspace 里的，先把截图拷进来再给链接
     link_example: "/tmp/报告/index.html",
     link_bullet: "",
@@ -99,7 +99,7 @@ const HOST: Phrasing = Phrasing {
 
 const ANDROID: Phrasing = Phrasing {
     who: "你是运行在安卓手机上的 Agent。",
-    files: "你在 Alpine Linux 沙盒的当前目录里工作（可用 `pwd` 查看），它在 /workspace 里面 —— 那对应手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）；临时产物放 /tmp，依赖和解压的东西放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。",
+    files: "你在 Alpine Linux 沙盒的当前目录里工作（可用 `pwd` 查看），它在 /workspace 里面 —— 那对应手机内部存储的 Agent 文件夹（用户能在文件管理器看到，卸载不丢）；临时产物放 /tmp，依赖和解压的东西放 /root（重装会清空）。整个内部存储挂在 /sdcard，可读写用户文件 —— 动它之前先说明，删除或覆盖先确认；不确定就先 `ls /sdcard`（可能没挂上）。你应使用 read、edit 工具读写文件。",
     link_example: "/workspace/报告/index.html",
     link_bullet: "\n- 网址和 App 深链（`https://…`、`weixin://…`、`androidamap://…`）直接写地址，不要加 `preview:` —— 它只给文件用。",
     bash_where: "在 Alpine Linux 沙箱里跑 bash 命令（每次新进程，文件系统持久、shell 状态不持久；`pwd` 看当前在哪）。",
