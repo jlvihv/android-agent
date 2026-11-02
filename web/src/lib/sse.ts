@@ -341,10 +341,6 @@ export type Message = {
   done: boolean;
 };
 
-export function newAssistantMessage(id: string): Message {
-  return { id, role: "assistant", parts: [], steps: 0, done: false };
-}
-
 /**
  * 把一个 chunk 应用到消息上（原地修改）。
  *

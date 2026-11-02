@@ -26,7 +26,7 @@ use rusqlite::{params, Connection};
 
 use crate::agent::{ChatMessage, ChatSession, SessionStore, Stub};
 
-const SCHEMA: &str = r#"
+const SCHEMA: &str = r"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 -- checkpoint 之后把 WAL 截回 1MB：默认不截，文件一直停在历史最高点（一次大写入之后
@@ -164,7 +164,7 @@ CREATE TABLE IF NOT EXISTS http_cache (
   body       TEXT NOT NULL,
   fetched_at INTEGER NOT NULL
 );
-"#;
+";
 
 /// 当前在用的 LLM（`llm` 表那一行）。
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -471,8 +471,7 @@ impl Db {
     pub fn is_synced(&self, s: &ChatSession) -> bool {
         self.inner
             .lock()
-            .map(|g| g.saved.get(&s.id) == Some(&Saved::of(s)))
-            .unwrap_or(false)
+            .is_ok_and(|g| g.saved.get(&s.id) == Some(&Saved::of(s)))
     }
 
     /// 增量落盘。每 2 秒被定时器调一次（有改动时）。
@@ -525,7 +524,7 @@ impl Db {
             // 消息不在内存里的会话只可能改了会话头（改名、换 provider session），
             // 消息一条都不能动 —— 空的 `messages` 在这里会被当成「清空过」。
             let messages = if s.resident() {
-                let mut from = prev.map(|x| x.len).unwrap_or(0);
+                let mut from = prev.map_or(0, |x| x.len);
                 let rewrite = s.messages.len() < from || prev.is_some_and(|x| x.epoch != s.epoch);
                 if rewrite {
                     from = 0;

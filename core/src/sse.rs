@@ -14,7 +14,6 @@
 //!
 //! 这里只产出 **chunk 本身**（`serde_json::Value`），不负责传输格式：
 //! - HTTP 走 `axum::response::sse`，用 `SseEvent::default().data(v.to_string())`
-//! - 需要裸 SSE 文本时用 `frame()`
 
 use serde_json::{json, Value};
 
@@ -23,16 +22,6 @@ pub const STREAM_HEADER_VALUE: &str = "v1";
 
 /// 流终止标记
 pub const DONE: &str = "[DONE]";
-
-/// 把 chunk 包成一帧裸 SSE 文本（调试 / 测试 / 非 axum 传输用）
-pub fn frame(v: &Value) -> String {
-    format!("data: {v}\n\n")
-}
-
-/// 终止帧
-pub fn done_frame() -> &'static str {
-    "data: [DONE]\n\n"
-}
 
 // --- 消息 / 步骤生命周期 ---------------------------------------------------
 

@@ -1,7 +1,7 @@
 //! 全局状态与边界数据模型。
 //!
 //! 设计铁律（见 docs/01-tech-selection.md §4）：
-//! native 侧不反调 Java。Kotlin 把 UI 树拍平成扁平 JSON 送进来，
+//! native 侧不反调 Java。Kotlin 把设备指令的结果按 JSON 送进来，
 //! Rust 只回传指令。所以这里所有跨边界类型都是 JSON 可序列化的。
 
 use std::borrow::Cow;
@@ -139,13 +139,11 @@ pub enum Event {
         port: u16,
         version: String,
         platform: String,
-        mock: bool,
     },
     /// 设备连接状态变化
     Device {
         connected: bool,
         name: String,
-        mock: bool,
     },
     Log {
         level: String,
@@ -238,7 +236,6 @@ pub struct AppState {
     /// 完事的回合当成新消息重放一遍，壳就再发一次「已完成」通知。
     pub turn_status: Mutex<HashMap<String, crate::status::Snapshot>>,
     pub port: AtomicU16,
-    pub mock: AtomicBool,
     /// 会话历史。用 tokio 的 RwLock，因为 agent loop 会跨 await 持有。
     /// 多会话。侧边栏的「最近对话」就是它。
     ///
@@ -373,7 +370,6 @@ impl AppState {
             shizuku: RwLock::new(None),
             turn_status: Mutex::new(HashMap::new()),
             port: AtomicU16::new(0),
-            mock: AtomicBool::new(false),
             chat: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
             linux: RwLock::new(None),
             llm: RwLock::new(None),
@@ -439,7 +435,6 @@ impl AppState {
         self.emit(Event::Device {
             connected: false,
             name: String::new(),
-            mock: false,
         });
     }
 
@@ -475,14 +470,12 @@ impl AppState {
 
     pub fn set_device(&self, dev: Arc<dyn DeviceApi>) {
         let name = dev.name();
-        let mock = self.mock.load(std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut g) = self.device.write() {
             *g = Some(dev);
         }
         self.emit(Event::Device {
             connected: true,
             name,
-            mock,
         });
     }
 
@@ -799,7 +792,7 @@ impl AppState {
         if let Ok(mut g) = self.providers.write() {
             *g = store;
         }
-        if self.providers.read().map(|g| g.is_empty()).unwrap_or(false) {
+        if self.providers.read().is_ok_and(|g| g.is_empty()) {
             if let Some(p) = self.llm() {
                 self.adopt_provider(&p);
             }
@@ -929,13 +922,13 @@ impl AppState {
     }
 
     pub fn auth(&self) -> Auth {
-        self.auth
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| Auth {
+        self.auth.read().map_or_else(
+            |_| Auth {
                 token: Some(random_secret()),
                 sandbox_key: random_secret(),
-            })
+            },
+            |g| g.clone(),
+        )
     }
 
     /// 桌面开发用：`AGENT_TOKEN` 设了就要求凭据，没设就不设防。
@@ -1006,10 +999,7 @@ impl AppState {
     }
 
     pub fn is_busy(&self, sid: &str) -> bool {
-        self.turns
-            .lock()
-            .map(|g| g.contains_key(sid))
-            .unwrap_or(false)
+        self.turns.lock().is_ok_and(|g| g.contains_key(sid))
     }
 
     // ---- 排队等着交给模型的用户消息（见 `queued` 字段） --------------------
@@ -1047,8 +1037,7 @@ impl AppState {
     pub fn has_queued(&self, sid: &str) -> bool {
         self.queued
             .lock()
-            .map(|g| g.get(sid).is_some_and(|q| !q.is_empty()))
-            .unwrap_or(false)
+            .is_ok_and(|g| g.get(sid).is_some_and(|q| !q.is_empty()))
     }
 
     /// 撤掉一条**还在排队**的（界面上面那个 ×）。已经交给模型的撤不掉 ——
@@ -1317,7 +1306,7 @@ impl AppState {
         style: Option<crate::llm::ApiStyle>,
     ) -> anyhow::Result<()> {
         if let Some(db) = self.db() {
-            db.set_api_style(id, style.map(|s| s.as_str()))?;
+            db.set_api_style(id, style.map(super::llm::ApiStyle::as_str))?;
         }
         if let Ok(mut g) = self.api_styles.write() {
             match style {
@@ -1411,10 +1400,7 @@ impl AppState {
     }
 
     pub fn system_prompt_overridden(&self) -> bool {
-        self.system_prompt
-            .read()
-            .map(|g| g.is_some())
-            .unwrap_or(false)
+        self.system_prompt.read().is_ok_and(|g| g.is_some())
     }
 
     /// `None` = 恢复成编译进去的那版。
@@ -1614,18 +1600,6 @@ impl AppState {
         provider.supports_files
     }
 
-    /// provider 的模型清单（带 vision 判定），给设置界面 / CLI 用。
-    pub async fn list_models(
-        &self,
-        refresh: bool,
-    ) -> anyhow::Result<Vec<crate::models::ModelInfo>> {
-        let provider = self
-            .llm()
-            .ok_or_else(|| anyhow::anyhow!("还没有配置 LLM"))?;
-        let db = self.db();
-        crate::models::list(&provider, refresh, db.as_deref()).await
-    }
-
     /// 启动时从库里恢复 provider。
     fn load_llm(&self, db: &Db) {
         match db.llm() {
@@ -1732,14 +1706,14 @@ impl UsageStats {
     fn add(&mut self, v: &crate::openai::UsageView) {
         self.last = Some(v.clone());
         if v.cache_hit_ratio.is_some() {
-            self.cache_reported_input += v.input as u64;
+            self.cache_reported_input += u64::from(v.input);
         }
-        self.input += v.input as u64;
-        self.uncached_input += v.uncached_input as u64;
-        self.cache_read += v.cache_read as u64;
-        self.cache_write += v.cache_write as u64;
-        self.output += v.output as u64;
-        self.reasoning += v.reasoning as u64;
+        self.input += u64::from(v.input);
+        self.uncached_input += u64::from(v.uncached_input);
+        self.cache_read += u64::from(v.cache_read);
+        self.cache_write += u64::from(v.cache_write);
+        self.output += u64::from(v.output);
+        self.reasoning += u64::from(v.reasoning);
         self.calls += 1;
         self.cache_hit_ratio =
             crate::openai::cache_hit_ratio(self.cache_read, self.cache_reported_input);

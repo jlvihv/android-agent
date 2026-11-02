@@ -174,10 +174,7 @@ impl Mcp {
     }
 
     pub fn is_enabled(&self, name: &str) -> bool {
-        self.disabled
-            .read()
-            .map(|g| !g.contains(name))
-            .unwrap_or(true)
+        self.disabled.read().map_or(true, |g| !g.contains(name))
     }
 
     pub fn set_enabled(&self, name: &str, enabled: bool) {
@@ -491,7 +488,7 @@ async fn call(
     );
     let result = mcp.call(&srv, tool, args).await?;
     let text = render_result(&result, out.as_ref());
-    if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+    if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
         anyhow::bail!("{name} {tool} 失败：{text}");
     }
     Ok(text)

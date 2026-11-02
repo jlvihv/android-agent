@@ -365,98 +365,134 @@ pub fn shq(s: &str) -> String {
 /// 返回 `Err` 表示**参数不对**（缺参数、给多了、不认识的子命令）。这类错误必须在
 /// 发出去之前拦住：静默拼出一条别的命令，模型会对着"成功"的输出继续往下错。
 pub fn plan(argv: &[String]) -> Result<Plan, String> {
-    let group = argv.first().map(|s| s.as_str()).unwrap_or("");
-    let rest: Vec<&str> = argv[1..].iter().map(|s| s.as_str()).collect();
+    let group = argv.first().map_or("", std::string::String::as_str);
+    let rest: Vec<&str> = argv[1..].iter().map(std::string::String::as_str).collect();
     // 第一项是子命令；不带子命令时用这一组的默认值（help 里写了"不带 = xxx"）
     let (sub, a) = split_sub(group, &rest);
 
-    match (group, sub) {
-        // ---- device ----
-        ("device", "info") => Ok(Plan::parsed(
+    // 每组一个函数：以前这些分支全挤在一个 match 里（357 行），改一个子命令要在
+    // 三十多屏里找自己那一段。
+    match group {
+        "device" => plan_device(group, sub, &a),
+        "package" => plan_package(group, sub, &a),
+        "settings" => plan_settings(group, sub, &a),
+        "activity" => plan_activity(group, sub, &a),
+        "input" => plan_input(group, sub, &a),
+        "display" => plan_display(group, sub, &a),
+        "user" => plan_user(group, sub, &a),
+        "notification" => plan_notification(group, sub, &a),
+        "file" => plan_file(group, sub, &a),
+        other => Err(format!(
+            "`agent shizuku {other}` 不认识（`agent shizuku help` 看全部）"
+        )),
+    }
+}
+
+/// `shizuku device …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_device(group: &str, sub: &str, _a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "info" => Ok(Plan::parsed(
             "getprop | grep -E '\\[ro\\.(product|build)\\.(model|brand|manufacturer|device)|\\[ro\\.build\\.version\\.(release|sdk)'",
             crate::shizuku_parse::parse_device_info,
         )),
-        ("device", "battery") => Ok(Plan::parsed("dumpsys battery", crate::shizuku_parse::parse_battery)),
-        ("device", "top") => Ok(Plan::parsed(
+        "battery" => Ok(Plan::parsed(
+            "dumpsys battery",
+            crate::shizuku_parse::parse_battery,
+        )),
+        "top" => Ok(Plan::parsed(
             "dumpsys activity activities",
             crate::shizuku_parse::parse_top_activity,
         )),
+        _ => Err(format!(
+            "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
+        )),
+    }
+}
 
-        // ---- package ----
-        ("package", "list") => {
+/// `shizuku package …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_package(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "list" => {
             let mut flag = "";
-            for x in &a {
+            for x in a {
                 flag = match *x {
-                    "--third-party" | "-3" => "-3",
-                    "--system" => "-s",
-                    "--disabled" => "-d",
-                    other => return Err(format!("`package list` 不认识「{other}」（只有 --third-party/-3/--system/--disabled）")),
-                };
+                "--third-party" | "-3" => "-3",
+                "--system" => "-s",
+                "--disabled" => "-d",
+                other => return Err(format!("`package list` 不认识「{other}」（只有 --third-party/-3/--system/--disabled）")),
+            };
             }
             Ok(Plan::parsed(
                 format!("pm list packages {flag}"),
                 crate::shizuku_parse::parse_packages,
             ))
         }
-        ("package", "info") => {
-            let pkg = need(&a, 0, "package info <包名>")?;
+        "info" => {
+            let pkg = need(a, 0, "package info <包名>")?;
             Ok(Plan::parsed(
                 format!("dumpsys package {}", shq(pkg)),
                 crate::shizuku_parse::parse_package_info,
             ))
         }
-        ("package", "permissions") => {
-            let pkg = need(&a, 0, "package permissions <包名>")?;
+        "permissions" => {
+            let pkg = need(a, 0, "package permissions <包名>")?;
             Ok(Plan::parsed(
                 format!("dumpsys package {}", shq(pkg)),
                 crate::shizuku_parse::parse_permissions,
             ))
         }
-        ("package", "path") => {
-            let pkg = need(&a, 0, "package path <包名>")?;
+        "path" => {
+            let pkg = need(a, 0, "package path <包名>")?;
             Ok(Plan::raw(format!("pm path {}", shq(pkg))))
         }
-        ("package", "install") => {
-            let apk = need(&a, 0, "package install <apk 路径> [-g]")?;
+        "install" => {
+            let apk = need(a, 0, "package install <apk 路径> [-g]")?;
             let g = if a.contains(&"-g") { "-g " } else { "" };
             Ok(Plan::done(
                 format!("pm install -r {g}{}", shq(apk)),
                 format!("已装 {apk}"),
             ))
         }
-        ("package", "uninstall") => {
-            let pkg = need(&a, 0, "package uninstall <包名> [-k]")?;
+        "uninstall" => {
+            let pkg = need(a, 0, "package uninstall <包名> [-k]")?;
             let k = if a.contains(&"-k") { "-k " } else { "" };
             Ok(Plan::done(
                 format!("pm uninstall {k}{}", shq(pkg)),
                 format!("已卸载 {pkg}"),
             ))
         }
-        ("package", "enable") => {
-            let pkg = need(&a, 0, "package enable <包名>")?;
+        "enable" => {
+            let pkg = need(a, 0, "package enable <包名>")?;
             Ok(Plan::done(
                 format!("pm enable {}", shq(pkg)),
                 format!("已启用 {pkg}"),
             ))
         }
-        ("package", "disable") => {
-            let pkg = need(&a, 0, "package disable <包名>")?;
+        "disable" => {
+            let pkg = need(a, 0, "package disable <包名>")?;
             Ok(Plan::done(
                 format!("pm disable-user --user 0 {}", shq(pkg)),
                 format!("已停用 {pkg}"),
             ))
         }
-        ("package", "clear") => {
-            let pkg = need(&a, 0, "package clear <包名>")?;
+        "clear" => {
+            let pkg = need(a, 0, "package clear <包名>")?;
             Ok(Plan::done(
                 format!("pm clear {}", shq(pkg)),
                 format!("已清空 {pkg} 的数据"),
             ))
         }
+        _ => Err(format!(
+            "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
+        )),
+    }
+}
 
-        // ---- settings ----
-        ("settings", "get") => {
-            let (ns, key) = need2(&a, "settings get <global|system|secure> <键>")?;
+/// `shizuku settings …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_settings(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "get" => {
+            let (ns, key) = need2(a, "settings get <global|system|secure> <键>")?;
             check_ns(ns)?;
             // 只回一行值：不带 key 前缀，免得模型得自己剥
             Ok(Plan::done(
@@ -464,24 +500,24 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 String::new(),
             ))
         }
-        ("settings", "set") => {
-            let (ns, key, val) = need3(&a, "settings set <命名空间> <键> <值>")?;
+        "set" => {
+            let (ns, key, val) = need3(a, "settings set <命名空间> <键> <值>")?;
             check_ns(ns)?;
             Ok(Plan::done(
                 format!("settings put {} {} {}", shq(ns), shq(key), shq(val)),
                 format!("已设 {ns}/{key} = {val}"),
             ))
         }
-        ("settings", "delete") => {
-            let (ns, key) = need2(&a, "settings delete <命名空间> <键>")?;
+        "delete" => {
+            let (ns, key) = need2(a, "settings delete <命名空间> <键>")?;
             check_ns(ns)?;
             Ok(Plan::done(
                 format!("settings delete {} {}", shq(ns), shq(key)),
                 format!("已删 {ns}/{key}"),
             ))
         }
-        ("settings", "list") => {
-            let ns = need(&a, 0, "settings list <命名空间> [--filter 词]")?;
+        "list" => {
+            let ns = need(a, 0, "settings list <命名空间> [--filter 词]")?;
             check_ns(ns)?;
             let f = a
                 .iter()
@@ -494,9 +530,16 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 crate::shizuku_parse::parse_settings_list,
             ))
         }
+        _ => Err(format!(
+            "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
+        )),
+    }
+}
 
-        // ---- activity ----
-        ("activity", "start") => {
+/// `shizuku activity …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_activity(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "start" => {
             // `-n pkg/cls` / `-a action` / `-d uri` 原样传：这是 adb 自己的语法，
             // 我们只做转义，不重新解释
             if a.is_empty() {
@@ -508,22 +551,22 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 "已启动".to_string(),
             ))
         }
-        ("activity", "force-stop") => {
-            let pkg = need(&a, 0, "activity force-stop <包名>")?;
+        "force-stop" => {
+            let pkg = need(a, 0, "activity force-stop <包名>")?;
             Ok(Plan::done(
                 format!("am force-stop {}", shq(pkg)),
                 format!("已强停 {pkg}"),
             ))
         }
-        ("activity", "kill") => {
-            let pkg = need(&a, 0, "activity kill <包名>")?;
+        "kill" => {
+            let pkg = need(a, 0, "activity kill <包名>")?;
             Ok(Plan::done(
                 format!("am kill {}", shq(pkg)),
                 format!("已杀 {pkg}"),
             ))
         }
-        ("activity", "broadcast") => {
-            let act = need(&a, 0, "activity broadcast <action> [-p 包名]")?;
+        "broadcast" => {
+            let act = need(a, 0, "activity broadcast <action> [-p 包名]")?;
             let mut cmd = format!("am broadcast -a {}", shq(act));
             if let Some(i) = a.iter().position(|x| *x == "-p") {
                 let pkg = a.get(i + 1).ok_or("-p 后面要跟包名")?;
@@ -531,10 +574,17 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
             }
             Ok(Plan::done(cmd, "已发广播".to_string()))
         }
+        _ => Err(format!(
+            "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
+        )),
+    }
+}
 
-        // ---- input ----
-        ("input", "tap") => {
-            let (x, y) = need2(&a, "input tap <x> <y>")?;
+/// `shizuku input …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_input(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "tap" => {
+            let (x, y) = need2(a, "input tap <x> <y>")?;
             let x = num(x, "input tap 的 x")?;
             let y = num(y, "input tap 的 y")?;
             Ok(Plan::done(
@@ -542,9 +592,9 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 format!("已点 ({x}, {y})"),
             ))
         }
-        ("input", "swipe") => {
+        "swipe" => {
             let p = "input swipe <x1> <y1> <x2> <y2> [毫秒]";
-            let (x1, y1) = need2(&a, p)?;
+            let (x1, y1) = need2(a, p)?;
             let (x2, y2) = need2(&a[2..], p)?;
             let ms = a.get(4).copied().unwrap_or("300");
             let c = [
@@ -559,21 +609,34 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 format!("已从 ({}, {}) 滑到 ({}, {})", c[0], c[1], c[2], c[3]),
             ))
         }
-        ("input", "key") => {
-            let k = need(&a, 0, "input key <KEYCODE 或名字>")?;
+        "key" => {
+            let k = need(a, 0, "input key <KEYCODE 或名字>")?;
             // 名字（BACK/HOME）和数字（4/3）都认；转成大写的 KEYCODE 名字
             let name = k.to_ascii_uppercase();
             let known = matches!(
                 name.as_str(),
-                "BACK" | "HOME" | "MENU" | "APP_SWITCH" | "ENTER" | "DEL" | "TAB"
-                    | "POWER" | "VOLUME_UP" | "VOLUME_DOWN" | "WAKEUP" | "SLEEP"
-                    | "CAMERA" | "SEARCH" | "NOTIFICATION" | "MEDIA_PLAY_PAUSE"
+                "BACK"
+                    | "HOME"
+                    | "MENU"
+                    | "APP_SWITCH"
+                    | "ENTER"
+                    | "DEL"
+                    | "TAB"
+                    | "POWER"
+                    | "VOLUME_UP"
+                    | "VOLUME_DOWN"
+                    | "WAKEUP"
+                    | "SLEEP"
+                    | "CAMERA"
+                    | "SEARCH"
+                    | "NOTIFICATION"
+                    | "MEDIA_PLAY_PAUSE"
             );
             if !known && k.parse::<i32>().is_err() {
                 return Err(format!(
                     "input key 不认「{k}」：给数字 keycode，或这些名字之一：BACK HOME MENU \
-                     APP_SWITCH ENTER DEL TAB POWER VOLUME_UP VOLUME_DOWN WAKEUP SLEEP CAMERA \
-                     SEARCH NOTIFICATION MEDIA_PLAY_PAUSE"
+                 APP_SWITCH ENTER DEL TAB POWER VOLUME_UP VOLUME_DOWN WAKEUP SLEEP CAMERA \
+                 SEARCH NOTIFICATION MEDIA_PLAY_PAUSE"
                 ));
             }
             Ok(Plan::done(
@@ -581,7 +644,7 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 format!("已按 {name}"),
             ))
         }
-        ("input", "text") => {
+        "text" => {
             // 文本可能有很多段（`input text hello world`）—— 拼起来
             if a.is_empty() {
                 return Err("用法：agent shizuku input text <文本>".into());
@@ -594,18 +657,27 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 format!("已输入「{text}」"),
             ))
         }
+        _ => Err(format!(
+            "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
+        )),
+    }
+}
 
-        // ---- display ----
-        ("display", "list") => Ok(Plan::parsed(
+/// `shizuku display …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_display(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "list" => Ok(Plan::parsed(
             "dumpsys display",
             crate::shizuku_parse::parse_display,
         )),
-        ("display", "size") => match a.first().copied() {
+        "size" => match a.first().copied() {
             None => Err("用法：agent shizuku display size <宽>x<高>|reset".into()),
             Some("reset") => Ok(Plan::done("wm size reset", "已恢复默认分辨率")),
             Some(v) => {
                 if !v.contains('x') {
-                    return Err(format!("display size 要 `<宽>x<高>`（比如 1080x2400）或 reset，给的是「{v}」"));
+                    return Err(format!(
+                        "display size 要 `<宽>x<高>`（比如 1080x2400）或 reset，给的是「{v}」"
+                    ));
                 }
                 Ok(Plan::done(
                     format!("wm size {}", shq(v)),
@@ -613,7 +685,7 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 ))
             }
         },
-        ("display", "density") => match a.first().copied() {
+        "density" => match a.first().copied() {
             None => Err("用法：agent shizuku display density <dpi>|reset".into()),
             Some("reset") => Ok(Plan::done("wm density reset", "已恢复默认密度")),
             Some(v) => {
@@ -624,55 +696,73 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 ))
             }
         },
+        _ => Err(format!(
+            "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
+        )),
+    }
+}
 
-        // ---- user ----
-        ("user", "list") => Ok(Plan::parsed(
+/// `shizuku user …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_user(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "list" => Ok(Plan::parsed(
             "pm list users",
             crate::shizuku_parse::parse_users,
         )),
-        ("user", "switch") => {
-            let id = need(&a, 0, "user switch <id>")?;
+        "switch" => {
+            let id = need(a, 0, "user switch <id>")?;
             let id = num(id, "user id")?;
             Ok(Plan::done(
                 format!("am switch-user {id}"),
                 format!("已切到用户 {id}"),
             ))
         }
-        ("user", "start") => {
-            let id = need(&a, 0, "user start <id>")?;
+        "start" => {
+            let id = need(a, 0, "user start <id>")?;
             let id = num(id, "user id")?;
             Ok(Plan::done(
                 format!("am start-user {id}"),
                 format!("已启动用户 {id}"),
             ))
         }
-        ("user", "stop") => {
-            let id = need(&a, 0, "user stop <id>")?;
+        "stop" => {
+            let id = need(a, 0, "user stop <id>")?;
             let id = num(id, "user id")?;
             Ok(Plan::done(
                 format!("am stop-user {id}"),
                 format!("已停止用户 {id}"),
             ))
         }
-        ("user", "create") => {
-            let name = need(&a, 0, "user create <名字> [--guest]")?;
-            let guest = if a.contains(&"--guest") { "--guest " } else { "" };
+        "create" => {
+            let name = need(a, 0, "user create <名字> [--guest]")?;
+            let guest = if a.contains(&"--guest") {
+                "--guest "
+            } else {
+                ""
+            };
             Ok(Plan::done(
                 format!("pm create-user {guest}{}", shq(name)),
                 format!("已建用户 {name}"),
             ))
         }
-        ("user", "remove") => {
-            let id = need(&a, 0, "user remove <id>")?;
+        "remove" => {
+            let id = need(a, 0, "user remove <id>")?;
             let id = num(id, "user id")?;
             Ok(Plan::done(
                 format!("pm remove-user {id}"),
                 format!("已删用户 {id}"),
             ))
         }
+        _ => Err(format!(
+            "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
+        )),
+    }
+}
 
-        // ---- notification ----
-        ("notification", "list") => {
+/// `shizuku notification …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_notification(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "list" => {
             let f = a
                 .iter()
                 .position(|x| *x == "--package")
@@ -684,38 +774,50 @@ pub fn plan(argv: &[String]) -> Result<Plan, String> {
                 crate::shizuku_parse::parse_notifications,
             ))
         }
-        ("notification", "dismiss") => {
+        "dismiss" => {
             if a.contains(&"--all") {
                 return Ok(Plan::done("cmd notification cancel_all", "已清空通知栏"));
             }
-            match a.iter().position(|x| *x == "--package").and_then(|i| a.get(i + 1)) {
+            match a
+                .iter()
+                .position(|x| *x == "--package")
+                .and_then(|i| a.get(i + 1))
+            {
                 Some(pkg) => Ok(Plan::done(
                     format!("cmd notification cancel {}", shq(pkg)),
                     format!("已清掉 {pkg} 的通知"),
                 )),
-                None => Err("用法：agent shizuku notification dismiss --all | --package <包名>".into()),
+                None => {
+                    Err("用法：agent shizuku notification dismiss --all | --package <包名>".into())
+                }
             }
         }
+        _ => Err(format!(
+            "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
+        )),
+    }
+}
 
-        // ---- file ----
-        ("file", "ls") => {
-            let p = need(&a, 0, "file ls <路径> [-l]")?;
+/// `shizuku file …` 那一组。不带子命令时的默认值见 `split_sub`。
+fn plan_file(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
+    match sub {
+        "ls" => {
+            let p = need(a, 0, "file ls <路径> [-l]")?;
             let l = if a.contains(&"-l") { "-l " } else { "" };
             Ok(Plan::raw(format!("ls {l}{}", shq(p))))
         }
-        ("file", "pull") | ("file", "push") => {
-            let (src, dst) = need2(&a, "file pull|push <源> <目标>")?;
+        "pull" | "push" => {
+            let (src, dst) = need2(a, "file pull|push <源> <目标>")?;
             Ok(Plan::done(
                 format!("cp -r {} {}", shq(src), shq(dst)),
                 format!("已复制 {src} → {dst}"),
             ))
         }
-        ("file", "rm") => {
-            let p = need(&a, 0, "file rm <路径> [-r]")?;
+        "rm" => {
+            let p = need(a, 0, "file rm <路径> [-r]")?;
             let r = if a.contains(&"-r") { "-rf " } else { "-f " };
             Ok(Plan::done(format!("rm {r}{}", shq(p)), format!("已删 {p}")))
         }
-
         _ => Err(format!(
             "`agent shizuku {group}` 没有「{sub}」这个子命令（`agent shizuku help` 看全部）"
         )),

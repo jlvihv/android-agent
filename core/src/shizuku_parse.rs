@@ -112,7 +112,7 @@ fn split_eq_pairs(line: &str) -> Vec<(String, String)> {
 fn norm_key(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_whitespace() && *c != '_')
-        .flat_map(|c| c.to_lowercase())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
@@ -398,7 +398,7 @@ fn find_after<T>(s: &str, marker: &str, f: impl Fn(&str) -> Option<T>) -> Option
 pub fn parse_packages(text: &str) -> Option<Value> {
     let mut v: Vec<String> = text
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("package:").map(|s| s.to_string()))
+        .filter_map(|l| l.trim().strip_prefix("package:").map(str::to_string))
         .filter(|s| !s.is_empty())
         .collect();
     if v.is_empty() {
@@ -451,7 +451,7 @@ fn kv_int_inline(text: &str, key: &str) -> Option<i64> {
     for line in text.lines() {
         for (k, v) in split_eq_pairs(line) {
             if norm_key(&k) == norm_key(key) {
-                let num: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let num: String = v.chars().take_while(char::is_ascii_digit).collect();
                 return num.parse().ok();
             }
         }

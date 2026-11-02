@@ -322,14 +322,14 @@ fn encode(source: &[u8], source_mime: &str) -> anyhow::Result<Encoded> {
         if tw <= 1 && th <= 1 {
             anyhow::bail!("图片缩到 1×1 仍然超过内联上限，没法发给模型");
         }
-        tw = ((tw as f64 * 0.75) as u32).max(1);
-        th = ((th as f64 * 0.75) as u32).max(1);
+        tw = ((f64::from(tw) * 0.75) as u32).max(1);
+        th = ((f64::from(th) * 0.75) as u32).max(1);
         cur = cur.resize_exact(tw, th, FilterType::Lanczos3);
     }
 }
 
 fn pixels_ok(w: u32, h: u32) -> bool {
-    (w as u64) * (h as u64) <= MAX_PIXELS
+    u64::from(w) * u64::from(h) <= MAX_PIXELS
 }
 
 /// 等比缩进 `MAX_DIM` 以内，**不放大**
@@ -337,10 +337,13 @@ fn fit(w: u32, h: u32) -> (u32, u32) {
     if w <= MAX_DIM && h <= MAX_DIM {
         return (w.max(1), h.max(1));
     }
-    let scale = f64::min(MAX_DIM as f64 / w as f64, MAX_DIM as f64 / h as f64);
+    let scale = f64::min(
+        f64::from(MAX_DIM) / f64::from(w),
+        f64::from(MAX_DIM) / f64::from(h),
+    );
     (
-        ((w as f64 * scale).round() as u32).max(1),
-        ((h as f64 * scale).round() as u32).max(1),
+        ((f64::from(w) * scale).round() as u32).max(1),
+        ((f64::from(h) * scale).round() as u32).max(1),
     )
 }
 

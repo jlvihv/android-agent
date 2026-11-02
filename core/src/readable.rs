@@ -927,10 +927,5 @@ fn where_to(href: &str, host: &str) -> Option<String> {
 }
 
 fn host_of(url: &str) -> &str {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .or_else(|| url.strip_prefix("//"))
-        .unwrap_or("");
-    rest.split(['/', '?', '#']).next().unwrap_or("")
+    crate::text::authority(url)
 }

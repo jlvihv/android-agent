@@ -1,16 +1,14 @@
 //! 桌面：**这台电脑本身**就是设备。
 //!
 //! 手机上设备通道背后是无障碍服务（点 / 滑 / 按键 / 起 App / 开 URI）。电脑上
-//! 不能拿 mock 顶：它对什么都回「成功」（`agent open` 说「已让手机打开」其实什么
-//! 都没开，点击回一句假的 `mock: tapped`）。这台是真的：
+//! **不能假装成功**（曾经有过一个 mock 实现，对什么都回「成功」：`agent open` 说
+//! 「已让手机打开」其实什么都没开，点击回一句假的 `mock: tapped`）。这台是真的：
 //!
 //! - `open`：交给系统的打开器（macOS `open`，Linux `xdg-open`）—— 网页、文件、
 //!   `mailto:` 都由用户自己的默认程序接；
 //! - `launch`：macOS 上 `open -a <应用名>`；Linux 没有统一的「按名字起应用」，
 //!   明说让模型直接在 bash 里跑它的命令；
 //! - 点 / 滑 / 按键：明说「电脑上没有」，不假装做了。
-//!
-//! mock 还留着，给 `just dev`（在电脑上复现手机）和测试用。
 
 use std::path::PathBuf;
 use std::process::{Command as Proc, Stdio};
@@ -189,7 +187,6 @@ impl Advert {
             .map(str::trim)
             .find(|l| !l.is_empty())
             .map(str::to_string)
-            // 没话说也得说一句：静默死掉正是这个函数要消灭的东西
             .unwrap_or_else(|| "广播进程退出了，但没说什么".into());
         self.error = Some(why.clone());
         Some(why)

@@ -334,8 +334,7 @@ mod tests {
         std::process::Command::new("cat")
             .arg("--version")
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("GNU coreutils"))
-            .unwrap_or(false)
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("GNU coreutils"))
     }
 
     /// 跑真的 `cat -n`，返回它的 stdout。

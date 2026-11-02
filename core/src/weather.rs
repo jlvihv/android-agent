@@ -65,26 +65,26 @@ pub fn parse_args(argv: &[String]) -> anyhow::Result<Args> {
                 lat =
                     Some(v.parse().map_err(|_| {
                         anyhow::anyhow!("--lat 要一个数字（十进制度），给的是「{v}」")
-                    })?)
+                    })?);
             }
             "--lon" => {
                 let v = value("--lon")?;
                 lon =
                     Some(v.parse().map_err(|_| {
                         anyhow::anyhow!("--lon 要一个数字（十进制度），给的是「{v}」")
-                    })?)
+                    })?);
             }
             "--hours" => {
                 let v = value("--hours")?;
                 hours = v
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("--hours 要一个正整数，给的是「{v}」"))?
+                    .map_err(|_| anyhow::anyhow!("--hours 要一个正整数，给的是「{v}」"))?;
             }
             "--days" => {
                 let v = value("--days")?;
                 days = v
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("--days 要一个正整数，给的是「{v}」"))?
+                    .map_err(|_| anyhow::anyhow!("--days 要一个正整数，给的是「{v}」"))?;
             }
             "-h" | "--help" => anyhow::bail!("{USAGE}"),
             other => anyhow::bail!("不认识的参数：{other}\n{USAGE}"),
@@ -228,7 +228,10 @@ fn shape(a: &Args, raw: &Value) -> anyhow::Result<Value> {
 
     if a.sub == "current" || a.sub == "report" {
         if let Some(c) = raw.get("current") {
-            let code = c.get("weather_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let code = c
+                .get("weather_code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
             data["current"] = json!({
                 "time": c.get("time").cloned().unwrap_or(Value::Null),
                 "condition": condition(code),
@@ -274,7 +277,10 @@ fn shape(a: &Args, raw: &Value) -> anyhow::Result<Value> {
         // daily 那段补一个中文的天气描述：模型和界面都要用，别让它自己拿 code 去查表
         if let Some(arr) = data["daily"].as_array_mut() {
             for row in arr {
-                let code = row.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let code = row
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1);
                 row["condition"] = json!(condition(code));
             }
         }

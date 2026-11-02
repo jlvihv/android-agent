@@ -309,19 +309,6 @@ impl AgentCore {
             .collect()
     }
 
-    /// 连上这台电脑，返回 **WebView 要加载的地址**（`http://localhost:<端口>/auth?t=…&k=…`）。
-    ///
-    /// 选路（局域网 / 中继）在核心里，见 `tunnel.rs`；只是在本机绑端口，不联网。
-    /// 页面自己拿到的是另一个地址（不带凭据，见 `machines::Conn::page_url`）——
-    /// 这一步是壳专用的。
-    pub fn connect_machine(&self, id: String) -> Result<String, CoreError> {
-        let m = self.machines_store()?;
-        let rt = self.rt()?;
-        rt.block_on(m.connect(&id))
-            .map(|c| c.shell_url())
-            .map_err(failed)
-    }
-
     /// 上次连着的那台，接着连（壳启动时调）。返回 WebView 要加载的地址，没连过就是 `None`。
     pub fn resume_machine(&self) -> Option<String> {
         let m = self.machines_store().ok()?;

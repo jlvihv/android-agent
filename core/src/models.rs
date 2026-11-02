@@ -32,7 +32,7 @@ use crate::db::Db;
 use crate::llm::Provider;
 
 pub const CATALOG_URL: &str = "https://models.dev/api.json";
-const TTL: Duration = Duration::from_secs(48 * 3600);
+const TTL: Duration = Duration::from_hours(48);
 /// 目录/清单接口的超时。
 ///
 /// **必须有**：`visibility_for` 是在 `/api/llm` 里 await 的，`shared_http`
@@ -139,8 +139,7 @@ async fn catalog(refresh: bool, db: Option<&Db>) -> Option<Catalog> {
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 async fn fetch_catalog() -> anyhow::Result<Catalog> {
@@ -411,11 +410,8 @@ fn alias_candidates(model_id: &str) -> Vec<String> {
 }
 
 fn host_of(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let host = rest.split('/').next()?;
-    let host = host.rsplit('@').next()?; // 去掉 user:pass@
-    let host = host.split(':').next()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    let host = crate::text::host_name(url);
+    (!host.is_empty()).then_some(host)
 }
 
 fn model_vision(m: &CatalogModel) -> Option<bool> {

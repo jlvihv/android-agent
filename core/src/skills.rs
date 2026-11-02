@@ -78,7 +78,7 @@ pub fn scan(host: &Path, guest: &str) -> Vec<Skill> {
                 .name
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| dir.clone()),
-            description: clip(&description, MAX_DESCRIPTION),
+            description: crate::text::cap(&crate::text::one_line(&description), MAX_DESCRIPTION),
             path: format!("{}/{dir}/SKILL.md", guest.trim_end_matches('/')),
             dir,
             enabled: true,
@@ -115,7 +115,7 @@ pub const CREATE_SKILL: &str = "create-skill";
 pub fn create_skill_md(dir: &str) -> String {
     let dir = dir.trim_end_matches('/');
     format!(
-        r#"---
+        r"---
 name: create-skill
 description: 用户让你新建、安装（比如从 git 仓库装）、修改或删除技能（skill）时先读这个：skill 放在哪、SKILL.md 怎么写、怎么装。
 ---
@@ -163,7 +163,7 @@ description: <一句话写清「什么时候该用它」>
 ## 修改 / 删除
 
 直接改 SKILL.md；删除就删掉整个目录。（这个 create-skill 是内置的，删了下次启动会补回来。）
-"#
+"
     )
 }
 
@@ -228,14 +228,4 @@ fn unquote(s: &str) -> &str {
         }
     }
     s
-}
-
-fn clip(s: &str, max: usize) -> String {
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() <= max {
-        return s;
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
 }

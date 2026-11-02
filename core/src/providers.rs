@@ -84,7 +84,7 @@ pub fn preset(id: &str) -> Option<&'static Preset> {
 }
 
 pub fn display_name(id: &str) -> &'static str {
-    preset(id).map(|p| p.name).unwrap_or(CUSTOM_NAME)
+    preset(id).map_or(CUSTOM_NAME, |p| p.name)
 }
 
 pub fn is_known(id: &str) -> bool {
@@ -123,8 +123,7 @@ pub fn identify(p: &Provider) -> &'static str {
     PRESETS
         .iter()
         .find(|pr| norm(pr.base_url) == url)
-        .map(|pr| pr.id)
-        .unwrap_or(CUSTOM)
+        .map_or(CUSTOM, |pr| pr.id)
 }
 
 /// 刚配上的服务商默认用哪个模型。

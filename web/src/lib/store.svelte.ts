@@ -4,24 +4,21 @@
  * WS 上来的是设备 / 日志 / 回执这些事件，走同一个分发函数；聊天流走
  * `/api/chat` 的 SSE（chunk 进 `sse.ts` 的 `applyChunk`）。组件只读 store，
  * 不自己管连接。
+ *
+ * 后两种（`log` / `ack`）页面不渲染，只转到 devtools 的 console —— 它们是给
+ * 调试用的（服务端那侧同时进 tracing）。**别在这里攒数组**：攒了没人看，
+ * 还白占内存（以前就是这么烂掉的）。
  */
 
-import type { Ack, AgentEvent, ClientMsg, DeviceInfo, Hello } from "./types";
+import type { AgentEvent, DeviceInfo, Hello } from "./types";
 import type { Message } from "./sse";
 import { uid } from "./uid";
-
-export type LogItem = { id: number; ts: number; level: string; msg: string };
-
-let logSeq = 0;
 
 /** WebSocket 退避重连：起始间隔（ms），每次翻倍，封顶 `RETRY_MAX_MS` */
 const RETRY_BASE_MS = 500;
 const RETRY_MAX_MS = 8000;
 /** 解析不了的事件，日志里只留前这么多字符 */
 const LOG_SNIPPET = 120;
-/** 日志 / 指令回执各自最多留多少条（进抽屉的面板看的，不是审计） */
-const MAX_LOGS = 300;
-const MAX_ACKS = 50;
 
 class AgentStore {
   connected = $state(false);
@@ -87,8 +84,6 @@ class AgentStore {
    * 从 `/api/health` 拿（那个接口要凭据，别的 App 拿不到）。
    */
   sandboxKey = $state("");
-  logs = $state<LogItem[]>([]);
-  acks = $state<(Ack & { ts: number })[]>([]);
   /** 当前正在流式接收的助手消息 */
   streaming = $state<Message | null>(null);
   /**
@@ -148,9 +143,8 @@ class AgentStore {
       try {
         ev = JSON.parse(e.data as string) as AgentEvent;
       } catch {
-        this.pushLog(
-          "warn",
-          `无法解析的事件: ${String(e.data).slice(0, LOG_SNIPPET)}`,
+        console.warn(
+          `[ws] 无法解析的事件: ${String(e.data).slice(0, LOG_SNIPPET)}`,
         );
         return;
       }
@@ -194,23 +188,19 @@ class AgentStore {
           port: ev.port,
           version: ev.version,
           platform: ev.platform,
-          mock: ev.mock,
         };
         break;
 
       case "device":
-        this.device = { connected: ev.connected, name: ev.name, mock: ev.mock };
+        this.device = { connected: ev.connected, name: ev.name };
         break;
 
       case "log":
-        this.pushLog(ev.level, ev.msg);
+        console.debug(`[core ${ev.level}]`, ev.msg);
         break;
 
       case "ack":
-        this.acks = [
-          { id: ev.id, ok: ev.ok, detail: ev.detail, ts: Date.now() },
-          ...this.acks,
-        ].slice(0, MAX_ACKS);
+        console.debug(`[core ack ${ev.id}]`, ev.ok, ev.detail);
         break;
 
       case "turn_active":
@@ -223,22 +213,6 @@ class AgentStore {
         this.turnActive = true;
         break;
     }
-  }
-
-  pushLog(level: string, msg: string): void {
-    this.logs = [
-      { id: ++logSeq, ts: Date.now(), level, msg },
-      ...this.logs,
-    ].slice(0, MAX_LOGS);
-  }
-
-  send(msg: ClientMsg): void {
-    const ws = this.#ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      this.pushLog("warn", "未连接，消息丢弃");
-      return;
-    }
-    ws.send(JSON.stringify(msg));
   }
 
   /**
@@ -256,11 +230,6 @@ class AgentStore {
       done: false,
     };
     return this.streaming!;
-  }
-
-  clearLogs(): void {
-    this.logs = [];
-    this.acks = [];
   }
 }
 

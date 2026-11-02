@@ -49,7 +49,7 @@ pub struct SideDirs {
 
 /// 历史里没引用、但模型可能还在用的文件（bash 里直接处理截图、grep 溢出的
 /// 输出），启动时只清这么久以前的。
-const LOOSE_TTL: Duration = Duration::from_secs(24 * 3600);
+const LOOSE_TTL: Duration = Duration::from_hours(24);
 
 /// 一段历史引用的、**归我们管**的文件（绝对路径）：附件、内联给模型的图片副本。
 /// `read` 读图时的原图（`ImagePart::source`）是用户自己的文件，**绝不能**算进来。

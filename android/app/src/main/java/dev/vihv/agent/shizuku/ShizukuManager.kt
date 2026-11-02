@@ -155,8 +155,6 @@ object ShizukuManager {
         Snapshot(State.NOT_INSTALLED)
     }
 
-    fun isReady(): Boolean = snapshot().state == State.READY
-
     // -----------------------------------------------------------------------
     // 授权
     // -----------------------------------------------------------------------

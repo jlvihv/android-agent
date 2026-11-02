@@ -670,8 +670,7 @@ def cmd_doctor(deep: bool = False) -> int:
         row("核心", False, f"{BASE} 连不上（{code}）{str(h)[:120]}")
         print(c(DIM, "  手机上跑着吗？先 `just wifi`；本机就 `just dev`"))
         return 1
-    tag = "（mock 设备）" if h.get("mock") else ""
-    row("核心", True, f"v{h.get('version')} · {h.get('platform')} · 端口 {h.get('port')} {tag}")
+    row("核心", True, f"v{h.get('version')} · {h.get('platform')} · 端口 {h.get('port')}")
 
     llm = h.get("llm") or {}
     row("模型", bool(llm), (f"{llm.get('name')} / {llm.get('model')}" if llm
@@ -814,7 +813,7 @@ def repl() -> int:
         print(c(DIM, "手机上跑着？先 `just forward`。本机跑着？`just dev`。"))
         return 1
     if tty:
-        where = "手机" if d.get("device") else ("本机 mock" if d.get("mock") else "本机（无设备）")
+        where = "手机" if d.get("device") else "本机（无设备）"
         print(c(DIM, f"连上 {BASE} · {where} · 会话 {d.get('sessions', {}).get('count')} 个"
                      f" · 模型 {(d.get('llm') or {}).get('model')}"))
         print(c(DIM, f"{session_note()} · /help 看命令，Ctrl-D 退出"))

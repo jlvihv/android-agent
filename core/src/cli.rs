@@ -326,7 +326,7 @@ pub fn prompt_clause(m: Machine) -> String {
 // 脚本片段
 // ---------------------------------------------------------------------------
 
-const PRELUDE: &str = r##"#!/bin/sh
+const PRELUDE: &str = r#"#!/bin/sh
 # agent —— 由核心按这台机器生成（core/src/cli.rs），别手改。`agent help` 看用法。
 set -eu
 
@@ -401,7 +401,7 @@ say() {
 # 设备操作（按键 / 点击 / 滑动 / 启动 / 打开）：核心回纯文本
 act() { say "$(post '/api/command?format=text' "{\"cmd\":$1}")"; }
 
-"##;
+"#;
 
 /// `agent browser` 的动作和参数（help 和提示词共用这一份）。
 const BROWSER_ACTIONS: &[&str] = &[
@@ -445,7 +445,7 @@ fn browser_help() -> String {
     lines.join("\n")
 }
 
-const BROWSER_BODY: &str = r##"    shift || true
+const BROWSER_BODY: &str = r#"    shift || true
     # `--tab N` 放在动作前：先切到第 N 只再做（电脑上不同标签上的动作能同时跑）
     tab_=""
     if [ "${1:-}" = "--tab" ]; then
@@ -555,9 +555,9 @@ EOT
       esac
       body="{\"tab\":${tab_},${body#\{}"
     fi
-    say "$(post /api/browser "$body")""##;
+    say "$(post /api/browser "$body")""#;
 
-const SEARCH_BODY: &str = r##"    shift || true
+const SEARCH_BODY: &str = r#"    shift || true
     if [ -z "${1:-}" ]; then
       echo "用法：agent search <检索意图> [条数]" >&2
       exit 2
@@ -570,11 +570,11 @@ const SEARCH_BODY: &str = r##"    shift || true
     else
       body="{\"query\":\"$q\",\"format\":\"text\"}"
     fi
-    post /api/websearch "$body""##;
+    post /api/websearch "$body""#;
 
 // 请求体就是 HTML 原文（不包 JSON：几 MB 的页面转义一遍既慢又容易出错）。
 // curl 的 `@-` / wget 的 `--post-file` 都是直接把文件流过去，不经过 shell 变量。
-const READABLE_BODY: &str = r##"    shift || true
+const READABLE_BODY: &str = r#"    shift || true
     case "${1:-}" in
       -h|--help) echo "用法：agent readable [文件]（不给文件就读标准输入，比如 curl -sL <url> | agent readable）"; exit 0 ;;
     esac
@@ -598,12 +598,12 @@ const READABLE_BODY: &str = r##"    shift || true
       out=$(wget -q -T 120 -O - --header "$AUTH" --header 'content-type: text/html' --post-file "$src" "$BASE/api/readable") \
         || { echo "POST /api/readable 失败" >&2; exit 1; }
     fi
-    say "$out""##;
+    say "$out""#;
 
-const WEATHER_BODY: &str = r##"    shift || true
-    say "$(post /api/weather "{\"argv\":$(json_args "$@")}")""##;
+const WEATHER_BODY: &str = r#"    shift || true
+    say "$(post /api/weather "{\"argv\":$(json_args "$@")}")""#;
 
-const OPEN_BODY: &str = r##"    shift || true
+const OPEN_BODY: &str = r#"    shift || true
     uri=""
     for a in "$@"; do
       # 任何 `scheme:` 开头都接（tel: 这种没有 //；--flags 以 - 开头不会被误认）
@@ -620,56 +620,56 @@ const OPEN_BODY: &str = r##"    shift || true
     case "$out" in
       错误：*) echo "没能打开 ${uri}：${out#错误：}" >&2 ;;
       *) echo "已打开: $uri" ;;
-    esac"##;
+    esac"#;
 
-const KEY_BODY: &str = r##"    case "${2:-}" in
+const KEY_BODY: &str = r#"    case "${2:-}" in
       back|home|recents|notifications) ;;
       *) echo "用法：agent key back|home|recents|notifications" >&2; exit 2 ;;
     esac
-    act "{\"type\":\"key\",\"name\":\"$2\"}""##;
+    act "{\"type\":\"key\",\"name\":\"$2\"}""#;
 
-const TAP_BODY: &str = r##"    [ $# -eq 3 ] || { echo "用法：agent tap <x> <y>" >&2; exit 2; }
+const TAP_BODY: &str = r#"    [ $# -eq 3 ] || { echo "用法：agent tap <x> <y>" >&2; exit 2; }
     int_arg "$2" tap; int_arg "$3" tap
-    act "{\"type\":\"tap_xy\",\"x\":$2,\"y\":$3}""##;
+    act "{\"type\":\"tap_xy\",\"x\":$2,\"y\":$3}""#;
 
-const SWIPE_BODY: &str = r##"    [ $# -eq 5 ] || [ $# -eq 6 ] || { echo "用法：agent swipe <x1> <y1> <x2> <y2> [毫秒]" >&2; exit 2; }
+const SWIPE_BODY: &str = r#"    [ $# -eq 5 ] || [ $# -eq 6 ] || { echo "用法：agent swipe <x1> <y1> <x2> <y2> [毫秒]" >&2; exit 2; }
     for _n in "$2" "$3" "$4" "$5" "${6:-300}"; do int_arg "$_n" swipe; done
-    act "{\"type\":\"swipe\",\"x1\":$2,\"y1\":$3,\"x2\":$4,\"y2\":$5,\"ms\":${6:-300}}""##;
+    act "{\"type\":\"swipe\",\"x1\":$2,\"y1\":$3,\"x2\":$4,\"y2\":$5,\"ms\":${6:-300}}""#;
 
-const LAUNCH_BODY: &str = r##"    [ $# -eq 2 ] || { echo "用法：agent launch <包名>（比如 com.android.settings）" >&2; exit 2; }
-    act "{\"type\":\"launch\",\"package\":\"$(esc "$2")\"}""##;
+const LAUNCH_BODY: &str = r#"    [ $# -eq 2 ] || { echo "用法：agent launch <包名>（比如 com.android.settings）" >&2; exit 2; }
+    act "{\"type\":\"launch\",\"package\":\"$(esc "$2")\"}""#;
 
 // `agent shizuku`：参数原样交给核心，**核心侧校验 + 排版**（见 core/src/shizuku.rs）。
 // 不带参数 = 核心回 help + 状态；`help` 也是核心答（组表在那儿）。
-const SHIZUKU_BODY: &str = r##"    shift || true
-    say "$(post /api/shizuku "{\"argv\":$(json_args "$@")}")""##;
+const SHIZUKU_BODY: &str = r#"    shift || true
+    say "$(post /api/shizuku "{\"argv\":$(json_args "$@")}")""#;
 
-const PHONE_BODY: &str = r##"    _name="$cmd"; shift || true
+const PHONE_BODY: &str = r#"    _name="$cmd"; shift || true
     # 截屏默认落到当前工作目录下面的 screenshots/（核心把它注在 ${AGENT_WORKDIR} 里）。
     # 显式给了 --path 就按给的来。
     if [ "$_name" = "screenshot" ] && [ $# -eq 0 ] && [ -n "${AGENT_WORKDIR:-}" ]; then
       set -- --path "${AGENT_WORKDIR}/screenshots/shot-$(date +%Y%m%d-%H%M%S).png"
     fi
-    say "$(post /api/device "{\"cmd\":\"$_name\",\"argv\":$(json_args "$@")}")""##;
+    say "$(post /api/device "{\"cmd\":\"$_name\",\"argv\":$(json_args "$@")}")""#;
 
 // 工具回的图片落在当前目录下（`$AGENT_WORKDIR`，核心那边见 `http::mcp_run`）。
 // 出错时核心回的文字以「错误：」开头 —— 变成非 0 退出码，`&&` 链才会断。
-const MCP_BODY: &str = r##"    shift || true
-    say "$(post /api/mcp "{\"argv\":$(json_args "$@"),\"workdir\":\"$(esc "${AGENT_WORKDIR:-}")\"}")""##;
+const MCP_BODY: &str = r#"    shift || true
+    say "$(post /api/mcp "{\"argv\":$(json_args "$@"),\"workdir\":\"$(esc "${AGENT_WORKDIR:-}")\"}")""#;
 
-const FILES_BODY: &str = r##"    shift || true
-    say "$(post /api/files "{\"path\":\"$(esc "${1:-/workspace}")\"}")""##;
+const FILES_BODY: &str = r#"    shift || true
+    say "$(post /api/files "{\"path\":\"$(esc "${1:-/workspace}")\"}")""#;
 
-const SETUP_BODY: &str = r##"    shift || true
-    exec /usr/local/bin/agent-setup "$@""##;
+const SETUP_BODY: &str = r#"    shift || true
+    exec /usr/local/bin/agent-setup "$@""#;
 
 // 什么在跑：核心那边记着每条命令是哪个 proot，而 guest 进程的 TracerPid 就是它 ——
 // 于是连刻意 setsid / nohup 脱离的常驻进程也能认出来（它们的父进程早就是 init 了，
 // 靠 ps 自己认不出来）。`self` 参数把自己的进程组报上去，免得在「正在跑」里看到自己。
-const PS_BODY: &str = r##"    self_pgid=$(awk '{print $5}' /proc/self/stat 2>/dev/null || echo 0)
-    get "/api/procs?format=text&self=$self_pgid""##;
+const PS_BODY: &str = r#"    self_pgid=$(awk '{print $5}' /proc/self/stat 2>/dev/null || echo 0)
+    get "/api/procs?format=text&self=$self_pgid""#;
 
-const KILL_BODY: &str = r##"    case "${2:-}" in
+const KILL_BODY: &str = r#"    case "${2:-}" in
       ''|*[!0-9]*) echo "用法：agent kill <pid>（pid 从 agent ps 来）" >&2; exit 2 ;;
     esac
     pid="$2"
@@ -684,9 +684,9 @@ const KILL_BODY: &str = r##"    case "${2:-}" in
       echo "停不掉 ${pid}（不是这个 uid 的进程？）" >&2
       exit 1
     fi
-    echo "已强杀 $pid""##;
+    echo "已强杀 $pid""#;
 
-const DEBUG_BODY: &str = r##"    case "${2:-}" in
+const DEBUG_BODY: &str = r#"    case "${2:-}" in
       state)    get /api/debug/state | fmt ;;
       request)  get /api/debug/request | fmt ;;
       tools)    get /api/debug/tools | tr ',' '\n' | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p' ;;
@@ -704,7 +704,7 @@ const DEBUG_BODY: &str = r##"    case "${2:-}" in
         echo "      agent debug get <path> / post <path> <json>" >&2
         exit 2
         ;;
-    esac"##;
+    esac"#;
 
 #[cfg(test)]
 mod tests {

@@ -66,8 +66,20 @@ impl Holder {
 #[derive(Debug)]
 pub struct Guard {
     /// 打不开锁文件时是 `None`（见 `acquire`：锁不住也不能不让核心起）。
-    /// 这个字段本身不重要，**它的存活**才是（文件关掉 = 锁放掉）。
-    _file: Option<File>,
+    file: Option<File>,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        // 显式 unlock，不靠「关文件自然释放」：`flock` 的锁挂在 **open file
+        // description** 上，而我们（以及并行跑测试的别的线程）会 `fork` 出子进程 ——
+        // 子进程在 `exec` 之前握着同一个 fd 的副本，那份副本让锁活着，
+        // 于是 drop 之后下一个人还是抢不到（测试里实测会随机失败）。
+        if let Some(f) = &self.file {
+            // SAFETY: flock 只碰这个 fd；失败返回非 0，不写任何内存
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
 }
 
 /// 抢这把锁。抢到 = `Ok`（顺手写下「我是谁」，下一个被拒的就能看见）；
@@ -78,7 +90,7 @@ pub struct Guard {
 pub fn acquire(path: &Path, port: u16) -> Result<Guard, Holder> {
     if multi_allowed() {
         tracing::info!("{MULTI_ENV} 已设：跳过单实例检查（这台机器上会有不止一个核心）");
-        return Ok(Guard { _file: None });
+        return Ok(Guard { file: None });
     }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -97,7 +109,7 @@ pub fn acquire(path: &Path, port: u16) -> Result<Guard, Holder> {
                 "打不开锁文件 {}（{e}）—— 这次跳过单实例检查",
                 path.display()
             );
-            return Ok(Guard { _file: None });
+            return Ok(Guard { file: None });
         }
     };
     // SAFETY: flock 只碰这个 fd；失败返回非 0，不写任何内存
@@ -115,7 +127,7 @@ pub fn acquire(path: &Path, port: u16) -> Result<Guard, Holder> {
     let _ = file.set_len(0);
     let _ = writeln!(file, "{info}");
     let _ = file.flush();
-    Ok(Guard { _file: Some(file) })
+    Ok(Guard { file: Some(file) })
 }
 
 /// `AGENT_MULTI` 算开着吗（`1`/`true`/`yes`/`on`；`0`/`false`/`no`/空当没开）。
@@ -135,8 +147,14 @@ fn read_holder(file: &mut File) -> Option<Holder> {
     file.read_to_string(&mut raw).ok()?;
     let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
     Some(Holder {
-        pid: v.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32),
-        port: v.get("port").and_then(|p| p.as_u64()).map(|p| p as u16),
+        pid: v
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .map(|p| p as u32),
+        port: v
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .map(|p| p as u16),
         cmd: v.get("cmd").and_then(|c| c.as_str()).map(str::to_string),
     })
 }

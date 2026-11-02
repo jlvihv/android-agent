@@ -98,16 +98,13 @@ impl Routes {
     /// 发现服务会反复报同一个地址：地址没变、也没在走中继的话，池子里的连接照用
     /// （不然每报一次池子就清一次，复用就白做了）。
     pub fn set_lan(&self, addr: String) {
-        let changed = self
-            .lan
-            .lock()
-            .map(|mut g| g.replace(addr.clone()).as_deref() != Some(addr.as_str()))
-            .unwrap_or(true);
+        let changed = self.lan.lock().map_or(true, |mut g| {
+            g.replace(addr.clone()).as_deref() != Some(addr.as_str())
+        });
         let was_down = self
             .lan_down_until
             .lock()
-            .map(|mut g| g.take().is_some_and(|t| Instant::now() < t))
-            .unwrap_or(false);
+            .is_ok_and(|mut g| g.take().is_some_and(|t| Instant::now() < t));
         if changed || was_down {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }

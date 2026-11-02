@@ -66,7 +66,6 @@ class BrowserController(private val app: Application) : BrowserHost {
 
         /** 骨架树给模型的文本上限（它会进历史，按钱算） */
         private const val BACKBONE_MAX_CHARS = 12_000
-        private const val BACKBONE_MAX_NODES = 220
 
         /** 正文上限 */
         private const val TEXT_MAX_CHARS = 12_000

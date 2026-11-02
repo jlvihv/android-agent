@@ -165,12 +165,6 @@ function stylesheets(html: string, base: string): string[] {
   return out;
 }
 
-export function sniffBackground(html: string): string | null {
-  const bg = sniffExplicit(html);
-  if (bg) return bg;
-  return schemeOf(html) === "dark" ? "#121212" : null;
-}
-
 const cache = new Map<string, string | null>();
 
 async function getText(url: string): Promise<string | null> {

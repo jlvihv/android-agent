@@ -41,7 +41,7 @@ const SNAPSHOT_OK: &str = ".upgrade-snapshot-ok";
 /// 快照不复制的目录：临时文件（重启就该没）、我们自己的状态文件
 const SNAPSHOT_SKIP: &[&str] = &["tmp", ".agent-exit"];
 /// `apk upgrade` 给多久。手机上 3.21 → 3.24（178 个包、~300MB）要 3 分 20 秒
-const APK_TIMEOUT: Duration = Duration::from_secs(40 * 60);
+const APK_TIMEOUT: Duration = Duration::from_mins(40);
 /// 进度日志只留最后这么多行（界面上看的是尾巴）
 const LOG_KEEP: usize = 200;
 /// 除了快照，还要给下载 + 解包留的余量
@@ -162,7 +162,7 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     let mut it = v.trim().split('.');
     let a = it.next()?.parse().ok()?;
     let b = it.next()?.parse().ok()?;
-    let c = it.next().map(|c| c.parse().ok()).unwrap_or(Some(0))?;
+    let c = it.next().map_or(Some(0), |c| c.parse().ok())?;
     it.next().is_none().then_some((a, b, c))
 }
 
@@ -302,7 +302,7 @@ fn tree_size(p: &Path) -> u64 {
     rd.flatten()
         .map(|e| match e.file_type() {
             Ok(t) if t.is_dir() => tree_size(&e.path()),
-            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
             _ => 0,
         })
         .sum()

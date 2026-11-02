@@ -2,7 +2,6 @@ package dev.vihv.agent.shizuku
 
 import android.util.Log
 import org.json.JSONObject
-import uniffi.agent_core.HostException
 import uniffi.agent_core.ShizukuHost
 
 /**

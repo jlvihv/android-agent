@@ -345,7 +345,6 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "git": crate::state::GIT,
         "port": st.port.load(std::sync::atomic::Ordering::Relaxed),
         "platform": std::env::consts::OS,
-        "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),
         "device": dev.map(|d| d.name()),
         // 这个核心跑在哪台机器上：界面（侧栏底栏那个小标签）靠它显示
         // 「现在连的是哪台电脑」。手机上给 `null`（本机就是这台手机，见函数注释）。
@@ -414,7 +413,7 @@ async fn post_command(
         .and_then(|d| d.as_str())
         .unwrap_or("")
         .trim();
-    let text = if ack.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+    let text = if ack.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
         if detail.is_empty() {
             "完成".to_string()
         } else {
@@ -468,8 +467,7 @@ async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -
     let core = Core { state: st.clone() };
     let timeout = body
         .timeout_ms
-        .map(Duration::from_millis)
-        .unwrap_or(crate::linux::DEFAULT_TIMEOUT)
+        .map_or(crate::linux::DEFAULT_TIMEOUT, Duration::from_millis)
         .min(crate::linux::MAX_TIMEOUT);
 
     match core.run_linux(&body.command, timeout, None).await {
@@ -938,7 +936,7 @@ fn browser_text(v: &Value) -> String {
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .trim_end();
-    if v.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
         return format!(
             "错误：{}",
             if text.is_empty() {
@@ -962,9 +960,15 @@ fn browser_text(v: &Value) -> String {
             out.push_str(&format!("\n[页面：{title} — {url}]"));
         }
     }
-    let tabs = v.get("tabs").and_then(|t| t.as_u64()).unwrap_or(0);
+    let tabs = v
+        .get("tabs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     if tabs > 1 {
-        let tab = v.get("tab").and_then(|t| t.as_u64()).unwrap_or(0);
+        let tab = v
+            .get("tab")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         out.push_str(&format!("\n[标签 #{tab}，共 {tabs} 只]"));
     }
     out
@@ -1002,7 +1006,7 @@ async fn device_command(State(st): State<Arc<AppState>>, Json(body): Json<Device
 
 /// 壳的回包（`phone::normalize_reply` 收敛过的 `{ok, data}` / `{ok:false, error}`）→ 文字。
 fn device_text(v: &Value) -> String {
-    if v.get("ok").and_then(|o| o.as_bool()) == Some(false) {
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
         let e = &v["error"];
         let msg = e
             .get("message")
@@ -1497,7 +1501,7 @@ async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) ->
     }
     let num = body
         .get("num_results")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(5) as usize;
     match core.search_web(query, num).await {
         Ok(found) => {
@@ -2338,7 +2342,7 @@ async fn get_attachment(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<St
     };
     let mime = match path.extension().and_then(|e| e.to_str()) {
         Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         Some("bmp") => "image/bmp",
@@ -2651,7 +2655,6 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "git": crate::state::GIT,
         "platform": std::env::consts::OS,
         "port": st.port.load(std::sync::atomic::Ordering::Relaxed),
-        "mock": st.mock.load(std::sync::atomic::Ordering::Relaxed),
         "device": st.device().map(|d| d.name()),
         "busySessions": st.busy_sessions(),
         "sessions": sessions,
@@ -3293,7 +3296,7 @@ async fn serve_bytes(host: &std::path::Path, name: &str, range: Option<String>) 
         Ok(f) => f,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let len = file.metadata().await.map_or(0, |m| m.len());
 
     let mime = sandbox_mime(host, name).await;
 
@@ -3360,7 +3363,7 @@ async fn dir_listing(guest: &str, host: &std::path::Path) -> Response {
     let mut entries: Vec<(String, bool)> = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(host).await {
         while let Ok(Some(e)) = rd.next_entry().await {
-            let dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            let dir = e.file_type().await.is_ok_and(|t| t.is_dir());
             entries.push((e.file_name().to_string_lossy().into_owned(), dir));
         }
     }
@@ -3463,7 +3466,6 @@ async fn ws_loop(mut socket: WebSocket, st: Arc<AppState>) {
         port: st.port.load(std::sync::atomic::Ordering::Relaxed),
         version: VERSION.into(),
         platform: std::env::consts::OS.into(),
-        mock: st.mock.load(std::sync::atomic::Ordering::Relaxed),
     };
     if send_event(&mut socket, &hello).await.is_err() {
         return;
@@ -3507,7 +3509,7 @@ async fn send_event(socket: &mut WebSocket, ev: &Event) -> Result<(), axum::Erro
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
-    /// 转发一条指令给设备
+    /// 转发一条指令给设备（页面里点「返回 / home」那类按钮走这条）
     Command { cmd: Command },
     /// 前端发起的日志（调试用）
     Log { level: String, msg: String },
@@ -3551,7 +3553,7 @@ pub async fn dispatch(st: &Arc<AppState>, cmd: Command) -> serde_json::Value {
             tokio::task::spawn_blocking(move || host.execute(&action).and_then(browser_reply)).await
         }
         (None, _) => {
-            return json!({ "id": id, "ok": false, "detail": "没有设备实现（mock 未启用或无障碍服务未连接）" })
+            return json!({ "id": id, "ok": false, "detail": "没有设备实现（无障碍服务未连上）" })
         }
     };
 
@@ -3578,7 +3580,7 @@ pub async fn dispatch(st: &Arc<AppState>, cmd: Command) -> serde_json::Value {
 fn browser_reply(raw: String) -> Result<String, String> {
     let v: Value = serde_json::from_str(&raw).map_err(|_| raw.clone())?;
     let text = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
         Ok(text("text"))
     } else {
         let why = text("text");

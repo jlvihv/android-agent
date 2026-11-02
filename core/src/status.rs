@@ -17,9 +17,10 @@
 //! （开始想 / 开始跑工具 / 工具结束 / 回合结束）立刻发。
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::state::AppState;
+use crate::text;
 
 /// 流式正文最快多久推一次。
 ///
@@ -333,17 +334,17 @@ pub fn reply_preview(text: &str) -> Option<String> {
         .replace(['*', '`', '_'], "")
         .trim()
         .to_string();
-    (!clean.is_empty()).then(|| cap(&clean, DETAIL_MAX))
+    (!clean.is_empty()).then(|| text::cap(&clean, DETAIL_MAX))
 }
 
-/// 一行、别太长。
+/// 第一行非空的内容，压成一行、别太长。
 fn one_line(s: &str) -> String {
     let first = s
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or_default();
-    cap(&collapsed(first), DETAIL_MAX)
+    text::cap(&collapsed(first), DETAIL_MAX)
 }
 
 /// 连续空白压成一个空格（命令行里的缩进、正文里的换行都不该出现在一行里）。
@@ -359,21 +360,6 @@ fn collapsed(s: &str) -> String {
             out.push(' ');
         }
         space = false;
-        out.push(c);
-    }
-    out
-}
-
-/// 按**字符**截断并加省略号。
-///
-/// 不按字节：中文一个字三字节，按字节切会切出半个字（界面上是个方块）。
-fn cap(s: &str, max: usize) -> String {
-    let mut out = String::with_capacity(s.len().min(max * 4));
-    for (n, c) in s.chars().enumerate() {
-        if n == max {
-            out.push('…');
-            break;
-        }
         out.push(c);
     }
     out
@@ -403,11 +389,7 @@ fn tail_start(s: &str, max: usize) -> usize {
     i
 }
 
-/// wall clock 毫秒。和 `agent::now_ms` 同一个坐标系（那边是给消息时间戳用的，
-/// 私有函数，这里就不为它开个口子了）。
+/// wall clock 毫秒（和消息时间戳 `agent::now_ms` 同一个坐标系）。
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::agent::now_ms()
 }

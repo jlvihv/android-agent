@@ -28,7 +28,7 @@ const BACKBONE_MAX_NODES: usize = 220;
 ///
 /// `window.open()` 不带地址（先开空白窗口、再往里写）的没法掰：回 `null`，和
 /// 「被弹窗拦截了」一样 —— 页面一般有兜底（直接跳过去）。
-const TARGET_FIX_JS: &str = r#"
+const TARGET_FIX_JS: &str = r"
 (function() {
   if (window.__agentTargetFix) return;
   window.__agentTargetFix = 1;
@@ -42,7 +42,7 @@ const TARGET_FIX_JS: &str = r#"
     return window;
   };
 })()
-"#;
+";
 
 /// 支持哪些 kind（`AgentCore.browserJs` 和测试都看它）
 pub const KINDS: &[&str] = &[
@@ -73,11 +73,11 @@ pub fn build(kind: &str, params: &str) -> Result<String, String> {
     let s = |k: &str| -> Result<String, String> {
         p.get(k)
             .and_then(|v| v.as_str())
-            .map(|v| v.to_string())
+            .map(str::to_string)
             .ok_or_else(|| format!("{kind} 缺参数 {k}"))
     };
     let opt = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let num = |k: &str, d: i64| p.get(k).and_then(|v| v.as_i64()).unwrap_or(d);
+    let num = |k: &str, d: i64| p.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d);
 
     Ok(match kind {
         "dom_sig" => DOM_SIG_JS.to_string(),
@@ -88,10 +88,10 @@ pub fn build(kind: &str, params: &str) -> Result<String, String> {
         "click_sel" => click_sel_js(&s("selector")?),
         "click_xy" => click_xy_js(
             p.get("x")
-                .and_then(|v| v.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .ok_or("click_xy 缺参数 x")?,
             p.get("y")
-                .and_then(|v| v.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .ok_or("click_xy 缺参数 y")?,
         ),
         "type" => type_js(&s("selector")?, &opt("text")),
@@ -127,7 +127,7 @@ const DOM_SIG_JS: &str = "(function(){var b=document.body;if(!b)return 'null';\
      return document.querySelectorAll('*').length+':'+(b.innerText||'').length+':'+\
      (document.documentElement.scrollHeight||0);})()";
 
-const PAGE_INFO_JS: &str = r##"
+const PAGE_INFO_JS: &str = r"
 (function() {
   return JSON.stringify({
     url: location.href,
@@ -140,13 +140,13 @@ const PAGE_INFO_JS: &str = r##"
     elements: document.querySelectorAll('*').length
   });
 })()
-"##;
+";
 
 /// 点一个元素的**完整鼠标事件序列**。
 ///
 /// 只调 `el.click()` 不够：很多站点在 `mousedown`/`mouseup` 上做状态
 /// （下拉菜单、拖拽、自定义控件），合成 click 到不了它们。
-const CLICK_EVENTS: &str = r##"
+const CLICK_EVENTS: &str = r"
   var mk = function(type, bubbles) {
     return new MouseEvent(type, {bubbles: bubbles, cancelable: true, view: window});
   };
@@ -158,12 +158,12 @@ const CLICK_EVENTS: &str = r##"
   el.click();
   el.dispatchEvent(mk('mouseleave', false));
   el.dispatchEvent(mk('mouseout', true));
-"##;
+";
 
 fn click_sel_js(selector: &str) -> String {
     let q = js_quote(selector);
     format!(
-        r##"
+        r"
 (function() {{
   var list = document.querySelectorAll('{q}');
   if (!list.length) return JSON.stringify({{error: '没找到元素: {q}'}});
@@ -173,20 +173,20 @@ fn click_sel_js(selector: &str) -> String {
   {CLICK_EVENTS}
   return JSON.stringify({{clicked: true, matched: list.length, tag: el.tagName, text: (el.innerText || el.value || '').substring(0, 100)}});
 }})()
-"##
+"
     )
 }
 
 fn click_xy_js(x: i64, y: i64) -> String {
     format!(
-        r##"
+        r"
 (function() {{
   var el = document.elementFromPoint({x}, {y});
   if (!el) return JSON.stringify({{error: '坐标 ({x}, {y}) 上没有元素'}});
   {CLICK_EVENTS}
   return JSON.stringify({{clicked: true, tag: el.tagName, text: (el.innerText || el.value || '').substring(0, 100)}});
 }})()
-"##
+"
     )
 }
 
@@ -199,7 +199,7 @@ fn type_js(selector: &str, text: &str) -> String {
     let q = js_quote(selector);
     let val = js_quote(text);
     format!(
-        r##"
+        r"
 (function() {{
   var list = document.querySelectorAll('{q}');
   if (!list.length) return JSON.stringify({{error: '没找到元素: {q}'}});
@@ -234,30 +234,30 @@ fn type_js(selector: &str, text: &str) -> String {
   el.blur();
   return JSON.stringify({{typed: true, matched: list.length, length: val.length}});
 }})()
-"##
+"
     )
 }
 
 fn get_text_js(selector: &str) -> String {
     if selector.is_empty() {
-        return r##"
+        return r"
 (function() {
   var t = (document.body.innerText || '').trim();
   return JSON.stringify({text: t.substring(0, 40000), length: t.length, url: location.href, title: document.title});
 })()
-"##
+"
         .to_string();
     }
     let q = js_quote(selector);
     format!(
-        r##"
+        r"
 (function() {{
   var el = document.querySelector('{q}');
   if (!el) return JSON.stringify({{error: '没找到元素: {q}'}});
   var t = (el.innerText || el.textContent || '').trim();
   return JSON.stringify({{text: t.substring(0, 40000), length: t.length}});
 }})()
-"##
+"
     )
 }
 
@@ -272,7 +272,7 @@ fn scroll_js(direction: &str, amount: i64, selector: &str) -> String {
         format!("'{}'", js_quote(selector))
     };
     format!(
-        r##"
+        r"
 (function() {{
   var sel = {sel};
   var px = {px};
@@ -303,7 +303,7 @@ fn scroll_js(direction: &str, amount: i64, selector: &str) -> String {
   }}
   return JSON.stringify({{scrolled: false, scrollY: Math.round(window.scrollY), scrollHeight: document.documentElement.scrollHeight}});
 }})()
-"##
+"
     )
 }
 
@@ -311,7 +311,7 @@ fn scroll_js(direction: &str, amount: i64, selector: &str) -> String {
 fn press_js(key: &str) -> String {
     let name = js_quote(key);
     format!(
-        r##"
+        r"
 (function() {{
   var name = '{name}';
   var CODES = {{
@@ -372,7 +372,7 @@ fn press_js(key: &str) -> String {
   }}
   return JSON.stringify({{pressed: name, tag: el.tagName, acted: acted}});
 }})()
-"##
+"
     )
 }
 
@@ -381,7 +381,7 @@ fn press_js(key: &str) -> String {
 fn find_elements_js(selector: &str) -> String {
     let q = js_quote(selector);
     format!(
-        r##"
+        r"
 (function() {{
   var all = document.querySelectorAll('{q}');
   var sx = window.scrollX || 0, sy = window.scrollY || 0;
@@ -406,7 +406,7 @@ fn find_elements_js(selector: &str) -> String {
   }}
   return JSON.stringify({{count: all.length, shown: limit, items: items, scrollY: Math.round(sy)}});
 }})()
-"##
+"
     )
 }
 
@@ -424,7 +424,7 @@ fn backbone_js(max_depth: usize) -> String {
         .replace("__LIMIT__", &BACKBONE_MAX_NODES.to_string())
 }
 
-const BACKBONE_JS: &str = r##"
+const BACKBONE_JS: &str = r#"
 (function() {
   var MAX_DEPTH = __MAX_DEPTH__;
   var MERGE = 8;
@@ -578,7 +578,7 @@ const BACKBONE_JS: &str = r##"
   if (!lines.length) lines.push('（这一屏没有可读的可见元素）');
   return JSON.stringify({text: lines.join('\n'), nodes: count, depth: depth});
 })()
-"##;
+"#;
 
 /// 取渲染后的整页 HTML（`get_readable` 用：抽正文在核心里做，和 `agent readable`
 /// 同一套，见 `readable.rs`）。
@@ -587,7 +587,7 @@ const BACKBONE_JS: &str = r##"
 /// 折叠菜单、移动版 / 桌面版二选一的那半）。所以先把它们临时标上 `hidden`（解析器
 /// 跳过带 `hidden` 的元素），取完 `outerHTML` 马上摘掉，页面原样不动。
 /// 本来就带 `hidden` 的不碰；藏起来的元素里面不用再往下看。
-const PAGE_HTML_JS: &str = r##"
+const PAGE_HTML_JS: &str = r"
 (function() {
   var marked = [];
   var root = document.body || document.documentElement;
@@ -612,4 +612,4 @@ const PAGE_HTML_JS: &str = r##"
   }
   return JSON.stringify({html: html, hidden: marked.length, title: document.title, url: location.href});
 })()
-"##;
+";

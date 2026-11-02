@@ -111,9 +111,6 @@ uniffi = { version = "0.32", features = ["tokio"] }
 # 也走它（Rust 默认把 panic 打到 stderr，而安卓上 stderr 是丢掉的）
 log = "0.4"
 
-# 只桌面用（安卓走 tracing 的 log feature → android_logger）。
-# 放这里而不是普通依赖：否则 env-filter 会把 regex-automata/regex-syntax
-# 编进安卓的 .so（实测 ~0.2MB）。
 # 中继（出门在外连家里的电脑，见 docs/12-relay.md）：握手协议和中继服务器在
 # `relay/` 那个小 crate 里，两头共用同一份。
 agent-relay = { path = "../relay" }
@@ -138,6 +135,9 @@ hyper-util = { version = "0.1", features = [
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
+# 只桌面用（安卓走 tracing 的 log feature → android_logger）。
+# 放这里而不是普通依赖：否则 env-filter 会把 regex-automata/regex-syntax
+# 编进安卓的 .so（实测 ~0.2MB）。
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 桌面浏览器后端（`cdp.rs`）：CDP 就是 WebSocket + JSON，自己写客户端。
 # 用**同步**那个（tokio-tungstenite 依赖的），因为 `BrowserApi::execute` 本来就

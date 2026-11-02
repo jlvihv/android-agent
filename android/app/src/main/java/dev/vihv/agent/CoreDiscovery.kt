@@ -38,8 +38,6 @@ class CoreDiscovery(context: Context, private val onChange: (List<Found>) -> Uni
     private var resolving = false
     private var listener: NsdManager.DiscoveryListener? = null
 
-    val running: Boolean get() = listener != null
-
     fun current(): List<Found> = synchronized(lock) { found.values.toList() }
 
     fun start() {

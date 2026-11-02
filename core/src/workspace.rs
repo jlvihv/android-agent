@@ -8,7 +8,7 @@
 //! 临时的该放 `/tmp`）。它不整理任何东西 —— 只把「该收一收了」这件事变得看得见。
 //! 整理是模型的活（它会 `mv`），也是用户的决定（他的文件，他不点头我们不动）。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 /// 递归算大小时最多看这么多条目（大目录不至于让命令卡住）。
@@ -55,7 +55,7 @@ pub fn render(root_guest: &str, host: &Path) -> anyhow::Result<String> {
                 modified,
             });
         } else if ft.is_file() {
-            let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+            let bytes = e.metadata().map_or(0, |m| m.len());
             total_bytes += bytes;
             files.push(Entry {
                 name,
@@ -145,7 +145,7 @@ fn dir_stats(dir: &Path, budget: &mut u32) -> (u64, usize) {
         items += 1;
         match e.file_type() {
             Ok(t) if t.is_dir() => bytes += dir_stats(&e.path(), budget).0,
-            Ok(t) if t.is_file() => bytes += e.metadata().map(|m| m.len()).unwrap_or(0),
+            Ok(t) if t.is_file() => bytes += e.metadata().map_or(0, |m| m.len()),
             _ => {}
         }
     }
@@ -183,14 +183,5 @@ fn ago(t: Option<SystemTime>) -> String {
         format!("{} 天前", secs / 86_400)
     } else {
         format!("{} 个月前", secs / (86_400 * 30))
-    }
-}
-
-/// 把 `/workspace`（或它的子目录）解析成宿主路径的工具见 `LinuxSandbox::resolve_path`；
-/// 这个模块只管画表。
-pub fn entry_path(root: &Path, sub: Option<&str>) -> PathBuf {
-    match sub {
-        Some(s) if !s.is_empty() => root.join(s),
-        _ => root.to_path_buf(),
     }
 }

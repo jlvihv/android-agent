@@ -89,7 +89,7 @@ def spans_vs_others(texts, key):
         if other == key:
             continue
         sm = difflib.SequenceMatcher(None, mine, t, autojunk=False)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
             if tag != "equal":
                 spans.append((i1, i2))
     # 挨得很近的碎块合成一段：逐字比出来的是「wor/ks/ace」这种碎片，

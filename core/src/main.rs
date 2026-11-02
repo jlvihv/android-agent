@@ -246,7 +246,10 @@ fn lan_ips() -> Vec<std::net::Ipv4Addr> {
         while !p.is_null() {
             let ifa = &*p;
             let up = ifa.ifa_flags & (libc::IFF_UP as u32) != 0;
-            if up && !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET {
+            if up
+                && !ifa.ifa_addr.is_null()
+                && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET
+            {
                 let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
                 let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
                 if ip.is_private() && !out.contains(&ip) {

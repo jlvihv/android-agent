@@ -97,8 +97,6 @@ class AgentNotificationListener : NotificationListenerService() {
             return out
         }
 
-        fun connected(): Boolean = instance != null
-
         private val timeFmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
 
         private fun describe(ctx: Context, sbn: StatusBarNotification): JSONObject? {

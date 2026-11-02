@@ -115,7 +115,7 @@ impl Resident {
             cmd.current_dir(c);
         }
         let mut child = cmd.spawn()?;
-        let pid = child.id().map(|p| p as i32).unwrap_or(0);
+        let pid = child.id().map_or(0, |p| p as i32);
         let stdin = child
             .stdin
             .take()
@@ -148,15 +148,6 @@ impl Resident {
     /// 宿主上那个进程的 pid（`agent ps` 认 tracee 用）
     pub fn pid(&self) -> i32 {
         self.pid
-    }
-
-    /// 常驻 bash 自己的 pid（`agent ps` 里要把它排除掉）
-    pub fn shell_pid(&self) -> Option<i32> {
-        std::fs::read_to_string(&self.marker)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
     }
 
     /// 交给它一条命令（文件已经写好、FIFO 已经建好）。

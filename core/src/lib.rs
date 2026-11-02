@@ -7,7 +7,7 @@
 //!                                        │
 //!                            spawn_blocking
 //!                                        ▼
-//!                                 DeviceApi (Kotlin / mock)
+//!                                 DeviceApi (Kotlin)
 //! ```
 //!
 //! 边界铁律：**native 侧不反调 Java**。设备能力由 `DeviceApi` trait 抽象，
@@ -37,7 +37,6 @@ pub mod linux;
 pub mod llm;
 pub mod machines;
 pub mod mcp;
-pub mod mock;
 pub mod models;
 pub mod notify;
 pub mod openai;
@@ -60,8 +59,8 @@ pub mod skills;
 pub mod sse;
 pub mod state;
 pub mod status;
+pub mod text;
 pub mod tunnel;
-pub mod urls;
 pub mod weather;
 pub mod workspace;
 
@@ -268,17 +267,16 @@ impl Core {
         // 并告诉人怎么办（见 `cdp::Conn::connect`）。
         #[cfg(not(target_os = "android"))]
         {
-            let shots =
-                core.state
-                    .linux()
-                    .map(|l| l.shot_dir())
-                    .unwrap_or_else(|| crate::gc::ShotDir {
-                        host: std::env::temp_dir().join("android-agent-shots"),
-                        guest: std::env::temp_dir()
-                            .join("android-agent-shots")
-                            .display()
-                            .to_string(),
-                    });
+            let shots = core.state.linux().map_or_else(
+                || crate::gc::ShotDir {
+                    host: std::env::temp_dir().join("android-agent-shots"),
+                    guest: std::env::temp_dir()
+                        .join("android-agent-shots")
+                        .display()
+                        .to_string(),
+                },
+                |l| l.shot_dir(),
+            );
             if let Some(b) = cdp::CdpBrowser::from_env(shots) {
                 tracing::info!("浏览器后端: CDP（{}）", b.endpoint());
                 core.state.set_browser(Arc::new(b));
@@ -409,7 +407,7 @@ impl Core {
     pub async fn browser(&self, action_json: &str) -> anyhow::Result<serde_json::Value> {
         let host = self.state.browser().ok_or_else(|| {
             // 桌面上被 `AGENT_CDP=off` 关掉时走这里；手机上则是壳还没注入
-            if self.state.linux().map(|s| s.is_native()).unwrap_or(false) {
+            if self.state.linux().is_some_and(|s| s.is_native()) {
                 anyhow::anyhow!(
                     "浏览器不可用（桌面这个后端被 AGENT_CDP=off 关了）。要取网页就用 bash 里的 curl"
                 )
@@ -566,7 +564,7 @@ impl Core {
         };
 
         // 不带参数 = help + 状态；service = 核心自己答
-        let group = argv.first().map(|s| s.as_str()).unwrap_or("");
+        let group = argv.first().map_or("", std::string::String::as_str);
         // 不带参数和 `help` 都是「help + 现在什么状态」（状态放在最后一行）
         if group.is_empty() || matches!(group, "help" | "-h" | "--help") {
             return crate::shizuku::banner(&host.state());
@@ -638,8 +636,10 @@ impl Core {
             .read()
             .ok()
             .and_then(|g| g.clone())
-            .map(|d| d.join("images"))
-            .unwrap_or_else(|| std::env::temp_dir().join("android-agent-images"));
+            .map_or_else(
+                || std::env::temp_dir().join("android-agent-images"),
+                |d| d.join("images"),
+            );
         // 写盘是阻塞 I/O，几 MB 也会占住一个 worker（只有 `WORKERS` 个）
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("建图片目录失败: {e}"))?;
@@ -665,8 +665,10 @@ impl Core {
             .read()
             .ok()
             .and_then(|g| g.clone())
-            .map(|d| d.join("attachments"))
-            .unwrap_or_else(|| std::env::temp_dir().join("android-agent-attachments"))
+            .map_or_else(
+                || std::env::temp_dir().join("android-agent-attachments"),
+                |d| d.join("attachments"),
+            )
     }
 
     /// 按 id 取已落盘的附件绝对路径。
@@ -978,7 +980,7 @@ fn readable_reply(html: &str, spill: Option<&SpillDir>) -> Result<String, String
 /// 以前两边各写一套，同一个动作模型在两种机器上看到两个样子。
 fn tab_reply(action: &str, v: &serde_json::Value) -> Option<String> {
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
-    let n = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+    let n = |k: &str| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
     let page = |url: &str, title: &str| {
         if url.is_empty() || url == "about:blank" {
             "空白页".to_string()
@@ -1009,9 +1011,9 @@ fn tab_reply(action: &str, v: &serde_json::Value) -> Option<String> {
                 let field = |k: &str| t.get(k).and_then(|x| x.as_str()).unwrap_or("");
                 out.push_str(&format!(
                     "\n  [{}] {}{}",
-                    t.get("id").and_then(|x| x.as_i64()).unwrap_or(0),
+                    t.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0),
                     page(field("url"), field("title")),
-                    if t.get("current").and_then(|x| x.as_bool()) == Some(true) {
+                    if t.get("current").and_then(serde_json::Value::as_bool) == Some(true) {
                         "  ← 当前"
                     } else {
                         ""

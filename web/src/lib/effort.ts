@@ -17,8 +17,6 @@ export const EFFORTS = [
   { value: "high", label: "高" },
 ] as const;
 
-export type EffortValue = (typeof EFFORTS)[number]["value"];
-
 /** 值 → 显示名。认不出来的（比如 CLI 手填的）原样显示，别显示成「默认」骗人。 */
 export function effortLabel(v: string | null | undefined): string {
   return EFFORTS.find((e) => e.value === (v ?? null))?.label ?? String(v);

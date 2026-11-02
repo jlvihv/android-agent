@@ -460,353 +460,385 @@ impl CdpBrowser {
     }
 
     /// 一只标签上的动作：只碰它自己的连接。
+    ///
+    /// 每个动作一个 `page_*` 小函数。以前这些分支全挤在这一个 match 里（348 行），
+    /// 改一个动作要在几十屏里找自己那一段；现在这里是张表，细节各自成篇。
     fn page_dispatch(&self, p: &mut Page, name: &str, a: &Value) -> Result<Value, String> {
-        let conn = &mut p.conn;
         // 每只标签一条自己的连接（直连页面），消息里不带 sessionId
-        let session = String::new();
+        let conn = &mut p.conn;
+        let session = "";
         match name {
-            "navigate" => {
-                let url = a.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
-                if url.is_empty() {
-                    return Err("缺少参数 url".into());
-                }
-                let target =
-                    normalize_url(url).ok_or_else(|| format!("只支持 http/https：{url}"))?;
-                self.navigate_on(conn, &target)
-            }
-            "get_backbone" => {
-                let depth = a
-                    .get("max_depth")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .clamp(1, 10);
-                let js = page_js("backbone", json!({ "max_depth": depth }))?;
-                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
-                if let Some(e) = err_of(&out) {
-                    return Err(e);
-                }
-                let mut text = out
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if text.chars().count() > BACKBONE_MAX_CHARS {
-                    text = clip(&text, BACKBONE_MAX_CHARS);
-                    text.push_str("\n…（树太长，已截断；用 selector 缩小范围或调小 max_depth）");
-                }
-                let nodes = out.get("nodes").and_then(|v| v.as_i64()).unwrap_or(0);
-                let d = out.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
-                Ok(ok(
-                    &format!("页面结构（{nodes} 个节点，深度 {d}）：\n{text}"),
-                    None,
-                    None,
-                ))
-            }
-            "click" => {
-                let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-                let js = if !sel.is_empty() {
-                    page_js("click_sel", json!({ "selector": sel }))?
-                } else if let (Some(x), Some(y)) = (
-                    a.get("x").and_then(|v| v.as_i64()),
-                    a.get("y").and_then(|v| v.as_i64()),
-                ) {
-                    page_js("click_xy", json!({ "x": x, "y": y }))?
-                } else {
-                    return Err("click 需要 selector，或者 x + y".into());
-                };
-                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
-                if let Some(e) = err_of(&out) {
-                    return Err(e);
-                }
-                self.settle(conn, &session)?;
-                let tag = out.get("tag").and_then(|v| v.as_str()).unwrap_or("");
-                let text = clip(out.get("text").and_then(|v| v.as_str()).unwrap_or(""), 80);
-                let matched = out.get("matched").and_then(|v| v.as_i64()).unwrap_or(1);
-                let extra = if matched > 1 {
-                    format!("（selector 匹配到 {matched} 个，点的是第一个）")
-                } else {
-                    String::new()
-                };
-                let info = page_info(conn, &session)?;
-                Ok(with_page_info(
-                    ok(&format!("已点击 <{tag}> {text}{extra}"), None, None),
-                    &info,
-                ))
-            }
-            "type" => {
-                let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-                if sel.is_empty() {
-                    return Err("缺少参数 selector".into());
-                }
-                let text = a.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                let js = page_js("type", json!({ "selector": sel, "text": text }))?;
-                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
-                if let Some(e) = err_of(&out) {
-                    return Err(e);
-                }
-                self.settle(conn, &session)?;
-                let n = out.get("length").and_then(|v| v.as_i64()).unwrap_or(0);
-                let matched = out.get("matched").and_then(|v| v.as_i64()).unwrap_or(1);
-                let extra = if matched > 1 {
-                    format!("（selector 匹配到 {matched} 个，填的是第一个）")
-                } else {
-                    String::new()
-                };
-                Ok(ok(
-                    &format!("已往 {sel} 输入 {n} 个字符{extra}"),
-                    None,
-                    None,
-                ))
-            }
-            "get_text" => {
-                let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-                let js = page_js("get_text", json!({ "selector": sel }))?;
-                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
-                if let Some(e) = err_of(&out) {
-                    return Err(e);
-                }
-                let mut text = out
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let total = out.get("length").and_then(|v| v.as_i64()).unwrap_or(0);
-                if text.chars().count() > TEXT_MAX_CHARS {
-                    text = clip(&text, TEXT_MAX_CHARS);
-                }
-                let head = if sel.is_empty() {
-                    format!("正文（{total} 字）：")
-                } else {
-                    format!("{sel} 的文本（{total} 字）：")
-                };
-                Ok(ok(&format!("{head}\n{text}"), None, None))
-            }
-            // 只取渲染后的 HTML：抽正文和排版在 `Core::browser` 里做（和手机、和
-            // `agent readable` 同一套，见 readable.rs）
-            "get_readable" => {
-                let js = page_js("page_html", json!({}))?;
-                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
-                if let Some(e) = err_of(&out) {
-                    return Err(e);
-                }
-                let mut v = out;
-                v["ok"] = json!(true);
-                Ok(v)
-            }
-            "wait_for_dom_stable" => {
-                let secs = a
-                    .get("timeout")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(10)
-                    .max(1);
-                let sig_js = page_js("dom_sig", json!({}))?;
-                let before = eval_str(conn, &session, &sig_js)?;
-                self.await_dom_stable(conn, &session, Duration::from_secs(secs as u64))?;
-                let after = eval_str(conn, &session, &sig_js)?;
-                let moved = before != after;
-                Ok(ok(
-                    if moved {
-                        "页面已经安定（内容有更新）"
-                    } else {
-                        "页面已经安定（内容没变）"
-                    },
-                    None,
-                    None,
-                ))
-            }
-            "scroll" => {
-                let dir = a
-                    .get("direction")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("down");
-                let amount = a.get("amount").and_then(|v| v.as_i64()).unwrap_or(600);
-                let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-                let js = page_js(
-                    "scroll",
-                    json!({ "direction": dir, "amount": amount, "selector": sel }),
-                )?;
-                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
-                if let Some(e) = err_of(&out) {
-                    return Err(e);
-                }
-                let where_ = out
-                    .get("element")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("window");
-                let y = out.get("scrollY").and_then(|v| v.as_i64()).unwrap_or(0);
-                let h = out
-                    .get("scrollHeight")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let done = out
-                    .get("scrolled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                Ok(ok(
-                    &format!(
-                        "{}滚动 {where_}：y={y} / {h}",
-                        if done { "" } else { "没能" }
-                    ),
-                    None,
-                    None,
-                ))
-            }
-            "screenshot" => {
-                let full = a
-                    .get("full_page")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let r = conn.call(
-                    Some(&session),
-                    "Page.captureScreenshot",
-                    json!({
-                        "format": "jpeg",
-                        "quality": SHOT_QUALITY,
-                        "captureBeyondViewport": full,
-                    }),
-                )?;
-                let b64 = r
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "截图没有数据".to_string())?;
-                let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                    .map_err(|e| format!("截图解码失败: {e}"))?;
-                std::fs::create_dir_all(&self.shots.host)
-                    .map_err(|e| format!("建截图目录失败: {e}"))?;
-                let name = format!("shot-{}.jpg", uuid::Uuid::now_v7());
-                let path = self.shots.host.join(&name);
-                std::fs::write(&path, &bytes).map_err(|e| format!("写截图失败: {e}"))?;
-                let guest = format!("{}/{}", self.shots.guest.trim_end_matches('/'), name);
-                let info = page_info(conn, &session)?;
-                let mut out = json!({
-                    "ok": true,
-                    "image": guest,
-                    "text": format!(
-                        "已截图（{}，{} KB）",
-                        if full { "整页" } else { "当前视口" },
-                        bytes.len() / 1024
-                    ),
-                });
-                out = with_page_info(out, &info);
-                Ok(out)
-            }
-            "back" => {
-                let h = conn.call(Some(&session), "Page.getNavigationHistory", json!({}))?;
-                let idx = h.get("currentIndex").and_then(|v| v.as_i64()).unwrap_or(0);
-                let entries = h
-                    .get("entries")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                if idx <= 0 || entries.is_empty() {
-                    return Err("已经是第一页了，退不了".into());
-                }
-                let entry = entries
-                    .get((idx - 1) as usize)
-                    .and_then(|e| e.get("id"))
-                    .cloned()
-                    .ok_or_else(|| "拿不到上一条历史".to_string())?;
-                conn.drain_events();
-                conn.call(
-                    Some(&session),
-                    "Page.navigateToHistoryEntry",
-                    json!({ "entryId": entry }),
-                )?;
-                conn.wait_event(&session, "Page.loadEventFired", NAV_TIMEOUT)?;
-                self.await_dom_stable(conn, &session, SETTLE_BUDGET)?;
-                install_target_fix(conn, &session);
-                let info = page_info(conn, &session)?;
-                let url = info
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Ok(with_page_info(
-                    ok(&format!("已后退到 {url}"), None, None),
-                    &info,
-                ))
-            }
-            "press" => {
-                let key = a.get("key").and_then(|v| v.as_str()).unwrap_or("");
-                let js = page_js("press", json!({ "key": key }))?;
-                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
-                if let Some(e) = err_of(&out) {
-                    return Err(e);
-                }
-                self.settle(conn, &session)?;
-                let acted = out.get("acted").and_then(|v| v.as_str()).unwrap_or("");
-                Ok(ok(
-                    &format!(
-                        "已按 {key}{}",
-                        if acted.is_empty() {
-                            String::new()
-                        } else {
-                            format!("（{acted}）")
-                        }
-                    ),
-                    None,
-                    None,
-                ))
-            }
-            "find_elements" => {
-                let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-                if sel.is_empty() {
-                    return Err("缺少参数 selector".into());
-                }
-                let js = page_js("find_elements", json!({ "selector": sel }))?;
-                let out = eval_json(conn, &session, &js, JS_TIMEOUT)?;
-                if let Some(e) = err_of(&out) {
-                    return Err(e);
-                }
-                let count = out.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-                let items = out
-                    .get("items")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let mut text = format!("匹配到 {count} 个（列前 {} 个）：", items.len());
-                for it in &items {
-                    text.push_str(&format!(
-                        "\n  [{}] <{}> {}  {}x{} @ {},{} {}",
-                        it.get("i").and_then(|v| v.as_i64()).unwrap_or(0),
-                        it.get("tag").and_then(|v| v.as_str()).unwrap_or(""),
-                        clip(it.get("text").and_then(|v| v.as_str()).unwrap_or(""), 60),
-                        it.get("w").and_then(|v| v.as_i64()).unwrap_or(0),
-                        it.get("h").and_then(|v| v.as_i64()).unwrap_or(0),
-                        it.get("x").and_then(|v| v.as_i64()).unwrap_or(0),
-                        it.get("y").and_then(|v| v.as_i64()).unwrap_or(0),
-                        if it.get("visible").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            "可见"
-                        } else {
-                            "不可见"
-                        },
-                    ));
-                }
-                Ok(ok(&text, None, None))
-            }
-            "js" => {
-                let script = a.get("script").and_then(|v| v.as_str()).unwrap_or("");
-                if script.trim().is_empty() {
-                    return Err("缺少参数 script".into());
-                }
-                // 包一层 async IIFE：`await fetch(...)` 是这个动作最值钱的用法。
-                // CDP 的 `awaitPromise` 会等它，不用像 Kotlin 那边 kick + 轮询。
-                let expr = format!("(async function() {{\n{script}\n}})()");
-                let v = conn.eval(&session, &expr, JS_TIMEOUT)?;
-                let body = match &v {
-                    Value::Null => "（没有返回值）".to_string(),
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                let mut body = body;
-                if body.chars().count() > TEXT_MAX_CHARS {
-                    body = clip(&body, TEXT_MAX_CHARS);
-                    body.push_str("\n…（已截断）");
-                }
-                Ok(ok(&format!("JS 返回：\n{body}"), None, None))
-            }
+            "navigate" => self.page_navigate(conn, session, a),
+            "get_backbone" => self.page_backbone(conn, session, a),
+            "click" => self.page_click(conn, session, a),
+            "type" => self.page_type(conn, session, a),
+            "get_text" => self.page_get_text(conn, session, a),
+            "get_readable" => self.page_readable(conn, session, a),
+            "wait_for_dom_stable" => self.page_wait_stable(conn, session, a),
+            "scroll" => self.page_scroll(conn, session, a),
+            "screenshot" => self.page_screenshot(conn, session, a),
+            "back" => self.page_back(conn, session, a),
+            "press" => self.page_press(conn, session, a),
+            "find_elements" => self.page_find_elements(conn, session, a),
+            "js" => self.page_js_run(conn, session, a),
             other => Err(format!("未知动作: {other}（支持：{}）", ACTIONS.join(" "))),
         }
+    }
+
+    fn page_navigate(&self, conn: &mut Conn, _session: &str, a: &Value) -> Result<Value, String> {
+        let url = a.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if url.is_empty() {
+            return Err("缺少参数 url".into());
+        }
+        let target = normalize_url(url).ok_or_else(|| format!("只支持 http/https：{url}"))?;
+        self.navigate_on(conn, &target)
+    }
+
+    fn page_backbone(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let depth = a
+            .get("max_depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(5)
+            .clamp(1, 10);
+        let js = page_js("backbone", json!({ "max_depth": depth }))?;
+        let out = eval_json(conn, session, &js, JS_TIMEOUT)?;
+        if let Some(e) = err_of(&out) {
+            return Err(e);
+        }
+        let mut text = out
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if text.chars().count() > BACKBONE_MAX_CHARS {
+            text = crate::text::cap(&text, BACKBONE_MAX_CHARS);
+            text.push_str("\n…（树太长，已截断；用 selector 缩小范围或调小 max_depth）");
+        }
+        let nodes = out.get("nodes").and_then(|v| v.as_i64()).unwrap_or(0);
+        let d = out.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
+        Ok(ok(
+            &format!("页面结构（{nodes} 个节点，深度 {d}）：\n{text}"),
+            None,
+            None,
+        ))
+    }
+
+    fn page_click(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+        let js = if !sel.is_empty() {
+            page_js("click_sel", json!({ "selector": sel }))?
+        } else if let (Some(x), Some(y)) = (
+            a.get("x").and_then(|v| v.as_i64()),
+            a.get("y").and_then(|v| v.as_i64()),
+        ) {
+            page_js("click_xy", json!({ "x": x, "y": y }))?
+        } else {
+            return Err("click 需要 selector，或者 x + y".into());
+        };
+        let out = eval_json(conn, session, &js, JS_TIMEOUT)?;
+        if let Some(e) = err_of(&out) {
+            return Err(e);
+        }
+        self.settle(conn, session)?;
+        let tag = out.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+        let text = crate::text::cap(out.get("text").and_then(|v| v.as_str()).unwrap_or(""), 80);
+        let matched = out.get("matched").and_then(|v| v.as_i64()).unwrap_or(1);
+        let extra = if matched > 1 {
+            format!("（selector 匹配到 {matched} 个，点的是第一个）")
+        } else {
+            String::new()
+        };
+        let info = page_info(conn, session)?;
+        Ok(with_page_info(
+            ok(&format!("已点击 <{tag}> {text}{extra}"), None, None),
+            &info,
+        ))
+    }
+
+    fn page_type(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+        if sel.is_empty() {
+            return Err("缺少参数 selector".into());
+        }
+        let text = a.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let js = page_js("type", json!({ "selector": sel, "text": text }))?;
+        let out = eval_json(conn, session, &js, JS_TIMEOUT)?;
+        if let Some(e) = err_of(&out) {
+            return Err(e);
+        }
+        self.settle(conn, session)?;
+        let n = out.get("length").and_then(|v| v.as_i64()).unwrap_or(0);
+        let matched = out.get("matched").and_then(|v| v.as_i64()).unwrap_or(1);
+        let extra = if matched > 1 {
+            format!("（selector 匹配到 {matched} 个，填的是第一个）")
+        } else {
+            String::new()
+        };
+        Ok(ok(
+            &format!("已往 {sel} 输入 {n} 个字符{extra}"),
+            None,
+            None,
+        ))
+    }
+
+    fn page_get_text(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+        let js = page_js("get_text", json!({ "selector": sel }))?;
+        let out = eval_json(conn, session, &js, JS_TIMEOUT)?;
+        if let Some(e) = err_of(&out) {
+            return Err(e);
+        }
+        let mut text = out
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let total = out.get("length").and_then(|v| v.as_i64()).unwrap_or(0);
+        if text.chars().count() > TEXT_MAX_CHARS {
+            text = crate::text::cap(&text, TEXT_MAX_CHARS);
+        }
+        let head = if sel.is_empty() {
+            format!("正文（{total} 字）：")
+        } else {
+            format!("{sel} 的文本（{total} 字）：")
+        };
+        Ok(ok(&format!("{head}\n{text}"), None, None))
+    }
+
+    // 只取渲染后的 HTML：抽正文和排版在 `Core::browser` 里做（和手机、和
+    // `agent readable` 同一套，见 readable.rs）
+    fn page_readable(&self, conn: &mut Conn, session: &str, _a: &Value) -> Result<Value, String> {
+        let js = page_js("page_html", json!({}))?;
+        let out = eval_json(conn, session, &js, JS_TIMEOUT)?;
+        if let Some(e) = err_of(&out) {
+            return Err(e);
+        }
+        let mut v = out;
+        v["ok"] = json!(true);
+        Ok(v)
+    }
+
+    fn page_wait_stable(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let secs = a
+            .get("timeout")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(10)
+            .max(1);
+        let sig_js = page_js("dom_sig", json!({}))?;
+        let before = eval_str(conn, session, &sig_js)?;
+        self.await_dom_stable(conn, session, Duration::from_secs(secs as u64))?;
+        let after = eval_str(conn, session, &sig_js)?;
+        let moved = before != after;
+        Ok(ok(
+            if moved {
+                "页面已经安定（内容有更新）"
+            } else {
+                "页面已经安定（内容没变）"
+            },
+            None,
+            None,
+        ))
+    }
+
+    fn page_scroll(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let dir = a
+            .get("direction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("down");
+        let amount = a.get("amount").and_then(|v| v.as_i64()).unwrap_or(600);
+        let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+        let js = page_js(
+            "scroll",
+            json!({ "direction": dir, "amount": amount, "selector": sel }),
+        )?;
+        let out = eval_json(conn, session, &js, JS_TIMEOUT)?;
+        if let Some(e) = err_of(&out) {
+            return Err(e);
+        }
+        let where_ = out
+            .get("element")
+            .and_then(|v| v.as_str())
+            .unwrap_or("window");
+        let y = out.get("scrollY").and_then(|v| v.as_i64()).unwrap_or(0);
+        let h = out
+            .get("scrollHeight")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let done = out
+            .get("scrolled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(ok(
+            &format!(
+                "{}滚动 {where_}：y={y} / {h}",
+                if done { "" } else { "没能" }
+            ),
+            None,
+            None,
+        ))
+    }
+
+    fn page_screenshot(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let full = a
+            .get("full_page")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let r = conn.call(
+            Some(session),
+            "Page.captureScreenshot",
+            json!({
+                "format": "jpeg",
+                "quality": SHOT_QUALITY,
+                "captureBeyondViewport": full,
+            }),
+        )?;
+        let b64 = r
+            .get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "截图没有数据".to_string())?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .map_err(|e| format!("截图解码失败: {e}"))?;
+        std::fs::create_dir_all(&self.shots.host).map_err(|e| format!("建截图目录失败: {e}"))?;
+        let name = format!("shot-{}.jpg", uuid::Uuid::now_v7());
+        let path = self.shots.host.join(&name);
+        std::fs::write(&path, &bytes).map_err(|e| format!("写截图失败: {e}"))?;
+        let guest = format!("{}/{}", self.shots.guest.trim_end_matches('/'), name);
+        let info = page_info(conn, session)?;
+        let mut out = json!({
+            "ok": true,
+            "image": guest,
+            "text": format!(
+                "已截图（{}，{} KB）",
+                if full { "整页" } else { "当前视口" },
+                bytes.len() / 1024
+            ),
+        });
+        out = with_page_info(out, &info);
+        Ok(out)
+    }
+
+    fn page_back(&self, conn: &mut Conn, session: &str, _a: &Value) -> Result<Value, String> {
+        let h = conn.call(Some(session), "Page.getNavigationHistory", json!({}))?;
+        let idx = h.get("currentIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+        let entries = h
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if idx <= 0 || entries.is_empty() {
+            return Err("已经是第一页了，退不了".into());
+        }
+        let entry = entries
+            .get((idx - 1) as usize)
+            .and_then(|e| e.get("id"))
+            .cloned()
+            .ok_or_else(|| "拿不到上一条历史".to_string())?;
+        conn.drain_events();
+        conn.call(
+            Some(session),
+            "Page.navigateToHistoryEntry",
+            json!({ "entryId": entry }),
+        )?;
+        conn.wait_event(session, "Page.loadEventFired", NAV_TIMEOUT)?;
+        self.await_dom_stable(conn, session, SETTLE_BUDGET)?;
+        install_target_fix(conn, session);
+        let info = page_info(conn, session)?;
+        let url = info
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(with_page_info(
+            ok(&format!("已后退到 {url}"), None, None),
+            &info,
+        ))
+    }
+
+    fn page_press(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let key = a.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let js = page_js("press", json!({ "key": key }))?;
+        let out = eval_json(conn, session, &js, JS_TIMEOUT)?;
+        if let Some(e) = err_of(&out) {
+            return Err(e);
+        }
+        self.settle(conn, session)?;
+        let acted = out.get("acted").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(ok(
+            &format!(
+                "已按 {key}{}",
+                if acted.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{acted}）")
+                }
+            ),
+            None,
+            None,
+        ))
+    }
+
+    fn page_find_elements(
+        &self,
+        conn: &mut Conn,
+        session: &str,
+        a: &Value,
+    ) -> Result<Value, String> {
+        let sel = a.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+        if sel.is_empty() {
+            return Err("缺少参数 selector".into());
+        }
+        let js = page_js("find_elements", json!({ "selector": sel }))?;
+        let out = eval_json(conn, session, &js, JS_TIMEOUT)?;
+        if let Some(e) = err_of(&out) {
+            return Err(e);
+        }
+        let count = out.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let items = out
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut text = format!("匹配到 {count} 个（列前 {} 个）：", items.len());
+        for it in &items {
+            text.push_str(&format!(
+                "\n  [{}] <{}> {}  {}x{} @ {},{} {}",
+                it.get("i").and_then(|v| v.as_i64()).unwrap_or(0),
+                it.get("tag").and_then(|v| v.as_str()).unwrap_or(""),
+                crate::text::cap(it.get("text").and_then(|v| v.as_str()).unwrap_or(""), 60),
+                it.get("w").and_then(|v| v.as_i64()).unwrap_or(0),
+                it.get("h").and_then(|v| v.as_i64()).unwrap_or(0),
+                it.get("x").and_then(|v| v.as_i64()).unwrap_or(0),
+                it.get("y").and_then(|v| v.as_i64()).unwrap_or(0),
+                if it.get("visible").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "可见"
+                } else {
+                    "不可见"
+                },
+            ));
+        }
+        Ok(ok(&text, None, None))
+    }
+
+    fn page_js_run(&self, conn: &mut Conn, session: &str, a: &Value) -> Result<Value, String> {
+        let script = a.get("script").and_then(|v| v.as_str()).unwrap_or("");
+        if script.trim().is_empty() {
+            return Err("缺少参数 script".into());
+        }
+        // 包一层 async IIFE：`await fetch(...)` 是这个动作最值钱的用法。
+        // CDP 的 `awaitPromise` 会等它，不用像 Kotlin 那边 kick + 轮询。
+        let expr = format!("(async function() {{\n{script}\n}})()");
+        let v = conn.eval(session, &expr, JS_TIMEOUT)?;
+        let body = match &v {
+            Value::Null => "（没有返回值）".to_string(),
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let mut body = body;
+        if body.chars().count() > TEXT_MAX_CHARS {
+            body = crate::text::cap(&body, TEXT_MAX_CHARS);
+            body.push_str("\n…（已截断）");
+        }
+        Ok(ok(&format!("JS 返回：\n{body}"), None, None))
     }
 
     /// 在这只标签上打开一个（已经规范化的）地址，等它加载完、安定下来。
@@ -1392,7 +1424,7 @@ impl Conn {
                 .and_then(|d| d.as_str())
                 .or_else(|| ex.get("text").and_then(|t| t.as_str()))
                 .unwrap_or("未知错误");
-            return Err(format!("页面里报错: {}", clip(what, 300)));
+            return Err(format!("页面里报错: {}", crate::text::cap(what, 300)));
         }
         Ok(r.get("result")
             .and_then(|v| v.get("value"))
@@ -1905,16 +1937,6 @@ fn normalize_url(raw: &str) -> Option<String> {
     Some(format!("https://{url}"))
 }
 
-/// 按**字符**截断（多字节边界上 `truncate` 会 panic）
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
-}
-
 fn ok(text: &str, url: Option<String>, title: Option<String>) -> Value {
     let mut v = json!({ "ok": true, "text": text });
     if let Some(u) = url.filter(|u| !u.is_empty()) {
@@ -1963,7 +1985,7 @@ fn eval_json(conn: &mut Conn, session: &str, js: &str, timeout: Duration) -> Res
     let v = conn.eval(session, js, timeout)?;
     match v {
         Value::String(s) => serde_json::from_str(&s)
-            .map_err(|e| format!("页面返回的不是 JSON: {e}（{}）", clip(&s, 120))),
+            .map_err(|e| format!("页面返回的不是 JSON: {e}（{}）", crate::text::cap(&s, 120))),
         other => Ok(other),
     }
 }

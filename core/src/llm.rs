@@ -20,7 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::openai::{self, ChatRequest, StreamChunk, UserContent};
+use crate::openai::{self, ChatRequest, StreamChunk};
 use crate::responses::ResponsesRequest;
 
 /// OpenCode Go 明确要求：客户端要"用自己的 user agent 标识自己，
@@ -531,8 +531,7 @@ pub fn responses_key(p: &Provider) -> String {
 pub fn responses_known_unsupported(p: &Provider) -> bool {
     responses_unsupported()
         .lock()
-        .map(|s| s.contains(&responses_key(p)))
-        .unwrap_or(false)
+        .is_ok_and(|s| s.contains(&responses_key(p)))
 }
 
 /// 记下「这个端点不支持 Responses」。返回 `true` = 这是新记下的（调用方据此
@@ -540,47 +539,13 @@ pub fn responses_known_unsupported(p: &Provider) -> bool {
 pub fn mark_responses_unsupported(p: &Provider) -> bool {
     responses_unsupported()
         .lock()
-        .map(|mut s| s.insert(responses_key(p)))
-        .unwrap_or(false)
-}
-
-/// 全部已知不支持的（落盘用）。
-pub fn responses_unsupported_list() -> Vec<String> {
-    let mut v: Vec<String> = responses_unsupported()
-        .lock()
-        .map(|s| s.iter().cloned().collect())
-        .unwrap_or_default();
-    v.sort();
-    v
+        .is_ok_and(|mut s| s.insert(responses_key(p)))
 }
 
 /// 启动时把落过盘的读回来：不然每次重启后的第一个请求都要白白失败一次。
 pub fn load_responses_unsupported(keys: impl IntoIterator<Item = String>) {
     if let Ok(mut s) = responses_unsupported().lock() {
         s.extend(keys);
-    }
-}
-
-/// 构造一条最小的 chat 请求（Chat Completions）。
-pub fn build_chat_request(model: &str, system: Option<&str>, user: &str) -> ChatRequest {
-    let mut messages = Vec::new();
-    if let Some(sys) = system {
-        messages.push(openai::Message::System {
-            content: sys.to_string(),
-        });
-    }
-    messages.push(openai::Message::User {
-        content: UserContent::Text(user.to_string()),
-    });
-    ChatRequest {
-        model: model.to_string(),
-        messages,
-        tools: Vec::new().into(),
-        stream: true,
-        stream_options: openai::StreamOptions {
-            include_usage: true,
-        },
-        reasoning_effort: None,
     }
 }
 

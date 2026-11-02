@@ -29,6 +29,7 @@
 use std::process::{Command as Proc, Stdio};
 
 use crate::status::Snapshot;
+use crate::text;
 
 /// 一条要发出去的通知（拼好的文案）。
 #[derive(Clone, Debug, PartialEq)]
@@ -63,8 +64,8 @@ pub fn compose(s: &Snapshot) -> Option<Notice> {
         name_or(&s.title, "新对话")
     );
     // 正文 = 回复预览（`Snapshot::detail`，核心里是「模型最后说的那行」）
-    let body = match s.detail.as_deref().map(one_line) {
-        Some(d) if !d.is_empty() => clip(&d, BODY_MAX),
+    let body = match s.detail.as_deref().map(text::one_line) {
+        Some(d) if !d.is_empty() => text::cap(&d, BODY_MAX),
         _ => if s.ok {
             "任务跑完了"
         } else {
@@ -73,7 +74,7 @@ pub fn compose(s: &Snapshot) -> Option<Notice> {
         .to_string(),
     };
     Some(Notice {
-        title: clip(&title, TITLE_MAX),
+        title: text::cap(&title, TITLE_MAX),
         body,
     })
 }
@@ -85,20 +86,6 @@ fn name_or(s: &str, fallback: &str) -> String {
     } else {
         t.to_string()
     }
-}
-
-/// 压成一行：通知只有一段，多个换行会被系统折成一堆空白。
-fn one_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// 按**字符**截断（`String::len` 数的是字节，汉字会被截成半个）。
-fn clip(s: &str, max: usize) -> String {
-    let mut out: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        out.push('…');
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------

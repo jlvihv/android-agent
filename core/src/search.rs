@@ -170,7 +170,11 @@ async fn search_mcp(query: &str, num: usize) -> anyhow::Result<Found> {
                 text.chars().take(200).collect::<String>()
             )
         })?;
-    if payload.pointer("/result/isError").and_then(|v| v.as_bool()) == Some(true) {
+    if payload
+        .pointer("/result/isError")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
         anyhow::bail!(
             "Exa MCP 报错：{}",
             content.chars().take(300).collect::<String>()
@@ -269,12 +273,14 @@ fn squeeze(s: &str) -> String {
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 回退标题用：域名；连域名都认不出（没有协议头）就原样给 URL，别给空标题。
 fn host_of(url: &str) -> String {
-    url.split("//")
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or(url)
-        .to_string()
+    let host = crate::text::host_name(url);
+    if host.is_empty() {
+        url.to_string()
+    } else {
+        host
+    }
 }
 
 // ---------------------------------------------------------------------------

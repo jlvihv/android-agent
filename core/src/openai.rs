@@ -321,8 +321,8 @@ impl UsageView {
         let input = input.max(cache_read + cache_write);
         let uncached_input = input - cache_read - cache_write;
         let cache_hit_ratio = cache_hit_ratio(
-            cache_read as u64,
-            if cache_reported { input as u64 } else { 0 },
+            u64::from(cache_read),
+            if cache_reported { u64::from(input) } else { 0 },
         );
         Self {
             input,

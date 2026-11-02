@@ -506,7 +506,7 @@ fn convert_usage(u: ResponsesUsage) -> Usage {
 }
 
 fn clip(s: &str) -> &str {
-    let end = s.char_indices().nth(200).map(|(i, _)| i).unwrap_or(s.len());
+    let end = s.char_indices().nth(200).map_or(s.len(), |(i, _)| i);
     &s[..end]
 }
 

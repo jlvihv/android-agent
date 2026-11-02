@@ -3,42 +3,15 @@
  * 改动这里时记得同步改 Rust（字段名靠 serde 保持一致）。
  */
 
-export type Flags = {
-  clickable: boolean;
-  long_clickable: boolean;
-  editable: boolean;
-  scrollable: boolean;
-  checkable: boolean;
-  focusable: boolean;
-  enabled: boolean;
-  selected: boolean;
-};
-
-/** 剪枝后的扁平节点。`p` 是父节点索引，-1 为根。 */
-export type Command =
-  | { type: "tap_xy"; x: number; y: number }
-  | {
-      type: "swipe";
-      x1: number;
-      y1: number;
-      x2: number;
-      y2: number;
-      ms?: number;
-    }
-  | { type: "key"; name: "back" | "home" | "recents" | "enter" | string }
-  | { type: "launch"; package: string };
-
 export type Hello = {
   port: number;
   version: string;
   platform: string;
-  mock: boolean;
 };
 
 export type DeviceInfo = {
   connected: boolean;
   name: string;
-  mock: boolean;
 };
 
 export type Ack = {
@@ -76,8 +49,3 @@ export type AgentEvent =
   | { type: "turn"; status: TurnStatus }
   /** 「还有没有回合在跑」（全局的，不分会话）。起止各一条 */
   | { type: "turn_active"; active: boolean };
-
-/** 前端 → Rust 的 WS 消息 */
-export type ClientMsg =
-  | { type: "command"; cmd: Command }
-  | { type: "log"; level: string; msg: string };

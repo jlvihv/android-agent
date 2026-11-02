@@ -270,7 +270,7 @@ the loader's .text differs between toolchain generations`。功能等价，别�
 
 proot 是个普通 Linux 程序，x86_64 版本随便装。所以 `linux_run` 工具、
 rootfs 管理、命令构造这些逻辑**全部可以在桌面上开发验证**，
-跟我们前面「同源 localhost + mock 设备」的路子完全一致。
+跟我们前面「同源 localhost + 假设备」的路子完全一致。
 
 只有 loader / nativeLibraryDir / SELinux 那部分必须真机验证。
 

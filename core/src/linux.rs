@@ -46,7 +46,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// 基本等于「不设限」，但总得有个兜底 —— 一条真正挂死的命令不能把沙箱占住到
 /// 天荒地老。下载、编译、`apk add` 这类活儿几十分钟到几小时都正常，6000 秒
 /// 那种量级完全该允许。
-pub const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+pub const MAX_TIMEOUT: Duration = Duration::from_hours(24);
 
 /// `read` 工具允许整份读进内存的文本文件上限。
 ///
@@ -158,7 +158,7 @@ pub const WORKSPACE: &str = "/workspace";
 pub fn session_dir_name(sid: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in sid.as_bytes() {
-        h ^= *b as u64;
+        h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     // splitmix64 的收尾：把高位搅下来，不然 uuid（高 8 位是时间戳、彼此很像）
@@ -746,7 +746,7 @@ fn render_cmdline(raw: &[u8]) -> String {
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect::<Vec<_>>()
         .join(" ");
-    clip_chars(&joined, 120)
+    crate::text::cap(&joined, 120)
 }
 
 /// 这条进程是不是一个 proot（我们要找的孤儿就是它）。
@@ -758,23 +758,12 @@ fn is_proot(p: &RawProc, proot_name: &str) -> bool {
     p.cmdline
         .split_whitespace()
         .next()
-        .map(|a| a.rsplit('/').next().unwrap_or(a) == proot_name)
-        .unwrap_or(false)
-}
-
-/// 按**字符**截断（`String::truncate` 撞上多字节边界会 panic）。
-fn clip_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
+        .is_some_and(|a| a.rsplit('/').next().unwrap_or(a) == proot_name)
 }
 
 /// 多行命令压成一行（登记表里只留一条给模型认领的线索）。
 fn one_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::text::one_line(s)
 }
 
 /// 进程还活着吗。僵尸也算「活着」（它占着 pid），调用方按需滤掉。
@@ -787,10 +776,7 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::agent::now_ms()
 }
 
 /// 我们起过的一条命令 —— `procs()` 靠它把 /proc 里的进程认到命令上。
@@ -1081,11 +1067,11 @@ pub const fn has_phone_capabilities() -> bool {
 /// 为什么留这个小壳而不是直接把 `BROWSER` 指到 `agent`：`$BROWSER` 和那几个
 /// 名字都得是**一个可执行文件**，写不了 `agent open`（不同调用方拆参数的方式
 /// 还不一样；python 的 webbrowser 会拿 `%s` 去替换）。
-const AGENT_OPEN: &str = r##"#!/bin/sh
+const AGENT_OPEN: &str = r#"#!/bin/sh
 # agent-open —— 见 `agent open`。也会以 xdg-open / sensible-browser /
 # www-browser / x-www-browser / gnome-open / kde-open 的身份被调用。
 exec /usr/local/bin/agent open "$@"
-"##;
+"#;
 
 /// 这六个名字都是“开浏览器”的常见入口（OpenMinis 垫的是同一组），全转发给
 /// `agent-open`。
@@ -1125,7 +1111,7 @@ pub const TOOLSET: &[&str] = &[
 /// 注意：**不能拿 `apk add` 的退出码当准**。proot 下 busybox / ca-certificates
 /// 的 trigger 常常返回非零（装一个全新的小包也会报 “1 error; N packages”，
 /// 但包确实装上了）。所以脚本以**那些命令找不找得到**为准。
-const AGENT_SETUP_TEMPLATE: &str = r##"#!/bin/sh
+const AGENT_SETUP_TEMPLATE: &str = r#"#!/bin/sh
 # agent-setup —— 把干活要用的工具装上。
 #
 # Alpine minirootfs 里只有 busybox（没有 python、没有 curl、没有 jq，
@@ -1191,7 +1177,7 @@ echo "好了（apk 那句 1 error 是 proot 下 trigger 的事，以这份清单
 for b in $CHECK; do
   printf '  %-10s %s\n' "$b" "$(command -v "$b" 2>/dev/null || echo '?')"
 done
-"##;
+"#;
 
 /// 预装脚本的内容。清单变了这里就变，`write_if_changed` 会重写文件。
 fn setup_script() -> String {
@@ -1204,9 +1190,7 @@ fn setup_script() -> String {
 ///
 /// `exec` = 写成 0755（可执行）。
 fn write_if_changed(path: &Path, body: &str, exec: bool) -> anyhow::Result<()> {
-    let same = std::fs::read_to_string(path)
-        .map(|old| old == body)
-        .unwrap_or(false);
+    let same = std::fs::read_to_string(path).is_ok_and(|old| old == body);
     if same {
         return Ok(());
     }
@@ -1260,7 +1244,7 @@ fn native_bash() -> Option<PathBuf> {
 /// `POSIX::setsid()`。跟 util-linux 一样，调用方自己是组长时先 fork 一次
 /// （组长调 setsid 会 EPERM），父进程直接返回。只在 PATH 里**没有**真
 /// setsid 的机器上写（`prepare_native`），Linux 上一行都不碰。
-const SETSID_SHIM: &str = r##"#!/bin/sh
+const SETSID_SHIM: &str = r#"#!/bin/sh
 # setsid —— macOS 没有 util-linux 的 setsid(1)，这是 android-agent 垫的一个。
 # 用法同 util-linux：setsid <命令> [参数…]（让命令跑在一个新会话 / 进程组里）
 [ $# -gt 0 ] || { echo "用法：setsid <命令> [参数…]" >&2; exit 2; }
@@ -1272,17 +1256,15 @@ exec /usr/bin/perl -MPOSIX -e '
   exec { $ARGV[0] } @ARGV or die "setsid: $ARGV[0]: $!
 ";
 ' -- "$@"
-"##;
+"#;
 
 /// PATH 里（我们自己的 bin 目录以外）有没有真的 `setsid`。
 fn native_has_setsid(ours: &Path) -> bool {
-    std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| d != ours)
-                .any(|d| d.join("setsid").is_file())
-        })
-        .unwrap_or(false)
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .filter(|d| d != ours)
+            .any(|d| d.join("setsid").is_file())
+    })
 }
 
 impl LinuxSandbox {
@@ -1315,7 +1297,7 @@ impl LinuxSandbox {
     ) -> Option<RunKey> {
         let mut r = self.runs.lock().ok()?;
         Some(r.add(RunInfo {
-            command: clip_chars(&one_line(script), 160),
+            command: crate::text::cap(&one_line(script), 160),
             started_ms: now_ms(),
             proot_pid,
             pid_file,
@@ -1518,8 +1500,7 @@ impl LinuxSandbox {
     pub fn is_provisioned(&self) -> bool {
         match &self.mode {
             Mode::Proot(cfg) => std::fs::read_to_string(cfg.rootfs.join("etc/agent-tools"))
-                .map(|s| s.trim() == TOOLSET.len().to_string())
-                .unwrap_or(false),
+                .is_ok_and(|s| s.trim() == TOOLSET.len().to_string()),
             // 桌面：工具就是这台机器上本来就有的那些，没有 `apk add` 这一步
             Mode::Native { .. } => true,
         }
@@ -1529,7 +1510,7 @@ impl LinuxSandbox {
     ///
     /// 超时给得很大：手机上首次要下 ~75MB。
     pub async fn provision(&self) -> anyhow::Result<ExecResult> {
-        self.run("/usr/local/bin/agent-setup", Duration::from_secs(900), None)
+        self.run("/usr/local/bin/agent-setup", Duration::from_mins(15), None)
             .await
     }
 
@@ -1627,9 +1608,7 @@ impl LinuxSandbox {
                 .map(|s| format!("nameserver {s}\n"))
                 .collect();
             // 只在内容变了才写，避免每次启动都碰文件
-            let same = std::fs::read_to_string(&resolv)
-                .map(|old| old == body)
-                .unwrap_or(false);
+            let same = std::fs::read_to_string(&resolv).is_ok_and(|old| old == body);
             if !same {
                 std::fs::create_dir_all(rootfs.join("etc"))?;
                 std::fs::write(&resolv, body)?;
@@ -2285,7 +2264,7 @@ impl LinuxSandbox {
             let tap = tap.clone();
             tokio::spawn(async move {
                 let rx = resident::open_fifo_reader(fifo).await;
-                Capture::read_into(rx, live, cap, Some(tap)).await
+                Capture::read_into(rx, live, cap, Some(tap)).await;
             })
         };
         let out_task = reader(out_fifo.clone(), live.clone(), out_cap.clone());
@@ -2525,14 +2504,14 @@ impl LinuxSandbox {
         // （3 秒的超时能变成 5.5 秒返回）。
         let proot_exit = match exit_rx {
             Some(mut exit_rx) if !timed_out && status_code.is_none() => {
-                let early = exit_rx.try_recv().ok().and_then(|r| r.ok());
+                let early = exit_rx.try_recv().ok().and_then(std::result::Result::ok);
                 match early {
                     Some(st) => Some(st),
                     None => tokio::time::timeout(REAP_GRACE, exit_rx)
                         .await
                         .ok()
-                        .and_then(|r| r.ok())
-                        .and_then(|r| r.ok()),
+                        .and_then(std::result::Result::ok)
+                        .and_then(std::result::Result::ok),
                 }
             }
             _ => None,
@@ -2802,19 +2781,6 @@ impl LinuxSandbox {
         )?))
     }
 
-    /// 纯文本那条路（测试与内部用）。
-    pub fn read_text(
-        &self,
-        guest_path: &str,
-        offset: usize,
-        limit: Option<usize>,
-        numbered: bool,
-    ) -> anyhow::Result<ReadView> {
-        let host = self.resolve_readable(guest_path)?;
-        let text = read_utf8(&host, guest_path)?;
-        reader::read(&text, guest_path, offset, limit, numbered)
-    }
-
     fn resolve_readable(&self, guest_path: &str) -> anyhow::Result<PathBuf> {
         let host = self.resolve_path(guest_path)?;
         anyhow::ensure!(
@@ -2822,12 +2788,6 @@ impl LinuxSandbox {
             "不是文件或不存在: {guest_path}（目录内容用 bash 的 ls）"
         );
         Ok(host)
-    }
-
-    /// 写文件（`bash` 之外的小工具，也供测试用）
-    pub fn read_file(&self, guest_path: &str) -> anyhow::Result<String> {
-        let host = self.resolve_path(guest_path)?;
-        std::fs::read_to_string(&host).map_err(|e| anyhow::anyhow!("读取失败 {guest_path}: {e}"))
     }
 }
 
@@ -2917,7 +2877,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// 读成 UTF-8 文本。二进制给一条能操作的错误，而不是一句 "invalid utf-8"。
 fn read_utf8(host: &Path, guest_path: &str) -> anyhow::Result<String> {
-    let size = std::fs::metadata(host).map(|m| m.len()).unwrap_or(0);
+    let size = std::fs::metadata(host).map_or(0, |m| m.len());
     check_text_size(size, guest_path)?;
     let raw = std::fs::read(host).map_err(|e| anyhow::anyhow!("读取失败 {guest_path}: {e}"))?;
     String::from_utf8(raw).map_err(|_| {
@@ -3161,7 +3121,8 @@ impl Capture {
 /// 拿 `Capture` 的锁；被上个任务的 panic 毒到了也照样用（里面只有字节，
 /// 没有需要维持的不变式）。
 fn lock(cap: &Mutex<Capture>) -> MutexGuard<'_, Capture> {
-    cap.lock().unwrap_or_else(|e| e.into_inner())
+    cap.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// 等这次调用结束：状态文件 / 两根管道 EOF / 超时，三条路先到先算。

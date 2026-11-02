@@ -101,11 +101,11 @@ macOS 和 Linux 走同一条路（proot 是 Android 的事）：`just dev`，两
 
 两个平台共用的顺手修复：
 
-- **设备通道不能拿 mock 顶**：mock 对什么都回成功 —— `agent open` 打出「已让手机
-  打开」其实什么都没开，点击回一句假的 `mock: tapped`。宿主
-  模式的设备就是这台电脑（`core/src/desktop.rs` 的 `HostDevice`）：`open` 交给
-  `open` / `xdg-open`，做不到的（点、滑、按键）明说做不到。`agent` 脚本里不需要
-  任何桌面的特判 —— 走的还是同一条 `/api/command`。mock 只在测试里用。
+- **设备通道不能假装成功**：曾经有过一个 mock 设备实现（对什么都回「成功」——
+  `agent open` 打出「已让手机打开」其实什么都没开，点击回一句假的 `mock: tapped`），
+  已经删掉了。宿主模式的设备就是这台电脑（`core/src/desktop.rs` 的 `HostDevice`）：
+  `open` 交给 `open` / `xdg-open`，做不到的（点、滑、按键）明说做不到。
+  `agent` 脚本里不需要任何桌面的特判 —— 走的还是同一条 `/api/command`。
 - **提示词要如实写宿主能干什么**：桌面上有核心自己起的无头 Chrome，提示词不能说
   「没有 `agent browser`」—— 那样模型会白白放弃浏览器。
 

@@ -787,7 +787,7 @@ impl Machines {
 async fn watch_turns(port: u16, token: &str, db: Option<&crate::db::Db>) -> Result<(), String> {
     // reqwest 已经在依赖里（llm 用它），流式响应也开着 —— 不必自己拼一回 hyper。
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60 * 60)) // 长连接：一小时没动静就算死了
+        .timeout(Duration::from_hours(1)) // 长连接：一小时没动静就算死了
         .build()
         .map_err(|e| format!("建不了客户端：{e}"))?;
     let res = client

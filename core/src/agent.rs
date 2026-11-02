@@ -260,8 +260,7 @@ fn new_provider_session() -> String {
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 impl ChatSession {
@@ -1077,8 +1076,7 @@ pub fn session_tail_start(sess: &ChatSession, tail: usize) -> usize {
     session_boundaries(sess)
         .into_iter()
         .rfind(|(count, _)| *count <= want)
-        .map(|(_, i)| i)
-        .unwrap_or(0)
+        .map_or(0, |(_, i)| i)
 }
 
 /// 往前翻一页：`(窗口起点, 窗口终点)`（都是 DB 下标、都是回合边界）。
@@ -1100,8 +1098,7 @@ pub fn session_page(sess: &ChatSession, before: usize, limit: usize) -> (usize, 
     let start = bounds
         .iter()
         .rfind(|(count, _)| *count <= want)
-        .map(|&(_, i)| i)
-        .unwrap_or(0);
+        .map_or(0, |&(_, i)| i);
     (start, end.1)
 }
 
@@ -1823,7 +1820,7 @@ fn build_responses_input(
     for m in &sess.messages {
         match m {
             ChatMessage::System(s) => {
-                out.push(message_item("system", MessageContent::Text(s.clone())))
+                out.push(message_item("system", MessageContent::Text(s.clone())));
             }
             ChatMessage::User { text, attachments } => out.push(message_item(
                 "user",
@@ -2658,9 +2655,8 @@ fn parse_edits(args: &Value) -> anyhow::Result<Vec<crate::editor::Edit>> {
 /// `read` 的 offset：从 1 开始；缺失/非法/<=0 都退回第 1 行。
 fn parse_offset(args: &Value) -> usize {
     args.get("offset")
-        .and_then(|v| v.as_i64())
-        .map(|n| n.max(1) as usize)
-        .unwrap_or(1)
+        .and_then(serde_json::Value::as_i64)
+        .map_or(1, |n| n.max(1) as usize)
 }
 
 /// `bash` 不给 timeout 时的超时。
@@ -2726,7 +2722,7 @@ fn parse_limit(args: &Value) -> anyhow::Result<Option<usize>> {
 /// 就当没给 —— 一个可选开关写错不该让整次 read 失败。
 fn parse_numbered(args: &Value) -> bool {
     args.get("numbered")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -2784,11 +2780,10 @@ async fn execute_tool(
     // 工具的 cwd 和 bash 走同一个函数（`LinuxSandbox::session_cwd`）：手机沙箱里是
     // 这个会话自己的目录，电脑上（宿主模式）是 workspace 本身。两个门必须一致 ——
     // 模型在 bash 里 `pwd` 看到哪，`read x.txt` 就得去哪找。
-    let cwd = core
-        .state
-        .linux()
-        .map(|sb| sb.session_cwd(Some(sid)))
-        .unwrap_or_else(|| linux::WORKSPACE.to_string());
+    let cwd = core.state.linux().map_or_else(
+        || linux::WORKSPACE.to_string(),
+        |sb| sb.session_cwd(Some(sid)),
+    );
 
     // read / bash / edit 都不走设备（`DeviceApi`）：read 和 edit 直接
     // 读写 rootfs 里的文件，bash 起 proot 子进程。
@@ -2912,8 +2907,7 @@ async fn read_image_outcome(
     let supports_images = core
         .state
         .llm()
-        .map(|p| core.state.cached_supports_images(&p))
-        .unwrap_or(true);
+        .is_none_or(|p| core.state.cached_supports_images(&p));
 
     // 只说图本身：格式、原尺寸、大小，缩过的话发过去的是多大（在图上估坐标要用）。
     // 路径不回显 —— 就是模型自己刚传进来的那个。
