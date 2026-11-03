@@ -18,7 +18,11 @@ android {
 
     defaultConfig {
         applicationId = "dev.vihv.agent"
-        minSdk = 26
+        // 28 而不是 26：`mallopt(M_PURGE, 0)` 从 API 28 起才被 bionic 认（见
+        // core/src/trim.rs），而这是「放掉会话之后把分配器攥着的内存还给
+        // 内核」在安卓上的唯一入口 —— 旧版本上没有它，核心长跑之后 RSS 就只
+        // 涨不回。反正这个 App 只给自己用，手上最老的机器也比 28 新。
+        minSdk = 28
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"

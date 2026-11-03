@@ -130,7 +130,10 @@ src/android/app/src/main/
 └── libproot-loader32.so
 ```
 
-`minSdk 26 / targetSdk 35 / compileSdk 36`，**只出 `arm64-v8a`**（`abiFilters`）。
+`minSdk 28 / targetSdk 35 / compileSdk 36`，**只出 `arm64-v8a`**（`abiFilters`）。
+
+minSdk 从 26 提到 28 是为了 `mallopt(M_PURGE, 0)`（见 `core/src/trim.rs`）：
+那是安卓上「把分配器攥着的空闲内存还给内核」的唯一入口，API 28 起才有。
 
 ---
 

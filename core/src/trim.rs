@@ -14,6 +14,16 @@
 //! （97 MB）、tcmalloc 也差（60 MB），`MALLOC_ARENA_MAX=2` 只省 9 MB
 //! 而且得靠每个部署记得配。
 //!
+//! ## 各平台分别怎么做
+//!
+//! 三家分配器**都有**「把空闲的还回去」的入口，只是名字不同；没有的那个
+//! 恰恰是 musl（它每个大块单独 `mmap`，`free` 即 `munmap`，本来就没这个坑）：
+//!
+//! - glibc（桌面 Linux）：`malloc_trim(0)`
+//! - bionic/scudo（安卓）：`mallopt(M_PURGE, 0)`（API 28 起；`minSdk = 28`
+//!   就是为这个，见 `android/app/build.gradle.kts`）
+//! - musl / macOS / 别的：编成空函数（它们自己会还，调了也没坏处）
+//!
 //! ## 为什么在这个时机
 //!
 //! 只在「刚放掉了一些会话」之后调（`lib.rs` 的落盘定时器里，`evict_idle`
@@ -26,10 +36,7 @@
 ///
 /// 还的是「堆顶那段连续的」和「能整块 `madvise` 出去的」；arena 里被活数据
 /// **夹在中间**的空洞照样留着 —— 所以是「大部分」，不是「全部」。
-///
-/// 只在 glibc 上有这个入口：musl / macOS 的分配器自己会 `munmap`，安卓的
-/// bionic 也没有 —— 那些目标上编出来就是永远返回 `false` 的空函数（那边确实
-/// 没有「攥着不放的空间」要还），调用点不用写 `cfg`。
+/// 安卓上 scudo 的回收粒度是内存块大小分级，同样不保证「一块不剩」。
 pub fn release_free_memory() -> bool {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -39,7 +46,24 @@ pub fn release_free_memory() -> bool {
         // 它会拿 glibc 的 arena 锁 —— 别在 tokio worker 上直接调。
         unsafe { libc::malloc_trim(0) == 1 }
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(target_os = "android")]
+    {
+        // bionic 的 mallopt 不是 `libc` crate 暴露的那几个（它只导出了
+        // `mallinfo` / `malloc_info`），自己声明一下。
+        unsafe extern "C" {
+            fn mallopt(param: libc::c_int, value: libc::c_int) -> libc::c_int;
+        }
+        // `M_PURGE` = -101（定义在 bionic 的 `<malloc.h>`，API 28 起）：
+        // 「立即把所有不在用的内存还给内核」。比它更狠的 `M_PURGE_ALL`
+        // 要 API 34，而且官方文档说可能慢一倍以上（它会把所有东西都翻
+        // 一遍），这里用不上。
+        //
+        // SAFETY: 和 glibc 那边同理 —— 只动分配器自己的空闲块，不碰活着的
+        // 分配；第二个参数对 M_PURGE 是被忽略的。
+        // 它会拿 scudo 的全局锁 —— 和 `malloc_trim` 一样别在 worker 上直接调。
+        unsafe { mallopt(-101, 0) == 1 }
+    }
+    #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "android")))]
     {
         false
     }

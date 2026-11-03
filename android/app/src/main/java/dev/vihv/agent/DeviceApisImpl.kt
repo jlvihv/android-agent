@@ -372,11 +372,9 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
             }
 
             "clear" -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    cm.clearPrimaryClip()
-                } else {
-                    cm.setPrimaryClip(ClipData.newPlainText("", ""))
-                }
+                // minSdk = 28，`clearPrimaryClip()` 正好是 API 28 起的，
+                // 不需要再退回「写一个空串」（那样会在剪贴板里留一条空记录）
+                cm.clearPrimaryClip()
                 ok(JSONObject().put("cleared", true))
             }
 
@@ -1657,11 +1655,10 @@ class DeviceApisImpl(private val app: android.app.Application) : PhoneHost {
 
         val nm = app.getSystemService(NotificationManager::class.java)
         val channel = "agent-device-notice"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm.createNotificationChannel(
-                NotificationChannel(channel, "Agent 主动通知", NotificationManager.IMPORTANCE_DEFAULT)
-            )
-        }
+        // minSdk = 28，通知渠道（API 26 起）一定在
+        nm.createNotificationChannel(
+            NotificationChannel(channel, "Agent 主动通知", NotificationManager.IMPORTANCE_DEFAULT)
+        )
         val id = (System.currentTimeMillis() % 100000).toInt() + 2000
         val n = Notification.Builder(app, channel)
             .setSmallIcon(R.drawable.ic_notif_done)
