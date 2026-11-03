@@ -60,6 +60,8 @@ pub mod sse;
 pub mod state;
 pub mod status;
 pub mod text;
+/// 把分配器攥着的空闲内存还给系统（放掉会话之后调一次）。
+pub mod trim;
 pub mod tunnel;
 pub mod weather;
 pub mod workspace;
@@ -869,6 +871,17 @@ impl Core {
                 let n = st.evict_idle();
                 if n > 0 {
                     tracing::debug!("{n} 个会话的消息已移出内存");
+                    // 刚放掉的那几 MB 是**散在 arena 里的小块**，glibc 不会自己
+                    // 还给系统（只有挨着堆顶时才收缩 brk）。不还的话 RSS 停在
+                    // 峰值上，看着像泄漏。只在这个时机 trim：别的时候没有
+                    // 「一大坨已经明确不要了」的内存可还。见 `trim` 模块。
+                    //
+                    // 丢给阻塞池：`malloc_trim` 要拿 arena 锁，坐在 worker 上
+                    // 会卡住其它任务（和上面落盘同一个理由）。**不等它**：
+                    // 这里是落盘定时器，没东西依赖「还完了」，而阻塞池只有
+                    // 4 个线程（`BLOCKING`）—— 等在这里就是白白占着一个。
+                    // 丢掉句柄 = 不跟它要结果（任务照样跑完）。
+                    drop(tokio::task::spawn_blocking(trim::release_free_memory));
                 }
             }
         });
