@@ -2681,7 +2681,22 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "chars": st.system_prompt().chars().count(),
             "overridden": st.system_prompt_overridden(),
         },
+        // 内存：`rss` 是内核看到的，`inUse` 是业务真在用的。两者差的那一大块
+        // 是分配器攥着的碎片（不是泄漏）—— 只看 RSS 会去优化一个不存在的问题，
+        // 所以这里两个都给，单位统一用 MB（留一位小数）。见 `trim::report`。
+        "memory": memory_json(),
     }))
+}
+
+/// `trim::report()` 的 JSON 形状（`/api/debug/state` 的 `memory`）。
+fn memory_json() -> Value {
+    let r = crate::trim::report();
+    let mb = |b: Option<u64>| b.map(|b| (b as f64 / 1048576.0 * 10.0).round() / 10.0);
+    json!({
+        "rss": mb(r.rss),
+        "inUse": mb(r.in_use),
+        "free": mb(r.free),
+    })
 }
 
 /// `GET /api/debug/request` → **下一次**会发给 provider 的完整请求体。
