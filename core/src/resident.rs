@@ -213,6 +213,28 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// 环境变量名能不能直接拼进 shell 脚本。
+///
+/// **这是一个安全边界，不是风格洁癖**。名字来自 `std::env::vars()`（见
+/// `linux::JobEnv`），而内核**不校验**环境变量名 —— `A; touch /tmp/x; B=v`
+/// 这种是合法的 `execve` 参数。名字不做检查就拼成 `export {k}={v}`，
+/// bash 会把 `;` 当命令分隔符执行掉：
+///
+/// ```text
+/// export A; touch /tmp/x; B='v'
+///                ^^^^^^^^^^ 真的被执行了
+/// ```
+///
+/// 值那边有 `sh_quote` 包着，名字这边没有 —— 所以这里只放行
+/// POSIX 认的字符集（字母、数字、下划线，不以数字开头）。
+/// 不合法就跳过这个变量，并在 `run_file` 里记一条：
+/// 少了某个变量最多是命令里少个配置，比注入强得多。
+fn is_valid_env_name(k: &str) -> bool {
+    !k.is_empty()
+        && !k.starts_with(|c: char| c.is_ascii_digit())
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// 脚本要不要单独起一个 bash 跑（而不是在常驻 shell 的 fork 里直接 `.` 进来）。
 ///
 /// 只有一种情况：脚本里用了 `$$`。子 shell 里的 `$$` 是**常驻 bash 自己的** pid（bash
@@ -238,6 +260,11 @@ pub fn run_file(
     );
     out.push_str(&format!("cd -- {} 2>/dev/null || cd /\n", sh_quote(cwd)));
     for (k, v) in env {
+        // 名字不合法就跳过（见 `is_valid_env_name`：那是防注入的边界）
+        if !is_valid_env_name(k) {
+            tracing::debug!("跳过名字不合法的环境变量（不拼进 shell）");
+            continue;
+        }
         out.push_str(&format!("export {k}={}\n", sh_quote(v)));
     }
     if own_shell {
@@ -267,5 +294,37 @@ mod tests {
         assert!(run_file("/", &[], "/x/1.sh", true).contains("exec \"$BASH\" -c"));
         assert!(needs_own_shell("kill $$") && needs_own_shell("echo ${$}"));
         assert!(!needs_own_shell("echo $HOME $1 $?"));
+    }
+
+    /// 环境变量**名**里带 shell 元字符时，不能把命令拼进脚本。
+    ///
+    /// 真踩过的注入路径：`host_env()` 把 `std::env::vars()` 原样全带上，
+    /// 而内核不校验变量名。`A; touch /tmp/x; B` 拼成 `export A; touch /tmp/x; B='v'`
+    /// 就是一个真的会执行的命令。
+    #[test]
+    fn env_names_cannot_inject_shell() {
+        let evil = vec![("A; touch /tmp/PWNED; B".to_string(), "x".to_string())];
+        let f = run_file("/", &evil, "/x/1.sh", false);
+        assert!(!f.contains("touch"), "恶意变量名进了脚本: {f}");
+        assert!(!f.contains("PWNED"), "恶意变量名进了脚本: {f}");
+
+        // 常见的合法名字照旧要过
+        let ok = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("AGENT_TOKEN".to_string(), "t".to_string()),
+            ("_x9".to_string(), "1".to_string()),
+        ];
+        let f = run_file("/", &ok, "/x/1.sh", false);
+        assert!(f.contains("export PATH='/usr/bin'"));
+        assert!(f.contains("export AGENT_TOKEN='t'"));
+        assert!(f.contains("export _x9='1'"));
+
+        // 各种边界：空名、数字开头、带空格 / 反引号 / 美元符
+        for bad in ["", "9LIVES", "A B", "A`id`", "A$(id)", "A\nB", "A=B"] {
+            assert!(
+                !run_file("/", &[(bad.into(), "v".into())], "/x/1.sh", false).contains("export"),
+                "{bad:?} 不该被当成变量名"
+            );
+        }
     }
 }

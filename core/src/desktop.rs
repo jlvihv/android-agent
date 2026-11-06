@@ -325,6 +325,11 @@ where
                 };
                 let now: Vec<Seen> = seen.values().cloned().collect();
                 if now != last {
+                    // `last` 存一份、`on_change` 拿另一份。两份确实需要：`last`
+                    // 要留着比下一次，`on_change` 要把值交出去（签名是
+                    // `Fn(Vec<Seen>)`，取所有权）。想省掉这次拷贝得把回调改成
+                    // 收 `&[Seen]`，那要动所有调用方 —— 而这里的列表只有
+                    // 局域网上几台，不值得。
                     last = now.clone();
                     if !change {
                         continue;
