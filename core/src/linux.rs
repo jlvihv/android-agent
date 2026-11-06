@@ -21,6 +21,7 @@
 //! 命令行构造、超时、输出截断这些逻辑全部测通，不必等真机。
 //! Kotlin 只需要在 boot 时把两个路径交进来。
 
+use anyhow::Context;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
@@ -2890,7 +2891,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn read_utf8(host: &Path, guest_path: &str) -> anyhow::Result<String> {
     let size = std::fs::metadata(host).map_or(0, |m| m.len());
     check_text_size(size, guest_path)?;
-    let raw = std::fs::read(host).map_err(|e| anyhow::anyhow!("读取失败 {guest_path}: {e}"))?;
+    let raw = std::fs::read(host).with_context(|| format!("读取失败 {guest_path}"))?;
     String::from_utf8(raw).map_err(|_| {
         anyhow::anyhow!(
             "不是 UTF-8 文本（二进制文件？）: {guest_path}；要查看内容用 bash 的 file / xxd"

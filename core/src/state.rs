@@ -1856,6 +1856,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `cow_take` 的三条语义：有值取出、无值 `None`、**锁中毒了也不 panic**。
+    ///
+    /// 第三条最容易在重构里丢：谁都可能顺手把它写成 `.read().unwrap()`，
+    /// 而那等于把一个写侧的 panic 传染给之后所有读者（一次 panic → 整个
+    /// 核心的会话都读不出来）。这个 crate 里 `cow_take` 有十几处调用，
+    /// 所以值得钉住。
+    #[test]
+    fn cow_take_takes_copies_and_survives_a_poisoned_lock() {
+        // 有值：拿出来的是同一份内容
+        let some: RwLock<Option<Arc<str>>> = RwLock::new(Some(Arc::from("x")));
+        assert_eq!(cow_take(&some).as_deref(), Some("x"));
+
+        // 无值：None（不是 panic）
+        let none: RwLock<Option<Arc<str>>> = RwLock::new(None);
+        assert!(cow_take(&none).is_none());
+
+        // 锁中毒：照样返回 None，不 panic
+        let poisoned: RwLock<Option<Arc<str>>> = RwLock::new(Some(Arc::from("x")));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = poisoned.write().unwrap();
+            panic!("故意把锁毒掉");
+        }));
+        assert!(poisoned.is_poisoned(), "前提没造出来：锁应该是毒的");
+        assert!(
+            cow_take(&poisoned).is_none(),
+            "锁中毒时应当当没有，而不是 panic"
+        );
+    }
+
     /// 读凭据**失败**时不能把库里的覆盖掉。
     ///
     /// 后果很重：token 一换，所有已经配对过的手机下次全部 401，而且旧的那把

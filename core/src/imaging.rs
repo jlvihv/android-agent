@@ -11,6 +11,7 @@
 //! 上限按 **base64 字符数** 算（4_718_592 ≈ 4.5 MiB），因为发出去的是
 //! `data:` URL；按原始字节能塞下、编码成 base64 后却超了是最容易踩的坑。
 
+use anyhow::Context;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -87,16 +88,14 @@ pub fn is_image_file(path: &Path) -> std::io::Result<bool> {
 
 /// 是图片就处理成可内联的形态；不是图片返回 `None`。
 pub fn load_if_image(path: &Path) -> anyhow::Result<Option<Encoded>> {
-    let meta =
-        std::fs::metadata(path).map_err(|e| anyhow::anyhow!("读取失败 {}: {e}", path.display()))?;
+    let meta = std::fs::metadata(path).with_context(|| format!("读取失败 {}", path.display()))?;
     anyhow::ensure!(
         meta.len() <= MAX_SOURCE_BYTES,
         "图片有 {}MB，超过 {}MB 上限",
         meta.len() / 1024 / 1024,
         MAX_SOURCE_BYTES / 1024 / 1024
     );
-    let source =
-        std::fs::read(path).map_err(|e| anyhow::anyhow!("读取失败 {}: {e}", path.display()))?;
+    let source = std::fs::read(path).with_context(|| format!("读取失败 {}", path.display()))?;
     load_if_image_bytes(&source)
 }
 
@@ -203,7 +202,7 @@ pub fn cached_data_url(path: &str, mime: &str) -> anyhow::Result<Arc<str>> {
         return Ok(url);
     }
 
-    let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("读取图片失败 {path}: {e}"))?;
+    let bytes = std::fs::read(path).with_context(|| format!("读取图片失败 {path}"))?;
     let url: Arc<str> = data_url(mime, &bytes).into();
 
     if let Ok(mut cache) = url_cache().lock() {

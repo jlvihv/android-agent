@@ -66,6 +66,7 @@ pub mod tunnel;
 pub(crate) mod weather;
 pub(crate) mod workspace;
 
+use anyhow::Context;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -200,7 +201,8 @@ async fn write_attachment(
     bytes: Vec<u8>,
 ) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("建附件目录失败: {e}"))?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("建附件目录失败: {}", dir.display()))?;
         std::fs::write(dir.join(&id), &bytes).map_err(|e| anyhow::anyhow!("写附件失败: {e}"))?;
         Ok::<_, anyhow::Error>(())
     })
@@ -463,7 +465,7 @@ impl Core {
         let raw = match joined {
             Ok(join) => join
                 .map_err(|e| anyhow::anyhow!("浏览器调用没能跑起来: {e}"))?
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+                .map_err(anyhow::Error::msg)?,
             Err(_) => {
                 anyhow::bail!("浏览器动作超时（75s 没回来）—— 页面可能卡住了；重试或者换个做法")
             }
@@ -553,7 +555,7 @@ impl Core {
         let raw = match joined {
             Ok(join) => join
                 .map_err(|e| anyhow::anyhow!("设备调用没能跑起来: {e}"))?
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+                .map_err(anyhow::Error::msg)?,
             Err(_) => anyhow::bail!("设备命令超时（180s 没回来）"),
         };
         Ok(crate::phone::normalize_reply(&raw))
@@ -656,7 +658,8 @@ impl Core {
             );
         // 写盘是阻塞 I/O，几 MB 也会占住一个 worker（只有 `WORKERS` 个）
         tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("建图片目录失败: {e}"))?;
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("建图片目录失败: {}", dir.display()))?;
             let ext = match mime.as_str() {
                 "image/png" => "png",
                 "image/jpeg" => "jpg",
@@ -666,7 +669,8 @@ impl Core {
                 _ => "bin",
             };
             let path = dir.join(format!("{}.{ext}", uuid::Uuid::now_v7()));
-            std::fs::write(&path, &bytes).map_err(|e| anyhow::anyhow!("写图片失败: {e}"))?;
+            std::fs::write(&path, &bytes)
+                .with_context(|| format!("写图片失败: {}", path.display()))?;
             Ok(path)
         })
         .await?
