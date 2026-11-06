@@ -43,7 +43,11 @@
 /// 还的是「堆顶那段连续的」和「能整块 `madvise` 出去的」；arena 里被活数据
 /// **夹在中间**的空洞照样留着 —— 所以是「大部分」，不是「全部」。
 /// 安卓上 scudo 的回收粒度是内存块大小分级，同样不保证「一块不剩」。
-pub fn release_free_memory() -> bool {
+///
+/// 故意**不 pub**：外部一律走 [`release_soon`]。那一个自带「先看账」和
+/// 「搬到阻塞池」—— 直接把这一条暴露出去，等于把「`malloc_trim` 要拿 arena
+/// 锁、不能坐在 worker 上」这个约束外派给每个调用方去记得。
+fn release_free_memory() -> bool {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // SAFETY: `malloc_trim` 只动分配器自己**空闲**的块（收缩 brk、

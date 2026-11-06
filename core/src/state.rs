@@ -66,6 +66,29 @@ fn default_swipe_ms() -> u32 {
     300
 }
 
+/// 从 `RwLock<Option<T>>` 里取一份拷贝（`T: Clone`，通常是 `Arc<…>`）。
+///
+/// 整个 `state.rs` 里有十几个字段长这个形状（设备、浏览器、库、配置……），
+/// 读取方式一模一样：拿读锁 → 有就 `clone` 一份 → 释放锁。每次都写
+/// `.read().ok().and_then(|g| g.clone())` 除了重复，还容易写成各不相同的
+/// 「锁毒了怎么办」（有的 `unwrap_or_default`、有的 `?`）。统一在这里：
+/// **锁毒了就当没有** —— 毒说明写的那一次 panic 了，数据已经不可信。
+///
+/// 故意不返回 `&T`：拿不出锁外的引用（守卫一释放就没了），而且调用方几乎
+/// 都是要把它带过 `.await`，那更不能持锁。
+///
+/// `pub(crate)`：`http.rs` / `search.rs` 里也有同样的直接访问字段的地方
+/// （`pairing` / `remote` / `relay_host` 这几个没开 getter）。
+pub(crate) fn cow_take<T: Clone>(lock: &RwLock<Option<T>>) -> Option<T> {
+    lock.read().ok().and_then(|g| g.clone())
+}
+
+/// 各家模型清单的缓存值：(拉的时间, 清单)。
+///
+/// 清单本身是 `Arc`：开一次选择模型面板要把每家都列出来，命中缓存是**每次**
+/// 都发生的事，深拷贝一份几百条的 `Vec<ModelInfo>`（每条两个 `String`）不划算。
+type CachedModels = (std::time::Instant, Arc<Vec<crate::models::ModelInfo>>);
+
 // ---------------------------------------------------------------------------
 // 设备能力抽象（决策 D2 的落点）
 // ---------------------------------------------------------------------------
@@ -266,7 +289,11 @@ pub struct AppState {
     ///
     /// 打开选择模型面板要拉好几家的 `/models`，每次都等网络太慢；
     /// 清单十分钟内不会变，换 Key 时清掉。
-    pub model_lists: Mutex<HashMap<String, (std::time::Instant, Vec<crate::models::ModelInfo>)>>,
+    ///
+    /// 值是 `Arc`：清单是 `Vec<ModelInfo>`（每条两个 `String`），几百条时
+    /// 一次深拷贝就是几十 KB，而命中缓存是**每次开面板都发生**的事。
+    /// 共享同一份，读的人拿个引用计数就行。
+    pub model_lists: Mutex<HashMap<String, CachedModels>>,
     /// 持久化目录（安卓上是 `<filesDir>`；桌面上为空则只存内存）
     pub data_dir: RwLock<Option<std::path::PathBuf>>,
     /// 沙箱的 Alpine 升级（设置页里点的那个，见 `alpine`）
@@ -425,7 +452,7 @@ impl AppState {
     }
 
     pub fn device(&self) -> Option<Arc<dyn DeviceApi>> {
-        self.device.read().ok().and_then(|g| g.clone())
+        cow_take(&self.device)
     }
 
     pub fn clear_device(&self) {
@@ -439,7 +466,7 @@ impl AppState {
     }
 
     pub fn browser(&self) -> Option<Arc<dyn BrowserApi>> {
-        self.browser.read().ok().and_then(|g| g.clone())
+        cow_take(&self.browser)
     }
 
     pub fn set_browser(&self, b: Arc<dyn BrowserApi>) {
@@ -449,7 +476,7 @@ impl AppState {
     }
 
     pub fn phone(&self) -> Option<Arc<dyn PhoneApi>> {
-        self.phone.read().ok().and_then(|g| g.clone())
+        cow_take(&self.phone)
     }
 
     pub fn set_phone(&self, p: Arc<dyn PhoneApi>) {
@@ -459,7 +486,7 @@ impl AppState {
     }
 
     pub fn shizuku(&self) -> Option<Arc<dyn ShizukuApi>> {
-        self.shizuku.read().ok().and_then(|g| g.clone())
+        cow_take(&self.shizuku)
     }
 
     pub fn set_shizuku(&self, s: Arc<dyn ShizukuApi>) {
@@ -480,11 +507,11 @@ impl AppState {
     }
 
     pub fn linux(&self) -> Option<Arc<LinuxSandbox>> {
-        self.linux.read().ok().and_then(|g| g.clone())
+        cow_take(&self.linux)
     }
 
     pub fn db(&self) -> Option<Arc<Db>> {
-        self.db.read().ok().and_then(|g| g.clone())
+        cow_take(&self.db)
     }
 
     /// 机器记账（配对过哪些电脑、现在连的是哪台）。没有库时为 `None`。
@@ -593,7 +620,7 @@ impl AppState {
 
     /// 启动清扫：删掉没有任何会话引用的图片副本 / 附件 / 截图 / 溢出输出。
     async fn sweep_files(&self, db: Arc<Db>, before: std::time::SystemTime) {
-        let data = self.data_dir.read().ok().and_then(|g| g.clone());
+        let data = cow_take(&self.data_dir);
         let dirs = self.side_dirs();
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let msgs = db.messages_with_files()?;
@@ -840,12 +867,14 @@ impl AppState {
     }
 
     /// 一家的可对话模型清单（带缓存）。`refresh` = 不要缓存。
+    ///
+    /// 返回 `Arc` 而不是 `Vec`：命中缓存时只加一次引用计数，不复制整份清单。
     pub async fn models_of(
         &self,
         id: &str,
         provider: &Provider,
         refresh: bool,
-    ) -> anyhow::Result<Vec<crate::models::ModelInfo>> {
+    ) -> anyhow::Result<std::sync::Arc<Vec<crate::models::ModelInfo>>> {
         const TTL: std::time::Duration = std::time::Duration::from_secs(600);
         if !refresh {
             let hit = self.model_lists.lock().ok().and_then(|g| {
@@ -860,6 +889,8 @@ impl AppState {
         let db = self.db();
         let mut list = crate::models::list(provider, refresh, db.as_deref()).await?;
         list.retain(|m| crate::providers::is_chat_model(&m.id));
+        // 先包成 Arc 再入缓存：缓存和返回的是同一个（不深拷贝）。
+        let list = std::sync::Arc::new(list);
         if let Ok(mut g) = self.model_lists.lock() {
             g.insert(id.to_string(), (std::time::Instant::now(), list.clone()));
         }
@@ -1433,7 +1464,7 @@ impl AppState {
     }
 
     pub fn llm(&self) -> Option<Provider> {
-        self.llm.read().ok().and_then(|g| g.clone())
+        cow_take(&self.llm)
     }
 
     /// 给所有会话换一个 provider session id。
@@ -1519,7 +1550,7 @@ impl AppState {
     /// 判定结果会落盘，下次启动直接读，不用再联网。
     pub async fn supports_images_for(&self, provider: &Provider) -> bool {
         let key = vision_key(provider);
-        if let Some((k, v)) = self.vision.read().ok().and_then(|g| g.clone()) {
+        if let Some((k, v)) = cow_take(&self.vision) {
             if k == key {
                 return v;
             }
@@ -1553,7 +1584,7 @@ impl AppState {
     /// 总好过发一个保证 400 的请求。
     pub async fn supports_files_for(&self, provider: &Provider) -> bool {
         let key = files_key(provider);
-        if let Some((k, v)) = self.files.read().ok().and_then(|g| g.clone()) {
+        if let Some((k, v)) = cow_take(&self.files) {
             if k == key {
                 return v;
             }
@@ -1581,7 +1612,7 @@ impl AppState {
     /// 只看缓存/已存的值（同步，给组装请求和工具用，不做网络）。
     pub fn cached_supports_images(&self, provider: &Provider) -> bool {
         let key = vision_key(provider);
-        if let Some((k, v)) = self.vision.read().ok().and_then(|g| g.clone()) {
+        if let Some((k, v)) = cow_take(&self.vision) {
             if k == key {
                 return v;
             }
@@ -1592,7 +1623,7 @@ impl AppState {
     /// 同 `cached_supports_images`，但看的是 PDF / 文档输入。
     pub fn cached_supports_files(&self, provider: &Provider) -> bool {
         let key = files_key(provider);
-        if let Some((k, v)) = self.files.read().ok().and_then(|g| g.clone()) {
+        if let Some((k, v)) = cow_take(&self.files) {
             if k == key {
                 return v;
             }

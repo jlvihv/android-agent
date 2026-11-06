@@ -1485,6 +1485,17 @@ impl LinuxSandbox {
         }
     }
 
+    /// 现在那把凭据（没设过就是 `None`：本机免登录的部署）。
+    ///
+    /// 三个注入点（`agent` 命令、环境变量、`tunnel`）都要读它 —— 之前三处
+    /// 各自写了一边 `.read().ok().and_then(|g| g.clone())`。
+    ///
+    /// 名字带 `_value`：字段就叫 `agent_token`，同名方法能编过（`self.agent_token`
+    /// 指字段、`self.agent_token()` 指方法），但读的人会愣一下。
+    fn agent_token_value(&self) -> Option<String> {
+        self.agent_token.read().ok().and_then(|g| g.clone())
+    }
+
     /// rootfs 齐了吗（安卓上解压是后台做的，之前只是个空壳）。
     pub fn is_ready(&self) -> bool {
         match &self.mode {
@@ -1779,7 +1790,7 @@ impl LinuxSandbox {
             env.insert("AGENT_PORT".into(), port.to_string());
             env.insert("AGENT_BASE".into(), format!("http://127.0.0.1:{port}"));
         }
-        if let Some(t) = self.agent_token.read().ok().and_then(|g| g.clone()) {
+        if let Some(t) = self.agent_token_value() {
             env.insert("AGENT_TOKEN".into(), t);
         }
 
@@ -1994,7 +2005,7 @@ impl LinuxSandbox {
             env.insert("AGENT_PORT".into(), port.to_string());
             env.insert("AGENT_BASE".into(), format!("http://127.0.0.1:{port}"));
         }
-        if let Some(t) = self.agent_token.read().ok().and_then(|g| g.clone()) {
+        if let Some(t) = self.agent_token_value() {
             env.insert("AGENT_TOKEN".into(), t);
         }
 
@@ -2202,7 +2213,7 @@ impl LinuxSandbox {
             env.push(("AGENT_PORT".into(), port.to_string()));
             env.push(("AGENT_BASE".into(), format!("http://127.0.0.1:{port}")));
         }
-        if let Some(t) = self.agent_token.read().ok().and_then(|g| g.clone()) {
+        if let Some(t) = self.agent_token_value() {
             env.push(("AGENT_TOKEN".into(), t));
         }
         env

@@ -165,6 +165,18 @@ impl Default for Core {
     }
 }
 
+/// HTTP handler 手上拿的是 `State<Arc<AppState>>`，要交给 `Core` 才能跑
+/// 工具 / 读会话 —— 之前那 10 个 handler 各自写了一遍
+/// `Core { state: st.clone() }`，现在统一走这里。
+///
+/// 取的是**所有权**（不是 `&Arc`）：调用的地方本来就已经不打算再用那个
+/// `State` 了，这样比先 clone 再给少一次引用计数的进出。
+impl From<Arc<AppState>> for Core {
+    fn from(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+}
+
 /// 接一条连接。出错（文件描述符用光这类）就歇一下再接：不能空转把一个核跑满，
 /// 也不能就此不接了 —— 那个口会悄悄地死掉。
 pub(crate) async fn accept(

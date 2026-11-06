@@ -464,7 +464,7 @@ struct EditItem {
 ///
 /// 绕开 LLM，方便单独测沙箱（也是前端"终端"页的接口）。
 async fn bash_run(State(st): State<Arc<AppState>>, Json(body): Json<BashBody>) -> Response {
-    let core = Core { state: st.clone() };
+    let core = Core::from(st);
     let timeout = body
         .timeout_ms
         .map_or(crate::linux::DEFAULT_TIMEOUT, Duration::from_millis)
@@ -502,7 +502,7 @@ struct PairBody {
 /// `POST /api/pair` `{code}` → `{token, id, name}`：手机第一次连这台电脑时拿配对码
 /// 换访问凭据（见 `desktop::Pairing`）。只有桌面宿主模式对局域网开放时才开着（别的时候 404）。
 async fn pair(State(st): State<Arc<AppState>>, Json(b): Json<PairBody>) -> Response {
-    let Some(p) = st.pairing.read().ok().and_then(|g| g.clone()) else {
+    let Some(p) = crate::state::cow_take(&st.pairing) else {
         return (
             StatusCode::NOT_FOUND,
             "这台电脑没开配对（宿主模式对局域网开放时才有）",
@@ -528,7 +528,7 @@ async fn pair(State(st): State<Arc<AppState>>, Json(b): Json<PairBody>) -> Respo
 }
 
 fn remote_info(st: &AppState) -> Option<crate::state::RemoteInfo> {
-    st.remote.read().ok().and_then(|g| g.clone())
+    crate::state::cow_take(&st.remote)
 }
 
 /// `POST /api/remote/relay {addr, key}` → 让这台电脑挂到这个中继上（要凭据）。
@@ -540,7 +540,7 @@ async fn set_relay(
     State(st): State<Arc<AppState>>,
     Json(b): Json<crate::state::RelayAddr>,
 ) -> Response {
-    let Some(host) = st.relay_host.read().ok().and_then(|g| g.clone()) else {
+    let Some(host) = crate::state::cow_take(&st.relay_host) else {
         return (
             StatusCode::NOT_FOUND,
             "这个核心不挂中继（只有电脑上、对局域网开放时才有）",
@@ -584,7 +584,7 @@ async fn pairing_info(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     let pairing = if addr.ip().is_loopback() {
-        st.pairing.read().ok().and_then(|g| g.clone())
+        crate::state::cow_take(&st.pairing)
     } else {
         None
     };
@@ -917,7 +917,7 @@ async fn list_procs(State(st): State<Arc<AppState>>, Query(q): Query<ProcsQuery>
 /// 2. 走到一次工具调用要花一整轮 LLM（钱 + 时间），调试浏览器时不现实。
 ///    有个能直接打的入口，改一行 JS 就能立刻验。
 async fn browser_action(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let core = Core { state: st.clone() };
+    let core = Core::from(st);
     let text = match core.browser(&body.to_string()).await {
         Ok(v) => browser_text(&v),
         Err(e) => format!("错误：{e:#}"),
@@ -987,7 +987,7 @@ fn browser_text(v: &Value) -> String {
 /// **恒用 200 回**：沙箱里的 `wget` 对 5xx 会**重试**，于是一次“没有这台设备”会被
 /// 放成三次请求；成不成看正文开头。
 async fn device_command(State(st): State<Arc<AppState>>, Json(body): Json<DeviceBody>) -> Response {
-    let core = Core { state: st.clone() };
+    let core = Core::from(st.clone());
     let text = match core.phone(&body.cmd, &body.argv).await {
         Ok(v) => device_text(&v),
         Err(e) => {
@@ -1031,7 +1031,7 @@ fn device_text(v: &Value) -> String {
 ///
 /// **恒用 200 回**：沙箱里的 `wget` 对 5xx 会重试，一次失败会变成三次请求。
 async fn shizuku_run(State(st): State<Arc<AppState>>, Json(body): Json<ShizukuBody>) -> Response {
-    let core = Core { state: st.clone() };
+    let core = Core::from(st);
     let text = core.shizuku(&body.argv).await;
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
 }
@@ -1479,7 +1479,7 @@ async fn list_skills(State(st): State<Arc<AppState>>) -> Json<Value> {
 ///
 /// 和 `/api/browser` 一样的理由存在：调试、以及让沙箱里的 `agent search` 能直接用。
 async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let core = Core { state: st.clone() };
+    let core = Core::from(st);
     let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let as_text = body.get("format").and_then(|v| v.as_str()) == Some("text");
     let text = |s: String| {
@@ -1590,7 +1590,7 @@ async fn set_search_config(
     State(st): State<Arc<AppState>>,
     Json(body): Json<SearchConfigBody>,
 ) -> Response {
-    let Some(db) = st.db.read().ok().and_then(|g| g.clone()) else {
+    let Some(db) = crate::state::cow_take(&st.db) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "会话库没打开").into_response();
     };
     let key = body.exa_api_key.trim();
@@ -1611,7 +1611,7 @@ async fn set_search_config(
 
 /// `POST /api/edit` → 直接在沙箱里改文件（对应 `edit` 工具）。
 async fn edit_file(State(st): State<Arc<AppState>>, Json(body): Json<EditBody>) -> Response {
-    let core = Core { state: st.clone() };
+    let core = Core::from(st);
     let edits: Vec<crate::editor::Edit> = body
         .edits
         .iter()
@@ -1757,7 +1757,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
                 // 回合可能就在上面 `begin_turn` 失败之后、`enqueue` 之前收了尾 ——
                 // 它收尾时看队列还是空的，这条就没人取了。所以排完再试着开一次：
                 // 回合还在跑的话这是空操作（`begin_turn` 拿不到），由它在步边界取。
-                crate::agent::continue_with_queued(&Core { state: st.clone() }, p, &sid);
+                crate::agent::continue_with_queued(&Core::from(st.clone()), p, &sid);
                 return queued_response(&id);
             }
         },
@@ -1765,7 +1765,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
-    let core = Core { state: st.clone() };
+    let core = Core::from(st.clone());
 
     match provider.zip(turn) {
         Some((p, turn)) => {
@@ -2033,8 +2033,10 @@ async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery
             (id, r)
         });
     }
-    let mut got: Vec<(String, anyhow::Result<Vec<crate::models::ModelInfo>>)> =
-        jobs.join_all().await;
+    let mut got: Vec<(
+        String,
+        anyhow::Result<std::sync::Arc<Vec<crate::models::ModelInfo>>>,
+    )> = jobs.join_all().await;
     // 按设置页里的顺序排：内置的几家在前，「其他」最后
     let order = |id: &str| {
         crate::providers::PRESETS
@@ -2051,7 +2053,8 @@ async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery
             let name = crate::providers::display_name(&id);
             match r {
                 Ok(models) => {
-                    let v = json!(models);
+                    // `models` 是 `Arc<Vec<_>>`：直接序列化它，别 `(*models).clone()`
+                    let v = json!(&*models);
                     if current_id == Some(id.as_str()) {
                         current_models = v.clone();
                     }
@@ -2271,8 +2274,8 @@ async fn delete_provider(
                     .models_of(&nid, &probe, false)
                     .await
                     .unwrap_or_default()
-                    .into_iter()
-                    .map(|m| m.id)
+                    .iter()
+                    .map(|m| m.id.clone())
                     .collect();
                 let mut p = probe;
                 p.model = crate::providers::pick_default(&nid, &ids).unwrap_or_default();
@@ -2315,7 +2318,7 @@ async fn upload_attachment(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "file".into());
 
-    let core = Core { state: st.clone() };
+    let core = Core::from(st.clone());
     match core.store_attachment(name, mime, body.to_vec()).await {
         Ok(a) => {
             st.add_pending_attachment(a.clone());
@@ -2336,7 +2339,7 @@ async fn upload_attachment(
 ///
 /// `id` 必须是裸文件名（`attachment_path` 把这一点钉死在路径拼接之前）。
 async fn get_attachment(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<String>) -> Response {
-    let core = Core { state: st };
+    let core = Core::from(st);
     let Some(path) = core.attachment_path(&id) else {
         return (StatusCode::NOT_FOUND, "没有这个附件").into_response();
     };

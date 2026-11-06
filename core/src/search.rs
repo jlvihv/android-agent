@@ -85,7 +85,7 @@ pub fn format_hits(found: &Found) -> String {
 /// 曾经还有一条 `EXA_API_KEY` 环境变量压库一头（桌面开发）—— 删了：配置只有
 /// 一个来源，不然「界面上填的」和「shell 里带的」会互相打架（LLM 那边同一个教训）。
 pub fn read_key(state: &AppState) -> Option<String> {
-    let db = state.db.read().ok().and_then(|g| g.clone())?;
+    let db = crate::state::cow_take(&state.db)?;
     db.get_meta("exa_api_key")
         .ok()
         .flatten()

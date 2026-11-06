@@ -2185,6 +2185,18 @@ async fn stream_one(
                 if let Some(tcs) = choice.delta.tool_calls {
                     for tc in tcs {
                         let i = tc.index as usize;
+                        // 上限：`acc` 是按 index 下标存的，而 index 是**服务端给的**。
+                        // 畸形（或坏网关改写）的 index 就是一个 OOM 开关：
+                        // `u32::MAX` 会让下面这个 while 一直 push 到 300 GB。
+                        // 几十个工具调用已经远超任何模型的实际行为，超过就当
+                        // 这一条不能用 —— 丢掉比整个进程被 OOM 杀掉强。
+                        const MAX_TOOL_CALLS: usize = 64;
+                        if i >= MAX_TOOL_CALLS {
+                            tracing::warn!(
+                                "工具调用 index={i} 超出预期（>{MAX_TOOL_CALLS}），忽略"
+                            );
+                            continue;
+                        }
                         while acc.len() <= i {
                             acc.push((String::new(), String::new(), String::new()));
                             started.push(false);
