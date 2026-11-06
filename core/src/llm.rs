@@ -168,21 +168,6 @@ impl Provider {
         }
     }
 
-    /// DeepSeek 官方端点
-    pub fn deepseek(api_key: impl Into<String>) -> Self {
-        Self::compatible(
-            "deepseek",
-            "https://api.deepseek.com/v1",
-            "deepseek-chat",
-            api_key,
-        )
-    }
-
-    /// 本地 Ollama（不需要真 key，占位即可）
-    pub fn ollama(model: impl Into<String>) -> Self {
-        Self::compatible("ollama", "http://127.0.0.1:11434/v1", model, "ollama")
-    }
-
     // 配置从**库**里来（`db::LlmConfig` / 设置页 / `POST /api/llm`），没有环境变量那条路。
     //
     // 曾经有过 `AGENT_LLM_*` 环境变量兜底（后来又多一套 `OPENCODE_*` 别名），和库里的

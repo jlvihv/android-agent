@@ -14,57 +14,57 @@
 //! 安卓上由 Kotlin 实现，通过 UniFFI callback interface 注入（阶段 2）。
 
 pub mod agent;
-pub mod alpine;
-pub mod assets;
+pub(crate) mod alpine;
+pub(crate) mod assets;
 /// 页面里注入的 JS：**只有一份**，手机（Kotlin 的 WebView）和桌面（CDP）都从
 /// 这儿取（见 `browser_js` 的模块说明）。
-pub mod browser_js;
+pub(crate) mod browser_js;
 /// 桌面（Linux）上的浏览器：无头 Chrome + CDP。安卓那边是壳里的 WebView
 /// （`BrowserController.kt`），用不到这个模块 —— 别把它编进 .so。
 #[cfg(not(target_os = "android"))]
-pub mod cdp;
-pub mod cli;
-pub mod db;
-pub mod demo;
+pub(crate) mod cdp;
+pub(crate) mod cli;
+pub(crate) mod db;
+pub(crate) mod demo;
 pub mod desktop;
-pub mod editor;
+pub(crate) mod editor;
 pub mod ffi;
-pub mod gc;
-pub mod html;
-pub mod http;
-pub mod imaging;
+pub(crate) mod gc;
+pub(crate) mod html;
+pub(crate) mod http;
+pub(crate) mod imaging;
 pub mod linux;
-pub mod llm;
-pub mod machines;
-pub mod mcp;
-pub mod models;
-pub mod notify;
-pub mod openai;
-pub mod phone;
-pub mod plain;
+pub(crate) mod llm;
+pub(crate) mod machines;
+pub(crate) mod mcp;
+pub(crate) mod models;
+pub(crate) mod notify;
+pub(crate) mod openai;
+pub(crate) mod phone;
+pub(crate) mod plain;
 pub mod platform;
 pub mod prompt;
-pub mod providers;
-pub mod readable;
-pub mod reader;
+pub(crate) mod providers;
+pub(crate) mod readable;
+pub(crate) mod reader;
 #[cfg(not(target_os = "android"))]
 pub mod remote;
-pub mod resident;
-pub mod responses;
-pub mod search;
-pub mod shizuku;
-pub mod shizuku_parse;
+pub(crate) mod resident;
+pub(crate) mod responses;
+pub(crate) mod search;
+pub(crate) mod shizuku;
+pub(crate) mod shizuku_parse;
 pub mod single;
-pub mod skills;
-pub mod sse;
+pub(crate) mod skills;
+pub(crate) mod sse;
 pub mod state;
-pub mod status;
-pub mod text;
+pub(crate) mod status;
+pub(crate) mod text;
 /// 把分配器攥着的空闲内存还给系统（放掉会话之后调一次）。
-pub mod trim;
+pub(crate) mod trim;
 pub mod tunnel;
-pub mod weather;
-pub mod workspace;
+pub(crate) mod weather;
+pub(crate) mod workspace;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
