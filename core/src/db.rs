@@ -650,6 +650,36 @@ impl Db {
         }
     }
 
+    /// 只给测试用：直接跑一条 SQL。
+    ///
+    /// 用来**造真的坏库**（`DROP TABLE meta` 之后 `get_meta` 返回 `Err` 而不是
+    /// `Ok(None)`）—— 「读失败不能当成没有」这类保证，光靠在正常库上调用是
+    /// 测不出来的。
+    #[cfg(test)]
+    pub fn exec_for_test(&self, sql: &str) -> Result<()> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        g.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
+    /// 只给测试用：跑一条返回单值单列的查询。
+    #[cfg(test)]
+    pub fn query_for_test(&self, sql: &str) -> Result<Option<String>> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        let v = g.conn.query_row(sql, [], |r| r.get::<_, String>(0));
+        match v {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// 删一条设置。
     pub fn delete_meta(&self, k: &str) -> Result<()> {
         let g = self

@@ -912,15 +912,28 @@ impl AppState {
     /// 访问凭据：库里有就用，没有就生成一份存进去（跨重启不变，调试脚本
     /// 拿一次就够）。
     fn load_auth(&self, db: &Db) {
+        // `get_meta` 能区分「库里没有」和「读失败」：前者 `Ok(None)`，后者 `Err`。
+        // **两者绝不能同等对待** —— 读失败（库被锁、磁盘抽了一下）如果当成
+        // 「没有」，下面就会生成一把新 token 并**覆盖掉旧的那把**，于是所有
+        // 已经配对过的手机下次全部 401，旧 token 再也找不回来。一次临时读失败
+        // 不该有这么大的后果。
+        //
+        // 所以读失败时宁可不落盘：本次运行用临时的，库里那份不动，下次启动再读。
         let get_or_make = |k: &str| -> String {
             match db.get_meta(k) {
                 Ok(Some(v)) if !v.is_empty() => v,
-                _ => {
+                // 真的没有（第一次起）：生成一把，存下来
+                Ok(_) => {
                     let v = random_secret();
                     if let Err(e) = db.set_meta(k, &v) {
-                        tracing::warn!("保存 {k} 失败: {e:#}");
+                        tracing::warn!("保存 {k} 失败（本次运行用临时的，重启会再生成）: {e:#}");
                     }
                     v
+                }
+                // 读不出来：**不覆盖**库里的，本次用临时的
+                Err(e) => {
+                    tracing::error!("读 {k} 失败，本次运行用临时凭据（库里的没动）: {e:#}");
+                    random_secret()
                 }
             }
         };
@@ -1840,6 +1853,56 @@ mod tests {
         assert_eq!(st.auth().token, token, "凭据跨重启不变，调试脚本拿一次就够");
         assert_eq!(st.auth().sandbox_key, key);
         assert!(token.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读凭据**失败**时不能把库里的覆盖掉。
+    ///
+    /// 后果很重：token 一换，所有已经配对过的手机下次全部 401，而且旧的那把
+    /// 被覆盖后找不回来。`get_meta` 能区分「没有」和「读失败」
+    /// （`Ok(None)` vs `Err`），`load_auth` 必须跟着区分。
+    ///
+    /// 断言的是**库里那一行**，不是内存里的值：读失败时内存里无论如何都会是
+    /// 一把新生成的临时凭据，只看内存分辨不出「有没有把旧的覆盖掉」。
+    /// （第一版就是这么写错的 —— 把修复还原回去测试照样绿。）
+    #[test]
+    fn auth_read_failure_does_not_overwrite_the_stored_token() {
+        let dir = temp_dir("authfail");
+        let st = AppState::new();
+        st.open_db(&dir);
+        let before = st.auth().token.expect("第一次起会生成一把");
+
+        // 让 `get_meta("token")` **真的报错**，同时让 `set_meta` 仍能写进去 ——
+        // 只有这样才测得出「读失败时有没有去覆盖」。
+        //
+        // 造法：把 token 那行的 `v` 改成 BLOB。`get_meta` 做的是
+        // `r.get::<_, String>(0)`，碰上 BLOB 会返回类型错误；而 `set_meta` 是
+        // `INSERT ... ON CONFLICT DO UPDATE`，照样能把那行改成正常的文本。
+        //
+        // （第一版试过「删表」和「换成缺列的表」：前者 `open()` 会重建、旧值本来
+        // 就没了；后者 `set_meta` 也写不进去。两种都测不出区别 —— 测试必须能
+        // red，否则它只是装饰。）
+        {
+            let db = st.db().expect("有库");
+            db.exec_for_test("UPDATE meta SET v = x'00ff' WHERE k = 'token'")
+                .unwrap();
+        }
+        drop(st);
+
+        // 再起一次：读不到 → 本次用临时的，但库里不能出现任何新写入
+        let st2 = AppState::new();
+        st2.open_db(&dir);
+        assert!(st2.auth().token.is_some(), "仍然要给一把（临时的）");
+
+        // 库里那行必须还是原来那个 BLOB（没被写成新 token）。
+        // 只断言「读出来不是文本」—— 若真被覆盖，读出来就是一段正常 token 文本。
+        let db = st2.db().expect("有库");
+        let kind = db
+            .query_for_test("SELECT typeof(v) FROM meta WHERE k='token'")
+            .unwrap()
+            .expect("那行还在");
+        assert_eq!(kind, "blob", "读失败时不许往库里写新 token（会把旧值顶掉）");
+        let _ = before;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
