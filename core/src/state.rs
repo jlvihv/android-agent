@@ -757,7 +757,10 @@ impl AppState {
     /// 从库里读（赶在落盘把那些行删掉之前；没赶上就留给启动清扫）。
     async fn forget_files(&self, s: crate::agent::ChatSession) {
         let db = self.db();
-        let _ = tokio::task::spawn_blocking(move || {
+        // 不吞 JoinError：这个清理**只跑一次**（会话已经删了，不会再来第二遍），
+        // 任务 panic 掉就意味着那些文件永久留在盘上。记一条，至少查得出来。
+        // （`lib.rs` 的落盘任务也是这么处理的，别的地方照这个来。）
+        if let Err(e) = tokio::task::spawn_blocking(move || {
             let msgs = if s.resident() {
                 s.messages
             } else {
@@ -770,7 +773,10 @@ impl AppState {
                 tracing::debug!("会话 {} 的 {n} 个文件已清掉", s.id);
             }
         })
-        .await;
+        .await
+        {
+            tracing::warn!("清会话文件的任务挂了（那些文件会留在盘上）: {e}");
+        }
     }
 
     /// 记下一个刚上传、还没随消息发出去的附件；顺手清掉放了太久的。
@@ -1134,10 +1140,14 @@ impl AppState {
         if msgs.is_empty() {
             return;
         }
-        let _ = tokio::task::spawn_blocking(move || {
+        // 同上：只跑一次，挂掉了就永久漏，至少留个日志
+        if let Err(e) = tokio::task::spawn_blocking(move || {
             crate::gc::remove_all(&crate::gc::owned_files(&msgs))
         })
-        .await;
+        .await
+        {
+            tracing::warn!("清排队消息的文件时任务挂了: {e}");
+        }
     }
 
     /// 记下这个会话的回合是怎么失败的（见 `turn_errors`）。

@@ -124,9 +124,15 @@ pub fn acquire(path: &Path, port: u16) -> Result<Guard, Holder> {
         "port": port,
         "cmd": cmd.chars().take(200).collect::<String>(),
     });
-    let _ = file.set_len(0);
-    let _ = writeln!(file, "{info}");
-    let _ = file.flush();
+    // 写不进去不影响单实例本身（锁已经拿到了），但下一个被拒的核心就看不到
+    // 「谁在跑」——只能报一句空话。所以失败记一条，别完全静默。
+    let wrote = file
+        .set_len(0)
+        .and_then(|_| writeln!(file, "{info}"))
+        .and_then(|_| file.flush());
+    if let Err(e) = wrote {
+        tracing::warn!("写锁文件失败（不影响单实例，但下次冲突时说不清是谁在跑）: {e}");
+    }
     Ok(Guard { file: Some(file) })
 }
 
