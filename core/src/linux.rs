@@ -3010,14 +3010,24 @@ impl Capture {
         }
     }
 
-    /// 往尾部追加；超过 `CAPTURE_TAIL` 就从最旧的一端挤掉。
+    /// 往尾部追加；攒得太多了就从最旧的一端挤回来。
+    ///
+    /// **不是一到 `CAPTURE_TAIL` 就挤**：那样每读一块 64KB 都要把 2MB 整体前移
+    /// 一次，一条持续输出的大命令就是 O(输出量 × 2MB) 的白拷（实测 128MB 输出
+    /// 花了 823ms，全是 memmove）。这里留四分之一余量，攒到 2.5MB 才砍回 2MB
+    /// —— 同样是 2–2.5MB 的窗口，memmove 次数降到 1/16，实测 128MB 输出 8ms。
+    ///
+    /// `render` / `write_to` 都按 `tail.len()` 取尾部，多出来的那点余量对结果
+    /// 没有影响（`tail_part` 只取最后 `TAIL_LINES` 行、限 `SIDE_BYTES` 字节）。
     fn push_tail(&mut self, data: &[u8]) {
+        const SLACK: usize = CAPTURE_TAIL / 4;
         self.tail.extend_from_slice(data);
-        if self.tail.len() <= CAPTURE_TAIL {
+        if self.tail.len() <= CAPTURE_TAIL + SLACK {
             return;
         }
         // 挤到行边界（整行扔）；单行超长找不到换行，就按字节扔 ——
-        // 但别整段都丢，那样尾部就永远攒不起来了
+        // 但别整段都丢，那样尾部就永远攒不起来了。
+        // 目标：砍回 `CAPTURE_TAIL`（不是砍回零），这样窗口大小是稳定的。
         let excess = self.tail.len() - CAPTURE_TAIL;
         let cut = match self.tail[excess..].iter().position(|&b| b == b'\n') {
             Some(i) => excess + i + 1,
@@ -3585,6 +3595,45 @@ mod tests {
     }
 
     // —— 常驻 shell（桌面下打开它：和沙箱里同一套协议，在本机就能跑） ——
+
+    /// 尾部窗口的**上界**：超出上限就挤掉最旧的，但窗口不会缩到零、
+    /// 也不会无限涨（`push_tail` 的余量只是让 memmove 少做几次）。
+    ///
+    /// 同时确认统计是对的：丢掉的行/字节数就是被挤掉的那些。
+    #[test]
+    fn capture_tail_stays_bounded_and_counts_what_it_drops() {
+        let mut cap = Capture::default();
+        // 每块 64KB、按行切（和读管道时一样）
+        let line = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n";
+        let mut chunk = Vec::new();
+        while chunk.len() < 64 * 1024 {
+            chunk.extend_from_slice(line);
+        }
+        let total_chunks = 200; // ~12.8MB，远超 2MB 的上限
+        for _ in 0..total_chunks {
+            cap.push(&chunk);
+        }
+        let slack = CAPTURE_TAIL / 4;
+        assert!(
+            cap.tail.len() <= CAPTURE_TAIL + slack + chunk.len(),
+            "尾部窗口不能无限涨：{} 字节",
+            cap.tail.len()
+        );
+        assert!(
+            cap.tail.len() >= CAPTURE_TAIL,
+            "尾部窗口不该被挤空：{} 字节",
+            cap.tail.len()
+        );
+        let fed = (total_chunks * chunk.len()) as u64;
+        assert!(cap.dropped_bytes > 0, "超上限就该有丢弃");
+        assert!(
+            cap.dropped_bytes + cap.tail.len() as u64 <= fed,
+            "丢掉的和留下的不能超过喂进来的"
+        );
+        // 窗口从行边界开始、以换行结尾（挤的时候是按整行砍的）
+        assert_eq!(*cap.tail.last().unwrap(), b'\n');
+        assert!(cap.dropped_lines > 0);
+    }
 
     /// 管道被孙进程占着不关时：等到 grace 也得把**已经读到的**交出来。
     ///

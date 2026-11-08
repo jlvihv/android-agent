@@ -361,46 +361,180 @@ impl ChatSession {
 /// 一段文本里找 `needle`（忽略大小写），命中就返回带省略号的上下文。
 ///
 /// 按**字符**切而不是字节：中文（和多字节 UTF-8）里按字节切会把字切碎。
+///
+/// ## 为什么不是「一律小写化再比」
+///
+/// 搜索是**在会话锁里**跑的（`AppState::search` 由 `http::search_sessions` 拿着
+/// 读锁调），而抽屉那边 180ms 防抖、打字快就是背靠背几次。原实现每条消息都
+/// 展开三份 `Vec<char>`（原文 / 小写 / 来源下标）再逐窗口比：省库 40MB 正文实测
+/// 一次搜索 193ms，手机上还要乘几倍，这期间任何回合追加消息都得等。
+///
+/// 现在按**查询词本身**分派（见 `find_fold` / `fold_kind`），只有真需要折叠时
+/// 才付代价：没有大小写的查询走字面 `str::find`（memmem，不分配）；纯 ASCII 的
+/// 走字节级折小写；只有带非 ASCII 大小写的查询（`Ａ` / `Σ` / `İ`）才逐字符折叠。
+/// 任何一条路都不为整段历史建 `Vec<char>`。
 fn hit_snippet(text: &str, needle: &str) -> Option<String> {
     const BEFORE: usize = 20;
     const AFTER: usize = 60;
 
-    let raw: Vec<char> = text.chars().collect();
-    // 小写化可能改变字符数（`İ` → `i̇` 是两个字符）：逐字符展开，每个小写字符
-    // 记住它来自原文第几个字符，命中位置才能换算回原文。
-    let mut hay: Vec<char> = Vec::with_capacity(raw.len());
-    let mut origin: Vec<usize> = Vec::with_capacity(raw.len());
-    for (i, c) in raw.iter().enumerate() {
-        for l in c.to_lowercase() {
-            hay.push(l);
-            origin.push(i);
-        }
-    }
-    let pat: Vec<char> = needle.to_lowercase().chars().collect();
-    if pat.is_empty() || hay.len() < pat.len() {
-        return None;
-    }
-    let at_low = hay.windows(pat.len()).position(|w| w == pat.as_slice())?;
-    let at = origin[at_low];
-    let last = origin[at_low + pat.len() - 1];
+    // 命中位置用 (起, 止) 两个**字符**下标表示
+    let (at, last) = find_fold(text, needle)?;
 
     let start = at.saturating_sub(BEFORE);
-    let end = (last + 1 + AFTER).min(raw.len());
+    let end = last + 1 + AFTER;
 
+    // 单趟、只走到窗口末尾：不把整条消息 `collect` 成 `Vec<char>`，也不先
+    // `chars().count()` 数一遍全长（一条消息可能几十 KB，命中一下就要一份
+    // 完整的字符表）。`end` 不用先 clamp —— 按 `i < end` 收就行。
     let mut s = String::new();
     if start > 0 {
         s.push('…');
     }
-    // 换行拍平成空格，否则摘要里会带出多行
-    s.extend(
-        raw[start..end]
-            .iter()
-            .map(|c| if *c == '\n' { ' ' } else { *c }),
-    );
-    if end < raw.len() {
+    let mut more = false;
+    for (i, c) in text.chars().enumerate() {
+        if i >= end {
+            more = true;
+            break;
+        }
+        if i >= start {
+            // 换行拍平成空格，否则摘要里会带出多行
+            s.push(if c == '\n' { ' ' } else { c });
+        }
+    }
+    if more {
         s.push('…');
     }
     Some(s)
+}
+
+/// `hit_snippet` 的定位部分：返回命中区间的首尾**字符**下标（不是字节）。
+///
+/// 语义以**折叠后的第一次出现**为准（原实现就是这样：整段小写化后取第一个
+/// `windows` 命中）。这和「字面 `str::find`」不是一回事 —— `… 1aY … A …` 里
+/// 查 `A`，折叠后的第一次出现在前面那个 `a` 上。所以字面命中**不能**直接当
+/// 答案，它只是快速候选（随机对拍抓到过这一点）。
+///
+/// 分两层，第二层只在必要时走（省库 40MB 正文 --release 实测：常见查询
+/// 2–30ms，原来一律 200ms 以上）：
+///
+/// 1. **字节级 ASCII 折叠**（`ascii_fold_find`）：只折 ASCII 字母，非 ASCII
+///    字节按原样比。什么情况下能定案？
+///    - 查询**纯 ASCII** —— 它只能匹配 ASCII 串，字节级就是完备的；
+///    - 查询**不含任何大小写字符**（中文、标点、emoji）—— 折叠不改变任何
+///      字符，字面 `str::find` 就是答案（`str::find` 走 memmem，最快）；
+///    - 其余（查询里有全角字母、`Σ`、`İ` 这类）才需要精确折叠。
+/// 2. **精确折叠**（`exact_fold_find`）：逐 `char` 算 `to_lowercase`，
+///    能把 `İ` → `i̇`（一个变两个）、`Ａ` → `ａ` 算对。
+fn find_fold(text: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    match fold_kind(needle) {
+        // 查询没有大小写：字面命中就是折叠后的第一次出现
+        FoldKind::None => {
+            let at = text.find(needle)?;
+            let start = text[..at].chars().count();
+            Some((start, start + needle.chars().count() - 1))
+        }
+        FoldKind::Ascii => {
+            ascii_fold_find(text.as_bytes(), needle.as_bytes()).map(|(from, len)| {
+                let b = text.as_bytes();
+                // 字节下标 → 字符下标：数「非续字节」（UTF-8 里一个字符一个）
+                let at = b[..from].iter().filter(|&&x| x & 0xC0 != 0x80).count();
+                let n = b[from..from + len]
+                    .iter()
+                    .filter(|&&x| x & 0xC0 != 0x80)
+                    .count();
+                (at, at + n.saturating_sub(1))
+            })
+        }
+        FoldKind::Unicode => exact_fold_find(text, needle),
+    }
+}
+
+/// 查询词需要哪种折叠（见 `find_fold`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldKind {
+    /// 一个大小写字符都没有：折叠不改变任何字符，字面查找就够
+    None,
+    /// 只有 ASCII 字母的大小写差异：字节级折叠完备
+    Ascii,
+    /// 有非 ASCII 的大小写字符（`Ａ` / `Σ` / `İ`…）：必须精确折叠
+    Unicode,
+}
+
+/// 一个字符有没有大小写（大写、小写都推出它自己）。
+///
+/// 用「`to_lowercase`/`to_uppercase` 是不是原样返回」判，而不是 `is_uppercase`
+/// 之类：后者对 `Σ`、`ǅ`（标题大小写）、切罗基文那些不完整。
+fn caseless(c: char) -> bool {
+    c.to_lowercase().eq(std::iter::once(c)) && c.to_uppercase().eq(std::iter::once(c))
+}
+
+fn fold_kind(needle: &str) -> FoldKind {
+    if needle.chars().all(caseless) {
+        // 折叠管不到它。注意「折成别的无大小写字符」的情况不存在（穷举过
+        // BMP：无大小写的字符折叠后还是无大小写字符）
+        return FoldKind::None;
+    }
+    if needle.is_ascii() {
+        return FoldKind::Ascii;
+    }
+    FoldKind::Unicode
+}
+
+/// 在 `hay` 里按「ASCII 字母不分大小写、其余字节原样」找 `needle`。
+/// 返回 `(起始字节下标, 长度)`。
+///
+/// 只看首字节的候选位置再逐个比：不命中时比逐位置开窗快得多。`needle` 是
+/// 合法 `&str`，首字节一定不是续字节，所以命中的起点一定落在字符边界上。
+fn ascii_fold_find(hay: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
+    let n = needle.len();
+    if n == 0 || hay.len() < n {
+        return None;
+    }
+    let first = needle[0].to_ascii_lowercase();
+    let mut i = 0usize;
+    while i + n <= hay.len() {
+        let start = i + hay[i..=hay.len() - n]
+            .iter()
+            .position(|&b| b.to_ascii_lowercase() == first)?;
+        if hay[start..start + n]
+            .iter()
+            .zip(needle)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            return Some((start, n));
+        }
+        i = start + 1;
+    }
+    None
+}
+
+/// 真正的 Unicode 小写化匹配（慢，但能把 `İ`、全角字母这类算对）。
+///
+/// 窗口里每一项是「小写字符 + 它来自原文第几个字符」：小写化可能把一个字符
+/// 变成两个（`İ` → `i̇`），所以不能假设一个原文字符对应一个窗口项。用定长
+/// `VecDeque` 当环 —— 满了弹头推尾，不复位整段。
+fn exact_fold_find(text: &str, needle: &str) -> Option<(usize, usize)> {
+    let pat: Vec<char> = needle.to_lowercase().chars().collect();
+    if pat.is_empty() {
+        return None;
+    }
+    let mut run: std::collections::VecDeque<(char, usize)> =
+        std::collections::VecDeque::with_capacity(pat.len());
+    for (i, c) in text.chars().enumerate() {
+        for l in c.to_lowercase() {
+            if run.len() == pat.len() {
+                run.pop_front();
+            }
+            run.push_back((l, i));
+            if run.len() == pat.len() && run.iter().map(|(c, _)| *c).eq(pat.iter().copied()) {
+                return Some((run.front()?.1, run.back()?.1));
+            }
+        }
+    }
+    None
 }
 
 /// 多个会话。侧边栏的「最近对话」/ 搜索结果都从它来。
@@ -2968,6 +3102,173 @@ async fn read_image_outcome(
 mod tests {
     use super::*;
 
+    /// 摘要窗口之外，**最原始的那版**实现（一律全量小写化 + 双向 range）。
+    ///
+    /// 只用来对拍：新实现三条路径（原样命中 / 滑动窗口 / 全量折叠）在下面所有
+    /// 用例上必须和它给出**逐字相同**的结果 —— 搜索摘要长什么样是用户直接看到的，
+    /// 不能因为性能改动就变。
+    fn reference(text: &str, needle: &str) -> Option<String> {
+        const BEFORE: usize = 20;
+        const AFTER: usize = 60;
+        let raw: Vec<char> = text.chars().collect();
+        let mut hay: Vec<char> = Vec::with_capacity(raw.len());
+        let mut origin: Vec<usize> = Vec::with_capacity(raw.len());
+        for (i, c) in raw.iter().enumerate() {
+            for l in c.to_lowercase() {
+                hay.push(l);
+                origin.push(i);
+            }
+        }
+        let pat: Vec<char> = needle.to_lowercase().chars().collect();
+        if pat.is_empty() || hay.len() < pat.len() {
+            return None;
+        }
+        let at_low = hay.windows(pat.len()).position(|w| w == pat.as_slice())?;
+        let at = origin[at_low];
+        let last = origin[at_low + pat.len() - 1];
+        let start = at.saturating_sub(BEFORE);
+        let end = (last + 1 + AFTER).min(raw.len());
+        let mut s = String::new();
+        if start > 0 {
+            s.push('…');
+        }
+        s.extend(
+            raw[start..end]
+                .iter()
+                .map(|c| if *c == '\n' { ' ' } else { *c }),
+        );
+        if end < raw.len() {
+            s.push('…');
+        }
+        Some(s)
+    }
+
+    /// 三条路径 + 一堆边界，和原实现逐字对拍。
+    #[test]
+    fn snippet_matches_the_original_implementation() {
+        let long_cn = "前面有很多字".repeat(20);
+        let cases = [
+            ("第一行\n这里有 KEYWORD 在中间", "KEYWORD"),
+            ("第一行\n这里有 KEYWORD 在中间", "keyword"),
+            ("只有关键字", "关键"),
+            ("没有命中", "zzz"),
+            ("任意", ""),
+            ("prefix HelloWorld suffix", "helloworld"),
+            ("prefix HelloWorld suffix", "HelloWorld"),
+            ("前缀 İstanbul 后缀", "istanbul"),
+            ("前缀 İstanbul 后缀", "İstanbul"),
+            ("İX", "x"),
+            ("ＡＢＣ 全角", "ＡＢＣ"),
+            ("İİİİİİİİİİ target İİİİİİİİİİ", "target"),
+            (&format!("{long_cn}\n目标字串\n{long_cn}"), "目标字串"),
+            (&format!("{long_cn}{long_cn}{long_cn}tail"), "tail"),
+            (&format!("{long_cn}中间{long_cn}"), "中间"),
+            ("\n\n\n换行开头和结尾\n\n", "换行"),
+            ("aaaa", "a"),
+            ("😀emoji😀", "emoji"),
+            ("😀emoji😀", "😀"),
+        ];
+        for (text, needle) in cases {
+            assert_eq!(
+                hit_snippet(text, needle),
+                reference(text, needle),
+                "和原实现不一致：text={text:?} needle={needle:?}"
+            );
+        }
+    }
+
+    /// 用户看得见的那几条行为（不依赖对拍也能读懂）。
+    #[test]
+    fn snippet_shows_context_and_folds_case() {
+        // 长文本：前后都截了就都带省略号，换行拍平成空格
+        let long = format!("{}KEYWORD{}", "前".repeat(40), "后".repeat(200));
+        let s = hit_snippet(&long, "KEYWORD").unwrap();
+        assert!(s.contains("KEYWORD"), "摘要里必须有命中词：{s}");
+        assert!(!s.contains('\n'), "摘要不能带换行：{s}");
+        assert!(
+            s.starts_with('…') && s.ends_with('…'),
+            "两头都要标截断：{s}"
+        );
+
+        // 短文本：整条都在窗口里，不多加省略号
+        assert_eq!(hit_snippet("只有关键字", "关键").unwrap(), "只有关键字");
+        assert!(hit_snippet("没有命中", "zzz").is_none());
+        assert!(hit_snippet("任意", "").is_none(), "空查询不命中");
+
+        // 忽略大小写（滑动窗口那条路），但摘要回原文
+        let s = hit_snippet("prefix HelloWorld suffix", "helloworld").unwrap();
+        assert!(s.contains("HelloWorld"), "要回原文，不是小写版：{s}");
+
+        // 多字节字符不能在窗口里被切碎
+        let body = "前面一堆字".repeat(10);
+        let s = hit_snippet(&format!("{body}目标字串{body}"), "目标字串").unwrap();
+        assert!(s.contains("目标字串"));
+        assert!(!s.contains('\u{FFFD}'), "不能出现替换符（切碎了）：{s}");
+    }
+
+    /// 随机对拍：固定种子的伪随机文本 + 查询，逐例和原实现比。
+    ///
+    /// 手写用例只能覆盖想到的情况；三层路径（原样 / 字节折叠 / 精确折叠）
+    /// 边界多，靠随机拼（中英混排、大小写、全角、emoji、换行、控字符）能兜住
+    /// 「某一层漏判」这类回归 —— 这正是这次改动最容易出事的地方。
+    #[test]
+    fn snippet_matches_the_original_on_random_input() {
+        // xorshift：不引依赖，结果可复现
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet: Vec<char> = "abAB中文İıＡＡéÉ😀XYZ\n\t 12，。ǅǈΣσςϴᲐႠＡＢａｂ𝔘𝕒"
+            .chars()
+            .collect();
+        for round in 0..5000 {
+            let len = (rnd() % 120) as usize;
+            let text: String = (0..len)
+                .map(|_| alphabet[(rnd() as usize) % alphabet.len()])
+                .collect();
+            let qlen = 1 + (rnd() % 4) as usize;
+            let needle: String = (0..qlen)
+                .map(|_| alphabet[(rnd() as usize) % alphabet.len()])
+                .collect();
+            assert_eq!(
+                hit_snippet(&text, &needle),
+                reference(&text, &needle),
+                "第 {round} 轮不一致：text={text:?} needle={needle:?}"
+            );
+        }
+    }
+
+    /// 搜索是按会话排的：命中的会话要带角色和片段，`per_session` / `limit` 生效。
+    #[test]
+    fn search_reports_hits_with_role_and_respects_limits() {
+        let mut store = SessionStore::default();
+        let s = store.active_mut();
+        s.messages.push(ChatMessage::user("找一个 needle 吧"));
+        s.messages.push(ChatMessage::Assistant {
+            content: "这里也有 needle".into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            reasoning_items: Vec::new(),
+        });
+        s.messages.push(ChatMessage::Tool {
+            tool_call_id: "c1".into(),
+            content: "tool 里的 needle 不算".into(),
+            images: vec![],
+        });
+
+        let hits = store.search("needle", 3, 60, |_| None);
+        assert_eq!(hits.len(), 2, "工具结果不参与搜索：{hits:?}");
+        let roles: Vec<&str> = hits.iter().map(|h| h["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant"], "按会话里的顺序返回");
+
+        // 每个会话只回一条时，第二条不该出现
+        assert_eq!(store.search("needle", 1, 60, |_| None).len(), 1);
+        assert!(store.search("   ", 3, 60, |_| None).is_empty(), "空查询");
+    }
+
     fn wire(sess: &ChatSession) -> Vec<serde_json::Value> {
         build_messages(sess, true, true)
             .unwrap()
@@ -3343,4 +3644,69 @@ mod tests {
     // —— 侧边栏搜索 ——
 
     // —— 空会话 ——
+}
+
+#[cfg(test)]
+mod bench_search {
+    //! 搜索这条链的**量级**基准：不是断言的测试，是给人看的。
+    //!
+    //! `cargo test --release -- --ignored --nocapture search_cost`。
+    //! 数据按省库实测规模造（40MB 正文、50k 条消息），省得靠感觉猜。
+    use super::*;
+
+    /// 造一段和真实会话同量级的历史（40MB 正文、约 5 万条消息）。
+    fn realistic() -> SessionStore {
+        let unit = "这是一段中文回复，在真实历史里通常是几百字到几千字不等。".repeat(10);
+        let n = 40 * 1024 * 1024 / unit.len();
+        let mut store = SessionStore::default();
+        let s = store.active_mut();
+        s.messages.reserve(n);
+        for i in 0..n {
+            if i % 2 == 0 {
+                s.messages.push(ChatMessage::user(unit.clone()));
+            } else {
+                s.messages.push(ChatMessage::Assistant {
+                    content: unit.clone(),
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                    reasoning_items: Vec::new(),
+                });
+            }
+        }
+        store
+    }
+
+    #[test]
+    #[ignore = "量级基准，不是断言；手动跑 --ignored --nocapture"]
+    fn search_cost_on_a_realistic_history() {
+        let store = realistic();
+        let total: usize = store
+            .sessions
+            .iter()
+            .flat_map(|s| s.messages.iter())
+            .map(|m| match m {
+                ChatMessage::User { text, .. } => text.len(),
+                ChatMessage::Assistant { content, .. } => content.len(),
+                _ => 0,
+            })
+            .sum();
+        println!("历史 {} MB / {} 条消息", total / 1048576, {
+            store.sessions[0].messages.len()
+        });
+
+        // 命中（原样命中快路）：抽屉里最常见的「搜一个中文词」
+        let t = std::time::Instant::now();
+        let hits = store.search("中文回复", 3, 60, |_| None);
+        println!("命中查询    ：{:?}（{} 条）", t.elapsed(), hits.len());
+
+        // 不命中（要扫完全部）：打错字 / 找不存在的东西
+        let t = std::time::Instant::now();
+        let hits = store.search("不存在的词", 3, 60, |_| None);
+        println!("不命中查询  ：{:?}（{} 条）", t.elapsed(), hits.len());
+
+        // 大小写折叠那条路（ASCII 查询打中文历史，全都对不上 -> 走滑动窗口）
+        let t = std::time::Instant::now();
+        let hits = store.search("HELLO", 3, 60, |_| None);
+        println!("大小写折叠  ：{:?}（{} 条）", t.elapsed(), hits.len());
+    }
 }

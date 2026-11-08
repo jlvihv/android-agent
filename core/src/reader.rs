@@ -133,6 +133,11 @@ fn head(lines: &[&str], first_number: usize, numbered: bool, phantom: bool) -> H
     }
 }
 
+/// `text.split('\n')` 会切出多少段（= 换行数 + 1）。不建 `Vec`，只数。
+fn split_lines(text: &str) -> usize {
+    text.bytes().filter(|&b| b == b'\n').count() + 1
+}
+
 /// `cat -n` 的行号列数：`printf("%6d")` 里的 6。
 const NUMBER_COLS: usize = 6;
 
@@ -189,31 +194,41 @@ pub fn read(
     limit: Option<usize>,
     numbered: bool,
 ) -> anyhow::Result<ReadView> {
-    let lines: Vec<&str> = text.split('\n').collect();
-    // 真正的行数：文本以 `\n` 结尾时 `split` 末尾多切出的那个空串不是一行
-    //（`wc -l` / `cat -n` 都不数它）。续读提示里的「共几行 / 还有几行」都按它算 ——
-    // 按 `lines.len()` 的话，30 行的文件报「共 31 行」，读到最后一行还提示「还有 1 行」。
-    let total = if text.is_empty() || text.ends_with('\n') {
-        lines.len() - 1
-    } else {
-        lines.len()
-    };
     // offset 从 1 开始；0 或负数会落到第 1 行（跟参考实现一致）
     let start = offset.saturating_sub(1);
+    // `split('\n')` 切出来多少段。文本以 `\n` 结尾时末尾多一个空串 ——
+    // 它不是一行（`wc -l` / `cat -n` 都不数它）。
+    let split_len = split_lines(text);
+    // 真正的行数。续读提示里的「共几行 / 还有几行」都按它算 ——
+    // 按 `split_len` 的话，30 行的文件报「共 31 行」，读到最后一行还提示「还有 1 行」。
+    let total = if text.is_empty() || text.ends_with('\n') {
+        split_len - 1
+    } else {
+        split_len
+    };
     anyhow::ensure!(
-        start < lines.len().min(total.max(1)),
+        start < split_len.min(total.max(1)),
         "offset {offset} 超出文件末尾（共 {total} 行）",
     );
 
-    let selected: Vec<&str> = match limit {
-        Some(l) => lines[start..].iter().take(l).copied().collect(),
-        None => lines[start..].to_vec(),
-    };
+    // **只收集要用的那一段**，不是整份 `split('\n').collect()`：32MB 的日志
+    // 有 60 多万行，那份 `Vec<&str>` 光是空条目就要 12MB（`&str` = 16 字节），
+    // 而真正回给模型的只有前 2000 行。`take` 到头就停，剩下的行数靠数换行。
+    let want = limit.unwrap_or(MAX_LINES.max(1));
+    let mut selected: Vec<&str> = Vec::with_capacity(want.min(64));
+    let mut seen = 0usize;
+    for line in text.split('\n') {
+        if seen >= start && selected.len() < want {
+            selected.push(line);
+        }
+        seen += 1;
+    }
+    debug_assert_eq!(seen, split_len, "行数和单遍扫描的结果必须一致");
     // 文本以 `\n` 结尾（或空文件）时，`split('\n')` 会多切出一个空串 ——
     // 它不是一行，`cat -n` 不给它编号（见 `render` 的说明）。只有选中的
     // 片段真的读到文件末尾，这个空串才会出现在 `selected` 里。
     let phantom = numbered
-        && start + selected.len() == lines.len()
+        && start + selected.len() == split_len
         && (text.is_empty() || text.ends_with('\n'));
     let t = head(&selected, start + 1, numbered, phantom);
 
@@ -224,7 +239,7 @@ pub fn read(
             content: format!(
                 "[第 {} 行有 {}，超过 {} 上限。用 bash：sed -n '{}p' '{quoted}' | head -c {MAX_BYTES}]",
                 start + 1,
-                fmt_size(lines[start].len()),
+                fmt_size(text.lines().nth(start).map_or(0, str::len)),
                 fmt_size(MAX_BYTES),
                 start + 1,
             ),
