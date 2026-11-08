@@ -113,6 +113,12 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 # 而 guest 进程是独立的宿主进程 —— 见 linux.rs 的 `CommandGuard`。
 # （宿主模式也走它：那边没有 proot，但「命令自己的进程组」是同一个形状。）
 libc = "0.2"
+# 自己 bind + listen 监听 socket：**只为了设 backlog**。tokio 的
+# `TcpListener::bind` 底下是 mio，它照抄标准库写死 `listen(fd, 128)` ——
+# 内核明明允许 8192（`/proc/sys/net/core/somaxconn`），我们只用 128。实测
+# 200 条并发建连在第 129 条上卡了 1 秒（SYN 重传）。见 `listen_tcp`。
+# 本来就经 hyper-util 在依赖树里，这里只是变成直接依赖，不多编代码。
+socket2 = { version = "0.6", features = ["all"] }
 # 决策 D2：正向绑定 + 反向 callback，不手写 JNI
 uniffi = { version = "0.32", features = ["tokio"] }
 

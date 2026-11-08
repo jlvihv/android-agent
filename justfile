@@ -108,6 +108,20 @@ web-install:
 dom-audit *ARGS:
     scripts/dom-audit.sh {{ARGS}}
 
+# --- 压测 -------------------------------------------------------------------
+#
+# 本地假 LLM + 一套**隔离**的核心（独立端口 + 独立 XDG_DATA_HOME +
+# AGENT_MULTI=1），不碰你正在用的那个核心，也不花 token。
+#
+#   just stress                       # 全部场景，8 路并发
+#   just stress s1 48                 # 只跑并发对话，48 路
+#   just stress s2 24                 # 慢客户端（一半中途断开）
+#
+# 场景：s1 并发对话 / s2 慢客户端 / s3 突发连接 / s4 静默流 / s5 失败重试 /
+# s6 长会话。细节见 scripts/stress.py 的模块说明。
+stress scenario="all" concurrency="8" *ARGS:
+    python3 scripts/stress.py --auto --scenario {{scenario}} --concurrency {{concurrency}} {{ARGS}}
+
 # --- 对着真机调试 ----------------------------------------------------------
 #
 # 核心是个只听 127.0.0.1 的 HTTP 服务，所以 adb forward 一下就能从电脑驱动它。

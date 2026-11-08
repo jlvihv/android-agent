@@ -181,6 +181,44 @@ impl From<Arc<AppState>> for Core {
 
 /// 接一条连接。出错（文件描述符用光这类）就歇一下再接：不能空转把一个核跑满，
 /// 也不能就此不接了 —— 那个口会悄悄地死掉。
+/// 建监听 socket，**显式指定 accept 队列长度**。
+///
+/// 不能用 `tokio::net::TcpListener::bind`：它底下是 mio，mio 照抄标准库把
+/// `listen(fd, 128)` 写死了（mio 的注释原话是 "Use the same backlog value as
+/// the standard library"）—— 内核允许 8192（`somaxconn`），我们只用 128。
+///
+/// 128 在真机上不够：局域网里几台设备同时发现这台电脑、手机 App 切网络重连、
+/// 中继重连，很容易一下子涌进上百条。队列满了内核会**丢掉新来的 SYN**，客户端
+/// 等 1 秒重传 —— 表现成「连不上」「像卡住了」，而且核心这边一条日志都没有
+/// （连接根本没到我们手上）。压测实测：200 条并发建连，第 129 条起卡 1000ms；
+/// 把 backlog 提到 1024 之后 200 条只要 4ms。
+///
+/// 1024 是**上限**，不是承诺：内核取 `min(backlog, somaxconn)`，所以老机器上
+/// `somaxconn` 小的时候照样按它的来，不会更差。
+fn listen_tcp(ip: std::net::IpAddr, port: u16) -> anyhow::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = match ip {
+        std::net::IpAddr::V4(_) => Domain::IPV4,
+        std::net::IpAddr::V6(_) => Domain::IPV6,
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .with_context(|| "建监听 socket 失败")?;
+    // 重启核心时端口还处在 TIME_WAIT 也要能立刻绑上（和 mio 那边一致）
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&socket2::SockAddr::from(std::net::SocketAddr::new(
+        ip, port,
+    )))
+    .with_context(|| format!("绑定 {ip}:{port} 失败"))?;
+    sock.listen(LISTEN_BACKLOG)?;
+    Ok(tokio::net::TcpListener::from_std(sock.into())?)
+}
+
+/// accept 队列长度（见 [`listen_tcp`]）。1024 是保守值：够局域网里一堆设备 +
+/// 重连风暴用，又不会让 `somaxconn` 小的机器上多占什么。
+const LISTEN_BACKLOG: i32 = 1024;
+
 pub(crate) async fn accept(
     listener: &tokio::net::TcpListener,
 ) -> (tokio::net::TcpStream, std::net::SocketAddr) {
@@ -812,7 +850,7 @@ impl Core {
     /// 的地址 —— 那时**必须**设了凭据（`agent-dev` 的 `main` 里保证），否则局域网
     /// 里任何人都能在这台电脑上跑命令。手机上永远是 `serve`（127.0.0.1）。
     pub async fn serve_on(&self, ip: std::net::IpAddr, port: u16) -> anyhow::Result<u16> {
-        let listener = tokio::net::TcpListener::bind((ip, port)).await?;
+        let listener = listen_tcp(ip, port)?;
         let actual = listener.local_addr()?.port();
         self.state.port.store(actual, Ordering::Relaxed);
         let _ = self.state.rt.set(tokio::runtime::Handle::current());
@@ -1174,6 +1212,66 @@ async fn provision_tools(st: Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 监听 socket 的 accept 队列要够长。
+    ///
+    /// tokio 的 `TcpListener::bind` 底下是 mio，mio 照抄标准库写死
+    /// `listen(fd, 128)` —— 内核允许 8192，我们只用到 128。局域网里几台设备
+    /// 同时发现这台电脑、手机切网络重连时，128 很容易满，满了内核就丢掉新
+    /// 来的 SYN、客户端等 1 秒重传，表现成「连不上」而核心一条日志都没有。
+    ///
+    /// 这里从 `/proc/net/tcp` 读不出 backlog，所以直接问内核：把一个 listener
+    /// 建出来，用 `getsockopt` 拿不到（Linux 没有这个选项），于是退一步——
+    /// **断言我们自己传的值**，再断言 `somaxconn` 不小于它（否则设了也白设）。
+    #[test]
+    fn listen_backlog_is_larger_than_tokios_default() {
+        // tokio/mio 写死的那个值（标准库同款），见 mio 的 listener.rs。
+        // 用 `let` 而不是 `const`：常量比较会被 clippy 的 assertions_on_constants 拦
+        //（它说得很对 —— 那个断言在编译期就能算完），但这里要的是「以后有人把常量
+        // 改小」时**测试**失败，不是编译失败。
+        let tokio_default: i32 = std::hint::black_box(128);
+        assert!(
+            LISTEN_BACKLOG > tokio_default,
+            "backlog 必须比 tokio 默认的 {tokio_default} 大，否则这个修复没意义"
+        );
+        // 内核上限：设得比 somaxconn 大也不会更差（内核取 min），但小得离谱
+        // 就说明常量被改坏了
+        if let Ok(v) = std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
+            let somaxconn: i32 = v.trim().parse().unwrap_or(0);
+            if somaxconn > 0 {
+                assert!(
+                    LISTEN_BACKLOG <= somaxconn,
+                    "backlog {LISTEN_BACKLOG} 超过内核上限 somaxconn={somaxconn}，设了也不生效"
+                );
+            }
+        }
+    }
+
+    /// 真正的行为验证：`listen_tcp` 建出来的 socket **能接住**超过 tokio 默认
+    /// 队列长度的一批连接（不等 accept）。这条会真的向内核要连接，所以只在
+    /// 本机回环上跑。
+    #[tokio::test]
+    async fn listen_tcp_accepts_a_burst_longer_than_tokios_backlog() {
+        let listener = listen_tcp(std::net::Ipv4Addr::LOCALHOST.into(), 0).expect("建监听");
+        let port = listener.local_addr().unwrap().port();
+        // 发起 200 条（> 128），**先不 accept**。backlog 够大时它们都该在毫秒级
+        // 连上；只有 128 的话第 129 条起会卡在 SYN 重传（1 秒）。
+        let start = std::time::Instant::now();
+        let mut socks = Vec::new();
+        for _ in 0..200 {
+            let s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("连不上：accept 队列打满了");
+            socks.push(s);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "200 条连接花了 {elapsed:?} —— accept 队列没生效（应该在几十毫秒内）"
+        );
+        drop(socks);
+    }
 
     /// 崩溃策略是「panic 就崩」。
     ///
