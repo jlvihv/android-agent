@@ -493,21 +493,32 @@ async fn apply(
 
     up.step("下载并安装新版本的包（几百 MB，几分钟）");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    // 输出是一块一块来的，按行拼好再进日志
+    // 输出是一块一块来的，按行拼好再进日志。
+    //
+    // **先攒字节、凑齐整行再解码**：以前每片各自 `from_utf8_lossy`，一个汉字的
+    // 三个字节切在两片之间时两边都成 `�`，apk 的中文输出进了日志就是乱码。
     let pump = async {
-        let mut pending = String::new();
+        let mut pending: Vec<u8> = Vec::new();
         while let Some(chunk) = rx.recv().await {
-            pending.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(i) = pending.find('\n') {
-                let line: String = pending.drain(..=i).collect();
+            pending.extend_from_slice(&chunk);
+            // 一次把整段切成行：游标前进，最后整体搬一次（不是每行 drain 一遍）
+            let mut cut = 0usize;
+            while let Some(i) = pending[cut..].iter().position(|&b| b == b'\n') {
+                let end = cut + i;
+                let line = String::from_utf8_lossy(&pending[cut..end]);
                 let line = line.trim_end();
                 if !line.is_empty() {
                     up.log_line(line.to_string());
                 }
+                cut = end + 1;
+            }
+            if cut > 0 {
+                pending.drain(..cut);
             }
         }
-        if !pending.trim().is_empty() {
-            up.log_line(pending.trim_end().to_string());
+        let tail = String::from_utf8_lossy(&pending);
+        if !tail.trim().is_empty() {
+            up.log_line(tail.trim_end().to_string());
         }
     };
     let script = "apk update && apk upgrade --available";

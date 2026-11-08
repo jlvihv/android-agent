@@ -803,18 +803,22 @@ async fn watch_turns(port: u16, token: &str, db: Option<&crate::db::Db>) -> Resu
 
     // SSE 一行一行地读：`data: {...}` 里是一个 `Event`，空行结束一帧
     // （形状和手机壳读的一模一样，见 `http::turns_stream`）。
+    //
+    // **先按字节切帧、再解码**（`text::FrameBuf`）。以前是每片网络数据各自
+    // `from_utf8_lossy`：一个汉字的三个字节被切在两片之间时两边都变成 `�`，
+    // 中文状态到了通知里就是乱码 —— `openai.rs` 早就踩过这个坑并在那里写了注释，
+    // 这里是照抄错的版本。
     let mut stream = res.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = crate::text::FrameBuf::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("读流失败：{e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(idx) = buf.find("\n\n") {
-            let frame = buf[..idx].to_string();
-            buf.drain(..idx + 2);
+        buf.push(&chunk);
+        while let Some(frame) = buf.next_frame() {
+            let frame = String::from_utf8_lossy(frame);
             handle_sse_frame_with(&frame, db);
         }
         // 一条状态最多几 KB：一直攒着说明对面没在发空行，丢了重来
-        if buf.len() > 1 << 20 {
+        if buf.pending_len() > 1 << 20 {
             buf.clear();
         }
     }

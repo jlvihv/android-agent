@@ -423,7 +423,8 @@ where
     // **按字节**攒，凑齐一帧再解码：每个网络分片各自
     // `from_utf8_lossy` 的话，一个汉字的三个字节被切在两片里，两边都变成 `�`，
     // 回复里就会冒乱码。帧边界（空行）是纯 ASCII，切字节是安全的。
-    let mut buf: Vec<u8> = Vec::new();
+    // 切帧逻辑在 `text::FrameBuf` 里（`machines` / `alpine` 也用它）。
+    let mut buf = crate::text::FrameBuf::new();
     // 收到过结束标记没有：`[DONE]`（Chat），或者带 finish_reason / 用量的那一帧
     // （Responses 没有 `[DONE]`，`response.completed` 映射成后者）。
     let mut terminal = false;
@@ -451,19 +452,18 @@ where
                 DATA_IDLE.as_secs()
             ),
         };
-        buf.extend_from_slice(&next?);
+        buf.push(&next?);
 
-        while let Some((end, sep)) = frame_end(&buf) {
-            let frame = String::from_utf8_lossy(&buf[..end]).into_owned();
-            buf.drain(..end + sep);
+        while let Some(frame) = buf.next_frame() {
+            let frame = String::from_utf8_lossy(frame).into_owned();
             if handle_frame(&frame, &tx, &mut on_chunk)? {
                 return Ok(());
             }
         }
     }
     // 有些服务端在结尾不发空行
-    if !buf.iter().all(u8::is_ascii_whitespace) {
-        let frame = String::from_utf8_lossy(&buf).into_owned();
+    if let Some(frame) = buf.take_rest() {
+        let frame = String::from_utf8_lossy(frame).into_owned();
         if handle_frame(&frame, &tx, &mut on_chunk)? {
             return Ok(());
         }
@@ -476,18 +476,6 @@ where
     // 类型，那句只是延长了自己的生命周期）。
     anyhow::ensure!(terminal, "连接在回复结束前断开了");
     Ok(())
-}
-
-/// 找第一个帧边界（空行）：返回 (帧长度, 分隔符长度)。`\n\n` 和 `\r\n\r\n` 都认。
-fn frame_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let lf = buf.windows(2).position(|w| w == b"\n\n");
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(a), Some(b)) if b < a => Some((b, 4)),
-        (Some(a), _) => Some((a, 2)),
-        (None, Some(b)) => Some((b, 4)),
-        (None, None) => None,
-    }
 }
 
 /// 处理一帧。返回 `true` 表示收到 `[DONE]` 或消费端没了。
