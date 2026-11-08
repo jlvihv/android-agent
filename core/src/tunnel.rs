@@ -686,3 +686,149 @@ impl ServerCertVerifier for Pinned {
         self.algs.supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! 隧道的纯逻辑部分（指纹、凭据、路由代号、头部解析）。
+    //!
+    //! 这些以前一条测试都没有，而它们的失败表现都很难查：指纹算错 = 「连不上」
+    //! 且没有任何提示；凭据判断反了 = 一个能连到别处网页的隧道（安全问题）；
+    //! 路由代号没变 = 换网络后一直用死连接。
+    use super::*;
+
+    /// 指纹就是 DER 的 SHA-256 十六进制，小写、定长 64。
+    #[test]
+    fn fingerprint_is_lowercase_sha256_hex() {
+        let fp = fingerprint(b"hello");
+        assert_eq!(fp.len(), 64, "SHA-256 的十六进制是 64 个字符：{fp}");
+        assert!(
+            fp.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "必须是小写十六进制：{fp}"
+        );
+        // 和 sha2 算的一致（对齐 `agent_relay::hex` 的实现）
+        assert_eq!(fp, crate::tunnel::fingerprint(b"hello"));
+        assert_ne!(fingerprint(b"hello"), fingerprint(b"hell0"));
+        assert_eq!(fingerprint(b"").len(), 64, "空输入也要有定长输出");
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// 三种凭据都认：`x-agent-token` 头（隧道钥匙或那台电脑的 token）、
+    /// `agent_tunnel` cookie、`agent_token` cookie。
+    #[test]
+    fn credential_accepts_the_tunnel_key_and_the_machine_token() {
+        let (key, token) = ("tunnel-key", "machine-token");
+        // 头
+        assert!(credential_ok(
+            &headers(&[("x-agent-token", "tunnel-key")]),
+            key,
+            token
+        ));
+        assert!(credential_ok(
+            &headers(&[("x-agent-token", "machine-token")]),
+            key,
+            token
+        ));
+        // 两种 cookie 都认；多个 cookie 挤在一行也要能挑出来
+        assert!(credential_ok(
+            &headers(&[("cookie", "a=1; agent_tunnel=tunnel-key; b=2")]),
+            key,
+            token
+        ));
+        assert!(credential_ok(
+            &headers(&[("cookie", "x=y; agent_token=machine-token")]),
+            key,
+            token
+        ));
+        // 分在多个 cookie 头里
+        assert!(credential_ok(
+            &headers(&[("cookie", "a=1"), ("cookie", "agent_tunnel=tunnel-key")]),
+            key,
+            token
+        ));
+    }
+
+    /// **错的凭据必须挡住**：隧道能转发到，等于能操作那台电脑。
+    #[test]
+    fn credential_rejects_everything_else() {
+        let (key, token) = ("tunnel-key", "machine-token");
+        for bad in [
+            headers(&[]),
+            headers(&[("x-agent-token", "")]),
+            headers(&[("x-agent-token", "tunnel")]),
+            headers(&[("x-agent-token", "tunnel-keyy")]),
+            headers(&[("x-agent-token", "machine")]),
+            headers(&[("cookie", "agent_tunnel=wrong")]),
+            headers(&[("cookie", "agent_token=")]),
+            // 前缀相同但更长（长度不同就不该过）
+            headers(&[("x-agent-token", "tunnel-key-extra")]),
+        ] {
+            assert!(
+                !credential_ok(&bad, key, token),
+                "错的凭据不该通过: {bad:?}"
+            );
+        }
+    }
+
+    /// `query` / `cookie` 的解析：没有就 `None`，不要瞎猜。
+    #[test]
+    fn query_and_cookie_parsing() {
+        let uri: http::Uri = "http://localhost:8787/x?a=1&k=secret&b=2".parse().unwrap();
+        assert_eq!(query(&uri, "k"), Some("secret"));
+        assert_eq!(query(&uri, "a"), Some("1"));
+        assert_eq!(query(&uri, "missing"), None);
+        assert_eq!(query(&"http://h/".parse().unwrap(), "k"), None);
+
+        let h = headers(&[("cookie", "a=1; k=2")]);
+        assert_eq!(cookie(&h, "k"), Some("2"));
+        assert_eq!(cookie(&h, "a"), Some("1"));
+        assert_eq!(cookie(&h, "zzz"), None);
+        assert_eq!(cookie(&headers(&[]), "k"), None);
+    }
+
+    /// 路由代号：**换路必须换代号**（上游连接池按它分桶，不换就一直用走旧网络
+    /// 的死连接）。重复报同一个地址不该换（否则池子每报一次就清一次）。
+    #[test]
+    fn route_generation_changes_only_when_the_route_changes() {
+        let r = Routes::new(Some("10.0.0.2:8787".into()), None);
+        let g0 = r.generation();
+
+        // 同一个地址再报一次：不该动
+        r.set_lan("10.0.0.2:8787".into());
+        assert_eq!(r.generation(), g0, "地址没变不该换代号");
+
+        // 地址变了：换
+        r.set_lan("10.0.0.3:8787".into());
+        let g1 = r.generation();
+        assert_ne!(g1, g0, "地址变了必须换代");
+        assert_eq!(r.lan_now().as_deref(), Some("10.0.0.3:8787"));
+
+        // 明确 reset：换
+        r.reset();
+        assert_ne!(r.generation(), g1, "reset 必须换代");
+    }
+
+    /// 局域网刚失败过：冷却期内不再试它（直接走中继），冷却期由 `reset` 作废。
+    #[test]
+    fn lan_is_skipped_during_cooldown_and_reset_clears_it() {
+        let r = Routes::new(Some("10.0.0.2:8787".into()), None);
+        assert!(r.lan_now().is_some(), "一开始该试局域网");
+        r.lan_failed();
+        assert!(r.lan_now().is_none(), "失败之后冷却期内不该再试");
+        r.reset();
+        assert!(
+            r.lan_now().is_some(),
+            "reset（网络变了/回家了）之后该重新试"
+        );
+    }
+}

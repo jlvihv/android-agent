@@ -575,3 +575,133 @@ pub fn parse_settings_list(text: &str) -> Option<Value> {
     }
     Some(Value::Object(m))
 }
+
+#[cfg(test)]
+mod tests {
+    //! 用**真机抓下来的样本**（`tests/fixtures/shizuku/*.txt`，Pixel 10 /
+    //! Android 17）跑一遍解析。
+    //!
+    //! 这些 fixture 一直躺在仓库里没人用 —— 而这个模块是全套东西里最容易坏的
+    //! 部分（系统升级、换机型格式就变），没有测试等于每次真机出问题都靠猜。
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/shizuku")
+            .join(name);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("读不到 {}: {e}", p.display()))
+    }
+
+    #[test]
+    fn battery_sample_gives_the_fields_a_human_needs() {
+        let v = parse_battery(&fixture("battery.txt")).expect("电池样本必须解析得出来");
+        assert_eq!(v["电量"], "53%");
+        // 温度是「十分之一摄氏度」，377 必须报 37.7 而不是 377
+        assert_eq!(v["温度"], "37.7℃");
+        assert_eq!(v["状态"], "充电中");
+        assert_eq!(v["健康"], "良好");
+        assert_eq!(v["电压"], "4.171V");
+        assert_eq!(v["供电"], "充电器");
+    }
+
+    /// 拿不到关键字段时必须给 `None`（调用方退回原文），**不许**编默认值。
+    #[test]
+    fn battery_without_level_is_none_not_a_guess() {
+        assert!(parse_battery("Current Battery Service state:\n  status: 2\n").is_none());
+        assert!(parse_battery("").is_none());
+    }
+
+    #[test]
+    fn getprop_sample_picks_the_six_things_worth_showing() {
+        let v = parse_device_info(&fixture("getprop.txt")).expect("getprop 样本要能解析");
+        assert_eq!(v["品牌"], "google");
+        assert_eq!(v["型号"], "Pixel 10");
+        assert_eq!(v["设备"], "frankel");
+        assert_eq!(v["系统"], "17");
+        assert_eq!(v["SDK"], "37");
+        // `_for_attestation` / `_family` 那些噪音不该跑到字段里
+        let s = v.to_string();
+        assert!(!s.contains("attestation"), "认证用的重复属性不该进来：{s}");
+    }
+
+    #[test]
+    fn users_sample_lists_the_owner() {
+        let v = parse_users(&fixture("users.txt")).expect("users 样本要能解析");
+        assert!(v.to_string().contains("机主"), "要带出用户名：{v}");
+    }
+
+    /// 每个解析器的**底线**：给一堆垃圾/空文本不能 panic（这些输入来自
+    /// 别的 App 的输出，格式随时可能完全变样）。
+    #[test]
+    fn garbage_input_never_panics() {
+        let long = "0123456789".repeat(1000);
+        let samples = [
+            "",
+            "\n\n\n",
+            "::",
+            "a=b c=d",
+            "NotificationRecord(",
+            "runtime permissions:",
+            long.as_str(),
+        ];
+        for s in samples {
+            let _ = parse_battery(s);
+            let _ = parse_device_info(s);
+            let _ = parse_top_activity(s);
+            let _ = parse_users(s);
+            let _ = parse_display(s);
+            let _ = parse_packages(s);
+            let _ = parse_package_info(s);
+            let _ = parse_permissions(s);
+            let _ = parse_notifications(s);
+            let _ = parse_settings_list(s);
+        }
+    }
+
+    /// 真实 fixture 也一样不许 panic（大文件里格式五花八门）。
+    #[test]
+    fn all_fixtures_parse_without_panicking() {
+        for name in [
+            "activities.txt",
+            "battery.txt",
+            "display.txt",
+            "getprop.txt",
+            "notification.txt",
+            "package-info.txt",
+            "packages.txt",
+            "users.txt",
+        ] {
+            let text = fixture(name);
+            let _ = parse_battery(&text);
+            let _ = parse_device_info(&text);
+            let _ = parse_top_activity(&text);
+            let _ = parse_users(&text);
+            let _ = parse_display(&text);
+            let _ = parse_packages(&text);
+            let _ = parse_package_info(&text);
+            let _ = parse_permissions(&text);
+            let _ = parse_notifications(&text);
+            let _ = parse_settings_list(&text);
+        }
+    }
+
+    /// `k=v` 一行挤好几个、值里带空格/方括号的情况。
+    #[test]
+    fn inline_equals_pairs_handle_brackets_and_spaces() {
+        let pairs = split_eq_pairs("versionCode=1 minSdk=26 flags=[ INSTALLED HAS_CODE ]");
+        let get = |k: &str| pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("versionCode").as_deref(), Some("1"));
+        assert_eq!(get("minSdk").as_deref(), Some("26"));
+        assert_eq!(get("flags").as_deref(), Some("[ INSTALLED HAS_CODE ]"));
+    }
+
+    /// key 的比较忽略大小写和空格（不同版本写法不同：`Capacity level` /
+    /// `capacity_level`）。
+    #[test]
+    fn key_matching_ignores_case_and_spaces() {
+        let text = "  Capacity level: 3\n  capacity_level: 4\n";
+        // 第一个命中的就返回（和真机行为一致：取先出现的）
+        assert_eq!(kv_lookup(text, "capacity_level").as_deref(), Some("3"));
+        assert_eq!(norm_key("Capacity Level"), norm_key("capacity_level"));
+    }
+}
