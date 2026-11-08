@@ -58,6 +58,27 @@ jobs:
         working-directory: relay
         run: cargo clippy --all-targets -- -D warnings
 
+      # Android 目标只做**编译检查**（跑不了测试）：`cfg(target_os = "android")`
+      # 后面的那部分（trim 的 mallopt、android_logger、uniffi 的 callback）在
+      # 桌面目标上一行都不编，只有这里能发现它们坏了。
+      #
+      # 必须用真 NDK：`ring` / `libsqlite3-sys` 要 bionic 的头文件，
+      # Debian 那个 `gcc-aarch64-linux-android` 编不过它们。
+      - name: install NDK
+        run: |
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;27.0.12077973" > /dev/null
+
+      - name: android target compiles
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+        run: |
+          rustup target add aarch64-linux-android
+          export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          export CC_aarch64_linux_android=aarch64-linux-android26-clang
+          export AR_aarch64_linux_android=llvm-ar
+          cargo check --target aarch64-linux-android --lib --no-default-features
+
   web:
     runs-on: ubuntu-latest
     defaults:
