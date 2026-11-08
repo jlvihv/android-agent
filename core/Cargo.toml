@@ -12,6 +12,10 @@ crate-type = ["cdylib", "lib"]
 [[bin]]
 name = "agent-dev"
 path = "src/main.rs"
+# 桌面开发用的入口（`main.rs` 用了 `remote` / `desktop` 这些只在非 Android 上
+# 编进来的模块）。不加这行的话 `cargo ndk … check --all-targets` 会去编它然后
+# 报「cannot find module remote」—— 那和 Android 一点关系都没有。
+required-features = ["desktop-bin"]
 
 # 生成 Kotlin 绑定用。放在 feature 后面，这样默认构建不会把
 # uniffi_bindgen（含 askama 模板）编进来。
@@ -27,7 +31,12 @@ path = "src/bin/uniffi-bindgen.rs"
 required-features = ["uniffi-bindgen"]
 
 [features]
+default = ["desktop-bin"]
 uniffi-bindgen = ["uniffi/cli"]
+# 桌面入口 `agent-dev` 的开关。**默认开着**（`cargo run` / `just dev` 照旧），
+# 只有交叉编 Android 时才关掉：
+#   cargo ndk -t arm64-v8a check --lib --no-default-features
+desktop-bin = []
 
 [dependencies]
 tokio = { version = "1", features = [
