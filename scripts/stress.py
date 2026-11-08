@@ -11,8 +11,11 @@
     S2 慢客户端   客户端开了连接却**不读**（WebView 被挂起、手机切走）。
                   核心会不会无界堆积？断开之后资源放不放得掉？
     S3 突发连接   一次 200 条 TCP 打进来（局域网里一堆设备同时连）。
-    S4 静默流     上游 200 但一个事件都不发 —— 核心该按 DATA_IDLE 判超时，
-                  不能永远挂着（这是「回合卡死」的经典成因）。
+    S4 静默流     上游 200 但一个事件都不发 —— 核心不能永远挂着（这是
+                  「回合卡死」的经典成因）。**实测结论**：核心会把它当网络
+                  错误、按 2s/5s/10s 退避重试 3 次（约 65 秒）后报错结束 ——
+                  不会卡死，这点是对的。 `DATA_IDLE`（300s）那条路没走到，
+                  因为传输层先断了。
     S5 失败重试   上游按概率回 429 —— 重试退避会不会把连接池/线程占死。
     S6 长会话     一个会话里连着发 N 条，历史越滚越长（每步都重新组装请求）。
 
@@ -348,9 +351,18 @@ def scenario_s3(base: str, token: str | None, n: int) -> Summary:
     return total
 
 
-def scenario_s4(base: str, token: str | None, timeout: float) -> Summary:
-    """S4：上游 200 但一个事件都不发 —— 核心必须自己判超时，不能永远挂着。"""
+def scenario_s4(
+    base: str, token: str | None, timeout: float, harness: "Harness | None" = None
+) -> Summary:
+    """S4：上游 200 但一个事件都不发 —— 核心必须自己判超时，不能永远挂着。
+
+    **必须让假 LLM 处于 silent 模式**，否则它照常吐字，这条就测了个寂寞
+    （踩过：`--scenario all` 里没换模式，S4「325ms 就成功」）。有 harness 时
+    把假 LLM 重启成 silent 的，跑完再换回来。
+    """
     total = Summary("S4 静默流（上游 200 + 不发事件）")
+    if harness is not None:
+        harness.restart_llm({**harness.llm_env, "LLM_SILENT": "1"})
     sid = new_session(base, token)
     r = open_stream(
         base, "/api/chat", {"text": "压测 s4 静默流", "session": sid}, token, timeout
@@ -471,6 +483,32 @@ class Harness:
         )
         print(f"环境就绪：{base}（假 LLM :{self.llm_port}），数据 {self.data}")
 
+    def restart_llm(self, env: dict[str, str]) -> None:
+        """换假 LLM 的行为（杀掉重起，端口不变）。"""
+        self.llm_env = dict(env)
+        old = self.procs.pop(0)
+        old.send_signal(signal.SIGTERM)
+        try:
+            old.wait(timeout=5)
+        except Exception:
+            old.kill()
+        llm = subprocess.Popen(
+            ["bun", os.path.join(ROOT, "scripts", "fixture-llm-slow.ts")],
+            env={**os.environ, "FIXTURE_PORT": str(self.llm_port), **self.llm_env},
+            stdout=open("/tmp/stress-llm.log", "a"),
+            stderr=subprocess.STDOUT,
+        )
+        self.procs.insert(0, llm)
+        # 等端口重新可用
+        for _ in range(50):
+            time.sleep(0.1)
+            try:
+                socket.create_connection(("127.0.0.1", self.llm_port), timeout=1).close()
+                return
+            except OSError:
+                continue
+        raise RuntimeError("假 LLM 重启后没起来")
+
     def stop(self) -> None:
         for p in self.procs:
             try:
@@ -543,7 +581,7 @@ def main() -> int:
             results.append(scenario_s3(base, token, 200))
         if "s4" in want:
             print("\n=== S4 静默流 ===")
-            results.append(scenario_s4(base, token, min(args.timeout, 30)))
+            results.append(scenario_s4(base, token, min(args.timeout, 30), harness))
         if "s6" in want:
             print(f"\n=== S6 长会话：连发 {args.rounds * 4} 条 ===")
             results.append(scenario_s6(base, token, args.rounds * 4, args.timeout))
