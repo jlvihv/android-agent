@@ -40,6 +40,7 @@
 //! 动作**名字**这一层也有测试盯着：`ACTIONS` 和沙箱里 `agent browser` 的 case 表
 //! （`cli::browser_actions_match_the_core`）。
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -800,7 +801,8 @@ impl CdpBrowser {
             .unwrap_or_default();
         let mut text = format!("匹配到 {count} 个（列前 {} 个）：", items.len());
         for it in &items {
-            text.push_str(&format!(
+            let _ = write!(
+                text,
                 "\n  [{}] <{}> {}  {}x{} @ {},{} {}",
                 it.get("i").and_then(|v| v.as_i64()).unwrap_or(0),
                 it.get("tag").and_then(|v| v.as_str()).unwrap_or(""),
@@ -814,7 +816,7 @@ impl CdpBrowser {
                 } else {
                     "不可见"
                 },
-            ));
+            );
         }
         Ok(ok(&text, None, None))
     }
@@ -862,7 +864,7 @@ impl CdpBrowser {
             .to_string();
         let mut text = format!("已打开 {real}");
         if !title.is_empty() {
-            text.push_str(&format!("\n标题：{title}"));
+            let _ = write!(text, "\n标题：{title}");
         }
         if !loaded {
             // SPA 经常不触发 loadEventFired；不是失败，如实说

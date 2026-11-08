@@ -67,6 +67,7 @@ pub(crate) mod weather;
 pub(crate) mod workspace;
 
 use anyhow::Context;
+use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -1028,7 +1029,8 @@ fn tab_reply(action: &str, v: &serde_json::Value) -> Option<String> {
             let mut out = format!("共 {} 只标签：", list.len());
             for t in list {
                 let field = |k: &str| t.get(k).and_then(|x| x.as_str()).unwrap_or("");
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "\n  [{}] {}{}",
                     t.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0),
                     page(field("url"), field("title")),
@@ -1037,7 +1039,7 @@ fn tab_reply(action: &str, v: &serde_json::Value) -> Option<String> {
                     } else {
                         ""
                     }
-                ));
+                );
             }
             out
         }

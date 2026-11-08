@@ -136,7 +136,7 @@ impl Reporter {
             state,
             sid: sid.to_string(),
             title: title.to_string(),
-            started_at_ms: now_ms(),
+            started_at_ms: crate::agent::now_ms(),
             last: Mutex::new(Last::default()),
         }
     }
@@ -202,7 +202,7 @@ impl Reporter {
             Snapshot {
                 detail: reply,
                 active: false,
-                finished_at_ms: Some(now_ms()),
+                finished_at_ms: Some(crate::agent::now_ms()),
                 ok,
                 stopped,
                 ..self.running(Phase::Done, None, None)
@@ -387,9 +387,4 @@ fn tail_start(s: &str, max: usize) -> usize {
         i += 1;
     }
     i
-}
-
-/// wall clock 毫秒（和消息时间戳 `agent::now_ms` 同一个坐标系）。
-fn now_ms() -> u64 {
-    crate::agent::now_ms()
 }

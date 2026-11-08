@@ -24,6 +24,7 @@
 //! `LinuxSandbox::skills_dir`。装一个 skill 就是往里放一个目录（模型用 bash 就能
 //! `git clone`）。
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// 索引里最多列多少个（再多就该整理了，提示词不能无限长）。
@@ -100,10 +101,7 @@ pub fn index(skills: &[Skill]) -> String {
         "- 技能（skill）：遇到下面这些事，先用 read 读对应的 SKILL.md，按里面的做法来：",
     );
     for k in on {
-        s.push_str(&format!(
-            "\n  - {}：{}（{}）",
-            k.name, k.description, k.path
-        ));
+        let _ = write!(s, "\n  - {}：{}（{}）", k.name, k.description, k.path);
     }
     s
 }

@@ -12,7 +12,7 @@
 //! `data:` URL；按原始字节能塞下、编码成 base64 后却超了是最容易踩的坑。
 
 use anyhow::Context;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -180,20 +180,41 @@ pub fn data_url(mime: &str, bytes: &[u8]) -> String {
 /// 重新装」之间来回抖。
 const URL_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// LRU：path → (data URL, 它最近被用的序号)。
+///
+/// 原来是 `HashMap` + `VecDeque<String>` 手工维护顺序，`get` 里
+/// `order.iter().position(|p| p == path)` 再 `remove(i)` —— 线性扫 + memmove，
+/// 而且 path 在两张表里各存一份 `String`。
+///
+/// 现在用 `tick` 单调递增的序号表示「什么时候用的」，淘汰队列是一张
+/// `BTreeMap<序号, path>`：最久没用的就是 `first_key_value()`，O(log n)。
+/// 命中时只往 map 里插一个新序号，**不动任何已有条目**；旧序号留在树里，
+/// 淘汰时发现「map 里记的序号和它不一样」就说明已被取代，丢掉即可。
+///
+/// 为什么值得改：`cached_data_url` 在**组请求**里对每张图各调一次（一个回合
+/// 5–8 步、每步都把整段历史重新组装），缓存里通常有几十个大块。
 #[derive(Default)]
 struct UrlCache {
-    map: HashMap<String, Arc<str>>,
-    /// 最近用过的在后面
-    order: VecDeque<String>,
+    /// path → (data URL, 最近使用的序号)
+    map: HashMap<String, (Arc<str>, u64)>,
+    /// 序号 → path，最久没用的在最前（`pop_first` 就是淘汰对象）
+    queue: std::collections::BTreeMap<u64, String>,
+    /// 下一个要发的序号
+    tick: u64,
     bytes: usize,
 }
 
 impl UrlCache {
     fn get(&mut self, path: &str) -> Option<Arc<str>> {
-        let url = self.map.get(path)?.clone();
-        if let Some(i) = self.order.iter().position(|p| p == path) {
-            let k = self.order.remove(i).expect("刚找到的下标");
-            self.order.push_back(k);
+        let (url, old) = self.map.get(path)?;
+        let (url, old) = (url.clone(), *old);
+        self.tick += 1;
+        // 旧序号必须从队列里摘掉：留着的话它排在队头，淘汰时会被当成
+        // 「这条最久没用」—— 而它其实刚被用过（实测过，测试抓到的）。
+        self.queue.remove(&old);
+        self.queue.insert(self.tick, path.to_string());
+        if let Some((_, stamp)) = self.map.get_mut(path) {
+            *stamp = self.tick;
         }
         Some(url)
     }
@@ -203,16 +224,37 @@ impl UrlCache {
             return; // 单个就超上限的不缓存（每次现读），别为它把别的全挤掉
         }
         while self.bytes + url.len() > URL_CACHE_MAX_BYTES {
-            let Some(old) = self.order.pop_front() else {
+            if !self.evict_oldest() {
                 break;
-            };
-            if let Some(u) = self.map.remove(&old) {
-                self.bytes -= u.len();
             }
         }
         self.bytes += url.len();
-        self.order.push_back(path.to_string());
-        self.map.insert(path.to_string(), url);
+        self.tick += 1;
+        self.queue.insert(self.tick, path.to_string());
+        self.map.insert(path.to_string(), (url, self.tick));
+    }
+
+    /// 淘汰最久没用的那条。返回有没有真的淘汰掉东西。
+    ///
+    /// `get` 命中时会把旧序号从队列里摘掉，所以队列和 `map` 是**一一对应**的，
+    /// 正常情况下一摘就中。这里的 `is_some_and` 只是防御（也让「谁不在这张表里」
+    /// 这种不一致不至于静默留下垃圾条目）。
+    fn evict_oldest(&mut self) -> bool {
+        while let Some((stamp, path)) = self.queue.pop_first() {
+            if self.map.get(&path).is_some_and(|(_, s)| *s == stamp) {
+                if let Some((u, _)) = self.map.remove(&path) {
+                    self.bytes -= u.len();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 只给测试看：缓存里有几条。
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
     }
 }
 
@@ -407,6 +449,78 @@ fn try_jpeg(img: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LRU 的语义：命中要把那条推到「最新」，淘汰永远淘汰最久没用的那条。
+    ///
+    /// 这块自己实现过两版（`VecDeque` + `position`、条目记下标 + `swap_remove`），
+    /// 都容易写错 —— 而错了的表现是「某张图被提前淘汰，每步都要重新读盘 +
+    /// base64」，只看代码看不出来。
+    #[test]
+    fn url_cache_evicts_the_least_recently_used() {
+        let mut c = UrlCache::default();
+        c.put("a", Arc::from("AA")); // 2 字节
+        c.put("b", Arc::from("BB"));
+        c.put("c", Arc::from("CC"));
+        assert_eq!(c.len(), 3);
+
+        // 用一下 a：它变成最新的，淘汰时该轮到 b
+        assert_eq!(c.get("a").as_deref(), Some("AA"));
+        assert_eq!(c.len(), 3, "命中不该改变条数");
+
+        // 再加一条 4 字节：6 字节没超上限，谁都不该被淘汰
+        c.put("d", Arc::from("DDDD"));
+        assert_eq!(
+            c.len(),
+            4,
+            "没超上限不该淘汰：{:?}",
+            c.map.keys().collect::<Vec<_>>()
+        );
+
+        // 再塞到超上限（> 64MB）太费内存，这里直接验证「淘汰挑最久没用的」：
+        // 把上限调成 3 字节，看它先丢 b 还是先丢刚用过的 a。
+        let mut tiny = UrlCache::default();
+        tiny.put("a", Arc::from("A"));
+        tiny.put("b", Arc::from("B"));
+        tiny.get("a"); // a 变最新
+        tiny.put("c", Arc::from("C")); // 3 字节，没超
+        assert_eq!(tiny.len(), 3);
+        // 队列顺序（序号从小到大）= 最久没用 → 最新：b(2) → a(3) → c(4)
+        assert_eq!(
+            tiny.queue.values().cloned().collect::<Vec<_>>(),
+            vec!["b", "a", "c"],
+            "命中 a 之后，a 必须排到 b 后面"
+        );
+        // 淘汰最久没用的那条 = b
+        assert!(tiny.evict_oldest());
+        assert!(!tiny.map.contains_key("b"), "b 最久没用，先被淘汰");
+        assert!(tiny.map.contains_key("a") && tiny.map.contains_key("c"));
+        assert_eq!(tiny.bytes, 2, "淘汰后字节数要跟着减");
+    }
+
+    /// 淘汰只按字节算；单条就超过上限的东西不缓存，也不该把别人挤掉。
+    #[test]
+    fn url_cache_skips_oversize_entries_without_evicting_others() {
+        let mut c = UrlCache::default();
+        c.put("small", Arc::from("x"));
+        let huge = URL_CACHE_MAX_BYTES + 1;
+        let big: Arc<str> = "y".repeat(huge).into();
+        c.put("huge", big);
+        assert!(!c.map.contains_key("huge"), "单条超上限不缓存");
+        assert!(c.map.contains_key("small"), "不该为它把别人挤掉");
+    }
+
+    /// 反复命中同一条时，淘汰队列里的陈旧序号要被丢掉，且缓存条数不涨。
+    #[test]
+    fn url_cache_survives_repeated_hits() {
+        let mut c = UrlCache::default();
+        c.put("a", Arc::from("A"));
+        for _ in 0..1000 {
+            assert_eq!(c.get("a").as_deref(), Some("A"));
+        }
+        assert_eq!(c.len(), 1, "反复命中不该多出条目");
+        assert_eq!(c.queue.len(), 1, "命中要把旧序号摘掉，队列里只该剩一条");
+        assert!(c.get("missing").is_none());
+    }
 
     /// 两张表必须互为反向：写下去用什么后缀，取回来就得是什么 mime。
     /// （`gif` / `bmp` 现在解不了码，但历史里可能有老文件，后缀映射得留着。）

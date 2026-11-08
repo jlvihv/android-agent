@@ -151,7 +151,9 @@ const CLOSES_P: &[&str] = &[
     "ul",
 ];
 
-fn is_heading(name: &str) -> bool {
+/// 标题标签（`h1`–`h6`）。`readable` 也用它分块，别各写一份 —— 以后要加
+/// `hgroup` 之类的判断，只改这里。
+pub(crate) fn is_heading(name: &str) -> bool {
     matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
 }
 

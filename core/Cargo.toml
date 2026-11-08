@@ -200,6 +200,10 @@ unimplemented = "deny"
 # 实测只有 3 处命中，且全是误报（值要 move 进 `std::thread::spawn` /
 # `tokio::spawn` 的 move 闭包，clippy 看不出来）—— 那 3 处各自写了 allow。
 redundant_clone = "warn"
+# 白分配：`s.push_str(&format!(..))` 会先拼一个临时 String 再拷进去（实测 32 处，
+# 已全部改成 `write!`）。开着它，新写的别再退回去。
+format_push_string = "warn"
+
 large_enum_variant = "warn"
 
 # --- 编译档位 -------------------------------------------------------------

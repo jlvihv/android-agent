@@ -4,6 +4,7 @@
 //! 是 secure context —— `crypto.subtle`、Service Worker 都能用。
 
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -955,9 +956,9 @@ fn browser_text(v: &Value) -> String {
     if !url.is_empty() && !out.contains(url) {
         let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
         if title.is_empty() {
-            out.push_str(&format!("\n[页面：{url}]"));
+            let _ = write!(out, "\n[页面：{url}]");
         } else {
-            out.push_str(&format!("\n[页面：{title} — {url}]"));
+            let _ = write!(out, "\n[页面：{title} — {url}]");
         }
     }
     let tabs = v
@@ -969,7 +970,7 @@ fn browser_text(v: &Value) -> String {
             .get("tab")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        out.push_str(&format!("\n[标签 #{tab}，共 {tabs} 只]"));
+        let _ = write!(out, "\n[标签 #{tab}，共 {tabs} 只]");
     }
     out
 }
@@ -1896,7 +1897,7 @@ pub fn sandbox_page_url(raw: &str, port: u16, key: &str) -> Option<String> {
         if b.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:@".contains(&b) {
             enc.push(b as char);
         } else {
-            enc.push_str(&format!("%{b:02X}"));
+            let _ = write!(enc, "%{b:02X}");
         }
     }
     Some(format!("{}/sandbox/{key}{enc}{tail}", sandbox_origin(port)))
@@ -3403,11 +3404,12 @@ async fn dir_listing(guest: &str, host: &std::path::Path) -> Response {
     }
     for (name, dir) in entries {
         let slash = if dir { "/" } else { "" };
-        html.push_str(&format!(
+        let _ = write!(
+            html,
             "<a href=\"{h}{slash}\">{n}{slash}</a>",
             h = esc(&name),
             n = esc(&name)
-        ));
+        );
     }
     let mut res = html.into_response();
     sandbox_headers(&mut res, "text/html; charset=utf-8");

@@ -38,6 +38,7 @@
 //! 模型也就看不到「这台机器上没有」这层区分。
 
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 
 // ---------------------------------------------------------------------------
 // 命令表（help、提示词、校验都从这里取）
@@ -570,7 +571,7 @@ fn plan_activity(group: &str, sub: &str, a: &[&str]) -> Result<Plan, String> {
             let mut cmd = format!("am broadcast -a {}", shq(act));
             if let Some(i) = a.iter().position(|x| *x == "-p") {
                 let pkg = a.get(i + 1).ok_or("-p 后面要跟包名")?;
-                cmd.push_str(&format!(" -p {}", shq(pkg)));
+                let _ = write!(cmd, " -p {}", shq(pkg));
             }
             Ok(Plan::done(cmd, "已发广播".to_string()))
         }

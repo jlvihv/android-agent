@@ -26,6 +26,7 @@
 //! （有测试守着：`variables_are_braced_before_multibyte`）。
 
 use crate::platform::Platform;
+use std::fmt::Write as _;
 
 /// `agent` 命令跑在哪种机器上（见模块说明）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +271,7 @@ pub fn script(m: Machine) -> String {
     let mut out = String::from(PRELUDE);
     out.push_str("cmd=\"${1:-help}\"\ncase \"$cmd\" in\n");
     for s in &subs {
-        out.push_str(&format!("  {})\n{}\n    ;;\n", s.name, s.body.trim_end()));
+        let _ = write!(out, "  {})\n{}\n    ;;\n", s.name, s.body.trim_end());
     }
     out.push_str("  help|-h|--help)\n    cat <<'EOT'\n");
     out.push_str(&help_text(&subs));

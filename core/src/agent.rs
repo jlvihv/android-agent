@@ -8,6 +8,7 @@
 //! 的状态，回合结束就是结束，手机 App 随时被杀都没关系。
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -177,7 +178,7 @@ impl ChatMessage {
             ChatMessage::User { text, attachments } => {
                 let mut body = text.clone();
                 for a in attachments {
-                    body.push_str(&format!("\n[附件：{}（{}）]", a.name, a.mime));
+                    let _ = write!(body, "\n[附件：{}（{}）]", a.name, a.mime);
                 }
                 Message::User {
                     content: UserContent::Text(body),
@@ -3071,7 +3072,7 @@ async fn read_image_outcome(
         img.original_width, img.original_height
     );
     if (img.width, img.height) != (img.original_width, img.original_height) {
-        output.push_str(&format!("（缩到 {}×{} 发给你）", img.width, img.height));
+        let _ = write!(output, "（缩到 {}×{} 发给你）", img.width, img.height);
     }
 
     if !supports_images {
@@ -3090,7 +3091,7 @@ async fn read_image_outcome(
         },
         Err(e) => {
             tracing::warn!("图片落盘失败: {e:#}");
-            output.push_str(&format!("。图没能保存，这次没发给你：{e:#}"));
+            let _ = write!(output, "。图没能保存，这次没发给你：{e:#}");
             ToolOutcome::text(output)
         }
     }

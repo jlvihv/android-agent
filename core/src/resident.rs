@@ -39,6 +39,7 @@
 //! proot 的老路（`linux.rs`）。
 
 use std::ffi::CString;
+use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -258,23 +259,24 @@ pub fn run_file(
         // 命令自己的组里，跟以前一样被一起杀
         "set +m\n",
     );
-    out.push_str(&format!("cd -- {} 2>/dev/null || cd /\n", sh_quote(cwd)));
+    let _ = writeln!(out, "cd -- {} 2>/dev/null || cd /", sh_quote(cwd));
     for (k, v) in env {
         // 名字不合法就跳过（见 `is_valid_env_name`：那是防注入的边界）
         if !is_valid_env_name(k) {
             tracing::debug!("跳过名字不合法的环境变量（不拼进 shell）");
             continue;
         }
-        out.push_str(&format!("export {k}={}\n", sh_quote(v)));
+        let _ = writeln!(out, "export {k}={}", sh_quote(v));
     }
     if own_shell {
         // `$(< 文件)` 是 bash 的内建读文件（不 exec 一个 cat）
-        out.push_str(&format!(
-            "exec \"$BASH\" -c \"$(< {q})\" \"$BASH\"\n",
+        let _ = writeln!(
+            out,
+            "exec \"$BASH\" -c \"$(< {q})\" \"$BASH\"",
             q = sh_quote(script_guest)
-        ));
+        );
     } else {
-        out.push_str(&format!(". {}\n", sh_quote(script_guest)));
+        let _ = writeln!(out, ". {}", sh_quote(script_guest));
     }
     out
 }

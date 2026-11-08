@@ -23,6 +23,7 @@
 
 use anyhow::Context;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -763,10 +764,6 @@ fn is_proot(p: &RawProc, proot_name: &str) -> bool {
 }
 
 /// 多行命令压成一行（登记表里只留一条给模型认领的线索）。
-fn one_line(s: &str) -> String {
-    crate::text::one_line(s)
-}
-
 /// 进程还活着吗。僵尸也算「活着」（它占着 pid），调用方按需滤掉。
 fn pid_alive(pid: i32) -> bool {
     if pid <= 1 {
@@ -774,10 +771,6 @@ fn pid_alive(pid: i32) -> bool {
     }
     let r = unsafe { libc::kill(pid, 0) };
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-fn now_ms() -> u64 {
-    crate::agent::now_ms()
 }
 
 /// 我们起过的一条命令 —— `procs()` 靠它把 /proc 里的进程认到命令上。
@@ -924,10 +917,11 @@ impl ProcsReport {
         }
         let mut s = String::new();
         if !self.leftovers.is_empty() {
-            s.push_str(&format!(
-                "命令结束后还活着的常驻进程（{} 个）—— `agent kill <pid>` 停掉：\n",
+            let _ = writeln!(
+                s,
+                "命令结束后还活着的常驻进程（{} 个）—— `agent kill <pid>` 停掉：",
                 self.leftovers.len()
-            ));
+            );
             for e in &self.leftovers {
                 s.push_str(&fmt_proc_line(e));
             }
@@ -936,34 +930,33 @@ impl ProcsReport {
             if !s.is_empty() {
                 s.push('\n');
             }
-            s.push_str(&format!("正在跑的命令（{} 条）：\n", self.running.len()));
+            let _ = writeln!(s, "正在跑的命令（{} 条）：", self.running.len());
             for r in &self.running {
-                s.push_str(&format!(
+                let _ = write!(
+                    s,
                     "  pgid {}  {}个进程  {}前\n      ← {}\n",
                     r.pgid,
                     r.procs,
                     fmt_age(r.age_secs),
                     r.command
-                ));
+                );
             }
         }
         if !self.orphans.is_empty() {
             if !s.is_empty() {
                 s.push('\n');
             }
-            s.push_str(&format!(
+            let _ = writeln!(
+                s,
                 "不属于任何已知命令的进程（{} 个）—— 通常是**上一次 App 进程被杀**时\
-                 留下的（那次的登记表已经不在了），`agent kill <pid>` 可以停掉：\n",
+                 留下的（那次的登记表已经不在了），`agent kill <pid>` 可以停掉：",
                 self.orphans.len()
-            ));
+            );
             for e in self.orphans.iter().take(MAX_ORPHANS) {
                 s.push_str(&fmt_proc_line(e));
             }
             if self.orphans.len() > MAX_ORPHANS {
-                s.push_str(&format!(
-                    "  … 还有 {} 个没列\n",
-                    self.orphans.len() - MAX_ORPHANS
-                ));
+                let _ = writeln!(s, "  … 还有 {} 个没列", self.orphans.len() - MAX_ORPHANS);
             }
         }
         s.push_str("\n（pid / pgid 都是宿主 pid，跟沙箱里 `ps` 看到的一致）");
@@ -1298,8 +1291,8 @@ impl LinuxSandbox {
     ) -> Option<RunKey> {
         let mut r = self.runs.lock().ok()?;
         Some(r.add(RunInfo {
-            command: crate::text::cap(&one_line(script), 160),
-            started_ms: now_ms(),
+            command: crate::text::cap(&crate::text::one_line(script), 160),
+            started_ms: crate::agent::now_ms(),
             proot_pid,
             pid_file,
             finished: false,
@@ -1344,7 +1337,7 @@ impl LinuxSandbox {
             return ProcsReport::default();
         };
         runs.prune();
-        let now = now_ms();
+        let now = crate::agent::now_ms();
         let mut leftovers = Vec::new();
         let mut running = Vec::new();
         let mut gone: Vec<RunKey> = Vec::new();

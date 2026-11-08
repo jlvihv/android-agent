@@ -98,8 +98,14 @@ impl Routes {
     /// 发现服务会反复报同一个地址：地址没变、也没在走中继的话，池子里的连接照用
     /// （不然每报一次池子就清一次，复用就白做了）。
     pub fn set_lan(&self, addr: String) {
+        // 先比再 move：原来是 `g.replace(addr.clone())` 之后又拿 `addr.as_str()` 比，
+        // 每次上报都白拷一份 String（发现服务刷得很勤）。
         let changed = self.lan.lock().map_or(true, |mut g| {
-            g.replace(addr.clone()).as_deref() != Some(addr.as_str())
+            if g.as_deref() == Some(addr.as_str()) {
+                return false;
+            }
+            *g = Some(addr);
+            true
         });
         let was_down = self
             .lan_down_until

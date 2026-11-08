@@ -304,14 +304,14 @@ fn meta_content<'a>(doc: &'a Doc, keys: &[&str]) -> Option<&'a str> {
 /// 标题：和 `og:title` / `<title>` 对得上的 `<h1>` > `og:title` > `<title>`。
 /// 后两个常带着站名（「… - Wikipedia」「…_新浪网」），`<h1>` 一般不带。
 fn page_title(doc: &Doc) -> String {
-    let og = meta_content(doc, &["og:title", "twitter:title"]).map(collapse);
+    let og = meta_content(doc, &["og:title", "twitter:title"]).map(crate::text::one_line);
     let title = doc
         .find("title")
-        .map(|t| collapse(&doc.text_of(t)))
+        .map(|t| crate::text::one_line(&doc.text_of(t)))
         .unwrap_or_default();
     for (i, n) in doc.nodes.iter().enumerate() {
         if n.name == "h1" {
-            let h = collapse(&doc.text_of(i));
+            let h = crate::text::one_line(&doc.text_of(i));
             let matches = |t: &str| t.contains(&h);
             if h.chars().count() >= 2 && (og.as_deref().is_some_and(matches) || matches(&title)) {
                 return h;
@@ -339,7 +339,7 @@ fn page_meta(doc: &Doc) -> String {
     [author, date]
         .into_iter()
         .flatten()
-        .map(collapse)
+        .map(crate::text::one_line)
         .collect::<Vec<_>>()
         .join(" · ")
 }
@@ -355,7 +355,7 @@ fn page_host(doc: &Doc) -> String {
     });
     canonical
         .or_else(|| meta_content(doc, &["og:url"]))
-        .map(|u| host_of(u).to_string())
+        .map(|u| crate::text::authority(u).to_string())
         .unwrap_or_default()
 }
 
@@ -490,10 +490,6 @@ fn is_block(name: &str) -> bool {
     BLOCK.contains(&name)
 }
 
-fn is_heading(name: &str) -> bool {
-    matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
-}
-
 struct Segmenter<'a> {
     doc: &'a Doc,
     host: &'a str,
@@ -606,7 +602,7 @@ impl<'a> Segmenter<'a> {
             match name {
                 "br" => self.buf.br(),
                 "hr" | "img" => self.flush(n, chrome),
-                _ if is_heading(name) => {
+                _ if html::is_heading(name) => {
                     self.flush(n, chrome);
                     let inl = inline(doc, c);
                     let t = tidy(&inl.s).replace('\n', " ");
@@ -928,10 +924,6 @@ fn tidy(s: &str) -> String {
     out.join("\n")
 }
 
-fn collapse(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// 链接去哪：同站只写路径，别的站写 域名 + 路径（外站的短查询串留着）。
 /// 页内锚点、`javascript:` 不算去处。
 fn where_to(href: &str, host: &str) -> Option<String> {
@@ -948,7 +940,7 @@ fn where_to(href: &str, host: &str) -> Option<String> {
         return Some(href.to_string());
     };
     let rest = rest.split('#').next().unwrap_or(rest);
-    let h = host_of(href);
+    let h = crate::text::authority(href);
     if !host.is_empty() && h == host {
         let path = &rest[h.len()..];
         Some(if path.is_empty() {
@@ -966,10 +958,6 @@ fn where_to(href: &str, host: &str) -> Option<String> {
             _ => Some(rest.to_string()),
         }
     }
-}
-
-fn host_of(url: &str) -> &str {
-    crate::text::authority(url)
 }
 
 #[cfg(test)]

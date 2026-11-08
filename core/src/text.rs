@@ -101,9 +101,20 @@ fn frame_end(buf: &[u8]) -> Option<(usize, usize)> {
 
 /// 压成一行：连续空白折成一个空格，首尾不留空白。
 ///
-/// 通知只有一段（多个换行会被系统折成一堆空白），登记表里也只需要一条线索。
+/// 通知只有一段（多个换行会被系统折成一堆空白），登记表里也只需要一条线索；
+/// 网页正文里的标题、搜索摘要也用它。
+///
+/// 不用 `collect::<Vec<_>>().join(" ")`：那是先建一遍索引表再拼一遍，多一次
+/// 分配。这里一趟写出去，只在真需要插空格的地方插。
 pub fn one_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    for w in s.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    out
 }
 
 /// 去掉协议头之后那一截（到 `/`、`?`、`#` 为止），**是 `url` 的一段** ——

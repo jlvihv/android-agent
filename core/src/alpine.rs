@@ -551,9 +551,6 @@ async fn apply(
         "升级后跑不起来基本命令：{}",
         r.to_text()
     );
-    up.log_line(format!(
-        "✓ {}",
-        r.stdout.split_whitespace().collect::<Vec<_>>().join(" ")
-    ));
+    up.log_line(format!("✓ {}", crate::text::one_line(&r.stdout)));
     Ok(())
 }

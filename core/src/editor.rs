@@ -16,6 +16,7 @@
 //! 索引一律用**字节偏移**（Rust 的 `str::find` 语义）。Kotlin 版用 UTF-16
 //! 偏移，但整个算法自洽，换成字节偏移等价 —— 只要别混用。
 
+use std::fmt::Write as _;
 /// 一次替换
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
@@ -330,7 +331,7 @@ fn build_patch(path: &str, original: &str, changes: &[Match]) -> (usize, String)
     }
 
     let mut out = String::new();
-    out.push_str(&format!("--- {path}\n+++ {path}\n"));
+    let _ = write!(out, "--- {path}\n+++ {path}\n");
     if changes.is_empty() || original.is_empty() {
         return (1, out);
     }
@@ -410,9 +411,10 @@ fn build_patch(path: &str, original: &str, changes: &[Match]) -> (usize, String)
         } else {
             (ctx_first as isize + 1 + delta).max(0) as usize
         };
-        out.push_str(&format!(
-            "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
-        ));
+        let _ = writeln!(
+            out,
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+        );
         for rec in &before {
             emit(' ', *rec, &mut out);
         }

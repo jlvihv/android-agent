@@ -270,7 +270,7 @@ fn squeeze(s: &str) -> String {
         .replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#x27;", "'");
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::text::one_line(&cleaned)
 }
 
 /// 回退标题用：域名；连域名都认不出（没有协议头）就原样给 URL，别给空标题。

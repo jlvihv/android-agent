@@ -8,6 +8,7 @@
 //! 临时的该放 `/tmp`）。它不整理任何东西 —— 只把「该收一收了」这件事变得看得见。
 //! 整理是模型的活（它会 `mv`），也是用户的决定（他的文件，他不点头我们不动）。
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -70,12 +71,13 @@ pub fn render(root_guest: &str, host: &Path) -> anyhow::Result<String> {
     files.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "{root_guest}  {} 个目录 / {} 个文件，共 {}\n",
+    let _ = writeln!(
+        out,
+        "{root_guest}  {} 个目录 / {} 个文件，共 {}",
         dirs.len(),
         files.len(),
         human_bytes(total_bytes)
-    ));
+    );
 
     if dirs.is_empty() && files.is_empty() {
         out.push_str("\n（空的。一个任务一个子目录，成品放里面。）\n");
@@ -90,35 +92,38 @@ pub fn render(root_guest: &str, host: &Path) -> anyhow::Result<String> {
             .max()
             .unwrap_or(0);
         for d in &dirs {
-            out.push_str(&format!(
-                "  {:<width$}  {:>5} 项  {:>9}  {}\n",
+            let _ = writeln!(
+                out,
+                "  {:<width$}  {:>5} 项  {:>9}  {}",
                 format!("{}/", d.name),
                 d.items.unwrap_or(0),
                 human_bytes(d.bytes),
                 ago(d.modified),
                 width = width + 1,
-            ));
+            );
         }
     }
 
     if !files.is_empty() {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "\n散在根目录的文件（{} 个）—— 成品收进子目录，临时的放 /tmp 或删掉\n",
             files.len()
-        ));
+        );
         let width = files
             .iter()
             .map(|f| f.name.chars().count())
             .max()
             .unwrap_or(0);
         for f in &files {
-            out.push_str(&format!(
-                "  {:<width$}  {:>9}  {}\n",
+            let _ = writeln!(
+                out,
+                "  {:<width$}  {:>9}  {}",
                 f.name,
                 human_bytes(f.bytes),
                 ago(f.modified),
                 width = width,
-            ));
+            );
         }
     }
 

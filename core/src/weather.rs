@@ -12,6 +12,7 @@
 //! `agent location current -q` 拿 latitude/longitude，喂给这里。
 
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 
 /// Open-Meteo 的预报接口（免 key）。
 const ENDPOINT: &str = "https://api.open-meteo.com/v1/forecast";
@@ -169,13 +170,13 @@ fn url(a: &Args) -> String {
         a.lat, a.lon
     );
     if !current.is_empty() {
-        u.push_str(&format!("&current={current}"));
+        let _ = write!(u, "&current={current}");
     }
     if !hourly.is_empty() {
-        u.push_str(&format!("&hourly={hourly}&forecast_hours={}", a.hours));
+        let _ = write!(u, "&hourly={hourly}&forecast_hours={}", a.hours);
     }
     if !daily.is_empty() {
-        u.push_str(&format!("&daily={daily}&forecast_days={}", a.days));
+        let _ = write!(u, "&daily={daily}&forecast_days={}", a.days);
     }
     u
 }
