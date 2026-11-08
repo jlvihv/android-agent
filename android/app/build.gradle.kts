@@ -1,6 +1,7 @@
 plugins {
+    // Kotlin 支持是 AGP 9 内置的：**不要**再 apply `org.jetbrains.kotlin.android`，
+    // 留着会直接构建失败（"no longer required for Kotlin support since AGP 9.0"）。
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 /** 要出哪些 ABI（`AGENT_ABIS=arm64-v8a,x86_64 just emu-install` 那种）。 */
@@ -15,6 +16,15 @@ val knownAbis =
 android {
     namespace = "dev.vihv.agent"
     compileSdk = 36
+
+    // AGP 9 不再认 ANDROID_NDK_HOME / NDK_HOME 环境变量（"Not considering
+    // ANDROID_NDK_HOME because support was removed after deprecation period"），
+    // 而它自带的默认值是 28.2.13676358 —— 本机装的是 27.0.12077973（cargo-ndk
+    // 也用这个）。不显式写的话，stripReleaseDebugSymbols 找不到 llvm-strip，
+    // 整个包会变成「Unable to strip ... packaging them as they are」，APK 直接胖一圈。
+    //
+    // 换 NDK 时这里和 justfile 的 ndk_home 要一起改。
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "dev.vihv.agent"
@@ -108,7 +118,8 @@ android {
     }
 
     // cargo-ndk 的输出目录（由 justfile 的 android-libs 生成）
-    sourceSets["main"].jniLibs.srcDir("src/main/jniLibs")
+    // `srcDir(Any)` 在 Gradle 9 里已弃用，用 `directories`。
+    sourceSets["main"].jniLibs.directories.add("src/main/jniLibs")
 
     lint {
         // 我们刻意不用 AndroidX；没必要求最新版本

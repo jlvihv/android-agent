@@ -24,7 +24,7 @@ Kotlin（薄壳）+ Rust（核心）+ Web 前端（WebView），做一个跑在�
 | `cargo-ndk`          | ❌ **未安装**，需 `cargo install cargo-ndk`（4.1.2）                       |
 | Android SDK          | `/home/vihv/Android/Sdk`，platform `android-36`，build-tools 34/35/36 ✅   |
 | NDK                  | **r27.0.12077973** ✅（注意：r27 的 16KB page size 是**选开**，见风险 R1） |
-| Java                 | OpenJDK 21.0.12 ✅（AGP 8.x 可用）                                         |
+| Java                 | OpenJDK 21.0.12 ✅                                                        |
 | Gradle               | ❌ 系统无，用 wrapper 即可                                                 |
 | Node / Bun           | v26.11.1 / 1.4.2 ✅                                                        |
 | 连接设备             | 无（`adb devices` 空）                                                     |
@@ -287,8 +287,9 @@ Rust（决策/规划/推理）──[指令 JSON]──▶ Kotlin Service（无�
 | rust        | 1.98.0            | 已装                                  |
 | cargo-ndk   | 4.1.2             | 已装                                  |
 | NDK         | r27.0.12077973    | 已装；见 R1                           |
-| AGP         | 8.x 最新          | 配 Java 21                            |
-| Kotlin      | 2.x 最新          |                                       |
+| AGP         | 9.5.1             | 配 Java 21；9.x 内置 Kotlin，别再 apply kotlin.android |
+| Gradle      | 9.6.0（wrapper）  | AGP 9.5.1 的最低要求                                  |
+| Kotlin      | 2.4.21            | 显式顶 KGP；AGP 9.5.1 自带的是 2.2.10 |
 | axum        | 0.8               |                                       |
 | tokio       | 1.x               |                                       |
 | rusqlite    | 0.3x（`bundled`） | 会话库 / 配置表；`.so` 多 ~50 KB      |

@@ -37,8 +37,8 @@ CPU 核数：8
 
 ```
 android/                          # Gradle 根
-├── build.gradle.kts              # AGP 8.13.2 / Kotlin 2.4.21
-├── gradle/wrapper/               # Gradle 8.14.6
+├── build.gradle.kts              # AGP 9.5.1 / KGP 2.4.21
+├── gradle/wrapper/               # Gradle 9.6.0
 └── app/
     ├── build.gradle.kts
     ├── proguard-rules.pro
