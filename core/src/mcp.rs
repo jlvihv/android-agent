@@ -553,14 +553,11 @@ fn save_blob(b64: &str, mime: &str, out: Option<&OutDir>) -> anyhow::Result<Stri
     use base64::Engine;
     let out = out.ok_or_else(|| anyhow::anyhow!("没地方放"))?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim())?;
+    // 图片格式走 `imaging::ext_of` 那唯一一份表；音频只有 MCP 服务会给，另开两个
     let ext = match mime {
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
         "audio/mpeg" => "mp3",
         "audio/wav" | "audio/x-wav" => "wav",
-        _ => "bin",
+        other => crate::imaging::ext_of(other),
     };
     // uuid v7 按时间排序：同一个目录里 ls 出来就是先后顺序
     let name = format!("{}{}.{ext}", out.prefix, uuid::Uuid::now_v7());

@@ -92,7 +92,7 @@ image = { version = "0.25", default-features = false, features = [
   "webp",
 ] }
 # 图片以 data URL 发出，直接 base64
-base64 = "0.22"
+base64 = "0.23"
 
 # 会话持久化。bundled = 把 SQLite 源码一起编进来，不依赖系统库
 # （Android 上根本没有 libsqlite3.so 可链）。
@@ -158,6 +158,40 @@ rcgen = { version = "0.14", default-features = false, features = [
 # `with_filter` 用的）。我们只用 with_max_level/with_tag，关掉它就不会把
 # regex-automata/regex-syntax 编进 .so。
 android_logger = { version = "0.14", default-features = false }
+
+# --- lint ---------------------------------------------------------------
+#
+# `just check` 里那个 `-D warnings` 只在你记得跑它的时候生效；
+# 直接 `cargo build` / 别人的 CI 就绕过去了。这几条写在这里，是「无论如何
+# 都不许过」的底线，每条都说清为什么：
+#
+# - `unsafe_op_in_unsafe_fn`：Rust 2024 起默认 deny。本 crate 是 2021，
+#   这里显式打开 —— 以后往 unsafe fn 里加代码时，必须自己写 unsafe 块
+#   并给 SAFETY 注释（现在的 6 处 unsafe 都是这个风格，别退化）。
+# - `unused_must_use`：Result 被悄悄丢掉的经典坑（这个项目里到处是
+#   `let _ = …`，那些是**故意**的，得写成 `let _ =`；漏写就必须报）。
+#
+# `unreachable_pub` 试过，全库 222 处 —— 都是 `pub(crate)` 模块里的 `pub`
+# 项（模块内可见性收口之后，这些 `pub` 等价于 `pub(crate)`，但全部改一遍
+# 是纯噪音的 diff）。先关掉，等哪天真要发布 API 再开。
+# - `clippy::redundant_clone`：这个 crate 里 `.clone()` 出现 500+ 次，
+#   其中真有白拷的；开着它至少让新写的白拷过不去。
+# - `clippy::large_enum_variant`：`ChatMessage` / `Message` 这些会被大量
+#   搬动，变体大小差太多会悄悄拖慢。
+# - `clippy::dbg_macro` / `todo` / `unimplemented`：不许留在主干里。
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unreachable_pub = "allow"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# 实测只有 3 处命中，且全是误报（值要 move 进 `std::thread::spawn` /
+# `tokio::spawn` 的 move 闭包，clippy 看不出来）—— 那 3 处各自写了 allow。
+redundant_clone = "warn"
+large_enum_variant = "warn"
 
 # --- 编译档位 -------------------------------------------------------------
 #

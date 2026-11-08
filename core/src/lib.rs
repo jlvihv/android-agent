@@ -660,15 +660,11 @@ impl Core {
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("建图片目录失败: {}", dir.display()))?;
-            let ext = match mime.as_str() {
-                "image/png" => "png",
-                "image/jpeg" => "jpg",
-                "image/gif" => "gif",
-                "image/webp" => "webp",
-                "image/bmp" => "bmp",
-                _ => "bin",
-            };
-            let path = dir.join(format!("{}.{ext}", uuid::Uuid::now_v7()));
+            let path = dir.join(format!(
+                "{}.{}",
+                uuid::Uuid::now_v7(),
+                crate::imaging::ext_of(&mime)
+            ));
             std::fs::write(&path, &bytes)
                 .with_context(|| format!("写图片失败: {}", path.display()))?;
             Ok(path)
@@ -719,15 +715,7 @@ impl Core {
 
         // 图片：按魔数认，不看客户端报的 mime（那是可以伪造的）
         if let Some(img) = crate::imaging::load_if_image_bytes(&bytes)? {
-            let ext = match img.mime.as_str() {
-                "image/png" => "png",
-                "image/jpeg" => "jpg",
-                "image/gif" => "gif",
-                "image/webp" => "webp",
-                "image/bmp" => "bmp",
-                _ => "bin",
-            };
-            let id = format!("{id}.{ext}");
+            let id = format!("{id}.{}", crate::imaging::ext_of(&img.mime));
             write_attachment(dir.clone(), id.clone(), img.bytes).await?;
             return Ok(Attachment {
                 path: dir.join(&id).display().to_string(),
@@ -747,7 +735,7 @@ impl Core {
             MAX_PDF_BYTES / 1024 / 1024
         );
         let _ = mime; // mime 统一由服务端判定，不信客户端
-        let id = format!("{id}.pdf");
+        let id = format!("{id}.{}", crate::imaging::ext_of("application/pdf"));
         write_attachment(dir.clone(), id.clone(), bytes).await?;
         Ok(Attachment {
             path: dir.join(&id).display().to_string(),
@@ -911,6 +899,8 @@ impl Core {
     /// 给 Kotlin 用的入口：同步返回端口，服务在独立线程里跑。
     pub fn serve_in_background(self, port: u16) -> anyhow::Result<u16> {
         let (tx, rx) = std::sync::mpsc::channel::<Result<u16, String>>();
+        // 误报：这个 clone 就是要给下面的 `move` 闭包用的
+        #[allow(clippy::redundant_clone)]
         let me = self.clone();
 
         std::thread::Builder::new()

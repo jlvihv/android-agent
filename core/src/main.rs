@@ -185,6 +185,9 @@ async fn run() -> anyhow::Result<()> {
     // 核心重启（改了东西重跑）之后刷新一下就能接着用，不用回 `127.0.0.1` 再切一次。
     // 必须**在 serve 之后**：隧道要把 `/api/machines*` 转回本机核心，那时端口才定下来。
     if let Some(m) = core.state.machines() {
+        // 误报：这个 clone 就是要给下面的 `move` 异步块用的（上面那个 `m`
+        // 后面 `watch_own_turns` 还要用）
+        #[allow(clippy::redundant_clone)]
         let m = m.clone();
         // 本机自己跑完的回合也要提醒（连着别的机器时它自己不发，见 `watch_own_turns`）
         m.watch_own_turns();

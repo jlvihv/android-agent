@@ -2343,15 +2343,8 @@ async fn get_attachment(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<St
     let Some(path) = core.attachment_path(&id) else {
         return (StatusCode::NOT_FOUND, "没有这个附件").into_response();
     };
-    let mime = match path.extension().and_then(|e| e.to_str()) {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
-        Some("pdf") => "application/pdf",
-        _ => "application/octet-stream",
-    };
+    // 后缀 → mime 只有 `imaging` 那一份表（写下去和取回来必须互相对得上）
+    let mime = crate::imaging::mime_of_ext(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
     match tokio::fs::read(&path).await {
         Ok(bytes) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
         Err(e) => (

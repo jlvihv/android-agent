@@ -381,6 +381,9 @@ impl AgentCore {
     /// 输入、按键、滚动、找元素、DOM 指纹、页面信息、`target=_blank` 修正）只有
     /// 核心这一份，桌面（CDP）用的是同一个 `build`。各写一份就会漂 ——
     /// 漂了的表现是「点不动 / 抽不出正文」，只有真机上才看得出来。
+    // `redundant_clone` 误报：`e` 是 `anyhow::Error`，`to_string()` 这里就是要
+    // 把根因拍平成一条消息给 Kotlin（跨 FFI 没法传错误链）。
+    #[allow(clippy::redundant_clone)]
     pub fn browser_js(&self, kind: String, params: String) -> Result<String, CoreError> {
         crate::browser_js::build(&kind, &params).map_err(|e| CoreError::Failed {
             message: e.to_string(),

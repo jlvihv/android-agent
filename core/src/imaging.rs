@@ -75,6 +75,40 @@ pub fn mime_of(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// mime → 落盘用的扩展名。**只有这里一份**。
+///
+/// 以前 `lib.rs` 里两处、`mcp.rs` 里一处各抄一遍，而 `image` 依赖在
+/// 2026-10-13 已经把 gif / bmp 的解码器去掉了（`.text` 里省 ~90KB）——
+/// 那几张表还留着 `gif` / `bmp`，于是「按 mime 定后缀」和「能不能解码」是
+/// 两份各自演化的真相。收在这里，新增格式只改一处。
+///
+/// 认识不了的给 `bin`（不猜，猜错了会让 `GET /api/attachment/<id>` 回错
+/// Content-Type）。
+pub fn ext_of(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
+/// 扩展名 → mime。`ext_of` 的反向，取回附件时用（`GET /api/attachment/<id>`）。
+pub fn mime_of_ext(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
 /// 只读前 12 字节嗅魔数，判断是不是认识的图片。
 ///
 /// **不要为了判断类型把整个文件读进来** —— 一个 200MB 的文本日志会因此
@@ -373,6 +407,37 @@ fn try_jpeg(img: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 两张表必须互为反向：写下去用什么后缀，取回来就得是什么 mime。
+    /// （`gif` / `bmp` 现在解不了码，但历史里可能有老文件，后缀映射得留着。）
+    #[test]
+    fn ext_and_mime_tables_agree() {
+        for mime in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/bmp",
+            "application/pdf",
+        ] {
+            let ext = ext_of(mime);
+            assert_ne!(ext, "bin", "{mime} 应该有后缀");
+            assert_eq!(mime_of_ext(ext), mime, "{mime} → {ext} → 反查不一致");
+        }
+        // 轰出来的魔数也走同一套
+        for bytes in [
+            &b"\x89PNG\r\n\x1a\n0000"[..],
+            &b"\xff\xd8\xff000"[..],
+            &b"GIF89a"[..],
+            &b"RIFF0000WEBP"[..],
+            &b"BM00"[..],
+        ] {
+            let mime = mime_of(bytes).expect("认得的格式");
+            assert_ne!(ext_of(mime), "bin", "魔数认出来的格式必须有后缀");
+        }
+        assert_eq!(ext_of("application/x-weird"), "bin");
+        assert_eq!(mime_of_ext("bin"), "application/octet-stream");
+    }
 
     use image::{Rgb, RgbImage};
 
