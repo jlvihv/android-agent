@@ -175,13 +175,41 @@ fn pick(doc: &Doc, blocks: &[Block]) -> Option<usize> {
             n = doc.nodes[n].parent;
         }
     }
-    // 同分取后面的：先序里后面的是更深的那层（只包着一个子元素的外壳和它里面同分）
+    // 容器取**装内容的那层**，不取内容本身。
+    //
+    // 同一个块沿祖先链一路累加，所以 `<article>` 和它里面唯一的 `<p>` 常常同分。
+    // 取最深的话正文容器会缩成那一个 `<p>` —— 和它平级的代码块、表格、小标题
+    // 全落在容器外，全被丢掉（实测：`<article><p>正文</p><pre>代码</pre>
+    // <table>表</table></article>` 抽出来只剩那一个 `<p>`）。
+    //
+    // 也不能一路往上：`<body>`/`<html>` 分数一样，取到那儿就等于整页都是容器，
+    // 导航又回来了。折中是「同分祖先里最深的、真正装了两个以上子元素的盒子」。
     let mut best = 0;
     for (i, &s) in v.iter().enumerate().skip(1) {
-        if !doc.nodes[i].is_text() && s > 0 && s >= v[best] {
+        if !doc.nodes[i].is_text() && s > 0 && s > v[best] {
             best = i;
         }
     }
+    if best != 0 {
+        // 从最高的同分祖先往下，找第一个「子元素 ≥ 2」的
+        let top = v[best];
+        let mut root = best;
+        while root != 0 && v[doc.nodes[root].parent] == top {
+            root = doc.nodes[root].parent;
+        }
+        let mut cursor = root;
+        while cursor < doc.end[root] {
+            if v[cursor] == top
+                && !doc.nodes[cursor].is_text()
+                && element_children(doc, cursor) >= 2
+            {
+                best = cursor;
+                break;
+            }
+            cursor += 1;
+        }
+    }
+
     let good: usize = blocks
         .iter()
         .filter(|b| doc.contains(best, b.node) && score(b) > 0)
@@ -195,6 +223,13 @@ fn pick(doc: &Doc, blocks: &[Block]) -> Option<usize> {
         .map(|b| b.units)
         .sum();
     (good >= MIN_ARTICLE_UNITS && good * 10 >= all * 7).then_some(best)
+}
+
+/// 一个节点的**元素**子节点个数（不算文本节点）。
+fn element_children(doc: &Doc, n: usize) -> usize {
+    (n + 1..doc.end[n])
+        .filter(|&c| doc.nodes[c].parent == n && !doc.nodes[c].is_text())
+        .count()
 }
 
 /// 容器里的块，剃掉开头结尾的链接块、连成串（≥3）的链接块和零碎的短链接；跟着被剃掉的
@@ -745,10 +780,17 @@ struct Inline {
 
 impl Inline {
     /// 原样的一段字（代码块）：只数字数
+    /// 代码块这类「整段都是一手文字」的：字数是字母数字，且**算作正文**
+    /// （`plain_words = true`）。
+    ///
+    /// 不设 `plain_words` 的话，`<pre>` 会被 `trim` 里那条「字全在链接里的碎片
+    /// 就扔掉」剔掉 —— 而代码块本来就不在链接里，它是纯粹的正文。实测：
+    /// 一个正文里带 `<pre><code>` 的文章，抽出来的文字里代码块整段消失。
     fn counted(s: &str) -> Self {
         Inline {
             s: s.to_string(),
             chars: s.chars().filter(|c| c.is_alphanumeric()).count(),
+            plain_words: true,
             ..Default::default()
         }
     }
@@ -928,4 +970,179 @@ fn where_to(href: &str, host: &str) -> Option<String> {
 
 fn host_of(url: &str) -> &str {
     crate::text::authority(url)
+}
+
+#[cfg(test)]
+mod tests {
+    //! `render` / `extract` 是**用户和模型直接看到的那段文字**，以前一条测试都没有。
+    //! 这里钉住的是「什么样算正文、什么样退回整页」这条判断的边界。
+    use super::*;
+
+    /// 一篇结构正常的文章：抽出标题和正文，链接栏不该混进来。
+    #[test]
+    fn a_normal_article_keeps_prose_and_drops_the_nav() {
+        let html = r#"<html><head><title>标题在这里</title></head><body>
+            <nav><a href="/a">首页</a><a href="/b">关于</a><a href="/c">联系</a></nav>
+            <article>
+              <h1>标题在这里</h1>
+              <p>第一段正文，写了一些足够长的内容好让它被认成正文，而不是导航或者页脚。</p>
+              <p>第二段正文，继续写一些足够长的内容，让这个容器的字数超过识别门槛。</p>
+              <p>第三段正文，再多一点文字，保证这段内容不会被当成零散的碎片扔掉。</p>
+            </article>
+            <footer><a href="/x">版权</a></footer>
+          </body></html>"#;
+        let a = extract(html).expect("正常文章要能抽出来");
+        assert!(!a.fallback, "这不该退回整页：{}", a.text);
+        assert!(a.title.contains("标题在这里"), "标题没抽到：{:?}", a.title);
+        assert!(a.text.contains("第一段正文"));
+        assert!(a.text.contains("第三段正文"));
+        assert!(!a.text.contains("版权"), "页脚不该进正文：{}", a.text);
+    }
+
+    /// 没有正文结构的页面：`fallback = true`，`text` 是整页文字。
+    #[test]
+    fn a_page_without_prose_falls_back_to_the_whole_page() {
+        let html = "<html><body><div><a href='/1'>链接一</a></div><div><a href='/2'>链接二</a></div></body></html>";
+        let a = extract(html).expect("整页也是结果");
+        assert!(a.fallback, "全是链接，应该退回整页");
+        assert!(a.text.contains("链接一"));
+        // 退回整页时不带 meta（作者/时间对整页没意义）
+        assert!(a.meta.is_empty());
+    }
+
+    /// 完全没文字的页面：明确报错（并告诉调用方该用浏览器那条路）。
+    #[test]
+    fn an_empty_page_is_an_error_with_a_hint() {
+        let e = extract("<html><body><div id=app></div></body></html>").unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("没有文字"), "错误要说清原因：{msg}");
+        assert!(msg.contains("agent browser"), "要给出下一步：{msg}");
+    }
+
+    /// 非 UTF-8 的字节：报错里带页面声明的编码和转码命令，不静默变成乱码。
+    #[test]
+    fn non_utf8_bytes_report_the_charset_and_how_to_convert() {
+        let mut bytes = b"<html><head><meta charset=\"gbk\"></head><body>".to_vec();
+        bytes.extend_from_slice(&[0xC4, 0xE3]); // GBK 的「你」，不是合法 UTF-8
+        bytes.extend_from_slice(b"</body></html>");
+        let e = extract_bytes(&bytes).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("iconv"), "要告诉怎么转码：{msg}");
+        assert!(
+            msg.contains("gbk") || msg.contains("GBK"),
+            "要说清编码：{msg}"
+        );
+        // UTF-8 BOM 要去掉再解析
+        let mut with_bom = b"\xEF\xBB\xBF".to_vec();
+        with_bom.extend_from_slice(b"<html><body><p>");
+        with_bom.extend_from_slice(
+            "中文正文，足够长的一段话，用来跨过识别门槛。"
+                .repeat(4)
+                .as_bytes(),
+        );
+        with_bom.extend_from_slice(b"</p></body></html>");
+        let a = extract_bytes(&with_bom).expect("带 BOM 的 UTF-8 要能解析");
+        assert!(a.text.contains("中文正文"));
+    }
+
+    /// `render` 的形状：标题一行、meta 一行、空一行、正文；退回整页时先说明一句。
+    #[test]
+    fn render_puts_title_meta_and_body_in_order() {
+        let a = Article {
+            title: "标题".into(),
+            meta: "作者 · 2026-01-02".into(),
+            text: "正文".into(),
+            fallback: false,
+        };
+        assert_eq!(render(&a), "标题\n作者 · 2026-01-02\n\n正文");
+
+        // 没有 title/meta 时不要留空行
+        let a = Article {
+            title: String::new(),
+            meta: String::new(),
+            text: "正文".into(),
+            fallback: false,
+        };
+        assert_eq!(render(&a), "正文");
+
+        // 退回整页要显式告诉模型
+        let a = Article {
+            title: "标题".into(),
+            meta: String::new(),
+            text: "整页文字".into(),
+            fallback: true,
+        };
+        assert_eq!(
+            render(&a),
+            "（没认出正文，下面是整页的文字）\n标题\n\n整页文字"
+        );
+
+        // 一个字都没有：只有头，没有多余空行
+        let a = Article {
+            title: "只有标题".into(),
+            meta: String::new(),
+            text: String::new(),
+            fallback: false,
+        };
+        assert_eq!(render(&a), "只有标题");
+    }
+
+    /// 真实页面（维基、HN 首页）在改动前后的抽取结果对比。`#[ignore]`：
+    /// 它只是打印，不判胜负，人工看有没有「正文变短 / 导航混进来」。
+    #[test]
+    #[ignore = "人工对比用，跑 --ignored --nocapture"]
+    fn dump_real_pages() {
+        for path in ["/tmp/wiki.html", "/tmp/hn.html"] {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let Ok(a) = extract_bytes(&bytes) else {
+                println!("{path}: ERROR");
+                continue;
+            };
+            println!(
+                "=== {path} fallback={} title={:?} 正文字数={} ===",
+                a.fallback,
+                a.title,
+                a.text.chars().count()
+            );
+            println!("{}", a.text.chars().take(300).collect::<String>());
+        }
+    }
+
+    /// 各种坏 HTML 都不许 panic（输入来自任意网页）。
+    #[test]
+    fn malformed_html_never_panics() {
+        let cases = [
+            "",
+            "<",
+            "<html",
+            "<p>没闭合",
+            "<div><div><div><p>深层嵌套",
+            "<script>var x = '<p>假的';</script>",
+            "<p>&#x4E2D;&amp;&lt;&gt;&nbsp;</p>",
+            &"<p>段落</p>".repeat(2000),
+            "<table><tr><td>单元格</td></tr></table>",
+        ];
+        for html in cases {
+            let _ = extract(html);
+        }
+    }
+
+    /// 表格和代码块要保留结构（模型靠它理解内容）。
+    #[test]
+    fn code_and_tables_survive_extraction() {
+        let body = "这是一段足够长的正文，用来把容器撑过识别门槛，免得整页回退。".repeat(6);
+        let html = format!(
+            r#"<html><head><title>T</title></head><body><article>
+              <p>{body}</p>
+              <pre><code>fn main() {{ println!("hi"); }}</code></pre>
+              <table><tr><th>列一</th><th>列二</th></tr><tr><td>1</td><td>2</td></tr></table>
+            </article></body></html>"#
+        );
+        let a = extract(&html).expect("该抽出正文");
+        assert!(a.text.contains("fn main"), "代码块要保留：{}", a.text);
+        assert!(a.text.contains("列一"), "表头要保留：{}", a.text);
+        assert!(a.text.contains("code") || a.text.contains("```") || a.text.contains("fn main"));
+    }
 }
