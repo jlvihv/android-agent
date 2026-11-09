@@ -196,7 +196,7 @@ fi
 
 # --- 1. 先编译（失败什么都不动） --------------------------------------------
 if [ "$BUILD" = 1 ]; then
-    log "编译中：cargo build --release --bin agent-dev（musl，见 ~/.cargo/config.toml）"
+    log "编译中：cargo build --release --bin agent-dev（musl，见 .cargo/config.toml）"
     if ! cargo build --release --bin agent-dev --manifest-path core/Cargo.toml >>"$LOG" 2>&1; then
         log "❌ 编译失败 —— 什么都不动，老核心（pid=$PID）照旧跑着"
         echo "❌ 编译失败，老核心照旧跑着（日志：$LOG）" >&2

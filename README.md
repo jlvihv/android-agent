@@ -77,10 +77,17 @@ just service uninstall   # 停掉并取消自启（二进制和会话库都不�
 musl 对超过阈值的块直接 `mmap`、`free` 即 `munmap`，没有 arena 这层，两个问题都不存在。
 代价是多线程下纯分配比 glibc 慢（微基准 4 线程慢 20×，但 agent 的热路径是等 IO）。
 
-这台机器的 `~/.cargo/config.toml` 把 `build.target` 设成了
+仓库根的 `.cargo/config.toml` 把 `build.target` 设成了
 `x86_64-unknown-linux-musl`，所以 `cargo build` / `cargo run` / `cargo test`
-**默认就出 musl**，不用写 `--target`。想要 glibc 那份就在命令行显式覆盖：
+**默认就出 musl**，不用写 `--target`（也不用再依赖谁的 `~/.cargo/config.toml`）。
+想要 glibc 那份就在命令行显式覆盖：
 `cargo build --release --target x86_64-unknown-linux-gnu`。
+
+这份配置是**跟着仓库走**的，不是跟着某台机器：cargo 只从「当前目录」往上找配置，
+**不看** `--manifest-path` 指过去的那个 crate（踩过：放 `core/.cargo/` 时，`just build`
+从仓库根跑就不生效了）。macOS 上 musl 编不了，所以 `justfile` 用
+`CARGO_BUILD_TARGET` 按系统把它换成 `aarch64-apple-darwin` —— 走 `just` 就不用管，
+裸跑 `cargo build` 的 macOS 用户要自己写一次 `--target`。
 
 产物的路径随 `--target` 变（cargo 的规矩）：带 `--target` 就多一层三元组目录。
 systemd unit / launchd plist / `scripts/service.sh` 都指着上面那个带三元组的路径。

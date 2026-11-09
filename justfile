@@ -40,10 +40,25 @@ export NDK_HOME := ndk_home
 
 # --- Rust ------------------------------------------------------------------
 
-# **musl 静态**：这台机器的 `~/.cargo/config.toml` 把 `build.target` 设成了
-# `x86_64-unknown-linux-musl`，所以这条命令不写 `--target` 也出 musl。
+# 桌面核心默认编 **musl 静态**，写在仓库根的 `.cargo/config.toml`（`[build] target`）。
 # 为什么换 musl（glibc 的 arena + THP 放大，78 MB → 6.7 MB）见 README 那段。
 #
+# 那份配置只能写死一个三元组，而 macOS 上 musl 目标根本编不了，所以这里按系统用
+# `CARGO_BUILD_TARGET` 覆盖它（环境变量压过配置文件里的 `build.target`）：`just build`
+# / `check` / `test` / `dev` 在哪个系统上都对。只有**裸跑 `cargo build`** 的人要自己
+# 写一次 `--target`（macOS 上是 `aarch64-apple-darwin`）。
+#
+# 必须是 `export` 而不是 `env_var_or_default`：后者在「设了但是空串」时会返回空，
+# cargo 拿到空的会直接 `error: target was empty`。
+default_target := if os() == "macos" {
+    if arch() == "aarch64" { "aarch64-apple-darwin" } else { "x86_64-apple-darwin" }
+} else if arch() == "aarch64" {
+    "aarch64-unknown-linux-musl"
+} else {
+    "x86_64-unknown-linux-musl"
+}
+export CARGO_BUILD_TARGET := default_target
+
 # 产物在 `core/target/x86_64-unknown-linux-musl/release/agent-dev` —— systemd unit /
 # launchd plist / service.sh 都指着这个路径。
 #
@@ -241,7 +256,7 @@ android-bindings:
     # 这一步带 `--features uniffi-bindgen`，feature 集一变 cargo 就把依赖树重编一遍
     # （实测 ~60s），和 `just dev` 的产物互相踩。给个单独的 target 目录，两边各自稳定。
     export CARGO_TARGET_DIR=target/bindgen
-    # **必须显式要 gnu/darwin，不能用默认 target**：本机 `~/.cargo/config.toml` 把
+    # **必须显式要 gnu/darwin，不能用默认 target**：仓库根的 `.cargo/config.toml` 把
     # `build.target` 设成了 musl，而 musl 是纯静态目标 —— cargo 会**丢掉 `cdylib`
     # 这个 crate-type**（就是编译时那条 `dropping unsupported crate type` 警告），
     # 于是 `libagent_core.so` 根本不生成，下面 bindgen 要 dlopen 它就直接失败。

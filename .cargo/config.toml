@@ -1,0 +1,32 @@
+# 桌面核心默认编 **musl 静态**目标 —— 不用在命令行写 `--target`。
+#
+# 为什么（README「桌面核心编成 musl 静态」那段有实测）：glibc 每个线程一块 arena
+# 还要靠 THP 记账，空闲时 RSS 停在 78 MB（活数据 2.7 MB）；musl 版 6.7 MB。
+#
+# 为什么放**仓库根**：cargo 找配置是从**当前目录**往上走，**不看** `--manifest-path`
+# 指过去的那个 crate 目录。放 `core/.cargo/` 的话，`cd core && cargo build` 生效，
+# 而 `just build`（从仓库根带 --manifest-path）和 `scripts/restart-core.sh` 全都会
+# 悄悄编出 glibc 那份、落到另一个目录 —— 正是这次要修的那个坑。
+#
+# 代价：这里写死了 x86_64-linux-musl，cargo 配置**没法按操作系统条件生效**。
+# macOS / 别的 Linux 架构上由 justfile 用 `CARGO_BUILD_TARGET` 覆盖（环境变量压过
+# 这里的 build.target），所以 `just …` 在哪个系统上都对；只有**裸跑 `cargo build`**
+# 的 macOS 用户会撞上它，显式写一次就行：
+#   cargo build --release --target aarch64-apple-darwin
+#
+# 想要 glibc 那份同样显式覆盖（产物会回到 `core/target/release/`，带 --target 才
+# 多一层三元组目录；systemd unit / launchd plist / service.sh 都指着三元组那条）：
+#   cargo build --release --target x86_64-unknown-linux-gnu
+
+[build]
+target = "x86_64-unknown-linux-musl"
+
+# linker 用 rustc 自带的 lld（跟 rustup 工具链一起装，名字就叫 `rust-lld`，rustc
+# 会去自己 sysroot 里找）。不这么写的话 cargo 会去要 `musl-gcc`，发行版不一定装
+# （Arch 的 musl 包默认不带包装器），报错还挺难懂。
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+# 同理，给 arm64 Linux 机器用（justfile 会把 build.target 覆盖成这个）。
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
