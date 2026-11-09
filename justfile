@@ -40,14 +40,20 @@ export NDK_HOME := ndk_home
 
 # --- Rust ------------------------------------------------------------------
 
-# 编桌面核心（release，给服务跑）。
-#
 # **musl 静态**：这台机器的 `~/.cargo/config.toml` 把 `build.target` 设成了
 # `x86_64-unknown-linux-musl`，所以这条命令不写 `--target` 也出 musl。
 # 为什么换 musl（glibc 的 arena + THP 放大，78 MB → 6.7 MB）见 README 那段。
 #
 # 产物在 `core/target/x86_64-unknown-linux-musl/release/agent-dev` —— systemd unit /
 # launchd plist / service.sh 都指着这个路径。
+#
+# **那条 `dropping unsupported crate type cdylib` 是预期的**，别去查：musl 是纯静态
+# 目标，没有动态库，cargo 就把 `[lib] crate-type` 里的 `cdylib` 丢掉。而 `cdylib`
+# 必须留着 —— 安卓的 `cargo ndk build --lib` 和 `just android-bindings` 都要它。
+# Cargo 不支持按 target 条件写 `crate-type`（`[target.'cfg(...)'.lib]` 只认 rustflags
+# 那一类键），所以这条消不掉，只能接受。
+#
+# 编 release 给服务跑。
 build:
     cargo build --release --manifest-path {{core}}/Cargo.toml --bin agent-dev
 
