@@ -2679,15 +2679,17 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "overridden": st.system_prompt_overridden(),
         },
         // 内存：`rss` 是内核看到的，`inUse` 是业务真在用的。两者差的那一大块
-        // 是分配器攥着的碎片（不是泄漏）—— 只看 RSS 会去优化一个不存在的问题，
-        // 所以这里两个都给，单位统一用 MB（留一位小数）。见 `trim::report`。
+        // 是分配器攥着的碎片（不是泄漏）—— 只看 RSS 会去优化一个不存在的问题。
+        // 单位统一用 MB（留一位小数）。桌面是 musl，`inUse`/`free` 是 `null`
+        // （它没 arena 这层，问不到也不需问）；安卓同是 `null`（scudo 没有 mallinfo2）。
+        // 见 `mem` 模块。
         "memory": memory_json(),
     }))
 }
 
-/// `trim::report()` 的 JSON 形状（`/api/debug/state` 的 `memory`）。
+/// `mem::report()` 的 JSON 形状（`/api/debug/state` 的 `memory`）。
 fn memory_json() -> Value {
-    let r = crate::trim::report();
+    let r = crate::mem::report();
     let mb = |b: Option<u64>| b.map(|b| (b as f64 / 1048576.0 * 10.0).round() / 10.0);
     json!({
         "rss": mb(r.rss),

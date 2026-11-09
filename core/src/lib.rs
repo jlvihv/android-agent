@@ -37,6 +37,8 @@ pub mod linux;
 pub(crate) mod llm;
 pub(crate) mod machines;
 pub(crate) mod mcp;
+/// 这个进程占了多少内存（`/api/debug/state` 的 `memory`）。每个平台都问得出来。
+pub(crate) mod mem;
 pub(crate) mod models;
 pub(crate) mod notify;
 pub(crate) mod openai;
@@ -60,7 +62,10 @@ pub(crate) mod sse;
 pub mod state;
 pub(crate) mod status;
 pub(crate) mod text;
-/// 把分配器攥着的空闲内存还给系统（放掉会话之后调一次）。
+/// 把分配器攥着的空闲内存还给内核。**只在安卓上编**：桌面是 musl 静态二进制，
+/// 它本就没 arena 这层（`free` 即 `munmap`），不需要也不该跑这段 ——
+/// 两个调用点（`TurnGuard::drop`、落盘定时器）也跟着一起不编进去。见 `trim` 的文件头。
+#[cfg(target_os = "android")]
 pub(crate) mod trim;
 pub mod tunnel;
 pub(crate) mod weather;
@@ -912,19 +917,24 @@ impl Core {
                 }
                 // 落过盘的、不用的会话把消息放掉（只剩摘要，要用时再读）
                 let n = st.evict_idle();
+                // 刚放掉的那几 MB 在安卓上是**散在 scudo 分级缓存里的小块**，
+                // 不显式 purge 就顶着峰值不放。另一个同样的时机是回合结束
+                // （`agent::TurnGuard::drop`），两处一起覆盖了「内存刚变成垃圾」
+                // 的两个时刻；别的时候没有这种内存可还，定时去碰堆只是白付代价。
+                //
+                // **只在安卓上编**：桌面是 musl 静态二进制，`free` 即 `munmap`，
+                // 没有可还的东西。见 `trim` 的文件头。
+                //
+                // 不等它：这里是落盘定时器，没东西依赖「还完了」，`release_soon`
+                // 自己会丢给阻塞池（`mallopt` 要拿 scudo 的全局锁，不能坐 worker 上）。
+                #[cfg(target_os = "android")]
                 if n > 0 {
                     tracing::debug!("{n} 个会话的消息已移出内存");
-                    // 刚放掉的那几 MB 是**散在 arena 里的小块**，glibc 不会自己
-                    // 还给系统（只有挨着堆顶时才收缩 brk）。不还的话 RSS 停在
-                    // 峰值上，看着像泄漏。另一个同样的时机是回合结束
-                    // （`agent::TurnGuard::drop`），两处一起覆盖了「内存刚变成
-                    // 垃圾」的两个时刻；别的时候没有这种内存可还，定时去碰堆
-                    // 只是白付代价。见 `trim` 模块。
-                    //
-                    // 不等它：这里是落盘定时器，没东西依赖「还完了」，
-                    // `release_soon` 自己会先看账（可还的不到 2 MB 就不折腾）、
-                    // 再丢给阻塞池（`malloc_trim` 要拿 arena 锁，不能坐 worker 上）。
                     trim::release_soon();
+                }
+                #[cfg(not(target_os = "android"))]
+                if n > 0 {
+                    tracing::debug!("{n} 个会话的消息已移出内存");
                 }
             }
         });

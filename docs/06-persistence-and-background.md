@@ -347,7 +347,7 @@ JS 在后台会被系统挂起；电脑上的核心更是只能从 HTTP 拿。�
 （`android-agent.service`，unit 在 `~/Code/project/config/systemd/user/`），macOS 是
 launchd 用户代理（`dev.vihv.android-agent`，plist 由 `scripts/service.sh install` 生成到
 `~/Library/LaunchAgents/`，日志在 `~/Library/Logs/android-agent.log`）。两边都跑
-`core/target/release/agent-dev`；模型在库（`sessions.db`）里，中继密钥在仓库根目录的
+`core/target/x86_64-unknown-linux-musl/release/agent-dev`；模型在库（`sessions.db`）里，中继密钥在仓库根目录的
 `.env.local` 里。
 
 核心归它们管时，`restart-core.sh` **只用** `systemctl --user restart` / `launchctl kickstart -k`，

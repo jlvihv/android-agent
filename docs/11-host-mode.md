@@ -172,7 +172,7 @@ just dev        # cwd = 这个仓库（just 会把 cwd 设到 justfile 那儿）
 （pid / 端口 / 命令行，是它自己写在锁文件里的）打出来：
 
 ```
-  已经有核心在跑了：pid 1698717，端口 8787，./core/target/release/agent-dev
+  已经有核心在跑了：pid 1698717，端口 8787，./core/target/x86_64-unknown-linux-musl/release/agent-dev
   这台机器上只允许一个 —— 两个会静默地互相干扰：mDNS 广播互相挤掉、
   会话库的内存态互相覆盖（两边都不报错，只是行为怪）。先停掉它再起：
     kill 1698717

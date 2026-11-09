@@ -18,7 +18,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/core/target/release/agent-dev"
+BIN="$ROOT/core/target/x86_64-unknown-linux-musl/release/agent-dev"
 LABEL=dev.vihv.android-agent
 PLIST_SRC="$ROOT/scripts/launchd/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -48,7 +48,7 @@ wait_health() {
 need_bin() {
     [ -x "$BIN" ] && return 0
     echo "没有 release 二进制：$BIN" >&2
-    echo "先编一个：cargo build --release --bin agent-dev --manifest-path core/Cargo.toml" >&2
+    echo "先编一个：just build" >&2
     echo "（或者直接 scripts/restart-core.sh，它编完会顺手重启）" >&2
     exit 1
 }

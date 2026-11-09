@@ -17,7 +17,7 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>__ROOT__/core/target/release/agent-dev</string>
+    <string>__ROOT__/core/target/x86_64-unknown-linux-musl/release/agent-dev</string>
   </array>
 
   <!-- 核心的 cwd 就是模型的 /workspace（`read` / `edit` / `bash` 的相对路径基准） -->

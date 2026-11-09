@@ -185,7 +185,7 @@ log "=== restart-core: pid=$PID port=$PORT 管=$MANAGED build=$BUILD now=$NOW ==
 
 if [ "$DRY" = 1 ]; then
     echo "核心:    pid=$PID  端口=$PORT  （$MANAGED 管）"
-    echo "二进制:  core/target/release/agent-dev"
+    echo "二进制:  core/target/x86_64-unknown-linux-musl/release/agent-dev（musl 静态）"
     echo "会先编译: $([ "$BUILD" = 1 ] && echo "是（编不动就什么都不做）" || echo "不（--no-build）")"
     echo "空闲等待: $([ "$NOW" = 1 ] && echo "跳过（--now）" || echo "等到 busy=false")"
     echo "重启方式: $([ "$MANAGED" = launchd ] && echo "launchctl kickstart -k $LABEL" || echo "systemctl --user restart $UNIT")"
@@ -196,7 +196,7 @@ fi
 
 # --- 1. 先编译（失败什么都不动） --------------------------------------------
 if [ "$BUILD" = 1 ]; then
-    log "编译中：cargo build --release --bin agent-dev"
+    log "编译中：cargo build --release --bin agent-dev（musl，见 ~/.cargo/config.toml）"
     if ! cargo build --release --bin agent-dev --manifest-path core/Cargo.toml >>"$LOG" 2>&1; then
         log "❌ 编译失败 —— 什么都不动，老核心（pid=$PID）照旧跑着"
         echo "❌ 编译失败，老核心照旧跑着（日志：$LOG）" >&2

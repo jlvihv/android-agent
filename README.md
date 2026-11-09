@@ -61,7 +61,30 @@ just service logs        # 跟日志（macOS 是 ~/Library/Logs/android-agent.lo
 just service uninstall   # 停掉并取消自启（二进制和会话库都不动）
 ```
 
-跑的是 `core/target/release/agent-dev`（先编一次：`cargo build --release --bin agent-dev`）。
+跑的是 `core/target/x86_64-unknown-linux-musl/release/agent-dev`（先编一次：
+`just build`）。
+
+### 桌面核心编成 musl 静态，不是 glibc
+
+同样是「回合结束、空闲下来」的状态，glibc 版 RSS 停在 78 MB（其中 70 MB 是 THP 大页
+放大的假象，活数据 2.7 MB），musl 版 6.7 MB。glibc 治不好的两件事：
+
+- **arena 攥着不放**：每个线程一块 arena，`malloc_trim` 只收拾调用者那块，散在里面的
+  空洞一律留着
+- **THP 放大**：`transparent_hugepage/enabled` 是 `always`，内核碰一个字节就按 2 MB
+  记账（实测：256 MB 区域每 2 MB 只写 1 字节 = 真实数据 128 KB，RSS 264 MB）
+
+musl 对超过阈值的块直接 `mmap`、`free` 即 `munmap`，没有 arena 这层，两个问题都不存在。
+代价是多线程下纯分配比 glibc 慢（微基准 4 线程慢 20×，但 agent 的热路径是等 IO）。
+
+这台机器的 `~/.cargo/config.toml` 把 `build.target` 设成了
+`x86_64-unknown-linux-musl`，所以 `cargo build` / `cargo run` / `cargo test`
+**默认就出 musl**，不用写 `--target`。想要 glibc 那份就在命令行显式覆盖：
+`cargo build --release --target x86_64-unknown-linux-gnu`。
+
+产物的路径随 `--target` 变（cargo 的规矩）：带 `--target` 就多一层三元组目录。
+systemd unit / launchd plist / `scripts/service.sh` 都指着上面那个带三元组的路径。
+
 装好之后 `scripts/restart-core.sh` **只**走系统那套重启（`launchctl kickstart` /
 `systemctl --user restart`）—— 手动 kill + 手动起会和它抢端口、抢单实例锁。
 
@@ -70,7 +93,7 @@ Linux 的 unit 不在仓库里（放在 `~/Code/project/config/systemd/user/`）
 ```ini
 [Service]
 WorkingDirectory=%h/Code/project/android-agent
-ExecStart=%h/Code/project/android-agent/core/target/release/agent-dev
+ExecStart=%h/Code/project/android-agent/core/target/x86_64-unknown-linux-musl/release/agent-dev
 Restart=always
 
 [Install]

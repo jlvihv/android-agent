@@ -1598,11 +1598,13 @@ impl Drop for TurnGuard {
         self.0.state.end_turn(&self.1);
         self.0.state.mark_sessions_dirty();
         // 这一轮里最大的那些临时块（请求体的 base64、工具输出的整段捕获、
-        // 图片解码的中间图）到这附近都已经放掉了。glibc 不会自己把它们还给
-        // 内核 —— 不在这里还，arena 就顶着这一轮的峰值一直挂到下一次
-        // `evict_idle`（实测两次之间能差出 80 MB 纯碎片）。
-        // `release_soon` 自带「可还的不到 2 MB 就不折腾」和搬去阻塞池，
-        // 所以这里只是几行判断，不会卡住收尾。见 `trim` 模块。
+        // 图片解码的中间图）到这附近都已经放掉了。
+        //
+        // **只有安卓需要在这儿还一次**：bionic/scudo 攥着空闲块不放，`mallopt`
+        // 是那边唯一的入口。桌面是 musl 静态二进制（见 README 那段），
+        // 超过阈值的块直接 `mmap`、`free` 即 `munmap` —— 没有东西可还，所以这段
+        // 在桌面上**根本不编进去**（不是调一个空函数）。见 `trim` 的文件头。
+        #[cfg(target_os = "android")]
         crate::trim::release_soon();
     }
 }
