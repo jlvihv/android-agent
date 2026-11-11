@@ -2393,7 +2393,7 @@ async fn get_part(
     let Some(sess) = store.get(&sid) else {
         return (StatusCode::NOT_FOUND, "没有这个会话").into_response();
     };
-    match crate::agent::part_full(sess, &id) {
+    match crate::agent::part_full_kind(sess, &id, q.input.unwrap_or(false)) {
         Some(text) => Json(json!({ "text": text })).into_response(),
         None => (StatusCode::NOT_FOUND, "没有这个 part").into_response(),
     }
@@ -2406,6 +2406,10 @@ struct PartQuery {
     /// 哪个会话。不给 = 当前活动会话（面板只能从当前会话点开）
     #[serde(default)]
     session: Option<String>,
+    /// 要**工具参数**（完整 JSON 文本）而不是输出。参数在首屏也会被截
+    /// （`TOOL_INPUT_PREVIEW_CHARS`），点开面板取明细时用。
+    #[serde(default)]
+    input: Option<bool>,
 }
 
 /// `POST /api/model` → 在当前 provider 内换模型（不用再传 key）。

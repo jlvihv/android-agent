@@ -260,6 +260,8 @@
    * 面板里先显示截断的那份 + 一行「载入中」，不会白屏。
    */
   let full = $state<Record<string, string>>({});
+  /** 完整参数（`input` 被截过的工具才有），key 是 toolCallId */
+  let fullInput = $state<Record<string, Record<string, unknown>>>({});
   let loading = $state<string | null>(null);
 
   /** 面板要打开的 part 若被截断过，就补一次全文；取回来写进 `full` 后自动重渲染 */
@@ -271,10 +273,36 @@
     if (loading === id) loading = null;
   }
 
+  /**
+   * 工具参数被截过的，点开面板时取完整的 JSON。
+   *
+   * 首屏只给一段预览（`inputTruncated`）：实测 `bash` 的参数合计能到 57 KB，
+   * 而工具行只显示 `command` 的第一行、参数明细只在面板里看。
+   * 取回来解析成对象，`describeInput` 就有完整字段可用（`edit` 的 `edits`、
+   * `bash` 的 `timeout` 这些）。
+   */
+  async function needInput(id: string, truncated: boolean | undefined) {
+    if (!truncated || fullInput[id] !== undefined) return;
+    const text = await partFull(id, "input");
+    if (!text) return;
+    try {
+      const v = JSON.parse(text);
+      if (v && typeof v === "object") fullInput[id] = v as Record<string, unknown>;
+    } catch {
+      /* 解析失败就继续用预览那份，不打断面板 */
+    }
+  }
+
   function openTool(msg: Message, tool: ToolPart) {
-    panelArgs = argsOf(tool);
+    panelArgs = fullInput[tool.toolCallId] ?? argsOf(tool);
     sheet = { kind: "tool", msg, tool };
     void needFull(tool.toolCallId, tool.truncated);
+    void needInput(tool.toolCallId, tool.inputTruncated).then(() => {
+      // 取回来之后只更新「正开着的这个面板」，别去动别人的
+      if (fullInput[tool.toolCallId] && sheet?.kind === "tool") {
+        panelArgs = fullInput[tool.toolCallId];
+      }
+    });
   }
 
   function openReasoning(part: ReasoningPart) {

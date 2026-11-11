@@ -1275,6 +1275,23 @@ pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<V
 /// 400 字够放下摘要行 + 面板里的开头一段；剩下的点开时再取（见 `part_full`）。
 pub const PART_PREVIEW_CHARS: usize = 400;
 
+/// 工具**参数**（`input`）在首屏最多序列化成这么多字符。
+///
+/// 第一版只截了 `output`，漏了 `input` —— 实测这个会话里 `bash` 的参数合计
+/// **57 KB**（30 条命令），比截断后的 output（29 KB）还大一倍。而屏幕上：
+///   - 工具行只显示 `command` 的**第一行**（`summarize`）
+///   - 参数明细只在点开面板时才看（`describeInput`）
+/// 所以首屏没有任何理由把 30 条完整命令都传一遍。
+const TOOL_INPUT_PREVIEW_CHARS: usize = 2000;
+
+/// 单个长字段（`command` / `content` …）在首屏最多留这么多字符。
+///
+/// 和 `TOOL_INPUT_PREVIEW_CHARS` 是两件事：那个管「整个 input 序列化后多长」，
+/// 这个管「其中某一个字段多长」。后者才是绝大多数情况 —— 106 个工具、每个参数
+/// 都不到 2 KB，但合计 71 KB，因为它们是一条条几百字的命令。
+/// 工具行只显示 `command` 的第一行，留 200 字（够看出是什么命令）足够。
+const LONG_FIELD_CHARS: usize = 200;
+
 /// 把一个 part 的某个正文字段截到 `cap` 个字符，截了就标 `truncated` + `chars`。
 ///
 /// 按**字符**不是字节：中日文一个字 3 字节，按字节切会把一个汉字劈成两半
@@ -1292,6 +1309,85 @@ fn clip_part(mut part: Value, total: usize, cap: usize, field: &str) -> Value {
         part["chars"] = json!(total);
     }
     part
+}
+
+/// 把 `part["input"]` 截成一个「够看的预览」。
+///
+/// 和 [`clip_part`] 不同：`input` 是结构体（不是字符串），不能按字符切。
+/// 做法是**整个换成一段文本预览**：
+///   - 短参数（序列化后 ≤ cap）原样保留，前端不用管；
+///   - 长的就换成 `{"__preview": "<前 cap 字符>"}` 这种形状，前端认 `truncated`
+///     就知道「这不是完整参数，点开面板再取」。
+///
+/// 为什么不保留完整结构再砍某个字段：不同工具的参数形状差得远（`bash` 是
+/// `command`、`edit` 是 `edits`/`content`、`read` 是 `path`），逐个字段判断
+/// 既容易漏又难维护。整个预览一段就够了 —— 首屏只需要 `summarize()` 那一个
+/// 短字段（它还会从 `inputText` 兜底）。
+fn clip_input(part: Value, cap: usize) -> Value {
+    if cap == usize::MAX {
+        return part;
+    }
+    // 先克隆出来，后面要整体改 `part`（不能一边借着 `part["input"]` 一边 move）
+    let Some(input) = part.get("input").cloned() else {
+        return part;
+    };
+    let full = serde_json::to_string(&input).unwrap_or_default();
+    let full_len = full.chars().count();
+
+    // **先看单个长字段**：`bash` 的 `command` 经常是一整段脚本（几百到几千字），
+    // 而工具行只显示它的第一行。整体序列化不到 cap 不代表没问题 —— 实测这个
+    // 会话里 106 个工具的参数合计 71 KB，单个最大才 3.4 KB，**每一个都「没超
+    // 2000」**，总量却失控了。所以长字段单独截，阈值比整体小得多。
+    let mut preview = serde_json::Map::new();
+    let mut cut_any = false;
+    if let Some(obj) = input.as_object() {
+        for (k, v) in obj {
+            let is_long_field = matches!(
+                k.as_str(),
+                "command" | "content" | "text" | "query" | "oldText" | "newText"
+            );
+            if is_long_field {
+                if let Some(text) = v.as_str() {
+                    if text.chars().count() > LONG_FIELD_CHARS {
+                        let short: String = text.chars().take(LONG_FIELD_CHARS).collect();
+                        preview.insert(k.clone(), json!(format!("{short}…")));
+                        cut_any = true;
+                        continue;
+                    }
+                }
+            }
+            preview.insert(k.clone(), v.clone());
+        }
+    }
+
+    if !cut_any {
+        return part;
+    }
+    // 字段截过之后**仍然**超 cap 的（比如一百个短字段堆在一起），才退化成一整段
+    // 文本预览。判断用截断后的实际大小 —— 用原始 `full_len` 的话，一条长命令
+    // 明明已经被砍到 200 字了，还会被再套一层 `__preview`（测试抓到过）。
+    let after = serde_json::to_string(&Value::Object(preview.clone()))
+        .map(|v| v.chars().count())
+        .unwrap_or(0);
+    if after > cap {
+        let mut slim = serde_json::Map::new();
+        for key in ["command", "path", "name", "query", "url"] {
+            if let Some(v) = preview.get(key) {
+                slim.insert(key.into(), v.clone());
+            }
+        }
+        slim.insert(
+            "__preview".into(),
+            json!(full.chars().take(cap).collect::<String>()),
+        );
+        slim.insert("chars".into(), json!(full_len));
+        preview = slim;
+    }
+    let mut out = part;
+    out["input"] = Value::Object(preview);
+    out["inputTruncated"] = json!(true);
+    out["inputChars"] = json!(full_len);
+    out
 }
 
 /// 同 [`session_view_range`]，但把 reasoning / tool 的正文截到
@@ -1385,6 +1481,11 @@ pub fn session_view_range_clipped(
                         part["output"] = json!(o);
                         part = clip_part(part, o.chars().count(), cap, "output");
                     }
+                    // 参数也要截：第一版漏了这条，实测 bash 的参数合计 57 KB，
+                    // 比截断后的 output 还大一倍（见 TOOL_INPUT_PREVIEW_CHARS）。
+                    if cap != usize::MAX {
+                        part = clip_input(part, TOOL_INPUT_PREVIEW_CHARS);
+                    }
                     parts.push(part);
                 }
                 if parts.is_empty() {
@@ -1427,6 +1528,14 @@ pub fn session_view_range_clipped(
 ///
 /// 找不到返回 `None`（会话被删、id 打错、或者那条消息已经被回收）。
 pub fn part_full(sess: &ChatSession, id: &str) -> Option<String> {
+    part_full_kind(sess, id, false)
+}
+
+/// 同上，`want_input = true` 时取的是**工具参数**（`arguments`）而不是输出。
+///
+/// 参数也会被截（见 `TOOL_INPUT_PREVIEW_CHARS`），点开工具面板要完整参数时
+/// 走这条。
+pub fn part_full_kind(sess: &ChatSession, id: &str, want_input: bool) -> Option<String> {
     // `r3` / `t3`：前缀 + DB 下标
     if let Some(rest) = id.strip_prefix('r') {
         if let Ok(i) = rest.parse::<usize>() {
@@ -1453,6 +1562,16 @@ pub fn part_full(sess: &ChatSession, id: &str) -> Option<String> {
         }
     }
     let i = call_index?;
+    if want_input {
+        // 参数就在那条 assistant 上，不用往后找
+        return sess.messages[i..].iter().find_map(|m| match m {
+            ChatMessage::Assistant { tool_calls, .. } => tool_calls
+                .iter()
+                .find(|tc| tc.id == id)
+                .map(|tc| tc.arguments.clone()),
+            _ => None,
+        });
+    }
     // 结果可能在它后面任意一条 Tool 消息上（一个回合的 tool 结果都在后面）
     sess.messages[i + 1..].iter().find_map(|m| match m {
         ChatMessage::Tool {
@@ -3882,6 +4001,58 @@ mod bench_search {
         let reasoning = parts.iter().find(|p| p["type"] == "reasoning").unwrap();
         assert!(reasoning.get("truncated").is_none());
         assert_eq!(reasoning["text"].as_str().unwrap().chars().count(), 1000);
+    }
+
+    #[test]
+    fn 工具参数超长也截但摘要字段留着() {
+        // 实测 `bash` 的参数合计能到 57 KB（30 条命令）。前端工具行只显示
+        // `command` 的第一行，所以那个字段必须活下来 —— 否则整屏的工具行
+        // 都变成「执行命令」。
+        let mut sess = ChatSession::new();
+        let long = format!(
+            r#"{{"command":"ls -la\n{}","timeout":30}}"#,
+            "x".repeat(4000)
+        );
+        sess.messages.push(ChatMessage::User {
+            text: "跑".into(),
+            attachments: vec![],
+        });
+        sess.messages.push(ChatMessage::Assistant {
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![RecordedToolCall {
+                id: "call_big".into(),
+                name: "bash".into(),
+                arguments: long,
+            }],
+            reasoning_items: vec![],
+        });
+        let view = session_view_from_clipped(&sess, 0, PART_PREVIEW_CHARS);
+        let tool = &view[1]["parts"].as_array().unwrap()[0];
+        assert_eq!(tool["inputTruncated"], json!(true));
+        // 摘要字段还在，截到 LONG_FIELD_CHARS（前端 `summarize` 自己取第一行）
+        let cmd = tool["input"]["command"].as_str().unwrap();
+        assert!(cmd.starts_with("ls -la"));
+        assert_eq!(cmd.chars().count(), LONG_FIELD_CHARS + 1); // + 省略号
+        // 整体没超 cap，所以不该出现 `__preview`
+        assert!(tool["input"].get("__preview").is_none());
+        assert_eq!(tool["inputChars"].as_u64().unwrap(), 4035);
+        // 短参数的**原样保留**，不该被换成预览
+        let mut small = ChatSession::new();
+        small.messages.push(ChatMessage::Assistant {
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![RecordedToolCall {
+                id: "call_small".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"/tmp/a"}"#.into(),
+            }],
+            reasoning_items: vec![],
+        });
+        let v2 = session_view_from_clipped(&small, 0, PART_PREVIEW_CHARS);
+        let t2 = &v2[0]["parts"].as_array().unwrap()[0];
+        assert!(t2.get("inputTruncated").is_none());
+        assert_eq!(t2["input"]["path"], json!("/tmp/a"));
     }
 
     #[test]

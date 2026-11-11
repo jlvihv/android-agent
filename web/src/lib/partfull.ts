@@ -29,8 +29,8 @@ function key(id: string): string {
  * 失败时**不抛** —— 返回空串，调用方继续显示那份截断的。面板里内容少一截，
  * 比弹一个错误框打断用户强。
  */
-export async function partFull(id: string): Promise<string> {
-  const k = key(id);
+export async function partFull(id: string, kind: "output" | "input" = "output"): Promise<string> {
+  const k = kind === "input" ? `in\u0000${key(id)}` : key(id);
   const hit = cache.get(k);
   if (hit !== undefined) return hit;
   const running = inflight.get(k);
@@ -39,6 +39,7 @@ export async function partFull(id: string): Promise<string> {
   const p = (async () => {
     try {
       const qs = new URLSearchParams({ id });
+      if (kind === "input") qs.set("input", "1");
       // **不带空 session**：服务端把「给了 session 但查不到」当成 404，而空串
       // 就是查不到 —— 首屏 `store.sessionId` 还没同步上时就会踩到，表现为
       // 面板一直「载入全文…」。宁可让它退回「用当前活动会话」那条路（那正是

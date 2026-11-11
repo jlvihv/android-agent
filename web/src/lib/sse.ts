@@ -320,6 +320,14 @@ export type ToolPart = {
   truncated?: boolean;
   /** 截断前 `output` 的总字符数（面板里告诉用户「还有多少」） */
   chars?: number;
+  /**
+   * `input`（工具参数）也被截过。首屏只给一段预览 —— 实测 `bash` 的参数合计
+   * 能到 57 KB，而屏幕上工具行只显示 `command` 的第一行。
+   * 点开面板时按 `input=1` 走 `/api/part` 取完整 JSON。
+   */
+  inputTruncated?: boolean;
+  /** 截断前 `input` 序列化后的总字符数 */
+  inputChars?: number;
 };
 
 export type Part =
