@@ -113,7 +113,10 @@ mod tests {
         }
         #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
         {
-            assert!(in_use.is_none() && free.is_none(), "问不到就给 None，别编数");
+            assert!(
+                in_use.is_none() && free.is_none(),
+                "问不到就给 None，别编数"
+            );
         }
     }
 

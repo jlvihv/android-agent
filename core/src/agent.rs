@@ -3978,7 +3978,6 @@ mod bench_search {
         println!("大小写折叠  ：{:?}（{} 条）", t.elapsed(), hits.len());
     }
 
-
     // --- part 截断（首屏只给 400 字，点开面板再取全文） ---
 
     /// 造一条带 reasoning + tool 的会话，正文都超过 400 字。
@@ -4014,7 +4013,10 @@ mod bench_search {
         let sess = big_session();
         let view = session_view_from_clipped(&sess, 0, PART_PREVIEW_CHARS);
         let parts = view[1]["parts"].as_array().expect("parts");
-        let reasoning = parts.iter().find(|p| p["type"] == "reasoning").expect("有 reasoning");
+        let reasoning = parts
+            .iter()
+            .find(|p| p["type"] == "reasoning")
+            .expect("有 reasoning");
         let tool = parts.iter().find(|p| p["type"] == "tool").expect("有 tool");
 
         // reasoning 仍然给前 400 字（那一行摘要要用它渲染）
@@ -4094,7 +4096,7 @@ mod bench_search {
         let cmd = tool["input"]["command"].as_str().unwrap();
         assert!(cmd.starts_with("ls -la"));
         assert_eq!(cmd.chars().count(), LONG_FIELD_CHARS + 1); // + 省略号
-        // 整体没超 cap，所以不该出现 `__preview`
+                                                               // 整体没超 cap，所以不该出现 `__preview`
         assert!(tool["input"].get("__preview").is_none());
         assert_eq!(tool["inputChars"].as_u64().unwrap(), 4035);
         // 短参数的**原样保留**，不该被换成预览
@@ -4119,9 +4121,15 @@ mod bench_search {
     fn 取全文两种id都认() {
         let sess = big_session();
         // reasoning：`r{i}`，i 是 DB 下标（这条是 messages[1]）
-        assert_eq!(part_full(&sess, "r1").unwrap()["text"], json!("想".repeat(1000)));
+        assert_eq!(
+            part_full(&sess, "r1").unwrap()["text"],
+            json!("想".repeat(1000))
+        );
         // 正文：`t{i}`
-        assert_eq!(part_full(&sess, "t1").unwrap()["text"], json!("回答".repeat(10)));
+        assert_eq!(
+            part_full(&sess, "t1").unwrap()["text"],
+            json!("回答".repeat(10))
+        );
         // 不存在
         assert!(part_full(&sess, "nope").is_none());
         assert!(part_full(&sess, "r99").is_none());

@@ -59,7 +59,9 @@ Bun.serve({
       });
     }
     if (!pathname.endsWith("/chat/completions")) {
-      return new Response("只有 /v1/models 和 /v1/chat/completions", { status: 404 });
+      return new Response("只有 /v1/models 和 /v1/chat/completions", {
+        status: 404,
+      });
     }
     totalReq += 1;
     inFlight += 1;
@@ -125,7 +127,11 @@ Bun.serve({
               created: 0,
               model: "fixture-slow",
               choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-              usage: { prompt_tokens: 100, completion_tokens: 200, total_tokens: 300 },
+              usage: {
+                prompt_tokens: 100,
+                completion_tokens: 200,
+                total_tokens: 300,
+              },
             })}\n\n`,
           );
           push("data: [DONE]\n\n");
@@ -136,7 +142,10 @@ Bun.serve({
       },
     });
     return new Response(stream, {
-      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      },
     });
   },
 });
@@ -147,4 +156,7 @@ console.log(
     `fail=${FAIL_RATE}@${FAIL_STATUS} silent=${SILENT})`,
 );
 // 每 5 秒报一次在飞请求数（判断是不是压住了）
-setInterval(() => console.log(`[stats] 累计 ${totalReq}，在飞 ${inFlight}`), 5000);
+setInterval(
+  () => console.log(`[stats] 累计 ${totalReq}，在飞 ${inFlight}`),
+  5000,
+);

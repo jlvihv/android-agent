@@ -2373,10 +2373,7 @@ async fn get_attachment(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<St
 /// 反正最终都是「在那条消息里找那个字段」。
 ///
 /// 走**当前活动会话**：part 的 id 只在会话内有意义，而面板只能从当前会话里点开。
-async fn get_part(
-    State(st): State<Arc<AppState>>,
-    Query(q): Query<PartQuery>,
-) -> Response {
+async fn get_part(State(st): State<Arc<AppState>>, Query(q): Query<PartQuery>) -> Response {
     let Some(id) = q.id.filter(|v| !v.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "要带 id").into_response();
     };
@@ -2391,7 +2388,11 @@ async fn get_part(
         return (StatusCode::NOT_FOUND, "没有活动会话").into_response();
     };
     if let Err(e) = st.ensure_loaded(&sid).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("读会话失败: {e:#}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读会话失败: {e:#}"),
+        )
+            .into_response();
     }
     let store = st.chat.read().await;
     let Some(sess) = store.get(&sid) else {
@@ -2410,7 +2411,6 @@ struct PartQuery {
     /// 哪个会话。不给 = 当前活动会话（面板只能从当前会话点开）
     #[serde(default)]
     session: Option<String>,
-
 }
 
 /// `POST /api/model` → 在当前 provider 内换模型（不用再传 key）。
