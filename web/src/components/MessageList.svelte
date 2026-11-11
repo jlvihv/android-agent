@@ -271,7 +271,10 @@
     hasHiddenOutput: number | undefined,
     inputTruncated: boolean | undefined,
   ) {
-    if ((hasHiddenOutput === undefined && !inputTruncated) || full[id] !== undefined)
+    if (
+      (hasHiddenOutput === undefined && !inputTruncated) ||
+      full[id] !== undefined
+    )
       return;
     loading = id;
     const got = await partFull(id);
@@ -1015,9 +1018,11 @@
             {#if loading === t.toolCallId}
               <p class="text-meta text-faint">载入全文…</p>
             {:else if (t.chars !== undefined || t.inputTruncated) && full[t.toolCallId] === undefined}
-              <!-- 取失败了：明确说一声，别让人以为输出就这么短 -->
+              <!-- 取失败了（离线 / 服务端没这个 part）：明确说一声，别让人以为没有内容。
+                   注意**不能说「只显示了前 N 字」**：首屏根本不传 output 正文
+                   （见 core 的 `OUTPUT_ON_WIRE`），面板里此刻一个字都没显示。 -->
               <p class="text-meta text-warn">
-                只显示了前 {t.output?.length ?? 0} 字（原文 {t.chars} 字），全文没取到
+                全文没取到（原文 {t.chars ?? 0} 字）
               </p>
             {/if}
 
