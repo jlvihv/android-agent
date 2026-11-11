@@ -21,7 +21,7 @@
   import Img from "./Img.svelte";
   import Icon from "./Icon.svelte";
   import { onBack } from "../lib/overlay";
-  import { dismissable, RELEASE, reducedMotion } from "../lib/drag";
+  import { dismissable, RELEASE } from "../lib/drag";
   import { focusRestore } from "../lib/focus";
   import { viewer, closeViewer } from "../lib/viewer.svelte.ts";
   import { favorites } from "../lib/favorites.svelte.ts";
@@ -175,8 +175,6 @@
   };
 
   function slideIn(_: Element) {
-    // 系统要求减少动效时直接到位（跟手拖动不受影响，见 `reducedMotion` 的说明）
-    if (reducedMotion()) return { duration: 0 };
     return {
       duration: 300,
       easing: quintOut,
@@ -186,7 +184,6 @@
 
   function slideOut(_: Element) {
     const from = off;
-    if (reducedMotion()) return { duration: 0 };
     return {
       duration: 240 * (1 - from) + 80,
       easing: quintOut,

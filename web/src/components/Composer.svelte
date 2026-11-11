@@ -68,19 +68,20 @@
   // 按内容长高，最多 5 行（再高就在框里滚）：5 × 行高 1.5rem + 上下内边距
   // 0.25×2 = 8rem。这个数是算出来的，不是量的。
   //
-  // **交给 CSS 的 `field-sizing: content`（2026-11）**，不再每帧读 `scrollHeight`
-  // 再写 `height`。原来那套是「读布局属性 → 写样式」交替，每次输入都会强制一次
-  // 同步重排（Lighthouse 的 forced-reflow 在首屏抓到 37.6 ms，就在这一行）。
-  // 现在滚动/输入全在浏览器自己的布局里完成，主线程一次也不进。
+  // **别换成 CSS 的 `field-sizing: content`**（2026-11 试过，回退了）。它和
+  // `overflow-y-auto` 撞在一起：高度恒等于内容高度时滚动条就永远不该出现，
+  // 但 `overflow-y-auto` 又让浏览器按「已经可以滚」来算 —— 实测高度**一直卡在
+  // 25px 不再增长**（12 次逐字输入的采样全是 25），文字在一条 25px 的缝里滚，
+  // 看着就是内容被切碎、上下跳。
   //
-  // 两个前提（见 Modern Web Guidance 的 `form-fields-automatically-fit-contents`）：
-  //   - 全局若给 textarea 定了 height，必须显式 `height: auto`，否则它压过
-  //     `field-sizing`；我们是 `rows="1"` + Tailwind 的 preflight，没有固定高度，
-  //     但仍然显式写一遍（`height-auto` 那个类）
-  //   - textarea **要给固定宽度**，不然长 placeholder 会让它横向缩一下再长回来；
-  //     这里是 `w-full`（父级已经是 flex-1）
-  //
-  // 上限仍由 `max-h-[8rem]` 给：到了就出滚动条，和以前一样。
+  // 那点 forced-reflow（Lighthouse 首屏量到 37.6 ms）换不回来这个体验：
+  // 它是「读 scrollHeight → 写 height」的一次同步重排，代价确定、行为也确定。
+  $effect(() => {
+    void value;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${ta.scrollHeight}px`;
+  });
 
   export const focus = () => ta?.focus();
 
@@ -235,9 +236,8 @@
     placeholder="与 agent 对话…"
     {onkeydown}
     spellcheck="false"
-    class="field-sizing-content h-auto max-h-[8rem] w-full resize-none overflow-y-auto
-           bg-transparent px-1 py-1 text-base leading-6 text-fg placeholder:text-muted
-           outline-none"></textarea>
+    class="max-h-[8rem] resize-none overflow-y-auto bg-transparent px-1 py-1 text-base leading-6
+           text-fg placeholder:text-muted outline-none"></textarea>
 
   {#if failed.length > 0}
     <!-- 失败原因放一行完整显示：缩略胶囊里塞不下，而「为什么没加进去」正是此刻最该看到的 -->

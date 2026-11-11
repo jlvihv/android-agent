@@ -341,23 +341,12 @@ textarea {
  *    `:hover` 会**粘在**元素上（经典 sticky hover），以及浏览器默认的
  *    focus 外框。这条按元素兜底清掉。
  *
- * **触屏上也不要有焦点框（2026-11 补）**：上面那批清掉之后，全站一度没有任何
- * 焦点视觉 —— 触屏没问题，但桌面浏览器（`just web dev` 跑在 5173）和一众
- * 接键盘的安卓设备上，Tab 到哪儿完全看不出来，屏幕阅读器用户也定位不到。
- *
- * 现在只把**`:focus-visible`** 的框放回来，不靠媒体查询区分设备：
- *   - 手指 / 鼠标点出来的只是 `:focus`，而 `:focus-visible` **不匹配** ——
- *     触屏上照旧一干二净，不需要 `@media (hover: none)` 去屏蔽；
- *   - Tab 过来的是 `:focus-visible`，给一圈框。
- * 这本来就是 `:focus-visible` 存在的理由（比起 `(hover: hover)` 那类媒体
- * 查询也靠得住：无头浏览器 / 混合设备上指针能力报告得都不准）。
- *
- * `:where()` 把特异性压成 0，组件自己写的 `ring-*` / `outline-*` 一律盖得住，
- * 不需要 `!important`。
- *
- * 注意 `@custom-variant` 那四行**只管 Tailwind 的 `focus:` / `hover:` 变体**
- * （写成 `:not(*)` 就永不匹配），下面的 `:focus-visible` 是原生 CSS 选择器，
- * 两者不冲突：`focus-visible:ring-2` 这类类名照样不生效，焦点视觉统一由这段提供。
+ * **不要加焦点框（2026-11 再次确认）**：中间试过按 `:focus-visible` 给键盘焦点
+ * 画一圈 `2px solid var(--color-fg)` —— 深色下那就是**暖白边框**，点在消息输入框
+ * 和抽屉搜索框上非常显眼（它们是页面中心最大的两块输入区）。这个 App 的界面
+ * 本来就是「手指点下去纹丝不动」，输入框的焦点由光标本身表达就够了。
+ * 触屏设备的可达性不受影响（没有硬件键盘就不会有 Tab 焦点）；真要接键盘，
+ * 光标的闪烁和输入法状态栏也足够定位。
  */
 @custom-variant active (&:not(*));
 @custom-variant hover (&:not(*));
@@ -366,50 +355,21 @@ textarea {
 
 button:active,
 button:hover,
+button:focus,
+button:focus-visible,
 input:focus,
+input:focus-visible,
 textarea:focus,
-a:hover {
+textarea:focus-visible,
+select:focus,
+select:focus-visible,
+a:hover,
+a:focus,
+a:focus-visible,
+summary:focus,
+summary:focus-visible {
   filter: none;
-}
-
-/*
- * 焦点框：**只清“不是键盘焦点”的那种**。
- *
- * 以前这里是 `button:focus, a:focus, button:focus-visible { outline: none }` ——
- * 两件事都错了：
- *   1. 把 `:focus-visible` 也清了，于是键盘用户全站看不到焦点；
- *   2. `button:focus`（特异性 0,1,1）比下面那条 `:where(...):focus-visible`
- *      （0,1,0）高，就算只清 `:focus` 也会把框盖掉。
- *
- * 现在用 `:focus:not(:focus-visible)`：手机 / 鼠标点出来的焦点依旧一点痕迹没有，
- * Tab 过来的保留（规则在下面）。
- */
-button:focus:not(:focus-visible),
-a:focus:not(:focus-visible),
-input:focus:not(:focus-visible),
-textarea:focus:not(:focus-visible),
-select:focus:not(:focus-visible) {
   outline: none;
-}
-
-/* 键盘焦点。颜色用文字色：陶土橙表示「可点」，焦点是「你现在在哪」。 */
-:where(
-  a,
-  button,
-  input,
-  textarea,
-  select,
-  summary,
-  [tabindex]:not([tabindex="-1"])
-):focus-visible {
-  outline: 2px solid var(--color-fg);
-  outline-offset: 2px;
-  border-radius: 6px;
-}
-
-/* 本来就有圆角的（药丸、卡片）跟着自己的圆角走，别被上面那 6px 切掉角 */
-:where(button, a, input, textarea)[class*="rounded"]:focus-visible {
-  border-radius: inherit;
 }
 
 /*

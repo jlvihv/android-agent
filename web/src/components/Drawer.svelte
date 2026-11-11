@@ -35,7 +35,7 @@
   import { fade, slide } from "svelte/transition";
   import { quintOut } from "svelte/easing";
   import { onBack } from "../lib/overlay";
-  import { dismissable, RELEASE, reducedMotion } from "../lib/drag";
+  import { dismissable, RELEASE } from "../lib/drag";
   import { focusRestore } from "../lib/focus";
   import Icon from "./Icon.svelte";
   import { untrack } from "svelte";
@@ -269,8 +269,7 @@
 
   /** 进场：从左边整个滑进来（跟着手指拉出来的那种不要进场动画：位置归手指管） */
   function slideIn(_: Element) {
-    // 跟手拉出来的不要动效（位移归手指）；系统要求减少动效时也不要
-    if (peek != null || reducedMotion()) return { duration: 0 };
+    if (peek != null) return { duration: 0 };
     return {
       duration: SLIDE_IN_MS,
       easing: quintOut,
@@ -286,14 +285,13 @@
    * 对应的那一点点，看着就是「闪一下」。
    */
   function scrimIn(node: Element) {
-    if (peek != null || reducedMotion()) return { duration: 0 };
+    if (peek != null) return { duration: 0 };
     return fade(node, { duration: SCRIM_FADE_MS });
   }
 
   /** 出场：从当前位置（可能被拖到一半）继续往左收（时间怎么算见上面常量） */
   function slideOut(_: Element) {
     const from = off;
-    if (reducedMotion()) return { duration: 0 };
     return {
       duration: SLIDE_OUT_MS * (1 - from) + SLIDE_OUT_MIN_MS,
       easing: quintOut,
@@ -529,8 +527,8 @@
        absolute + inset-inline:0，没有定位祖先就按整个视口铺 —— 会横穿对话区，
        在滚动条和正文上压出两道暗带（踩过）。窄屏那个是 fixed，不受影响。 -->
   <aside
-    in:slide|global={{ axis: "x", duration: reducedMotion() ? 0 : PIN_MS }}
-    out:slide|global={{ axis: "x", duration: reducedMotion() ? 0 : PIN_MS }}
+    in:slide|global={{ axis: "x", duration: PIN_MS }}
+    out:slide|global={{ axis: "x", duration: PIN_MS }}
     class="drawer-shell relative flex h-full w-72 shrink-0 flex-col border-r border-hairline bg-drawer
            pt-[env(safe-area-inset-top)]"
   >
@@ -544,7 +542,7 @@
     aria-label="关闭"
     onclick={onclose}
     in:scrimIn|global
-    out:fade|global={{ duration: reducedMotion() ? 0 : SCRIM_FADE_MS }}
+    out:fade|global={{ duration: SCRIM_FADE_MS }}
   ></button>
 
   <aside

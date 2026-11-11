@@ -609,8 +609,8 @@
       try {
         const r = await fetch("/api/sessions");
         if (r.ok)
-          sessions = ((await r.json()) as { sessions: Session[] }).sessions ??
-            [];
+          sessions =
+            ((await r.json()) as { sessions: Session[] }).sessions ?? [];
       } catch {
         /* 同上 */
       } finally {

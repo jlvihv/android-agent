@@ -23,7 +23,7 @@
   import Icon from "./Icon.svelte";
   import Sheet from "./Sheet.svelte";
   import { hasShell, machines, type Machine } from "../lib/machines.svelte.ts";
-  import { reducedMotion } from "../lib/drag";
+  import {} from "../lib/drag";
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -31,9 +31,7 @@
   const ROW_MS = 200;
   /** 机器那几行展开 / 收起；「本机」那行不要（它一直在，没有「冒出来」这回事） */
   const rowIn = (node: Element, on: boolean) =>
-    on && !reducedMotion()
-      ? slide(node, { duration: ROW_MS, easing: cubicOut })
-      : { duration: 0 };
+    on ? slide(node, { duration: ROW_MS, easing: cubicOut }) : { duration: 0 };
 
   type Page = "list" | "pair" | "manual";
   let page = $state<Page>("list");

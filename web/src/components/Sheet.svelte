@@ -23,7 +23,7 @@
   import { fly } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
   import { onBack, type Peek } from "../lib/overlay";
-  import { dismissable, RELEASE, PAGE_MS, reducedMotion } from "../lib/drag";
+  import { dismissable, RELEASE, PAGE_MS } from "../lib/drag";
   import { focusTrap } from "../lib/focus";
 
   /** 滑出 / 淡出遮罩的时长。面板的 transform 和遮罩的 opacity 必须同步，
@@ -241,12 +241,12 @@
           <h2
             in:fly={{
               x: PAGE_SHIFT * slide,
-              duration: reducedMotion() ? 0 : PAGE_MS,
+              duration: PAGE_MS,
               easing: cubicOut,
             }}
             out:fly={{
               x: -PAGE_SHIFT * slide,
-              duration: reducedMotion() ? 0 : PAGE_MS,
+              duration: PAGE_MS,
               easing: cubicOut,
             }}
             class="absolute inset-0 flex items-center justify-center truncate px-12 text-row

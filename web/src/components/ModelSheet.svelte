@@ -34,7 +34,7 @@
   import { store } from "../lib/store.svelte.ts";
   import { models, type Group, type Model } from "../lib/models.svelte.ts";
   import { EFFORTS, effortLabel } from "../lib/effort";
-  import { PAGE_MS, reducedMotion } from "../lib/drag";
+  import { PAGE_MS } from "../lib/drag";
   import type { Peek } from "../lib/overlay";
 
   let {
@@ -229,17 +229,13 @@
   <div
     class="overflow-hidden"
     style:height={hModels ? `${height}px` : undefined}
-    style:transition={peeking || reducedMotion()
-      ? "none"
-      : `height ${PAGE_MS}ms ${ease}`}
+    style:transition={peeking ? "none" : `height ${PAGE_MS}ms ${ease}`}
   >
     <!-- 两页并排，整条轨道平移：位移和高度都是原生 CSS 过渡 -->
     <div
       class="flex w-[200%]"
       style:transform="translateX({-50 * at}%)"
-      style:transition={peeking || reducedMotion()
-        ? "none"
-        : `transform ${PAGE_MS}ms ${ease}`}
+      style:transition={peeking ? "none" : `transform ${PAGE_MS}ms ${ease}`}
     >
       <!-- 每一页**自己**带 12px 外边距（所以 Sheet 那边传了 padClass="px-0"）。
            挂在 Sheet 内容区上的话，两页交界处没有边距 —— 切换动画滑到中间时，

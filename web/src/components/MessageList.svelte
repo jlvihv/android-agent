@@ -28,7 +28,7 @@
   import Markdown from "./Markdown.svelte";
   import Sheet from "./Sheet.svelte";
   import ThoughtLine from "./ThoughtLine.svelte";
-  import { reducedMotion } from "../lib/drag";
+  import {} from "../lib/drag";
   import { partFull } from "../lib/partfull";
 
   let {
@@ -782,7 +782,7 @@
 {#snippet dropBtn(id: string)}
   <!-- 发出去的那一刻淡出（和气泡的颜色过渡同一个时长），不是凭空消失 -->
   <button
-    transition:fade={{ duration: reducedMotion() ? 0 : BUBBLE_MS }}
+    transition:fade={{ duration: BUBBLE_MS }}
     onclick={() => ondrop?.(id)}
     aria-label="从队列里去掉"
     title="从队列里去掉"
@@ -973,7 +973,8 @@
     <!-- 全文取回来了就拿它替掉截断的那份，`describeResult` 的判定（failed / diff）
          也跟着用全文 —— 否则一个 400 字之后才有 `[exit 1]` 的命令会被判成成功 -->
     {@const toolFull = full[t.toolCallId]}
-    {@const shown = toolFull === undefined ? t : { ...t, output: toolFull, truncated: false }}
+    {@const shown =
+      toolFull === undefined ? t : { ...t, output: toolFull, truncated: false }}
     {@const res = describeResult(shown)}
     {@const inp = describeInput(t, panelArgs)}
     <Sheet title={toolTitle(t, panelArgs)} onclose={() => (sheet = null)}>
