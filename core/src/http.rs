@@ -2875,11 +2875,45 @@ async fn debug_set_system_prompt(
     Json(json!({ "ok": true, "overridden": on, "chars": chars }))
 }
 
-/// `GET /api/sessions` → 侧边栏的「最近对话」列表
-async fn list_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+/// `GET /api/sessions?tail=…&before=…` → 侧边栏的「最近对话」列表（游标分页）。
+///
+/// 一页 20 条（`tail` 不给时）。不分页的话一千条会话就是 150 KB，而抽屉一屏只看
+/// 得见十条 —— 手机上那是几百毫秒的白等，前端还要一次挂一千个节点。
+///
+/// 游标是上一页最后一条的 `(createdAt, id)`（`before` = `"<createdAt>:<id>"`）：
+/// 排序是创建时间倒序 + id 倒序，所以「后面那页」就是二元组更小的那些。不用
+/// offset —— 新建会话会插到最前面，offset 分页在那种情况下会重复 / 漏行。
+#[derive(Deserialize)]
+struct SessionsQuery {
+    /// 一页多少条。`0` / 不给 = 全给（CLI、脚本、老的调用方）
+    #[serde(default)]
+    tail: Option<usize>,
+    /// 从哪一条之后接着给：上一页最后一条的 `"<createdAt>:<id>"`
+    #[serde(default)]
+    before: Option<String>,
+}
+
+/// 一页多少条（`tail` 不给时的默认档）。一屏十条左右，留一屏余量。
+const SESSIONS_PAGE: usize = 20;
+
+async fn list_sessions(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<SessionsQuery>,
+) -> impl IntoResponse {
     let busy = st.busy_sessions();
+    let limit = q.tail.unwrap_or(SESSIONS_PAGE);
+    // 游标拆成 `(createdAt, id)`。拆不开（老的 / 手写的）就当没给：从头来
+    let before = q.before.as_deref().and_then(|b| {
+        b.split_once(':').and_then(|(ts, id)| {
+            let ts: u64 = ts.parse().ok()?;
+            let id = id.trim();
+            (!id.is_empty()).then_some((ts, id))
+        })
+    });
     let store = st.chat.read().await;
-    let mut list = store.list();
+    let (mut list, has_more, next) = store.list_page(before, limit);
+    // 会话总数（`agentctl doctor` 的「会话库 N 个会话」还要它，一页看不出总数）
+    let total = store.sessions.iter().filter(|s| s.has_content()).count();
     drop(store);
     // 抽屉里给正在跑的会话打个点：切走了也知道它还在干活
     for s in &mut list {
@@ -2888,7 +2922,14 @@ async fn list_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             .is_some_and(|id| busy.iter().any(|b| b == id));
         s["busy"] = json!(running);
     }
-    Json(json!({ "sessions": list }))
+    Json(json!({
+        "sessions": list,
+        // 还有更早的吗（侧边栏滚到底就按 `next` 再要一页）
+        "hasMore": has_more,
+        // 下一页的游标：`?before=<它>`。`null` = 到底了
+        "next": next,
+        "total": total,
+    }))
 }
 
 /// `GET /api/search?q=…` → 跨会话搜消息正文。

@@ -78,6 +78,13 @@
     /** 现在连的是哪台机器（`store.machine`）：`phone` = 手机自己的核心 */
     machine,
     onmachine,
+    /**
+     * 滚到底了、还有更早的：去要下一页（见 App 的 `loadMoreSessions`）。
+     * 列表是**分页**的（一次 20 条），不然一千条会话要传 150 KB。
+     */
+    onmore,
+    /** 还有没有下一页（`App` 的 `sessionsNext !== null`） */
+    more = false,
   }: {
     sessions: Session[];
     onclose: () => void;
@@ -92,6 +99,8 @@
     /** 点底栏那个机器标签 → 「选择机器」面板。**壳不在时是 null**
      *  （电脑浏览器 / 手机浏览器里只有一个核心，没得换）——那就只显示，不可点。 */
     onmachine: (() => void) | null;
+    onmore?: () => void;
+    more?: boolean;
   } = $props();
 
   /**
@@ -100,7 +109,11 @@
    * 面板挂上时直接用这份）。点不了的时候（没有 `onmachine`）不拉。
    */
   $effect(() => {
-    if (onmachine) void untrack(() => machines.load());
+    if (onmachine) {
+      // 已经有那份（开过一次侧栏了）就不再问：首帧的数据照样在，只是不再每次开侧栏
+      // 都发一个 300 B；真点开面板时 `machines.watch()` 会立刻 `load()` 一次，不差这一份。
+      if (!machines.loaded) void untrack(() => machines.load());
+    }
   });
 
   // 收藏列表也是「一拉就有」：模块级那份（查看器里点星会直接改它），
@@ -326,6 +339,21 @@
   }
   const pressEnd = () => clearTimeout(pressTimer);
 
+  /**
+   * 滚到底了 → 再要一页（`more` 是「还有更早的」，`App` 给的）。
+   *
+   * 触底提前一屏就要，不然用户会看着底部停一下再冒出来。搜索状态下不要：
+   * 那时列表画的是命中，和分页没关系。
+   */
+  const MORE_LEAD_PX = 200;
+  function maybeMore() {
+    if (!more || !onmore || !scroller || q.trim()) return;
+    const left =
+      scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    if (left < MORE_LEAD_PX) onmore();
+  }
+  let scroller: HTMLElement | null = $state(null);
+
   /** 点收藏行：直接打开那个页面，顺手收起抽屉（宽屏那一栏不受影响） */
   function openPage(f: Favorite) {
     openViewer(sandboxPath(f.path), f.title);
@@ -376,7 +404,9 @@
        左右边距跟搜索框和底栏对齐（`px-4`）—— 都是顶层表面，内部要一个值。
        行自己的 `px-3` 是药丸内的内边距，不是这里说的边距。 -->
   <div
+    bind:this={scroller}
     class="min-h-0 flex-1 overflow-y-auto px-4 pt-[var(--fade-top)] pb-[var(--fade-top)]"
+    onscroll={maybeMore}
   >
     <!-- 收藏的页面：AI 做的网页收藏后列在这儿，点一下直接开（不搜索时才有；
          搜索是在找对话，这时候把页面混进结果里没有意义）。 -->
@@ -472,6 +502,13 @@
           </button>
         {/if}
       {/each}
+      <!-- 还有更早的：滚到底自动去要（`maybeMore`）。这一行是给人看的反馈 ——
+           一页 20 条，翻的时候总得知道「下面还有」。到底了就什么都不留。 -->
+      {#if more}
+        <p class="px-3 py-3 text-center text-xs text-faint" aria-live="polite">
+          载入中…
+        </p>
+      {/if}
     {/if}
   </div>
 

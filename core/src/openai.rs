@@ -207,7 +207,10 @@ impl Delta {
         self.reasoning_content
             .as_deref()
             .or(self.reasoning.as_deref())
-            .filter(|s| !s.is_empty())
+            // **纯空白也算没内容**。以前只挡空串，结果网关发来的「只有一个空格」的
+            // 思考占位被当成真内容落了库（全库 245 条，`reasoning` 恰好是 `" "`）。
+            // 那些步 `reasoning_tokens` 是 0 —— 模型根本没想，网关发了个空占位。
+            .filter(|s| !s.trim().is_empty())
     }
 }
 
@@ -520,6 +523,38 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 网关的「空思考占位」不能被当成内容。
+    ///
+    /// opencode-go → deepseek-v4.1-flash 偶尔会为「这一步根本没想」的步骤
+    /// （usage 里 `reasoning_tokens` = 0）发一条 `reasoning_summary_text.delta`，
+    /// 内容是**一个空格**。以前只挡空串，于是它被当成本步的思考落库 —— 全库 245 条
+    /// `reasoning: " "`，界面上就是一整行「思考」、点开是个空面板。
+    #[test]
+    fn whitespace_only_reasoning_is_not_content() {
+        let d = |r: Option<&str>, c: Option<&str>| Delta {
+            content: c.map(str::to_string),
+            reasoning_content: r.map(str::to_string),
+            reasoning: None,
+            tool_calls: None,
+        };
+        // 真内容照旧
+        assert_eq!(d(Some("想了一下"), None).reasoning_text(), Some("想了一下"));
+        // 网关的空占位：一个空格 / 换行 / 制表符，全都不算
+        assert_eq!(d(Some(" "), None).reasoning_text(), None);
+        assert_eq!(d(Some("\n"), None).reasoning_text(), None);
+        assert_eq!(d(Some(" \t "), None).reasoning_text(), None);
+        // 空串本来就不算
+        assert_eq!(d(Some(""), None).reasoning_text(), None);
+        assert_eq!(d(None, None).reasoning_text(), None);
+        // `reasoning`（GLM 那套字段）走同一条过滤
+        let glm = Delta {
+            reasoning_content: None,
+            reasoning: Some(" ".into()),
+            ..Delta::default()
+        };
+        assert_eq!(glm.reasoning_text(), None);
+    }
 
     /// 把几段字节当成网络分片，跑一遍 `pump_frames`，收回解析出的正文和结果。
     async fn pump(pieces: Vec<&'static [u8]>) -> (String, anyhow::Result<()>) {

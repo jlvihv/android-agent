@@ -829,20 +829,28 @@
             {#if part.type === "text"}
               <Markdown text={part.text} />
             {:else if part.type === "reasoning"}
-              <!-- 一行：它此刻在想什么。点开面板看全文 -->
-              {@const live = !msg.done && i === msg.parts.length - 1}
-              <button
-                onclick={() => openReasoning(part)}
-                class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
-              >
-                <Icon name="sparkle" size={16} class="shrink-0 text-faint" />
-                <ThoughtLine text={part.text} {live} />
-                <Icon
-                  name="chevron"
-                  size={15}
-                  class="ml-auto shrink-0 text-faint"
-                />
-              </button>
+              <!-- 一行：它此刻在想什么。点开面板看全文。
+                   **纯空白的不画**：网关（opencode-go → deepseek-v4.1-flash）偶尔会为
+                   「这步根本没想」（`reasoning_tokens` = 0）的步骤发一条只有空格的思考
+                   占位，落库就成了 `reasoning: " "`（全库 245 条）。核心那边已经不再
+                   收这种（`Delta::reasoning_text` 挡掉了），但**历史里的还在**，所以
+                   这里再挡一道 —— 否则界面上一整行「思考」、点开是个空面板。
+                   判据用 `trim()`：`ThoughtLine` 对空白文本也会兜底成「思考」。 -->
+              {#if part.text.trim()}
+                {@const live = !msg.done && i === msg.parts.length - 1}
+                <button
+                  onclick={() => openReasoning(part)}
+                  class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
+                >
+                  <Icon name="sparkle" size={16} class="shrink-0 text-faint" />
+                  <ThoughtLine text={part.text} {live} />
+                  <Icon
+                    name="chevron"
+                    size={15}
+                    class="ml-auto shrink-0 text-faint"
+                  />
+                </button>
+              {/if}
             {:else if part.type === "tool"}
               {@const tool = part}
               <!-- 失败的行整行染红（图标 + 摘要）：16px 的淡灰图标单独变红，

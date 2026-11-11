@@ -614,6 +614,23 @@ impl SessionStore {
     /// 调试端/CLI 直接 `POST /api/sessions` 建的、`/api/reset` 清空后的、
     /// 以及启动时 `active_mut()` 顺手建的，都是没内容的，不该在抽屉里占位。
     pub fn list(&self) -> Vec<Value> {
+        self.list_page(None, 0).0
+    }
+
+    /// 侧边栏的一页会话（游标分页），返回 `(这一页, 后面还有没有, 下一页的游标)`。
+    ///
+    /// 为什么分页：一条 157 字节上下，一千条会话就是 150 KB —— 而抽屉一屏只看得见
+    /// 十条。全部传过去等于每次都白花十几倍流量（手机上还是几百毫秒），前端也要
+    /// 一次挂一千个 DOM 节点。`limit = 0` 保持老行为（全给），CLI / 脚本这么用。
+    ///
+    /// 游标是上一页最后一条的 `(created_at, id)`：排序是「创建时间倒序 + id 倒序」，
+    /// 所以「排在它后面」就是二元组更小的那些 —— 新建会话插到最上面也不会让下一页
+    /// 错位（离线游标不会漂，不需要 offset）。
+    pub fn list_page(
+        &self,
+        before: Option<(u64, &str)>,
+        limit: usize,
+    ) -> (Vec<Value>, bool, Option<String>) {
         let mut v: Vec<&ChatSession> = self.sessions.iter().filter(|s| s.has_content()).collect();
         // created_at 撞车（同一毫秒建的）时拿 id 兜底：顺序必须**确定** ——
         // 同一个列表反复拉，每次都得一模一样，不然抽屉又会自己动
@@ -622,7 +639,25 @@ impl SessionStore {
                 .cmp(&a.created_at)
                 .then_with(|| b.id.cmp(&a.id))
         });
-        v.into_iter()
+        if let Some((ts, id)) = before {
+            let at = v
+                .iter()
+                .position(|s| (s.created_at, s.id.as_str()) < (ts, id))
+                .unwrap_or(v.len());
+            v.drain(..at);
+        }
+        let has_more = limit > 0 && v.len() > limit;
+        if has_more {
+            v.truncate(limit);
+        }
+        // 下一页从这一页**最后一条**之后开始。游标里带着 `created_at` 和 id：
+        // 只看 id 或者只看时间都不行（同一毫秒建的两条得能分开）
+        let next = v
+            .last()
+            .filter(|_| has_more)
+            .map(|s| format!("{}:{}", s.created_at, s.id));
+        let rows = v
+            .into_iter()
             .map(|s| {
                 json!({
                     "id": s.id,
@@ -632,7 +667,8 @@ impl SessionStore {
                     "count": s.user_count(),
                 })
             })
-            .collect()
+            .collect();
+        (rows, has_more, next)
     }
 
     /// 全文搜：跨会话找用户／助手消息里的子串（忽略大小写），
@@ -3369,6 +3405,57 @@ async fn read_image_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 侧边栏分页：游标翻页不重不漏、顺序和全量一致。
+    ///
+    /// 这条挡的是「用 offset 分页」那个坑 —— 翻页期间新建会话会插到最前面，
+    /// offset 会让下一页重复一行、漏掉一行。
+    #[test]
+    fn session_list_pages_by_cursor() {
+        let mut store = SessionStore::default();
+        // 5 条会话，创建时间递减（越新越靠前）。故意有两对撞同一毫秒的
+        for i in 0..5u64 {
+            let mut s = ChatSession::new();
+            s.created_at = 1000 - (i / 2);
+            s.updated_at = s.created_at;
+            s.title = format!("会话{i}");
+            // 有内容才进列表
+            s.messages.push(ChatMessage::user(format!("hi {i}")));
+            store.sessions.push(s);
+        }
+        let all = store.list();
+        assert_eq!(all.len(), 5, "5 条都该在列表里");
+
+        // 一页 2 条：按游标一页页翻，拼起来必须和全量**逐条相同**
+        let mut seen: Vec<String> = vec![];
+        let mut cursor: Option<(u64, String)> = None;
+        loop {
+            let (rows, more, next) =
+                store.list_page(cursor.as_ref().map(|(t, id)| (*t, id.as_str())), 2);
+            assert!(rows.len() <= 2);
+            // 第一次的游标就是这一页最后一条
+            if let Some(c) = &next {
+                let (ts, id) = c.split_once(':').unwrap();
+                cursor = Some((ts.parse().unwrap(), id.to_string()));
+            }
+            seen.extend(rows.iter().map(|r| r["id"].as_str().unwrap().to_string()));
+            if !more {
+                break;
+            }
+            assert!(next.is_some(), "还有下一页就必须给游标");
+        }
+        let expect: Vec<String> = all
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(seen, expect, "翻完所有页 = 全量，不重不漏");
+
+        // `limit = 0` 是老行为：一次全给
+        let (rows, more, next) = store.list_page(None, 0);
+        assert_eq!(rows.len(), 5);
+        assert!(!more);
+        assert!(next.is_none());
+    }
 
     /// 摘要窗口之外，**最原始的那版**实现（一律全量小写化 + 双向 range）。
     ///

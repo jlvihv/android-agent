@@ -584,40 +584,135 @@
   }
 
   /**
-   * 拉会话列表。**同一个安静窗口内的重复调用并成一次。**
+   * 拉会话列表。**重复调用并成一次**（两档）：
    *
-   * 首屏有三个入口几乎同时要它：挂载那一轮、WS 连上、`pageshow`（后者在首次加载
-   * 时也会触发）。以前这就是三份 21 KB 同时发出去 —— 实测 26ms 和 28ms 各一份。
+   *   1. 已经有一份在路上 → 直接复用它的 promise。**不看发起时刻**（只看它是不是
+   *      卡了太久，`SESSIONS_INFLIGHT_MAX_MS`）。真机上 22 KB 在路上要几十上百毫秒，
+   *      「切回前台（focus）+ 点菜单」这种最常见的组合刚好落在旧的 300ms 窗口之外，
+   *      于是同一份列表在路上发了两遍（实测：第一份还没落地，第二份已经出去了）。
+   *   2. 刚落地那份 → `SESSIONS_MERGE_MS` 内复用。
    *
-   * 不在各个入口上各自判断「要不要跳过」：那种写法漏一个就又回来了（已经漏过一次）。
-   * 收敛到函数自己身上：`SESSIONS_MERGE_MS` 内已经有请求在飞，就直接复用它的结果。
+   * 首屏那几个入口（挂载、WS 连上、`pageshow`）以前就是三份 21 KB 同时发出去。
+   * 判断收敛到函数自己身上，不在各个入口各写一遍 —— 那种写法漏一个就又回来了。
    *
-   * 会不会漏掉更新？会，但这个窗口只有 300ms，而且真正的「必须看到最新」那条路
-   * （重命名 / 删除 / 新建会话之后）都是 `await loadSessions()`，那时前一个请求
-   * 早就落地了（本地回环 1~3ms）。退一步说，列表晚 300ms 也和用户操作无关紧要。
+   * 会不会漏掉更新？会晚 `SESSIONS_MERGE_MS`，而且真正的「必须看到最新」那几处
+   * （重命名 / 删除 / 切会话 / 回合收尾）走 `loadSessions(true)`，绕开合并。
    */
   const SESSIONS_MERGE_MS = 300;
+  /**
+   * 在飞的那一份最多认这么久（ms）。
+   *
+   * 「在飞就复用」不能没有上限：隧道断着 / 核心卡住时那份请求可能永远不落地，
+   * 认它一辈子等于列表再也不刷新了。
+   */
+  const SESSIONS_INFLIGHT_MAX_MS = 10_000;
+  /** 上一份**发起**的时刻：算「在飞了多久」用 */
   let sessionsAt = 0;
+  /** 上一份**落地**的时刻：算「刚拉过」的安静窗口用 */
+  let sessionsDoneAt = 0;
   let sessionsInflight: Promise<void> | null = null;
+  /** 上手那份（不管落地没有）。安静窗口内复用它，省掉「刚拉过又拉一次」 */
+  let sessionsLast: Promise<void> | null = null;
+  /**
+   * 第一页之后的游标（`/api/sessions` 的 `next`）。`null` = 已经到底 / 还没拉过。
+   *
+   * 见 `loadMoreSessions`：抽屉滚到底才按它要下一页。一千条会话不该在打开的那一帧
+   * 就传 150 KB 过来。
+   */
+  let sessionsNext = $state<string | null>(null);
+  /** 正在拉下一页（滚到底会反复触发，别叠请求；抽屉底部那行「载入中」也看它） */
+  let sessionsMoreBusy = $state(false);
 
-  async function loadSessions() {
-    if (sessionsInflight && Date.now() - sessionsAt < SESSIONS_MERGE_MS) {
-      return sessionsInflight;
+  /**
+   * `force`：绕开合并，**一定**打一份新的（重命名 / 删除 / 切换会话 / 回合收尾）。
+   *
+   * **只拉第一页**（服务端默认 20 条）。翻页走 `loadMoreSessions`。已经翻出来不止
+   * 一页的，按现有条数重拉（见下面 `keep`）。
+   */
+  async function loadSessions(force = false) {
+    const now = Date.now();
+    if (!force) {
+      // **在飞就无条件复用。** 以前这个条件还带着「发起不到 300ms」，可真机上 22 KB
+      // 在路上就要几十上百毫秒，而「切回前台（focus）+ 点菜单」这种最常见的组合正好
+      // 落在窗口之外 —— 同一份列表就在路上发了两遍（实测：第一份还没落地，第二份已出）。
+      if (sessionsInflight && now - sessionsAt < SESSIONS_INFLIGHT_MAX_MS) {
+        return sessionsInflight;
+      }
+      // 刚落地那份：窗口内也不再问
+      if (sessionsLast && now - sessionsDoneAt < SESSIONS_MERGE_MS) {
+        return sessionsLast;
+      }
     }
-    sessionsAt = Date.now();
-    sessionsInflight = (async () => {
+    sessionsAt = now;
+    // 先占位：`finally` 里要靠它认出「现在在飞的是不是我自己」—— 赋值在本函数
+    // 尾部，所以用会一个先建出来的对象，而不引用那个 `const p`。
+    const slot: { p: Promise<void> | null } = { p: null };
+    // 重拉时把**已经翻出来的条数**带上（0 = 服务端默认一页）。
+    // 不带的话，回一次前台 / 重命名一次就会把用户翻到第 6 页的列表缩回 20 条，
+    // 滚动位置也跟着跳回顶部 —— 明明什么都没变。代价是翻得越多重拉越重，
+    // 但那正是用户自己翻出来的量（以前每一次都是全量）。
+    const keep = sessions.length;
+    const p = (async () => {
       try {
-        const r = await fetch("/api/sessions");
-        if (r.ok)
-          sessions =
-            ((await r.json()) as { sessions: Session[] }).sessions ?? [];
+        const r = await fetch(`/api/sessions${keep ? `?tail=${keep}` : ""}`);
+        if (r.ok) {
+          const d = (await r.json()) as {
+            sessions?: Session[];
+            next?: string | null;
+          };
+          sessions = d.sessions ?? [];
+          // 整份重来：游标也跟着回到第一页之后（之前翻出来的那些没了）
+          sessionsNext = d.next ?? null;
+        }
       } catch {
         /* 同上 */
       } finally {
-        sessionsInflight = null;
+        sessionsDoneAt = Date.now();
+        // 只清自己那一份：`force` 可能在它落地之前又发了一份，那份不能被抹掉
+        // （抹了的话下一次调用就以为「没人在飞」，又发一份）
+        if (sessionsInflight === slot.p) sessionsInflight = null;
       }
     })();
-    return sessionsInflight;
+    slot.p = p;
+    sessionsInflight = p;
+    sessionsLast = p;
+    return p;
+  }
+
+  /**
+   * 抽屉滚到底了：按游标再要一页，追加到 `sessions` 后面。
+   *
+   * 不能和 `loadSessions` 合并（那份是「整份重来」，会把翻出来的页面冲掉）——
+   * 这里只在自己身上防重入。`force` 重拉第一页时游标会重置，这一页作废。
+   */
+  async function loadMoreSessions() {
+    const cursor = sessionsNext;
+    if (!cursor || sessionsMoreBusy) return;
+    sessionsMoreBusy = true;
+    const at = sessions.length;
+    try {
+      const r = await fetch(
+        `/api/sessions?before=${encodeURIComponent(cursor)}`,
+      );
+      if (!r.ok) return;
+      const d = (await r.json()) as {
+        sessions?: Session[];
+        next?: string | null;
+      };
+      // 这期间整份重来过（切会话 / 回合收尾 / 回前台）：游标和工作都换了，这份丢掉
+      if (sessionsNext !== cursor || sessions.length !== at) return;
+      // 按 id 去重：翻页期间新建的会话会顶到最前面，理论上不该重复，但宁可少一行
+      const have = new Set(sessions.map((s) => s.id));
+      sessions = [
+        ...sessions,
+        ...(d.sessions ?? []).filter((s) => !have.has(s.id)),
+      ];
+      sessionsNext = d.next ?? null;
+    } catch {
+      /* 拉不到就下次滚到底再试 */
+    } finally {
+      sessionsMoreBusy = false;
+    }
   }
 
   function newSession() {
@@ -651,7 +746,7 @@
     sessionId = "";
     windowFrom = 0;
     pending = null;
-    await Promise.all([loadSessions(), loadMessages()]);
+    await Promise.all([loadSessions(true), loadMessages()]);
     drawer = false;
   }
 
@@ -661,7 +756,7 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ id, title }),
     });
-    await loadSessions();
+    await loadSessions(true);
   }
 
   async function deleteSession(id: string) {
@@ -678,7 +773,7 @@
     sessionId = "";
     windowFrom = 0;
     pending = null;
-    await Promise.all([loadSessions(), loadMessages()]);
+    await Promise.all([loadSessions(true), loadMessages()]);
   }
 
   // 只在挂载时跑一次。`untrack` 不能省：`loadMessages` 在第一个 await 之前同步读了
@@ -836,18 +931,19 @@
   // 左上角那个菜单按钮：窄屏是开抽屉；宽屏是**收 / 展**侧边栏
   // （宽屏侧边栏一直在，只是可以收起来把地方让给对话）。
   //
-  // 展开时**显式**刷新列表。不能只靠 `$effect(() => { if (drawer) ... })`：
-  // 开着的时候状态没变化，effect 不会重跑（在别处新建了会话，
-  // 抽屉里还是“还没有对话”）。
+  // **打开不发请求**。抽屉里只有三样东西：会话列表 / 收藏 / 机器标签，前两样都是
+  // 模块级状态（`sessions` / `favorites`），不需要「打开时去确认一下」：
+  //
+  //   - 本页改过列表（新建 / 重命名 / 删除 / 切会话 / 回合收尾）→ 那些地方自己已经拉了；
+  //   - 用户从别处回来（切前台 / 聚焦 / 连接恢复）→ 那三条入口已经拉了；
+  //   - 首屏 → 挂载时拉了。
+  //
+  // 以前这里会多发一份 `/api/sessions`（22 KB，手机 WiFi 上几百毫秒），为的是盖住
+  // 「别的客户端在服务端改了、本页一直在前台没动」这一种情况 —— 那一下的代价和它
+  // 出现的频率不成比例，而真碰上了切一下前台就是最新的。
   function toggleSidebar() {
-    if (wide.on) {
-      sidebar = !sidebar;
-      if (!sidebar) return;
-    } else {
-      drawer = true;
-    }
-    void loadSessions();
-    void loadMessages();
+    if (wide.on) sidebar = !sidebar;
+    else drawer = true;
   }
 
   // 返回键关覆盖层：每个覆盖层自己登记（lib/overlay.ts），这里不管。
@@ -894,7 +990,6 @@
     onStart: () => {
       peek = 0;
       drawer = true;
-      void loadSessions();
     },
     onMove: (p: number) => (peek = p),
     onEnd: (open: boolean) => {
@@ -944,7 +1039,8 @@
         // 流收完了：换成服务端那份（id、合并方式以它为准；流里断了的也补回来）
         void loadMessages();
       }
-      void loadSessions();
+      // 这一趟可能刚建出新会话（第一句才建）、标题也是服务端起的：要新的那份
+      void loadSessions(true);
     }
   }
 
@@ -1138,6 +1234,8 @@
       onsettings={() => (settings = true)}
       machine={store.machine}
       onmachine={openMachines}
+      onmore={loadMoreSessions}
+      more={sessionsNext !== null}
       pinned
     />
   {/if}
@@ -1249,6 +1347,8 @@
       onsettings={() => (settings = true)}
       machine={store.machine}
       onmachine={openMachines}
+      onmore={loadMoreSessions}
+      more={sessionsNext !== null}
     />
   {/if}
 </div>

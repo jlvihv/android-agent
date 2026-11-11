@@ -370,7 +370,8 @@ def pick_session(which: str) -> None:
         return
 
     # find-or-create：同一条调试会话反复用，历史能连着，也不会在侧边栏堆一堆
-    code, d = call("GET", "/api/sessions")
+    # `tail=0` = 全给：这里要按标题找那条调试会话，翻页只会白翻
+    code, d = call("GET", "/api/sessions?tail=0")
     was_active = None
     if code == 200 and isinstance(d, dict):
         for sess in d.get("sessions") or []:
@@ -619,7 +620,9 @@ def cmd_dev(js: str) -> None:
 
 
 def cmd_sessions() -> None:
-    code, d = call("GET", "/api/sessions")
+    # `tail=0` = 一次全给。界面上分页是因为它一屏只看得见十条；命令行是
+    # 「我要看全部，自己往下翻终端」，翻页只会让人多敲几次
+    code, d = call("GET", "/api/sessions?tail=0")
     if code != 200:
         print(c(BAD, f"失败 {code}: {d}"))
         return
@@ -700,7 +703,8 @@ def cmd_doctor(deep: bool = False) -> int:
     row("跑命令", good,
         f"{dt:.0f}ms · {str(d.get('output', '')).strip()!r}" if good else f"{code} {str(d)[:120]}")
 
-    code, ss = call("GET", "/api/sessions")
+    # `tail=0`：这里要的是**总数**，不是在数这一页
+    code, ss = call("GET", "/api/sessions?tail=0")
     n = len(ss.get("sessions", [])) if code == 200 and isinstance(ss, dict) else None
     row("会话库", n is not None, f"{n} 个会话" if n is not None else f"{code} {str(ss)[:80]}")
 
