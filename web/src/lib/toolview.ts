@@ -41,6 +41,11 @@ const str = (v: unknown) => (typeof v === "string" ? v : "");
  * 折叠行染红和面板用**同一个**判定。
  */
 export function failed(t: ToolPart): boolean {
+  // 首屏服务端只给一个布尔（`failed`）—— output 正文不再传（见 core 的
+  // `OUTPUT_ON_WIRE`）。有它就信它，这是服务端按全文算的，比拿截断的那点
+  // 自己判可靠（截断会把末尾的 `[exit 1]` 切掉）。
+  if (t.failed !== undefined) return t.failed;
+  // 没有那个字段的（流式过程中、老的本地数据）：退回自己判
   const text = t.output;
   if (text === undefined) return false;
   if (text.startsWith("错误：")) return true;

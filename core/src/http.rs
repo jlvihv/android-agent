@@ -2357,12 +2357,16 @@ async fn get_attachment(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<St
     }
 }
 
-/// `GET /api/part?id=<part id>` → 一个 part 的**全文**。
+/// `GET /api/part?id=<part id>` → 一个 part 的**全文**（所有被截过的字段一起）。
 ///
-/// 首屏那条路（`/api/session`）会把 reasoning / tool 的正文截到 400 字
-/// （见 `PART_PREVIEW_CHARS`），实测能把一份 190 KB 的窗口压到 20 KB 上下。
-/// 用户点开思考 / 工具面板时才来这里取剩下的 —— 本地回环几毫秒，用户感觉不到；
-/// 远程连的时候也只是一次几十 KB 的请求，而且只有真正点开才付。
+/// 首屏那条路（`/api/session`）会把 reasoning / tool 的正文截到 400 字、工具参数
+/// 截到 200 字/字段（见 `PART_PREVIEW_CHARS` / `LONG_FIELD_CHARS`），实测能把一份
+/// 190 KB 的窗口压到一半以下。用户点开思考 / 工具面板时才来这里取剩下的 ——
+/// 本地回环几毫秒，用户感觉不到；远程连的时候也只是一次请求，且只有真正点开才付。
+///
+/// **一次把所有字段给全**（`{"text"?, "output"?, "input"?}`）：早先按 `?input=1`
+/// 分成两条路，输入输出都长的工具点一下会并发两条往返 —— 同一份数据的两个字段，
+/// 没理由拆两次。
 ///
 /// `id` 就是视图里的 `r{i}` / `t{i}` / `toolCallId`：前者是 DB 下标（`i` 是
 /// `ChatMessage` 的下标），后者是工具调用自己的 id。两种都用同一条路解析 ——
@@ -2393,8 +2397,8 @@ async fn get_part(
     let Some(sess) = store.get(&sid) else {
         return (StatusCode::NOT_FOUND, "没有这个会话").into_response();
     };
-    match crate::agent::part_full_kind(sess, &id, q.input.unwrap_or(false)) {
-        Some(text) => Json(json!({ "text": text })).into_response(),
+    match crate::agent::part_full(sess, &id) {
+        Some(v) => Json(v).into_response(),
         None => (StatusCode::NOT_FOUND, "没有这个 part").into_response(),
     }
 }
@@ -2406,10 +2410,7 @@ struct PartQuery {
     /// 哪个会话。不给 = 当前活动会话（面板只能从当前会话点开）
     #[serde(default)]
     session: Option<String>,
-    /// 要**工具参数**（完整 JSON 文本）而不是输出。参数在首屏也会被截
-    /// （`TOOL_INPUT_PREVIEW_CHARS`），点开面板取明细时用。
-    #[serde(default)]
-    input: Option<bool>,
+
 }
 
 /// `POST /api/model` → 在当前 provider 内换模型（不用再传 key）。

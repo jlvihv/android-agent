@@ -1275,6 +1275,18 @@ pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<V
 /// 400 字够放下摘要行 + 面板里的开头一段；剩下的点开时再取（见 `part_full`）。
 pub const PART_PREVIEW_CHARS: usize = 400;
 
+/// 工具**输出**首屏一个字都不给。
+///
+/// 它在前端**从不显示**：工具行只有图标 + 摘要（摘要读的是 `input` 的
+/// `command`/`path`），输出全文只在点开面板时才看。所以「留前 400 字」纯属浪费
+/// —— 反正点开要重新请求一次，那 400 字一行也用不上。
+///
+/// 唯一从 output 里读出来的东西是「这一行要不要标红」（`failed`：开头
+/// `错误：` 或末尾 `[exit N]`，N≠0）。那个在服务端算好，作为 `failed: true`
+/// 一起发 —— 比传 400 字再让前端截尾判一遍省得多，也不会因为截断把
+/// 末尾的 `[exit 1]` 切掉而误判成功（这个坑真踩过）。
+pub const OUTPUT_ON_WIRE: bool = false;
+
 /// 工具**参数**（`input`）在首屏最多序列化成这么多字符。
 ///
 /// 第一版只截了 `output`，漏了 `input` —— 实测这个会话里 `bash` 的参数合计
@@ -1291,6 +1303,29 @@ const TOOL_INPUT_PREVIEW_CHARS: usize = 2000;
 /// 都不到 2 KB，但合计 71 KB，因为它们是一条条几百字的命令。
 /// 工具行只显示 `command` 的第一行，留 200 字（够看出是什么命令）足够。
 const LONG_FIELD_CHARS: usize = 200;
+
+/// 这次工具调用算不算失败 —— 和前端 `lib/toolview.ts` 的 `failed()` **同一套判定**。
+///
+/// 放在服务端算的理由：首屏不再传 output 正文（见 [`OUTPUT_ON_WIRE`]），
+/// 而工具行要不要标红就看这个。传一个布尔比传 400 字让前端自己截尾判便宜，
+/// 而且不会因为把末尾的 `[exit 1]` 切掉而误判成成功（这个坑真踩过：一条
+/// 400 字之后才输出 `[exit 1]` 的命令，界面不标红）。
+fn tool_failed(output: &str) -> bool {
+    if output.starts_with("错误：") {
+        return true;
+    }
+    // `[exit N]` 在**末尾**（允许尾随空白）
+    match output.trim_end().rfind("[exit ") {
+        Some(at) => {
+            let rest = &output[at + 6..];
+            rest.split(']')
+                .next()
+                .and_then(|n| n.trim().parse::<i32>().ok())
+                .is_some_and(|n| n != 0)
+        }
+        None => false,
+    }
+}
 
 /// 把一个 part 的某个正文字段截到 `cap` 个字符，截了就标 `truncated` + `chars`。
 ///
@@ -1475,11 +1510,21 @@ pub fn session_view_range_clipped(
                     // Svelte 那一轮更新整个打断 —— 切回一个工具正跑着的会话，界面停在上一个
                     // 会话的内容上、没有停止键，直到那个工具跑完。
                     if let Some(o) = output {
-                        // **先写进去再截**：`clip_part` 是拿 `part[field]` 去切的，
-                        // 字段还没写时它什么都不做（踩过：工具输出原样发了全文，
-                        // 190 KB 的窗口里 tool 占 177 KB 一点没省）。
-                        part["output"] = json!(o);
-                        part = clip_part(part, o.chars().count(), cap, "output");
+                        // **首屏不带 output 正文**（见 `OUTPUT_ON_WIRE`）：
+                        //   - 截断版（界面那条路，cap != MAX）：一个字都不给，
+                        //     只给 `failed` 和 `chars`（面板里显示「原文 N 字」用）；
+                        //   - 不截断版（调试脚本 / 老客户端）：原样给全文。
+                        part["chars"] = json!(o.chars().count());
+                        if !OUTPUT_ON_WIRE && cap != usize::MAX {
+                            part["failed"] = json!(tool_failed(o));
+                            part["output"] = json!("");
+                        } else {
+                            // **先写进去再截**：`clip_part` 是拿 `part[field]` 去切的，
+                            // 字段还没写时它什么都不做（踩过：工具输出原样发了全文，
+                            // 190 KB 的窗口里 tool 占 177 KB 一点没省）。
+                            part["output"] = json!(o);
+                            part = clip_part(part, o.chars().count(), cap, "output");
+                        }
                     }
                     // 参数也要截：第一版漏了这条，实测 bash 的参数合计 57 KB，
                     // 比截断后的 output 还大一倍（见 TOOL_INPUT_PREVIEW_CHARS）。
@@ -1518,69 +1563,67 @@ pub fn session_view_range_clipped(
     out
 }
 
-/// 按视图里的 part id 取**全文**（首屏那条路是截断过的，见 [`PART_PREVIEW_CHARS`]）。
+/// 按视图里的 part id 取**全文**（首屏那条路是截断过的，见 [`PART_PREVIEW_CHARS`]
+/// 和 [`LONG_FIELD_CHARS`]）。
+///
+/// **一次返回所有被截过的字段**，不是一次只要一个：
+/// ```json
+/// {"text": "…"}                      // reasoning / 正文
+/// {"output": "…", "input": {…}}      // 工具：输出和参数一起给
+/// ```
+/// 早先按 `?input=1` 拆成两条路，输入输出都长的工具点一下会并发两条往返 ——
+/// 同一份数据的两个字段没理由拆两次，而且调用方还要自己管两份缓存。
 ///
 /// id 的两种来源：
-/// - `r{i}` / `t{i}` / `a{i}` —— `i` 是 `ChatMessage` 的下标（`session_view_range`
-///   里 `format!("r{i}")` 那个 `i`），直接在 `sess.messages[i]` 上取对应字段；
+/// - `r{i}` / `t{i}` —— `i` 是 `ChatMessage` 的下标（`session_view_range` 里
+///   `format!("r{i}")` 那个 `i`），直接在 `sess.messages[i]` 上取对应字段；
 /// - 别的一律当工具调用 id，在整段里找那个 `tool_calls[].id`（工具调用可能落在
 ///   回合里任意一条 assistant 上）。
 ///
 /// 找不到返回 `None`（会话被删、id 打错、或者那条消息已经被回收）。
-pub fn part_full(sess: &ChatSession, id: &str) -> Option<String> {
-    part_full_kind(sess, id, false)
-}
-
-/// 同上，`want_input = true` 时取的是**工具参数**（`arguments`）而不是输出。
-///
-/// 参数也会被截（见 `TOOL_INPUT_PREVIEW_CHARS`），点开工具面板要完整参数时
-/// 走这条。
-pub fn part_full_kind(sess: &ChatSession, id: &str, want_input: bool) -> Option<String> {
+pub fn part_full(sess: &ChatSession, id: &str) -> Option<Value> {
     // `r3` / `t3`：前缀 + DB 下标
     if let Some(rest) = id.strip_prefix('r') {
         if let Ok(i) = rest.parse::<usize>() {
             if let Some(ChatMessage::Assistant { reasoning, .. }) = sess.messages.get(i) {
-                return Some(reasoning.clone());
+                return Some(json!({ "text": reasoning }));
             }
         }
     }
     if let Some(rest) = id.strip_prefix('t') {
         if let Ok(i) = rest.parse::<usize>() {
             if let Some(ChatMessage::Assistant { content, .. }) = sess.messages.get(i) {
-                return Some(content.clone());
+                return Some(json!({ "text": content }));
             }
         }
     }
-    // 工具：先定位那条 assistant（拿它的内容要给 `output`，那在后面的 Tool 消息里）
-    let mut call_index = None;
-    for (i, m) in sess.messages.iter().enumerate() {
+    // 工具：参数在那条 assistant 上，输出在它后面某条 Tool 上 —— 两个一起给
+    let mut i = None;
+    for (k, m) in sess.messages.iter().enumerate() {
         if let ChatMessage::Assistant { tool_calls, .. } = m {
-            if tool_calls.iter().any(|tc| tc.id == id) {
-                call_index = Some(i);
+            if let Some(tc) = tool_calls.iter().find(|tc| tc.id == id) {
+                i = Some((k, tc.arguments.clone()));
                 break;
             }
         }
     }
-    let i = call_index?;
-    if want_input {
-        // 参数就在那条 assistant 上，不用往后找
-        return sess.messages[i..].iter().find_map(|m| match m {
-            ChatMessage::Assistant { tool_calls, .. } => tool_calls
-                .iter()
-                .find(|tc| tc.id == id)
-                .map(|tc| tc.arguments.clone()),
-            _ => None,
-        });
-    }
+    let (i, arguments) = i?;
+    let mut out = json!({
+        "input": serde_json::from_str::<Value>(&arguments)
+            .unwrap_or_else(|_| json!(arguments)),
+    });
     // 结果可能在它后面任意一条 Tool 消息上（一个回合的 tool 结果都在后面）
-    sess.messages[i + 1..].iter().find_map(|m| match m {
+    if let Some(content) = sess.messages[i + 1..].iter().find_map(|m| match m {
         ChatMessage::Tool {
             tool_call_id,
             content,
             ..
         } if tool_call_id == id => Some(content.clone()),
         _ => None,
-    })
+    }) {
+        out["output"] = json!(content);
+    }
+    Some(out)
 }
 
 /// 一条历史消息在前端视图里贡献几个 part（和 `session_view_from` 的规则一致，
@@ -3974,11 +4017,14 @@ mod bench_search {
         let reasoning = parts.iter().find(|p| p["type"] == "reasoning").expect("有 reasoning");
         let tool = parts.iter().find(|p| p["type"] == "tool").expect("有 tool");
 
-        // 截断标记 + 全长都在
+        // reasoning 仍然给前 400 字（那一行摘要要用它渲染）
         assert_eq!(reasoning["truncated"], serde_json::json!(true));
         assert_eq!(reasoning["chars"], serde_json::json!(1000));
-        assert_eq!(tool["truncated"], serde_json::json!(true));
+        // **工具输出首屏一个字都不给**（前端从不显示它，只在面板里看）：
+        // 只留 `chars`（面板显示「原文 N 字」）和 `failed`（工具行标红用）
+        assert_eq!(tool["output"], serde_json::json!(""));
         assert_eq!(tool["chars"], serde_json::json!(8000));
+        assert_eq!(tool["failed"], serde_json::json!(false));
 
         // 实际长度：400 字 + 一个省略号。**按字符不是按字节** —— 中文一个字 3 字节，
         // 按字节切会把汉字劈成两半。
@@ -3990,6 +4036,20 @@ mod bench_search {
         let text = parts.iter().find(|p| p["type"] == "text").expect("有 text");
         assert!(text.get("truncated").is_none());
         assert!(text.get("chars").is_none());
+    }
+
+    #[test]
+    fn 失败判定和前端那套一致() {
+        // 首屏不再传 output 正文，工具行要不要标红全靠这个布尔，
+        // 所以它的判定规则必须和前端 `failed()` 一字不差。
+        assert!(tool_failed("错误：no such file"));
+        assert!(tool_failed("some output\n[exit 1]"));
+        assert!(tool_failed("some output\n[exit 1]\n")); // 尾随空白
+        assert!(!tool_failed("ok\n[exit 0]"));
+        assert!(!tool_failed("就是一段没有退出码的输出"));
+        assert!(!tool_failed(""));
+        // 末尾那个才算；正文里提到 `[exit 1]` 不算
+        assert!(!tool_failed("[exit 1] 这行在开头\n最后是 [exit 0]"));
     }
 
     #[test]
@@ -4059,17 +4119,26 @@ mod bench_search {
     fn 取全文两种id都认() {
         let sess = big_session();
         // reasoning：`r{i}`，i 是 DB 下标（这条是 messages[1]）
-        assert_eq!(part_full(&sess, "r1"), Some("想".repeat(1000)));
+        assert_eq!(part_full(&sess, "r1").unwrap()["text"], json!("想".repeat(1000)));
         // 正文：`t{i}`
-        assert_eq!(part_full(&sess, "t1"), Some("回答".repeat(10)));
-        // 工具输出：按 tool_call_id 找，结果在后面那条 Tool 消息上
-        assert_eq!(
-            part_full(&sess, "call_abc"),
-            Some("输出行\n".repeat(2000))
-        );
+        assert_eq!(part_full(&sess, "t1").unwrap()["text"], json!("回答".repeat(10)));
         // 不存在
-        assert_eq!(part_full(&sess, "nope"), None);
-        assert_eq!(part_full(&sess, "r99"), None);
+        assert!(part_full(&sess, "nope").is_none());
+        assert!(part_full(&sess, "r99").is_none());
+    }
+
+    #[test]
+    fn 工具的参数和输出一次全给() {
+        // 输入输出都长的工具，点开面板**一条请求**就该拿到两样。
+        // 早先按 `?input=1` 拆成两条路，点一下并发两次往返 —— 同一份数据的两个
+        // 字段没理由拆两次。
+        let sess = big_session();
+        let got = part_full(&sess, "call_abc").expect("有这个工具");
+        assert_eq!(got["output"], json!("输出行\n".repeat(2000)));
+        // 参数是解析好的 JSON（不是一段字符串）
+        assert_eq!(got["input"]["command"], json!("ls"));
+        // 两个字段在同一个响应里，调用方一次就够
+        assert!(got.get("output").is_some() && got.get("input").is_some());
     }
 
     #[test]

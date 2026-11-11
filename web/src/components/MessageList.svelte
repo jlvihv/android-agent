@@ -29,7 +29,7 @@
   import Sheet from "./Sheet.svelte";
   import ThoughtLine from "./ThoughtLine.svelte";
   import {} from "../lib/drag";
-  import { partFull } from "../lib/partfull";
+  import { partFull, type PartFull } from "../lib/partfull";
 
   let {
     messages,
@@ -252,62 +252,46 @@
   $effect(() => () => cancelAnimationFrame(argsRaf));
 
   /**
-   * 首屏那些 part 是**截断过**的（服务端只给前 400 字，见 core 的
-   * `PART_PREVIEW_CHARS`）。点开面板的这一刻才去取全文 —— 90% 的消息一辈子
-   * 没人点开，那部分字节从来不用传。
+   * 首屏那些 part 是**截断过**的（服务端把 reasoning / 正文截到 400 字、工具参数
+   * 截到 200 字/字段，见 core 的 `PART_PREVIEW_CHARS` / `LONG_FIELD_CHARS`）。
+   * 点开面板的这一刻才去取全文 —— 90% 的消息一辈子没人点开，那部分字节从来不用传。
    *
-   * `full` 是「已经取到的全文」，key 是 part id（`r3` / 工具调用 id）。取回来之前
-   * 面板里先显示截断的那份 + 一行「载入中」，不会白屏。
+   * `full` 是「已经取到的完整内容」，key 是 part id（`r3` / 工具调用 id）。
+   * **一个 part 一条请求**，服务端一次把 `text` / `output` / `input` 里被截过的
+   * 字段都给回来 —— 输入输出都长的工具也只有一次往返。
+   *
+   * 取回来之前，面板里先显示截断的那份 + 一行「载入中」，不会白屏。
    */
-  let full = $state<Record<string, string>>({});
-  /** 完整参数（`input` 被截过的工具才有），key 是 toolCallId */
-  let fullInput = $state<Record<string, Record<string, unknown>>>({});
+  let full = $state<Record<string, PartFull>>({});
   let loading = $state<string | null>(null);
 
-  /** 面板要打开的 part 若被截断过，就补一次全文；取回来写进 `full` 后自动重渲染 */
-  async function needFull(id: string, truncated: boolean | undefined) {
-    if (!truncated || full[id] !== undefined) return;
+  /** 面板要打开的 part 只要有字段被截过，就补一次全文 */
+  async function needFull(
+    id: string,
+    hasHiddenOutput: number | undefined,
+    inputTruncated: boolean | undefined,
+  ) {
+    if ((hasHiddenOutput === undefined && !inputTruncated) || full[id] !== undefined)
+      return;
     loading = id;
-    const text = await partFull(id);
-    if (text) full[id] = text;
+    const got = await partFull(id);
+    if (Object.keys(got).length) full[id] = got;
     if (loading === id) loading = null;
   }
 
-  /**
-   * 工具参数被截过的，点开面板时取完整的 JSON。
-   *
-   * 首屏只给一段预览（`inputTruncated`）：实测 `bash` 的参数合计能到 57 KB，
-   * 而工具行只显示 `command` 的第一行、参数明细只在面板里看。
-   * 取回来解析成对象，`describeInput` 就有完整字段可用（`edit` 的 `edits`、
-   * `bash` 的 `timeout` 这些）。
-   */
-  async function needInput(id: string, truncated: boolean | undefined) {
-    if (!truncated || fullInput[id] !== undefined) return;
-    const text = await partFull(id, "input");
-    if (!text) return;
-    try {
-      const v = JSON.parse(text);
-      if (v && typeof v === "object") fullInput[id] = v as Record<string, unknown>;
-    } catch {
-      /* 解析失败就继续用预览那份，不打断面板 */
-    }
-  }
-
   function openTool(msg: Message, tool: ToolPart) {
-    panelArgs = fullInput[tool.toolCallId] ?? argsOf(tool);
+    panelArgs = full[tool.toolCallId]?.input ?? argsOf(tool);
     sheet = { kind: "tool", msg, tool };
-    void needFull(tool.toolCallId, tool.truncated);
-    void needInput(tool.toolCallId, tool.inputTruncated).then(() => {
+    void needFull(tool.toolCallId, tool.chars, tool.inputTruncated).then(() => {
       // 取回来之后只更新「正开着的这个面板」，别去动别人的
-      if (fullInput[tool.toolCallId] && sheet?.kind === "tool") {
-        panelArgs = fullInput[tool.toolCallId];
-      }
+      const got = full[tool.toolCallId]?.input;
+      if (got && sheet?.kind === "tool") panelArgs = got;
     });
   }
 
   function openReasoning(part: ReasoningPart) {
     sheet = { kind: "reasoning", part };
-    void needFull(part.id, part.truncated);
+    void needFull(part.id, part.truncated ? 1 : undefined, undefined);
   }
 
   /**
@@ -980,7 +964,7 @@
     {@const rp = sheet.part}
     <!-- 全文取回来了就用它；没有（还在取、或者服务端说没截断）就用手上这份。
          存的是 part 本身而不是文本副本：思考还在流式时打开，面板里也跟着长。 -->
-    {@const rtext = full[rp.id] ?? rp.text}
+    {@const rtext = full[rp.id]?.text ?? rp.text}
     <Sheet title="思考" onclose={() => (sheet = null)}>
       <div class="flex flex-col gap-2 text-ui leading-6 text-fg/90">
         {#if loading === rp.id}
@@ -1000,10 +984,16 @@
     {@const t = s.tool}
     <!-- 全文取回来了就拿它替掉截断的那份，`describeResult` 的判定（failed / diff）
          也跟着用全文 —— 否则一个 400 字之后才有 `[exit 1]` 的命令会被判成成功 -->
-    {@const toolFull = full[t.toolCallId]}
-    {@const shown =
-      toolFull === undefined ? t : { ...t, output: toolFull, truncated: false }}
-    {@const res = describeResult(shown)}
+    {@const toolFull = full[t.toolCallId]?.output}
+    <!-- 首屏的 output 是**空串**（服务端只给了 `chars`，正文没传，见 core 的
+         `OUTPUT_ON_WIRE`）。所以「有没有可取的结果」看 `chars`，不只看 output 在不在：
+         没取到全文之前不渲染结果区，只显示「载入全文…」，别给一个空白的 `<pre>`。 -->
+    {@const res =
+      toolFull !== undefined
+        ? describeResult({ ...t, output: toolFull })
+        : t.chars !== undefined
+          ? null
+          : describeResult(t)}
     {@const inp = describeInput(t, panelArgs)}
     <Sheet title={toolTitle(t, panelArgs)} onclose={() => (sheet = null)}>
       <div class="flex flex-col gap-4">
@@ -1024,7 +1014,7 @@
             </span>
             {#if loading === t.toolCallId}
               <p class="text-meta text-faint">载入全文…</p>
-            {:else if t.truncated && toolFull === undefined}
+            {:else if (t.chars !== undefined || t.inputTruncated) && full[t.toolCallId] === undefined}
               <!-- 取失败了：明确说一声，别让人以为输出就这么短 -->
               <p class="text-meta text-warn">
                 只显示了前 {t.output?.length ?? 0} 字（原文 {t.chars} 字），全文没取到

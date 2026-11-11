@@ -310,15 +310,18 @@ export type ToolPart = {
   /** 工具返回的图片（read 读到图）：沙箱里的原图路径 */
   images?: string[];
   /**
-   * `output` 被服务端截断过（首屏只给前 400 字，见 core 的 `PART_PREVIEW_CHARS`）。
-   * 点开面板时按 `toolCallId` 走 `/api/part` 取全文。
+   * 服务端算好的「这次调用失败了吗」。
    *
-   * 首屏为什么要截：实测一个 10 条消息的窗口能到 190 KB，其中 reasoning 和 tool
-   * 输出占 96%，而屏幕上 reasoning 只渲染一行摘要、tool 只有一个折叠行 ——
-   * 那些字节传过来了但一个字看不见。
+   * 首屏**不再传 output 正文**（它在界面上从不显示，只在面板里看），而工具行
+   * 要不要标红就看这个。服务端按全文判定（开头 `错误：` 或末尾 `[exit N]`，N≠0），
+   * 比前端拿截断的片段自己判可靠 —— 截断会把末尾的 `[exit 1]` 切掉。
    */
-  truncated?: boolean;
-  /** 截断前 `output` 的总字符数（面板里告诉用户「还有多少」） */
+  failed?: boolean;
+  /**
+   * `output` 的总字符数。**有它就说明首屏把正文扣下了**（`output` 是空串），
+   * 点开面板时要按 `toolCallId` 走 `/api/part` 取。
+   * 面板里也用它显示「原文 N 字」。
+   */
   chars?: number;
   /**
    * `input`（工具参数）也被截过。首屏只给一段预览 —— 实测 `bash` 的参数合计
