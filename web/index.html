@@ -4,8 +4,11 @@
     <meta charset="UTF-8" />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
+    <!-- 别加 `maximum-scale=1`（历史上加过，2026-11 去掉了）：它会连用户的双指缩放
+         一起禁掉，是 WCAG 1.4.4 的典型问题 —— 代码块里那 13px 的等宽字体本就是要
+         放大看的。App 是 WebView，页面本来也不会被浏览器自动缩放。 -->
     <!-- dark 在前：没偏好的环境（老 WebView）拿到的就是深色，和 app.css 里
          `@theme` 那份默认一致。有偏好的照样跟随系统（浅色在那边的
          `@media (prefers-color-scheme: light)` 里）。 -->

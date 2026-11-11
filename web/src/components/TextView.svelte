@@ -74,8 +74,10 @@
     {#if text != null}
       <span>{lines} 行 · {(text.length / 1024).toFixed(1)}KB</span>
       {#if note}<span class="truncate text-warn">{note}</span>{/if}
+      <!-- `aria-live`：复制完那两个字的切换要让读屏也念出来 -->
       <button
-        class="ml-auto shrink-0 rounded-full bg-control px-3 py-1 text-fg"
+        class="ml-auto shrink-0 rounded-full bg-control px-3 py-1.5 text-fg"
+        aria-live="polite"
         onclick={copy}
       >
         {copied ? "已复制" : "复制"}

@@ -1130,7 +1130,7 @@
         onclick={toggleSidebar}
         aria-label="菜单"
         title={wide.on ? "收起 / 展开侧边栏" : "菜单"}
-        class="pointer-events-auto p-1 text-fg"
+        class="tap-y pointer-events-auto p-1 text-fg"
       >
         <Icon name="menu" size={20} />
       </button>
@@ -1145,7 +1145,7 @@
             onclick={openAgentBrowser}
             aria-label="看 agent 的浏览器"
             title="看 agent 的浏览器"
-            class="p-1 text-fg"
+            class="tap-y p-1 text-fg"
           >
             <Icon name="globe" size={20} />
           </button>
@@ -1154,7 +1154,7 @@
           onclick={newSession}
           aria-label="新对话"
           title="新对话"
-          class="p-1 text-fg"
+          class="tap-y p-1 text-fg"
         >
           <Icon name="newchat" size={20} />
         </button>

@@ -169,8 +169,13 @@
           class="flex items-center border-b border-hairline px-3 py-1 text-meta text-faint"
         >
           <span>{b.lang || "代码"}</span>
+          <!-- 复制按钮：`aria-live` 挂在它身上，状态一变读屏会念「已复制」。
+               以前只有两个字在切，屏幕阅读器一点反馈都没有。按钮文字本身就是
+               状态，所以 live 区放按钮里（不是旁边那个 `<span>`）—— 念一次就够。
+               内边距从 `py-0.5` 提到 `py-1.5`：原来可点区只有 22px 高，手指点不准。 -->
           <button
-            class="-mr-1.5 ml-auto px-1.5 py-0.5"
+            class="-mr-1.5 ml-auto px-2 py-1.5"
+            aria-live="polite"
             onclick={() => copy(b.v)}
           >
             {copied === b.v ? "已复制" : "复制"}

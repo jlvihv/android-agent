@@ -153,6 +153,31 @@ if (typeof window !== "undefined") {
     top?.close();
   });
 
+  /**
+   * Esc 关闭栈顶那一层（桌面）。
+   *
+   * 安卓有返回键、触屏有点遮罩 / 拖走，但**桌面浏览器里 Esc 是唯一的习惯** ——
+   * 以前按 Esc 什么都不发生。
+   *
+   * 统一在这里接，而不是每个覆盖层各挂一个 `onkeydown`：那些层盖满屏幕，
+   * 焦点往往还在原来的触发按钮上（没有焦点圈的面层 —— 抽屉、查看器、设置页），
+   * 事件根本不会冒泡到它们身上。挂在 window 上就不用先给每层抢焦点。
+   *
+   * 只给**栈顶**：`stopImmediatePropagation` 之后不会再有人拿到这个 Esc，
+   * 叠两层时按一下只关最上面那层（和返回键一致）。
+   *
+   * `isComposing`：中文输入法展开着候选框时 Esc 是给输入法的（收候选），不抢。
+   */
+  addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || e.isComposing) return;
+    const top = stack.at(-1);
+    if (!top) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    // 走栈顶的 close()：history 那一条由它卸载时的 release 退回（和点遮罩同一条路）
+    top.close();
+  });
+
   // 系统手势返回：进度驱动栈顶那一层
   window.__predictiveBack = (phase, progress = 0) => {
     const top = stack.at(-1);

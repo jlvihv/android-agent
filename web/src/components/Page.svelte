@@ -13,7 +13,8 @@
   import { quintOut } from "svelte/easing";
   import Icon from "./Icon.svelte";
   import { onBack } from "../lib/overlay";
-  import { dismissable, RELEASE } from "../lib/drag";
+  import { dismissable, RELEASE, reducedMotion } from "../lib/drag";
+  import { focusRestore } from "../lib/focus";
 
   let {
     title,
@@ -51,6 +52,8 @@
   $effect(() => onBack(() => onclose(), drag));
 
   function slideIn(_: Element) {
+    // 系统要求减少动效时直接到位
+    if (reducedMotion()) return { duration: 0 };
     return {
       duration: 300,
       easing: quintOut,
@@ -71,6 +74,7 @@
   /** 从当前拖到的位置接着滑出去，不跳回原位再走 */
   function slideOut(_: Element) {
     const from = off;
+    if (reducedMotion()) return { duration: 0 };
     return {
       duration: 240 * (1 - from) + 80,
       easing: quintOut,
@@ -82,6 +86,7 @@
 
 <section
   bind:this={box}
+  use:focusRestore
   use:dismissable={drag}
   class="fixed inset-0 z-[60] flex flex-col bg-ink will-change-transform"
   style:transform={off ? `translateX(${off * 100}%)` : null}
@@ -94,7 +99,7 @@
   <header
     class="flex h-[var(--hdr)] shrink-0 items-center gap-2 px-3 pt-[env(safe-area-inset-top)]"
   >
-    <button class="p-1 text-fg" aria-label="返回" onclick={onclose}>
+    <button class="tap p-1 text-fg" aria-label="返回" onclick={onclose}>
       <Icon name="back" size={20} />
     </button>
     <span class="min-w-0 truncate text-base font-medium">{title}</span>

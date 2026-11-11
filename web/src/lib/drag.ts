@@ -171,3 +171,20 @@ export function dismissable(node: HTMLElement, opts: DismissOpts) {
 export const RELEASE = "transform 280ms cubic-bezier(0.22, 1, 0.36, 1)";
 /** 面板内部换页（横移 + 标题飞入）的时长。300 太急，看不清是从哪页到哪页 */
 export const PAGE_MS = 450;
+
+/**
+ * 用户是不是要求「减少动效」（系统无障碍设置）。
+ *
+ * 怎么用：**只卡自动播放的那批** —— 覆盖层进出场、面板换页、气泡淡入、
+ * 连贯动画。**别卡跟手的**：拖动、预测性返回（`peek`）的位移是手指直接驱动的，
+ * 缩成 0 只会让界面不跟手。高德/微信那类 App 的 reduced-motion 也是这么做的。
+ *
+ * `Svelte` 的 `in:` / `out:` 不认这个开关，所以每个过渡函数自己先问一句
+ * 本函数，返回 `{ duration: 0 }`（Svelte 对 duration 0 会直接切到终态）。
+ */
+export function reducedMotion(): boolean {
+  return (
+    typeof matchMedia === "function" &&
+    matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}

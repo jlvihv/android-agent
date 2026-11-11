@@ -8,6 +8,15 @@
    *
    * `class` 给的是图片本身的样式；compact 占位也用它（尺寸 / 圆角 / 边框跟着走），
    * 默认占位只认自己的样式（图片的 max-h 之类对胶囊没意义）。
+   *
+   * **CLS**：消息里的图是 `loading="lazy"` 的，图片没到之前 `<img>` 高度是 0，
+   * 一加载就把下面整段文字顶下去 —— 聊天里截图很多，连着几张就是连续跳。
+   * 浏览器只能靠 `width`/`height` 两个属性提前把位置占好（比例 > 具体像素），
+   * 而这里图片的 URL 是沙箱里的文件，**我们手上没有尺寸**（也不会为了它多发一个
+   * 请求），所以：
+   *   - 调用方知道尺寸就传 `width`/`height` —— 写了就完全不跳；
+   *   - 不知道的话就这一次性位移，不为它造一个占位盒子（撑出来的空白比跳一下更丑）。
+   * 另外统一 `decoding="async"`：流式渲染时主线程很忙，解码不跟着挤。
    */
   import Icon from "./Icon.svelte";
 
@@ -17,12 +26,18 @@
     class: cls = "",
     compact = false,
     loading,
+    /** 已知的固有尺寸（没给就不知道，只能等解码）。给了就写 `width`/`height`，
+     *  浏览器据此按住比例算占位高，加载前后一行都不动。 */
+    width,
+    height,
   }: {
     src: string;
     alt?: string;
     class?: string;
     compact?: boolean;
     loading?: "lazy" | "eager";
+    width?: number;
+    height?: number;
   } = $props();
 
   /** 哪个地址加载失败过：换了地址（同一个组件复用）就重新试 */
@@ -53,5 +68,17 @@
     </span>
   {/if}
 {:else}
-  <img {src} {alt} {loading} class={cls} onerror={() => (failed = src)} />
+  <!-- `decoding="async"`：别让解码挤在主线程上（消息流式渲染时每帧都在跑）。
+       给了 `width`/`height` 就一并写上 —— 有没有这两个属性，决定了加载前
+       浏览器能不能先按比例占好位置（CLS）。 -->
+  <img
+    {src}
+    {alt}
+    {loading}
+    {width}
+    {height}
+    decoding="async"
+    class={cls}
+    onerror={() => (failed = src)}
+  />
 {/if}

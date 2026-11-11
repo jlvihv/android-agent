@@ -48,20 +48,27 @@
      背景本来就最黑了。所以「面板看得出边界」这件事不再靠它，靠面板自己的底色。 */
   --color-scrim: rgb(0 0 0 / 0.35);
 
-  /* 文字。三档都按 WCAG AA 校准过（2026-10，见文件末尾「对比度账本」）：
+  /* 文字。三档都按 WCAG AA 校准过（2026-10 首版，2026-11 复算，见文件末尾「对比度账本」）：
      faint 原来 #6f6d66 压在卡片(#20201f)上只有 3.15:1、压在代码块(#1c1c1b)上 3.29:1，
-     而它扛的是「代码块是什么语言」「能不能复制」这类**状态信息** —— 太淡就读没了。 */
+     而它扛的是「代码块是什么语言」「能不能复制」这类**状态信息** —— 太淡就读没了。
+     2026-11 那轮又发现它在气泡(#2c2c2a) 3.94、在 control(#313131) 3.66 都不够 ——
+     抽屉长按菜单就是压 `bubble` 的。提到 #9a988f 之后四层全部 ≥ 4.5。 */
   --color-fg: #f9f9f7; /* 暖白，不用纯白 */
-  --color-muted: #9c9a92; /* 药丸里「· 默认」压在 control 上 4.62:1（原来 4.34）*/
-  --color-faint: #8a8880; /* 卡片 4.59 / 代码块 4.80 / 页面 5.63；在 control 上当图标 3.66 */
+  --color-muted: #9c9a92; /* 药丸里「· 默认」压在 control 上 5.03（原来 4.62）*/
+  --color-faint: #9a988f; /* 页 7.26 / 卡片 5.64 / 气泡 4.84 / control 4.50 */
 
   /* 语义色：刻意去饱和，不抢主色 */
   --color-ok: #7fb37f;
   --color-warn: #d9b87f;
   --color-bad: #d98a8a;
-  /* 删除 / 危险操作的文字。比去饱和的 bad 更实（#da6262）—— 刻意两档：
-     bad 是“出错了”的提示色，danger 是“点了会删东西”的按钮色。 */
-  --color-danger: #da6262;
+  /* 删除 / 危险操作的文字。比去饱和的 bad 更实 —— 刻意两档：
+     bad 是“出错了”的提示色，danger 是“点了会删东西”的按钮色。
+
+     2026-11：#da6262 压在气泡(#2c2c2a)上只有 3.93:1 —— 而它**唯一**的去处就是
+     抽屉长按菜单的「删除」（`bg-bubble`），等于这个色从来没用对过。
+     改成 #ea6f6f：气泡 4.67 / 卡片 5.44 / 页 7.00，色相不动（还是那个红）——
+     去饱和路线（#e88080 那类）到 4.65 也行，但它会跟 `bad` 撞脸，两档就分不出来了。 */
+  --color-danger: #ea6f6f;
   /* 选中 / 链接 / 主行动色：**陶土橙（clay）**，Claude 唯一的那个品牌色。
      中间换过一版蓝（当时是从截图里量出来的勾选 / 链接色），现在按 CDS 收回来：
      `--cds-clay: #d97757`（星芒 logo、新对话、发送、勾选、链接、选中态全是它）。
@@ -155,10 +162,12 @@
     --color-scrim: rgb(20 20 19 / 0.35);
 
     /* 文字。同样按 AA 校准（原来的 faint #7b7974 在气泡上只有 3.91:1，
-       而 drawer 里「还没有对话」、路径这些小字全用它）。 */
+       而 drawer 里「还没有对话」、路径这些小字全用它）。
+       2026-11：#6f6d67 在 control(#eae9e4) 4.26、active(#e1e0d9) 3.91 —— 前者是
+       搜索框里的占位字，后者是选中会话行里的小字。降到 #666460 后两处都 ≥ 4.46。 */
     --color-fg: #1c1c1b; /* 近黑，不用纯黑（对称于深色的 #f9f9f7）*/
     --color-muted: #5f5e5a;
-    --color-faint: #6f6d67; /* 白卡 5.17 / 气泡 4.65 / 页 5.04 */
+    --color-faint: #666460; /* 白卡 5.90 / 气泡 5.31 / control 4.86 / active 4.46 */
 
     /* 语义色：同色相、加深，不抢主色 */
     --color-ok: #4f7a4a;
@@ -188,9 +197,9 @@
   }
 
   /* 抽屉搜索框里那个放大镜是**背景图**（见文件末尾），颜色写死在 SVG 里，
-     拿不到令牌 —— 所以浅色下只能再写一张：换成浅色的 faint（#6f6d67，跟着 token 走）。 */
+     拿不到令牌 —— 所以浅色下只能再写一张：换成浅色的 faint（#666460，跟着 token 走）。 */
   .search-input {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Ccircle cx='8.7' cy='8.7' r='5.6' stroke='%236f6d67' stroke-width='1.8'/%3E%3Cpath d='M13 13l4 4' stroke='%236f6d67' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Ccircle cx='8.7' cy='8.7' r='5.6' stroke='%23666460' stroke-width='1.8'/%3E%3Cpath d='M13 13l4 4' stroke='%23666460' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
   }
 }
 
@@ -289,7 +298,23 @@ body {
   user-select: none;
 }
 
-/* 消息、日志、代码、输入框要能选中复制 */
+/*
+ * 能选中复制的地方。
+ *
+ * body 全局禁选：整个界面是一层层触发器，手指划过就选中一片蓝没有意义。
+ * 所以凡是「用户会想抄下来」的文字都得自己挂 `.selectable`：
+ *
+ *   - 消息正文（`MessageList`，用户自己的提问 + 模型的回答）—— 以前居然漏了，
+ *     手机上想摘一段回答没有任何路径（只能靠代码块的「复制」按钮）；
+ *   - 抽屉里搜索命中的摘要（`Drawer`）—— 搜的就是正文，搜到了不让抄没道理；
+ *   - 面板正文（`Sheet`）；
+ *   - 设置页里的明细行（`Page`）—— API Key 尾巴、机器地址这些要能拷出来。
+ *
+ * 代码块 / 输入框 / 全部 `<pre>` 无论如何都可选（下面的选择器）。
+ *
+ * 副作用（已知、可接受）：长按消息会弹系统的选择菜单，而不是 App 的长按菜单 ——
+ * 长按菜单本来只长在抽屉的会话行上，不冲突。
+ */
 .selectable,
 pre,
 input,
@@ -315,6 +340,24 @@ textarea {
  * 2. 真机上还有两个不是「我们写的类」带来的高亮：WebView 里 tap 完
  *    `:hover` 会**粘在**元素上（经典 sticky hover），以及浏览器默认的
  *    focus 外框。这条按元素兜底清掉。
+ *
+ * **触屏上也不要有焦点框（2026-11 补）**：上面那批清掉之后，全站一度没有任何
+ * 焦点视觉 —— 触屏没问题，但桌面浏览器（`just web dev` 跑在 5173）和一众
+ * 接键盘的安卓设备上，Tab 到哪儿完全看不出来，屏幕阅读器用户也定位不到。
+ *
+ * 现在只把**`:focus-visible`** 的框放回来，不靠媒体查询区分设备：
+ *   - 手指 / 鼠标点出来的只是 `:focus`，而 `:focus-visible` **不匹配** ——
+ *     触屏上照旧一干二净，不需要 `@media (hover: none)` 去屏蔽；
+ *   - Tab 过来的是 `:focus-visible`，给一圈框。
+ * 这本来就是 `:focus-visible` 存在的理由（比起 `(hover: hover)` 那类媒体
+ * 查询也靠得住：无头浏览器 / 混合设备上指针能力报告得都不准）。
+ *
+ * `:where()` 把特异性压成 0，组件自己写的 `ring-*` / `outline-*` 一律盖得住，
+ * 不需要 `!important`。
+ *
+ * 注意 `@custom-variant` 那四行**只管 Tailwind 的 `focus:` / `hover:` 变体**
+ * （写成 `:not(*)` 就永不匹配），下面的 `:focus-visible` 是原生 CSS 选择器，
+ * 两者不冲突：`focus-visible:ring-2` 这类类名照样不生效，焦点视觉统一由这段提供。
  */
 @custom-variant active (&:not(*));
 @custom-variant hover (&:not(*));
@@ -323,15 +366,91 @@ textarea {
 
 button:active,
 button:hover,
-button:focus,
-button:focus-visible,
 input:focus,
 textarea:focus,
-a:hover,
-a:focus,
-a:focus-visible {
+a:hover {
   filter: none;
+}
+
+/*
+ * 焦点框：**只清“不是键盘焦点”的那种**。
+ *
+ * 以前这里是 `button:focus, a:focus, button:focus-visible { outline: none }` ——
+ * 两件事都错了：
+ *   1. 把 `:focus-visible` 也清了，于是键盘用户全站看不到焦点；
+ *   2. `button:focus`（特异性 0,1,1）比下面那条 `:where(...):focus-visible`
+ *      （0,1,0）高，就算只清 `:focus` 也会把框盖掉。
+ *
+ * 现在用 `:focus:not(:focus-visible)`：手机 / 鼠标点出来的焦点依旧一点痕迹没有，
+ * Tab 过来的保留（规则在下面）。
+ */
+button:focus:not(:focus-visible),
+a:focus:not(:focus-visible),
+input:focus:not(:focus-visible),
+textarea:focus:not(:focus-visible),
+select:focus:not(:focus-visible) {
   outline: none;
+}
+
+/* 键盘焦点。颜色用文字色：陶土橙表示「可点」，焦点是「你现在在哪」。 */
+:where(
+  a,
+  button,
+  input,
+  textarea,
+  select,
+  summary,
+  [tabindex]:not([tabindex="-1"])
+):focus-visible {
+  outline: 2px solid var(--color-fg);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* 本来就有圆角的（药丸、卡片）跟着自己的圆角走，别被上面那 6px 切掉角 */
+:where(button, a, input, textarea)[class*="rounded"]:focus-visible {
+  border-radius: inherit;
+}
+
+/*
+ * 图标按钮的触摸目标。
+ *
+ * 头部的菜单 / 新对话 / 查看器返回 / 收藏都是「20px 图标 + p-1」，视觉上 28×28 ——
+ * 好看，但手指落点精度大约就是 40px 往上，28px 的按钮在真机上很难一次点中
+ * （特别是单手拿手机时那两个角上的）。
+ *
+ * 做法：**视觉尺寸一像素不动**，用伪元素把可点区向上向下（以及横向，看场合）
+ * 撑到 44px（Apple HIG 的值；Material 是 48dp）。伪元素是按钮自己的一部分，
+ * 点上去就是点按钮，不靠任何 JS。
+ *
+ * 两档：
+ *   - `.tap`   四向都到 44px —— 只用于**四周没有别的按钮**的那些（返回、收藏）。
+ *   - `.tap-y` 只往上下撑 —— 给头部那排相邻的按钮用（间距只有 4px，
+ *              横向再撑就会互相盖住，点哪个看 DOM 顺序，那就不可预测了）。
+ */
+.tap,
+.tap-y {
+  position: relative;
+}
+
+.tap::after,
+.tap-y::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 100%;
+  height: 100%;
+  transform: translate(-50%, -50%);
+}
+
+.tap::after {
+  width: max(100%, 44px);
+  height: max(100%, 44px);
+}
+
+.tap-y::after {
+  height: max(100%, 44px);
 }
 
 /*
@@ -582,7 +701,7 @@ a:focus-visible {
 }
 
 /*
- * 对比度账本（2026-10 校准）
+ * 对比度账本（2026-10 首版，2026-11 复算）
  *
  * 为什么要留这一张表：对比度靠眼睛看不出来。`--color-faint` 原来压在卡片上
  * 只有 3.15:1 —— 截图里"看着有点淡"，真机在户外直接读不见。改色时按这张表核对
@@ -590,17 +709,30 @@ a:focus-visible {
  *
  * 目标：正文/小字 ≥ 4.5:1（WCAG AA），图形/图标 ≥ 3:1。
  *
- *                       深色                     浅色
- *   色值       ink   surface  control | ink   surface  bubble  control
- *   fg       19.92    14.9      —   | 17.6    18.1     —       —
- *   muted     7.0     5.6     4.62  |  6.3     6.5    5.84     —
- *   faint     5.63    4.59    3.66* |  5.04    5.17   4.65    4.26*
- *   accent    6.73    5.22      —   |  5.11    5.17    4.72     —
+ * 2026-11 那轮复算的重点是「颜色用得对，但没在实际背景上验过」——
  *
- *   * faint 在 control 上只当图标用（发送键的暗态箭头、勾选框），3.66 / 4.26 都过 3:1。
- *   * 浅色 accent 是新算的 #ad5133：它同时是「正在使用」的文字色和 bg-accent 的底，
- *     两种用法都要过，原 #c96442 当文字只有 3.8:1。深色 accent #d97757 本来就够。
- *   * 浅色的 muted(#5f5e5a) 和 fg 都未动 —— 它们本来就达标，只是没人算过。
+ *                       深色                                   浅色
+ *                     ink  surface control bubble active | ink  surface control bubble active
+ *   fg              19.92   15.47  12.34  13.27   9.68 | 16.61  17.06  14.03  15.34  12.89
+ *   muted            7.45    5.79   4.62   4.96   3.62 |  6.32   6.49   5.34   5.84   4.90
+ *   faint            7.26    5.64   4.50*  4.84   3.53*|  5.75   5.90   4.86   5.31   4.46
+ *   accent           6.73    5.22   4.17*  4.48   3.27*|  5.11   5.25   4.32*  4.72   3.96*
+ *   danger           7.00    5.44   4.34*  4.67   3.40*|  7.18   7.37   6.06   6.63   5.57
+ *   bad              7.95    6.18   4.93   5.30   3.94*|  5.87   6.02   4.96   5.42   4.55
+ *
+ *   * 只当图标/描边用（发送键暗态箭头、勾选框、选中行上的小图标），过 3:1 即可；
+ *     这些位置没有任何「必须读出字」的文本。`active` 那一列例外少 —— 它只在
+ *     选中会话行里当背景，上面压的是 `fg`(9.68 / 12.89)。
+ *
+ *   改了哪几个（都是有实际文本压在那层背景上、算出来不到 4.5 的）：
+ *     faint  深 #8a8880 → #9a988f（bubble 3.94→4.84、control 3.66→4.50）
+ *            浅 #6f6d67 → #666460（control 4.26→4.86、active 3.91→4.46）
+ *     danger 深 #da6262 → #ea6f6f（bubble 3.93→4.67）
+ *            ——它全项目只有一个去处：抽屉长按菜单的「删除」行，而那一行正是 bg-bubble。
+ *     accent 浅 #c96442 → #ad5133（当文字 3.80→5.11），10 月那轮改过，这次复算仍过。
+ *
+ *   注意 faint 现在和 muted 几乎一样亮（7.26 vs 7.45，原来是 5.91 vs 7.45）。
+ *   层级靠字号/位置维持，不靠亮度 —— 可读性优先。
  *
  * 校准方法：在渲染后的真实页面上遍历每个带文字的节点，算 前景/最近不透明背景 的
  * 亮度比（含字体大小与粗细判定），再 `impeccable detect --cdp` 交叉验证 —— 两套主题

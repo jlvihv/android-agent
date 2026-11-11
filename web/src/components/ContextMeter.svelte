@@ -136,7 +136,9 @@
 {#if usage}
   <button
     onclick={() => (open = true)}
-    aria-label="上下文用量"
+    aria-label={pctLabel == null
+      ? `上下文用量：已用 ${fmt(used)} token`
+      : `上下文用量：${pctLabel}，已用 ${fmt(used)} token`}
     title={pctLabel == null
       ? `上下文 ${fmt(used)} token`
       : `上下文 ${pctLabel}（${fmt(used)} / ${fmt(ctxWindow ?? 0)}）`}

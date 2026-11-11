@@ -23,7 +23,8 @@
   import { fly } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
   import { onBack, type Peek } from "../lib/overlay";
-  import { dismissable, RELEASE, PAGE_MS } from "../lib/drag";
+  import { dismissable, RELEASE, PAGE_MS, reducedMotion } from "../lib/drag";
+  import { focusTrap } from "../lib/focus";
 
   /** 滑出 / 淡出遮罩的时长。面板的 transform 和遮罩的 opacity 必须同步，
    *  `close()` 那个 setTimeout 也用它（等动画跑完再卸载）。 */
@@ -153,6 +154,23 @@
 
   $effect(() => onBack(goBack, backPeek));
 
+  /**
+   * Esc 关闭（桌面）。
+   *
+   * 安卓有返回键、触屏有下拉和点遮罩，但桌面浏览器里就 Esc 这一个习惯 ——
+   * 以前按 Esc 什么都不发生。挂在面板自己身上（不是 window）：`focusTrap` 保证
+   * 焦点在面板里，事件会冒泡到这儿；以后真出现叠层也不会一层层全关。
+   *
+   * 往第二页退还是直接关：和返回键一样走 `goBack`（第二页先退回第一页）。
+   */
+  function onkeydown(e: KeyboardEvent) {
+    if (e.key !== "Escape" || closing) return;
+    // 有展开的 IME 候选框时 Esc 是给输入法的，不抢
+    if (e.isComposing) return;
+    e.stopPropagation();
+    goBack();
+  }
+
   /** 从手指落点往上到面板，有没有哪层已经滚过了（正文、或里面单独滚的清单）。
    *  有的话往下拉是在把它滚回去，不是关面板。 */
   function scrolled(t: EventTarget | null): boolean {
@@ -200,6 +218,8 @@
   use:portal
   bind:this={panel}
   use:dismissable={drag}
+  use:focusTrap
+  {onkeydown}
   role="dialog"
   aria-modal="true"
   aria-label={title}
@@ -221,12 +241,12 @@
           <h2
             in:fly={{
               x: PAGE_SHIFT * slide,
-              duration: PAGE_MS,
+              duration: reducedMotion() ? 0 : PAGE_MS,
               easing: cubicOut,
             }}
             out:fly={{
               x: -PAGE_SHIFT * slide,
-              duration: PAGE_MS,
+              duration: reducedMotion() ? 0 : PAGE_MS,
               easing: cubicOut,
             }}
             class="absolute inset-0 flex items-center justify-center truncate px-12 text-row

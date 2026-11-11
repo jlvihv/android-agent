@@ -28,6 +28,7 @@
   import Markdown from "./Markdown.svelte";
   import Sheet from "./Sheet.svelte";
   import ThoughtLine from "./ThoughtLine.svelte";
+  import { reducedMotion } from "../lib/drag";
 
   let {
     messages,
@@ -742,7 +743,7 @@
 {#snippet dropBtn(id: string)}
   <!-- 发出去的那一刻淡出（和气泡的颜色过渡同一个时长），不是凭空消失 -->
   <button
-    transition:fade={{ duration: BUBBLE_MS }}
+    transition:fade={{ duration: reducedMotion() ? 0 : BUBBLE_MS }}
     onclick={() => ondrop?.(id)}
     aria-label="从队列里去掉"
     title="从队列里去掉"
@@ -760,7 +761,7 @@
   {onscroll}
   class="h-full overflow-y-auto overscroll-y-contain px-4 pt-[calc(var(--hdr)+var(--fade-top))] pb-[calc(var(--composer-h,0px)+1rem)]"
 >
-  <div bind:this={content} class="flex flex-col gap-6">
+  <div bind:this={content} class="flex selectable flex-col gap-6">
     <!-- 排队中（还没发出去）的那几条**接在同一个 each 里**（`shown`），不另开一个：
        发出去时 App 用**同一个 id** 把它挪进 `messages`，同一个 key → Svelte 复用
        同一个节点，只是 `done` 翻了 —— 于是颜色能真的过渡（虚线淡掉、底色变实）。
