@@ -41,6 +41,15 @@ class AgentStore {
   instance = $state<string | null>(null);
 
   /**
+   * 当前会话的 id（服务端给的，`sessionId` 那个）。
+   *
+   * 这里只放一份**只读镜像**给需要跨组件用它的地方（现在只有 `lib/partfull.ts`
+   * 的缓存 key：`r3` 这种 part id 只在会话内有意义，两个会话里都有 `r3`）。
+   * 真正的状态还在 `App.svelte` —— 那儿切换会话时同步写一下这里。
+   */
+  sessionId = $state("");
+
+  /**
    * 侧栏底栏那个小标签上写什么 —— 现在连的是哪台机器。
    *
    *   - 手机自己的核心 →「本机」

@@ -29,6 +29,7 @@
   import Sheet from "./Sheet.svelte";
   import ThoughtLine from "./ThoughtLine.svelte";
   import { reducedMotion } from "../lib/drag";
+  import { partFull } from "../lib/partfull";
 
   let {
     messages,
@@ -88,8 +89,20 @@
     `border border-dashed transition-colors duration-200 ${queued ? "border-control bg-bubble/40" : "border-transparent bg-bubble"}`;
 
   /** 当前打开的面板。一次只有一个。 */
+  /*
+   * 思考面板存的是 `Part` 里那个 reasoning 的**形状**（不是副本）：流式时它还在
+   * 长，面板里要跟着长。`id` / `truncated` / `chars` 是服务端截断时带回来的
+   * （见 core 的 `PART_PREVIEW_CHARS`），点开时按 `id` 去 `/api/part` 取全文。
+   */
+  type ReasoningPart = {
+    id: string;
+    text: string;
+    truncated?: boolean;
+    chars?: number;
+  };
+
   let sheet = $state<
-    | { kind: "reasoning"; part: { text: string } }
+    | { kind: "reasoning"; part: ReasoningPart }
     | { kind: "tool"; msg: Message; tool: ToolPart }
     | null
   >(null);
@@ -238,9 +251,35 @@
   });
   $effect(() => () => cancelAnimationFrame(argsRaf));
 
+  /**
+   * 首屏那些 part 是**截断过**的（服务端只给前 400 字，见 core 的
+   * `PART_PREVIEW_CHARS`）。点开面板的这一刻才去取全文 —— 90% 的消息一辈子
+   * 没人点开，那部分字节从来不用传。
+   *
+   * `full` 是「已经取到的全文」，key 是 part id（`r3` / 工具调用 id）。取回来之前
+   * 面板里先显示截断的那份 + 一行「载入中」，不会白屏。
+   */
+  let full = $state<Record<string, string>>({});
+  let loading = $state<string | null>(null);
+
+  /** 面板要打开的 part 若被截断过，就补一次全文；取回来写进 `full` 后自动重渲染 */
+  async function needFull(id: string, truncated: boolean | undefined) {
+    if (!truncated || full[id] !== undefined) return;
+    loading = id;
+    const text = await partFull(id);
+    if (text) full[id] = text;
+    if (loading === id) loading = null;
+  }
+
   function openTool(msg: Message, tool: ToolPart) {
     panelArgs = argsOf(tool);
     sheet = { kind: "tool", msg, tool };
+    void needFull(tool.toolCallId, tool.truncated);
+  }
+
+  function openReasoning(part: ReasoningPart) {
+    sheet = { kind: "reasoning", part };
+    void needFull(part.id, part.truncated);
   }
 
   /**
@@ -778,7 +817,7 @@
               <!-- 一行：它此刻在想什么。点开面板看全文 -->
               {@const live = !msg.done && i === msg.parts.length - 1}
               <button
-                onclick={() => (sheet = { kind: "reasoning", part })}
+                onclick={() => openReasoning(part)}
                 class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
               >
                 <Icon name="sparkle" size={16} class="shrink-0 text-faint" />
@@ -910,17 +949,32 @@
 
 {#if sheet}
   {#if sheet.kind === "reasoning"}
+    {@const rp = sheet.part}
+    <!-- 全文取回来了就用它；没有（还在取、或者服务端说没截断）就用手上这份。
+         存的是 part 本身而不是文本副本：思考还在流式时打开，面板里也跟着长。 -->
+    {@const rtext = full[rp.id] ?? rp.text}
     <Sheet title="思考" onclose={() => (sheet = null)}>
-      <!-- 存的是 part 本身而不是文本副本：思考还在流式时打开，面板里也跟着长 -->
-      <div class="text-ui leading-6 text-fg/90">
-        <Markdown text={sheet.part.text} />
+      <div class="flex flex-col gap-2 text-ui leading-6 text-fg/90">
+        {#if loading === rp.id}
+          <p class="text-meta text-faint">载入全文…</p>
+        {:else if rp.truncated && full[rp.id] === undefined}
+          <!-- 取失败了（离线 / 服务端没这个 part）：明确说一声，别让人以为思考就这么短 -->
+          <p class="text-meta text-warn">
+            只显示了前 {rp.text.length} 字（原文 {rp.chars} 字），全文没取到
+          </p>
+        {/if}
+        <Markdown text={rtext} />
       </div>
     </Sheet>
   {:else}
     <!-- 存成 const：sheet 是 $state，在 onclick 闭包里 TS 收窄不了 -->
     {@const s = sheet}
     {@const t = s.tool}
-    {@const res = describeResult(t)}
+    <!-- 全文取回来了就拿它替掉截断的那份，`describeResult` 的判定（failed / diff）
+         也跟着用全文 —— 否则一个 400 字之后才有 `[exit 1]` 的命令会被判成成功 -->
+    {@const toolFull = full[t.toolCallId]}
+    {@const shown = toolFull === undefined ? t : { ...t, output: toolFull, truncated: false }}
+    {@const res = describeResult(shown)}
     {@const inp = describeInput(t, panelArgs)}
     <Sheet title={toolTitle(t, panelArgs)} onclose={() => (sheet = null)}>
       <div class="flex flex-col gap-4">
@@ -939,6 +993,14 @@
             <span class="text-meta {res.failed ? 'text-bad' : 'text-faint'}">
               {t.state === "output" ? "模型收到的结果" : "运行中…"}
             </span>
+            {#if loading === t.toolCallId}
+              <p class="text-meta text-faint">载入全文…</p>
+            {:else if t.truncated && toolFull === undefined}
+              <!-- 取失败了：明确说一声，别让人以为输出就这么短 -->
+              <p class="text-meta text-warn">
+                只显示了前 {t.output?.length ?? 0} 字（原文 {t.chars} 字），全文没取到
+              </p>
+            {/if}
 
             {#each res.images as img}
               <!-- 工具返回的图：展示原图（沙箱路由），模型看的是缩放后的那份 -->

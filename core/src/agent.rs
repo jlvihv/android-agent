@@ -1249,6 +1249,11 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
     session_view_range(sess, from, sess.messages.len())
 }
 
+/// 同 [`session_view_from`]，但把 reasoning / tool 的正文截到 `cap`（界面那条路用）。
+pub fn session_view_from_clipped(sess: &ChatSession, from: usize, cap: usize) -> Vec<Value> {
+    session_view_range_clipped(sess, from, sess.messages.len(), cap)
+}
+
 /// 同 `session_view`，但只要 `messages[from..upto]` 那一段。
 ///
 /// 两个端点都必须是**回合边界**（见 [`session_boundaries`]）——
@@ -1257,6 +1262,48 @@ pub fn session_view_from(sess: &ChatSession, from: usize) -> Vec<Value> {
 /// 存在的理由：往前翻的时候只发这一窗，不把整段历史（含每个 50KB 的 bash 输出）
 /// 重新发一遍 —— 客户端一屏也就几十条，给多了它也不渲染。
 pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<Value> {
+    session_view_range_clipped(sess, from, upto, usize::MAX)
+}
+
+/// 单条 part 的**正文**在首屏最多给这么多字符（reasoning 的 `text`、tool 的 `output`）。
+///
+/// 实测一个 10 条消息的窗口能到 190 KB，其中 reasoning 197 KB、tool 输出 177 KB
+/// （同一份数据里两者有重叠计数），而真正给人看的 `text` 只有 **7.5 KB —— 4%**。
+/// 前端对 reasoning 只渲染**一行摘要**（`ThoughtLine`），tool 只有一个折叠行；
+/// 全文只在点开面板时才看。所以首屏把 96% 的字节传了过去，屏幕上根本没有。
+///
+/// 400 字够放下摘要行 + 面板里的开头一段；剩下的点开时再取（见 `part_full`）。
+pub const PART_PREVIEW_CHARS: usize = 400;
+
+/// 把一个 part 的某个正文字段截到 `cap` 个字符，截了就标 `truncated` + `chars`。
+///
+/// 按**字符**不是字节：中日文一个字 3 字节，按字节切会把一个汉字劈成两半
+/// （`String::truncate` 会在非边界上 panic，而这里连 panic 都不该有）。
+/// 前端要拿到全长才知道「还有多少没显示」，所以 `chars` 是无条件记的。
+fn clip_part(mut part: Value, total: usize, cap: usize, field: &str) -> Value {
+    if total <= cap || cap == usize::MAX {
+        return part;
+    }
+    if let Some(Value::String(text)) = part.get(field) {
+        // 留一点余量给省略号，前端不会自动加
+        let cut: String = text.chars().take(cap).collect();
+        part[field] = json!(format!("{cut}…"));
+        part["truncated"] = json!(true);
+        part["chars"] = json!(total);
+    }
+    part
+}
+
+/// 同 [`session_view_range`]，但把 reasoning / tool 的正文截到
+/// [`PART_PREVIEW_CHARS`]，并带上 `truncated: true` 和 `chars`（全长）。
+///
+/// `cap` 传 `usize::MAX` 就是不截（调试脚本、`session_view` 那条老路照旧要全文）。
+pub fn session_view_range_clipped(
+    sess: &ChatSession,
+    from: usize,
+    upto: usize,
+    cap: usize,
+) -> Vec<Value> {
     let len = sess.messages.len();
     let from = from.min(len);
     let upto = upto.clamp(from, len);
@@ -1299,9 +1346,12 @@ pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<V
             } => {
                 let mut parts: Vec<Value> = Vec::new();
                 if !reasoning.is_empty() {
-                    parts.push(
+                    parts.push(clip_part(
                         json!({ "type": "reasoning", "id": format!("r{i}"), "text": reasoning }),
-                    );
+                        reasoning.chars().count(),
+                        cap,
+                        "text",
+                    ));
                 }
                 if !content.is_empty() {
                     parts.push(json!({ "type": "text", "id": format!("t{i}"), "text": content }));
@@ -1329,7 +1379,11 @@ pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<V
                     // Svelte 那一轮更新整个打断 —— 切回一个工具正跑着的会话，界面停在上一个
                     // 会话的内容上、没有停止键，直到那个工具跑完。
                     if let Some(o) = output {
+                        // **先写进去再截**：`clip_part` 是拿 `part[field]` 去切的，
+                        // 字段还没写时它什么都不做（踩过：工具输出原样发了全文，
+                        // 190 KB 的窗口里 tool 占 177 KB 一点没省）。
                         part["output"] = json!(o);
+                        part = clip_part(part, o.chars().count(), cap, "output");
                     }
                     parts.push(part);
                 }
@@ -1361,6 +1415,53 @@ pub fn session_view_range(sess: &ChatSession, from: usize, upto: usize) -> Vec<V
         }
     }
     out
+}
+
+/// 按视图里的 part id 取**全文**（首屏那条路是截断过的，见 [`PART_PREVIEW_CHARS`]）。
+///
+/// id 的两种来源：
+/// - `r{i}` / `t{i}` / `a{i}` —— `i` 是 `ChatMessage` 的下标（`session_view_range`
+///   里 `format!("r{i}")` 那个 `i`），直接在 `sess.messages[i]` 上取对应字段；
+/// - 别的一律当工具调用 id，在整段里找那个 `tool_calls[].id`（工具调用可能落在
+///   回合里任意一条 assistant 上）。
+///
+/// 找不到返回 `None`（会话被删、id 打错、或者那条消息已经被回收）。
+pub fn part_full(sess: &ChatSession, id: &str) -> Option<String> {
+    // `r3` / `t3`：前缀 + DB 下标
+    if let Some(rest) = id.strip_prefix('r') {
+        if let Ok(i) = rest.parse::<usize>() {
+            if let Some(ChatMessage::Assistant { reasoning, .. }) = sess.messages.get(i) {
+                return Some(reasoning.clone());
+            }
+        }
+    }
+    if let Some(rest) = id.strip_prefix('t') {
+        if let Ok(i) = rest.parse::<usize>() {
+            if let Some(ChatMessage::Assistant { content, .. }) = sess.messages.get(i) {
+                return Some(content.clone());
+            }
+        }
+    }
+    // 工具：先定位那条 assistant（拿它的内容要给 `output`，那在后面的 Tool 消息里）
+    let mut call_index = None;
+    for (i, m) in sess.messages.iter().enumerate() {
+        if let ChatMessage::Assistant { tool_calls, .. } = m {
+            if tool_calls.iter().any(|tc| tc.id == id) {
+                call_index = Some(i);
+                break;
+            }
+        }
+    }
+    let i = call_index?;
+    // 结果可能在它后面任意一条 Tool 消息上（一个回合的 tool 结果都在后面）
+    sess.messages[i + 1..].iter().find_map(|m| match m {
+        ChatMessage::Tool {
+            tool_call_id,
+            content,
+            ..
+        } if tool_call_id == id => Some(content.clone()),
+        _ => None,
+    })
 }
 
 /// 一条历史消息在前端视图里贡献几个 part（和 `session_view_from` 的规则一致，
@@ -1414,7 +1515,7 @@ pub fn session_patch(sess: &ChatSession, client_len: usize) -> SessionPatch {
         return SessionPatch {
             replace_from: session_view_count_before(sess, client_len),
             keep_parts: None,
-            messages: session_view_from(sess, client_len),
+            messages: session_view_from_clipped(sess, client_len, PART_PREVIEW_CHARS),
         };
     }
 
@@ -1431,13 +1532,15 @@ pub fn session_patch(sess: &ChatSession, client_len: usize) -> SessionPatch {
         return SessionPatch {
             replace_from: session_view_count_before(sess, client_len),
             keep_parts: None,
-            messages: session_view_from(sess, client_len),
+            messages: session_view_from_clipped(sess, client_len, PART_PREVIEW_CHARS),
         };
     };
 
     let keep: usize = msgs[turn_start..last].iter().map(view_parts_len).sum();
     let prior_steps = assistants.len() - 1;
-    let mut out = session_view_from(sess, last);
+    // 这条增量也截断：一个回合能长到几十步、每步一个 50KB 的 bash 输出，而用户
+    // 此刻多半并没有打开那个面板。要全文时走 `/api/part`。
+    let mut out = session_view_from_clipped(sess, last, PART_PREVIEW_CHARS);
     if let Some(head) = out.first_mut() {
         // 并进去之后它就是完整视图里那一条：id 和步数都按整条算
         head["id"] = json!(format!("a{first}"));
@@ -3711,5 +3814,102 @@ mod bench_search {
         let t = std::time::Instant::now();
         let hits = store.search("HELLO", 3, 60, |_| None);
         println!("大小写折叠  ：{:?}（{} 条）", t.elapsed(), hits.len());
+    }
+
+
+    // --- part 截断（首屏只给 400 字，点开面板再取全文） ---
+
+    /// 造一条带 reasoning + tool 的会话，正文都超过 400 字。
+    fn big_session() -> ChatSession {
+        let mut sess = ChatSession::new();
+        let reasoning = "想".repeat(1000);
+        let content = "回答".repeat(10);
+        let output = "输出行\n".repeat(2000);
+        sess.messages.push(ChatMessage::User {
+            text: "问一句".into(),
+            attachments: vec![],
+        });
+        sess.messages.push(ChatMessage::Assistant {
+            content: content.clone(),
+            reasoning: reasoning.clone(),
+            tool_calls: vec![RecordedToolCall {
+                id: "call_abc".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            }],
+            reasoning_items: vec![],
+        });
+        sess.messages.push(ChatMessage::Tool {
+            tool_call_id: "call_abc".into(),
+            content: output.clone(),
+            images: vec![],
+        });
+        sess
+    }
+
+    #[test]
+    fn 首屏那条路会截断长正文() {
+        let sess = big_session();
+        let view = session_view_from_clipped(&sess, 0, PART_PREVIEW_CHARS);
+        let parts = view[1]["parts"].as_array().expect("parts");
+        let reasoning = parts.iter().find(|p| p["type"] == "reasoning").expect("有 reasoning");
+        let tool = parts.iter().find(|p| p["type"] == "tool").expect("有 tool");
+
+        // 截断标记 + 全长都在
+        assert_eq!(reasoning["truncated"], serde_json::json!(true));
+        assert_eq!(reasoning["chars"], serde_json::json!(1000));
+        assert_eq!(tool["truncated"], serde_json::json!(true));
+        assert_eq!(tool["chars"], serde_json::json!(8000));
+
+        // 实际长度：400 字 + 一个省略号。**按字符不是按字节** —— 中文一个字 3 字节，
+        // 按字节切会把汉字劈成两半。
+        let rt = reasoning["text"].as_str().unwrap();
+        assert_eq!(rt.chars().count(), PART_PREVIEW_CHARS + 1);
+        assert!(rt.ends_with('…'));
+
+        // 短的正文不动：这条 content 只有 20 字
+        let text = parts.iter().find(|p| p["type"] == "text").expect("有 text");
+        assert!(text.get("truncated").is_none());
+        assert!(text.get("chars").is_none());
+    }
+
+    #[test]
+    fn 不截断那条路给全文() {
+        // `session_view_from`（调试脚本 / 老客户端走的）必须还是全文
+        let sess = big_session();
+        let view = session_view_from(&sess, 0);
+        let parts = view[1]["parts"].as_array().unwrap();
+        let reasoning = parts.iter().find(|p| p["type"] == "reasoning").unwrap();
+        assert!(reasoning.get("truncated").is_none());
+        assert_eq!(reasoning["text"].as_str().unwrap().chars().count(), 1000);
+    }
+
+    #[test]
+    fn 取全文两种id都认() {
+        let sess = big_session();
+        // reasoning：`r{i}`，i 是 DB 下标（这条是 messages[1]）
+        assert_eq!(part_full(&sess, "r1"), Some("想".repeat(1000)));
+        // 正文：`t{i}`
+        assert_eq!(part_full(&sess, "t1"), Some("回答".repeat(10)));
+        // 工具输出：按 tool_call_id 找，结果在后面那条 Tool 消息上
+        assert_eq!(
+            part_full(&sess, "call_abc"),
+            Some("输出行\n".repeat(2000))
+        );
+        // 不存在
+        assert_eq!(part_full(&sess, "nope"), None);
+        assert_eq!(part_full(&sess, "r99"), None);
+    }
+
+    #[test]
+    fn 补丁和首屏用同一个上限() {
+        // 增量那条路也用同一个 cap：否则刷新拿到 400 字、流式拿到全文，
+        // 用户会看到同一段思考在两个时刻长度不一样。
+        let sess = big_session();
+        let head = session_view_from_clipped(&sess, 0, PART_PREVIEW_CHARS);
+        let patch = session_patch(&sess, 0);
+        // replace_from 都是 0 时两边应该是一样的形状
+        assert_eq!(patch.replace_from, 0);
+        assert_eq!(patch.messages[1]["parts"], head[1]["parts"]);
     }
 }

@@ -309,11 +309,30 @@ export type ToolPart = {
   output?: string;
   /** 工具返回的图片（read 读到图）：沙箱里的原图路径 */
   images?: string[];
+  /**
+   * `output` 被服务端截断过（首屏只给前 400 字，见 core 的 `PART_PREVIEW_CHARS`）。
+   * 点开面板时按 `toolCallId` 走 `/api/part` 取全文。
+   *
+   * 首屏为什么要截：实测一个 10 条消息的窗口能到 190 KB，其中 reasoning 和 tool
+   * 输出占 96%，而屏幕上 reasoning 只渲染一行摘要、tool 只有一个折叠行 ——
+   * 那些字节传过来了但一个字看不见。
+   */
+  truncated?: boolean;
+  /** 截断前 `output` 的总字符数（面板里告诉用户「还有多少」） */
+  chars?: number;
 };
 
 export type Part =
   | { type: "text"; id: string; text: string }
-  | { type: "reasoning"; id: string; text: string }
+  | {
+      type: "reasoning";
+      id: string;
+      text: string;
+      /** 被截断过（首屏只给前 400 字）。面板打开时按 `id` 取全文 */
+      truncated?: boolean;
+      /** 截断前的总字符数 */
+      chars?: number;
+    }
   | ToolPart
   | { type: "data"; name: string; data: unknown }
   | { type: "error"; text: string }

@@ -84,6 +84,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(upload_attachment).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route("/api/attachment/{id}", get(get_attachment))
+        .route("/api/part", get(get_part))
         .route("/api/stop", post(stop_turn))
         .route("/api/chat", post(chat))
         .route("/api/session", get(get_session))
@@ -2356,6 +2357,57 @@ async fn get_attachment(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<St
     }
 }
 
+/// `GET /api/part?id=<part id>` → 一个 part 的**全文**。
+///
+/// 首屏那条路（`/api/session`）会把 reasoning / tool 的正文截到 400 字
+/// （见 `PART_PREVIEW_CHARS`），实测能把一份 190 KB 的窗口压到 20 KB 上下。
+/// 用户点开思考 / 工具面板时才来这里取剩下的 —— 本地回环几毫秒，用户感觉不到；
+/// 远程连的时候也只是一次几十 KB 的请求，而且只有真正点开才付。
+///
+/// `id` 就是视图里的 `r{i}` / `t{i}` / `toolCallId`：前者是 DB 下标（`i` 是
+/// `ChatMessage` 的下标），后者是工具调用自己的 id。两种都用同一条路解析 ——
+/// 反正最终都是「在那条消息里找那个字段」。
+///
+/// 走**当前活动会话**：part 的 id 只在会话内有意义，而面板只能从当前会话里点开。
+async fn get_part(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<PartQuery>,
+) -> Response {
+    let Some(id) = q.id.filter(|v| !v.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "要带 id").into_response();
+    };
+    let session_id = {
+        let store = st.chat.read().await;
+        match q.session.as_deref() {
+            Some(s) => store.get(s).map(|s| s.id.clone()),
+            None => store.active_ref().map(|s| s.id.clone()),
+        }
+    };
+    let Some(sid) = session_id else {
+        return (StatusCode::NOT_FOUND, "没有活动会话").into_response();
+    };
+    if let Err(e) = st.ensure_loaded(&sid).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("读会话失败: {e:#}")).into_response();
+    }
+    let store = st.chat.read().await;
+    let Some(sess) = store.get(&sid) else {
+        return (StatusCode::NOT_FOUND, "没有这个会话").into_response();
+    };
+    match crate::agent::part_full(sess, &id) {
+        Some(text) => Json(json!({ "text": text })).into_response(),
+        None => (StatusCode::NOT_FOUND, "没有这个 part").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PartQuery {
+    /// `r3` / `t3` / 工具调用的 id
+    id: Option<String>,
+    /// 哪个会话。不给 = 当前活动会话（面板只能从当前会话点开）
+    #[serde(default)]
+    session: Option<String>,
+}
+
 /// `POST /api/model` → 在当前 provider 内换模型（不用再传 key）。
 ///
 /// 换完自动重判视觉能力（并落盘）—— 模型能不能看图是它自己的属性。
@@ -2555,7 +2607,18 @@ async fn session_body(
     // 尾部窗口（`tail = 0` 就是整段）。起点落在回合边界上，见 `session_tail_start`。
     let start = crate::agent::session_tail_start(sess, tail);
     let from = crate::agent::session_view_count_before(sess, start);
-    let msgs = crate::agent::session_view_range(sess, start, sess.messages.len());
+    // **界面这条路截断**：reasoning / tool 正文各留 400 字，带上 `truncated` +
+    // `chars`，点开面板时走 `/api/part` 取全文。实测一个 10 条消息的窗口能到
+    // 190 KB，其中 96% 是屏幕上不显示的 reasoning / tool 输出（reasoning 只渲染
+    // 一行摘要、tool 只有一个折叠行）。截完大约 20 KB。
+    //
+    // 调试脚本要全文的那条路（`/api/debug/session`）不走这里，见它的 `full`。
+    let msgs = crate::agent::session_view_range_clipped(
+        sess,
+        start,
+        sess.messages.len(),
+        crate::agent::PART_PREVIEW_CHARS,
+    );
     drop(store);
 
     // busy 让前端知道「服务端还在跑」—— App 切到后台时 agent 不会停，

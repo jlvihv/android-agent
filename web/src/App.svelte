@@ -450,6 +450,11 @@
    * 切回去才轮到它发）。
    */
   let sessionId = $state("");
+  // `store` 里留一份只读镜像（`lib/partfull.ts` 的缓存 key 要用：`r3` 这种 part id
+  // 只在会话内有意义）。放一个 effect 比在 6 个赋值点各写一遍更不容易漏。
+  $effect(() => {
+    store.sessionId = sessionId;
+  });
 
   /**
    * 把算好的三个值写回去（`$state` 得逐个赋值才触发更新）。
@@ -578,14 +583,41 @@
     if (pending && pending.base !== windowFrom) pending = null;
   }
 
+  /**
+   * 拉会话列表。**同一个安静窗口内的重复调用并成一次。**
+   *
+   * 首屏有三个入口几乎同时要它：挂载那一轮、WS 连上、`pageshow`（后者在首次加载
+   * 时也会触发）。以前这就是三份 21 KB 同时发出去 —— 实测 26ms 和 28ms 各一份。
+   *
+   * 不在各个入口上各自判断「要不要跳过」：那种写法漏一个就又回来了（已经漏过一次）。
+   * 收敛到函数自己身上：`SESSIONS_MERGE_MS` 内已经有请求在飞，就直接复用它的结果。
+   *
+   * 会不会漏掉更新？会，但这个窗口只有 300ms，而且真正的「必须看到最新」那条路
+   * （重命名 / 删除 / 新建会话之后）都是 `await loadSessions()`，那时前一个请求
+   * 早就落地了（本地回环 1~3ms）。退一步说，列表晚 300ms 也和用户操作无关紧要。
+   */
+  const SESSIONS_MERGE_MS = 300;
+  let sessionsAt = 0;
+  let sessionsInflight: Promise<void> | null = null;
+
   async function loadSessions() {
-    try {
-      const r = await fetch("/api/sessions");
-      if (r.ok)
-        sessions = ((await r.json()) as { sessions: Session[] }).sessions ?? [];
-    } catch {
-      /* 同上 */
+    if (sessionsInflight && Date.now() - sessionsAt < SESSIONS_MERGE_MS) {
+      return sessionsInflight;
     }
+    sessionsAt = Date.now();
+    sessionsInflight = (async () => {
+      try {
+        const r = await fetch("/api/sessions");
+        if (r.ok)
+          sessions = ((await r.json()) as { sessions: Session[] }).sessions ??
+            [];
+      } catch {
+        /* 同上 */
+      } finally {
+        sessionsInflight = null;
+      }
+    })();
+    return sessionsInflight;
   }
 
   function newSession() {
@@ -652,12 +684,31 @@
   // 只在挂载时跑一次。`untrack` 不能省：`loadMessages` 在第一个 await 之前同步读了
   // `busy` / `fresh`，不包的话它们都成了这个 effect 的依赖 —— 发第一句时 `fresh`
   // 一变就多拉一次，和 `/api/chat` 赛跑。
+  //
+  // **首屏那一轮要记账**（`booted`）：下面还有三处会在挂载后紧接着触发同步
+  // （WS 连上、`pageshow`、切回前台），它们各自都是「用户回来了 / 连接恢复了，
+  // 补一次」，而首屏这一轮刚拉过 —— 不挡住就是同一份 190 KB 的历史立刻再发两遍。
+  // 实测（Lighthouse 的 network-requests）：`/api/sessions` 发两次、
+  // `/api/session` 一次在 37ms、一次在 1612ms，两次都把整窗历史拉回来。
+  let bootedAt = 0;
   $effect(() =>
     untrack(() => {
+      bootedAt = Date.now();
       void loadMessages();
       void loadSessions();
     }),
   );
+
+  /**
+   * 「刚起来这一会儿不算数」的窗口（ms）。
+   *
+   * 首屏那几个同步入口（WS 连上 / `pageshow` / `visibilitychange`）和挂载几乎是
+   * 同时到的；隔这么久之内的，认定为首屏那一轮已经覆盖，不再发。
+   * 取 1500：够覆盖连接建立 + 首屏渲染，又不会把「用户真去后台转了一圈马上回来」
+   * 这种挡掉（那本来就有各自的 `SYNC_GAP_MS` 兜着）。
+   */
+  const BOOT_GRACE_MS = 1500;
+  const justBooted = () => Date.now() - bootedAt < BOOT_GRACE_MS;
 
   // 有人在**服务端**动这个会话 → 立即对一次账。
   //
@@ -685,7 +736,11 @@
   // 沙箱钥匙），消息列表只能这里补。
   $effect(() => {
     if (!store.connected) return;
-    void untrack(() => loadMessages());
+    void untrack(() => {
+      // 首屏那一轮刚拉过就别再来一遍（这条在挂载后几毫秒就会响）
+      if (justBooted()) return;
+      void loadMessages();
+    });
   });
 
   // 切回前台 / 重新聚焦 → 同步一次。
@@ -703,6 +758,10 @@
   $effect(() => {
     const sync = () => {
       if (document.visibilityState !== "visible") return;
+      // `pageshow` 在**首次加载**时也会触发（不只是从 bfcache 恢复），而
+      // `lastSync` 初值是 0 —— 以前这条等于「挂载后立刻再拉一轮」。首屏那轮
+      // 刚拉过就跳过。
+      if (justBooted()) return;
       const now = Date.now();
       if (now - lastSync < SYNC_GAP_MS) return;
       lastSync = now;
