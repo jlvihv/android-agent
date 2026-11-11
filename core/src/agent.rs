@@ -1329,6 +1329,7 @@ pub const OUTPUT_ON_WIRE: bool = false;
 /// **57 KB**（30 条命令），比截断后的 output（29 KB）还大一倍。而屏幕上：
 ///   - 工具行只显示 `command` 的**第一行**（`summarize`）
 ///   - 参数明细只在点开面板时才看（`describeInput`）
+///
 /// 所以首屏没有任何理由把 30 条完整命令都传一遍。
 const TOOL_INPUT_PREVIEW_CHARS: usize = 2000;
 
@@ -4078,8 +4079,9 @@ mod bench_search {
             attachments: vec![],
         });
         sess.messages.push(ChatMessage::Assistant {
-            content: content.clone(),
-            reasoning: reasoning.clone(),
+            // 三个都不再用了：直接 move 进来，不用 clone
+            content,
+            reasoning,
             tool_calls: vec![RecordedToolCall {
                 id: "call_abc".into(),
                 name: "bash".into(),
@@ -4089,7 +4091,7 @@ mod bench_search {
         });
         sess.messages.push(ChatMessage::Tool {
             tool_call_id: "call_abc".into(),
-            content: output.clone(),
+            content: output,
             images: vec![],
         });
         sess
