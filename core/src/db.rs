@@ -342,16 +342,10 @@ impl Db {
 
         let store = {
             let g = &*g;
-            let active: String = g
-                .conn
-                .query_row("SELECT v FROM meta WHERE k = 'active'", [], |r| {
-                    r.get::<_, String>(0)
-                })
-                .unwrap_or_default();
-            let mut store = SessionStore {
-                active,
-                ..Default::default()
-            };
+            // 不再从库里读那个 `active`：服务端已经没有「当前会话」这个概念了
+            //（归界面的地址栏）。老库里的 `meta.active` 行留着不动 —— 它只是一
+            // 条没人读的旧数据，删它就得写一次 schema 迁移，不值当。
+            let mut store = SessionStore::default();
 
             // 用户消息条数靠 payload 的开头认：`ChatMessage` 是外部标签的枚举，
             // 用户消息序列化出来是 `{"User":…`（有测试盯着）。
@@ -376,7 +370,7 @@ impl Db {
 
             for row in rows {
                 let (id, title, created_at, updated_at, provider_session, len, users) = row?;
-                let mut s = ChatSession {
+                let s = ChatSession {
                     id,
                     title,
                     created_at: created_at.max(0) as u64,
@@ -390,14 +384,9 @@ impl Db {
                     loaded_at: None,
                     epoch: 0,
                 };
-                // 活动会话一打开就要看，直接读进来；读不出来就让它留着摘要
-                // （库里的行原样不动，换个能读的版本还能看到）
-                if s.id == store.active {
-                    match Self::messages_of(&g.conn, &s.id) {
-                        Ok(m) => s.install(m),
-                        Err(e) => tracing::warn!("会话 {} 读不出来: {e:#}", s.id),
-                    }
-                }
+                // 一条都不预读：以前会把「活动会话」直接读进内存（用户一打开就
+                // 能看到），现在没有「活动会话」了，谁被打开谁再 `ensure_loaded`。
+                // 冷启动落在空对话，本来也不需要预读。
                 store.sessions.push(s);
             }
             store
@@ -409,7 +398,7 @@ impl Db {
         for s in &store.sessions {
             g.saved.insert(s.id.clone(), Saved::of(s));
         }
-        g.saved_active = Some(store.active.clone());
+        g.saved_active = None;
 
         Ok(store)
     }
@@ -507,8 +496,8 @@ impl Db {
             .filter(|id| !keep.iter().any(|s| &s.id == *id))
             .cloned()
             .collect();
-        let active = (g.saved_active.as_deref() != Some(store.active.as_str()))
-            .then(|| store.active.clone());
+        // 不再往库里写「当前会话」（服务端没这个概念了）。见 `load` 那段。
+        let active: Option<String> = None;
 
         let mut sessions = Vec::new();
         for s in keep {
@@ -1251,7 +1240,7 @@ mod tests {
 
         let back = db.load().unwrap();
         assert_eq!(back.sessions.len(), 2);
-        assert_eq!(back.active, st.active);
+        // 不再有「当前会话」：读回来的就是纯会话列表（见 `SessionStore` 的注释）
         let s0 = back.sessions.iter().find(|s| s.title == "会话0").unwrap();
         assert_eq!(db.load_messages(&s0.id).unwrap().len(), 3);
     }
@@ -1288,7 +1277,14 @@ mod tests {
         db.sync(&st).unwrap();
 
         let back = db.load().unwrap();
-        let msgs = &back.sessions[0].messages;
+        // `load()` 只回会话头 + 摘要，**不预读任何一条会话的消息**（以前会把
+        // 「活动会话」读进来；现在没有「活动会话」了 —— 谁被打开谁再按需读）。
+        assert_eq!(
+            back.sessions[0].message_count(),
+            1,
+            "摘要里的条数得是清空后的 1"
+        );
+        let msgs = db.load_messages(&back.sessions[0].id).unwrap();
         assert_eq!(msgs.len(), 1, "旧消息不该回来");
         match &msgs[0] {
             ChatMessage::User { text: t, .. } => assert_eq!(t, "清空后第一条"),

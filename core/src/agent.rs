@@ -539,31 +539,22 @@ fn exact_fold_find(text: &str, needle: &str) -> Option<(usize, usize)> {
 }
 
 /// 多个会话。侧边栏的「最近对话」/ 搜索结果都从它来。
+///
+/// **没有 `active` 字段**（2026-11 删的）。「用户眼前看的是哪条会话」归界面管
+/// （地址栏 `/s/<id>`），服务端不该存一份自己的答案 —— 以前那份 `active` 会跟
+/// 前端打架：多端同时开着时互相抢，`agentctl` 还得手动把用户那条切回去。
+///
+/// 现在需要「不指定 id 时用哪条」的地方（`agentctl --session active`、
+/// `/api/reset`、`/api/debug/request`、以及下次启动恢复现场）统一走
+/// `AppState::last_session`，那是一份**纯提示**：可以被显式写，但任何操作都
+/// 不会顺手改它。
 #[derive(Default, Serialize, Deserialize)]
 pub struct SessionStore {
     pub sessions: Vec<ChatSession>,
-    pub active: String,
 }
 
 impl SessionStore {
     /// 当前会话，没有就建一个
-    pub fn active_mut(&mut self) -> &mut ChatSession {
-        if self.sessions.is_empty() {
-            let s = ChatSession::new();
-            self.active = s.id.clone();
-            self.sessions.push(s);
-        }
-        if !self.sessions.iter().any(|s| s.id == self.active) {
-            self.active = self.sessions[0].id.clone();
-        }
-        let id = self.active.clone();
-        self.sessions.iter_mut().find(|s| s.id == id).unwrap()
-    }
-
-    pub fn active_ref(&self) -> Option<&ChatSession> {
-        self.sessions.iter().find(|s| s.id == self.active)
-    }
-
     pub fn get(&self, id: &str) -> Option<&ChatSession> {
         self.sessions.iter().find(|s| s.id == id)
     }
@@ -572,35 +563,18 @@ impl SessionStore {
         self.sessions.iter_mut().find(|s| s.id == id)
     }
 
+    /// 建一条空会话，返回它的 id。**不改任何「当前会话」**（见上面的说明）。
     pub fn create(&mut self) -> String {
         let s = ChatSession::new();
         let id = s.id.clone();
         self.sessions.push(s);
-        self.active = id.clone();
         id
-    }
-
-    pub fn activate(&mut self, id: &str) -> bool {
-        if self.sessions.iter().any(|s| s.id == id) {
-            self.active = id.to_string();
-            true
-        } else {
-            false
-        }
     }
 
     /// 删掉并交还这个会话（调用方要清它引用的文件）。
     pub fn delete(&mut self, id: &str) -> Option<ChatSession> {
         let at = self.sessions.iter().position(|s| s.id == id);
-        let gone = at.map(|i| self.sessions.remove(i));
-        if self.active == id {
-            self.active = self
-                .sessions
-                .first()
-                .map(|s| s.id.clone())
-                .unwrap_or_default();
-        }
-        gone
+        at.map(|i| self.sessions.remove(i))
     }
 
     /// 给侧边栏用的列表，**按创建时间**排（新建的在最上面）。
@@ -612,7 +586,7 @@ impl SessionStore {
     /// **空会话不进列表**：前端点「新对话」不同，那是本地清空视图、服务端
     /// 到第一句话才建会话（见 `POST /api/chat` 的 `fresh`）。这里是兜底 ——
     /// 调试端/CLI 直接 `POST /api/sessions` 建的、`/api/reset` 清空后的、
-    /// 以及启动时 `active_mut()` 顺手建的，都是没内容的，不该在抽屉里占位。
+    /// 以及 `/api/reset` 清空后的，都是没内容的，不该在抽屉里占位。
     pub fn list(&self) -> Vec<Value> {
         self.list_page(None, 0).0
     }
@@ -662,7 +636,6 @@ impl SessionStore {
                 json!({
                     "id": s.id,
                     "title": if s.title.is_empty() { "新对话" } else { &s.title },
-                    "active": s.id == self.active,
                     "updatedAt": s.updated_at,
                     "count": s.user_count(),
                 })
@@ -715,7 +688,6 @@ impl SessionStore {
                 out.push(json!({
                     "id": s.id,
                     "title": if s.title.is_empty() { "新对话" } else { &s.title },
-                    "active": s.id == self.active,
                     "role": role,
                     "snippet": snippet,
                     "updatedAt": s.updated_at,
@@ -1870,8 +1842,8 @@ async fn turn_once(
 
 /// 往本回合所属的会话追加一条消息。
 ///
-/// **按 id 找，不用 `active_mut()`**：回合跑在后台，用户随时可能在侧边栏
-/// 切到别的会话或新建会话 —— 之前全用 active_mut()，切走之后模型的回复
+/// **按 id 找**：回合跑在后台，用户随时可能在侧边栏切到别的会话或新建会话
+/// —— 以前用「当前会话」去找，切走之后模型的回复
 /// 和工具结果就写进了**另一个**会话，两边都坏掉。
 /// 会话中途被删了就丢掉（下一步 stream_one 会报错停下）。
 async fn append(core: &Core, sid: &str, m: ChatMessage) {
@@ -3601,7 +3573,8 @@ mod tests {
     #[test]
     fn search_reports_hits_with_role_and_respects_limits() {
         let mut store = SessionStore::default();
-        let s = store.active_mut();
+        let id = store.create();
+        let s = store.get_mut(&id).unwrap();
         s.messages.push(ChatMessage::user("找一个 needle 吧"));
         s.messages.push(ChatMessage::Assistant {
             content: "这里也有 needle".into(),
@@ -4015,7 +3988,8 @@ mod bench_search {
         let unit = "这是一段中文回复，在真实历史里通常是几百字到几千字不等。".repeat(10);
         let n = 40 * 1024 * 1024 / unit.len();
         let mut store = SessionStore::default();
-        let s = store.active_mut();
+        let id = store.create();
+        let s = store.get_mut(&id).unwrap();
         s.messages.reserve(n);
         for i in 0..n {
             if i % 2 == 0 {

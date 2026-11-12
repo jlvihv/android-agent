@@ -1685,15 +1685,25 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     // 运行时配置优先（安卓），回退环境变量（桌面）
     let provider = if body.demo { None } else { st.llm() };
 
-    // 写进哪个会话：指定的 > 当前活动的（脚本 / agentctl 不指定）。
+    // 写进哪个会话：**必须指定**。
+    //
+    // 以前不指定就写进服务端的 `active` —— 那份状态被任何操作顺手改（新建、
+    // 删除、切换），等于服务端替用户记着「他现在在哪」，多端一开就互相打架。
+    // 现在「用户在看哪条」只由前端的地址栏决定，请求里带过来。
     let sid = {
-        let mut store = st.chat.write().await;
+        let store = st.chat.read().await;
         match &body.session {
             Some(id) if store.get(id).is_some() => id.clone(),
             Some(id) => {
                 return (StatusCode::NOT_FOUND, format!("没有这个会话: {id}")).into_response()
             }
-            None => store.active_mut().id.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "要带 session：服务端不再有「当前会话」这个概念",
+                )
+                    .into_response()
+            }
         }
     };
 
@@ -1987,13 +1997,14 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
 /// agent loop 没有轮数上限，前端那个「停止」按钮必须真的把服务端循环停下来，
 /// 而不只是断开 SSE（循环看不到断连，会继续跑、继续烧 token）。
 async fn stop_turn(State(st): State<Arc<AppState>>, body: Option<Json<StopBody>>) -> Response {
-    // 不指定会话 = 当前活动会话（调试脚本 / agentctl）
-    let sid = match body.and_then(|Json(b)| b.session) {
-        Some(id) => id,
-        None => match st.chat.read().await.active_ref() {
-            Some(s) => s.id.clone(),
-            None => return Json(json!({ "ok": true, "running": false })).into_response(),
-        },
+    // **必须带 session**：服务端不再有「当前会话」（见 `POST /api/chat` 那段）。
+    // 前端总是知道自己停的是哪一条 —— 它连着那条流。
+    let Some(sid) = body.and_then(|Json(b)| b.session) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "要带 session：服务端不再有「当前会话」这个概念",
+        )
+            .into_response();
     };
     let running = st.request_abort(&sid);
     if running {
@@ -2376,15 +2387,14 @@ async fn get_part(State(st): State<Arc<AppState>>, Query(q): Query<PartQuery>) -
     let Some(id) = q.id.filter(|v| !v.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "要带 id").into_response();
     };
-    let session_id = {
+    // **必须带 session**：part id（`r3` / `t3`）只在会话内有意义，而服务端
+    // 不再有「当前会话」可供兜底（见 `POST /api/chat` 那段）。
+    let sid = {
         let store = st.chat.read().await;
-        match q.session.as_deref() {
-            Some(s) => store.get(s).map(|s| s.id.clone()),
-            None => store.active_ref().map(|s| s.id.clone()),
-        }
+        q.session.as_deref().and_then(|s| store.get(s)).map(|s| s.id.clone())
     };
-    let Some(sid) = session_id else {
-        return (StatusCode::NOT_FOUND, "没有活动会话").into_response();
+    let Some(sid) = sid else {
+        return (StatusCode::NOT_FOUND, "没有这个会话（要带 session）").into_response();
     };
     if let Err(e) = st.ensure_loaded(&sid).await {
         return (
@@ -2479,24 +2489,25 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
 async fn get_session(
     State(st): State<Arc<AppState>>,
     Query(q): Query<SessionQuery>,
-) -> impl IntoResponse {
-    // 不指定 = 当前活动会话（界面）；调试脚本指定自己那条调试会话
+) -> Response {
+    // **必须带 id**：服务端不再有「当前会话」这个概念 —— 前端手里一直有 id
+    //（地址栏 `/s/<id>`），带过来就行。`sessionId` 为空的那一小段（刚点「新对话」、
+    // 还没建）前端本来也不会来问。
     let id = {
         let store = st.chat.read().await;
-        match q.id.as_deref() {
-            Some(id) => store.get(id).map(|s| s.id.clone()),
-            None => store.active_ref().map(|s| s.id.clone()),
-        }
+        q.id.as_deref().and_then(|id| store.get(id)).map(|s| s.id.clone())
     };
     let Some(id) = id else {
-        return Json(json!({
-            "messages": [], "queued": [], "rev": "", "busy": false, "from": 0, "hasMore": false
-        }));
+        return (
+            StatusCode::BAD_REQUEST,
+            "要带 id：服务端不再有「当前会话」这个概念",
+        )
+            .into_response();
     };
 
     // 往前翻一页（用户往上滚）：只要那一窗消息
     if let Some(before) = q.before {
-        return Json(session_page_body(&st, &id, before, q.window()).await);
+        return Json(session_page_body(&st, &id, before, q.window()).await).into_response();
     }
 
     let mut v = session_body(&st, &id, &q.rev, q.tail.unwrap_or(0), q.from).await;
@@ -2509,7 +2520,7 @@ async fn get_session(
             v["turnError"] = json!(e);
         }
     }
-    Json(v)
+    Json(v).into_response()
 }
 
 /// 往前翻一页的正文（`?before=<from>`）：`before` 是客户端手上那窗的起点。
@@ -2649,12 +2660,19 @@ fn parse_rev(rev: &str) -> Option<(&str, usize)> {
     Some((id, len))
 }
 
+/// `GET /api/debug/request?session=<id>` 的参数
+#[derive(Deserialize)]
+struct DebugReqQuery {
+    #[serde(default)]
+    session: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct SessionQuery {
     /// 客户端上次拿到的版本号。空 = 全量要一份。
     #[serde(default)]
     rev: String,
-    /// 要哪个会话。不给 = 当前活动会话。
+    /// 要哪个会话。**必填**（服务端没有「当前会话」了）。
     #[serde(default)]
     id: Option<String>,
     /// 只给最后 `tail` 条视图消息（`0` / 不给 = 整段）。界面首屏就带它。
@@ -2704,13 +2722,6 @@ async fn debug_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         let store = st.chat.read().await;
         json!({
             "count": store.sessions.len(),
-            "active": store.active_ref().map(|s| json!({
-                "id": s.id,
-                "title": if s.title.is_empty() { "新对话" } else { &s.title },
-                "messages": s.message_count(),
-                "resident": s.resident(),
-                "rev": session_rev(s),
-            })),
         })
     };
 
@@ -2772,23 +2783,36 @@ fn memory_json() -> Value {
 ///
 /// 说是「预测」是因为真的发的时候，历史里可能先补上一条新的系统提示词
 /// （`ensure_system_prompt`）—— 这里也照做，所以和实际发送一致。
-async fn debug_request(State(st): State<Arc<AppState>>) -> Response {
+async fn debug_request(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<DebugReqQuery>,
+) -> Response {
     let Some(p) = st.llm() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "未配置 LLM provider").into_response();
     };
 
-    let active = st.chat.read().await.active_ref().map(|s| s.id.clone());
-    if let Some(id) = &active {
-        if let Err(e) = st.ensure_loaded(id).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
-        }
+    // **要带 session**：服务端没有「当前会话」了（见 `POST /api/chat` 那段）。
+    // 调提示词的人（`agentctl`）本来就知道自己在看哪条。
+    let Some(sid) = q.session.filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "要带 session：服务端不再有「当前会话」这个概念",
+        )
+            .into_response();
+    };
+    let exists = st.chat.read().await.get(&sid).is_some();
+    if !exists {
+        return (StatusCode::NOT_FOUND, format!("没有这个会话: {sid}")).into_response();
+    }
+    if let Err(e) = st.ensure_loaded(&sid).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
     }
     let mut sess = {
         let store = st.chat.read().await;
-        match store.active_ref() {
-            // 拷一份：不想持着锁做拼装，而这是手动的调试接口，不在乎这点开销
+        // 拷一份：不想持着锁做拼装，而这是手动的调试接口，不在乎这点开销
+        match store.get(&sid) {
             Some(s) => s.clone(),
-            None => return (StatusCode::NOT_FOUND, "没有活跃会话").into_response(),
+            None => return (StatusCode::NOT_FOUND, "没有这个会话").into_response(),
         }
     };
     crate::agent::ensure_system_prompt(&mut sess, &st.system_prompt());
@@ -2965,29 +2989,11 @@ async fn search_sessions(
 
 /// `POST /api/sessions` → 新建会话
 ///
-/// **不再顺手把它设成服务端的 `active`。**
-///
-/// `active` 是「不指定 id 时用哪条」的默认值（给 `agentctl` / 调试脚本用，
-/// 以及下次启动时恢复现场）。而「用户现在打开的是哪条」是界面的事 —— 由地址栏
-///（`/s/<id>`）决定，服务端不该被一条「新建会话」的请求顺手改动。
-///
-/// 以前会改，代价是 `agentctl` 里得专门加一段「建了调试会话之后把用户原来那条
-/// 切回去」（见 `scripts/agentctl.py` 的 `pick_target`）。现在不用了。
-///
-/// `SessionStore::create()` 本身还是会把 active 指向新的那条（那是它在库内部的
-/// 语义），所以这里显式还原。
+/// 只是建一条空会话并回它的 id。**不动任何「当前会话」** —— 服务端已经没有那个
+/// 概念了（见 `SessionStore` 的注释）。
 async fn new_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let mut store = st.chat.write().await;
-    let prev = store.active.clone();
     let id = store.create();
-    // 还原：新建不该改「默认会话」
-    store.active = prev;
-    // 还原之后那个 id 可能指向一条已经不存在的会话（库是空的）
-    if !store.sessions.iter().any(|s| s.id == store.active) {
-        if let Some(first) = store.sessions.first() {
-            store.active = first.id.clone();
-        }
-    }
     drop(store);
     st.mark_sessions_dirty();
     Json(json!({ "id": id }))
@@ -3043,9 +3049,16 @@ async fn unqueue(State(st): State<Arc<AppState>>, Json(body): Json<UnqueueBody>)
     Json(json!({ "ok": true, "removed": removed })).into_response()
 }
 
-/// `POST /api/reset` → 清空会话历史。
-async fn reset(State(st): State<Arc<AppState>>) -> Response {
-    match st.reset_active().await {
+/// `POST /api/reset?session=<id>` → 清空一条会话的历史。
+///
+/// **要带 session**：服务端没有「当前会话」了，所以「清空我正看着的那条」
+/// 这句话得由调用方说清楚是哪条。
+async fn reset(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<DebugReqQuery>,
+) -> Response {
+    let sid = q.session.unwrap_or_default();
+    match st.reset_session(&sid).await {
         Ok(()) => {
             st.log("info", "会话已清空");
             StatusCode::NO_CONTENT.into_response()

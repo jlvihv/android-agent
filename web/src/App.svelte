@@ -316,6 +316,8 @@
     // 而请求在路上时用户可能往上翻了一页（数组前面多了一段）—— 下标就不作数了。
     const winAt = windowFrom;
     try {
+      const sid0 = sessionId;
+      if (!sid0) return; // 没 id 就没有「当前会话」可拉（服务端也不猜了）
       const d = await api<
         SessionPayload & {
           // 窗口那几件（`messages` / `from` / `hasMore` / `append` / `replaceFrom` /
@@ -338,8 +340,8 @@
         // 不能靠服务端那个 `active` —— 别的客户端 / 调试脚本随时会把它改掉。
         // 手上还没有 id 时才不带（首屏、刚点新对话），那时服务端回的是它认为的
         // 当前会话，我们随后把它写进地址栏（见下面的 `syncUrl`）。
-        `/api/session?${sessionId ? `id=${encodeURIComponent(sessionId)}&` : ""}` +
-          `rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
+        `/api/session?id=${encodeURIComponent(sid0)}` +
+          `&rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
       );
       // 请求在路上的时候本地发了一条（`send`）：这份是发之前的样子，拿它整份
       // 覆盖会把刚推进去的用户消息和正在流的那条助手消息冲掉 —— 流接着往一个
@@ -354,7 +356,7 @@
       // `rev`（那是消息的版本号），光看 rev 看不出「排队里少了一条」。
       // `pending` 的那几条是刚发出去、还没听到回话的，留着 —— 服务端下一份就会
       // 报上它们（或者它们已经开跑了）。
-      const sid = d.session ?? sessionId;
+      const sid = d.session ?? sid0;
       if (d.queued) {
         // 只换**这个**会话的那几条：别的会话的排队项留着（切回去之前不会再拉它们）。
         // 名字别叫 `inflight` —— 那是「这一份 /api/session 在不在路上」的门。
@@ -395,10 +397,6 @@
         setWindow(applyWindow({ messages, windowFrom }, d, same));
       }
       if (d.turnError) showTurnError(d.turnError);
-      // 地址栏是这个状态的**唯一真相**：服务端告诉了我们是哪条（首屏 / 地址里
-      // 没带 id 时），安静地补进地址（`replace`，不在历史里留一格）。
-      // 之后换会话走 `switchSession` 的 `push`。
-      if (sid) syncUrl(sid, true);
       sessionId = sid;
     } catch {
       /* 拉不到就算了 */
@@ -818,14 +816,17 @@
   $effect(() =>
     untrack(() => {
       bootedAt = Date.now();
-      // 地址栏里带了 `/s/<id>` 就认它（刷新 / 分享 / 从历史里回来都走这条）；
-      // 没带（`/`）就让 `loadMessages` 去问服务端的默认值，回来时补进地址。
+      // 地址栏里带了 `/s/<id>` 就认它（刷新 / 分享 / 从历史里回来都走这条）。
       //
-      // 这里先填 `sessionId` 很要紧：`loadMessages` 用它拼 `?id=`，也就决定了
-      // 首屏拉的是**地址里那条**而不是服务端 active 那条。
+      // **没带（`/`）= 空对话**：冷启动就该是「来思考些什么?」，不是把上次那条
+      // 翻出来。「上次看的是哪条」这个东西服务端根本不存（见 core 的
+      // `SessionStore` 注释），前端也不往 localStorage 里放 —— 这个 App 一直
+      // 守着「不往本地存东西」那条线。
       const fromUrl = sessionFromPath();
-      if (fromUrl) sessionId = fromUrl;
-      void loadMessages();
+      if (fromUrl) {
+        sessionId = fromUrl;
+        void loadMessages();
+      }
       void loadSessions();
     }),
   );
@@ -1110,6 +1111,11 @@
       view = { k: "idle" };
       sessionId = id;
       rev = "";
+      // 服务端刚建出来的会话：**换地址**（`replace`，不是 `push`）——
+      // 用户点「新对话」那一下不该在历史里留一格「空对话」，否则从新会话
+      // 按一次后退会退到另一个空对话，看着像没反应。
+      // 之后在抽屉里切会话才 `push`（见 `switchSession`）。
+      syncUrl(id, true);
       return id;
     } catch {
       return null;
@@ -1257,11 +1263,12 @@
     // 服务端循环看不到 SSE 断连（tx.send 失败会被忽略），得显式告诉它停。
     // 否则前端显示停了，agent 还在后台一轮轮跑工具、烧 token。
     // 只停**这个**会话的回合：别的会话在跑的不受影响。
-    void post("/api/stop", sessionId ? { session: sessionId } : {}).catch(
-      () => {
+    // 没有会话 id 就没有回合可停（新对话、还没发第一句）——
+    // 服务端现在**要求**带 session，所以别发那个必然 400 的请求。
+    if (sessionId)
+      void post("/api/stop", { session: sessionId }).catch(() => {
         /* 停不下来也得把本地的流断掉（下面照样 abort） */
-      },
-    );
+      });
     const r = view.k === "live" ? view.run : null;
     // 点了停止：先按「没在跑」画出来（服务端那边 300ms 内会确认），
     // 拉回来的那份要是还在跑，`loadMessages` 会再翻成 `remote`

@@ -49,14 +49,14 @@ export async function partFull(id: string, session: string): Promise<PartFull> {
   const running = inflight.get(k);
   if (running) return running;
 
-  // **不带空 session**：服务端把「给了 session 但查不到」当成 404，而空串就是
-  // 查不到（首屏刚起来、`App` 还没拿到会话 id 时就会踩到，表现为面板一直
-  // 「载入全文…」）。空着时退回服务端的「当前活动会话」—— 那正是用户点开面板时
-  // 所在的那个。
+  // `session` 现在是**必填**：服务端没有「当前会话」可以兜底了（见 core 的
+  // `SessionStore` 注释），而 part id（`r3`）离开会话就没有意义。
+  // 真为空（理论上到不了：面板是从消息里点开的，那时一定有会话）就返回空对象，
+  // 让面板显示截断的那份，别发一个必然 400 的请求。
   const p = (async (): Promise<PartFull> => {
     try {
-      const qs = new URLSearchParams({ id });
-      if (session) qs.set("session", session);
+      if (!session) return {};
+      const qs = new URLSearchParams({ id, session });
       const r = await fetch(`/api/part?${qs}`);
       if (!r.ok) return {};
       const d = (await r.json()) as PartFull;

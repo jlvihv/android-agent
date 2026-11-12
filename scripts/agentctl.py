@@ -348,7 +348,9 @@ class Transcript:
 # 消息会被追加进用户正在聊的会话里。
 SCRATCH = "调试（agentctl）"
 
-# None = 用服务端的当前活动会话（前端的默认行为）
+# **永远是一条具体的会话 id**（不再有 None = 「服务端当前会话」那回事了）。
+# 服务端没有「用户在看哪条」这个概念 —— 那归 App 的地址栏（见 core 的
+# `SessionStore` 注释）。所以脚本必须自己说清楚往哪条写。
 TARGET: str | None = None
 
 
@@ -361,12 +363,14 @@ def pick_session(which: str) -> None:
     """
     global TARGET
     if which == "active":
-        print(c(WARN, "⚠ --session active：会写进你当前打开的那条会话"), file=sys.stderr)
-        TARGET = None
-        return
+        # `--session active` 已经没有意义了：服务端不记「用户打开的是哪条」
+        # （那归 App 的地址栏，脚本看不见）。说清楚，然后退回调试会话。
+        print(
+            c(WARN, "⚠ --session active 不再支持（服务端没有「当前会话」了）—— 用调试会话"),
+            file=sys.stderr,
+        )
+        which = "scratch"
     if which not in ("", "scratch"):
-        # 显式给了 id 就**不动**活动会话 —— run_turn 是按 id 找会话的，
-        # 没必要顺手把用户正开着的那条切走。（要切用 /use）
         TARGET = which
         return
 
@@ -384,8 +388,7 @@ def pick_session(which: str) -> None:
     # 再切回去，现在不用了。
     code, d = call("POST", "/api/sessions")
     if code != 200 or not isinstance(d, dict):
-        print(c(WARN, f"建不了调试会话（{code}），改写到当前活动会话"), file=sys.stderr)
-        TARGET = None
+        print(c(BAD, f"建不了调试会话（{code}）：{d}"), file=sys.stderr)
         return
     sid = str(d.get("id"))
     call("POST", "/api/sessions/rename", {"id": sid, "title": SCRATCH})
@@ -396,7 +399,7 @@ def pick_session(which: str) -> None:
 
 def session_note() -> str:
     if TARGET is None:
-        return c(WARN, "写进当前活动会话")
+        return c(WARN, "还没定会话")
     return c(DIM, f"会话 {TARGET}")
 
 
@@ -411,7 +414,9 @@ def wait_until_idle(timeout: float = 1800.0) -> dict | None:
     「进行中」是按会话记的（几个会话可以同时各跑一个），所以要问**自己那条**
     会话 —— 不带 id 问到的是用户当前打开的那条。
     """
-    path = "/api/session" + (f"?id={TARGET}" if TARGET else "")
+    if not TARGET:
+        return None
+    path = f"/api/session?id={urllib.parse.quote(TARGET)}"
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -445,9 +450,10 @@ def do_turn(prompt: str, as_json: bool) -> int:
         print(c(DIM, "── 用户 ──"))
         print(prompt)
         print(c(DIM, "── agent ──"))
-    body: dict = {"text": prompt}
-    if TARGET:
-        body["session"] = TARGET
+    if not TARGET:
+        print(c(BAD, "没有目标会话（先 --session scratch，或给一个 id）"), file=sys.stderr)
+        return 2
+    body: dict = {"text": prompt, "session": TARGET}
     dropped = False
     try:
         for ch in sse("/api/chat", body, timeout=TIMEOUT):
@@ -498,8 +504,9 @@ HELP = f"""
   /prompt -              从 stdin 读到 EOF（heredoc 好用）
   /prompt!               恢复成编译进去的那版
   /new                   新建会话      /use <id>   切会话     /clear  清空当前会话
-                         （默认写进「调试（agentctl）」那条会话，不动你正在聊的；
-                           /use active 改成写进当前活动会话）
+                         （默认写进「调试（agentctl）」那条会话，不动你正在聊的。
+                           服务端没有「当前会话」这个概念 —— 那归 App 的地址栏，
+                           所以 /clear 和 /use 都得说清楚是哪条）
 
 {c('1', '直连（绕过模型）')}
   /bash [--timeout 秒] <命令>   在沙箱里跑命令（/api/linux）
@@ -519,7 +526,10 @@ def print_state() -> None:
 
 
 def print_request(raw: bool) -> None:
-    code, d = call("GET", "/api/debug/request")
+    if not TARGET:
+        print(c(BAD, "还没定会话"))
+        return
+    code, d = call("GET", f"/api/debug/request?session={urllib.parse.quote(TARGET)}")
     if code != 200:
         print(c(BAD, f"失败 {code}: {d}"))
         return
@@ -784,8 +794,10 @@ def handle_command(line: str) -> bool:
     elif cmd == "/use":
         global TARGET
         if rest == "active":
-            TARGET = None
-            print(c(WARN, "改成写进当前活动会话"))
+            print(
+                c(WARN, "「当前活动会话」没有了（服务端不记这个了）—— 给个具体 id"),
+                file=sys.stderr,
+            )
         else:
             # **只改本进程的目标**：以前这里还会 `POST /api/sessions/activate`
             # 把服务端的默认会话也切过去 —— 等于从命令行把用户 App 里打开的
@@ -802,8 +814,13 @@ def handle_command(line: str) -> bool:
             else:
                 print(c(BAD, f"失败 {code}: {d}"))
     elif cmd == "/clear":
-        code, _ = call("POST", "/api/reset")
-        print(c(OK, "当前会话已清空") if code == 204 else c(BAD, f"失败 {code}"))
+        if not TARGET:
+            print(c(BAD, "还没定会话"))
+        else:
+            code, _ = call(
+                "POST", f"/api/reset?session={urllib.parse.quote(TARGET)}"
+            )
+            print(c(OK, "会话已清空") if code == 204 else c(BAD, f"失败 {code}"))
     elif cmd == "/wait":
         d = wait_until_idle()
         print_server_view(d)

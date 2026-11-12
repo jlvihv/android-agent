@@ -486,8 +486,8 @@ impl AgentCore {
         self.core.push_log(&level, &msg);
     }
 
-    /// 清空会话历史
-    pub fn reset_session(&self) {
-        self.core.reset_session();
+    /// 清空**指定**会话的历史（要带 id：服务端没有「当前会话」这个概念了）
+    pub fn reset_session(&self, id: String) {
+        self.core.reset_session(&id);
     }
 }

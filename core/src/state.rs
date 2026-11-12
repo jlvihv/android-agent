@@ -684,12 +684,11 @@ impl AppState {
         let Ok(mut store) = self.chat.try_write() else {
             return 0;
         };
-        let active = store.active.clone();
+        // 不保任何一条：服务端没有「用户正看着哪条」的概念了（那归地址栏）。
+        // 清退之后下次被打开会从库里重新读回来，只是多一次 IO。
         let mut n = 0;
         for s in &mut store.sessions {
-            let idle = s.resident()
-                && s.has_content()
-                && s.id != active
+            let idle = s.resident() && s.has_content()
                 && !busy.contains(&s.id)
                 && s.loaded_at.is_none_or(|t| t.elapsed() >= KEEP_FOR);
             if idle && db.is_synced(s) {
@@ -717,21 +716,24 @@ impl AppState {
         }
     }
 
-    /// 清空当前会话（`/api/reset`）。有回合在跑就拒绝：回合跑到一半把历史
+    /// 清空一条会话的历史（`/api/reset`）。有回合在跑就拒绝：回合跑到一半把历史
     /// 抽空，后面追加进来的工具结果就没有对应的调用了，这条会话从此每次都 400。
-    pub async fn reset_active(&self) -> Result<(), &'static str> {
-        let Some(id) = self.chat.read().await.active_ref().map(|s| s.id.clone()) else {
-            return Ok(());
-        };
+    ///
+    /// **必须给 id**：服务端没有「当前会话」这个概念了（见 `SessionStore` 的注释），
+    /// 所以不存在「清空我正看着的那条」—— 调用方（`agentctl /clear`）得说是哪条。
+    pub async fn reset_session(&self, id: &str) -> Result<(), &'static str> {
+        if id.is_empty() {
+            return Err("要带 id：服务端不再有「当前会话」这个概念");
+        }
         // 读进来只是为了知道要清哪些文件；读不出来也照样清空
-        let _ = self.ensure_loaded(&id).await;
+        let _ = self.ensure_loaded(id).await;
         let old = {
             let mut store = self.chat.write().await;
             // 在会话锁里判断：拿着锁的这段时间，新回合碰不到这条历史
-            if self.is_busy(&id) {
+            if self.is_busy(id) {
                 return Err("这个会话还有回合在运行，先停止它或等它结束");
             }
-            let Some(s) = store.get_mut(&id) else {
+            let Some(s) = store.get_mut(id) else {
                 return Ok(());
             };
             let old = std::mem::take(&mut s.messages);
@@ -740,7 +742,7 @@ impl AppState {
         };
         self.mark_sessions_dirty();
         // 历史清空了，用量里那个「当前上下文」也就不成立了
-        self.clear_usage(&id);
+        self.clear_usage(id);
         let mut gone = crate::agent::ChatSession::new();
         gone.messages = old;
         self.forget_files(gone).await;

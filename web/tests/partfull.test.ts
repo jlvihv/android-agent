@@ -61,9 +61,10 @@ describe("partFull", () => {
     expect(calls).toHaveLength(1);
   });
 
-  test("空会话：请求上不带 session（服务端按当前活动会话答）", async () => {
+  test("空会话：根本不发请求（服务端没有「当前会话」可兜底了）", async () => {
     stub();
-    await partFull("r1", "");
-    expect(calls[0]).not.toContain("session=");
+    const got = await partFull("r1", "");
+    expect(got).toEqual({});
+    expect(calls).toHaveLength(0);
   });
 });

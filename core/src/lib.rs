@@ -373,13 +373,20 @@ impl Core {
         self.state.set_linux(Arc::new(sb));
     }
 
-    /// 清空当前会话的历史。有回合在跑就不清（见 `AppState::reset_active`）。
-    pub fn reset_session(&self) {
+    /// 清空**指定**会话的历史。有回合在跑就不清（见 `AppState::reset_session`）。
+    ///
+    /// 要带 `id`：服务端没有「当前会话」这个概念了（那归界面 / 地址栏）。
+    pub fn reset_session(&self, id: &str) {
+        if id.is_empty() {
+            self.push_log("warn", "reset_session 要带 id");
+            return;
+        }
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 let st = self.state.clone();
+                let id = id.to_string();
                 h.spawn(async move {
-                    match st.reset_active().await {
+                    match st.reset_session(&id).await {
                         Ok(()) => st.log("info", "会话已清空"),
                         Err(why) => st.log("warn", why),
                     }
@@ -391,12 +398,13 @@ impl Core {
                 let Ok(mut store) = self.state.chat.try_write() else {
                     return;
                 };
-                let sid = store.active_mut().id.clone();
-                if self.state.is_busy(&sid) {
+                if self.state.is_busy(id) {
                     self.push_log("warn", "这个会话还有回合在运行，没有清空");
                     return;
                 }
-                store.active_mut().clear();
+                if let Some(s) = store.get_mut(id) {
+                    s.clear();
+                }
                 drop(store);
                 self.state.mark_sessions_dirty();
                 self.push_log("info", "会话已清空");
