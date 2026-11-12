@@ -22,7 +22,6 @@ function msg(i: number, parts?: Part[]): Message {
   return {
     id: `${role === "user" ? "u" : "a"}${i}`,
     role,
-    steps: 1,
     done: true,
     parts: parts ?? [{ type: "text", id: `t${i}`, text: `第 ${i} 条` }],
   };
@@ -339,5 +338,47 @@ describe("不变式：翻页 + 补丁之后手上始终是完整视图的一段"
       hasMore: true,
     });
     expect(page?.messages).toEqual(all.slice(w.windowFrom - 10));
+  });
+});
+
+describe("applyPatch 是纯的（不改手上那份 /api/session 回包）", () => {
+  test("keepParts 那一支不能把 d.messages[0] 原地换掉", () => {
+    const w = win(full(2), 0);
+    const fresh = msg(1, [{ type: "text", id: "t-new", text: "新" }]);
+    const payload = {
+      append: true,
+      replaceFrom: 1,
+      keepParts: 1,
+      messages: [fresh],
+    };
+    const before = structuredClone(payload);
+    const r = applyPatch(w, payload, 0);
+    expect(r.ok).toBe(true);
+    // 回包对象原样：调用方还要拿它做别的事（也不该被悄悄改）
+    expect(payload.messages[0].parts).toHaveLength(1);
+    expect(payload.messages[0]).toBe(fresh);
+    expect(payload).toEqual(before);
+    if (!r.ok) return;
+    // 合并后的那条只在结果里
+    expect(r.window.messages[1].parts).toHaveLength(2);
+  });
+
+  test("replaceFrom 落在手上这窗之外 → mismatch（不压到最后一条上）", () => {
+    const w = win(full(10).slice(5), 5); // 手上有 5 条
+    for (const bad of [-1, 6, 99]) {
+      const r = applyPatch(
+        w,
+        { append: true, replaceFrom: bad, messages: [msg(6)] },
+        5,
+      );
+      expect(r).toEqual({ ok: false, why: "mismatch" });
+    }
+    // 边界（= 末尾）是合法的追加
+    const ok = applyPatch(
+      w,
+      { append: true, replaceFrom: 5, messages: [msg(10)] },
+      5,
+    );
+    expect(ok.ok).toBe(true);
   });
 });

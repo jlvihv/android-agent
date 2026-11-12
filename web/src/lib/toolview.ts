@@ -135,12 +135,19 @@ function isDiff(text: string): boolean {
   return text.startsWith("--- ") && text.includes("\n+++ ");
 }
 
-export function describeResult(t: ToolPart): ResultView | null {
-  if (t.output === undefined) return null;
+/**
+ * `output` 覆盖：面板里取到全文之后要拿**全文**重算 `failed` / `diff`
+ * （否则一个 400 字之后才出现 `[exit 1]` 的命令会被判成成功）。
+ *
+ * 用参数而**不是**在调用方 `{ ...t, output }` 克隆一个 ToolPart：模板里那个
+ * 浅拷贝每次渲染都跑一遍，而它只是为了换一个字段。
+ */
+export function describeResult(t: ToolPart, output = t.output): ResultView | null {
+  if (output === undefined) return null;
   return {
-    text: t.output,
-    failed: failed(t),
-    diff: isDiff(t.output),
+    text: output,
+    failed: failed({ ...t, output }),
+    diff: isDiff(output),
     images: t.images ?? [],
   };
 }

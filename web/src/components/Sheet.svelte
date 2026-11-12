@@ -154,22 +154,11 @@
 
   $effect(() => onBack(goBack, backPeek));
 
-  /**
-   * Esc 关闭（桌面）。
-   *
-   * 安卓有返回键、触屏有下拉和点遮罩，但桌面浏览器里就 Esc 这一个习惯 ——
-   * 以前按 Esc 什么都不发生。挂在面板自己身上（不是 window）：`focusTrap` 保证
-   * 焦点在面板里，事件会冒泡到这儿；以后真出现叠层也不会一层层全关。
-   *
-   * 往第二页退还是直接关：和返回键一样走 `goBack`（第二页先退回第一页）。
-   */
-  function onkeydown(e: KeyboardEvent) {
-    if (e.key !== "Escape" || closing) return;
-    // 有展开的 IME 候选框时 Esc 是给输入法的，不抢
-    if (e.isComposing) return;
-    e.stopPropagation();
-    goBack();
-  }
+  // Esc 不在这里接。`lib/overlay.ts` 在 window 上统一接（只给栈顶那一层），
+  // 它调的正是这个面板登记进去的 `goBack` —— 第二页退回第一页，第一页关面板。
+  // 以前这里又挂了一个 `onkeydown`（`stopPropagation`）跟它抢同一件事：谁先跑到
+  // 取决于焦点在不在面板里，而且两条路径得维护同一套「第二页先退回去」的语义。
+  // 现在只有一条：覆盖层开的时候系统返回键 / Esc / 跟手返回都走 overlay 的栈。
 
   /** 从手指落点往上到面板，有没有哪层已经滚过了（正文、或里面单独滚的清单）。
    *  有的话往下拉是在把它滚回去，不是关面板。 */
@@ -219,7 +208,6 @@
   bind:this={panel}
   use:dismissable={drag}
   use:focusTrap
-  {onkeydown}
   role="dialog"
   aria-modal="true"
   aria-label={title}

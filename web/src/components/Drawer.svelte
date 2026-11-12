@@ -204,6 +204,7 @@
     if (!needle) {
       hits = [];
       searching = false;
+      req++;
       return;
     }
     searching = true;
@@ -211,14 +212,26 @@
     return () => clearTimeout(t);
   });
 
+  /**
+   * 搜索请求的序号。**只有最新那一次的结果能落地。**
+   *
+   * 防抖管的是「打字期间不发」，管不了「发出去两个、先发的后回来」：打完 "a"
+   * 再打 "ab"，两个请求都在路上，「a」那份晚到就会把结果盖成 "a" 的，界面停在
+   * 和输入框对不上的命中上。`searching` 也一样 —— 旧的那份回来不能把「搜索中…」
+   * 提前关掉。
+   */
+  let req = 0;
+
   async function search(needle: string) {
+    const mine = ++req;
     try {
       const r = await fetch(`/api/search?q=${encodeURIComponent(needle)}`);
+      if (mine !== req) return; // 已经有更新的搜索了，这份作废
       if (r.ok) hits = ((await r.json()) as { hits: Hit[] }).hits ?? [];
     } catch {
       /* 后端不在就当没搜到 */
     } finally {
-      searching = false;
+      if (mine === req) searching = false;
     }
   }
 

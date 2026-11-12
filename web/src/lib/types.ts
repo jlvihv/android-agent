@@ -3,6 +3,7 @@
  * 改动这里时记得同步改 Rust（字段名靠 serde 保持一致）。
  */
 
+/** 连线时核心报的身份（页面只留 `platform` 一个用途：`/api/health` 没答出来时兜底） */
 export type Hello = {
   port: number;
   version: string;

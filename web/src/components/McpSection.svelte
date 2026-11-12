@@ -18,6 +18,7 @@
    */
   import McpPage from "./McpPage.svelte";
   import Switch from "./Switch.svelte";
+  import { api, post } from "../lib/api";
 
   let servers = $state<McpServer[]>([]);
   let err = $state("");
@@ -27,9 +28,8 @@
   async function load() {
     err = "";
     try {
-      const r = await fetch("/api/mcp/servers");
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      servers = ((await r.json()) as { servers: McpServer[] }).servers;
+      const d = await api<{ servers: McpServer[] }>("/api/mcp/servers");
+      servers = d.servers;
     } catch (e) {
       err = String(e);
     }
@@ -43,12 +43,7 @@
   async function setEnabled(s: McpServer, enabled: boolean) {
     err = "";
     try {
-      const r = await fetch("/api/mcp/servers/enabled", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: s.name, enabled }),
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      await post("/api/mcp/servers/enabled", { name: s.name, enabled });
       await load();
     } catch (e) {
       err = String(e);

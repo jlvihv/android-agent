@@ -83,8 +83,6 @@
     ta.style.height = `${ta.scrollHeight}px`;
   });
 
-  export const focus = () => ta?.focus();
-
   function onkeydown(e: KeyboardEvent) {
     if (e.key === "Enter" && !e.shiftKey) {
       // 中文 / 日文输入法：拼音打完按回车是**选词**，不是「发送」。

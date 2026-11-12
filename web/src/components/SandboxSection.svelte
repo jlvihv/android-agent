@@ -8,6 +8,8 @@
    *
    * 宿主模式（桌面）没有 Alpine，`available: false`，整栏不显示。
    */
+  import { api, post } from "../lib/api";
+
   type Job = {
     state: "idle" | "running" | "done" | "failed";
     from: string;
@@ -36,9 +38,7 @@
 
   async function load(check = false) {
     try {
-      const r = await fetch(`/api/alpine${check ? "?check=1" : ""}`);
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      st = (await r.json()) as Status;
+      st = await api<Status>(`/api/alpine${check ? "?check=1" : ""}`);
       err = "";
     } catch (e) {
       err = String(e);
@@ -59,12 +59,7 @@
     confirming = false;
     starting = true;
     try {
-      const r = await fetch("/api/alpine/upgrade", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(st?.latest ? { to: st.latest } : {}),
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      await post("/api/alpine/upgrade", st?.latest ? { to: st.latest } : {});
       await load();
     } catch (e) {
       err = String(e);

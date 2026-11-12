@@ -5,6 +5,7 @@
    * （可能只是这会儿没网）。
    */
   import Page from "./Page.svelte";
+  import { post } from "../lib/api";
   import type { McpServer } from "./McpSection.svelte";
 
   let {
@@ -51,17 +52,11 @@
           Authorization: /^bearer\s/i.test(t) ? t : `Bearer ${t}`,
         };
       else if (!server) body.headers = {};
-      const r = await fetch("/api/mcp/servers", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const res = (await r.json()) as {
-        ok: boolean;
-        tools?: number;
-        error?: string;
-      };
+      // 这个端点**总是** 200：连不上也落库，只是 `ok: false` 带一句原因
+      const res = await post<{ ok: boolean; tools?: number; error?: string }>(
+        "/api/mcp/servers",
+        body,
+      );
       await onchange();
       if (res.ok) page?.dismiss();
       else warn = `已保存，但现在连不上：${res.error ?? ""}`;
@@ -77,12 +72,7 @@
     busy = true;
     err = "";
     try {
-      const r = await fetch("/api/mcp/servers/delete", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: server.name }),
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      await post("/api/mcp/servers/delete", { name: server.name });
       await onchange();
       page?.dismiss();
     } catch (e) {

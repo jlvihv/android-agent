@@ -28,7 +28,6 @@
   import Markdown from "./Markdown.svelte";
   import Sheet from "./Sheet.svelte";
   import ThoughtLine from "./ThoughtLine.svelte";
-  import {} from "../lib/drag";
   import { partFull, type PartFull } from "../lib/partfull";
 
   let {
@@ -103,7 +102,7 @@
 
   let sheet = $state<
     | { kind: "reasoning"; part: ReasoningPart }
-    | { kind: "tool"; msg: Message; tool: ToolPart }
+    | { kind: "tool"; tool: ToolPart }
     | null
   >(null);
 
@@ -150,12 +149,61 @@
    * `content` 这种排在前面的短字段，而且每来一小段参数就会重算一次 —— 对整段
    * inputText 跑，模型用 edit 写一个 30KB 的文件就是几千次 × 30KB。
    * 新建文件的那个 `content` 就在开头（path 只有几个字符），这一截里照样认得出。
+   *
+   * 除了只扫前 `SUMMARY_SCAN` 个字符，**每帧最多解析一次**：参数是一片一片流过来
+   * 的，`summarize` 和 `toolIcon` 在一次渲染里各要一次它，而 Svelte 每来一个 delta
+   * 就重跑一次渲染 —— 一帧里能来十几片。做法和 `panelArgs` / `Markdown` 一样：
+   * 变化先攒着，下一帧算一遍（`partialArgs` 的解析结果按 `toolCallId` 存着，
+   * 同一份文本不会算两次）。
    */
-  const summaryArgs = (t: ToolPart) =>
-    (t.input ?? partialArgs(t.inputText.slice(0, SUMMARY_SCAN))) as Record<
-      string,
-      unknown
-    >;
+  const summaryCache = new Map<
+    string,
+    { n: number; args: Record<string, unknown> }
+  >();
+  /** 这一帧里攒下的、参数还在流的工具（下一帧统一解析） */
+  const summaryPending = new Map<string, ToolPart>();
+  /** 只为了在 rAF 解析完之后让那几行重渲染一次 */
+  let summaryVersion = $state(0);
+  let summaryRaf = 0;
+
+  function summaryArgs(t: ToolPart): Record<string, unknown> {
+    // 参数已经完整了（`tool-input-available` 之后）：直接给它，不用缓存
+    if (t.input !== undefined) return t.input as Record<string, unknown>;
+
+    // 读一下版本号：rAF 里算完之后它会变，于是读它的那几行（工具行的摘要和图标）
+    // 下一帧重跑一次渲染 —— 这**就是**「攒一帧」的实现（不读它就没有更新信号）。
+    void summaryVersion;
+
+    const hit = summaryCache.get(t.toolCallId);
+    // 缓存和当前文本对得上：直接用
+    if (hit && hit.n === t.inputText.length) return hit.args;
+
+    // 对不上：排进这一帧的待算队列，统一在下一帧算（一帧里来多少片都只算一次）
+    summaryPending.set(t.toolCallId, t);
+    summaryRaf ||= requestAnimationFrame(() => {
+      summaryRaf = 0;
+      for (const p of summaryPending.values()) {
+        if (p.input !== undefined) {
+          summaryCache.delete(p.toolCallId);
+          continue;
+        }
+        summaryCache.set(p.toolCallId, {
+          n: p.inputText.length,
+          args: partialArgs(p.inputText.slice(0, SUMMARY_SCAN)),
+        });
+      }
+      summaryPending.clear();
+      summaryVersion++;
+    });
+
+    // 第一次见到这个工具：别让那一行空着，当场算一遍（每个工具一辈子就这一次）
+    if (hit) return hit.args;
+    const args = partialArgs(t.inputText.slice(0, SUMMARY_SCAN));
+    summaryCache.set(t.toolCallId, { n: t.inputText.length, args });
+    return args;
+  }
+
+  $effect(() => () => cancelAnimationFrame(summaryRaf));
 
   /**
    * 从还没写完的参数 JSON 里抠出已经出现的字段。
@@ -261,8 +309,16 @@
    * 字段都给回来 —— 输入输出都长的工具也只有一次往返。
    *
    * 取回来之前，面板里先显示截断的那份 + 一行「载入中」，不会白屏。
+   *
+   * **按会话分桶**（`full[session][id]`）：`r3` / `t3` 是 `ChatMessage` 的下标，
+   * 每条会话都有。只按裸 id 存的话，在会话 A 点开过 `r3` 再切到 B 点开 `r3`，
+   * 面板里显示的是 A 的那段思考（而且 `needFull` 看到「已经有了」连请求都不发）。
+   * 这个组件切会话时**不重建**（`App` 只按 `messages` 空不空挂它），所以桶一定
+   * 得自己清 —— 切会话那一刻把别的会话的桶丢掉（见下面那个 `$effect`）。
    */
-  let full = $state<Record<string, PartFull>>({});
+  let fullBySession = $state<Record<string, Record<string, PartFull>>>({});
+  /** 当前会话那一桶（读的地方都走它） */
+  let full = $derived(fullBySession[session] ?? {});
   let loading = $state<string | null>(null);
 
   /** 面板要打开的 part 只要有字段被截过，就补一次全文 */
@@ -276,19 +332,49 @@
       full[id] !== undefined
     )
       return;
+    const sid = session;
     loading = id;
-    const got = await partFull(id);
-    if (Object.keys(got).length) full[id] = got;
+    const got = await partFull(id, sid);
+    if (Object.keys(got).length)
+      fullBySession = {
+        ...fullBySession,
+        [sid]: { ...(fullBySession[sid] ?? {}), [id]: got },
+      };
     if (loading === id) loading = null;
   }
 
-  function openTool(msg: Message, tool: ToolPart) {
+  /**
+   * 切会话：**关掉面板、丢掉别的会话的全文桶**。
+   *
+   * 面板里存的是 part / tool 的**引用**（思考面板跟着流式长就是因为这个）——
+   * 切走之后那个对象属于上一条会话，继续开着只会显示别人的内容。桶也一样：
+   * 留着就是内存里常驻几条会话的工具输出。
+   */
+  $effect(() => {
+    void session;
+    untrack(() => {
+      sheet = null;
+      fullBySession = {};
+      loading = null;
+      // 摘要缓存也是按 id 存的，而且只在「参数还在流」的那几秒有用
+      summaryCache.clear();
+      summaryPending.clear();
+    });
+  });
+
+  /**
+   * 打开工具面板。只认 `tool` 这个引用 —— 面板里要显示的结果 / 状态 / 失败判定
+   * 全在它身上，不需要那条消息（以前还传了个 `msg` 留着，从没读过）。
+   */
+  function openTool(tool: ToolPart) {
     panelArgs = full[tool.toolCallId]?.input ?? argsOf(tool);
-    sheet = { kind: "tool", msg, tool };
+    sheet = { kind: "tool", tool };
+    const sid = session;
     void needFull(tool.toolCallId, tool.chars, tool.inputTruncated).then(() => {
       // 取回来之后只更新「正开着的这个面板」，别去动别人的
-      const got = full[tool.toolCallId]?.input;
-      if (got && sheet?.kind === "tool") panelArgs = got;
+      const got = fullBySession[sid]?.[tool.toolCallId]?.input;
+      if (got && sheet?.kind === "tool" && sheet.tool === tool)
+        panelArgs = got;
     });
   }
 
@@ -859,7 +945,7 @@
                  判定走 toolview 的 `failed()`，和面板同一个函数。 -->
               {@const bad = failed(tool)}
               <button
-                onclick={() => openTool(msg, tool)}
+                onclick={() => openTool(tool)}
                 class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
               >
                 <Icon
@@ -991,8 +1077,7 @@
     </Sheet>
   {:else}
     <!-- 存成 const：sheet 是 $state，在 onclick 闭包里 TS 收窄不了 -->
-    {@const s = sheet}
-    {@const t = s.tool}
+    {@const t = sheet.tool}
     <!-- 全文取回来了就拿它替掉截断的那份，`describeResult` 的判定（failed / diff）
          也跟着用全文 —— 否则一个 400 字之后才有 `[exit 1]` 的命令会被判成成功 -->
     {@const toolFull = full[t.toolCallId]?.output}
@@ -1001,7 +1086,7 @@
          没取到全文之前不渲染结果区，只显示「载入全文…」，别给一个空白的 `<pre>`。 -->
     {@const res =
       toolFull !== undefined
-        ? describeResult({ ...t, output: toolFull })
+        ? describeResult(t, toolFull)
         : t.chars !== undefined
           ? null
           : describeResult(t)}

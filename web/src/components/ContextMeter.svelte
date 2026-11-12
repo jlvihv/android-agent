@@ -15,6 +15,7 @@
    *              数字用 k / M 这种给人看的格式。
    */
   import { type SessionUsage } from "../lib/sse";
+  import { fmtCount } from "../lib/num";
   import Sheet from "./Sheet.svelte";
 
   let {
@@ -38,9 +39,6 @@
   const RING_BIG = { size: 56, r: 22, sw: 5.2, fs: 18 };
   /** 环里那个数低于这个百分比就写 `<1`（0 看着像坏了） */
   const TINY_PCT = 0.5;
-  /** `fmt` 的进位门槛 */
-  const KILO = 1_000;
-  const MEGA = 1_000_000;
 
   const used = $derived(usage?.last.input ?? 0);
   /** 0..1；没有窗口就是 null */
@@ -65,12 +63,8 @@
   //
   // token 数只保留三位有效：`1.2M` / `36.2k` / `940`。面板是给人瞟一眼的，
   // 精确到个位只是噪声（真实值在 /api/session 里，随时能看）。
-  function fmt(n: number): string {
-    // 过万就不给小数位了：`12.3k` 三位有效数字够看，`12345` 精确到个位只是噪声
-    if (n >= MEGA) return `${(n / MEGA).toFixed(n >= MEGA * 10 ? 0 : 1)}M`;
-    if (n >= KILO) return `${(n / KILO).toFixed(n >= KILO * 10 ? 0 : 1)}k`;
-    return String(n);
-  }
+  // 格式在 `lib/num.ts`：设置页的「用量」那一栏用的是同一个（以前两份逐字相同）。
+  const fmt = fmtCount;
   const fmtPct = (r: number) => `${(r * 100).toFixed(1)}%`;
 </script>
 

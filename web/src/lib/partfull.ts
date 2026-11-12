@@ -14,10 +14,13 @@
  * 全部），前端只发一条。
  *
  * 缓存按 part id 存一份：同一个面板关了又开不该再请求一次。缓存不设上限 ——
- * 一个会话里的 part 数量本来就是有限的。会话切走时不必清：id 是 `r{i}` /
- * 工具调用 id，跨会话理论上可能撞（`r3` 在两个会话里都有），所以**key 里带上会话**。
+ * 一个会话里的 part 数量本来就是有限的。
+ *
+ * **key 里必须带会话**：id 是 `r{i}` / `t{i}`（`ChatMessage` 的下标）和工具调用 id，
+ * 前者跨会话一定会撞（两个会话都有 `r3`）。会话由调用方传进来 —— 这里**不读全局
+ * 状态**：面板是点开那一刻才查缓存，而全局那份会话靠 `$effect` 同步，两者不同步时
+ * 就会拿错会话的全文字。
  */
-import { store } from "./store.svelte.ts";
 
 /** 一个 part 的全部完整内容：`text` 是推理/正文，`output` 是工具输出，`input` 是工具参数 */
 export type PartFull = {
@@ -29,8 +32,8 @@ export type PartFull = {
 const cache = new Map<string, PartFull>();
 const inflight = new Map<string, Promise<PartFull>>();
 
-function key(id: string): string {
-  return `${store.sessionId}\u0000${id}`;
+function key(session: string, id: string): string {
+  return `${session}\u0000${id}`;
 }
 
 /**
@@ -39,21 +42,21 @@ function key(id: string): string {
  * 失败时**不抛** —— 返回空对象，调用方继续显示那份截断的。面板里内容少一截，
  * 比弹一个错误框打断用户强。
  */
-export async function partFull(id: string): Promise<PartFull> {
-  const k = key(id);
+export async function partFull(id: string, session: string): Promise<PartFull> {
+  const k = key(session, id);
   const hit = cache.get(k);
   if (hit !== undefined) return hit;
   const running = inflight.get(k);
   if (running) return running;
 
+  // **不带空 session**：服务端把「给了 session 但查不到」当成 404，而空串就是
+  // 查不到（首屏刚起来、`App` 还没拿到会话 id 时就会踩到，表现为面板一直
+  // 「载入全文…」）。空着时退回服务端的「当前活动会话」—— 那正是用户点开面板时
+  // 所在的那个。
   const p = (async (): Promise<PartFull> => {
     try {
       const qs = new URLSearchParams({ id });
-      // **不带空 session**：服务端把「给了 session 但查不到」当成 404，而空串
-      // 就是查不到 —— 首屏 `store.sessionId` 还没同步上时就会踩到，表现为
-      // 面板一直「载入全文…」。宁可让它退回「用当前活动会话」那条路（那正是
-      // 用户点开面板时所在的那个会话）。
-      if (store.sessionId) qs.set("session", store.sessionId);
+      if (session) qs.set("session", session);
       const r = await fetch(`/api/part?${qs}`);
       if (!r.ok) return {};
       const d = (await r.json()) as PartFull;

@@ -6,6 +6,7 @@
   import Icon from "./Icon.svelte";
   import Page from "./Page.svelte";
   import type { ApiStyle, ProviderRow } from "./Settings.svelte";
+  import { del, post } from "../lib/api";
 
   let {
     provider,
@@ -37,15 +38,10 @@
     busy = true;
     err = "";
     try {
-      const r = await fetch(`/api/providers/${provider.id}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          apiKey: apiKey.trim(),
-          baseUrl: baseUrl.trim(),
-        }),
+      await post(`/api/providers/${provider.id}`, {
+        apiKey: apiKey.trim(),
+        baseUrl: baseUrl.trim(),
       });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
       await onchange();
       page?.dismiss();
     } catch (e) {
@@ -76,12 +72,7 @@
     busy = true;
     err = "";
     try {
-      const r = await fetch(`/api/providers/${provider.id}/api-style`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ style: v }),
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      await post(`/api/providers/${provider.id}/api-style`, { style: v });
       style = v;
       await onchange();
     } catch (e) {
@@ -95,10 +86,7 @@
     busy = true;
     err = "";
     try {
-      const r = await fetch(`/api/providers/${provider.id}`, {
-        method: "DELETE",
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      await del(`/api/providers/${provider.id}`);
       await onchange();
       page?.dismiss();
     } catch (e) {

@@ -16,6 +16,8 @@
  * 和缓存上记的对不上就强制重拉 —— 这是唯一需要「真的再拉一次」的场合。
  */
 
+import { api } from "./api";
+
 export type Model = {
   id: string;
   name: string;
@@ -95,12 +97,9 @@ class ModelCache {
 
   async #fetch(rev: number): Promise<void> {
     try {
-      const r = await fetch("/api/models");
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const d = (await r.json()) as {
-        groups?: Group[];
-        provider?: string | null;
-      };
+      const d = await api<{ groups?: Group[]; provider?: string | null }>(
+        "/api/models",
+      );
       this.groups = d.groups ?? [];
       this.provider = d.provider ?? null;
       this.err = "";

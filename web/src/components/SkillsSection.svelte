@@ -5,6 +5,7 @@
    * 文件夹。索引会进系统提示词，AI 遇到对应的事会先读 SKILL.md（见 core/src/skills.rs）。
    */
   import Switch from "./Switch.svelte";
+  import { api, post } from "../lib/api";
 
   type Skill = {
     name: string;
@@ -20,9 +21,7 @@
 
   async function load() {
     try {
-      const r = await fetch("/api/skills");
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const d = (await r.json()) as { dir: string | null; skills: Skill[] };
+      const d = await api<{ dir: string | null; skills: Skill[] }>("/api/skills");
       skills = d.skills;
       dir = d.dir;
     } catch (e) {
@@ -38,12 +37,7 @@
   async function setEnabled(s: Skill, enabled: boolean) {
     err = "";
     try {
-      const r = await fetch("/api/skills/enabled", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: s.dir, enabled }),
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      await post("/api/skills/enabled", { name: s.dir, enabled });
       await load();
     } catch (e) {
       err = String(e);

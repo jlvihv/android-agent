@@ -20,6 +20,7 @@ import {
   watchDiscovery,
 } from "./overlay";
 import { store } from "./store.svelte.ts";
+import { api, post } from "./api";
 
 /** 面板里的一行（`GET /api/machines` 的 `list`）。 */
 export type Machine = {
@@ -90,13 +91,11 @@ class Machines {
   /** 问一次核心。 */
   async load(): Promise<void> {
     try {
-      const r = await fetch("/api/machines");
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const j = (await r.json()) as {
+      const j = await api<{
         list: Machine[];
         local: LocalCore;
         current: string | null;
-      };
+      }>("/api/machines");
       this.list = j.list;
       this.local = j.local;
       this.current = j.current;
@@ -162,9 +161,7 @@ class Machines {
     if (backToLocalShell()) return;
     this.busy = true;
     try {
-      const r = await fetch("/api/machines/local", { method: "POST" });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      const j = (await r.json()) as { url: string };
+      const j = await post<{ url: string }>("/api/machines/local");
       this.#go(j.url);
     } catch (e) {
       this.err = String(e);
@@ -186,22 +183,10 @@ class Machines {
   ): Promise<Record<string, unknown> | null> {
     this.busy = true;
     try {
-      const r = await fetch(`/api/machines/${what}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const text = await r.text();
-      let j: Record<string, unknown> = {};
-      try {
-        j = JSON.parse(text) as Record<string, unknown>;
-      } catch {
-        // 不是 JSON（核心没起来 / 老核心）：下面那行把原文带上
-      }
-      if (!r.ok)
-        throw new Error(
-          String(j.error ?? "").trim() || text.trim() || `HTTP ${r.status}`,
-        );
+      // 错误正文可能是 JSON（`{error: "…"}`）也可能是一段纯文本（核心没起来时
+      // 是网关的 502），两种都要能给出那句人话 —— `ApiError.message` 就是它
+      //（`lib/api.ts` 里统一做的），这里只负责落进 `err` 并返回 null。
+      const j = await post<Record<string, unknown>>(`/api/machines/${what}`, body);
       this.err = "";
       return j;
     } catch (e) {

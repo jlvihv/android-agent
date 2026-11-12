@@ -10,7 +10,7 @@
  * 还白占内存（以前就是这么烂掉的）。
  */
 
-import type { AgentEvent, DeviceInfo, Hello } from "./types";
+import type { AgentEvent } from "./types";
 import type { Message } from "./sse";
 import { uid } from "./uid";
 
@@ -22,8 +22,6 @@ const LOG_SNIPPET = 120;
 
 class AgentStore {
   connected = $state(false);
-  hello = $state<Hello | null>(null);
-  device = $state<DeviceInfo | null>(null);
   /**
    * 这个核心跑在哪台机器上（`/api/health` 的 `computer`）。
    *
@@ -41,15 +39,6 @@ class AgentStore {
   instance = $state<string | null>(null);
 
   /**
-   * 当前会话的 id（服务端给的，`sessionId` 那个）。
-   *
-   * 这里只放一份**只读镜像**给需要跨组件用它的地方（现在只有 `lib/partfull.ts`
-   * 的缓存 key：`r3` 这种 part id 只在会话内有意义，两个会话里都有 `r3`）。
-   * 真正的状态还在 `App.svelte` —— 那儿切换会话时同步写一下这里。
-   */
-  sessionId = $state("");
-
-  /**
    * 侧栏底栏那个小标签上写什么 —— 现在连的是哪台机器。
    *
    *   - 手机自己的核心 →「本机」
@@ -59,7 +48,7 @@ class AgentStore {
    * 自己的核心，别的都当成电脑，先拿地址撑着 —— 总比空着强，而且**不会说错**。
    */
   machine = $derived.by((): { name: string; phone: boolean } => {
-    const os = this.platform || this.hello?.platform || "";
+    const os = this.platform;
     if (os === "android") return { name: "本机", phone: true };
     if (os) return { name: this.computer ?? location.hostname, phone: false };
     // 只认 127.0.0.1：手机自己的核心就在那儿。经中继连电脑时页面来自 `localhost`
@@ -93,8 +82,6 @@ class AgentStore {
    * 从 `/api/health` 拿（那个接口要凭据，别的 App 拿不到）。
    */
   sandboxKey = $state("");
-  /** 当前正在流式接收的助手消息 */
-  streaming = $state<Message | null>(null);
   /**
    * **有没有回合在跑**（总线上的 `turn_active`；全局的，不分会话）。
    *
@@ -192,16 +179,11 @@ class AgentStore {
 
   #dispatch(ev: AgentEvent): void {
     switch (ev.type) {
+      // `hello` / `device` 页面不显示（平台看 `/api/health` 的 `platform`，
+      // 设备连接状态只在手机壳的通知栏里用）。以前把它们攒进 `$state` 就再没有
+      // 一处读过 —— 两个白占内存的字段，删了。
       case "hello":
-        this.hello = {
-          port: ev.port,
-          version: ev.version,
-          platform: ev.platform,
-        };
-        break;
-
       case "device":
-        this.device = { connected: ev.connected, name: ev.name };
         break;
 
       case "log":
@@ -225,20 +207,14 @@ class AgentStore {
   }
 
   /**
-   * 开始一条新的助手消息（聊天流用）。
+   * 一条空的助手消息（聊天流从这里开始写）。
    *
-   * 返回值刻意从 `$state` 读回来 —— 这样拿到的是 Svelte 的响应式代理，
-   * 后续 `applyChunk` 原地修改才能触发 UI 更新。
+   * **不挂在 store 上**：真正持有它的是调用方（`App` 的 `messages` 数组，元素在
+   * 那里才是响应式代理）。以前这里还存一份 `this.streaming`，全项目没有一处读，
+   * 副作用是 store 永久抓着最后那条助手消息（含几十 KB 工具输出）不放。
    */
   beginStreaming(): Message {
-    this.streaming = {
-      id: uid(),
-      role: "assistant",
-      parts: [],
-      steps: 0,
-      done: false,
-    };
-    return this.streaming!;
+    return { id: uid(), role: "assistant", parts: [], done: false };
   }
 }
 

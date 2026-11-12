@@ -5,6 +5,9 @@
    * 只有 token，**不估钱**：包月套餐（OpenCode Go 这类）按目录价算出来的数字是错的，
    * 不如不给（见 core 的 `usage_summary`）。输入含缓存读取。
    */
+  import { api } from "../lib/api";
+  import { fmtCount } from "../lib/num";
+
   type Row = {
     key: string;
     calls: number;
@@ -22,25 +25,21 @@
   $effect(() => {
     void (async () => {
       try {
-        const r = await fetch("/api/usage");
-        if (!r.ok) return;
-        const d = (await r.json()) as { byModel: Row[]; byDay: Row[] };
+        const d = await api<{ byModel: Row[]; byDay: Row[] }>("/api/usage");
         byModel = d.byModel;
         byDay = d.byDay;
+      } catch {
+        // 拉不到就不显示这一栏（`loaded` 仍然置真）：用量是附加信息，
+        // 不值得为它在设置页里挂一条错误。以前这里没有 `catch`，fetch 一失败
+        // 就是一个 unhandled rejection。
       } finally {
         loaded = true;
       }
     })();
   });
 
-  const KILO = 1_000;
-  const MEGA = 1_000_000;
-  /** 和上下文圆环同一套：三位有效数字，k / M */
-  function fmt(n: number): string {
-    if (n >= MEGA) return `${(n / MEGA).toFixed(n >= MEGA * 10 ? 0 : 1)}M`;
-    if (n >= KILO) return `${(n / KILO).toFixed(n >= KILO * 10 ? 0 : 1)}k`;
-    return String(n);
-  }
+  /** 和上下文圆环同一套（`lib/num.ts`）：三位有效数字，k / M */
+  const fmt = fmtCount;
   const pct = (r: number | null) =>
     r == null ? "-" : `${Math.round(r * 100)}%`;
   /** 一行的第二行字：次数 · 输入 · 输出 · 命中 */

@@ -23,7 +23,6 @@
   import Icon from "./Icon.svelte";
   import Sheet from "./Sheet.svelte";
   import { hasShell, machines, type Machine } from "../lib/machines.svelte.ts";
-  import {} from "../lib/drag";
 
   let { onclose }: { onclose: () => void } = $props();
 

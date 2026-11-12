@@ -38,10 +38,38 @@ export type Peek = {
   onEnd: (commit: boolean) => void;
 };
 
-type Layer = { close: () => void; peek?: Peek };
-
 const stack: Layer[] = [];
+
+/**
+ * 「我们自己正在退回去」的那几条 history。
+ *
+ * `release()`（点遮罩 / 拖走 / Esc 关掉一层）要把当初 `pushState` 的那一条退掉，
+ * 而它引起的 `popstate` **不能**被当成「用户按了返回」—— 否则会顺手把下面一层也
+ * 关了。所以退之前记一笔，`popstate` 来了先扣掉这一笔。
+ *
+ * 用计数器而不是「哪一层」：两边都是「少一层」，而我们的层已经从 `stack` 里摘掉了，
+ * 所以无论两条 popstate 谁先到，最后剩下的栈顶都一样。
+ *
+ * **但计数器必须会自己过期**（以前不会，这是真的丢返回键的地方）：`history.back()`
+ * 在栈底 / 被浏览器合并时可能**根本不发** popstate，那这笔账就永远挂着 —— 之后用户
+ * 按的第一次返回被当成我们的、静默吞掉（表现就是「按一下没反应，得再按一下」）。
+ * 所以每一笔都挂一个定时器：等这么久还没等到 popstate，就当它没发生。
+ */
 let skip = 0;
+const SKIP_TTL_MS = 600;
+let skipTimers: ReturnType<typeof setTimeout>[] = [];
+
+function skipOnce(): void {
+  skip++;
+  const t = setTimeout(() => {
+    skip = Math.max(0, skip - 1);
+    skipTimers = skipTimers.filter((x) => x !== t);
+  }, SKIP_TTL_MS);
+  skipTimers.push(t);
+}
+
+/** 一个覆盖层。`peek` 可选（预测性返回的跟手位移）。 */
+type Layer = { close: () => void; peek?: Peek };
 
 /** 壳暴露给页面的钩子（桌面浏览器上没有）。见 MainActivity.kt 的 BackHost */
 type BackHost = {
@@ -144,6 +172,7 @@ declare global {
 
 if (typeof window !== "undefined") {
   addEventListener("popstate", () => {
+    // 自己退的那一条回来了：吃掉，别关下一层
     if (skip > 0) {
       skip--;
       return;
@@ -211,7 +240,7 @@ export function onBack(close: () => void, peek?: Peek): () => void {
     if (i === -1) return; // 已经被返回键弹掉了
     stack.splice(i, 1);
     syncHost();
-    skip++;
+    skipOnce();
     history.back();
   };
 }

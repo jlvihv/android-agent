@@ -103,6 +103,13 @@ export function spliceAt(
  * `base` 是**发请求时**手上的窗口起点。补丁里的下标是服务端按 `base` 翻译的，而
  * 请求在路上时用户可能往上翻了一页（数组前面多了一段）—— 那时下标就不作数了，
  * 硬套的结果是消息重复或丢几段。这种（极少见的）情况宁可作废，下一次同步会重算。
+ *
+ * `replaceFrom` 落在手上这窗**之外**也算 mismatch（不再往最后一条上压）：
+ * 压到边界上会把补丁接到错位置，界面看着像「消息串了」，而重新要一份全量总是对的。
+ *
+ * **不改入参**（`d` 是 `/api/session` 的应答对象）：`keepParts` 那一支要换掉
+ * `messages[0]`，以前是原地写的，等于把调用方手上那份 JSON 悄悄改了 —— 这个
+ * 模块自称纯函数，就得真纯。
  */
 export function applyPatch(
   w: Window,
@@ -111,8 +118,13 @@ export function applyPatch(
 ): PatchResult {
   if (base !== w.windowFrom) return { ok: false, why: "stale" };
 
-  const from = Math.min(d.replaceFrom ?? 0, w.messages.length);
-  const fresh = d.messages ?? [];
+  // 浅拷一份：下面 `keepParts` 那一支要**换掉** `messages[0]`，直接写就是把
+  // 调用方手上那份 `/api/session` 回包改掉了（消息对象本身照样复用 —— 不深拷，
+  // `reconcile` 靠的就是对象身份）。
+  const fresh = [...(d.messages ?? [])];
+  const from = d.replaceFrom ?? 0;
+  if (from < 0 || from > w.messages.length) return { ok: false, why: "mismatch" };
+
   const keep = d.keepParts;
   if (keep != null) {
     const old = w.messages[from];
@@ -170,8 +182,15 @@ export function applyWindow(
  * 接不上就整页丢掉（返回 null）：宁可少显示一窗，也不能在中间留个洞 —— 洞会让
  * 之后所有下标都对不上，`replaceFrom` 那套全乱。空页面也返回 null（调用方什么都不
  * 用做，下次再要）。
+ *
+ * 只收 `messages` / `from`：回包里那个 `hasMore` 以前一路搬到这里，参数接了却
+ * 从没读过 —— 「还有没有更早的」是 `windowFrom > 0` 推导出来的（见 `Window` 的
+ * 注释），不是搬来的一份状态。
  */
-export function prependPage(w: Window, d: SessionPayload): Window | null {
+export function prependPage(
+  w: Window,
+  d: Pick<SessionPayload, "messages" | "from">,
+): Window | null {
   const page = d.messages ?? [];
   if (!page.length) return null;
   const from = d.from ?? 0;

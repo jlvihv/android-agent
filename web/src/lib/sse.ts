@@ -100,6 +100,12 @@ function parseFrame(raw: string): UiChunk | typeof DONE | null {
  * 把 `Response` 的 body 变成 chunk 异步迭代器。
  *
  * 必须自己缓冲：网络分片会把一个 SSE 帧切在中间。
+ *
+ * **`[DONE]` 一帧就把流结束掉**，不再接着读。以前 `drain` 遇到它就 `return`，
+ * 而上层那个 `for(;;)` 仍然继续 `reader.read()` —— 于是后面每来一帧都要等一次
+ * 读才被丢掉，服务端要是留着连接（keep-alive 心跳、代理不转 FIN），这条流就
+ * 一直挂着，`consume` 也就一直不返回（回合永远是「运行中」）。现在 `drain` 用
+ * 返回值告诉上层「收了终止帧」，上层 `break` + `cancel()` 释放连接。
  */
 export async function* parseUiStream(
   res: Response,
@@ -110,7 +116,8 @@ export async function* parseUiStream(
   const decoder = new TextDecoder();
   let buf = "";
 
-  const drain = function* (flush: boolean): Generator<UiChunk> {
+  /** 把缓冲里完整的帧都吐出去；返回 true = 撞上终止帧（后面的一律不要了） */
+  const drain = function* (flush: boolean): Generator<UiChunk, boolean> {
     buf = buf.replace(/\r\n/g, "\n");
     for (;;) {
       const idx = buf.indexOf("\n\n");
@@ -118,14 +125,16 @@ export async function* parseUiStream(
       const frame = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
       const parsed = parseFrame(frame);
-      if (parsed === DONE) return;
+      if (parsed === DONE) return true;
       if (parsed) yield parsed;
     }
     if (flush && buf.trim()) {
       const parsed = parseFrame(buf);
       buf = "";
-      if (parsed && parsed !== DONE) return yield parsed;
+      if (parsed === DONE) return true;
+      if (parsed) yield parsed;
     }
+    return false;
   };
 
   for (;;) {
@@ -142,7 +151,11 @@ export async function* parseUiStream(
     }
     if (done) break;
     buf += decoder.decode(value, { stream: true });
-    yield* drain(false);
+    if (yield* drain(false)) {
+      // 收到 `[DONE]`：剩下的字节不用读，连接也主动放掉
+      void reader.cancel();
+      return;
+    }
   }
   buf += decoder.decode();
   yield* drain(true);
@@ -366,8 +379,13 @@ export type Message = {
   id: string;
   role: "user" | "assistant";
   parts: Part[];
-  /** 已完成一个 LLM 调用（finish-step）的次数 */
-  steps: number;
+  /**
+   * 这条消息说完了没有。**两个用途别混**：
+   *   - 助手消息：还在流式（`false`）还是结束了（`true`）
+   *   - 用户消息：`false` = 还排在服务端队列里、没交给模型（虚线圈 + ×），
+   *     `true` = 已经进正文了
+   * 服务端 `/api/session` 给的排队项就是 `done: false`，所以不是本地约定。
+   */
   done: boolean;
 };
 
@@ -465,9 +483,9 @@ export function applyChunk(msg: Message, c: UiChunk): void {
       }
       break;
     }
+    // 步边界只影响服务端记账（一次 LLM 调用算一步），界面不画它 ——
+    // 以前这里还维护 `msg.steps`，全项目没有一处读，删了。
     case "start-step":
-      msg.steps += 1;
-      break;
     case "finish-step":
     case "start":
     case "reset-step":
@@ -504,11 +522,16 @@ export function applyChunk(msg: Message, c: UiChunk): void {
   }
 }
 
-/** 消费整条流并实时回调。返回最终消息。 */
+/**
+ * 消费整条流。返回最终那条消息（调用方手上那个对象，或者最后一个新开的）。
+ *
+ * 以前还有一个 `onUpdate` 回调（每个 delta 调一次）：唯一的调用点传的是
+ * `undefined`，测试也不用。消息是**原地**改的响应式对象，界面自己会更新 ——
+ * 那个回调是个没人付钱的每帧函数调用，删了。
+ */
 export async function consume(
   msg: Message,
   stream: AsyncGenerator<UiChunk, void, undefined>,
-  onUpdate?: (m: Message) => void,
   /**
    * 流里又出现一个 `start` —— 服务端把排队的消息交给模型了，接下来的输出属于
    * **新的一条**助手消息（服务端的历史里也是新的一条：`session_view` 的合并
@@ -534,9 +557,7 @@ export async function consume(
       continue;
     }
     applyChunk(cur, c);
-    onUpdate?.(cur);
   }
   cur.done = true;
-  onUpdate?.(cur);
   return cur;
 }

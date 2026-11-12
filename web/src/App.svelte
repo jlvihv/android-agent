@@ -25,6 +25,7 @@
     totalsOf,
   } from "./lib/sse";
   import { uid } from "./lib/uid";
+  import { api, post } from "./lib/api";
   import {
     applyPatch,
     applyWindow,
@@ -49,11 +50,44 @@
   import { dismissable } from "./lib/drag";
 
   let input = $state("");
-  /** 当前看着的这个会话，本地正连着它的流。 */
-  let busy = $state(false);
-  /** 服务端说当前会话还在跑。App 切到后台、或者从别的会话切回来时，
-   *  本地没连着流，靠它判断"还在进行中"（然后轮询）。 */
-  let serverBusy = $state(false);
+
+  /**
+   * 「眼前这个会话此刻是什么状态」。**一个联合，不是四个布尔。**
+   *
+   * 以前是 `busy` / `serverBusy` / `live` / `fresh` 四个独立变量，合法组合只有
+   * 五种，而约束全靠记性和注释维系（`newSession` 里那句「不清 `serverBusy` 的话
+   * 输入框要等一个轮询周期才解冻」就是约束被外部记住的样子）。写成联合之后，
+   * 非法组合根本表达不出来：
+   *
+   *   idle    有会话（或空态），没有回合在跑
+   *   fresh   点了「新对话」、第一句还没发（服务端**还没有**这条会话）
+   *   live    本地正连着它的流（`run` 是身份：`stop` / `detach` 认它）
+   *   remote  服务端在跑，本地没连着 —— 切到后台 / 从别的会话切回来 / 别人发起的
+   *
+   * 几个推导量：`running` = 输入框该不该显示停止键；`busy` = 本地连没连着流
+   *（`loadMessages` 用这个门）；`fresh` = 还没建。
+   */
+  type View =
+    | { k: "idle" }
+    | { k: "fresh" }
+    | { k: "live"; run: Run }
+    | { k: "remote" };
+
+  /**
+   * 本地正连着的那条流。**只属于当前看着的会话**。
+   *
+   * 可以同时在几个会话里各跑一个回合（服务端按会话记）。切走的时候只是把
+   * 本地这条流断开（`detach`），服务端那个回合照跑；切回来靠轮询看进度。
+   */
+  type Run = { controller: AbortController };
+
+  let view = $state<View>({ k: "idle" });
+  /** 本地正连着流 */
+  const busy = $derived(view.k === "live");
+  /** 点了新对话还没建 */
+  const fresh = $derived(view.k === "fresh");
+  /** 有没有回合在跑（本地或远端）—— 输入框的停止键看它 */
+  const running = $derived(view.k === "live" || view.k === "remote");
   let messages = $state<Message[]>([]);
   let sessions = $state<Session[]>([]);
 
@@ -107,7 +141,6 @@
     base: number;
     page: Message[];
     from: number;
-    hasMore: boolean;
   } | null = null;
 
   /** 正在路上的那份 `loadMessages` 是哪一份（会话|窗口|rev）；空 = 没有 */
@@ -171,31 +204,18 @@
   );
 
   /**
-   * 本地正连着的那条流。**只属于当前看着的会话**。
+   * 不看这个会话了：断开本地的流，**不**停服务端的回合。
    *
-   * 可以同时在几个会话里各跑一个回合（服务端按会话记）。切走的时候只是把
-   * 本地这条流断开（`detach`），服务端那个回合照跑；切回来靠轮询看进度。
+   * 从 `live` 退到 `remote`（不是 `idle`）：我们只是不听了，服务端那个回合还在跑
+   * —— 这样轮询会接着把进度捞回来（以前只把 `busy` 置假、`serverBusy` 保持原值，
+   * 恰好也是这个效果，但没人说得清为什么）。
    */
-  type Run = { controller: AbortController };
-  let live: Run | null = null;
-
-  /** 不看这个会话了：断开本地的流，**不**停服务端的回合。 */
   function detach() {
-    const r = live;
-    if (!r) return;
-    live = null;
-    busy = false;
-    r.controller.abort();
+    const v = view;
+    if (v.k !== "live") return;
+    view = { k: "remote" };
+    v.run.controller.abort();
   }
-
-  /**
-   * 点了「新对话」、但第一句还没发出去。
-   *
-   * 这时服务端**还没有**这个会话 —— 不这样就会变成：连点五次「新对话」，
-   * 抽屉里多出五条「新对话」空记录。所以它只是一个本地意图，
-   * 第一句话发出去之前才在服务端建（见 `ensureSession`）。
-   */
-  let fresh = $state(false);
 
   let drawer = $state(false);
   /**
@@ -298,43 +318,34 @@
     // 而请求在路上时用户可能往上翻了一页（数组前面多了一段）—— 下标就不作数了。
     const winAt = windowFrom;
     try {
-      const r = await fetch(
-        `/api/session?rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
-      );
-      if (!r.ok) return;
-      const d = (await r.json()) as {
-        messages?: Message[];
+      const d = await api<
+        SessionPayload & {
+        // 窗口那几件（`messages` / `from` / `hasMore` / `append` / `replaceFrom` /
+        // `keepParts`）是 `SessionPayload`，在 `lib/session.ts` 里定义、有测试盯着 ——
+        // 以前这里手抄了一份，两份字段名一旦漂就靠 `as` 强转糊过去。
         busy: boolean;
         unchanged?: boolean;
         rev?: string;
-        /** 增量：只给了「当前回合」那一段 */
-        append?: boolean;
-        /** 增量时从哪里开始替换 */
-        replaceFrom?: number;
         /** 服务端队列里等着交给模型的那几条（`Message` 的形状，`done: false`） */
         queued?: Message[];
         /** 这份是哪个会话的 */
         session?: string;
         /** 上一个回合失败的原因（没在跑时才有） */
         turnError?: string;
-        /**
-         * 增量且是同一回合的延续：`messages[0]` 接在本地第 `replaceFrom` 条
-         * （assistant）的前 `keepParts` 个 part 后面 —— 服务端只重发最后一步，
-         * 不再把整个回合重发一遍（见 core 的 `session_patch`）。
-         */
-        keepParts?: number | null;
         /** token 用量（输入框那个圆环）。服务端那份是权威 */
         usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
-        /** 这一窗在**完整视图**里的起点（`messages` 下标从这里开始） */
-        from?: number;
-        /** 更早的还有没有（`false` = 这就是整段了） */
-        hasMore?: boolean;
-      };
+        }
+      >(
+        `/api/session?rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
+      );
       // 请求在路上的时候本地发了一条（`send`）：这份是发之前的样子，拿它整份
       // 覆盖会把刚推进去的用户消息和正在流的那条助手消息冲掉 —— 流接着往一个
       // 已经不在列表里的对象里写，界面上就是「没回复」。丢掉，下一次再拉。
       if (busy || at !== sent) return;
-      serverBusy = !!d.busy;
+      // 服务端说这个会话在不在跑。**只在本地没连着流时才认**：连着流的时候
+      // 本地那份更新（`run` 收完流会自己落到 `idle`），拿一个路上算好的旧值
+      // 盖上去只会让停止键闪一下。
+      if (!busy) view = d.busy ? { k: "remote" } : { k: "idle" };
       rev = d.rev ?? "";
       // 排队那几条按服务端**整份重来**（`unchanged` 时也要）：它们的变化不进
       // `rev`（那是消息的版本号），光看 rev 看不出「排队里少了一条」。
@@ -342,12 +353,13 @@
       // 报上它们（或者它们已经开跑了）。
       const sid = d.session ?? sessionId;
       if (d.queued) {
-        // 只换**这个**会话的那几条：别的会话的排队项留着（切回去之前不会再拉它们）
-        const inflight = queue.filter((q) => q.pending && q.sid === sid);
+        // 只换**这个**会话的那几条：别的会话的排队项留着（切回去之前不会再拉它们）。
+        // 名字别叫 `inflight` —— 那是「这一份 /api/session 在不在路上」的门。
+        const hoping = queue.filter((q) => q.pending && q.sid === sid);
         queue = [
           ...queue.filter((q) => q.sid !== sid),
           ...d.queued.map((m): Queued => ({ id: m.id, sid, parts: m.parts })),
-          ...inflight,
+          ...hoping,
         ];
       }
       // 服务端说没变：连 JSON 里都不带 messages，什么都不用做
@@ -363,11 +375,7 @@
       // 补丁 / 整窗两条路的规则在 `lib/session.ts` 里（有测试盯着，见 `bun test`）。
       const same = sid === sessionId;
       if (d.append && same) {
-        const r = applyPatch(
-          { messages, windowFrom },
-          d as SessionPayload,
-          winAt,
-        );
+        const r = applyPatch({ messages, windowFrom }, d, winAt);
         if (!r.ok) {
           if (r.why === "mismatch") {
             // 本地那条和服务端以为的对不上：老老实实重新要一份全量
@@ -381,9 +389,7 @@
         }
         setWindow(r.window);
       } else {
-        setWindow(
-          applyWindow({ messages, windowFrom }, d as SessionPayload, same),
-        );
+        setWindow(applyWindow({ messages, windowFrom }, d, same));
       }
       if (d.turnError) showTurnError(d.turnError);
       sessionId = sid;
@@ -414,7 +420,6 @@
     messages.push({
       id: uid(),
       role: "assistant",
-      steps: 0,
       done: true,
       parts: [{ type: "error", text }],
     });
@@ -429,8 +434,14 @@
   let rev = "";
 
   /**
-   * 本地往消息列表里加过东西的次数（`send` / 开跑）。`loadMessages` 发请求前记一下，
-   * 回来时对不上就说明这份是旧的（见那里的注释）。
+   * 消息列表被本地改过的版本号。**只在真往 `messages` 里加东西时才加一**。
+   *
+   * `loadMessages` 发请求前记下它，回来时对不上就说明这份回包算的是加之前的样子
+   * —— 拿它整份覆盖会把刚推进去的用户消息和正在流的那条冲掉（见那里的注释）。
+   *
+   * 以前在 `send()` 里就 +1 了（那时消息还没进列表），等于把一个「还没发生」的
+   * 改动提前记账：`ensureSession` 那一路要是慢，中间回来的那份回包会被无理由丢掉。
+   * 现在只有真正 `messages.push` 的两条路（建会话失败、开跑）各加一次。
    */
   let sent = 0;
 
@@ -450,11 +461,6 @@
    * 切回去才轮到它发）。
    */
   let sessionId = $state("");
-  // `store` 里留一份只读镜像（`lib/partfull.ts` 的缓存 key 要用：`r3` 这种 part id
-  // 只在会话内有意义）。放一个 effect 比在 6 个赋值点各写一遍更不容易漏。
-  $effect(() => {
-    store.sessionId = sessionId;
-  });
 
   /**
    * 把算好的三个值写回去（`$state` 得逐个赋值才触发更新）。
@@ -478,16 +484,11 @@
    *
    * 接不上就整页丢掉（`prependPage` 给 null）：宁可少一窗，也不能在中间留个洞。
    */
-  function insertOlder(p: {
-    page: Message[];
-    from: number;
-    hasMore: boolean;
-  }): boolean {
+  function insertOlder(p: { page: Message[]; from: number }): boolean {
     if (!p.page.length) return false; // 空页：什么都不用做，下次再要
     const next = prependPage(currentWindow(), {
       messages: p.page,
       from: p.from,
-      hasMore: p.hasMore,
     });
     if (!next) return false;
     setWindow(next);
@@ -505,19 +506,13 @@
   ): Promise<Omit<NonNullable<typeof pending>, "sid" | "base"> | null> {
     const sid = sessionId;
     try {
-      const r = await fetch(
+      const d = await api<SessionPayload>(
         `/api/session?id=${encodeURIComponent(sid)}&before=${base}&tail=${MSG_WINDOW}`,
       );
-      if (!r.ok) return null;
-      const d = (await r.json()) as SessionPayload;
       // 这一路走的过程中会话切走了 / 窗口又变了一页 / 已经没有更早的了：这份不要了
       if (sid !== sessionId || base !== windowFrom || windowFrom === 0)
         return null;
-      return {
-        page: d.messages ?? [],
-        from: d.from ?? 0,
-        hasMore: !!d.hasMore,
-      };
+      return { page: d.messages ?? [], from: d.from ?? 0 };
     } catch {
       return null;
     }
@@ -654,16 +649,12 @@
     const keep = sessions.length;
     const p = (async () => {
       try {
-        const r = await fetch(`/api/sessions${keep ? `?tail=${keep}` : ""}`);
-        if (r.ok) {
-          const d = (await r.json()) as {
-            sessions?: Session[];
-            next?: string | null;
-          };
-          sessions = d.sessions ?? [];
-          // 整份重来：游标也跟着回到第一页之后（之前翻出来的那些没了）
-          sessionsNext = d.next ?? null;
-        }
+        const d = await api<{ sessions?: Session[]; next?: string | null }>(
+          `/api/sessions${keep ? `?tail=${keep}` : ""}`,
+        );
+        sessions = d.sessions ?? [];
+        // 整份重来：游标也跟着回到第一页之后（之前翻出来的那些没了）
+        sessionsNext = d.next ?? null;
       } catch {
         /* 同上 */
       } finally {
@@ -691,14 +682,9 @@
     sessionsMoreBusy = true;
     const at = sessions.length;
     try {
-      const r = await fetch(
+      const d = await api<{ sessions?: Session[]; next?: string | null }>(
         `/api/sessions?before=${encodeURIComponent(cursor)}`,
       );
-      if (!r.ok) return;
-      const d = (await r.json()) as {
-        sessions?: Session[];
-        next?: string | null;
-      };
       // 这期间整份重来过（切会话 / 回合收尾 / 回前台）：游标和工作都换了，这份丢掉
       if (sessionsNext !== cursor || sessions.length !== at) return;
       // 按 id 去重：翻页期间新建的会话会顶到最前面，理论上不该重复，但宁可少一行
@@ -717,45 +703,56 @@
 
   function newSession() {
     detach();
+    resetView();
     // **不请求服务端**：新会话到第一句话才建（`ensureSession`），
     // 这里只把本地视图清空 —— 点了不发就不会攒出一堆空会话。
-    fresh = true;
+    view = { k: "fresh" };
+    drawer = false;
+  }
+
+  /**
+   * 把「手上这一个会话的视图」清空。**切会话三条路共用**（新建 / 切换 / 删除）。
+   *
+   * 以前这段在三个函数里各抄了一遍，而且已经抄漂了：`newSession` 清了 `usage` 和
+   * `serverBusy`，另外两个没清 —— 删掉当前会话之后，输入框上那个圆环还在报被删
+   * 那个会话的用量，`serverBusy` 还是 true 的话输入框会冻到下一次响应回来。
+   *
+   * `fresh` 不在这里：它表示「还没在服务端建」，只有新建和保证建过之后才说得清。
+   */
+  function resetView() {
     rev = "";
     sessionId = "";
     messages = [];
-    // 新会话还没跑过，手上这一窗的起点和「还有没有更早的」都从头算
+    // 手上这一窗的起点和「还有没有更早的」都从头算
     windowFrom = 0;
     pending = null;
-    // 新会话还没跑过，用量也从零开始
+    // 用量是**每个会话**的，跟着一起清
     usage = null;
-    // 新会话在服务端**还不存在**，所以它一定没在跑 —— 不清的话会留着上一条
-    // 会话的「服务端还在跑」，输入框要等一个轮询周期才解冻。
-    serverBusy = false;
-    drawer = false;
+    // 服务端在不在跑也是每个会话的：不清就会留着上一条会话的「还在跑」。
+    // **`fresh` 除外**（见 `newSession`）：它是「还没建」，由调用方决定。
+    view = { k: "idle" };
   }
 
   async function switchSession(id: string) {
     detach();
-    await fetch("/api/sessions/activate", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id }),
-    });
-    fresh = false;
-    rev = "";
-    sessionId = "";
-    windowFrom = 0;
-    pending = null;
+    try {
+      await post("/api/sessions/activate", { id });
+    } catch {
+      // 切不过去就不动（界面上还是原来那个会话）；后面 loadMessages 会按
+      // 服务端当前的 active 回答，不会停在两个会话之间
+      return;
+    }
+    resetView();
     await Promise.all([loadSessions(true), loadMessages()]);
     drawer = false;
   }
 
   async function renameSession(id: string, title: string) {
-    await fetch("/api/sessions/rename", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id, title }),
-    });
+    try {
+      await post("/api/sessions/rename", { id, title });
+    } catch {
+      /* 名字没改成就还是旧名字，下一次拉列表会纠正 */
+    }
     await loadSessions(true);
   }
 
@@ -763,16 +760,12 @@
     if (id === sessionId) detach();
     // 这个会话没了，它排着的队也没地方发了
     queue = queue.filter((q) => q.sid !== id);
-    await fetch("/api/sessions/delete", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id }),
-    });
-    fresh = false;
-    rev = "";
-    sessionId = "";
-    windowFrom = 0;
-    pending = null;
+    try {
+      await post("/api/sessions/delete", { id });
+    } catch {
+      /* 删不掉的话下一次拉列表它还在，界面不会撒谎 */
+    }
+    resetView();
     await Promise.all([loadSessions(true), loadMessages()]);
   }
 
@@ -880,10 +873,12 @@
   // 看到逐步骤推进。
   /** 轮询间隔（ms）。服务端的粒度是「一步」，1.5 秒完全够用；再密就是白转发。 */
   const POLL_MS = 1500;
+  /** `stop()` 之后那次拉取的定时器（见那里） */
+  let afterStop: ReturnType<typeof setTimeout> | undefined;
   /** 按下停止之后过多久拉一次（给服务端一点时间把「已停止」的工具结果补上） */
   const AFTER_STOP_MS = 300;
   $effect(() => {
-    if (!serverBusy) return;
+    if (!running) return;
     const t = setInterval(() => void loadMessages(), POLL_MS);
     return () => clearInterval(t);
   });
@@ -906,7 +901,6 @@
           id: q.id,
           role: "user",
           parts: q.parts,
-          steps: 0,
           done: true,
         });
       }
@@ -923,7 +917,6 @@
       id: q.id,
       role: "user",
       parts: q.parts,
-      steps: 0,
       done: false,
     })),
   );
@@ -1016,11 +1009,10 @@
     msg: Message,
     stream: AsyncGenerator<UiChunk, void, undefined>,
   ) {
-    live = me;
-    busy = true;
+    view = { k: "live", run: me };
     let cur = msg;
     try {
-      await consume(msg, stream, undefined, (prev) => {
+      await consume(msg, stream, (prev) => {
         prev.done = true;
         cur = store.beginStreaming();
         messages.push(cur);
@@ -1033,9 +1025,8 @@
     } finally {
       cur.done = true;
       // 已经被 detach（切走了）、或者后面又开了一条：别把别人的状态清掉
-      if (live === me) {
-        live = null;
-        busy = false;
+      if (view.k === "live" && view.run === me) {
+        view = { k: "idle" };
         // 流收完了：换成服务端那份（id、合并方式以它为准；流里断了的也补回来）
         void loadMessages();
       }
@@ -1048,10 +1039,10 @@
   async function ensureSession(): Promise<string | null> {
     if (!fresh && sessionId) return sessionId;
     try {
-      const r = await fetch("/api/sessions", { method: "POST" });
-      if (!r.ok) return null;
-      const { id } = (await r.json()) as { id: string };
-      fresh = false;
+      const { id } = await post<{ id: string }>("/api/sessions");
+      // 哪怕这会儿已经在跑了也用 `idle`：`deliver` 紧接着会把 `view` 换成
+      // `live`（或者服务端说排队了，由 `loadMessages` 认成 `remote`）。
+      view = { k: "idle" };
       sessionId = id;
       rev = "";
       return id;
@@ -1078,18 +1069,17 @@
     const text = input.trim();
     if (!text && attachments.length === 0) return;
     input = "";
-    sent++;
     ownSend++;
 
     const id = uid();
     const parts = userParts(text, attachments);
     const sid = await ensureSession();
     if (!sid) {
-      messages.push({ id, role: "user", parts, steps: 0, done: true });
+      sent++;
+      messages.push({ id, role: "user", parts, done: true });
       messages.push({
         id: uid(),
         role: "assistant",
-        steps: 0,
         done: true,
         parts: [{ type: "error", text: "建会话失败，再试一次" }],
       });
@@ -1150,11 +1140,10 @@
     } catch (e) {
       // 连请求都没发出去：把那条虚线气泡撤了，用一条错误消息说清楚（字不能丢）
       queue = queue.filter((q) => q.id !== id);
-      messages.push({ id, role: "user", parts, steps: 0, done: true });
+      messages.push({ id, role: "user", parts, done: true });
       messages.push({
         id: uid(),
         role: "assistant",
-        steps: 0,
         done: true,
         parts: [{ type: "error", text: String(e) }],
       });
@@ -1169,14 +1158,15 @@
       // 见 core 的 `http::chat`）—— 那个回合没有连着我们，拉一次才知道它在跑、开始轮询
       void loadMessages();
       // 本地这条流结束了 ≠ 服务端那个回合结束了：此刻还在跑的是**另一条**流
-      // （或者根本没连着）。所以这里 busy 一点都不动。
+      // （或者根本没连着）。所以这里 `view` 一点都不动 —— 紧接着那次
+      // `loadMessages` 会按服务端的 `busy` 把它置成 `remote`，轮询就开起来了。
       return;
     }
 
     // 开跑了：那条虚线气泡翻进正文（换了个 id 的影子都没有 —— 就是同一个 id）
     queue = queue.filter((q) => q.id !== id);
     sent++;
-    messages.push({ id, role: "user", parts, steps: 0, done: true });
+    messages.push({ id, role: "user", parts, done: true });
     const msg = store.beginStreaming();
     messages.push(msg);
     await run(me, msg, prepend(first, stream));
@@ -1193,11 +1183,7 @@
     const item = queue.find((q) => q.id === id);
     queue = queue.filter((q) => q.id !== id);
     if (!item) return;
-    void fetch("/api/sessions/unqueue", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ session: item.sid, id }),
-    }).catch(() => {
+    void post("/api/sessions/unqueue", { session: item.sid, id }).catch(() => {
       /* 撤不掉就算了：它已经落进正文，或者下次轮询会纠正 */
     });
   }
@@ -1206,38 +1192,49 @@
     // 服务端循环看不到 SSE 断连（tx.send 失败会被忽略），得显式告诉它停。
     // 否则前端显示停了，agent 还在后台一轮轮跑工具、烧 token。
     // 只停**这个**会话的回合：别的会话在跑的不受影响。
-    void fetch("/api/stop", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(sessionId ? { session: sessionId } : {}),
+    void post("/api/stop", sessionId ? { session: sessionId } : {}).catch(() => {
+      /* 停不下来也得把本地的流断掉（下面照样 abort） */
     });
-    const r = live;
-    live = null;
-    busy = false;
+    const r = view.k === "live" ? view.run : null;
+    // 点了停止：先按「没在跑」画出来（服务端那边 300ms 内会确认），
+    // 拉回来的那份要是还在跑，`loadMessages` 会再翻成 `remote`
+    view = { k: "idle" };
     r?.controller.abort();
     // 本地流断了，服务端收尾（补上「已停止」的工具结果）的那几条要拉回来；
-    // 没连着流时按的停止也一样：马上拉一次，「运行中」尽快消失
-    setTimeout(() => void loadMessages(), AFTER_STOP_MS);
+    // 没连着流时按的停止也一样：马上拉一次，「运行中」尽快消失。
+    //
+    // 句柄留着、下一次按下先清掉：300ms 内连按两下停止（或者按了停止又马上发下
+    // 一句），前一个定时器会在新回合开跑之后才到，那次拉取和 `/api/chat` 赛跑 ——
+    // `at !== sent` 那道门会把它丢掉，但白传一整窗历史。
+    clearTimeout(afterStop);
+    afterStop = setTimeout(() => void loadMessages(), AFTER_STOP_MS);
   };
 </script>
+
+<!-- 抽屉那堆 props 只有「并排 / 盖在上面」这一处不同，两个宽度下各挂一次。
+     以前是把同一份 11 个 prop 抄了两遍，加一个 prop 要记得改两处。 -->
+{#snippet drawerBody(pinned: boolean)}
+  <Drawer
+    {sessions}
+    {peek}
+    onclose={close}
+    onswitch={switchSession}
+    ondelete={deleteSession}
+    onrename={renameSession}
+    onsettings={() => (settings = true)}
+    machine={store.machine}
+    onmachine={openMachines}
+    onmore={loadMoreSessions}
+    more={sessionsNext !== null}
+    {pinned}
+  />
+{/snippet}
 
 <div class="flex h-full overflow-hidden bg-ink">
   <!-- 宽屏：侧边栏**并排**在左边（不是抽屉），默认收着，点左上角的菜单展开。
        窄屏：它还是盖在对话上的抽屉，同样是那个菜单按钮控制（见下面）。 -->
   {#if wide.on && sidebar}
-    <Drawer
-      {sessions}
-      onclose={close}
-      onswitch={switchSession}
-      ondelete={deleteSession}
-      onrename={renameSession}
-      onsettings={() => (settings = true)}
-      machine={store.machine}
-      onmachine={openMachines}
-      onmore={loadMoreSessions}
-      more={sessionsNext !== null}
-      pinned
-    />
+    {@render drawerBody(true)}
   {/if}
 
   <!-- 对话区：把侧边栏剩下的宽度**全部**拿走（不限宽）。 -->
@@ -1325,7 +1322,7 @@
 
       <Composer
         bind:value={input}
-        busy={busy || serverBusy}
+        busy={running}
         {usage}
         {ctxWindow}
         onsend={send}
@@ -1337,19 +1334,7 @@
 
   <!-- 窄屏：抽屉盖在对话上（宽屏它已经并排在左边了） -->
   {#if !wide.on && drawer}
-    <Drawer
-      {peek}
-      {sessions}
-      onclose={close}
-      onswitch={switchSession}
-      ondelete={deleteSession}
-      onrename={renameSession}
-      onsettings={() => (settings = true)}
-      machine={store.machine}
-      onmachine={openMachines}
-      onmore={loadMoreSessions}
-      more={sessionsNext !== null}
-    />
+    {@render drawerBody(false)}
   {/if}
 </div>
 

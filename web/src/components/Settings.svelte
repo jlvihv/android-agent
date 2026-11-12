@@ -54,6 +54,7 @@
   import StatusSection from "./StatusSection.svelte";
   import UsageSection from "./UsageSection.svelte";
   import { store } from "../lib/store.svelte.ts";
+  import { api } from "../lib/api";
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -65,9 +66,7 @@
   async function load() {
     err = "";
     try {
-      const r = await fetch("/api/providers");
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      rows = ((await r.json()) as { providers: ProviderRow[] }).providers;
+      rows = (await api<{ providers: ProviderRow[] }>("/api/providers")).providers;
     } catch (e) {
       err = String(e);
     }

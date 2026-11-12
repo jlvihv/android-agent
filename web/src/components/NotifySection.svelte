@@ -11,6 +11,7 @@
    */
   import Switch from "./Switch.svelte";
   import { store } from "../lib/store.svelte.ts";
+  import { api, post } from "../lib/api";
 
   type Config = {
     /** 这个平台会不会发系统通知（手机上恒 false） */
@@ -28,9 +29,7 @@
 
   async function load() {
     try {
-      const r = await fetch("/api/notify");
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      cfg = (await r.json()) as Config;
+      cfg = await api<Config>("/api/notify");
     } catch (e) {
       err = String(e).replace(/^Error: /, "");
     }
@@ -45,12 +44,7 @@
     busy = true;
     err = "";
     try {
-      const r = await fetch("/api/notify", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ enabled: next }),
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      await post("/api/notify", { enabled: next });
       await load();
     } catch (e) {
       err = String(e).replace(/^Error: /, "");

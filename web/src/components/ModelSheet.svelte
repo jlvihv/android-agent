@@ -35,6 +35,7 @@
   import { models, type Group, type Model } from "../lib/models.svelte.ts";
   import { EFFORTS, effortLabel } from "../lib/effort";
   import { PAGE_MS } from "../lib/drag";
+  import { post } from "../lib/api";
   import type { Peek } from "../lib/overlay";
 
   let {
@@ -192,16 +193,11 @@
     busy = true;
     models.err = "";
     try {
-      const r = await fetch("/api/model", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model,
-          provider: provider ?? undefined,
-          reasoningEffort: e ?? "",
-        }),
+      await post("/api/model", {
+        model,
+        provider: provider ?? undefined,
+        reasoningEffort: e ?? "",
       });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
       models.setProvider(provider);
       await store.reloadHealth();
     } catch (e) {

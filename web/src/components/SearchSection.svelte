@@ -6,6 +6,8 @@
    * 出口的人共用）。用完了才需要填（见 docs/09）。key 本身服务端不回，只回末尾几位。
    * 存进库（`meta` 的 `exa_api_key`），**没有环境变量那条路**。
    */
+  import { api, post } from "../lib/api";
+
   type Config = {
     configured: boolean;
     keyHint: string | null;
@@ -18,9 +20,7 @@
 
   async function load() {
     try {
-      const r = await fetch("/api/websearch/config");
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-      cfg = (await r.json()) as Config;
+      cfg = await api<Config>("/api/websearch/config");
     } catch (e) {
       err = String(e).replace(/^Error: /, "");
     }
@@ -34,12 +34,7 @@
     busy = true;
     err = "";
     try {
-      const r = await fetch("/api/websearch/config", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ exa_api_key: value }),
-      });
-      if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      await post("/api/websearch/config", { exa_api_key: value });
       key = "";
       await load();
     } catch (e) {
