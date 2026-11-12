@@ -614,6 +614,17 @@
   let sessionsNext = $state<string | null>(null);
   /** 正在拉下一页（滚到底会反复触发，别叠请求；抽屉底部那行「载入中」也看它） */
   let sessionsMoreBusy = $state(false);
+  /**
+   * 上一页**没拉成**（网络 / 后端）。
+   *
+   * 和「到底了」必须分开：`finally` 里 `sessionsMoreBusy` 一落，抽屉那边就只剩
+   * 「还有没有下一页」这一个信号 —— 拉失败时 `sessionsNext` 还是原值（还有更多），
+   * 但界面不能装作一切正常接着自动要（会死循环），也不能说「没有更早的了」
+   *（那是撒谎）。所以这里记一笔，抽屉改口「加载失败，点这里重试」。
+   *
+   * 一旦用户重试成功或者整份列表重来过，就清掉。
+   */
+  let sessionsMoreError = $state(false);
 
   /**
    * `force`：绕开合并，**一定**打一份新的（重命名 / 删除 / 切换会话 / 回合收尾）。
@@ -652,6 +663,7 @@
         sessions = d.sessions ?? [];
         // 整份重来：游标也跟着回到第一页之后（之前翻出来的那些没了）
         sessionsNext = d.next ?? null;
+        sessionsMoreError = false;
       } catch {
         /* 同上 */
       } finally {
@@ -677,6 +689,7 @@
     const cursor = sessionsNext;
     if (!cursor || sessionsMoreBusy) return;
     sessionsMoreBusy = true;
+    sessionsMoreError = false;
     const at = sessions.length;
     try {
       const d = await api<{ sessions?: Session[]; next?: string | null }>(
@@ -692,7 +705,11 @@
       ];
       sessionsNext = d.next ?? null;
     } catch {
-      /* 拉不到就下次滚到底再试 */
+      // 记下来，抽屉里那行改成「加载失败，点这里重试」——
+      // **不要**静默：以前这里什么都不做，界面上那行「载入中…」既没变成错误、
+      // 也没人去要下一页（自动要的那条路被 `sessionsMoreBusy` 挡住过一轮），
+      // 看起来就是「一直在载入、永远载不完」。
+      sessionsMoreError = true;
     } finally {
       sessionsMoreBusy = false;
     }
@@ -1225,6 +1242,8 @@
     onmachine={openMachines}
     onmore={loadMoreSessions}
     more={sessionsNext !== null}
+    moreBusy={sessionsMoreBusy}
+    moreError={sessionsMoreError}
     {pinned}
   />
 {/snippet}

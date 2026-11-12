@@ -38,7 +38,7 @@
   import { dismissable, RELEASE } from "../lib/drag";
   import { focusRestore } from "../lib/focus";
   import Icon from "./Icon.svelte";
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { machines } from "../lib/machines.svelte.ts";
   import { favorites, type Favorite } from "../lib/favorites.svelte.ts";
   import { sandboxPath } from "../lib/markdown";
@@ -85,6 +85,10 @@
     onmore,
     /** 还有没有下一页（`App` 的 `sessionsNext !== null`） */
     more = false,
+    /** 这一页正在路上（`App` 的 `sessionsMoreBusy`）—— 只有它能显示「载入中」 */
+    moreBusy = false,
+    /** 上一页没拉成（`App` 的 `sessionsMoreError`）—— 显示重试，别装作到底了 */
+    moreError = false,
   }: {
     sessions: Session[];
     onclose: () => void;
@@ -101,6 +105,8 @@
     onmachine: (() => void) | null;
     onmore?: () => void;
     more?: boolean;
+    moreBusy?: boolean;
+    moreError?: boolean;
   } = $props();
 
   /**
@@ -359,13 +365,44 @@
    * 那时列表画的是命中，和分页没关系。
    */
   const MORE_LEAD_PX = 200;
+  let scroller: HTMLElement | null = $state(null);
+
   function maybeMore() {
-    if (!more || !onmore || !scroller || q.trim()) return;
+    if (!more || !onmore || !scroller || q.trim() || moreBusy) return;
     const left =
       scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
     if (left < MORE_LEAD_PX) onmore();
   }
-  let scroller: HTMLElement | null = $state(null);
+
+  /**
+   * 「列表还没填满」也要接着要 —— 而且**不能只等 scroll 事件**。
+   *
+   * 电脑上侧边栏一打开就是满屏高度、一页 20 行却只占半屏：`scrollHeight` 不大于
+   * `clientHeight`，滚动条根本不出现，`onscroll` 一次都不会派发。于是底下那行
+   * 「载入中…」永远挂着、下一页永远不来（这就是「始终显示载入中但不真的载入」）。
+   *
+   * 所以每次 `sessions` / `more` / 抽屉挂载变化之后主动量一次：还没填满就继续要，
+   * 直到填满或者没有下一页。`moreBusy` 是那道重入门（`maybeMore` 里也拦一次）。
+   *
+   * `untrack` 里读那几个 prop 会被当成依赖（正是我们要的）；`tick()` 是因为
+   * 列表刚到、DOM 还没排完，这时候量出来的 `scrollHeight` 是上一次的。
+   */
+  $effect(() => {
+    // 盯：列表长度、还有没有下一页、是否正在要、搜索状态
+    void sessions.length;
+    void more;
+    void moreBusy;
+    void moreError;
+    void q;
+    // 失败了就**不再自动要**：交给人点那一下（否则一秒一次地打后端）
+    if (!more || moreBusy || moreError || q.trim()) return;
+    void untrack(() =>
+      tick().then(() => {
+        // 抽屉可能已经关了（`scroller` 被置空）
+        if (scroller) maybeMore();
+      }),
+    );
+  });
 
   /** 点收藏行：直接打开那个页面，顺手收起抽屉（宽屏那一栏不受影响） */
   function openPage(f: Favorite) {
@@ -515,11 +552,28 @@
           </button>
         {/if}
       {/each}
-      <!-- 还有更早的：滚到底自动去要（`maybeMore`）。这一行是给人看的反馈 ——
-           一页 20 条，翻的时候总得知道「下面还有」。到底了就什么都不留。 -->
-      {#if more}
+      <!-- 下面还有更早的。
+           **「载入中…」只在真的在载入时写** —— 以前这一行跟 `more`（= 还有下一页）
+           绑在一起，于是它常驻在列表底部，看着像一直在转、其实什么都没发生。
+           现在分三种：正在要 → 载入中；要完了还有 → 什么都不写（滚动过去自然触发）；
+           要完了没了 → 一行「没有更早的对话了」，让人知道到底了而不是卡住了。 -->
+      {#if moreBusy}
         <p class="px-3 py-3 text-center text-xs text-faint" aria-live="polite">
           载入中…
+        </p>
+      {:else if moreError}
+        <!-- 失败了要说清楚，而且给一条重试的路。以前这里既不报错也不重试，
+             看上去就是「一直在载入」。 -->
+        <button
+          onclick={() => onmore?.()}
+          class="w-full px-3 py-3 text-center text-xs text-warn"
+          aria-live="polite"
+        >
+          加载失败，点这里重试
+        </button>
+      {:else if !more && sessions.length > 0}
+        <p class="px-3 py-3 text-center text-xs text-faint">
+          没有更早的对话了
         </p>
       {/if}
     {/if}
