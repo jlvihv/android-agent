@@ -18,7 +18,7 @@
  * 给它们发 `content-encoding`。
  */
 import { brotliCompressSync, gzipSync, constants } from "node:zlib";
-import { readdir, readFile, writeFile, stat } from "node:fs/promises";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join, extname } from "node:path";
 
 /** 值得压的扩展名（和 core/src/assets.rs 的 `COMPRESSIBLE` 必须一致） */
@@ -38,6 +38,7 @@ const BR = {
   },
 };
 
+/** @param {string} dir @param {string[]} [out] @returns {Promise<string[]>} */
 async function walk(dir, out = []) {
   for (const e of await readdir(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
@@ -58,6 +59,7 @@ export function precompress() {
       let raw = 0;
       let br = 0;
       let gz = 0;
+      /** @type {Array<[string, number, number, number]>} 名字 / 原始 / br / gz */
       const rows = [];
       for (const f of files) {
         const buf = await readFile(f);
@@ -72,6 +74,8 @@ export function precompress() {
         rows.push([f.replace(`${dist}/`, ""), buf.length, b.length, g.length]);
       }
       if (!rows.length) return;
+      /** @param {number} n */
+      /** @param {number} n */
       const pct = (n) => `${((n / raw) * 100).toFixed(1)}%`;
       console.log(
         `\n预压缩 ${rows.length} 个文件：原始 ${(raw / 1024).toFixed(1)} KB → ` +
