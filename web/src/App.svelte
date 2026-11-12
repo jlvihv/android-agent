@@ -1302,6 +1302,7 @@
     more={sessionsNext !== null}
     moreBusy={sessionsMoreBusy}
     moreError={sessionsMoreError}
+    current={sessionId}
     {pinned}
   />
 {/snippet}

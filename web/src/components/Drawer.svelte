@@ -47,7 +47,6 @@
   export type Session = {
     id: string;
     title: string;
-    active: boolean;
     count: number;
     /** 这个会话有回合在跑（可以同时在几个会话里各跑一个） */
     busy?: boolean;
@@ -56,7 +55,6 @@
   export type Hit = {
     id: string;
     title: string;
-    active: boolean;
     role: string;
     snippet: string;
   };
@@ -89,6 +87,14 @@
     moreBusy = false,
     /** 上一页没拉成（`App` 的 `sessionsMoreError`）—— 显示重试，别装作到底了 */
     moreError = false,
+    /**
+     * 用户**正在看**哪条会话（`App` 的 `sessionId`）—— 高亮那一行。
+     *
+     * 以前从 `Session.active` 来，那是服务端算的（`s.id == store.active`）。
+     * 服务端现在不记「当前会话」了（见 core 的 `SessionStore` 注释），
+     * 所以这里由 `App` 传前端自己的答案 —— 这也正是它该在的地方。
+     */
+    current = "",
   }: {
     sessions: Session[];
     onclose: () => void;
@@ -107,6 +113,7 @@
     more?: boolean;
     moreBusy?: boolean;
     moreError?: boolean;
+    current?: string;
   } = $props();
 
   /**
@@ -162,9 +169,11 @@
   /**
    * 命中按会话分组。
    *
-   * 平铺的话，同一个会话的三条命中会把标题重复三遍，而且
-   * `h.active`（当前打开的那个会话）会给其中几条涂上 #414141 ——
-   * 看着像“这几条被选中了”，其实跟搜索无关。
+   * 平铺的话，同一个会话的三条命中会把标题重复三遍。
+   *
+   * （早就不是这样了，留个记录：以前每条命中带一个服务端算的 `active`，
+   * 当前会话的那几条会被涂上 #414141，看着像"这几条被选中了"，其实跟搜索
+   * 无关。那个字段现在连有都没有 —— 服务端不记「当前会话」了。）
    */
   const groups = $derived.by(() => {
     const m = new Map<string, { id: string; title: string; hits: Hit[] }>();
@@ -538,7 +547,7 @@
               onswitch(s.id);
             }}
             class="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left
-                   {s.active ? 'bg-active' : ''}"
+                   {s.id === current ? 'bg-active' : ''}"
           >
             <Icon name="chat" size={18} class="shrink-0 text-muted" />
             <span class="min-w-0 flex-1 truncate text-base">{s.title}</span>
