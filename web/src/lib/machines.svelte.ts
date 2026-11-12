@@ -186,7 +186,10 @@ class Machines {
       // 错误正文可能是 JSON（`{error: "…"}`）也可能是一段纯文本（核心没起来时
       // 是网关的 502），两种都要能给出那句人话 —— `ApiError.message` 就是它
       //（`lib/api.ts` 里统一做的），这里只负责落进 `err` 并返回 null。
-      const j = await post<Record<string, unknown>>(`/api/machines/${what}`, body);
+      const j = await post<Record<string, unknown>>(
+        `/api/machines/${what}`,
+        body,
+      );
       this.err = "";
       return j;
     } catch (e) {

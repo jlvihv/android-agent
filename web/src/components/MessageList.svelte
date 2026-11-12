@@ -373,8 +373,7 @@
     void needFull(tool.toolCallId, tool.chars, tool.inputTruncated).then(() => {
       // 取回来之后只更新「正开着的这个面板」，别去动别人的
       const got = fullBySession[sid]?.[tool.toolCallId]?.input;
-      if (got && sheet?.kind === "tool" && sheet.tool === tool)
-        panelArgs = got;
+      if (got && sheet?.kind === "tool" && sheet.tool === tool) panelArgs = got;
     });
   }
 

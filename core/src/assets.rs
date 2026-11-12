@@ -52,7 +52,9 @@ fn get(path: &str) -> Option<Cow<'static, [u8]>> {
 
 /// 值得带 `content-encoding` 的扩展名 —— **必须**和 `web/scripts/precompress.mjs`
 /// 里的 `TYPES` 一致：那边不给图片 / 字体生成 `.br`，这边也就不会去找。
-const COMPRESSIBLE: [&str; 8] = [".js", ".mjs", ".css", ".html", ".svg", ".json", ".txt", ".map"];
+const COMPRESSIBLE: [&str; 8] = [
+    ".js", ".mjs", ".css", ".html", ".svg", ".json", ".txt", ".map",
+];
 
 /// 这个路径该不该找压缩版
 fn compressible(path: &str) -> bool {
@@ -186,7 +188,10 @@ mod tests {
     #[test]
     fn 挑压缩方式() {
         // brotli 优先
-        assert_eq!(pick_encoding(&hdr("gzip, deflate, br")), Some((".br", "br")));
+        assert_eq!(
+            pick_encoding(&hdr("gzip, deflate, br")),
+            Some((".br", "br"))
+        );
         assert_eq!(pick_encoding(&hdr("br")), Some((".br", "br")));
         // 只有 gzip 就给 gzip
         assert_eq!(pick_encoding(&hdr("gzip, deflate")), Some((".gz", "gzip")));
@@ -201,10 +206,7 @@ mod tests {
     #[test]
     fn q0_是明确拒绝_要降级() {
         // `br;q=0` = 客户端明确说不要 br —— 这时不能硬发，得退到 gzip
-        assert_eq!(
-            pick_encoding(&hdr("br;q=0, gzip")),
-            Some((".gz", "gzip"))
-        );
+        assert_eq!(pick_encoding(&hdr("br;q=0, gzip")), Some((".gz", "gzip")));
         // 两个都拒了：原文
         assert_eq!(pick_encoding(&hdr("br;q=0, gzip;q=0")), None);
         // 其它 q 值（>0）照收

@@ -16,7 +16,10 @@ declare module "node:zlib" {
     BROTLI_PARAM_MODE: number;
     BROTLI_MODE_TEXT: number;
   };
-  export function brotliCompressSync(buf: Uint8Array, opts?: unknown): Uint8Array;
+  export function brotliCompressSync(
+    buf: Uint8Array,
+    opts?: unknown,
+  ): Uint8Array;
   export function gzipSync(buf: Uint8Array, opts?: unknown): Uint8Array;
 }
 

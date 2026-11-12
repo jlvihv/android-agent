@@ -142,7 +142,10 @@ function isDiff(text: string): boolean {
  * 用参数而**不是**在调用方 `{ ...t, output }` 克隆一个 ToolPart：模板里那个
  * 浅拷贝每次渲染都跑一遍，而它只是为了换一个字段。
  */
-export function describeResult(t: ToolPart, output = t.output): ResultView | null {
+export function describeResult(
+  t: ToolPart,
+  output = t.output,
+): ResultView | null {
   if (output === undefined) return null;
   return {
     text: output,

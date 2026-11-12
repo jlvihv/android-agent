@@ -21,7 +21,9 @@
 
   async function load() {
     try {
-      const d = await api<{ dir: string | null; skills: Skill[] }>("/api/skills");
+      const d = await api<{ dir: string | null; skills: Skill[] }>(
+        "/api/skills",
+      );
       skills = d.skills;
       dir = d.dir;
     } catch (e) {

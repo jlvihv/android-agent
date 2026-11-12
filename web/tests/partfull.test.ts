@@ -21,9 +21,12 @@ function stub(): void {
   globalThis.fetch = (async (url: string) => {
     calls.push(String(url));
     const q = new URL(String(url), "http://x").searchParams;
-    return new Response(JSON.stringify({ text: `${q.get("session")}:${q.get("id")}` }), {
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({ text: `${q.get("session")}:${q.get("id")}` }),
+      {
+        headers: { "content-type": "application/json" },
+      },
+    );
   }) as unknown as typeof fetch;
 }
 

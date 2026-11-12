@@ -68,10 +68,7 @@
    *（`loadMessages` 用这个门）；`fresh` = 还没建。
    */
   type View =
-    | { k: "idle" }
-    | { k: "fresh" }
-    | { k: "live"; run: Run }
-    | { k: "remote" };
+    { k: "idle" } | { k: "fresh" } | { k: "live"; run: Run } | { k: "remote" };
 
   /**
    * 本地正连着的那条流。**只属于当前看着的会话**。
@@ -320,20 +317,20 @@
     try {
       const d = await api<
         SessionPayload & {
-        // 窗口那几件（`messages` / `from` / `hasMore` / `append` / `replaceFrom` /
-        // `keepParts`）是 `SessionPayload`，在 `lib/session.ts` 里定义、有测试盯着 ——
-        // 以前这里手抄了一份，两份字段名一旦漂就靠 `as` 强转糊过去。
-        busy: boolean;
-        unchanged?: boolean;
-        rev?: string;
-        /** 服务端队列里等着交给模型的那几条（`Message` 的形状，`done: false`） */
-        queued?: Message[];
-        /** 这份是哪个会话的 */
-        session?: string;
-        /** 上一个回合失败的原因（没在跑时才有） */
-        turnError?: string;
-        /** token 用量（输入框那个圆环）。服务端那份是权威 */
-        usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
+          // 窗口那几件（`messages` / `from` / `hasMore` / `append` / `replaceFrom` /
+          // `keepParts`）是 `SessionPayload`，在 `lib/session.ts` 里定义、有测试盯着 ——
+          // 以前这里手抄了一份，两份字段名一旦漂就靠 `as` 强转糊过去。
+          busy: boolean;
+          unchanged?: boolean;
+          rev?: string;
+          /** 服务端队列里等着交给模型的那几条（`Message` 的形状，`done: false`） */
+          queued?: Message[];
+          /** 这份是哪个会话的 */
+          session?: string;
+          /** 上一个回合失败的原因（没在跑时才有） */
+          turnError?: string;
+          /** token 用量（输入框那个圆环）。服务端那份是权威 */
+          usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
         }
       >(
         `/api/session?rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
@@ -1192,9 +1189,11 @@
     // 服务端循环看不到 SSE 断连（tx.send 失败会被忽略），得显式告诉它停。
     // 否则前端显示停了，agent 还在后台一轮轮跑工具、烧 token。
     // 只停**这个**会话的回合：别的会话在跑的不受影响。
-    void post("/api/stop", sessionId ? { session: sessionId } : {}).catch(() => {
-      /* 停不下来也得把本地的流断掉（下面照样 abort） */
-    });
+    void post("/api/stop", sessionId ? { session: sessionId } : {}).catch(
+      () => {
+        /* 停不下来也得把本地的流断掉（下面照样 abort） */
+      },
+    );
     const r = view.k === "live" ? view.run : null;
     // 点了停止：先按「没在跑」画出来（服务端那边 300ms 内会确认），
     // 拉回来的那份要是还在跑，`loadMessages` 会再翻成 `remote`

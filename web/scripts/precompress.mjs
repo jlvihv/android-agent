@@ -22,7 +22,16 @@ import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join, extname } from "node:path";
 
 /** 值得压的扩展名（和 core/src/assets.rs 的 `COMPRESSIBLE` 必须一致） */
-const TYPES = new Set([".js", ".mjs", ".css", ".html", ".svg", ".json", ".txt", ".map"]);
+const TYPES = new Set([
+  ".js",
+  ".mjs",
+  ".css",
+  ".html",
+  ".svg",
+  ".json",
+  ".txt",
+  ".map",
+]);
 
 /** 太小的没必要压：多一个文件的元数据比省下的字节还值钱 */
 const MIN_BYTES = 1024;

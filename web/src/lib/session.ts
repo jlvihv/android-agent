@@ -123,7 +123,8 @@ export function applyPatch(
   // `reconcile` 靠的就是对象身份）。
   const fresh = [...(d.messages ?? [])];
   const from = d.replaceFrom ?? 0;
-  if (from < 0 || from > w.messages.length) return { ok: false, why: "mismatch" };
+  if (from < 0 || from > w.messages.length)
+    return { ok: false, why: "mismatch" };
 
   const keep = d.keepParts;
   if (keep != null) {

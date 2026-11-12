@@ -66,7 +66,8 @@
   async function load() {
     err = "";
     try {
-      rows = (await api<{ providers: ProviderRow[] }>("/api/providers")).providers;
+      rows = (await api<{ providers: ProviderRow[] }>("/api/providers"))
+        .providers;
     } catch (e) {
       err = String(e);
     }
