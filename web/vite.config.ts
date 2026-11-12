@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import tailwindcss from "@tailwindcss/vite";
+import { precompress } from "./scripts/precompress.mjs";
 
 // 不引 @types/node 就为了这一行 —— 用一个最小声明代替
 declare const process: { env: Record<string, string | undefined> };
@@ -17,7 +18,9 @@ const TOKEN = process.env.AGENT_TOKEN ?? "";
 const AUTH = TOKEN ? { "x-agent-token": TOKEN } : undefined;
 
 export default defineConfig({
-  plugins: [tailwindcss(), svelte()],
+  // 预压缩放在最后：`closeBundle` 跑在 dist 落盘之后，先把每个文本资源压成
+  // `.br` / `.gz` 一起嵌进 .so（见 scripts/precompress.mjs 和 core/src/assets.rs）。
+  plugins: [tailwindcss(), svelte(), precompress()],
   server: {
     port: 5173,
     host: true,
