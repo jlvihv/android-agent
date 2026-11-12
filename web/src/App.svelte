@@ -336,10 +336,9 @@
           usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
         }
       >(
-        // **显式带 id**：「现在看的是哪条会话」是前端的事（地址栏说了算），
-        // 不能靠服务端那个 `active` —— 别的客户端 / 调试脚本随时会把它改掉。
-        // 手上还没有 id 时才不带（首屏、刚点新对话），那时服务端回的是它认为的
-        // 当前会话，我们随后把它写进地址栏（见下面的 `syncUrl`）。
+        // **显式带 id**：「现在看的是哪条会话」是前端的事（地址栏说了算）。
+        // 服务端已经没有「当前会话」这个概念了，不带 id 会直接 400 ——
+        // 所以上面 `!sid0` 时干脆不发这个请求。
         `/api/session?id=${encodeURIComponent(sid0)}` +
           `&rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
       );
@@ -760,13 +759,16 @@
   /**
    * 切到另一条会话。
    *
-   * **只动前端**：不问服务端「把 active 设成这条」—— 当前看的是哪条会话是界面
-   * 的事，服务端那个 `active` 只是「不指定 id 时的默认值」（给 `agentctl` 这类
-   * 脚本用）。之前每次点会话都要打一次 `activate`，等于把前端状态写进后端，
-   * 多端同时开着时两边还会互相抢。
+   * 纯前端动作：改地址（`push`，后退能回上一条）→ 清本地视图 → 按**地址里那个
+   * id** 拉消息。服务端没有任何「切换会话」的接口 —— 「用户在看哪条」归界面。
    *
-   * 现在的顺序：地址先变（`push`，这样后退能回上一条）→ 本地视图清空 →
-   * 按**地址里那个 id** 拉消息（`loadMessages` 显式带 id）。
+   * **不重拉会话列表**：切一条会话并没有改变列表（标题、顺序、条数都不变）。
+   * 以前这里跟着 `loadSessions(true)` 一起发，等于每点一下就把整页列表重传一遍
+   * （`force` 还绕开了合并），而它一个字都没变。列表该更新的时候（新建 / 删除 /
+   * 重命名 / 回合收尾 / 回前台）各自有自己的调用点。
+   *
+   * 唯一会变的是「这条在不在跑」那个小圆点 —— 那个由轮询和 WS 的回合事件管，
+   * 不该靠切会话去刷新。
    */
   async function switchSession(id: string) {
     if (id === sessionId) {
@@ -777,7 +779,7 @@
     syncUrl(id);
     resetView();
     sessionId = id;
-    await Promise.all([loadSessions(true), loadMessages()]);
+    await loadMessages();
     drawer = false;
   }
 
@@ -790,8 +792,19 @@
     await loadSessions(true);
   }
 
+  /**
+   * 删一条会话。
+   *
+   * **只有删的是当前正看着的那条，才清空视图**。以前 `resetView()` 是无条件的
+   * —— 在抽屉里长按删掉**别的**会话，正在看的那条会从界面上被抹掉（`sessionId`
+   * 被清空 → `loadMessages` 直接 return → 界面停在空态），而地址栏还写着
+   * `/s/<那条>`，刷新一下它又回来了。
+   *
+   * 删别的时候什么都不用动：列表重拉一次，当前会话原样留着。
+   */
   async function deleteSession(id: string) {
-    if (id === sessionId) detach();
+    const isCurrent = id === sessionId;
+    if (isCurrent) detach();
     // 这个会话没了，它排着的队也没地方发了
     queue = queue.filter((q) => q.sid !== id);
     try {
@@ -799,7 +812,11 @@
     } catch {
       /* 删不掉的话下一次拉列表它还在，界面不会撒谎 */
     }
-    resetView();
+    if (isCurrent) {
+      resetView();
+      // 地址也收回根：`/s/<删掉的那条>` 是个死链接了
+      clearUrl();
+    }
     await Promise.all([loadSessions(true), loadMessages()]);
   }
 
