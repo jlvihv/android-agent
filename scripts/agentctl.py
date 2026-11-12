@@ -29,6 +29,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE = os.environ.get("AGENT_BASE", "http://127.0.0.1:8787")
@@ -372,17 +373,15 @@ def pick_session(which: str) -> None:
     # find-or-create：同一条调试会话反复用，历史能连着，也不会在侧边栏堆一堆
     # `tail=0` = 全给：这里要按标题找那条调试会话，翻页只会白翻
     code, d = call("GET", "/api/sessions?tail=0")
-    was_active = None
     if code == 200 and isinstance(d, dict):
         for sess in d.get("sessions") or []:
             if sess.get("title") == SCRATCH:
                 TARGET = str(sess["id"])
                 return
-            if sess.get("active"):
-                was_active = str(sess["id"])
 
-    # 服务端的「新建会话」会顺手把它设成活动会话。第一次建调试会话时把用户
-    # 原来那条**换回去** —— 打开 App 不该被我们从 CLI 里切走。（要切用 /use）
+    # 建调试会话不会动「用户正开着的那条」—— `POST /api/sessions` 已经不再顺手
+    # 把它设成活动会话了（见 core 的 `new_session`）。以前这里得先记下 `was_active`
+    # 再切回去，现在不用了。
     code, d = call("POST", "/api/sessions")
     if code != 200 or not isinstance(d, dict):
         print(c(WARN, f"建不了调试会话（{code}），改写到当前活动会话"), file=sys.stderr)
@@ -390,8 +389,6 @@ def pick_session(which: str) -> None:
         return
     sid = str(d.get("id"))
     call("POST", "/api/sessions/rename", {"id": sid, "title": SCRATCH})
-    if was_active:
-        call("POST", "/api/sessions/activate", {"id": was_active})
     print(c(DIM, f"建了一条调试会话「{SCRATCH}」—— 你的对话和当前打开的那条都不动"),
           file=sys.stderr)
     TARGET = sid
@@ -790,10 +787,18 @@ def handle_command(line: str) -> bool:
             TARGET = None
             print(c(WARN, "改成写进当前活动会话"))
         else:
-            code, d = call("POST", "/api/sessions/activate", {"id": rest})
+            # **只改本进程的目标**：以前这里还会 `POST /api/sessions/activate`
+            # 把服务端的默认会话也切过去 —— 等于从命令行把用户 App 里打开的
+            # 那条抢走。现在「用户在看哪条」归界面（地址栏）管，服务端不掺和。
+            # 会话存不存在还是问一下，免得打错 id 之后每条消息都 404。
+            code, d = call(
+                "GET", f"/api/session?id={urllib.parse.quote(rest)}&tail=1"
+            )
             if code == 200:
                 TARGET = rest
                 print(c(OK, f"切到 {rest}"))
+            elif code == 404:
+                print(c(BAD, f"没有这个会话：{rest}"))
             else:
                 print(c(BAD, f"失败 {code}: {d}"))
     elif cmd == "/clear":

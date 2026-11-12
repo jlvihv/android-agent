@@ -23,7 +23,7 @@
 use std::borrow::Cow;
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 #[cfg(not(debug_assertions))]
 use rust_embed::RustEmbed;
@@ -96,7 +96,7 @@ fn pick_encoding(headers: &HeaderMap) -> Option<(&'static str, &'static str)> {
     }
 }
 
-pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
+pub async fn serve(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
@@ -139,7 +139,22 @@ pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
             .into_response();
     }
 
-    // SPA fallback：非 API 路径一律回 index.html
+    // SPA fallback：**看起来像页面**的路径才回 index.html。
+    //
+    // 前端的路由是 `/s/<会话 id>` 这种真实路径（不是 `#/`），刷新 / 分享链接时
+    // 那条地址会直接打到核心 —— 这里得把它交给前端自己的路由。
+    //
+    // 但**不能无条件回退**，两种情况下必须老实 404：
+    //
+    //   1. 带扩展名的（`/assets/index-xxx.js` 没命中 —— 换了版本、缓存里记着旧
+    //      哈希）—— 回一份 `index.html` 只会让浏览器把 HTML 当 JS 解析，报一句
+    //      莫名其妙的语法错；
+    //   2. 不是 GET / HEAD 的（`POST /api/sessions/activate` 这种**已经删掉**的
+    //      端点）—— 否则旧客户端 / 过期的脚本会收到 200 + 一坨 HTML，以为成功了。
+    let looks_like_page = !path.rsplit('/').next().unwrap_or("").contains('.');
+    if !looks_like_page || !matches!(method, Method::GET | Method::HEAD) {
+        return (StatusCode::NOT_FOUND, "没有这个文件").into_response();
+    }
     match get("index.html").or_else(|| get("index.html.br")) {
         Some(data) => (
             [

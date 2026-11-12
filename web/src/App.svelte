@@ -26,6 +26,7 @@
   } from "./lib/sse";
   import { uid } from "./lib/uid";
   import { api, post } from "./lib/api";
+  import { clearUrl, onRouteChange, sessionFromPath, syncUrl } from "./lib/route";
   import {
     applyPatch,
     applyWindow,
@@ -333,7 +334,12 @@
           usage?: (Partial<UsageTotals> & { last?: Usage | null }) | null;
         }
       >(
-        `/api/session?rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
+        // **显式带 id**：「现在看的是哪条会话」是前端的事（地址栏说了算），
+        // 不能靠服务端那个 `active` —— 别的客户端 / 调试脚本随时会把它改掉。
+        // 手上还没有 id 时才不带（首屏、刚点新对话），那时服务端回的是它认为的
+        // 当前会话，我们随后把它写进地址栏（见下面的 `syncUrl`）。
+        `/api/session?${sessionId ? `id=${encodeURIComponent(sessionId)}&` : ""}` +
+          `rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
       );
       // 请求在路上的时候本地发了一条（`send`）：这份是发之前的样子，拿它整份
       // 覆盖会把刚推进去的用户消息和正在流的那条助手消息冲掉 —— 流接着往一个
@@ -389,6 +395,10 @@
         setWindow(applyWindow({ messages, windowFrom }, d, same));
       }
       if (d.turnError) showTurnError(d.turnError);
+      // 地址栏是这个状态的**唯一真相**：服务端告诉了我们是哪条（首屏 / 地址里
+      // 没带 id 时），安静地补进地址（`replace`，不在历史里留一格）。
+      // 之后换会话走 `switchSession` 的 `push`。
+      if (sid) syncUrl(sid, true);
       sessionId = sid;
     } catch {
       /* 拉不到就算了 */
@@ -721,6 +731,8 @@
     // **不请求服务端**：新会话到第一句话才建（`ensureSession`），
     // 这里只把本地视图清空 —— 点了不发就不会攒出一堆空会话。
     view = { k: "fresh" };
+    // 新会话还没有 id：地址收回根路径（不带 id 的 `/` 就是「新对话」的意思）
+    clearUrl();
     drawer = false;
   }
 
@@ -747,16 +759,26 @@
     view = { k: "idle" };
   }
 
+  /**
+   * 切到另一条会话。
+   *
+   * **只动前端**：不问服务端「把 active 设成这条」—— 当前看的是哪条会话是界面
+   * 的事，服务端那个 `active` 只是「不指定 id 时的默认值」（给 `agentctl` 这类
+   * 脚本用）。之前每次点会话都要打一次 `activate`，等于把前端状态写进后端，
+   * 多端同时开着时两边还会互相抢。
+   *
+   * 现在的顺序：地址先变（`push`，这样后退能回上一条）→ 本地视图清空 →
+   * 按**地址里那个 id** 拉消息（`loadMessages` 显式带 id）。
+   */
   async function switchSession(id: string) {
-    detach();
-    try {
-      await post("/api/sessions/activate", { id });
-    } catch {
-      // 切不过去就不动（界面上还是原来那个会话）；后面 loadMessages 会按
-      // 服务端当前的 active 回答，不会停在两个会话之间
+    if (id === sessionId) {
+      drawer = false;
       return;
     }
+    detach();
+    syncUrl(id);
     resetView();
+    sessionId = id;
     await Promise.all([loadSessions(true), loadMessages()]);
     drawer = false;
   }
@@ -796,10 +818,39 @@
   $effect(() =>
     untrack(() => {
       bootedAt = Date.now();
+      // 地址栏里带了 `/s/<id>` 就认它（刷新 / 分享 / 从历史里回来都走这条）；
+      // 没带（`/`）就让 `loadMessages` 去问服务端的默认值，回来时补进地址。
+      //
+      // 这里先填 `sessionId` 很要紧：`loadMessages` 用它拼 `?id=`，也就决定了
+      // 首屏拉的是**地址里那条**而不是服务端 active 那条。
+      const fromUrl = sessionFromPath();
+      if (fromUrl) sessionId = fromUrl;
       void loadMessages();
       void loadSessions();
     }),
   );
+
+  /**
+   * 后退 / 前进 → 换会话。
+   *
+   * 只处理「地址变了」这一种：覆盖层的 popstate 由 `lib/overlay.ts` 自己接
+   *（它看栈、不看地址）。两者压进 history 的顺序天然正确 —— 覆盖层是后压的，
+   * 后退时它先弹出去，再轮到换会话。
+   *
+   * `id` 为 `null`（退回到 `/`）等于「新对话」：和点头部的「新对话」同一个语义
+   *（`fresh` = 服务端还没有这条）。
+   */
+  $effect(() => {
+    return onRouteChange((id) => {
+      if (id === (sessionId || null)) return; // 地址没实质变化（覆盖层弹栈会走到这儿）
+      if (!id) {
+        newSession();
+        return;
+      }
+      // 不重复 `syncUrl`：地址已经是它了，`switchSession` 里那次会自己认出没变
+      void switchSession(id);
+    });
+  });
 
   /**
    * 「刚起来这一会儿不算数」的窗口（ms）。

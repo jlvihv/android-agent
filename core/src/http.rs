@@ -94,7 +94,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/debug/system-prompt", post(debug_set_system_prompt))
         .route("/api/sessions", get(list_sessions).post(new_session))
         .route("/api/search", get(search_sessions))
-        .route("/api/sessions/activate", post(activate_session))
         .route("/api/sessions/rename", post(rename_session))
         .route("/api/sessions/delete", post(delete_session))
         .route("/api/sessions/unqueue", post(unqueue))
@@ -2935,7 +2934,10 @@ async fn list_sessions(
 /// `GET /api/search?q=…` → 跨会话搜消息正文。
 ///
 /// 侧边栏顶上那个搜索框就靠它。命中回 `{ id, title, active, role, snippet }`，
-/// 点一下就是普通的切会话（activate）。
+/// 点一下就是普通的切会话（纯前端动作：改地址 + 按 id 拉消息，不通知服务端）。
+///
+/// `active` 字段还在，但它只是「服务端的默认会话」，界面**不再拿它打勾** ——
+/// 当前看的是哪条由地址栏决定（见 `web/src/lib/route.ts`）。
 #[derive(Deserialize)]
 struct SearchQuery {
     #[serde(default)]
@@ -2962,33 +2964,33 @@ async fn search_sessions(
 }
 
 /// `POST /api/sessions` → 新建会话
+///
+/// **不再顺手把它设成服务端的 `active`。**
+///
+/// `active` 是「不指定 id 时用哪条」的默认值（给 `agentctl` / 调试脚本用，
+/// 以及下次启动时恢复现场）。而「用户现在打开的是哪条」是界面的事 —— 由地址栏
+///（`/s/<id>`）决定，服务端不该被一条「新建会话」的请求顺手改动。
+///
+/// 以前会改，代价是 `agentctl` 里得专门加一段「建了调试会话之后把用户原来那条
+/// 切回去」（见 `scripts/agentctl.py` 的 `pick_target`）。现在不用了。
+///
+/// `SessionStore::create()` 本身还是会把 active 指向新的那条（那是它在库内部的
+/// 语义），所以这里显式还原。
 async fn new_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let mut store = st.chat.write().await;
+    let prev = store.active.clone();
     let id = store.create();
+    // 还原：新建不该改「默认会话」
+    store.active = prev;
+    // 还原之后那个 id 可能指向一条已经不存在的会话（库是空的）
+    if !store.sessions.iter().any(|s| s.id == store.active) {
+        if let Some(first) = store.sessions.first() {
+            store.active = first.id.clone();
+        }
+    }
     drop(store);
     st.mark_sessions_dirty();
     Json(json!({ "id": id }))
-}
-
-#[derive(Deserialize)]
-struct ActivateBody {
-    id: String,
-}
-
-/// `POST /api/sessions/activate` → 切换会话
-async fn activate_session(
-    State(st): State<Arc<AppState>>,
-    Json(body): Json<ActivateBody>,
-) -> Response {
-    let mut store = st.chat.write().await;
-    let ok = store.activate(&body.id);
-    drop(store);
-    st.mark_sessions_dirty();
-    if ok {
-        Json(json!({ "ok": true })).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "没有这个会话").into_response()
-    }
 }
 
 #[derive(Deserialize)]
@@ -3012,10 +3014,15 @@ async fn rename_session(State(st): State<Arc<AppState>>, Json(body): Json<Rename
     }
 }
 
+#[derive(Deserialize)]
+struct DeleteBody {
+    id: String,
+}
+
 /// `POST /api/sessions/delete` → 删除会话
 async fn delete_session(
     State(st): State<Arc<AppState>>,
-    Json(body): Json<ActivateBody>,
+    Json(body): Json<DeleteBody>,
 ) -> Response {
     st.delete_session(&body.id).await;
     Json(json!({ "ok": true })).into_response()
