@@ -209,12 +209,27 @@ class AgentStore {
   /**
    * 一条空的助手消息（聊天流从这里开始写）。
    *
-   * **不挂在 store 上**：真正持有它的是调用方（`App` 的 `messages` 数组，元素在
-   * 那里才是响应式代理）。以前这里还存一份 `this.streaming`，全项目没有一处读，
-   * 副作用是 store 永久抓着最后那条助手消息（含几十 KB 工具输出）不放。
+   * **返回的必须是 `$state` 代理**，不能是普通对象 —— 这一条不是风格问题：
+   * `applyChunk` 是**原地**往 `parts` 里追加 delta 的，而流式期间没有任何东西会
+   * 重新给 `messages[i]` 赋值。所以「改的是不是代理」直接决定界面动不动：
+   *
+   *   - 返回普通对象 → push 进 `messages` 之后，流写的是**原始对象**，
+   *     Svelte 的代理感知不到（实测：effect 不重跑），界面上只有用户那条气泡，
+   *     模型的回复永远不出现（踩过，而且看起来就像「SSE 没推送」）。
+   *   - 先写进一个 `$state`、再**读回来** → 拿到代理，写它才发信号。
+   *
+   * 以前这里还额外存了一份 `this.streaming`（全项目没有一处读，副作用是 store
+   * 永久抓着最后那条消息，含几十 KB 工具输出）。**留着它的作用恰恰是造出代理**；
+   * 我一度把它删成「直接返回字面量」，就把流式推送整个弄哑了。现在用一个只在本
+   * 方法里活着的临时 `$state` 完成同一件事，既不留常驻引用，也还是代理。
+   *
+   * 回归测试见 `tests/streaming.test.ts`（它盯的就是「写进去能不能被看见」）。
    */
   beginStreaming(): Message {
-    return { id: uid(), role: "assistant", parts: [], done: false };
+    const box = $state<{ msg: Message }>({
+      msg: { id: uid(), role: "assistant", parts: [], done: false },
+    });
+    return box.msg;
   }
 }
 
