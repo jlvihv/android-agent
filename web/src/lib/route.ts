@@ -17,7 +17,7 @@
  *
  * 覆盖层的返回键（`lib/overlay.ts`）也用 history，两者的约定是分开的：
  *   - 覆盖层：`pushState({ overlay: n })` —— 地址**不变**
- *   - 换会话：`pushState(null, "", "/s/<id>")` —— 地址**变**
+ *   - 换会话：`pushState({ route: true }, "", "/s/<id>")` —— 地址**变**
  * 后退时先弹覆盖层、再换会话，顺序天然正确（覆盖层是后压进去的）。
  */
 
@@ -54,8 +54,11 @@ export function sessionFromPath(pathname = location.pathname): string | null {
 export function syncUrl(id: string, replace = false): void {
   const want = sessionPath(id);
   if (location.pathname === want) return;
-  if (replace) history.replaceState(history.state, "", want);
-  else history.pushState(null, "", want);
+  // `state` 写成 `{ route: true }`（不是 `null`）：popstate 的两个监听者靠它
+  // 认领各自的条目 —— 覆盖层看 `overlay`，这里看 `route`（见 `onRouteChange`）。
+  // 用 `null` 的话「谁也认领不到」，两边都得靠猜。
+  if (replace) history.replaceState({ route: true }, "", want);
+  else history.pushState({ route: true }, "", want);
 }
 
 /**
@@ -63,17 +66,52 @@ export function syncUrl(id: string, replace = false): void {
  */
 export function clearUrl(): void {
   if (location.pathname === "/") return;
-  history.replaceState(history.state, "", "/");
+  // 换地址时要**保留我们自己那个标记**（`{route:true}`），别把覆盖层的 state
+  // 原样搬过来 —— 那样这条路由条目会被覆盖层认领走。
+  history.replaceState({ route: true }, "", "/");
+}
+
+/**
+ * 给**当前**这条 history 条目打上我们的标记。
+ *
+ * 必须在启动时调一次：首屏那条是浏览器自己压的（`state` 是 `null`），
+ * 于是「从第一条会话后退回首屏」时 `route` 判据认不出它是「落到了一条路由条目上」
+ * —— 界面不切换，而地址已经变了，两边对不上。
+ *
+ * 用 `replaceState`（不是 push）：不新增历史，只改这一条的 `state`。
+ *
+ * 为什么不干脆让判据「`state` 是 null 也算路由」：那样覆盖层弹栈（它的条目一定
+ * 带 `{overlay:n}`）之外的**任何** null 条目都会被路由认领，包括将来别人压的。
+ * 显式标记更硬：谁压的谁负责标记。
+ */
+export function markCurrentEntry(): void {
+  const st = history.state as { overlay?: number; route?: boolean } | null;
+  // 已经是覆盖层那条就别动（那一条归 overlay 管）
+  if (st?.overlay !== undefined) return;
+  history.replaceState({ ...(st ?? {}), route: true }, "");
 }
 
 /**
  * 订阅「用户在地址栏里换了会话」（后退 / 前进）。
  *
- * 返回退订函数。**只处理换会话那一类 popstate**：覆盖层的 popstate 由
- * `lib/overlay.ts` 自己接（它判断的是 `skip` 和栈，不看地址）。
+ * 返回退订函数。
+ *
+ * **按 `history.state` 认领自己的条目**，不靠「地址变了没变」去猜：
+ *
+ *   - 我们压的：`{ route: true }`（见 `syncUrl` / `clearUrl`）
+ *   - 覆盖层压的：`{ overlay: n }`（见 `lib/overlay.ts`）
+ *
+ * 两个监听者各看各的字段，互不误伤。以前这里是「一收到 popstate 就按当前地址
+ * 算一遍会话 id」，而覆盖层弹栈时地址不变 —— 于是它也算出一个「等于当前会话」
+ * 的 id，被 `id === sessionId` 那道早退挡住。能跑，但挡子弹的是别人的判断。
  */
 export function onRouteChange(fn: (id: string | null) => void): () => void {
-  const handler = () => fn(sessionFromPath());
+  const handler = (e: PopStateEvent) => {
+    const st = e.state as { route?: boolean; overlay?: number } | null;
+    // 判据：**带 `route` 且不带 `overlay`**（见 `lib/overlay.ts` 同名判断）
+    if (!st?.route || st.overlay !== undefined) return;
+    fn(sessionFromPath());
+  };
   addEventListener("popstate", handler);
   return () => removeEventListener("popstate", handler);
 }

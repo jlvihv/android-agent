@@ -26,7 +26,13 @@
   } from "./lib/sse";
   import { uid } from "./lib/uid";
   import { api, post } from "./lib/api";
-  import { clearUrl, onRouteChange, sessionFromPath, syncUrl } from "./lib/route";
+  import {
+    clearUrl,
+    markCurrentEntry,
+    onRouteChange,
+    sessionFromPath,
+    syncUrl,
+  } from "./lib/route";
   import {
     applyPatch,
     applyWindow,
@@ -289,35 +295,71 @@
   //
   // 消息本来只活在 JS 内存里，Activity 重建 / 刷新 / 从后台回来就空了。
   // 服务端一直留着，所以进来先拉一次。
+  /**
+   * 现在**不该**去对账？三个理由，以前是三道散落的 early-return：
+   *
+   *   - `busy`：本地正连着这条会话的流 —— 本地才是最新的，服务端那份是旧的，
+   *     拉回来只会白传一整段历史再丢掉
+   *   - `fresh`：点了「新对话」还没发第一句 —— 服务端那边还没有这条会话
+   *     （`sessionId` 是空的），拉了也没地方放
+   *   - 没有 `sessionId`：同上，服务端不会猜「当前会话」了（问了就是 400）
+   *
+   * 三个理由都读 `view` / `sid`，所以放在这里一起说清楚；调用方只看一个布尔。
+   */
+  function skipSync(sid: string): boolean {
+    return busy || fresh || !sid;
+  }
+
+  /**
+   * 这份回包**已经作废**了？三件事任何一个变过，就说明它算的是旧状态：
+   *
+   *   - 会话换了（`sid !== sessionId`）：`u1` 这种 id 每条会话都有，套上去就是串内容
+   *   - 本地发过消息了（`at !== sent`）：回包是发之前的样子，拿它整份覆盖会把刚推
+   *     进去的用户消息和正在流的那条助手消息冲掉 —— 流接着往一个已经不在列表里的
+   *     对象里写，界面上就是「没回复」
+   *   - 用户往上翻了一页（`winAt !== windowFrom`）：补丁的 `replaceFrom` 是按旧窗口
+   *     翻译的，下标不作数
+   *
+   * 以前这三条散在函数的三个位置（一条在开头、一条在中段、一条传给 `applyPatch`
+   * 让它返回 `stale`），读的时候得自己拼起来。
+   */
+  function stale(sid: string, at: number, winAt: number): boolean {
+    return sid !== sessionId || at !== sent || winAt !== windowFrom;
+  }
+
+  /**
+   * 跟服务端对一次账：把这一条会话的最新状态（消息、排队、用量、在不在跑）拉回来。
+   *
+   * 触发源有六七个（挂载、WS 重连、回合起停、切回前台、轮询、发完消息、停止之后），
+   * 它们常常挤在同一瞬间，所以这里要处理三件竞态：
+   *
+   *   1. **该不该发**（`skipSync`）—— 本地正在流 / 还没建会话时，服务端那份是旧的
+   *   2. **能不能合并**（`inflight`）—— 同一份（会话|窗口|rev）已经在路上就不发第二份，
+   *      但被合并掉的那次记一笔，等它回来再补（那条往往是「回合刚跑完，去拿最后几条」）
+   *   3. **回来时还作不作数**（`stale`）—— 请求在路上时用户可能已经发了消息、
+   *      往上翻了一页、或者切了会话
+   *
+   * 名字还叫 `loadMessages`：它是这个文件的术语，二十多个调用点都这么喊。但真干活
+   * 的是下面两个纯函数，这个函数只负责编排。
+   */
   async function loadMessages() {
-    // 本地流正在跑：本地才是最新的，服务端那份是旧的。拉回来只会白传
-    // 一整段历史再丢掉 —— 干脆不发这个请求。
-    if (busy) return;
-    // 刚点了「新对话」还没发第一句：服务端那边还是旧会话（新的根本还没建），
-    // 拉回来会把刚清空的界面又填满旧内容。
-    if (fresh) return;
-    // 同一份（会话 + 窗口 + rev）已经在路上了就别再发：触发源有好几个
-    //（挂载、WS 连上、回合起停、切回前台），它们常常挤在同一瞬间 —— 实测首屏
-    // 发了三份一模一样的窗口（每次一窗，长会话里就是白花几份流量）。
-    // 被合并掉的那一次不能就这么算了（它可能正是「回合刚跑完，去拿最后那几条」），
-    // 所以下面会在这一份回来之后再补一次 —— 见 `inflightAgain`。
-    const key = `${sessionId}|${windowFrom}|${rev}`;
+    const sid0 = sessionId;
+    const at = sent;
+    // 发请求时手上那一窗的起点。补丁的 `replaceFrom` 是服务端按**这个**翻译过来的。
+    const winAt = windowFrom;
+
+    if (skipSync(sid0)) return;
+
+    // 同一份已经在路上：合并掉，但记一笔（见函数注释第 2 条）
+    const key = `${sid0}|${winAt}|${rev}`;
     if (key === inflight) {
-      // 已经在路上了：**不能直接不管** —— 被合并掉的往往是「这个回合刚跑完，去把
-      // 最后那几条拿回来」那一次，而它要的东西可能比路上这份更新（路上那份可能在
-      // 回合结束之前就在服务端算好了）。记一笔，等它回来再补一次。
       inflightAgain = true;
       return;
     }
     inflight = key;
     inflightAgain = false;
-    const at = sent;
-    // 发请求时手上那一窗的起点。补丁的 `replaceFrom` 是服务端按**这个**翻译过来的，
-    // 而请求在路上时用户可能往上翻了一页（数组前面多了一段）—— 下标就不作数了。
-    const winAt = windowFrom;
+
     try {
-      const sid0 = sessionId;
-      if (!sid0) return; // 没 id 就没有「当前会话」可拉（服务端也不猜了）
       const d = await api<
         SessionPayload & {
           // 窗口那几件（`messages` / `from` / `hasMore` / `append` / `replaceFrom` /
@@ -342,10 +384,8 @@
         `/api/session?id=${encodeURIComponent(sid0)}` +
           `&rev=${encodeURIComponent(rev)}&tail=${MSG_WINDOW}&from=${windowFrom}`,
       );
-      // 请求在路上的时候本地发了一条（`send`）：这份是发之前的样子，拿它整份
-      // 覆盖会把刚推进去的用户消息和正在流的那条助手消息冲掉 —— 流接着往一个
-      // 已经不在列表里的对象里写，界面上就是「没回复」。丢掉，下一次再拉。
-      if (busy || at !== sent) return;
+      // 这份回包还作不作数（路上发过消息、翻了页、切了会话 —— 见 `stale`）
+      if (stale(sid0, at, winAt)) return;
       // 服务端说这个会话在不在跑。**只在本地没连着流时才认**：连着流的时候
       // 本地那份更新（`run` 收完流会自己落到 `idle`），拿一个路上算好的旧值
       // 盖上去只会让停止键闪一下。
@@ -373,12 +413,13 @@
       usage = d.usage?.last
         ? { last: d.usage.last, total: totalsOf(d.usage) }
         : null;
-      // 会话 id 变了（切会话 / 重置）就不能按 id 复用旧消息 ——
-      // `u1` 这种 id 每条会话都会有。`sid` 在上面算过了。
+      // 到这儿 `stale()` 已经确认过「还是同一条会话、没发过消息、窗口没动」，
+      // 所以 `same` 恒为真、`applyPatch` 的 `stale` 那一支**不可能**再返回
+      // （它比对的就是我们刚验过的 `winAt === windowFrom`）。留着那个分支只会
+      // 让人以为这里还会作废一次。
       //
       // 补丁 / 整窗两条路的规则在 `lib/session.ts` 里（有测试盯着，见 `bun test`）。
-      const same = sid === sessionId;
-      if (d.append && same) {
+      if (d.append) {
         const r = applyPatch({ messages, windowFrom }, d, winAt);
         if (!r.ok) {
           if (r.why === "mismatch") {
@@ -387,13 +428,11 @@
             rev = "";
             return loadMessages();
           }
-          // 'stale'：这一路上窗口变过（用户往上翻了一页），补丁的下标是按旧窗口
-          // 算的 —— 作废。下一次同步（轮询 / 聚焦 / 回合结束）会重算。
-          return;
+          return; // 理论上到不了（见上面那段）
         }
         setWindow(r.window);
       } else {
-        setWindow(applyWindow({ messages, windowFrom }, d, same));
+        setWindow(applyWindow({ messages, windowFrom }, d, true));
       }
       if (d.turnError) showTurnError(d.turnError);
       sessionId = sid;
@@ -839,6 +878,9 @@
       // 翻出来。「上次看的是哪条」这个东西服务端根本不存（见 core 的
       // `SessionStore` 注释），前端也不往 localStorage 里放 —— 这个 App 一直
       // 守着「不往本地存东西」那条线。
+      // 先给首屏这条 history 打上我们的标记 —— 否则「从第一条会话后退回首屏」
+      // 时那条 `state` 是 null，路由判据认不出来（见 `markCurrentEntry`）。
+      markCurrentEntry();
       const fromUrl = sessionFromPath();
       if (fromUrl) {
         sessionId = fromUrl;

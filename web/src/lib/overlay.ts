@@ -171,12 +171,39 @@ declare global {
 }
 
 if (typeof window !== "undefined") {
-  addEventListener("popstate", () => {
-    // 自己退的那一条回来了：吃掉，别关下一层
-    if (skip > 0) {
+  addEventListener("popstate", (e) => {
+    const st = e.state as { overlay?: number; route?: boolean } | null;
+    // 判据：**带 `overlay` 且不带 `route`**。后者是防御性的 —— 两个字段同时出现
+    // 说明有 bug（谁都不该压这样的条目），那种时候两边都别动，比抢着处理安全。
+    const isOurs = !!st && typeof st.overlay === "number" && !st.route;
+
+    // 自己退的那一条回来了：吃掉，别关下一层。
+    //
+    // **只在「退到的是我们自己那条」时消耗 `skip`**：`release()` 里
+    // `history.back()` 退到的可能是**前一条**，而那一条未必是覆盖层（比如盖在
+    // 会话页上时，下面是路由条目 `state: null`）。以前无条件先扣 `skip`，那种
+    // 情况下这笔账就白扣了 —— 紧接着用户按的返回会被当成我们自己的、静默吞掉。
+    if (skip > 0 && isOurs) {
       skip--;
       return;
     }
+
+    // **只处理「覆盖层那一类」的 popstate**。
+    //
+    // history 里现在同时住着两种条目：
+    //   - 覆盖层：`pushState({ overlay: n })` —— **地址不变**
+    //   - 换会话：`pushState(null, "", "/s/<id>")` —— **地址变**（见 `lib/route.ts`）
+    //
+    // 以前这里不区分，靠的是一条隐含约定「覆盖层的条目地址不变，所以路由那边的
+    // 监听者不会误响」—— 反过来呢？换会话引起的 popstate 会走到这里，把**栈顶
+    // 那一层覆盖层关掉**。现在恰好没暴露，是因为换会话时抽屉自己先关了；但那是
+    // 巧合，不是约定。
+    //
+    // 现在按 `history.state` 认领（更硬的判据）：覆盖层压进去的条目一定带
+    // `overlay` 字段，路由压的是 `null`。谁也认领不到的（老条目 / 手改的）
+    // 按「不是覆盖层的」处理，交给别人 —— 这里**不**乱关东西。
+    if (!isOurs) return;
+
     const top = stack.pop();
     syncHost();
     top?.close();
