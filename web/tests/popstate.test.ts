@@ -24,8 +24,7 @@ const overlayOwns = (st: State) =>
   !!st && typeof st.overlay === "number" && !st.route;
 
 /** `lib/route.ts` 里那条判据：带 `route` 且**不带** `overlay` */
-const routeOwns = (st: State) =>
-  st?.route === true && st.overlay === undefined;
+const routeOwns = (st: State) => st?.route === true && st.overlay === undefined;
 
 describe("popstate 认领", () => {
   test("覆盖层压的条目，只有覆盖层认领", () => {
@@ -48,7 +47,11 @@ describe("popstate 认领", () => {
   });
 
   test("老条目 / 手改的 state：两边都不认领（不乱关东西）", () => {
-    for (const st of [{} as State, { foo: 1 } as State, { overlay: "1" } as State]) {
+    for (const st of [
+      {} as State,
+      { foo: 1 } as State,
+      { overlay: "1" } as State,
+    ]) {
       expect(overlayOwns(st)).toBe(false);
       expect(routeOwns(st)).toBe(false);
     }

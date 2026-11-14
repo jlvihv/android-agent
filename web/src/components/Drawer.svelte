@@ -581,9 +581,7 @@
           加载失败，点这里重试
         </button>
       {:else if !more && sessions.length > 0}
-        <p class="px-3 py-3 text-center text-xs text-faint">
-          没有更早的对话了
-        </p>
+        <p class="px-3 py-3 text-center text-xs text-faint">没有更早的对话了</p>
       {/if}
     {/if}
   </div>

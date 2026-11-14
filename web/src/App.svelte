@@ -85,7 +85,20 @@
    */
   type Run = { controller: AbortController };
 
-  let view = $state<View>({ k: "idle" });
+  /**
+   * **`$state.raw`，不是 `$state`** —— 这一条不是风格问题。
+   *
+   * `live` 里的 `run` 是**身份**：`run()` 收尾时要问「眼前这条流还是我那条吗」
+   *（`view.run === me`），`stop()` 要借它 abort。而 `$state` 是**深代理** ——
+   *`view = { k: "live", run: me }` 之后读回来的 `view.run` 是个新的 Proxy，
+   *`=== me` 永远为假。后果：流正常收尾时那个判断恒不成立，`view` 停在 `live`，
+   *`running` 一直是真 → **模型说完了，停止键还在**，而且 `loadMessages` 的
+   *`if (!busy)` 门也关着，服务端那份 `busy: false` 永远盖不上去（轮询白转）。
+   *
+   * `view` 只在十来个地方**整份换掉**（没有一处原地改 `view.k`），所以 raw 的
+   *「只认赋值、不认深改」在这里刚好够用，而且身份原样保留。
+   */
+  let view = $state.raw<View>({ k: "idle" });
   /** 本地正连着流 */
   const busy = $derived(view.k === "live");
   /** 点了新对话还没建 */

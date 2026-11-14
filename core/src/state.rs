@@ -688,7 +688,8 @@ impl AppState {
         // 清退之后下次被打开会从库里重新读回来，只是多一次 IO。
         let mut n = 0;
         for s in &mut store.sessions {
-            let idle = s.resident() && s.has_content()
+            let idle = s.resident()
+                && s.has_content()
                 && !busy.contains(&s.id)
                 && s.loaded_at.is_none_or(|t| t.elapsed() >= KEEP_FOR);
             if idle && db.is_synced(s) {

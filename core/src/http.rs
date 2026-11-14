@@ -2391,7 +2391,10 @@ async fn get_part(State(st): State<Arc<AppState>>, Query(q): Query<PartQuery>) -
     // 不再有「当前会话」可供兜底（见 `POST /api/chat` 那段）。
     let sid = {
         let store = st.chat.read().await;
-        q.session.as_deref().and_then(|s| store.get(s)).map(|s| s.id.clone())
+        q.session
+            .as_deref()
+            .and_then(|s| store.get(s))
+            .map(|s| s.id.clone())
     };
     let Some(sid) = sid else {
         return (StatusCode::NOT_FOUND, "没有这个会话（要带 session）").into_response();
@@ -2486,16 +2489,15 @@ async fn set_model(State(st): State<Arc<AppState>>, Json(body): Json<ModelBody>)
 ///
 /// 响应里的 `from` / `hasMore` 是给客户端的窗口指针：`messages` 是完整视图里
 /// `[from, from + messages.len())` 那一段，`hasMore` = 上面还有没有更早的。
-async fn get_session(
-    State(st): State<Arc<AppState>>,
-    Query(q): Query<SessionQuery>,
-) -> Response {
+async fn get_session(State(st): State<Arc<AppState>>, Query(q): Query<SessionQuery>) -> Response {
     // **必须带 id**：服务端不再有「当前会话」这个概念 —— 前端手里一直有 id
     //（地址栏 `/s/<id>`），带过来就行。`sessionId` 为空的那一小段（刚点「新对话」、
     // 还没建）前端本来也不会来问。
     let id = {
         let store = st.chat.read().await;
-        q.id.as_deref().and_then(|id| store.get(id)).map(|s| s.id.clone())
+        q.id.as_deref()
+            .and_then(|id| store.get(id))
+            .map(|s| s.id.clone())
     };
     let Some(id) = id else {
         return (
@@ -3026,10 +3028,7 @@ struct DeleteBody {
 }
 
 /// `POST /api/sessions/delete` → 删除会话
-async fn delete_session(
-    State(st): State<Arc<AppState>>,
-    Json(body): Json<DeleteBody>,
-) -> Response {
+async fn delete_session(State(st): State<Arc<AppState>>, Json(body): Json<DeleteBody>) -> Response {
     st.delete_session(&body.id).await;
     Json(json!({ "ok": true })).into_response()
 }
@@ -3053,10 +3052,7 @@ async fn unqueue(State(st): State<Arc<AppState>>, Json(body): Json<UnqueueBody>)
 ///
 /// **要带 session**：服务端没有「当前会话」了，所以「清空我正看着的那条」
 /// 这句话得由调用方说清楚是哪条。
-async fn reset(
-    State(st): State<Arc<AppState>>,
-    Query(q): Query<DebugReqQuery>,
-) -> Response {
+async fn reset(State(st): State<Arc<AppState>>, Query(q): Query<DebugReqQuery>) -> Response {
     let sid = q.session.unwrap_or_default();
     match st.reset_session(&sid).await {
         Ok(()) => {
