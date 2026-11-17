@@ -212,6 +212,24 @@ describe("applyWindow", () => {
     expect(w2.messages[79].id).toBe("a99");
   });
 
+  test("`/api/reset` 之后（`reset: true`）：同 id 的新消息不能被当成旧对象复用", () => {
+    const prev = full(4);
+    // 清空后 DB 下标从 0 重数：id 和旧消息撞上，内容全变了
+    const fresh = full(4).map((m, i) => ({
+      ...m,
+      parts: [{ type: "text" as const, id: `n${i}`, text: `新 ${i}` }],
+    }));
+    // 调用方按 `d.reset` 传 `same = false`
+    const w = applyWindow(
+      win(prev, 0),
+      { messages: fresh, from: 0, reset: true },
+      false,
+    );
+    expect(w.messages).toHaveLength(4);
+    expect(w.messages[0]).toBe(fresh[0]); // 是新对象，不是旧的
+    expect((w.messages[0].parts[0] as { text: string }).text).toBe("新 0");
+  });
+
   test("不是同一个会话 / 首窗从 0 开始：整份换上", () => {
     const w = applyWindow(
       win(full(20).slice(0), 0),

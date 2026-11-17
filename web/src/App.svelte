@@ -445,7 +445,8 @@
         }
         setWindow(r.window);
       } else {
-        setWindow(applyWindow({ messages, windowFrom }, d, true));
+        // `reset`：整段换过了（`/api/reset`）。这时 id 会和旧消息撞上，不能合并。
+        setWindow(applyWindow({ messages, windowFrom }, d, !d.reset));
       }
       if (d.turnError) showTurnError(d.turnError);
       sessionId = sid;

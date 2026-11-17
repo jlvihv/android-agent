@@ -340,6 +340,20 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "apiStyle": p.api_style,
         })
     });
+    // 两个都要读库（`instance_id` / 通知开关）。放到**阻塞池**一次算完：
+    // 这是 worker 线程（只有 4 个），而 `Db` 内部是一把 std Mutex —— 落盘正在
+    // 写大事务时直接在这里等会卡住一个 worker。
+    let (instance_id, notify_done) = {
+        let st2 = st.clone();
+        tokio::task::spawn_blocking(move || {
+            (
+                st2.instance_id(),
+                crate::notify::enabled(st2.db().as_deref()),
+            )
+        })
+        .await
+        .unwrap_or_default()
+    };
     Json(json!({
         "ok": true,
         "version": VERSION,
@@ -352,7 +366,7 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "computer": computer_name(),
         // 这个核心的实例 id：页面据此知道「我是哪台给的」（「选择机器」里勾哪一行，
         // 见前端 `lib/machines.svelte.ts`）。经隧道时这个接口是那台电脑答的。
-        "id": st.instance_id(),
+        "id": instance_id,
         "linux": st.linux().map(|s| json!({
             "rootfs": s.rootfs().display().to_string(),
             "host": s.is_native(),
@@ -377,7 +391,7 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "sandboxKey": st.auth().sandbox_key,
         // 回合跑完时弹不弹系统通知（设置页那个开关）。手机上**永远 false**：
         // 那边是壳的前台服务在发，核心再发一次就是同一个任务响两下
-        "notifyDone": crate::notify::available() && crate::notify::enabled(st.db().as_deref()),
+        "notifyDone": crate::notify::available() && notify_done,
     }))
 }
 
@@ -784,8 +798,18 @@ async fn alpine_status(State(st): State<Arc<AppState>>, Query(q): Query<AlpineQu
     else {
         return Json(json!({ "available": false, "job": job })).into_response();
     };
-    let current = crate::alpine::installed_version(&rootfs);
-    let arch = crate::alpine::arch(&rootfs);
+    // 两次小文件读也在阻塞池里做（这个接口在升级期间会被设置页轮询）。
+    let (current, arch) = {
+        let rootfs = rootfs.clone();
+        tokio::task::spawn_blocking(move || {
+            (
+                crate::alpine::installed_version(&rootfs),
+                crate::alpine::arch(&rootfs),
+            )
+        })
+        .await
+        .unwrap_or((None, String::new()))
+    };
     let mut check_error = None;
     let latest = if q.check == Some(1) {
         match crate::alpine::fetch_latest(&st.alpine, &arch).await {
@@ -851,6 +875,14 @@ async fn alpine_upgrade(
     if !st.alpine.try_begin(&from, &to) {
         return (StatusCode::CONFLICT, "已经在升级了").into_response();
     }
+    // **原子地**确认没有回合在跑、并进入维护态。`precheck` 那个检查到这里的
+    // `fetch_latest`（联网，最长 20s）之间可能已经有回合开起来了 —— 那时
+    // `set_maintenance` 只能拦之后的命令，拦不住已经在跑的 `apk`/编译。
+    // 和 `begin_turn` 用同一把 `turns` 锁，之后来的回合会直接被挡（503）。
+    if !st.begin_upgrade(&sb) {
+        st.alpine.cancel_begin();
+        return (StatusCode::CONFLICT, "有对话正在进行，等它结束再升级").into_response();
+    }
     tokio::spawn(crate::alpine::run(
         st.clone(),
         sb,
@@ -877,7 +909,15 @@ async fn list_procs(State(st): State<Arc<AppState>>, Query(q): Query<ProcsQuery>
     let Some(sb) = st.linux() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "Linux 沙箱未初始化").into_response();
     };
-    let report = sb.procs(q.self_pgid);
+    let report = {
+        // 扫 /proc（每个进程 stat + environ）是同步阻塞 I/O：不能坐在 worker 上
+        // （`agent ps` 在回合里很常调，而 worker 只有 4 个）。
+        let sb = sb.clone();
+        let self_pgid = q.self_pgid;
+        tokio::task::spawn_blocking(move || sb.procs(self_pgid))
+            .await
+            .unwrap_or_default()
+    };
     if q.format.as_deref() == Some("text") {
         // CLI 直接 `cat` 这段：没有结尾换行的话，下一条命令的输出会接在同一行上
         let mut text = report.to_text();
@@ -1064,11 +1104,20 @@ async fn list_files(State(st): State<Arc<AppState>>, Json(body): Json<FilesBody>
         .path
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| "/workspace".to_string());
-    match sb.resolve_path(&guest) {
-        Ok(host) => match crate::workspace::render(&guest, &host) {
-            Ok(text) => text.into_response(),
-            Err(e) => format!("错误：{e:#}").into_response(),
-        },
+    // 目录遍历 + 每个条目的元数据：阻塞 I/O，别坐在 worker 上。
+    let res = {
+        let sb = sb.clone();
+        let guest2 = guest.clone();
+        tokio::task::spawn_blocking(move || {
+            let host = sb.resolve_path(&guest2)?;
+            crate::workspace::render(&guest2, &host)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("列目录的任务挂了: {e}"))
+        .and_then(|r| r)
+    };
+    match res {
+        Ok(text) => text.into_response(),
         Err(e) => format!("错误：{e:#}").into_response(),
     }
 }
@@ -1576,7 +1625,7 @@ async fn set_notify_config(State(st): State<Arc<AppState>>, Json(b): Json<Notify
 
 /// `GET /api/websearch/config` → 配没配 Exa key（设置页用）。key 本身不回，只回末尾几位。
 async fn search_config(State(st): State<Arc<AppState>>) -> Json<Value> {
-    let key = crate::search::read_key(&st);
+    let key = crate::search::read_key(&st).await;
     Json(json!({
         "configured": key.is_some(),
         "keyHint": key.as_deref().map(crate::providers::key_hint),
@@ -1682,6 +1731,17 @@ struct ChatBody {
 /// 配了 provider 就跑真实 agent loop（`agent.rs`），否则回退到脚本演示流。
 /// 两种情况下**输出格式完全一致**，所以前端不需要知道区别。
 async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Response {
+    // 沙箱正在升级 Alpine：这期间不能开回合（命令会和 apk 抢同一套 musl）。
+    // `begin_turn` 里也有同一道门（在 `turns` 锁里，和 `begin_upgrade` 互斥），
+    // 这里提前一步是为了给一个能看懂的回包，而不是莫名其妙地“排队”。
+    if st.sandbox_maintenance() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "沙箱正在升级 Alpine（设置 → Linux 沙箱），这期间不能开新回合；几分钟后再试",
+        )
+            .into_response();
+    }
+
     // 运行时配置优先（安卓），回退环境变量（桌面）
     let provider = if body.demo { None } else { st.llm() };
 
@@ -1712,26 +1772,37 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
     //
     // **排在回合检查之前**：排队的消息也要把附件拿在手里，不然「排队期间
     // 上传的那张图」到交给模型时已经不在 pending 里了。
-    let mut attachments: Vec<crate::agent::Attachment> = Vec::new();
-    if !body.attachments.is_empty() {
-        let mut pending = st
-            .pending_attachments
-            .lock()
-            .expect("pending_attachments poisoned");
-        for id in &body.attachments {
-            match pending.remove(id) {
-                Some((_, a)) => attachments.push(a),
-                None => {
-                    drop(pending);
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("附件已失效（{id}），请重新添加"),
-                    )
-                        .into_response();
-                }
-            }
+    //
+    // **先全部校完再一起取走**：以前是一边 remove 一边校，中途撞上一个失效 id
+    // 就 400 返回——前面已经取出来的那些既不在 pending（TTL 清不到）也不在历史里，
+    // 只能等下次启动的 `gc::sweep`。
+    //
+    // demo 流不消费附件（它不写历史），不然同样会变成孤儿。
+    let attachments: Vec<crate::agent::Attachment> = if provider.is_none()
+        || body.attachments.is_empty()
+    {
+        Vec::new()
+    } else {
+        let mut pending = match st.pending_attachments.lock() {
+            Ok(g) => g,
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "附件表不可用").into_response(),
+        };
+        if let Some(missing) = body
+            .attachments
+            .iter()
+            .find(|id| !pending.contains_key(*id))
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("附件已失效（{missing}），请重新添加"),
+            )
+                .into_response();
         }
-    }
+        body.attachments
+            .iter()
+            .filter_map(|id| pending.remove(id).map(|(_, a)| a))
+            .collect()
+    };
 
     // 一个会话同时只跑一个回合（两个回合往同一段历史里交错追加就乱了）；
     // 不同会话可以各跑各的。
@@ -1755,8 +1826,19 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
         } {
             Some(t) => Some(t),
             None => {
+                // 万一就在上面这几步之间沙箱进了维护态（`begin_upgrade` 和
+                // `begin_turn` 在同一把锁里，所以只会是「先检查、后被挡」），
+                // 不要把它排进队里白等：附件还回去，直接 503。
+                if st.sandbox_maintenance() {
+                    st.restore_pending(attachments);
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "沙箱正在升级 Alpine（设置 → Linux 沙箱），这期间不能开新回合；几分钟后再试",
+                    )
+                        .into_response();
+                }
                 let id = body.id.clone().unwrap_or_else(new_id);
-                st.enqueue(
+                let queued = st.enqueue(
                     &sid,
                     crate::state::QueuedMsg {
                         id: id.clone(),
@@ -1764,6 +1846,19 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
                         attachments,
                     },
                 );
+                if let Err(m) = queued {
+                    // 没排进去：附件还回待发列表（不然它们既不排队、也不在历史里，
+                    // 只能等下次启动的清扫）。
+                    st.restore_pending(m.attachments);
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "这个会话排队等着交给模型的消息太多了（上限 {}）；等它跑完再发",
+                            AppState::MAX_QUEUED
+                        ),
+                    )
+                        .into_response();
+                }
                 st.log("info", format!("这个会话在跑，消息先排队（{}）", sid));
                 // 回合可能就在上面 `begin_turn` 失败之后、`enqueue` 之前收了尾 ——
                 // 它收尾时看队列还是空的，这条就没人取了。所以排完再试着开一次：
@@ -1775,7 +1870,9 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
         None => None,
     };
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    // 有界通道（见 `agent::send`）：客户端读得慢时背压在发送方，而不是让
+    // 无界队列把内存一直涨上去（手机上一条长命令的输出是实时推的）。
+    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(CHUNK_QUEUE);
     let core = Core::from(st.clone());
 
     match provider.zip(turn) {
@@ -1787,7 +1884,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
                 let r = crate::agent::run_turn(&core, &p, &body.text, attachments, &sid, turn, txc)
                     .await;
                 if let Err(e) = r {
-                    let _ = tx.send(sse::error(&format!("{e:#}")));
+                    let _ = tx.send(sse::error(&format!("{e:#}"))).await;
                 }
                 // tx 在这里 drop → 转发任务会补上 [DONE]
             });
@@ -1796,7 +1893,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
             st.log("debug", format!("chat (demo): {}", body.text));
             tokio::spawn(async move {
                 for chunk in crate::demo::scripted(&body.text) {
-                    if tx.send(chunk).is_err() {
+                    if tx.send(chunk).await.is_err() {
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(35)).await;
@@ -1978,6 +2075,9 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
     if let Some(e) = body.reasoning_effort {
         p.reasoning_effort = crate::llm::normalize_effort(&e);
     }
+    // 换之前先看一眼：同一家、同一个模型（比如只改了思考强度、或者把设置原样再存一次）
+    // 不该轮换 provider session —— 那等于把**所有**会话的 prompt 缓存全部作废。
+    let old = st.llm();
     st.set_llm(p.clone());
     // 设置页的「模型提供商」里也要看得到这一家
     st.adopt_provider(&p);
@@ -1987,7 +2087,9 @@ async fn set_llm(State(st): State<Arc<AppState>>, Json(body): Json<LlmBody>) -> 
     let pdf = st.supports_files_for(&p).await;
     // 换了 provider / model，缓存前缀的语义就变了：给所有会话换一个
     // provider session id，否则 provider 侧会把新前缀路由到旧模型的缓存上。
-    st.rotate_provider_sessions().await;
+    if old.as_ref().is_none_or(|o| !same_cache_prefix(o, &p)) {
+        st.rotate_provider_sessions().await;
+    }
 
     Json(json!({ "ok": true, "vision": vision, "pdf": pdf })).into_response()
 }
@@ -2095,14 +2197,27 @@ async fn get_models(State(st): State<Arc<AppState>>, Query(q): Query<ModelsQuery
 
 /// 换成这个 provider：存下来、判定能力、给会话换 provider session id。
 async fn switch_provider(st: &Arc<AppState>, p: &Provider) -> (bool, bool) {
+    let old = st.llm();
     st.set_llm(p.clone());
     // 自动判定这个模型能不能吃图片 / PDF（查 models.dev），结果落盘。
     let vision = st.supports_images_for(p).await;
     let pdf = st.supports_files_for(p).await;
     // 换了 provider / model，缓存前缀的语义就变了：给所有会话换一个
     // provider session id，否则 provider 侧会把新前缀路由到旧模型的缓存上。
-    st.rotate_provider_sessions().await;
+    // 同样的 provider + model 不轮换（见 `same_cache_prefix`）。
+    if old.as_ref().is_none_or(|o| !same_cache_prefix(o, p)) {
+        st.rotate_provider_sessions().await;
+    }
     (vision, pdf)
+}
+
+/// 这两份配置的**缓存前缀语义**一样吗。
+///
+/// provider 侧按 `base_url` + `model` 路由/区分缓存前缀；思考强度、协议这些是
+/// 请求参数，不进历史、不影响前缀。只改它们时不该轮换 provider session，
+/// 否则所有会话下一次请求全部 cache miss。
+fn same_cache_prefix(a: &Provider, b: &Provider) -> bool {
+    a.base_url.trim_end_matches('/') == b.base_url.trim_end_matches('/') && a.model == b.model
 }
 
 /// `GET /api/providers` → 设置页「模型提供商」那一栏：内置的几家 + 其他。
@@ -2331,7 +2446,7 @@ async fn upload_attachment(
         .unwrap_or_else(|| "file".into());
 
     let core = Core::from(st.clone());
-    match core.store_attachment(name, mime, body.to_vec()).await {
+    match core.store_attachment(name, mime, &body).await {
         Ok(a) => {
             st.add_pending_attachment(a.clone());
             Json(json!({
@@ -2594,15 +2709,26 @@ async fn session_body(
         return json!({ "unchanged": true, "queued": queued, "rev": rev, "busy": busy });
     }
 
-    // 增量：客户端上次的 rev 里有 (会话 id, 已存消息数)。同一个会话、且它手上的
-    // 消息数没超过当前（没被重置）→ 只补差的那段，见 `session_patch`。
+    // 增量：客户端上次的 rev 里有 (会话 id, epoch, 已存消息数)。同一个会话、
+    // **同一个 epoch**（没被清空过）、且它手上的消息数没超过当前 → 只补差的那段，
+    // 见 `session_patch`。
+    //
+    // epoch 不能省：清空之后长度可能在两次轮询之间又长过旧值（另一个标签页/脚本
+    // `/api/reset` 之后又聊了几句），只看长度会把“整段换了”当成“接着长”。
     //
     // **下标要翻译**：补丁里的 `replaceFrom` 是整段视图的下标，而客户端手上可能只有
     // 尾部那一窗（`tail=N`）—— 它那边的下标比整段的小 `client_from`。落点在它手上
     // 那窗之外（说明它离得太远，比如从冻住里醒来）就退到下面「重发尾部窗口」。
     // 不带 `client_from` 的（脚本、老客户端）按整段算，和以前一模一样。
-    if let Some((cid, client_len)) = parse_rev(client_rev) {
-        if cid == sess.id && client_len <= sess.messages.len() {
+    // 客户端拿的是**清空之前**的历史（epoch 对不上）：这一份是全量，而且前端
+    // 不能拿它跟本地那条按 id 合并 —— 清空后 DB 下标从 0 重新数，`u1`/`a2` 这些
+    // id 会和旧消息撞上，靠 id 复用对象会把旧内容留在屏幕上（见 `reset` 字段）。
+    let mut reset = false;
+    if let Some((cid, client_epoch, client_len)) = parse_rev(client_rev) {
+        if cid == sess.id && client_epoch != sess.epoch {
+            reset = true;
+        }
+        if cid == sess.id && client_epoch == sess.epoch && client_len <= sess.messages.len() {
             let p = crate::agent::session_patch(sess, client_len);
             let base = client_from.unwrap_or(0);
             if p.replace_from >= base {
@@ -2648,18 +2774,22 @@ async fn session_body(
         "usage": usage,
         "from": from,
         "hasMore": from > 0,
+        // 整段换过了（`/api/reset`）：前端要**整份换掉**，不能按 id 和旧消息合并
+        // —— 清空后下标从 0 重数，id 会和旧消息撞上。
+        "reset": reset,
     })
 }
 
-/// 从 rev 里解出 (会话 id, 已存消息数)。格式见 `session_rev`。
-fn parse_rev(rev: &str) -> Option<(&str, usize)> {
+/// 从 rev 里解出 (会话 id, epoch, 已存消息数)。格式见 `session_rev`。
+fn parse_rev(rev: &str) -> Option<(&str, u32, usize)> {
     let mut it = rev.split(':');
     let id = it.next()?;
+    let epoch = it.next()?.parse().ok()?;
     let len = it.next()?.parse().ok()?;
     if id.is_empty() {
         return None;
     }
-    Some((id, len))
+    Some((id, epoch, len))
 }
 
 /// `GET /api/debug/request?session=<id>` 的参数
@@ -2702,8 +2832,18 @@ impl SessionQuery {
 ///
 /// 带 `id`：切换会话时长度和时间戳很容易撞车，撞了客户端就会一直拿着
 /// 上一个会话的消息不动。
+///
+/// 带 `epoch`：`/api/reset` 之后长度可能又长过旧值，只看 (id, len, updated_at)
+/// 认不出「整段换了」—— DB 层的 `plan()` 用同一个字段防的就是这件事。
+/// 最后一个 `updated_at` 只用来让 rev 变化（不参与解析）。
 fn session_rev(sess: &crate::agent::ChatSession) -> String {
-    format!("{}:{}:{}", sess.id, sess.message_count(), sess.updated_at)
+    format!(
+        "{}:{}:{}:{}",
+        sess.id,
+        sess.epoch,
+        sess.message_count(),
+        sess.updated_at
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3068,25 +3208,32 @@ fn new_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+/// agent loop → SSE 的通道容量。
+///
+/// 有界的：每一步的正文/思考 delta 都不能丢，满了两端就互相等（背压）；而
+/// 阶段性工具输出（`preliminary`）满了直接丢（前端对它是整份替换，见
+/// `agent::send`）。以前是无界的 —— 客户端挂着连接不读（WebView 被挂起、
+/// 手机网络很慢）时，一条跑几十分钟的命令能把它撑到几百 MB。
+const CHUNK_QUEUE: usize = 256;
+
 /// 「这条消息排上队了」的回应：一条只有一帧（`data-queued`）的流。
 ///
 /// 刻意**和正常回合同一种形状**（SSE + 同一个 header）：前端那一路就多一个
 /// 「先看首帧」的判断，不用为一个状态分出一条 HTTP 分支。
 fn queued_response(id: &str) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
-    let _ = tx.send(sse::queued(id));
+    let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
+    let _ = tx.try_send(sse::queued(id));
     drop(tx); // 通道关掉 → 转发任务补上 [DONE]
     sse_response(rx)
 }
 
 /// 把 chunk 通道包成带正确 header 的 SSE 响应，并在结束时补 `[DONE]`。
 ///
-/// 上游是无界通道（见 agent.rs 的 `send`）：前端读得慢只会让 chunk 在这里
-/// 排队，不会反压到 agent 循环。排队的大头是 bash 的实时输出（每 120ms 一份、
-/// 每份最多 64KB 的尾部快照），而这种东西只有最新的一份有用 —— 所以每次把
-/// 积压的一批取出来，被后来者盖掉的快照直接扔（`coalesce`）。客户端挂着连接
-/// 却不读（WebView 被挂起）时，积压就不会无限涨。
-fn sse_response(mut rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>) -> Response {
+/// 上游是**有界**通道（见 `CHUNK_QUEUE`）：正文/思考 delta 有背压，阶段性
+/// 工具输出（每 120ms 一份、每份最多 64KB 的尾部快照）满了直接丢 —— 这种东西
+/// 只有最新的一份有用。每次把积压的一批取出来时，被后来者盖掉的快照也扔掉
+/// （`coalesce`）。
+fn sse_response(mut rx: tokio::sync::mpsc::Receiver<serde_json::Value>) -> Response {
     let (out_tx, out_rx) =
         tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
 
@@ -3740,7 +3887,7 @@ fn cmd_name(c: &Command) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_origin, is_same_origin};
+    use super::{is_loopback_origin, is_same_origin, parse_rev, session_rev};
 
     /// 一个开着凭据、带一个真 rootfs 目录的核心：rootfs/workspace/site/index.html。
     async fn sandbox_core(
@@ -3975,5 +4122,30 @@ mod tests {
             !is_same_origin("http://sandbox.localhost:8787", "127.0.0.1:8787"),
             "沙箱网页的源不能连 WebSocket"
         );
+    }
+
+    /// `/api/reset` 之后长度可能又长过旧值：`rev` 里没有 epoch 的话，服务端会把
+    /// 「整段换了」当成「接着长」，增量补丁就把旧对话和新消息拼在一起。
+    #[test]
+    fn revision_notices_a_reset_even_when_the_length_comes_back() {
+        use crate::agent::{ChatMessage, ChatSession};
+        let mut s = ChatSession::new();
+        s.messages.push(ChatMessage::user("u1"));
+        s.messages.push(ChatMessage::System("a1".into()));
+        let before = session_rev(&s);
+        let (id, epoch, len) = parse_rev(&before).expect("rev 能解");
+        assert_eq!(id, s.id);
+        assert_eq!(epoch, 0);
+        assert_eq!(len, s.messages.len());
+
+        // 清空（epoch+1）之后又长回**同样的长度**
+        s.clear();
+        s.messages.push(ChatMessage::user("n1"));
+        s.messages.push(ChatMessage::System("n2".into()));
+        let after = session_rev(&s);
+        let (_, epoch2, len2) = parse_rev(&after).expect("rev 能解");
+        assert_eq!(len2, len, "长度一样");
+        assert_ne!(epoch2, epoch, "长度一样也必须在 rev 里看出整段换过");
+        assert_ne!(before, after);
     }
 }

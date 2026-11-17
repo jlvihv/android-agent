@@ -97,6 +97,8 @@ impl Routes {
     ///
     /// 发现服务会反复报同一个地址：地址没变、也没在走中继的话，池子里的连接照用
     /// （不然每报一次池子就清一次，复用就白做了）。
+    ///
+    /// **不碰冷却**：重复上报不是「它又通了」的证据（见 [`Self::lan_back`]）。
     pub fn set_lan(&self, addr: String) {
         // 先比再 move：原来是 `g.replace(addr.clone())` 之后又拿 `addr.as_str()` 比，
         // 每次上报都白拷一份 String（发现服务刷得很勤）。
@@ -107,13 +109,21 @@ impl Routes {
             *g = Some(addr);
             true
         });
-        let was_down = self
-            .lan_down_until
-            .lock()
-            .is_ok_and(|mut g| g.take().is_some_and(|t| Instant::now() < t));
-        if changed || was_down {
+        if changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// 局域网里**重新出现**了（上一次发现列表里没有它，现在又有了）：之前「不通」的
+    /// 判断作废，下一条连接先试局域网。
+    ///
+    /// 只有「重新出现」才该调：mDNS 心跳会**反复**报同一个地址，如果每次上报都
+    /// 清冷却，那个 30 秒冷却就形同虚设 —— 出门在外时每条新连接都白等 500ms。
+    pub fn lan_back(&self) {
+        if let Ok(mut g) = self.lan_down_until.lock() {
+            *g = None;
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 网络变了（换 Wi-Fi、出门、回家）：之前「局域网不通」的判断作废，池子里的连接
@@ -836,5 +846,19 @@ mod tests {
             r.lan_now().is_some(),
             "reset（网络变了/回家了）之后该重新试"
         );
+    }
+
+    /// 重复上报同一个地址**不能**清掉冷却：mDNS 心跳会让它形同虚设。
+    #[test]
+    fn repeated_discovery_does_not_clear_the_cooldown() {
+        let r = Routes::new(Some("10.0.0.2:8787".into()), None);
+        r.lan_failed();
+        for _ in 0..5 {
+            r.set_lan("10.0.0.2:8787".into());
+        }
+        assert!(r.lan_now().is_none(), "重复上报不该清冷却");
+        // 真正「重新出现」（发现列表里刚才没有它）才清
+        r.lan_back();
+        assert!(r.lan_now().is_some(), "重新出现之后该再试");
     }
 }

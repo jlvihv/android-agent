@@ -406,10 +406,17 @@ impl StatusFile {
         PathBuf::from(format!("{}.{ext}", self.host.display()))
     }
 
+    /// 作业**自己**写下「我开始跑了」的标记（见 `resident::DISPATCHER`）。
+    /// 它和 `pid_host` 是两件事：pid 由父 shell 写（`$!`，可移植），标记由作业写
+    /// （`BASHPID` 在老 bash 上不一定有，不能用来当 pid）。
+    fn started_host(&self) -> PathBuf {
+        self.extra("started")
+    }
+
     fn clean_up(&self) {
         let _ = std::fs::remove_file(&self.host);
         let _ = std::fs::remove_file(&self.pid_host);
-        for ext in ["sh", "run", "out", "err"] {
+        for ext in ["sh", "run", "out", "err", "started"] {
             let _ = std::fs::remove_file(self.extra(ext));
         }
     }
@@ -558,6 +565,64 @@ enum Done {
     PipesClosed,
     /// 用完 timeout
     TimedOut,
+}
+
+/// 命令起来之前，两根 FIFO 的读任务归它管。
+///
+/// `Drop` 的顺序是必须的：先 `unblock`（把阻塞在 `open()` 上的线程叫醒），再
+/// `abort` 任务，最后（由 `StatusFile` 的 Drop）删文件。只是 drop `JoinHandle`
+/// 是 **detach 不是 abort**，任务会继续跑，而 `open()` 在路径被 unlink 之后永远
+/// 等不到写端 —— 等于永久吃掉一个阻塞线程（池子只有 4 个）。
+struct PendingReaders {
+    out_fifo: Option<PathBuf>,
+    err_fifo: Option<PathBuf>,
+    out_task: Option<tokio::task::JoinHandle<()>>,
+    err_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PendingReaders {
+    fn new(
+        out_fifo: PathBuf,
+        err_fifo: PathBuf,
+        out_task: tokio::task::JoinHandle<()>,
+        err_task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            out_fifo: Some(out_fifo),
+            err_fifo: Some(err_fifo),
+            out_task: Some(out_task),
+            err_task: Some(err_task),
+        }
+    }
+
+    /// 命令起来了：把任务交出去（`Collect` 负责收尾）。
+    ///
+    /// FIFO 路径**留着**：正常跑完时读端也可能还卡在 `open()` 上（命令的
+    /// 重定向根本没写成功，比如 `.run` 先失败）——`Drop` 里那一下 `unblock`
+    /// 是它唯一的出路。
+    fn take(&mut self) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+        (
+            self.out_task.take().expect("刚构造过"),
+            self.err_task.take().expect("刚构造过"),
+        )
+    }
+}
+
+impl Drop for PendingReaders {
+    fn drop(&mut self) {
+        if let Some(p) = &self.out_fifo {
+            resident::unblock_fifo(p);
+        }
+        if let Some(p) = &self.err_fifo {
+            resident::unblock_fifo(p);
+        }
+        if let Some(t) = self.out_task.take() {
+            t.abort();
+        }
+        if let Some(t) = self.err_task.take() {
+            t.abort();
+        }
+    }
 }
 
 /// 一条命令的收尾责任。
@@ -2057,7 +2122,11 @@ impl LinuxSandbox {
                     .await
                 {
                     Ok(res) => return Ok(res),
-                    // 命令**没跑起来**（交不过去 / 常驻的那个半路没了）：关掉它，这条走老路
+                    // 命令**没开始跑**：关掉它，这条走老路。
+                    //
+                    // 回退是安全的：判断用的是作业自己写的 `.started`（不是父 shell
+                    // 写的 pid），而返回前 `StatusFile` 的 Drop 会把 `.run` 删掉 ——
+                    // 晚到的作业 source 不到文件，命令不会执行。见 `exec_resident`。
                     Err(e) => {
                         tracing::warn!("常驻 shell 没接住这条命令（走老路）：{e:#}");
                         self.stop_resident();
@@ -2075,6 +2144,11 @@ impl LinuxSandbox {
         if on {
             self.stop_resident();
         }
+    }
+
+    /// 现在在维护吗（升级 Alpine 期间）。`AppState::begin_turn` 用它挡住新回合。
+    pub fn in_maintenance(&self) -> bool {
+        self.maintenance.load(Ordering::Relaxed)
     }
 
     /// 关掉常驻 shell（下一条命令会再起一个）。
@@ -2215,9 +2289,9 @@ impl LinuxSandbox {
 
     /// 用常驻 shell 跑一条命令（见 `resident` 模块）。
     ///
-    /// `Err` 只有一种意思：**命令没跑起来**（文件写不了、交不过去、常驻的那个半路
-    /// 没了）—— 调用方退回老路，不会跑两遍。命令起来之后的一切（非 0 退出、超时、
-    /// 被杀）都是 `Ok`，和老路一样由 `collect` 收。
+    /// `Err` 只有一种意思：**命令没开始跑**（文件写不了、交不过去、常驻的那个半路
+    /// 没了、等不到 `.started`）。调用方退回老路，不会跑两遍 —— 见下面 `.started`
+    /// 那一段的说明。
     async fn exec_resident(
         &self,
         r: &Arc<Resident>,
@@ -2274,32 +2348,41 @@ impl LinuxSandbox {
         };
         let out_task = reader(out_fifo.clone(), live.clone(), out_cap.clone());
         let err_task = reader(err_fifo.clone(), live, err_cap.clone());
-        // 读端在阻塞线程里等写端：命令没起来的话放它们出来
-        let unblock = || {
-            resident::unblock_fifo(&out_fifo);
-            resident::unblock_fifo(&err_fifo);
-        };
+        // 命令起来之前这两根 FIFO 的读任务由它兜着（取消路径的收尾，见它的说明）。
+        let mut readers = PendingReaders::new(out_fifo, err_fifo, out_task, err_task);
 
-        // 交出去，等它起来（常驻 shell 写下这条命令的进程组号）
-        let spawned = async {
-            r.submit(&id).await?;
-            let t = Instant::now();
-            while read_pgid(&status.pid_host).is_none() {
-                anyhow::ensure!(r.alive(), "常驻 shell 半路退出了");
-                anyhow::ensure!(
-                    t.elapsed() < RESIDENT_SPAWN,
-                    "常驻 shell {RESIDENT_SPAWN:?} 没把命令起来"
-                );
-                tokio::time::sleep(Duration::from_millis(2)).await;
+        // 交出去，等它**真的开始跑**（作业自己写的 `.started`）和进程组号。
+        //
+        // 为什么不能只看 pid：pid 是父 shell 在 fork 之后写的，写完 pid 到作业真正
+        // 执行之间还有一个窗口（父 shell 被杀、作业排不上队）。没看到 `.started`
+        // 就回退是**安全的**：`StatusFile` 的 Drop 会把 `.run` 删掉，晚到的作业
+        // `. "$d/$id.run"` 找不到文件，命令不会执行。
+        //
+        // 看到 `.started` 就继续收（命令已经在跑，父 shell 死没死都不影响它）。
+        r.submit(&id).await?;
+        let t = Instant::now();
+        let mut begun = false;
+        loop {
+            begun |= status.started_host().is_file();
+            if begun && read_pgid(&status.pid_host).is_some() {
+                break;
             }
-            anyhow::Ok(())
-        };
-        if let Err(e) = spawned.await {
-            unblock();
-            out_task.abort();
-            err_task.abort();
-            return Err(e);
+            if !r.alive() {
+                if begun {
+                    // 已经跑起来了，父 shell 死没死不影响这条命令
+                    break;
+                }
+                anyhow::bail!("常驻 shell 半路退出了");
+            }
+            if t.elapsed() >= RESIDENT_SPAWN {
+                if begun {
+                    break;
+                }
+                anyhow::bail!("常驻 shell {RESIDENT_SPAWN:?} 没把命令起来");
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
+        let (out_task, err_task) = readers.take();
 
         let run = self.register_run(r.pid(), script, status.pid_host.clone(), Some(id));
         // 杀谁：只认这条命令自己的组（pid 文件）。**没有兜底** —— 兜底的那个组是常驻
@@ -2321,7 +2404,9 @@ impl LinuxSandbox {
                 using_bash: true,
             })
             .await;
-        unblock();
+        // 两个 FIFO 路径在 `readers` 里：它 Drop 时会 `unblock`（把可能还卡在
+        // `open()` 上的读端放出来）—— 命令的重定向根本没成功时（比如 `.run`
+        // 先失败），这是那个阻塞线程唯一的出路。见 `PendingReaders`。
         Ok(res)
     }
 

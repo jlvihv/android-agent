@@ -234,10 +234,28 @@ impl Machines {
             host: host.to_string(),
             port,
         };
+        // 「重新出现」（上一轮发现列表里没有它）才清掉局域网冷却。mDNS 会反复报
+        // 同一个地址，每次上报都清的话冷却等于没有（见 `Routes::lan_back`）。
+        let mut newly = false;
         if let Ok(mut g) = self.found.lock() {
             match g.iter_mut().find(|f| f.id == id) {
                 Some(f) => *f = entry,
-                None => g.push(entry),
+                None => {
+                    newly = true;
+                    g.push(entry);
+                }
+            }
+        }
+        if newly {
+            self.lan_back(id);
+        }
+    }
+
+    /// 局域网里重新看到它了：正连着的就是它的话，下一条上游连接先试局域网。
+    fn lan_back(&self, id: &str) {
+        if let Ok(g) = self.current.lock() {
+            if let Some(c) = g.as_ref().filter(|c| c.conn.id == id) {
+                c.routes.lan_back();
             }
         }
     }
@@ -852,20 +870,18 @@ fn notice_of_frame(raw: &str) -> Option<crate::notify::Notice> {
     None
 }
 
-/// 收到一帧就发（真发的那一步；解析在 `notice_of_frame` 里）。
-fn handle_sse_frame(raw: &str) {
+/// 收到一帧：解析出「回合完事」才查开关，再发。
+///
+/// **先解析、后查库**：这条 SSE 每条状态帧都会进来（一个回合上千帧），而
+/// `enabled` 是一次 SQLite 查询。`watch_own_turns` 也是这个顺序（见那里的注释）。
+fn handle_sse_frame_with(raw: &str, db: Option<&crate::db::Db>) {
     let Some(n) = notice_of_frame(raw) else {
         return;
     };
-    notify_in_background(n);
-}
-
-/// 同上，但先问一句本机开关：`db` 为空（没有库）时当开。
-fn handle_sse_frame_with(raw: &str, db: Option<&crate::db::Db>) {
     if !crate::notify::enabled(db) {
         return;
     }
-    handle_sse_frame(raw);
+    notify_in_background(n);
 }
 
 /// 真发一条，**不等它**：这条路径都在收尾/读流的循环里，`osascript` 要几十毫秒、

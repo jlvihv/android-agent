@@ -67,7 +67,7 @@ pub enum Message {
     Assistant {
         /// 只有工具调用、没有正文时省略（`null` 有些端点会 400）
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<std::sync::Arc<str>>,
         /// 这一步的思考内容，**原样回传**（DeepSeek 系的非标准字段）。
         ///
         /// DeepSeek 的思考模式：请求带了 `tools`，之后每一次请求都要把所有
@@ -76,13 +76,14 @@ pub enum Message {
         /// 不返回思考内容的模型（OpenAI 的 Chat Completions 就不给）历史里本来
         /// 就是空的，这个字段自然不出现。
         #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning_content: Option<String>,
+        reasoning_content: Option<std::sync::Arc<str>>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
     },
     Tool {
         tool_call_id: String,
-        content: String,
+        /// 和 `ChatMessage::Tool::content` 共享同一份（`Arc`），每步不再深拷。
+        content: std::sync::Arc<str>,
     },
 }
 
@@ -458,16 +459,14 @@ where
         buf.push(&next?);
 
         while let Some(frame) = buf.next_frame() {
-            let frame = String::from_utf8_lossy(frame).into_owned();
-            if handle_frame(&frame, &tx, &mut on_chunk)? {
+            if handle_frame_bytes(frame, &tx, &mut on_chunk)? {
                 return Ok(());
             }
         }
     }
     // 有些服务端在结尾不发空行
     if let Some(frame) = buf.take_rest() {
-        let frame = String::from_utf8_lossy(frame).into_owned();
-        if handle_frame(&frame, &tx, &mut on_chunk)? {
+        if handle_frame_bytes(frame, &tx, &mut on_chunk)? {
             return Ok(());
         }
     }
@@ -481,6 +480,25 @@ where
     Ok(())
 }
 
+/// 一帧的字节 → 一帧的 `&str`。
+///
+/// 帧绝大多数是合法 UTF-8（字节边界是空行，`FrameBuf` 已经切好了），所以先走
+/// **零拷贝**；真遇到坏字节才退到 `from_utf8_lossy`。以前无条件
+/// `from_utf8_lossy(..).into_owned()`，一条长回复几千帧就是几千次 String 分配。
+fn handle_frame_bytes<F>(
+    raw: &[u8],
+    tx: &tokio::sync::mpsc::UnboundedSender<anyhow::Result<StreamChunk>>,
+    map: &mut F,
+) -> anyhow::Result<bool>
+where
+    F: FnMut(&str) -> anyhow::Result<Option<StreamChunk>>,
+{
+    match std::str::from_utf8(raw) {
+        Ok(s) => handle_frame(s, tx, map),
+        Err(_) => handle_frame(&String::from_utf8_lossy(raw), tx, map),
+    }
+}
+
 /// 处理一帧。返回 `true` 表示收到 `[DONE]` 或消费端没了。
 fn handle_frame<F>(
     frame: &str,
@@ -490,7 +508,9 @@ fn handle_frame<F>(
 where
     F: FnMut(&str) -> anyhow::Result<Option<StreamChunk>>,
 {
-    let mut data = String::new();
+    // 单行 `data:` 是最常见的：直接借那一行，不拼 String。多行才真的拼。
+    let mut first: Option<&str> = None;
+    let mut joined: Option<String> = None;
     for raw in frame.lines() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         if line.starts_with(':') {
@@ -500,13 +520,27 @@ where
             continue;
         };
         let rest = rest.strip_prefix(' ').unwrap_or(rest);
-        if !data.is_empty() {
-            data.push('\n');
+        match (&mut joined, first) {
+            (Some(buf), _) => {
+                buf.push('\n');
+                buf.push_str(rest);
+            }
+            (None, None) => first = Some(rest),
+            (None, Some(f)) => {
+                let mut buf = String::with_capacity(f.len() + 1 + rest.len());
+                buf.push_str(f);
+                buf.push('\n');
+                buf.push_str(rest);
+                joined = Some(buf);
+            }
         }
-        data.push_str(rest);
     }
 
-    let data = data.trim();
+    let data = match (&joined, first) {
+        (Some(s), _) => s.trim(),
+        (None, Some(s)) => s.trim(),
+        (None, None) => return Ok(false),
+    };
     if data.is_empty() {
         return Ok(false);
     }

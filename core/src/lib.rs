@@ -684,7 +684,7 @@ impl Core {
         query: &str,
         num: usize,
     ) -> anyhow::Result<crate::search::Found> {
-        let key = crate::search::read_key(&self.state);
+        let key = crate::search::read_key(&self.state).await;
         crate::search::run(query, num, key.as_deref()).await
     }
 
@@ -753,11 +753,14 @@ impl Core {
     ///
     /// 图片走 `read` 读图同一条缩放流水线；PDF 原样存（只限大小）。
     /// 两个“不是文件”的底线：图片必须能被解码，PDF 必须真的以 `%PDF` 开头。
+    ///
+    /// 收 `&[u8]` 而不是 `Vec<u8>`：上传的 body 本来就在 `Bytes` 里，以前调用方
+    /// `to_vec()` 先拷一份（最多 64MB），图片快路再拷一份 —— 峰值 2–3 份。
     pub async fn store_attachment(
         &self,
         name: String,
         mime: String,
-        bytes: Vec<u8>,
+        bytes: &[u8],
     ) -> anyhow::Result<crate::agent::Attachment> {
         use crate::agent::{Attachment, AttachmentKind};
 
@@ -766,7 +769,7 @@ impl Core {
         let id = uuid::Uuid::now_v7().to_string();
 
         // 图片：按魔数认，不看客户端报的 mime（那是可以伪造的）
-        if let Some(img) = crate::imaging::load_if_image_bytes(&bytes)? {
+        if let Some(img) = crate::imaging::load_if_image_bytes(bytes)? {
             let id = format!("{id}.{}", crate::imaging::ext_of(&img.mime));
             write_attachment(dir.clone(), id.clone(), img.bytes).await?;
             return Ok(Attachment {
@@ -788,7 +791,7 @@ impl Core {
         );
         let _ = mime; // mime 统一由服务端判定，不信客户端
         let id = format!("{id}.{}", crate::imaging::ext_of("application/pdf"));
-        write_attachment(dir.clone(), id.clone(), bytes).await?;
+        write_attachment(dir.clone(), id.clone(), bytes.to_vec()).await?;
         Ok(Attachment {
             path: dir.join(&id).display().to_string(),
             id,
@@ -1133,8 +1136,21 @@ struct CancelBrowserOnDrop(Option<Arc<dyn state::BrowserApi>>);
 
 impl Drop for CancelBrowserOnDrop {
     fn drop(&mut self) {
-        if let Some(host) = self.0.take() {
+        let Some(host) = self.0.take() else { return };
+        // **不能**在这里直接 `host.execute(..)`：`BrowserApi::execute` 是阻塞的
+        // 秒级接口，而这个 Drop 跑在 tokio worker 上（`Core::browser` 超时/
+        // 取消时）。丢进阻塞池（或没有运行时的话一个裸线程）就好了 —— 这个调用
+        // 本身不需要结果，它只是去叫停另一个阻塞调用。
+        let send = move || {
             let _ = host.execute(r#"{"action":"__cancel"}"#);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => drop(h.spawn_blocking(send)),
+            Err(_) => {
+                let _ = std::thread::Builder::new()
+                    .name("agent-browser-cancel".into())
+                    .spawn(send);
+            }
         }
     }
 }

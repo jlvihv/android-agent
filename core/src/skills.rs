@@ -45,6 +45,21 @@ pub struct Skill {
     pub enabled: bool,
 }
 
+/// 读 `SKILL.md` 的**开头一段**就够：frontmatter 在最前面，正文可能几十 KB，
+/// 而这个索引**每个回合**（`system_prompt`）都要扫一遍。以前是整份
+/// `read_to_string`：几十个 skill × 每回合 = 白读几百 KB、白分配几百 KB。
+/// 16KB 放得下任何正常的 frontmatter（名字 + 一句描述）。
+const FRONTMATTER_MAX: usize = 16 * 1024;
+
+fn read_frontmatter(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; FRONTMATTER_MAX];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// 扫一遍 skill 目录。`host` 是磁盘上的目录，`guest` 是模型看到的同一个目录。
 ///
 /// 每个子目录里有 `SKILL.md`、frontmatter 里有 `description` 的才算；没有名字就用目录名。
@@ -63,7 +78,7 @@ pub fn scan(host: &Path, guest: &str) -> Vec<Skill> {
 
     let mut out = Vec::new();
     for dir in dirs {
-        let Ok(text) = std::fs::read_to_string(host.join(&dir).join("SKILL.md")) else {
+        let Some(text) = read_frontmatter(&host.join(&dir).join("SKILL.md")) else {
             continue;
         };
         let Some(meta) = frontmatter(&text) else {

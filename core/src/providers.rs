@@ -167,13 +167,13 @@ pub fn is_chat_model(id: &str) -> bool {
 
 /// 界面上显示的 Key：只露最后 4 位。
 pub fn key_hint(key: &str) -> String {
-    let tail: String = key
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{tail}")
+    // 只取最后 4 个字符：先倒着收进一个小数组，再正着拼（不用两次 Vec）。
+    let mut tail = ['\0'; 4];
+    let mut n = 0;
+    for (i, c) in key.chars().rev().take(4).enumerate() {
+        tail[i] = c;
+        n += 1;
+    }
+    let s: String = tail[..n].iter().rev().collect();
+    format!("…{s}")
 }

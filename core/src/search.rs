@@ -84,9 +84,12 @@ pub fn format_hits(found: &Found) -> String {
 ///
 /// 曾经还有一条 `EXA_API_KEY` 环境变量压库一头（桌面开发）—— 删了：配置只有
 /// 一个来源，不然「界面上填的」和「shell 里带的」会互相打架（LLM 那边同一个教训）。
-pub fn read_key(state: &AppState) -> Option<String> {
+pub async fn read_key(state: &AppState) -> Option<String> {
+    // 一次 SQLite 查询：不能坐在 tokio worker 上（`Db` 是 std Mutex，落盘写大事务时
+    // 会等一阵；worker 只有 4 个）。
     let db = crate::state::cow_take(&state.db)?;
-    db.get_meta("exa_api_key")
+    tokio::task::spawn_blocking(move || db.get_meta("exa_api_key").ok().flatten())
+        .await
         .ok()
         .flatten()
         .map(|k| k.trim().to_string())

@@ -195,10 +195,14 @@ const URL_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// 5–8 步、每步都把整段历史重新组装），缓存里通常有几十个大块。
 #[derive(Default)]
 struct UrlCache {
-    /// path → (data URL, 最近使用的序号)
-    map: HashMap<String, (Arc<str>, u64)>,
+    /// path → (data URL, 最近使用的序号)。
+    ///
+    /// key 用 `Arc<str>`：命中时淘汰队列里也要放同一份 path，Clone 一下 `Arc`
+    /// 就够 —— 以前每次命中都 `path.to_string()` 一次小分配（一个回合 5–8 步、
+    /// 每步每张图一次）。
+    map: HashMap<Arc<str>, (Arc<str>, u64)>,
     /// 序号 → path，最久没用的在最前（`pop_first` 就是淘汰对象）
-    queue: std::collections::BTreeMap<u64, String>,
+    queue: std::collections::BTreeMap<u64, Arc<str>>,
     /// 下一个要发的序号
     tick: u64,
     bytes: usize,
@@ -206,13 +210,15 @@ struct UrlCache {
 
 impl UrlCache {
     fn get(&mut self, path: &str) -> Option<Arc<str>> {
-        let (url, old) = self.map.get(path)?;
-        let (url, old) = (url.clone(), *old);
+        let (key, url, old) = {
+            let (key, (url, old)) = self.map.get_key_value(path)?;
+            (key.clone(), url.clone(), *old)
+        };
         self.tick += 1;
         // 旧序号必须从队列里摘掉：留着的话它排在队头，淘汰时会被当成
         // 「这条最久没用」—— 而它其实刚被用过（实测过，测试抓到的）。
         self.queue.remove(&old);
-        self.queue.insert(self.tick, path.to_string());
+        self.queue.insert(self.tick, key);
         if let Some((_, stamp)) = self.map.get_mut(path) {
             *stamp = self.tick;
         }
@@ -230,8 +236,9 @@ impl UrlCache {
         }
         self.bytes += url.len();
         self.tick += 1;
-        self.queue.insert(self.tick, path.to_string());
-        self.map.insert(path.to_string(), (url, self.tick));
+        let key: Arc<str> = Arc::from(path);
+        self.queue.insert(self.tick, key.clone());
+        self.map.insert(key, (url, self.tick));
     }
 
     /// 淘汰最久没用的那条。返回有没有真的淘汰掉东西。
@@ -240,9 +247,9 @@ impl UrlCache {
     /// 正常情况下一摘就中。这里的 `is_some_and` 只是防御（也让「谁不在这张表里」
     /// 这种不一致不至于静默留下垃圾条目）。
     fn evict_oldest(&mut self) -> bool {
-        while let Some((stamp, path)) = self.queue.pop_first() {
-            if self.map.get(&path).is_some_and(|(_, s)| *s == stamp) {
-                if let Some((u, _)) = self.map.remove(&path) {
+        while let Some((stamp, key)) = self.queue.pop_first() {
+            if self.map.get(key.as_ref()).is_some_and(|(_, s)| *s == stamp) {
+                if let Some((u, _)) = self.map.remove(key.as_ref()) {
                     self.bytes -= u.len();
                 }
                 return true;
@@ -485,11 +492,8 @@ mod tests {
         tiny.put("c", Arc::from("C")); // 3 字节，没超
         assert_eq!(tiny.len(), 3);
         // 队列顺序（序号从小到大）= 最久没用 → 最新：b(2) → a(3) → c(4)
-        assert_eq!(
-            tiny.queue.values().cloned().collect::<Vec<_>>(),
-            vec!["b", "a", "c"],
-            "命中 a 之后，a 必须排到 b 后面"
-        );
+        let order: Vec<&str> = tiny.queue.values().map(|p| &**p).collect();
+        assert_eq!(order, vec!["b", "a", "c"], "命中 a 之后，a 必须排到 b 后面");
         // 淘汰最久没用的那条 = b
         assert!(tiny.evict_oldest());
         assert!(!tiny.map.contains_key("b"), "b 最久没用，先被淘汰");

@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -145,8 +146,14 @@ pub struct OutDir {
 #[derive(Default)]
 pub struct Mcp {
     servers: std::sync::RwLock<Vec<Server>>,
-    /// 服务名 → 握过手了（`Some(会话 id)` / `None` = 服务端没给会话 id，无状态）
-    sessions: tokio::sync::Mutex<HashMap<String, Option<String>>>,
+    /// 服务名 → 握过手了（`Some(会话 id)` / `None` = 服务端没给会话 id，无状态）。
+    /// 锁只在这张表的读写上拿一下，**不跨网络**。
+    sessions: std::sync::Mutex<HashMap<String, Option<String>>>,
+    /// 服务名 → 「正在握手」的闸。同一台服务只允许一个人握手，别的等它；
+    /// **不同服务之间互不相干** —— 以前是一把全局 `tokio::Mutex` 跨两次 120s
+    /// 的网络往返，一个挂掉的服务会把所有 MCP 调用（包括别的服务）串行堵住。
+    /// 条目按服务名保留，数量有界（服务数）。
+    handshakes: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 停用的服务名（配置留着，模型用不了、提示词里也不提）
     disabled: std::sync::RwLock<std::collections::HashSet<String>>,
     next_id: AtomicU64,
@@ -211,7 +218,27 @@ impl Mcp {
 
     /// 换了配置（改 URL / 请求头 / 删掉）：旧会话作废，下次重新握手。
     pub async fn forget_session(&self, name: &str) {
-        self.sessions.lock().await.remove(name);
+        // 等这台服务正在进行的握手结束再清：不然那个握手会把旧会话又写回去。
+        let gate = self.gate(name);
+        let _one = gate.lock().await;
+        if let Ok(mut g) = self.sessions.lock() {
+            g.remove(name);
+        }
+    }
+
+    /// 这台服务「正在握手」的闸（首次访问时创建，之后一直用同一个）。
+    fn gate(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Ok(mut g) = self.handshakes.lock() {
+            return g.entry(name.to_string()).or_default().clone();
+        }
+        // 锁坏了（毒）：退化成不串行，也比 panic / 永等强。
+        Arc::new(tokio::sync::Mutex::new(()))
+    }
+
+    /// 已经握过手就返回（`None` 也缓存：「这个服务端不给会话 id」也是已知状态）。
+    fn cached_session(&self, name: &str) -> Option<Option<String>> {
+        let g = self.sessions.lock().ok()?;
+        g.get(name).cloned()
     }
 
     /// 全部工具（`tools/list`，跟着游标翻页）。
@@ -262,10 +289,18 @@ impl Mcp {
     }
 
     /// 这个服务的会话 id（没握过手就现握）。
+    ///
+    /// **网络往返不在任何共享锁里**：只拿这台服务自己的闸。同一台服务串行
+    /// （不会打出两个 initialize），不同服务并行。
     async fn session(&self, srv: &Server) -> anyhow::Result<Option<String>> {
-        let mut g = self.sessions.lock().await;
-        if let Some(s) = g.get(&srv.name) {
-            return Ok(s.clone());
+        if let Some(s) = self.cached_session(&srv.name) {
+            return Ok(s);
+        }
+        let gate = self.gate(&srv.name);
+        let _one = gate.lock().await;
+        // 等闸的时候可能别人刚握完（或刚失败、被别的请求重握了）
+        if let Some(s) = self.cached_session(&srv.name) {
+            return Ok(s);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let init = json!({
@@ -290,7 +325,9 @@ impl Mcp {
             srv.name,
             n.status
         );
-        g.insert(srv.name.clone(), session.clone());
+        if let Ok(mut g) = self.sessions.lock() {
+            g.insert(srv.name.clone(), session.clone());
+        }
         Ok(session)
     }
 }

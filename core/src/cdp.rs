@@ -193,7 +193,11 @@ impl Drop for Chrome {
 /// - 每只标签一条**自己的**连接（连的是那个页面的调试地址），自己一把锁：同一只
 ///   标签上的动作串行（`navigate A → click` 不能被插队），不同标签之间互不等
 struct Inner {
-    conn: Option<Conn>,
+    /// 浏览器级连接（开 / 关 / 列标签用）。`Arc<Mutex<…>>`：**调到它的网络等待
+    /// 不在 `Inner` 锁里** —— 拿到 Arc、放开标签表锁，再锁这条连接去发命令。
+    /// 以前它直接放在 `Inner` 里，`sweep` 会在拿着标签表锁时 `Target.closeTarget`
+    /// （最长 30s），期间所有标签的所有动作都进不来。
+    conn: Option<Arc<Mutex<Conn>>>,
     /// 自己起的 Chrome（连别人的时候是 None）
     chrome: Option<Chrome>,
     /// 实际连的地址（自己起的话 = 起来之后才知道的那个端口）
@@ -297,6 +301,36 @@ const TAB_ACTIONS: &[&str] = &[
     "set_user_agent",
 ];
 
+/// 拿浏览器级连接的锁（被 panic 毒了也是一个明确错误，不 panic）。
+fn conn_lock(conn: &Arc<Mutex<Conn>>) -> Result<MutexGuard<'_, Conn>, String> {
+    conn.lock()
+        .map_err(|_| "和浏览器的连接被锁坏了（上一个动作 panic 过？）".to_string())
+}
+
+/// 每只标签**现在**的地址和标题（targetId → (url, title)）。一次 `Target.getTargets`
+/// 就全拿到了，不用挨个切过去问。
+///
+/// 不拿 `Inner` 锁：连接是共享句柄（见 `Inner::conn`），网络等待不该坐在标签表锁上。
+fn live_pages_from(
+    conn: &Arc<Mutex<Conn>>,
+) -> Result<std::collections::HashMap<String, (String, String)>, String> {
+    let r = conn_lock(conn)?.call(None, "Target.getTargets", json!({}))?;
+    let str_of = |t: &Value, k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    Ok(r.get("targetInfos")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|t| {
+                    (
+                        str_of(t, "targetId"),
+                        (str_of(t, "url"), str_of(t, "title")),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// 「没有这只标签」：顺便列出现有的
 fn no_such_tab(g: &Inner, want: i64) -> String {
     if g.reaped.iter().any(|&r| r as i64 == want) {
@@ -383,7 +417,7 @@ impl CdpBrowser {
         let mut out = match name {
             "new_tab" => self.new_tab(a)?,
             "set_user_agent" => self.set_user_agent(a)?,
-            n if TAB_ACTIONS.contains(&n) => self.with_browser(|g| self.tab_table(g, n, a))?,
+            n if TAB_ACTIONS.contains(&n) => self.tab_table(n, a)?,
             n => self.page_action(n, a)?,
         };
         // 每个动作回都带上「在哪只标签上、一共几只」（和手机那边同款）：模型多标签时
@@ -402,19 +436,43 @@ impl CdpBrowser {
             .map_err(|_| "浏览器状态被锁坏了（上一个动作 panic 过？）".to_string())
     }
 
+    /// 浏览器级连接断了就重连一次。标签表动作 / 开新标签自己会发命令，不像
+    /// `with_browser` 那样自动重试，所以先在这里保证连接是活的。
+    fn reconnect_if_dead(&self) -> Result<(), String> {
+        let dead = {
+            let g = self.lock()?;
+            g.conn
+                .as_ref()
+                .is_some_and(|c| c.lock().map_or(true, |c| c.dead))
+        };
+        if dead {
+            tracing::info!("和 Chrome 的连接断了，重连");
+            self.reconnect()?;
+        }
+        Ok(())
+    }
+
     /// 拿着标签表那把锁做一件事。浏览器级的连接断了：重连一次再试 —— 只试一次，
     /// 再断就是真有问题（Chrome 自己还活着时，连接空闲一会儿也可能断）
     fn with_browser<T>(&self, f: impl Fn(&mut Inner) -> Result<T, String>) -> Result<T, String> {
-        let mut g = self.lock()?;
-        let r = f(&mut g);
-        if g.conn.as_ref().is_some_and(|c| c.dead) {
-            tracing::info!("和 Chrome 的连接断了，重连");
-            return match self.reconnect(&mut g) {
-                Ok(()) => f(&mut g),
-                Err(e) => Err(format!("和浏览器的连接断了，重连也失败：{e}")),
-            };
+        // 先拿锁做「标签表上的那一下」，把浏览器连接的 Arc 拷出来就放开。
+        let (r, conn) = {
+            let mut g = self.lock()?;
+            let r = f(&mut g);
+            let conn = g.conn.clone();
+            (r, conn)
+        };
+        // 断没断要锁连接本身（不在 `Inner` 锁里）。
+        let dead = conn
+            .as_ref()
+            .is_some_and(|c| c.lock().map_or(true, |c| c.dead));
+        if !dead {
+            return r;
         }
-        r
+        tracing::info!("和 Chrome 的连接断了，重连");
+        self.reconnect()?;
+        let mut g = self.lock()?;
+        f(&mut g)
     }
 
     /// 页面上的动作。带了 `tab` 就先切到那只（和手机一个语义：「当前标签」永远是
@@ -423,6 +481,10 @@ impl CdpBrowser {
     /// 标签表的锁只在挑标签那一下拿着；动作本身只锁这一只标签 —— 所以
     /// `agent browser --tab 1 … & agent browser --tab 2 … &` 是真的同时在跑。
     fn page_action(&self, name: &str, a: &Value) -> Result<Value, String> {
+        // 没有标签就先开一只。**开标签的 createTarget / 连页面在锁外做**。
+        if self.lock()?.tabs.is_empty() {
+            self.open_tab()?;
+        }
         let (id, page, profile) = self.with_browser(|g| {
             if let Some(want) = a.get("tab").and_then(|v| v.as_i64()) {
                 let i = g
@@ -432,7 +494,7 @@ impl CdpBrowser {
                     .ok_or_else(|| no_such_tab(g, want))?;
                 g.current = i;
             } else if g.tabs.is_empty() {
-                self.create_tab(g)?;
+                return Err("没有标签页（刚被别的动作关掉了）".to_string());
             }
             let t = &mut g.tabs[g.current];
             t.last_used = Instant::now();
@@ -450,7 +512,7 @@ impl CdpBrowser {
                     // 页面都连不上了：多半是 Chrome 整个没了。让浏览器那层重连 / 重起，
                     // 并把已经不在的标签从表里去掉
                     drop(p);
-                    let _ = self.with_browser(|g| self.reconnect(g));
+                    let _ = self.reconnect();
                     Err(format!("和第 {id} 只标签的连接断了，重连也失败：{e}"))
                 }
             };
@@ -875,71 +937,111 @@ impl CdpBrowser {
 
     /// 标签表上的动作：列 / 切 / 关。回结构化的数据（文字在 `Core::browser` 里排，
     /// 和手机那边同一份 —— 见 `lib.rs` 的 `tab_reply`）。
-    fn tab_table(&self, g: &mut Inner, name: &str, a: &Value) -> Result<Value, String> {
+    ///
+    /// **标签表的锁只在选目标那一下拿**：`Target.activateTarget` / `closeTarget` /
+    /// `getTargets` 都是网络往返，放在锁外（见 `Inner::conn`）。
+    fn tab_table(&self, name: &str, a: &Value) -> Result<Value, String> {
+        self.reconnect_if_dead()?;
         match name {
             "list_tabs" => {
-                // 模型看过现在有哪些了：被空闲回收的那些号可以重用了（见 `alloc_id`）
-                g.reaped.clear();
-                let live = if g.tabs.is_empty() {
-                    Default::default()
-                } else {
-                    self.live_pages(g)?
+                let (conn, tabs, current) = {
+                    let mut g = self.lock()?;
+                    // 模型看过现在有哪些了：被空闲回收的那些号可以重用了（见 `alloc_id`）
+                    g.reaped.clear();
+                    let conn = if g.tabs.is_empty() {
+                        None
+                    } else {
+                        Some(self.ensure_conn(&mut g)?)
+                    };
+                    (
+                        conn,
+                        g.tabs
+                            .iter()
+                            .map(|t| (t.id, t.target.clone()))
+                            .collect::<Vec<_>>(),
+                        g.current,
+                    )
                 };
-                let list: Vec<Value> = g
-                    .tabs
+                let live = match &conn {
+                    Some(c) => live_pages_from(c)?,
+                    None => Default::default(),
+                };
+                let list: Vec<Value> = tabs
                     .iter()
                     .enumerate()
-                    .map(|(i, t)| {
-                        let (url, title) = live.get(&t.target).cloned().unwrap_or_default();
-                        json!({ "id": t.id, "url": url, "title": title, "current": i == g.current })
+                    .map(|(i, (id, target))| {
+                        let (url, title) = live.get(target).cloned().unwrap_or_default();
+                        json!({ "id": id, "url": url, "title": title, "current": i == current })
                     })
                     .collect();
                 Ok(json!({ "ok": true, "list": list }))
             }
             "switch_tab" => {
                 let want = a.get("tab").and_then(|v| v.as_i64()).unwrap_or(-1);
-                let i = g
-                    .tabs
-                    .iter()
-                    .position(|t| t.id as i64 == want)
-                    .ok_or_else(|| no_such_tab(g, want))?;
-                g.current = i;
-                // 切过去就是要用它：算一次「用了」（列 / 关标签不算，见 `sweep`）
-                g.tabs[i].last_used = Instant::now();
-                let target = g.tabs[i].target.clone();
-                let conn = self.ensure_conn(g)?;
+                let (target, conn) = {
+                    let mut g = self.lock()?;
+                    let i = g
+                        .tabs
+                        .iter()
+                        .position(|t| t.id as i64 == want)
+                        .ok_or_else(|| no_such_tab(&g, want))?;
+                    g.current = i;
+                    // 切过去就是要用它：算一次「用了」（列 / 关标签不算，见 `sweep`）
+                    g.tabs[i].last_used = Instant::now();
+                    let target = g.tabs[i].target.clone();
+                    let conn = self.ensure_conn(&mut g)?;
+                    (target, conn)
+                };
                 // 切到前台（截图、焦点都认它）。每只标签在自己的窗口里，不切也不会被
                 // 当成后台标签降频 —— 这一步只是和「用户切标签」的语义对齐
-                let _ = conn.call(None, "Target.activateTarget", json!({ "targetId": target }));
-                let live = self.live_pages(g)?;
+                let _ = conn_lock(&conn)?.call(
+                    None,
+                    "Target.activateTarget",
+                    json!({ "targetId": target }),
+                );
+                let live = live_pages_from(&conn)?;
                 let (url, title) = live.get(&target).cloned().unwrap_or_default();
                 Ok(json!({ "ok": true, "url": url, "title": title }))
             }
             "close_tab" => {
-                if g.tabs.is_empty() {
-                    return Err("没有标签页可关".into());
-                }
-                let i = match a.get("tab").and_then(|v| v.as_i64()) {
-                    Some(n) => g
-                        .tabs
-                        .iter()
-                        .position(|t| t.id as i64 == n)
-                        .ok_or_else(|| no_such_tab(g, n))?,
-                    None => g.current,
+                let (target, id, conn) = {
+                    let mut g = self.lock()?;
+                    if g.tabs.is_empty() {
+                        return Err("没有标签页可关".into());
+                    }
+                    let i = match a.get("tab").and_then(|v| v.as_i64()) {
+                        Some(n) => g
+                            .tabs
+                            .iter()
+                            .position(|t| t.id as i64 == n)
+                            .ok_or_else(|| no_such_tab(&g, n))?,
+                        None => g.current,
+                    };
+                    let target = g.tabs[i].target.clone();
+                    let id = g.tabs[i].id;
+                    let conn = self.ensure_conn(&mut g)?;
+                    (target, id, conn)
                 };
-                let target = g.tabs[i].target.clone();
-                let id = g.tabs[i].id;
-                let conn = self.ensure_conn(g)?;
-                conn.call(None, "Target.closeTarget", json!({ "targetId": target }))?;
-                g.tabs.remove(i);
-                if i < g.current || g.current >= g.tabs.len() {
-                    g.current = g.current.saturating_sub(1);
-                }
+                conn_lock(&conn)?.call(
+                    None,
+                    "Target.closeTarget",
+                    json!({ "targetId": target }),
+                )?;
+                // 关完再动表（另一个动作可能已经把它关了 / 切走了）
+                let next = {
+                    let mut g = self.lock()?;
+                    if let Some(i) = g.tabs.iter().position(|t| t.target == target) {
+                        g.tabs.remove(i);
+                        if i < g.current || g.current >= g.tabs.len() {
+                            g.current = g.current.saturating_sub(1);
+                        }
+                    }
+                    g.tabs.get(g.current).map(|t| t.target.clone())
+                };
                 let mut v = json!({ "ok": true, "closed": id });
-                if let Some(t) = g.tabs.get(g.current) {
-                    let target = t.target.clone();
-                    let live = self.live_pages(g)?;
-                    let (url, title) = live.get(&target).cloned().unwrap_or_default();
+                if let Some(t) = next {
+                    let live = live_pages_from(&conn)?;
+                    let (url, title) = live.get(&t).cloned().unwrap_or_default();
                     v["url"] = json!(url);
                     v["title"] = json!(title);
                 }
@@ -961,14 +1063,7 @@ impl CdpBrowser {
             Some(u) => Some(normalize_url(u).ok_or_else(|| format!("只支持 http/https：{u}"))?),
             None => None,
         };
-        let (id, page) = self.with_browser(|g| {
-            if g.tabs.len() >= MAX_TABS {
-                return Err(format!(
-                    "标签页已经到上限（{MAX_TABS} 只）了，先 `agent browser close_tab` 关一只"
-                ));
-            }
-            self.create_tab(g)
-        })?;
+        let (id, page) = self.open_tab()?;
         let mut v = json!({ "ok": true, "opened": id, "tab": id });
         if let Some(t) = target {
             let mut p = page
@@ -1025,38 +1120,26 @@ impl CdpBrowser {
         ))
     }
 
-    /// 每只标签**现在**的地址和标题（targetId → (url, title)）。一次 `Target.getTargets`
-    /// 就全拿到了，不用挨个切过去问。
-    fn live_pages(
-        &self,
-        g: &mut Inner,
-    ) -> Result<std::collections::HashMap<String, (String, String)>, String> {
-        let conn = self.ensure_conn(g)?;
-        let r = conn.call(None, "Target.getTargets", json!({}))?;
-        let str_of =
-            |t: &Value, k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        Ok(r.get("targetInfos")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .map(|t| {
-                        (
-                            str_of(t, "targetId"),
-                            (str_of(t, "url"), str_of(t, "title")),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-
     /// 开一只空白标签并切过去，回 (编号, 它的连接)。每只标签开在**自己的窗口**里：
     /// 无头 Chrome 一个窗口里只有一只标签算「可见」，别的都被当成后台降频（实测
     /// `visibilityState=hidden`）—— 几只标签并行操作时就会互相拖慢。
-    fn create_tab(&self, g: &mut Inner) -> Result<(i32, Arc<Mutex<Page>>), String> {
-        let profile = g.profile;
-        let conn = self.ensure_conn(g)?;
-        let r = conn.call(
+    ///
+    /// 分三段：锁内拿连接 → **锁外** createTarget + 连页面 → 锁内入表。
+    fn open_tab(&self) -> Result<(i32, Arc<Mutex<Page>>), String> {
+        self.reconnect_if_dead()?;
+        let (profile, conn, ep) = {
+            let mut g = self.lock()?;
+            if g.tabs.len() >= MAX_TABS {
+                return Err(format!(
+                    "标签页已经到上限（{MAX_TABS} 只）了，先 `agent browser close_tab` 关一只"
+                ));
+            }
+            let profile = g.profile;
+            let conn = self.ensure_conn(&mut g)?;
+            let ep = self.endpoint_of(&g);
+            (profile, conn, ep)
+        };
+        let r = conn_lock(&conn)?.call(
             None,
             "Target.createTarget",
             json!({ "url": "about:blank", "newWindow": true }),
@@ -1066,25 +1149,28 @@ impl CdpBrowser {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "createTarget 没给 targetId".to_string())?
             .to_string();
-        let ep = self.endpoint_of(g);
         let page = match Page::open(&ep, &target, profile) {
             Ok(p) => p,
             Err(e) => {
-                if let Some(c) = g.conn.as_mut() {
-                    let _ = c.call(None, "Target.closeTarget", json!({ "targetId": target }));
-                }
+                let _ = conn_lock(&conn).and_then(|mut c| {
+                    c.call(None, "Target.closeTarget", json!({ "targetId": target }))
+                });
                 return Err(e);
             }
         };
-        let id = g.alloc_id();
         let page = Arc::new(Mutex::new(page));
-        g.tabs.push(Tab {
-            id,
-            target,
-            page: page.clone(),
-            last_used: Instant::now(),
-        });
-        g.current = g.tabs.len() - 1;
+        let id = {
+            let mut g = self.lock()?;
+            let id = g.alloc_id();
+            g.tabs.push(Tab {
+                id,
+                target,
+                page: page.clone(),
+                last_used: Instant::now(),
+            });
+            g.current = g.tabs.len() - 1;
+            id
+        };
         Ok((id, page))
     }
 
@@ -1175,9 +1261,21 @@ fn spawn_sweeper(inner: Weak<Mutex<Inner>>, managed: bool) {
         .spawn(move || loop {
             std::thread::sleep(SWEEP_EVERY);
             let Some(inner) = inner.upgrade() else { return };
-            let guard = inner.lock();
-            if let Ok(mut g) = guard {
-                sweep(&mut g, managed, Instant::now());
+            // 标签表锁里只做表操作，`Target.closeTarget` 拿到锁外再发（
+            // 最长 30s 的超时不能坐在浏览器级锁上）。
+            let to_close = {
+                let guard = inner.lock();
+                match guard {
+                    Ok(mut g) => sweep(&mut g, managed, Instant::now()),
+                    Err(_) => Vec::new(),
+                }
+            };
+            for (conn, target) in to_close {
+                if let Ok(mut c) = conn.lock() {
+                    if !c.dead {
+                        let _ = c.call(None, "Target.closeTarget", json!({ "targetId": target }));
+                    }
+                }
             }
         });
 }
@@ -1187,8 +1285,11 @@ fn spawn_sweeper(inner: Weak<Mutex<Inner>>, managed: bool) {
 /// **正在被动作用着的标签不碰**：它的锁拿不到（`try_lock`）就是有动作在跑（比如一次
 /// 等了很久的 `navigate`）—— 跳过，下一轮再看。这里拿着标签表的锁、只 `try_lock`
 /// 标签的锁，不会和 `page_action`（先标签表、放开、再标签）死锁。
-fn sweep(g: &mut Inner, managed: bool, now: Instant) {
+///
+/// 返回要关掉的 `(连接, targetId)`：**调用方在锁外发**（见 `spawn_sweeper`）。
+fn sweep(g: &mut Inner, managed: bool, now: Instant) -> Vec<(Arc<Mutex<Conn>>, String)> {
     let idle = |t: &Tab| now.saturating_duration_since(t.last_used) >= TAB_IDLE;
+    let mut to_close = Vec::new();
     let mut i = 0;
     while i < g.tabs.len() {
         if !idle(&g.tabs[i]) || g.tabs[i].page.try_lock().is_err() {
@@ -1196,8 +1297,8 @@ fn sweep(g: &mut Inner, managed: bool, now: Instant) {
             continue;
         }
         let t = g.tabs.remove(i);
-        if let Some(c) = g.conn.as_mut().filter(|c| !c.dead) {
-            let _ = c.call(None, "Target.closeTarget", json!({ "targetId": t.target }));
+        if let Some(c) = g.conn.as_ref() {
+            to_close.push((c.clone(), t.target.clone()));
         }
         tracing::info!(
             "标签 {} 空闲超过 {} 分钟，自动关掉",
@@ -1218,6 +1319,7 @@ fn sweep(g: &mut Inner, managed: bool, now: Instant) {
         g.conn = None;
         g.chrome = None; // Drop 就杀进程
     }
+    to_close
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,18 +1543,25 @@ impl CdpBrowser {
     /// 浏览器级的连接断了之后：重新连上。标签各有各的连接，不跟着这条断 —— 这里只把
     /// Chrome 里已经不在的标签从表里去掉。自己起的 Chrome 要是已经退出了，就重新起
     /// 一个（那时标签页确实都没了）。
-    fn reconnect(&self, g: &mut Inner) -> Result<(), String> {
-        g.conn = None;
-        if let Some(c) = g.chrome.as_mut() {
-            if !matches!(c.child.try_wait(), Ok(None)) {
-                tracing::info!("自己起的 Chrome 已经退出了，重新起");
-                g.chrome = None;
-                g.tabs.clear();
-                g.current = 0;
+    ///
+    /// **自己拿锁、自己放**（调用方不能已经持有 `Inner`）：`Target.getTargets`
+    /// 是一次网络往返，不能坐在标签表锁上。
+    fn reconnect(&self) -> Result<(), String> {
+        let conn = {
+            let mut g = self.lock()?;
+            g.conn = None;
+            if let Some(c) = g.chrome.as_mut() {
+                if !matches!(c.child.try_wait(), Ok(None)) {
+                    tracing::info!("自己起的 Chrome 已经退出了，重新起");
+                    g.chrome = None;
+                    g.tabs.clear();
+                    g.current = 0;
+                }
             }
-        }
-        self.ensure_conn(g)?;
-        let live = self.live_pages(g)?;
+            self.ensure_conn(&mut g)?
+        };
+        let live = live_pages_from(&conn)?;
+        let mut g = self.lock()?;
         let current = g.tabs.get(g.current).map(|t| t.id);
         g.tabs.retain(|t| live.contains_key(&t.target));
         g.current = g
@@ -1463,27 +1572,32 @@ impl CdpBrowser {
         Ok(())
     }
 
-    fn ensure_conn<'a>(&self, g: &'a mut Inner) -> Result<&'a mut Conn, String> {
-        if g.conn.is_none() {
-            if self.managed && g.chrome.is_none() {
-                let (chrome, endpoint) = launch_chrome()?;
-                tracing::info!(
-                    "自己起了无头 Chrome：{}（profile {}，日志 {}）",
-                    endpoint,
-                    chrome.profile.display(),
-                    chrome.log.display()
-                );
-                g.endpoint = endpoint;
-                g.chrome = Some(chrome);
-            }
-            let ep = if self.managed {
-                g.endpoint.clone()
-            } else {
-                self.endpoint.clone()
-            };
-            g.conn = Some(Conn::connect(&ep)?);
+    /// 浏览器级连接（没有就现连）。可能拉起 Chrome / 做一次连接握手，**要在锁内
+    /// 调用**（罕见、而且必须原子地写回 `g.conn`）；返回的是共享句柄，之后的
+    /// 请求在锁外发。
+    fn ensure_conn(&self, g: &mut Inner) -> Result<Arc<Mutex<Conn>>, String> {
+        if let Some(c) = &g.conn {
+            return Ok(c.clone());
         }
-        Ok(g.conn.as_mut().expect("刚设过"))
+        if self.managed && g.chrome.is_none() {
+            let (chrome, endpoint) = launch_chrome()?;
+            tracing::info!(
+                "自己起了无头 Chrome：{}（profile {}，日志 {}）",
+                endpoint,
+                chrome.profile.display(),
+                chrome.log.display()
+            );
+            g.endpoint = endpoint;
+            g.chrome = Some(chrome);
+        }
+        let ep = if self.managed {
+            g.endpoint.clone()
+        } else {
+            self.endpoint.clone()
+        };
+        let conn = Arc::new(Mutex::new(Conn::connect(&ep)?));
+        g.conn = Some(conn.clone());
+        Ok(conn)
     }
 }
 

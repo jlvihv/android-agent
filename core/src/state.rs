@@ -89,6 +89,27 @@ pub(crate) fn cow_take<T: Clone>(lock: &RwLock<Option<T>>) -> Option<T> {
 /// 都发生的事，深拷贝一份几百条的 `Vec<ModelInfo>`（每条两个 `String`）不划算。
 type CachedModels = (std::time::Instant, Arc<Vec<crate::models::ModelInfo>>);
 
+/// 待发附件最多留这么多。上传了不发、或者排队的消息没排进去（附件被还回来），
+/// 都可能堆起来 —— 满了就淘汰**最久**的那条（`Instant` 可比较），被淘汰的文件
+/// 交给调用方一起删。
+const MAX_PENDING_ATTACHMENTS: usize = 64;
+
+fn evict_oldest_pending(
+    pending: &mut HashMap<String, (std::time::Instant, crate::agent::Attachment)>,
+    stale: &mut Vec<std::path::PathBuf>,
+) {
+    while pending.len() >= MAX_PENDING_ATTACHMENTS {
+        let oldest = pending
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(k, _)| k.clone());
+        match oldest.and_then(|k| pending.remove(&k)) {
+            Some((_, old)) => stale.push(std::path::PathBuf::from(&old.path)),
+            None => break,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 设备能力抽象（决策 D2 的落点）
 // ---------------------------------------------------------------------------
@@ -676,21 +697,35 @@ impl AppState {
     /// **内存里的样子已经全部落盘**（放掉的东西必须能读回来）。
     pub fn evict_idle(&self) -> usize {
         const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+        /// 空会话（建了没说话 / 清空过）留这么久：人可能还在输入框里打字。
+        const EMPTY_TTL_MS: u64 = 60 * 60 * 1000;
         let Some(db) = self.db() else { return 0 };
         if !self.sessions_loaded.load(Ordering::Relaxed) {
             return 0;
         }
-        let busy = self.busy_sessions();
         let Ok(mut store) = self.chat.try_write() else {
             return 0;
         };
+        // **busy 必须在同一把写锁里现查**（不能先拍快照）：拍完快照到拿到锁之间，
+        // 一个回合可能刚好开始（`begin_turn` 不需要 chat 锁），把它的会话放掉之后
+        // `turn_once` 的 `ensure!(resident())` 会直接失败。锁序 chat → turns 与
+        // `begin_turn`/`end_turn` 一致（它们不碰 chat），不会死锁。
+        //
+        // 顺手把空会话收了：抽屉里本来就不显示它们（`list_page` 过滤），留着只占
+        // 内存和线性查找的时间。过了 TTL、又没回合在跑的才收。
+        let now = crate::agent::now_ms();
+        store.sessions.retain(|s| {
+            s.has_content()
+                || self.is_busy(&s.id)
+                || now.saturating_sub(s.updated_at) < EMPTY_TTL_MS
+        });
         // 不保任何一条：服务端没有「用户正看着哪条」的概念了（那归地址栏）。
         // 清退之后下次被打开会从库里重新读回来，只是多一次 IO。
         let mut n = 0;
         for s in &mut store.sessions {
             let idle = s.resident()
                 && s.has_content()
-                && !busy.contains(&s.id)
+                && !self.is_busy(&s.id)
                 && s.loaded_at.is_none_or(|t| t.elapsed() >= KEEP_FOR);
             if idle && db.is_synced(s) {
                 s.evict();
@@ -797,6 +832,7 @@ impl AppState {
                 }
                 keep
             });
+            evict_oldest_pending(&mut pending, &mut stale);
             pending.insert(a.id.clone(), (std::time::Instant::now(), a));
         }
         crate::gc::remove_all(&stale);
@@ -993,10 +1029,33 @@ impl AppState {
 
     // —— 回合 ——
 
-    /// 在这个会话上开一个回合。已经有一个在跑就返回 None。
+    /// 沙箱正在升级（Alpine）：这期间不能跑命令/开回合。
+    pub fn sandbox_maintenance(&self) -> bool {
+        self.linux().is_some_and(|sb| sb.in_maintenance())
+    }
+
+    /// 开始一次沙箱维护（Alpine 升级）：**原子地**确认现在没有回合在跑，再置维护态。
+    ///
+    /// 和 `begin_turn` 用同一把 `turns` 锁：不存在「检查完了之后又冒出一个回合」的
+    /// 窗口 —— 之后来的 `begin_turn` 会在锁里看到维护态并拒绝。
+    /// 返回 false = 有回合在跑（升级不该开始）。
+    pub fn begin_upgrade(&self, sb: &crate::linux::LinuxSandbox) -> bool {
+        let Ok(g) = self.turns.lock() else {
+            return false;
+        };
+        if !g.is_empty() {
+            return false;
+        }
+        sb.set_maintenance(true);
+        true
+    }
+
+    /// 在这个会话上开一个回合。已经有一个在跑、或者沙箱在升级，都返回 None。
     pub fn begin_turn(&self, sid: &str) -> Option<Arc<Turn>> {
         let mut g = self.turns.lock().ok()?;
-        if g.contains_key(sid) {
+        // 维护态检查放在锁里（见 `begin_upgrade`）：升级一开始，之后所有回合都进不来。
+        // 锁序 turns → linux 与 `begin_upgrade` 一致；没有反过来拿的地方。
+        if g.contains_key(sid) || self.sandbox_maintenance() {
             return None;
         }
         let t = Arc::new(Turn::default());
@@ -1069,11 +1128,43 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// 每个会话最多排这么多条。**必须有上限**：拿到凭据的客户端连续 POST 就是
+    /// 无界的内存增长（每条带正文 + 附件路径），而队列里本来就不该攒这么多。
+    pub const MAX_QUEUED: usize = 50;
+
     /// 排进来一条（“这会儿正跑着，等模型空下来再给它”）。
-    pub fn enqueue(&self, sid: &str, m: QueuedMsg) {
-        if let Ok(mut g) = self.queued.lock() {
-            g.entry(sid.to_string()).or_default().push_back(m);
+    ///
+    /// 队列满了（或者锁坏了）就把这条**原样交还**：它带的附件已经从
+    /// `pending_attachments` 里取出来了，直接丢掉会变成没人清理的孤儿文件。
+    pub fn enqueue(&self, sid: &str, m: QueuedMsg) -> Result<(), QueuedMsg> {
+        let Ok(mut g) = self.queued.lock() else {
+            return Err(m);
+        };
+        let q = g.entry(sid.to_string()).or_default();
+        if q.len() >= Self::MAX_QUEUED {
+            return Err(m);
         }
+        q.push_back(m);
+        Ok(())
+    }
+
+    /// 把刚取出来的附件放回 `pending_attachments`（排队的消息没排进去时用）。
+    /// 客户端会重发同一条消息、按同一批 id 再来取一次。
+    pub fn restore_pending(&self, attachments: Vec<crate::agent::Attachment>) {
+        if attachments.is_empty() {
+            return;
+        }
+        let mut stale = Vec::new();
+        if let Ok(mut g) = self.pending_attachments.lock() {
+            for a in attachments {
+                if g.contains_key(&a.id) {
+                    continue;
+                }
+                evict_oldest_pending(&mut g, &mut stale);
+                g.insert(a.id.clone(), (std::time::Instant::now(), a));
+            }
+        }
+        crate::gc::remove_all(&stale);
     }
 
     /// 取走**全部**排队的消息（回合循环在每个步边界调；没人取就一直是空的）。

@@ -18,6 +18,8 @@
 //! `read` 只看文件头，所以这里只实现 `head`；尾截断（bash 输出用）在
 //! `linux.rs` 里另有一套，两者互不影响。
 
+use std::fmt::Write as _;
+
 /// 一次最多给模型多少行
 pub const MAX_LINES: usize = 2000;
 /// 一次最多给模型多少字节（UTF-8）
@@ -143,8 +145,17 @@ const NUMBER_COLS: usize = 6;
 
 /// `cat -n` 的行号前缀占多少字节：`%6d`（至少 6 列）+ 一个 TAB。
 /// 位数超过 6 位时自然变宽，所以是逐行算。
+///
+/// 位数用整数算，不走 `n.to_string().len()`：`head()` 里每行要调好几次，
+/// 一个 2000 行的 `read` 就是几千次小分配。
 fn prefix_len(n: usize) -> usize {
-    n.to_string().len().max(NUMBER_COLS) + 1
+    let mut digits = 1usize;
+    let mut v = n;
+    while v >= 10 {
+        v /= 10;
+        digits += 1;
+    }
+    digits.max(NUMBER_COLS) + 1
 }
 
 /// 拼正文；`numbered` 为真时给每行加 `cat -n` 同款前缀（`%6d` 右对齐 + TAB）。
@@ -169,12 +180,20 @@ fn render(lines: &[&str], first_number: usize, numbered: bool, phantom: bool) ->
     } else {
         lines
     };
-    let mut out = real
-        .iter()
-        .enumerate()
-        .map(|(i, l)| format!("{:>width$}\t{l}", first_number + i, width = NUMBER_COLS))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // 直接写进一个 String：先前是 `format!` 逐行造一个 `String`、收成 `Vec` 再 join，
+    // 2000 行就是 2000 次分配 + 一次整体拷贝。
+    let mut out = String::with_capacity(real.len() * (NUMBER_COLS + 2));
+    for (i, l) in real.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = write!(
+            out,
+            "{:>width$}\t{l}",
+            first_number + i,
+            width = NUMBER_COLS
+        );
+    }
     // 结尾那个 `\n` 是“空串那一行”贡献的，编号时得手动补回来
     if phantom && !real.is_empty() {
         out.push('\n');
@@ -214,7 +233,10 @@ pub fn read(
     // **只收集要用的那一段**，不是整份 `split('\n').collect()`：32MB 的日志
     // 有 60 多万行，那份 `Vec<&str>` 光是空条目就要 12MB（`&str` = 16 字节），
     // 而真正回给模型的只有前 2000 行。`take` 到头就停，剩下的行数靠数换行。
-    let want = limit.unwrap_or(MAX_LINES.max(1));
+    //
+    // 上限也压在 `MAX_LINES`：`head()` 反正只留 2000 行，模型给 `limit=1000000`
+    // 时没理由先把几十万个 `&str` 收进内存（≈10MB）再截掉。
+    let want = limit.unwrap_or(MAX_LINES).min(MAX_LINES);
     let mut selected: Vec<&str> = Vec::with_capacity(want.min(64));
     let mut seen = 0usize;
     for line in text.split('\n') {

@@ -22,6 +22,11 @@
 //! printf '%s' "$!" > "<id>.pid"
 //! ```
 //!
+//! 作业的**第一句**写下 `<id>.started`：它才是「命令真的开始跑了」的证据。
+//! pid 是父 shell 在 fork 之后写的（`$!`，可移植），两者之间有一个窗口（父 shell
+//! 被杀、作业排不上队）—— 只看 pid 会把这个窗口里的失败当成「起来了」。
+//! 详见 `linux::exec_resident`。
+//!
 //! - `set -m`（作业控制）让每个作业**自成一个进程组**，组号就是 `$!`：超时 / 停止时宿主
 //!   照旧按组杀（`CommandGuard`），杀不到常驻 bash 自己
 //! - 作业里 `set +m`：模型脚本里的 `cmd &` 照旧留在**命令自己的组**里（跟以前一样会被
@@ -62,6 +67,7 @@ printf '%s' "$$" > "$d/$2"
 while IFS= read -r id; do
   [ -n "$id" ] || continue
   (
+    : > "$d/$id.started" || exit 1
     ( . "$d/$id.run" ) </dev/null >"$d/$id.out" 2>"$d/$id.err"
     printf '%s' "$?" > "$d/$id"
   ) &

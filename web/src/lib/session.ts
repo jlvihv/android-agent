@@ -40,6 +40,13 @@ export type SessionPayload = {
   replaceFrom?: number;
   /** 增量时 `messages[0]` 该接在本地那条 assistant 的前几个 part 后面 */
   keepParts?: number | null;
+  /**
+   * 会话被清空过（`/api/reset`，服务端的 `ChatSession::epoch` 变了）。
+   *
+   * 这一份是整段新历史：**不能**按 id 跟本地旧消息合并 —— 清空后 DB 下标从 0
+   * 重新数，`u1` / `a2` 这些 id 会和旧消息撞上，`reconcile` 会把旧内容留在屏幕上。
+   */
+  reset?: boolean;
 };
 
 /** 补丁套不上的两种原因（调用方的处置不一样）。 */

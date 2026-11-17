@@ -145,6 +145,20 @@ impl Reporter {
     ///
     /// 每个思考 delta 都会调到这里，所以阶段没变就直接返回（不拼快照）。
     pub fn thinking(&self) {
+        // **一步之内**又吐了一段思考：已经开始出正文的话**不切回 Thinking**。
+        // 有些 provider 会把 reasoning / content 交错着发，切来切去就是每个 chunk
+        // 一次通知栏刷新（binder 往返）。真正的新一步走 `new_step`。
+        if matches!(
+            self.last_phase(),
+            Some(Phase::Thinking) | Some(Phase::Streaming)
+        ) {
+            return;
+        }
+        self.send(self.running(Phase::Thinking, None, None), false);
+    }
+
+    /// 新的一步开始了（或一个工具刚跑完）：这时允许从 `Streaming` 切回 `Thinking`。
+    pub fn new_step(&self) {
         if self.last_phase() == Some(Phase::Thinking) {
             return;
         }
@@ -190,7 +204,7 @@ impl Reporter {
     /// 工具跑完了，等下一步（回到 `thinking`）。不这么推的话，通知栏会一直停在
     /// 上一条命令上 —— 那期间模型正在想下一步，说的却是「正在跑 apk add」。
     pub fn tool_done(&self) {
-        self.thinking();
+        self.new_step();
     }
 
     /// 回合结束。`stopped` = 用户按了停止，`ok` = 没出错。
@@ -387,4 +401,42 @@ fn tail_start(s: &str, max: usize) -> usize {
         i += 1;
     }
     i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn phases(rx: &mut tokio::sync::broadcast::Receiver<crate::state::Event>) -> Vec<Phase> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::state::Event::Turn { status } = ev {
+                out.push(status.phase);
+            }
+        }
+        out
+    }
+
+    /// 一步之内 reasoning / content 交错出现时，阶段不能在两者之间跳 ——
+    /// 每跳一次就是一次通知栏刷新（binder 往返）。`thinking()` 是「又吐了一段
+    /// 思考」，不切回 Thinking；`new_step()` 才允许。
+    #[test]
+    fn interleaved_reasoning_does_not_flap_the_phase() {
+        let st = AppState::new();
+        let mut rx = st.tx.subscribe();
+        let r = Reporter::new(st, "s1", "标题");
+
+        r.new_step(); // 新的一步：Thinking
+        r.streaming("正文");
+        // 同一步里的思考 delta：不该把阶段切回去
+        r.thinking();
+        r.streaming("正文更多");
+        r.thinking();
+
+        assert_eq!(phases(&mut rx), vec![Phase::Thinking, Phase::Streaming]);
+
+        // 新的一步（工具跑完 / 下一轮）：允许切回 Thinking
+        r.new_step();
+        assert_eq!(phases(&mut rx), vec![Phase::Thinking]);
+    }
 }

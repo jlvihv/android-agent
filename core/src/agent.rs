@@ -83,8 +83,10 @@ pub enum ChatMessage {
         attachments: Vec<Attachment>,
     },
     Assistant {
-        content: String,
-        reasoning: String,
+        /// 正文 / 思考（可能几十 KB）。和 `Tool::content` 同理：每一步都会把整段
+        /// 历史重新组装进请求，`Arc<str>` 让后续每一步只加引用计数。
+        content: std::sync::Arc<str>,
+        reasoning: std::sync::Arc<str>,
         tool_calls: Vec<RecordedToolCall>,
         /// Responses API 给的思考条目，**原样**（见 `StreamChunk::reasoning_item`）。
         ///
@@ -95,7 +97,9 @@ pub enum ChatMessage {
     },
     Tool {
         tool_call_id: String,
-        content: String,
+        /// 工具结果正文（bash 输出可能有几十 KB）。用 `Arc<str>`：同一条消息会在
+        /// **之后每一步**被重新组装进请求，克隆一次 Arc 比每步 memcpy 整段便宜得多。
+        content: std::sync::Arc<str>,
         /// 这次工具调用返回的图片（`read` 读图片时才有）。
         ///
         /// 不放进 `content` 里：OpenAI 的 tool 消息只能是字符串，图片必须
@@ -678,7 +682,7 @@ impl SessionStore {
             for m in messages {
                 let (role, text) = match m {
                     ChatMessage::User { text, .. } => ("user", text.as_str()),
-                    ChatMessage::Assistant { content, .. } => ("assistant", content.as_str()),
+                    ChatMessage::Assistant { content, .. } => ("assistant", content.as_ref()),
                     // 系统提示词和工具结果不参与搜索：前者不是对话，后者是噪音
                     _ => continue,
                 };
@@ -742,7 +746,7 @@ fn close_dangling_tail(sess: &mut ChatSession) {
     for id in missing {
         sess.messages.push(ChatMessage::Tool {
             tool_call_id: id,
-            content: prompt::INTERRUPTED.to_string(),
+            content: prompt::INTERRUPTED.into(),
             images: Vec::new(),
         });
     }
@@ -846,7 +850,7 @@ fn pass_back_empty_reasoning(msgs: &mut [Message]) {
             reasoning_content, ..
         } = m
         {
-            reasoning_content.get_or_insert_with(String::new);
+            reasoning_content.get_or_insert_with(Default::default);
         }
     }
 }
@@ -1456,7 +1460,7 @@ pub fn session_view_range_clipped(
             images,
         } = m
         {
-            results.insert(tool_call_id.as_str(), (content.as_str(), images.as_slice()));
+            results.insert(tool_call_id.as_str(), (content.as_ref(), images.as_slice()));
         }
     }
 
@@ -1737,7 +1741,7 @@ pub async fn run_turn(
     attachments: Vec<Attachment>,
     sid: &str,
     turn: std::sync::Arc<crate::state::Turn>,
-    tx: mpsc::UnboundedSender<Value>,
+    tx: mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     run_turn_with(
         core,
@@ -1761,7 +1765,7 @@ async fn run_turn_with(
     msgs: Vec<(String, Vec<Attachment>)>,
     sid: &str,
     turn: std::sync::Arc<crate::state::Turn>,
-    tx: mpsc::UnboundedSender<Value>,
+    tx: mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     let res = turn_once(core, provider, msgs, sid, turn, tx).await;
     if let Err(e) = &res {
@@ -1794,7 +1798,7 @@ async fn turn_once(
     msgs: Vec<(String, Vec<Attachment>)>,
     sid: &str,
     turn: std::sync::Arc<crate::state::Turn>,
-    tx: mpsc::UnboundedSender<Value>,
+    tx: mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     let _guard = TurnGuard(core.clone(), sid.to_string());
     // 系统提示词可能被 /api/debug/system-prompt 覆盖过，所以不能直接用常量。
@@ -1922,7 +1926,7 @@ async fn drive(
     sid: &str,
     turn: &crate::state::Turn,
     status: &crate::status::Reporter,
-    tx: &mpsc::UnboundedSender<Value>,
+    tx: &mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     let message_id = uuid::Uuid::now_v7().to_string();
     send(tx, sse::start(&message_id)).await;
@@ -1960,6 +1964,11 @@ async fn drive(
         }
         step_no += 1;
         send(tx, sse::start_step()).await;
+        // 新的一步：「想」是允许从「写」切回来的（见 `Reporter::new_step`）。
+        // 一步**之内**的思考 delta 走 `Reporter::thinking`，它不会再切回去 ——
+        // 有些 provider 把 reasoning / content 交错着发，切来切去就是每个 chunk
+        // 一次通知栏刷新。
+        status.new_step();
 
         let step_out = match stream_one(core, provider, sid, turn, status, tx).await {
             Ok(c) => c,
@@ -1970,28 +1979,37 @@ async fn drive(
             }
         };
         send(tx, sse::finish_step()).await;
-        let step = step_out;
+        let StepOutput {
+            content,
+            reasoning,
+            reasoning_items,
+            calls,
+            aborted,
+            interrupted,
+        } = step_out;
 
-        // 不管有没有工具调用，这一轮的 assistant 输出都要进历史
-        if !step.content.is_empty()
-            || !step.reasoning.is_empty()
-            || !step.calls.is_empty()
-            || !step.reasoning_items.is_empty()
+        // 不管有没有工具调用，这一轮的 assistant 输出都要进历史。
+        // 三个大字段直接 move 进去（以前每个 step 都 clone 一遍几十 KB 的正文/思考）；
+        // `calls` 后面还要拿去执行工具，只能 clone 这一份。
+        if !content.is_empty()
+            || !reasoning.is_empty()
+            || !calls.is_empty()
+            || !reasoning_items.is_empty()
         {
             append(
                 core,
                 sid,
                 ChatMessage::Assistant {
-                    content: step.content.clone(),
-                    reasoning: step.reasoning.clone(),
-                    tool_calls: step.calls.clone(),
-                    reasoning_items: step.reasoning_items.clone(),
+                    content: content.into(),
+                    reasoning: reasoning.into(),
+                    tool_calls: calls.clone(),
+                    reasoning_items,
                 },
             )
             .await;
         }
 
-        if step.aborted {
+        if aborted {
             send(tx, sse::abort("已停止")).await;
             send(tx, sse::finish()).await;
             return Ok(());
@@ -1999,7 +2017,7 @@ async fn drive(
 
         // 流到一半断了：已经流出来的上面进了历史，退避后接着下一步 —— 模型看得到自己
         // 说到哪了，从那接着做（界面上只是多出新的，不会有两份）
-        if let Some(why) = step.interrupted {
+        if let Some(why) = interrupted {
             if interrupts >= RETRY_DELAYS.len() {
                 send(tx, sse::error(&why)).await;
                 send(tx, sse::finish()).await;
@@ -2015,7 +2033,6 @@ async fn drive(
         }
         interrupts = 0;
 
-        let calls = step.calls;
         if calls.is_empty() {
             // 模型不再要求工具 → 除非**还有排队的用户消息**，本回合就结束了。
             // 有的话当场交给它、接着跑（「只要模型空下来就立刻给它」那条路）。
@@ -2059,7 +2076,7 @@ async fn drive(
                 sid,
                 ChatMessage::Tool {
                     tool_call_id: call.id.clone(),
-                    content: outcome.text,
+                    content: outcome.text.into(),
                     images: outcome.images,
                 },
             )
@@ -2083,7 +2100,7 @@ async fn drive(
 async fn deliver_queued(
     core: &Core,
     sid: &str,
-    tx: &mpsc::UnboundedSender<Value>,
+    tx: &mpsc::Sender<Value>,
     status: &crate::status::Reporter,
 ) -> bool {
     let msgs = core.state.drain_queued(sid);
@@ -2100,8 +2117,9 @@ async fn deliver_queued(
     }
     send(tx, sse::queued_delivered(&ids)).await;
     send(tx, sse::start(&uuid::Uuid::now_v7().to_string())).await;
-    // 通知栏那行回到「正在想」（它可能还停在某个工具上）
-    status.thinking();
+    // 通知栏那行回到「正在想」（它可能还停在某个工具上）。这是新的一步，
+    // 允许从「写」切回来。
+    status.new_step();
     true
 }
 
@@ -2136,7 +2154,8 @@ pub fn continue_with_queued(core: &Core, provider: &Provider, sid: &str) {
     }
     let (core, provider, sid) = (core.clone(), provider.clone(), sid.to_string());
     tokio::spawn(async move {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // 这个回合没有订阅者（见函数注释）：有界通道、容量小一点，推不进去就算了。
+        let (tx, rx) = mpsc::channel(1);
         drop(rx);
         if let Err(e) = run_turn_with(&core, &provider, msgs, &sid, turn, tx).await {
             tracing::warn!("接着跑排队的消息失败了（{sid}）: {e:#}");
@@ -2151,10 +2170,11 @@ pub fn continue_with_queued(core: &Core, provider: &Provider, sid: &str) {
 async fn stop_with_pending(
     core: &Core,
     sid: &str,
-    tx: &mpsc::UnboundedSender<Value>,
+    tx: &mpsc::Sender<Value>,
     pending: &[RecordedToolCall],
 ) -> anyhow::Result<()> {
     let stopped = ToolOutcome::error("用户已停止，这个工具没有执行完");
+    let stopped_text: std::sync::Arc<str> = stopped.text.as_str().into();
     for call in pending {
         send(tx, tool_output_event(&call.id, &stopped.text, &[])).await;
         append(
@@ -2162,7 +2182,7 @@ async fn stop_with_pending(
             sid,
             ChatMessage::Tool {
                 tool_call_id: call.id.clone(),
-                content: stopped.text.clone(),
+                content: stopped_text.clone(),
                 images: Vec::new(),
             },
         )
@@ -2264,7 +2284,7 @@ fn build_responses_input(
                         kind: "message",
                         role: "assistant",
                         content: vec![OutputPart::Text {
-                            text: content.clone(),
+                            text: content.to_string(),
                         }],
                     }));
                 }
@@ -2454,7 +2474,7 @@ async fn stream_one(
     sid: &str,
     turn: &crate::state::Turn,
     status: &crate::status::Reporter,
-    tx: &mpsc::UnboundedSender<Value>,
+    tx: &mpsc::Sender<Value>,
 ) -> anyhow::Result<StepOutput> {
     // 这个模型能不能看图 / 吃 PDF：自动判定（models.dev，带缓存 + 落盘）。
     // 在拿会话锁之前算 —— 首次判定要联网，不能拖着锁。
@@ -2577,7 +2597,7 @@ async fn stream_one(
                     reason_acc.push_str(r);
                     // 通知栏：从「跑工具」切回「在想」（幂等，一整段思考只推第一次）
                     status.thinking();
-                    for c in blocks.push(BlockKind::Reasoning, r) {
+                    for c in blocks.push(BlockKind::Reasoning, r).into_iter().flatten() {
                         send(tx, c).await;
                     }
                 }
@@ -2587,7 +2607,7 @@ async fn stream_one(
                         text_acc.push_str(c);
                         // 通知栏：正在写的最后一行（内部按半秒攒，不是每块都刷）
                         status.streaming(&text_acc);
-                        for c in blocks.push(BlockKind::Text, c) {
+                        for c in blocks.push(BlockKind::Text, c).into_iter().flatten() {
                             send(tx, c).await;
                         }
                     }
@@ -2798,7 +2818,7 @@ enum Retry {
 /// 重试前：告诉前端在等什么（不然界面就是一段莫名其妙的停顿），然后退避。
 /// 等的时候按停止要立刻生效。返回 `false` = 用户停了。
 async fn backoff(
-    tx: &mpsc::UnboundedSender<Value>,
+    tx: &mpsc::Sender<Value>,
     turn: &crate::state::Turn,
     attempt: usize,
     why: &str,
@@ -2925,23 +2945,31 @@ struct BlockStream {
 }
 
 impl BlockStream {
-    /// 追加一段内容。返回要发出的 chunk：可能先收尾上一块、再开新块。
-    fn push(&mut self, kind: BlockKind, delta: &str) -> Vec<Value> {
-        let mut out = Vec::new();
+    /// 追加一段内容。返回要发出的 chunk：可能先收尾上一块、再开新块（最多 3 个）。
+    ///
+    /// 用固定长度的栈数组而不是 `Vec`：这是**每个 delta** 都走一次的路径，一条长
+    /// 回复几千块，每块一个堆分配（哪怕只有一个元素）纯属白花。
+    fn push(&mut self, kind: BlockKind, delta: &str) -> [Option<Value>; 3] {
+        let mut out: [Option<Value>; 3] = [None, None, None];
+        let mut n = 0usize;
         if self.open.as_ref().map(|(k, _)| *k) != Some(kind) {
-            out.extend(self.close());
+            if let Some(v) = self.close() {
+                out[n] = Some(v);
+                n += 1;
+            }
             let id = match kind {
                 BlockKind::Text => format!("t-{}", uuid::Uuid::now_v7()),
                 BlockKind::Reasoning => format!("r-{}", uuid::Uuid::now_v7()),
             };
-            out.push(match kind {
+            out[n] = Some(match kind {
                 BlockKind::Text => sse::text_start(&id),
                 BlockKind::Reasoning => sse::reasoning_start(&id),
             });
+            n += 1;
             self.open = Some((kind, id));
         }
         let (_, id) = self.open.as_ref().expect("刚开过块");
-        out.push(match kind {
+        out[n] = Some(match kind {
             BlockKind::Text => sse::text_delta(id, delta),
             BlockKind::Reasoning => sse::reasoning_delta(id, delta),
         });
@@ -2956,8 +2984,17 @@ impl BlockStream {
     }
 }
 
-async fn send(tx: &mpsc::UnboundedSender<Value>, v: Value) {
-    let _ = tx.send(v);
+async fn send(tx: &mpsc::Sender<Value>, v: Value) {
+    if v.get("preliminary").and_then(Value::as_bool) == Some(true) {
+        // 阶段性工具输出：前端对它是整份替换，满了直接丢（下一帧会覆盖）。
+        let _ = tx.try_send(v);
+        return;
+    }
+    // 通道有界（见 `http::CHUNK_QUEUE`）：正文/思考 delta 要保序，所以满了就等。
+    // 但客户端可能挂着连接**永远不读**（WebView 被挂起、连接半死）—— 等太久就
+    // 当这一帧丢了，回合照样往下跑；界面下一次 `/api/session` 会把历史补齐。
+    const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let _ = tokio::time::timeout(SEND_TIMEOUT, tx.send(v)).await;
 }
 
 /// 把 bash 的实时输出攒一攒推给前端。
@@ -2971,7 +3008,7 @@ async fn send(tx: &mpsc::UnboundedSender<Value>, v: Value) {
 /// 的进度，要的是「现在跑到哪了」。
 async fn pump_live_output(
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Value>,
+    tx: mpsc::Sender<Value>,
     id: String,
 ) {
     const LIVE_EVERY: std::time::Duration = std::time::Duration::from_millis(120);
@@ -2985,8 +3022,9 @@ async fn pump_live_output(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let flush = |text: &str| {
-        // 跑到现在的输出，纯文本（「运行中」看 part 的 state，不用另带标记）
-        let _ = tx.send(sse::tool_output_preliminary(&id, json!(text)));
+        // 跑到现在的输出，纯文本（「运行中」看 part 的 state，不用另带标记）。
+        // `try_send`：这是阶段性结果，客户端读不过来就丢掉这一帧（下一帧会覆盖）。
+        let _ = tx.try_send(sse::tool_output_preliminary(&id, json!(text)));
     };
 
     loop {
@@ -3202,7 +3240,7 @@ async fn execute_tool(
     core: &Core,
     name: &str,
     arguments: &str,
-    live: Option<(&mpsc::UnboundedSender<Value>, &str)>,
+    live: Option<(&mpsc::Sender<Value>, &str)>,
     sid: &str,
 ) -> ToolOutcome {
     let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
@@ -3578,7 +3616,7 @@ mod tests {
         s.messages.push(ChatMessage::user("找一个 needle 吧"));
         s.messages.push(ChatMessage::Assistant {
             content: "这里也有 needle".into(),
-            reasoning: String::new(),
+            reasoning: String::new().into(),
             tool_calls: Vec::new(),
             reasoning_items: Vec::new(),
         });
@@ -3660,7 +3698,7 @@ mod tests {
         sess.messages.push(ChatMessage::user("第一问"));
         sess.messages.push(ChatMessage::Assistant {
             content: "答".into(),
-            reasoning: String::new(),
+            reasoning: String::new().into(),
             tool_calls: vec![],
             reasoning_items: Vec::new(),
         });
@@ -3873,14 +3911,14 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: "答1".into(),
-                reasoning: String::new(),
+                reasoning: String::new().into(),
                 tool_calls: vec![],
                 reasoning_items: Vec::new(),
             },
             ChatMessage::user("U2"),
             ChatMessage::Assistant {
                 content: "答2".into(),
-                reasoning: String::new(),
+                reasoning: String::new().into(),
                 tool_calls: vec![],
                 reasoning_items: Vec::new(),
             },
@@ -3907,8 +3945,8 @@ mod tests {
         for t in 0..turns {
             sess.messages.push(ChatMessage::user(format!("问{t}")));
             sess.messages.push(ChatMessage::Assistant {
-                content: String::new(),
-                reasoning: format!("想{t}"),
+                content: String::new().into(),
+                reasoning: format!("想{t}").into(),
                 tool_calls: vec![RecordedToolCall {
                     id: format!("c{t}"),
                     name: "bash".into(),
@@ -3918,12 +3956,12 @@ mod tests {
             });
             sess.messages.push(ChatMessage::Tool {
                 tool_call_id: format!("c{t}"),
-                content: format!("输出{t}"),
+                content: format!("输出{t}").into(),
                 images: vec![],
             });
             sess.messages.push(ChatMessage::Assistant {
-                content: format!("答{t}"),
-                reasoning: String::new(),
+                content: format!("答{t}").into(),
+                reasoning: String::new().into(),
                 tool_calls: vec![],
                 reasoning_items: Vec::new(),
             });
@@ -3996,8 +4034,8 @@ mod bench_search {
                 s.messages.push(ChatMessage::user(unit.clone()));
             } else {
                 s.messages.push(ChatMessage::Assistant {
-                    content: unit.clone(),
-                    reasoning: String::new(),
+                    content: unit.as_str().into(),
+                    reasoning: String::new().into(),
                     tool_calls: Vec::new(),
                     reasoning_items: Vec::new(),
                 });
@@ -4054,8 +4092,8 @@ mod bench_search {
         });
         sess.messages.push(ChatMessage::Assistant {
             // 三个都不再用了：直接 move 进来，不用 clone
-            content,
-            reasoning,
+            content: content.into(),
+            reasoning: reasoning.into(),
             tool_calls: vec![RecordedToolCall {
                 id: "call_abc".into(),
                 name: "bash".into(),
@@ -4065,7 +4103,7 @@ mod bench_search {
         });
         sess.messages.push(ChatMessage::Tool {
             tool_call_id: "call_abc".into(),
-            content: output,
+            content: output.into(),
             images: vec![],
         });
         sess
@@ -4143,8 +4181,8 @@ mod bench_search {
             attachments: vec![],
         });
         sess.messages.push(ChatMessage::Assistant {
-            content: String::new(),
-            reasoning: String::new(),
+            content: String::new().into(),
+            reasoning: String::new().into(),
             tool_calls: vec![RecordedToolCall {
                 id: "call_big".into(),
                 name: "bash".into(),
@@ -4165,8 +4203,8 @@ mod bench_search {
         // 短参数的**原样保留**，不该被换成预览
         let mut small = ChatSession::new();
         small.messages.push(ChatMessage::Assistant {
-            content: String::new(),
-            reasoning: String::new(),
+            content: String::new().into(),
+            reasoning: String::new().into(),
             tool_calls: vec![RecordedToolCall {
                 id: "call_small".into(),
                 name: "read".into(),

@@ -104,6 +104,15 @@ impl Upgrader {
         true
     }
 
+    /// 放弃刚占住、但还没开跑的这一次（比如被并发回合挡住了）：状态退回空闲。
+    pub fn cancel_begin(&self) {
+        if let Ok(mut j) = self.job.lock() {
+            if j.state == JobState::Running {
+                *j = Job::default();
+            }
+        }
+    }
+
     fn update(&self, f: impl FnOnce(&mut Job)) {
         if let Ok(mut j) = self.job.lock() {
             f(&mut j);
@@ -380,9 +389,22 @@ pub fn precheck(st: &AppState, sb: &LinuxSandbox) -> Result<(PathBuf, String), S
     Ok((rootfs, current))
 }
 
+/// 升级期间挂着维护态；**任何**退出路径（包括测试里的 unwind）都会清掉。
+///
+/// 维护态是 `http::alpine_upgrade` 在 spawn 之前置上的（和 `busy_sessions` 空
+/// 在同一把 `turns` 锁里，见 `AppState::begin_upgrade`）—— 这里只负责收尾。
+struct Maintenance<'a>(&'a LinuxSandbox);
+
+impl Drop for Maintenance<'_> {
+    fn drop(&mut self) {
+        self.0.set_maintenance(false);
+    }
+}
+
 /// 升到 `to`（如 `3.24.2`）。在后台跑，进度在 `st.alpine.job()`。
 ///
-/// 调之前先过 `precheck`，并用 `Upgrader::try_begin` 占住。
+/// 调之前先过 `precheck`，并用 `Upgrader::try_begin` + `AppState::begin_upgrade`
+/// 占住（后者同时置维护态，挡住新回合）。
 pub async fn run(
     st: Arc<AppState>,
     sb: Arc<LinuxSandbox>,
@@ -390,10 +412,9 @@ pub async fn run(
     from: String,
     to: String,
 ) {
+    let _maintenance = Maintenance(&sb);
     let up = &st.alpine;
-    sb.set_maintenance(true);
     let res = upgrade(&st, &sb, &rootfs, &to).await;
-    sb.set_maintenance(false);
     match res {
         Ok(()) => {
             up.step(format!("升级完成：{from} → {to}"));
@@ -412,6 +433,26 @@ pub async fn run(
     }
 }
 
+/// 在**独立的一条 OS 线程**上跑一大块文件 I/O（rootfs 快照 / 删除 / 换回去）。
+///
+/// 不走 `spawn_blocking`：阻塞池只有 4 个线程，和会话落盘、`ensure_loaded`、
+/// 图片解码、CDP、`phone`/`shizuku` 共用；一份 600MB 的 rootfs 拷贝能把一个
+/// 线程占几分钟，期间会话落盘会被一直推迟。这条线程只服务升级，跑完就退。
+async fn on_big_thread<T, F>(f: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("agent-alpine-fs".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })?;
+    rx.await
+        .map_err(|_| std::io::Error::other("升级的文件任务挂了"))?
+}
+
 async fn upgrade(st: &AppState, sb: &LinuxSandbox, rootfs: &Path, to: &str) -> anyhow::Result<()> {
     let up = &st.alpine;
     let branch = branch(to).ok_or_else(|| anyhow::anyhow!("认不出目标版本 {to}"))?;
@@ -425,7 +466,7 @@ async fn upgrade(st: &AppState, sb: &LinuxSandbox, rootfs: &Path, to: &str) -> a
     up.step("检查剩余空间");
     let (need, free) = {
         let r = rootfs.to_path_buf();
-        tokio::task::spawn_blocking(move || (tree_size(&r), free_bytes(&r))).await?
+        on_big_thread(move || Ok::<_, std::io::Error>((tree_size(&r), free_bytes(&r)))).await?
     };
     if let Some(free) = free {
         let want = need + SPACE_MARGIN;
@@ -442,14 +483,14 @@ async fn upgrade(st: &AppState, sb: &LinuxSandbox, rootfs: &Path, to: &str) -> a
     let bak = sibling(rootfs, BAK_SUFFIX);
     {
         let (r, b) = (rootfs.to_path_buf(), bak.clone());
-        tokio::task::spawn_blocking(move || {
+        on_big_thread(move || -> std::io::Result<()> {
             if b.exists() {
                 std::fs::remove_dir_all(&b)?;
             }
             copy_tree(&r, &b, SNAPSHOT_SKIP)?;
             std::fs::write(b.join(SNAPSHOT_OK), "")
         })
-        .await?
+        .await
         .map_err(|e| {
             let _ = std::fs::remove_dir_all(&bak);
             anyhow::anyhow!("备份失败（沙箱没动过）：{e}")
@@ -462,13 +503,14 @@ async fn upgrade(st: &AppState, sb: &LinuxSandbox, rootfs: &Path, to: &str) -> a
         Ok(()) => {
             up.step("清理备份");
             let b = bak.clone();
-            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(b)).await;
+            let _ = on_big_thread(move || std::fs::remove_dir_all(b)).await;
             Ok(())
         }
         Err(e) => {
             up.step("没成功，换回升级前的沙箱");
             let (r, b) = (rootfs.to_path_buf(), bak.clone());
-            match tokio::task::spawn_blocking(move || restore(&r, &b)).await? {
+            let restored = on_big_thread(move || Ok::<_, std::io::Error>(restore(&r, &b))).await?;
+            match restored {
                 Ok(()) => Err(e.context("已换回升级前的沙箱，什么都没丢")),
                 Err(re) => Err(e.context(format!(
                     "换回备份也失败了（{re}）—— 备份还在 {}",
