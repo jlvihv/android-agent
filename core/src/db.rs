@@ -466,8 +466,19 @@ fn migrate_schedules(conn: &Connection) -> Result<()> {
     }
     // 旧形状（有 created_at 没 anchor_at）：改名让开，新表由下面重建
     tracing::warn!("schedules 表是旧形状（created_at 而不是 anchor_at），改名留档后重建");
-    conn.execute_batch("ALTER TABLE schedules RENAME TO schedules_legacy")
-        .context("把旧 schedules 表改名留档")?;
+    // **目标名可能已经被占了**（`schedules_legacy` 上一次改名留下的 —— 比如用户
+    // 升级过一次、又退回了旧版本、再升回来）。那时 `RENAME` 会报
+    // 「there is already another table or index with this name」把整个
+    // `Db::open` 拖死。所以先挑一个没被占的名字（`_legacy` / `_legacy2` / …）。
+    let mut target = "schedules_legacy".to_string();
+    let mut n = 1;
+    while has_column(conn, &target, "id")? {
+        n += 1;
+        target = format!("schedules_legacy{n}");
+    }
+    conn.execute_batch(&format!("ALTER TABLE schedules RENAME TO {target}"))
+        .with_context(|| format!("把旧 schedules 表改名留档（-> {target}）"))?;
+    tracing::warn!("旧 schedules 表改名到 {target}（数据不删）");
     // 建当前形状的表（和 SCHEMA 里那段逐字一致 —— 只多这一处入口，
     // 所以把建表语句抽成常量会好，但那是重构，这轮不做）
     conn.execute_batch(
@@ -484,12 +495,12 @@ fn migrate_schedules(conn: &Connection) -> Result<()> {
          )",
     )
     .context("按当前形状重建 schedules 表")?;
-    // 旧表里有几行？留个日志 —— 数据在 `schedules_legacy` 里，人能看到
-    if let Ok(n) = conn.query_row("SELECT COUNT(*) FROM schedules_legacy", [], |r| {
+    // 旧表里有几行？留个日志 —— 数据在那个 legacy 表里，人能看到
+    if let Ok(rows) = conn.query_row(&format!("SELECT COUNT(*) FROM {target}"), [], |r| {
         r.get::<_, i64>(0)
     }) {
-        if n > 0 {
-            tracing::warn!("旧 schedules 表的 {n} 条数据留在 schedules_legacy（新表是空的）");
+        if rows > 0 {
+            tracing::warn!("旧 schedules 表的 {rows} 条数据留在 {target}（新表是空的）");
         }
     }
     Ok(())
@@ -2015,6 +2026,39 @@ mod tests {
         assert!(
             !has_column(&conn, "schedules_legacy", "id").unwrap(),
             "正常库不该被改名（表都不该存在）"
+        );
+    }
+
+    /// 旧 `schedules` 表 + **已经存在**的 `schedules_legacy`：不能把 `Db::open` 拖死。
+    ///
+    /// 真实路径：用户升级过一次（旧表改名成 `_legacy`）→ 退回旧版本（又建出一张
+    /// 旧形状的 `schedules`）→ 再升回来。这时 `RENAME TO schedules_legacy` 会报
+    /// 「there is already another table or index with this name」，库里**所有会话
+    /// 都读不出来**。
+    ///
+    /// 变异验证：去掉挑空名字那个循环（直接 `RENAME TO schedules_legacy`）→ 红。
+    #[test]
+    fn a_second_old_schedules_table_does_not_block_the_open() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schedules (
+               id TEXT PRIMARY KEY, prompt TEXT NOT NULL, every_secs INTEGER, cron TEXT,
+               created_at INTEGER NOT NULL, handled_through INTEGER NOT NULL, paused_at INTEGER);
+             INSERT INTO schedules VALUES('t1','旧',60,NULL,1,1,NULL);
+             -- 上一次改名留下的
+             CREATE TABLE schedules_legacy (id TEXT PRIMARY KEY, prompt TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).expect("不能被已存在的 schedules_legacy 挡死");
+        assert!(has_column(&conn, "schedules", "anchor_at").unwrap());
+        // 两份旧数据都还在（一个在 legacy，一个在 legacy2）
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM schedules_legacy2", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "这次的旧表改名到 legacy2（legacy 已经有东西了）"
         );
     }
 
