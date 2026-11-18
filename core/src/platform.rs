@@ -23,6 +23,19 @@ pub enum Platform {
 impl Platform {
     pub const ALL: [Platform; 3] = [Platform::Android, Platform::Linux, Platform::Macos];
 
+    /// 「平台 × 二元档位」的槽位数（见 [`Platform::slot2`]）。
+    ///
+    /// 提示词（有没有设备能力）、工具表（worker / router）都是一份「按平台 × 两档」
+    /// 的静态缓存，各在自己模块里声明一个 `[OnceLock<_>; 6]`。以前那个 6 和
+    /// `p as usize * 2 + 槽位` 在四个地方各写一遍 —— 加一个平台就漏一个（数组长度
+    /// 不会自己跟着变，而多出来的平台会静默落到越界 panic 上）。
+    pub const fn slot2(self, second: usize) -> usize {
+        self as usize * 2 + second
+    }
+
+    /// 这种「平台 × 两档」缓存的槽位总数。
+    pub const SLOTS2: usize = Self::ALL.len() * 2;
+
     /// 这个二进制上的桌面是哪种（按编译目标，一个二进制只跑在一种系统上）。
     pub const fn host() -> Self {
         if cfg!(target_os = "macos") {

@@ -57,7 +57,7 @@ pub fn system_prompt(p: Platform) -> &'static str {
 /// **渲染工具渲染不出真实产物，"看提示词"这件事就不成立了**。
 pub fn system_prompt_with(p: Platform, phone: bool) -> &'static str {
     // 3 个平台 × 有没有设备能力
-    static PROMPTS: [OnceLock<String>; 6] = [
+    static PROMPTS: [OnceLock<String>; Platform::SLOTS2] = [
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
@@ -65,7 +65,7 @@ pub fn system_prompt_with(p: Platform, phone: bool) -> &'static str {
         OnceLock::new(),
         OnceLock::new(),
     ];
-    PROMPTS[p as usize * 2 + usize::from(phone)].get_or_init(|| compose_prompt(p, phone))
+    PROMPTS[p.slot2(usize::from(phone))].get_or_init(|| compose_prompt(p, phone))
 }
 
 /// 提示词和工具描述里**随平台变**的那几句。共用的句子只在 `compose_prompt` /

@@ -47,7 +47,7 @@ pub struct ToolSpec {
 /// 索引是 `平台 * 2 + 角色槽位`（见 `Role::slot`）：同一个平台下 worker 和 router
 /// 各一份，两份都是从同一个 `Platform` 拼出来的固定字节。
 pub fn tools(p: Platform, role: Role) -> &'static [ToolSpec] {
-    static TOOLS: [OnceLock<Vec<ToolSpec>>; 6] = [
+    static TOOLS: [OnceLock<Vec<ToolSpec>>; Platform::SLOTS2] = [
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
@@ -55,7 +55,7 @@ pub fn tools(p: Platform, role: Role) -> &'static [ToolSpec] {
         OnceLock::new(),
         OnceLock::new(),
     ];
-    TOOLS[p as usize * 2 + role.slot()].get_or_init(|| match role {
+    TOOLS[p.slot2(role.slot())].get_or_init(|| match role {
         Role::Worker => build_tools(p),
         Role::Router => build_router_tools(p),
     })
@@ -1126,7 +1126,7 @@ fn user_message(
 /// 只建一次、之后共享（`Arc`）：每一步的请求都要带整张表，没必要每步重新
 /// 跑一遍 `json!` 拼 schema（也让「工具表字节确定」更没悬念）。
 pub fn tool_definitions(p: Platform, role: Role) -> std::sync::Arc<[Tool]> {
-    static DEFS: [OnceLock<std::sync::Arc<[Tool]>>; 6] = [
+    static DEFS: [OnceLock<std::sync::Arc<[Tool]>>; Platform::SLOTS2] = [
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
@@ -1134,7 +1134,7 @@ pub fn tool_definitions(p: Platform, role: Role) -> std::sync::Arc<[Tool]> {
         OnceLock::new(),
         OnceLock::new(),
     ];
-    DEFS[p as usize * 2 + role.slot()]
+    DEFS[p.slot2(role.slot())]
         .get_or_init(|| {
             tools(p, role)
                 .iter()
@@ -1153,7 +1153,7 @@ pub fn tool_definitions(p: Platform, role: Role) -> std::sync::Arc<[Tool]> {
 
 /// Responses API 的工具表：**扁平**的 `{"type":"function","name":…}`。
 fn tool_definitions_responses(p: Platform, role: Role) -> std::sync::Arc<[crate::responses::Tool]> {
-    static DEFS: [OnceLock<std::sync::Arc<[crate::responses::Tool]>>; 6] = [
+    static DEFS: [OnceLock<std::sync::Arc<[crate::responses::Tool]>>; Platform::SLOTS2] = [
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
@@ -1161,7 +1161,7 @@ fn tool_definitions_responses(p: Platform, role: Role) -> std::sync::Arc<[crate:
         OnceLock::new(),
         OnceLock::new(),
     ];
-    DEFS[p as usize * 2 + role.slot()]
+    DEFS[p.slot2(role.slot())]
         .get_or_init(|| {
             tools(p, role)
                 .iter()
