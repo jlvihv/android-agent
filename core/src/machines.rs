@@ -699,7 +699,7 @@ impl Machines {
         };
         let port = st.port.load(std::sync::atomic::Ordering::Relaxed);
         anyhow::ensure!(port != 0, "本机核心还没开始服务");
-        Ok((format!("127.0.0.1:{port}"), st.auth().token))
+        Ok((format!("127.0.0.1:{port}"), st.token()))
     }
 
     /// 记住「现在连的是哪台」（库里的 `meta`）：下次启动接着连。

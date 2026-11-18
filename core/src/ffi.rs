@@ -287,7 +287,7 @@ impl AgentCore {
     /// 之后 `/api/…` 才放行（见 `state::Auth`）。`setup_linux` 之后才有值
     /// （它在会话库里，库是那时打开的）。
     pub fn token(&self) -> Option<String> {
-        self.core.state.auth().token
+        self.core.state.token()
     }
 
     pub fn port(&self) -> u16 {

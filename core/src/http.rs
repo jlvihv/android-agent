@@ -280,7 +280,7 @@ async fn require_auth(
     if !req.uri().path().starts_with("/api/") || req.uri().path() == "/api/pair" {
         return next.run(req).await;
     }
-    let Some(token) = st.auth().token else {
+    let Some(token) = st.token() else {
         return next.run(req).await; // 桌面开发没设 AGENT_TOKEN
     };
     // 桌面：这台电脑自己（loopback）来的不要凭据 —— 宿主模式默认对局域网开放，
@@ -310,7 +310,7 @@ struct AuthQuery {
 ///
 /// 跳转是为了让地址栏里不留 token（WebView 的历史、页面的 `location` 都看不到）。
 async fn auth_login(State(st): State<Arc<AppState>>, Query(q): Query<AuthQuery>) -> Response {
-    let ok = match st.auth().token {
+    let ok = match st.token() {
         Some(token) => same_secret(&q.t, &token),
         None => true,
     };
@@ -318,7 +318,7 @@ async fn auth_login(State(st): State<Arc<AppState>>, Query(q): Query<AuthQuery>)
         return (StatusCode::FORBIDDEN, "凭据不对").into_response();
     }
     let mut res = axum::response::Redirect::to("/").into_response();
-    if let Some(token) = st.auth().token {
+    if let Some(token) = st.token() {
         // SameSite=Strict：别的网站发来的请求（手机浏览器里的随便一个网页）
         // 不带它。没有 Max-Age：会话 cookie，App 每次启动都会重新种。
         let c = format!("{AUTH_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict");
@@ -393,7 +393,7 @@ async fn health(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "capabilities": capabilities,
         // 沙箱文件的 URL 前缀要它（`/sandbox/<key>/…`）。这个接口本身要凭据，
         // 所以只有 App 自己的页面拿得到。
-        "sandboxKey": st.auth().sandbox_key,
+        "sandboxKey": st.sandbox_key(),
         // 回合跑完时弹不弹系统通知（设置页那个开关）。手机上**永远 false**：
         // 那边是壳的前台服务在发，核心再发一次就是同一个任务响两下
         "notifyDone": crate::notify::available() && notify_done,
@@ -533,7 +533,7 @@ async fn pair(State(st): State<Arc<AppState>>, Json(b): Json<PairBody>) -> Respo
         st.log("warn", format!("配对失败：{e}"));
         return (StatusCode::FORBIDDEN, e).into_response();
     }
-    let Some(token) = st.auth().token else {
+    let Some(token) = st.token() else {
         return (StatusCode::CONFLICT, "核心没设凭据").into_response();
     };
     st.log("info", "一台设备配对成功");
@@ -3519,7 +3519,7 @@ fn is_loopback_origin(origin: &str) -> bool {
 
 /// 路径上的沙箱钥匙对不对（见 `state::Auth`）。不对一律 404，不说为什么。
 fn sandbox_key_ok(st: &AppState, key: &str) -> bool {
-    same_secret(key, &st.auth().sandbox_key)
+    same_secret(key, &st.sandbox_key())
 }
 
 async fn sandbox_root(State(st): State<Arc<AppState>>, UrlPath(key): UrlPath<String>) -> Response {
@@ -4071,7 +4071,7 @@ mod tests {
     #[tokio::test]
     async fn the_sandbox_origin_serves_only_sandbox_files_and_unsandboxed() {
         let (st, root) = sandbox_core("origin").await;
-        let key = st.auth().sandbox_key;
+        let key = st.sandbox_key();
         let (base, c) = serve(st.clone()).await;
         let port = base.rsplit(':').next().unwrap().to_string();
         let sandbox_host = format!("sandbox.localhost:{port}");
@@ -4140,7 +4140,7 @@ mod tests {
     async fn the_api_needs_a_token_and_the_app_gets_it_as_a_cookie() {
         let st = crate::state::AppState::new();
         st.set_token(Some("s3cret".into()));
-        let key = st.auth().sandbox_key;
+        let key = st.sandbox_key();
         let (base, c) = serve(st).await;
 
         let status = |r: reqwest::Response| r.status().as_u16();

@@ -1032,14 +1032,52 @@ impl AppState {
         EPHEMERAL.get_or_init(random_secret).clone()
     }
 
+    /// 访问凭据（整份，给“一次拿两个字段”的地方）。
+    ///
+    /// 只读一个字段的路径走 [`Self::token`] / [`Self::sandbox_key`]：
+    /// 它们不多拷一份 `String`，而且在锁中毒时**不会重新生成凭据**。
+    ///
+    /// 以前这里是 `read().map_or_else(|_| Auth { 新随机值 }, |g| g.clone())` ——
+    /// `require_auth` 每个请求都调它，于是一旦锁中毒，token 每请求变一次，
+    /// 所有客户端全部 401（而且没有任何一行日志能看出是这个原因）。
+    /// 现在中毒时返回一份**稳定的**兜底（进程级 OnceLock），至少不越用越错。
     pub fn auth(&self) -> Auth {
-        self.auth.read().map_or_else(
-            |_| Auth {
-                token: Some(random_secret()),
-                sandbox_key: random_secret(),
-            },
-            |g| g.clone(),
-        )
+        self.auth
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| Auth {
+                token: self.fallback_token(),
+                sandbox_key: self.fallback_sandbox_key(),
+            })
+    }
+
+    /// `/api/*` 要的那把 token（`None` = 不设防）。
+    ///
+    /// 不放守卫出去：调用方几乎都要把它带过 `.await`（见 `state::cow_take` 的说明）。
+    pub fn token(&self) -> Option<String> {
+        match self.auth.read() {
+            Ok(g) => g.token.clone(),
+            Err(_) => self.fallback_token(),
+        }
+    }
+
+    /// 沙箱文件 URL 里那把钥匙（见 [`Auth`]）。
+    pub fn sandbox_key(&self) -> String {
+        match self.auth.read() {
+            Ok(g) => g.sandbox_key.clone(),
+            Err(_) => self.fallback_sandbox_key(),
+        }
+    }
+
+    /// 锁中毒时用的那把 token：**进程级只生成一次**（不是每次调用换一个）。
+    fn fallback_token(&self) -> Option<String> {
+        static FALLBACK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        Some(FALLBACK.get_or_init(random_secret).clone())
+    }
+
+    fn fallback_sandbox_key(&self) -> String {
+        static FALLBACK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        FALLBACK.get_or_init(random_secret).clone()
     }
 
     /// 桌面开发用：`AGENT_TOKEN` 设了就要求凭据，没设就不设防。
@@ -2024,6 +2062,30 @@ mod tests {
             cow_take(&poisoned).is_none(),
             "锁中毒时应当当没有，而不是 panic"
         );
+    }
+
+    /// **锁中毒时凭据也不能每次变一个。**
+    ///
+    /// `require_auth` 每个请求都问一次 token；以前 `auth()` 在中毒支里
+    /// `random_secret()` 两次，于是每次请求都拿到一把新 token —— 所有客户端
+    /// 从此永久 401，而且看不出原因。现在中毒时给的是进程级固定的兜底。
+    #[test]
+    fn a_poisoned_auth_lock_does_not_reroll_the_token() {
+        let st = AppState::new();
+        // 先把锁毒掉
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = st.auth.write().unwrap();
+            panic!("故意把锁毒掉");
+        }));
+        assert!(st.auth.is_poisoned(), "前提没造出来：锁应该是毒的");
+
+        let first = st.token();
+        let second = st.token();
+        assert!(first.is_some(), "中毒也不能变成「不设防」");
+        assert_eq!(first, second, "两次读到的 token 必须一样");
+        assert_eq!(st.sandbox_key(), st.sandbox_key());
+        // 整份读也不变
+        assert_eq!(st.auth().token, first);
     }
 
     /// 读凭据**失败**时不能把库里的覆盖掉。

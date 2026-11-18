@@ -368,7 +368,7 @@ impl Core {
         // 那是个新的 sandbox 实例）—— 不补这一下，沙箱里的 `agent` 命令
         // 就找不到核心。
         sb.set_agent_port(self.state.port.load(Ordering::Relaxed));
-        sb.set_agent_token(self.state.auth().token);
+        sb.set_agent_token(self.state.token());
         if let Err(e) = sb.prepare_rootfs() {
             self.push_log("warn", &format!("准备 rootfs 失败: {e:#}"));
         }
@@ -489,7 +489,7 @@ impl Core {
         // 沙箱里的文件（`preview:/…`、绝对路径）→ `sandbox.localhost` 上的 URL：
         // AI 写完网页能自己开来看。回来的结果再改写回 `preview:`
         let port = self.port();
-        let key = self.state.auth().sandbox_key;
+        let key = self.state.sandbox_key();
         let name = serde_json::from_str::<serde_json::Value>(action_json)
             .ok()
             .and_then(|v| v["action"].as_str().map(str::to_string))
@@ -880,7 +880,7 @@ impl Core {
         // 沙箱里的 `agent` 命令要靠端口找到核心（见 `cli.rs`）
         if let Some(sb) = self.state.linux() {
             sb.set_agent_port(actual);
-            sb.set_agent_token(self.state.auth().token);
+            sb.set_agent_token(self.state.token());
         }
 
         // 后台把常用工具装上（rg/fd/jq/python3…）。幂等：装过就秒退。
