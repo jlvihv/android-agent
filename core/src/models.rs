@@ -11,6 +11,10 @@
 //! 判定方式：先用 base_url 认出是目录里的哪个 provider（精确 api → host），
 //! 再按模型 id 查 `modalities.input` 里有没有 `image`。
 //!
+//! 还有一条**同步**入口 [`context_window_sync`]：`list_sessions` 那种同步工具要
+//! 算「上下文用了百分之多少」，拿不到分母就得编一个 —— 那个函数只读库里的目录
+//! 缓存（**不联网**），查不到就返回 `None`（调用方显示「未知」）。
+//!
 //! 目录缓存进库里的 `http_cache`（抓取时刻 + **只留用得上的字段**），48 小时过期；
 //! 网络挂了就用旧缓存。
 //!
@@ -320,8 +324,62 @@ pub async fn pdf_for(
 // 匹配
 // ---------------------------------------------------------------------------
 
-/// 按 base_url 找目录里的 provider：先精确比 `api`（带/不带 `/v1`），
-/// 再退回主机名。
+// ---------------------------------------------------------------------------
+// 同步查上下文窗口（给 `list_sessions` 用）
+// ---------------------------------------------------------------------------
+
+/// 解析过的目录的内存缓存（避免每次查都重新解析那 1MB 出头的 JSON）。
+///
+/// 键是**库里那份缓存的 `fetched_at`**：目录被刷新（`catalog()` 写库）之后那个
+/// 时间戳就变了，这里自然失效，不需要谁主动清。
+static CATALOG_MEMO: std::sync::Mutex<Option<(u64, std::sync::Arc<Catalog>)>> =
+    std::sync::Mutex::new(None);
+
+/// **同步**查一个模型的上下文窗口。给 `list_sessions` 这种同步工具用。
+///
+/// ## 只读缓存，不联网
+///
+/// 目录（models.dev）已经在库的 `http_cache` 里（`catalog()` 抓过就有一份，
+/// 48 小时过期）。这里只读它、**不发起任何网络请求** —— 一个「列会话」的工具
+/// 不该因为网络慢而卡住，也不该自己去拉几 MB 的 JSON。
+///
+/// 解析结果在 [`CATALOG_MEMO`] 里缓存（键是库那份的 `fetched_at`）：第一次查
+/// 解析约 1.3MB，之后就是一次 HashMap 查找。
+///
+/// ## 查不到就 `None`（调用方显示「未知」）
+///
+/// 三种查不到：库里从没缓存过目录、目录里没这个模型、这个模型没登记
+/// `limit.context`。**都不编默认值** —— 一个假分母算出来的百分比比「未知」糟
+/// 得多（和 `ContextMeter` 那条「宁可空着也不编一个假上限」是同一条原则）。
+///
+/// `base_url` 是**当前** provider 的（用来认目录里的哪一家）；`model_id` 是那条
+/// 会话最后一次调用实际用的模型（来自 `usage.model`）。
+pub fn context_window_sync(db: Option<&Db>, base_url: &str, model_id: &str) -> Option<u64> {
+    let db = db?;
+    let (body, fetched_at) = db.cached(CATALOG_URL).ok()??;
+    // 命中内存缓存？（键对得上就不用重新解析）
+    if let Ok(g) = CATALOG_MEMO.lock() {
+        if let Some((at, cat)) = g.as_ref() {
+            if *at == fetched_at {
+                return lookup_context(cat, base_url, model_id);
+            }
+        }
+    }
+    let cat: Catalog = serde_json::from_str(&body).ok()?;
+    let cat = std::sync::Arc::new(cat);
+    let out = lookup_context(&cat, base_url, model_id);
+    if let Ok(mut g) = CATALOG_MEMO.lock() {
+        *g = Some((fetched_at, cat));
+    }
+    out
+}
+
+fn lookup_context(cat: &Catalog, base_url: &str, model_id: &str) -> Option<u64> {
+    let key = provider_entry(cat, base_url).map(|(k, _)| k);
+    find_model(cat, key, model_id)?.limit.as_ref()?.context
+}
+
+/// 按 base_url 找目录里的 provider：先精确比 `api`（带/不带 `/v1`），再退回主机名。
 fn provider_entry<'a>(cat: &'a Catalog, base_url: &str) -> Option<(&'a str, &'a CatalogProvider)> {
     let strip = |s: &str| s.trim_end_matches('/').to_string();
     let target = strip(base_url);

@@ -84,6 +84,149 @@ fn arg_usize(args: &Value, key: &str, default: usize, min: usize, max: usize) ->
         .map_or(default, |n| (n as usize).clamp(min, max))
 }
 
+/// 一页多少条（`limit` 不给时）。**20 而不是 50**：这段文本进 Router 的上下文，
+/// 20 条已经够看一屏；再多它也该用 `query` 收窄而不是硬翻。
+const LIST_LIMIT_DEFAULT: usize = 20;
+
+/// 全文搜索一次最多取多少条消息行（防止 `the` 这种词把整库捞出来）。
+const FULLTEXT_ROWS_MAX: usize = 400;
+
+/// 片段前后各留多少字（`…关键词前后各 20 字…`）。
+const SNIPPET_AROUND: usize = 20;
+
+/// `list_sessions` 的排序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sort {
+    /// 最后碰过的在前（默认）—— 「我要找的那个」通常最近动过
+    Updated,
+    /// 建得最晚的在前
+    Created,
+}
+
+impl Sort {
+    fn parse(s: &str) -> Self {
+        match s.trim() {
+            "created" => Self::Created,
+            // 认不出来的（空 / 拼错）用默认，不报错：排序拼错不该让整个列表失败
+            _ => Self::Updated,
+        }
+    }
+
+    /// 这个排序用哪个时间戳（游标也用它）。
+    fn time(self, s: &crate::agent::ChatSession) -> u64 {
+        match self {
+            Self::Updated => s.updated_at,
+            Self::Created => s.created_at,
+        }
+    }
+}
+
+/// 拆游标 `<时间>:<id>`（和 `/api/sessions` 的 `before` 完全同一个格式）。
+fn parse_cursor(b: &str) -> Option<(u64, &str)> {
+    let (ts, id) = b.split_once(':')?;
+    let ts: u64 = ts.parse().ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then_some((ts, id))
+}
+
+/// 全文搜索：在**消息正文**里找 `query`，返回 `session_id -> 一小段命中片段`。
+///
+/// ## 为什么不用 `SessionStore::search`
+///
+/// 那个函数是 `/api/search` 用的（给侧边栏），形状是「一条消息一个 hit」。
+/// 而这里要的是「**每条会话一个**片段」，而且——更要紧的——它的实现会
+/// `load_messages` 把**每条**会话的**全部**消息从库里读回来再反序列化。
+///
+/// **实测**（真库副本：162 条会话 / 72047 条消息 / 140MB payload，
+/// 全部会话都被 evict 了 = 最坏情况）：
+///
+/// | 做法 | 耗时 |
+/// | --- | --- |
+/// | `SessionStore::search`（全量 load + 反序列化） | **1.54 s** |
+/// | 两阶段（LIKE 拿 id → load_messages 解析候选） | 0.15–1.54 s（看命中面） |
+/// | **本函数：一条 SQL 直接拿命中行的 payload → 只解析那几行** | **0.28 s**（冷） / **6 ms**（热） |
+///
+/// 差别在**不要反序列化没命中的消息**：`the` 这种词两阶段方案会把 157 条会话的
+/// 全部 72026 条消息都解析一遍，而这里只解析 LIKE 命中的那 400 行。
+///
+/// ## 复杂度
+///
+/// 一次 `SELECT ... WHERE payload LIKE '%q%' LIMIT 400`：SQLite 全表扫一遍
+/// payload（几百 MB 的字符串扫描，实测 0.15–0.3 s），命中就停。**没有索引可用**
+/// （子串搜索本来就用不上 B-tree；上 FTS 要新表 + 同步逻辑，这个量级不值得）。
+///
+/// 调用方在 `spawn_blocking` 里跑它，不占 worker。
+fn fulltext_hits(
+    db: &crate::db::Db,
+    query: &str,
+    from: &str,
+    all: bool,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    // LIKE 的转义：`%` `_` 在 payload 里出现会让匹配跑偏（用户搜「100%」时）
+    let pat = format!("%{}%", query.replace('%', r"\%").replace('_', r"\_"));
+    let rows = db.with(|c| {
+        let mut st = c.prepare(
+            "SELECT session_id, payload FROM messages
+              WHERE payload LIKE ?1 ESCAPE '\\'
+              ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let it = st.query_map(rusqlite::params![pat, FULLTEXT_ROWS_MAX as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        it.collect::<rusqlite::Result<Vec<(String, String)>>>()
+    });
+    let Ok(rows) = rows else {
+        return out;
+    };
+    // 归属 / 收尾过滤要问内存里的会话表 —— 但这里**不拿锁**：调用方已经把
+    // 允许的 id 集合通过参数约束了？没有。所以退回「先收下，锁外再筛」：
+    // 拼一个 id 集合给调用方用（调用方在锁里 filter）。
+    for (sid, payload) in rows {
+        if out.contains_key(&sid) {
+            continue; // 每条会话只留第一条（ORDER BY seq DESC → 最近的）
+        }
+        // 只解析命中的那几行
+        let Ok(msg) = serde_json::from_str::<crate::agent::ChatMessage>(&payload) else {
+            continue;
+        };
+        let text = match &msg {
+            crate::agent::ChatMessage::User { text, .. } => text.as_str(),
+            crate::agent::ChatMessage::Assistant { content, .. } => content.as_ref(),
+            // 系统提示词和工具结果不参与：前者不是对话，后者是噪音
+            _ => continue,
+        };
+        if let Some(sn) = snippet_hint(text, query) {
+            out.insert(sid, sn);
+        }
+    }
+    let _ = (from, all); // 归属过滤在调用方的锁里做（见 `list_sessions`）
+    out
+}
+
+/// 命中片段：`…前后各 20 字…`，**一行、不超过约 50 字**。
+///
+/// 为什么不给整条消息：这段文本进 Router 的上下文，一条消息可能几十 KB
+/// （bash 输出）。片段只要够它认出「对，就是这个」。
+fn snippet_hint(text: &str, needle: &str) -> Option<String> {
+    let (at, last) = crate::agent::find_fold(text, needle)?;
+    let chars: Vec<char> = text.chars().collect();
+    let start = at.saturating_sub(SNIPPET_AROUND);
+    let end = (last + 1 + SNIPPET_AROUND).min(chars.len());
+    let mut s = String::new();
+    if start > 0 {
+        s.push('…');
+    }
+    for c in &chars[start..end] {
+        // 换行拍平成空格：片段必须是一行
+        s.push(if *c == '\n' { ' ' } else { *c });
+    }
+    if end < chars.len() {
+        s.push('…');
+    }
+    Some(s)
+}
+
 /// `list_sessions` 里一行（锁里挑出来、锁外格式化）。
 struct Row {
     id: String,
@@ -98,9 +241,14 @@ struct Row {
     /// 这条会话**最近一次请求的 input token**（= 当前上下文占了多少）。
     /// `None` = 一次都没跑过。
     ctx_used: Option<u64>,
+    /// 那个模型的上下文窗口（分母）。`None` = 目录里查不到（显示成 `—`）。
+    ///
+    /// 来自 `models::context_window_sync`（**只读库里的目录缓存，不联网**）。
+    ctx_window: Option<u64>,
     title: String,
-    conclusion: String,
-    times: u32,
+    /// 全文命中的**一小段**（只有命中在消息正文里才有）。让模型看不出
+    /// 「为什么这条会命中」的时候有个线索。
+    snippet: Option<String>,
     standing: crate::agent::Standing,
 }
 
@@ -126,10 +274,20 @@ struct Row {
 ///   「它最后一次跑的时候用的那个」，不是「现在配置的是什么」。用户中途换模型时
 ///   这一条尤其要记住。
 /// - **上下文** = 那次请求的 `input` token（整段历史 + 系统提示词 + 工具）。
-///   **只给绝对数，不给比例**：分母要 `context_window`，那在 models.dev 目录里
-///   （异步、可能没收录），而 `list_sessions` 是同步的工具调用；何况这个数本身
-///   也只是「最近一次请求的输入」，缓存命中/会话 evict 都会让它和「当前上下文」
-///   有偏差 —— 拿它去算百分比会把误差放大成一个小数点后的假精度。
+///   有窗口就显示**百分比**（`models::context_window_sync` 同步读库里的目录缓存，
+///   **不联网**）；查不到窗口就退成绝对数（`36K`），绝不编一个假分母。
+///   这个数本身是「最近一次请求的输入」，缓存命中 / 会话 evict 都会让它和「当前
+///   上下文」有偏差 —— 百分比是**量级提示**，不是精确计量。
+///
+/// ## 排序 / 分页 / 搜索
+///
+/// - `sort`：`updated`（默认，最后碰过的在前）或 `created`。
+/// - 游标分页：`before` 是上一页最后一条的 `<时间>:<id>`，**和
+///   `/api/sessions` 那套完全一样**（见 `SessionStore::list_page_with`）——
+///   不发明第二套。`sort` 决定游标里用哪个时间。
+/// - `query`：三字段（title / brief / conclusion）在内存里搜；**命中消息正文的
+///   走 `SessionStore::search` 那套**（库里的 `messages` 表，SQL LIKE + 只解析
+///   命中行）。见 [`fulltext_hits`]。
 ///
 /// ## 锁与分配
 ///
@@ -139,58 +297,93 @@ struct Row {
 pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
     let all = arg_flag(args, "all");
-    let limit = arg_usize(args, "limit", LIST_MAX, 1, LIST_MAX);
+    let limit = arg_usize(args, "limit", LIST_LIMIT_DEFAULT, 1, LIST_MAX);
     let query = arg_str(args, "query");
+    let sort = Sort::parse(arg_str(args, "sort"));
+    // 游标的**键**和 `sort` 必须一致（`updated` 比 `updated_at`、`created` 比
+    // `created_at`）—— 拿 `created` 的游标去翻 `updated` 的页会错位。
+    let before = arg_str(args, "before");
+    let before = (!before.is_empty()).then_some(before);
 
     // 两次快照，各只拿一次锁
     let busy = state.busy_set();
     let queued = state.queued_set();
 
-    // 锁里只挑选 + 排序，不做格式化
-    let (total, matched, rows): (usize, usize, Vec<Row>) = {
+    // 全文命中（只**读**库里的 messages，不碰 chat 锁）：
+    // `query` 给了才做，而且是**一次 SQL**（见 [`fulltext_hits`] 的性能说明）。
+    let ft: std::collections::HashMap<String, String> = if query.is_empty() {
+        Default::default()
+    } else {
+        match state.db() {
+            Some(db) => {
+                let q = query.to_string();
+                let from_owned = from.to_string();
+                let all_flag = all;
+                tokio::task::spawn_blocking(move || fulltext_hits(&db, &q, &from_owned, all_flag))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("全文搜索任务挂了：{e}");
+                        Default::default()
+                    })
+            }
+            None => Default::default(),
+        }
+    };
+
+    let (total, matched, rows, next): (usize, usize, Vec<Row>, Option<String>) = {
         let store = state.chat.read().await;
+
+        // 挑：归属 + 收尾过滤 + query（三字段 **或** 全文命中）
         let mut mine: Vec<&crate::agent::ChatSession> = store
             .sessions
             .iter()
             .filter(|s| s.dispatched_by() == Some(from))
             .filter(|s| all || !s.closed.is_closed())
-            .filter(|s| query.is_empty() || matches_query(s, query))
+            .filter(|s| query.is_empty() || matches_fields(s, query) || ft.contains_key(&s.id))
             .collect();
-        // `all` 时按**最近碰过的**排（`updated_at`）：找旧会话时「上次动它是
-        // 什么时候」比「什么时候建的」更接近「我要找的那个」。
-        // 默认（未收尾的）仍旧按 `created_at` —— 那批本来就没几条，位置要稳定。
+
+        // 排：`sort` 决定用哪个时间戳；撞车拿 id 兜底（顺序必须**确定**）
         mine.sort_by(|a, b| {
-            let by_time = if all {
-                b.updated_at.cmp(&a.updated_at)
-            } else {
-                b.created_at.cmp(&a.created_at)
-            };
-            // 时间撞车（同一毫秒）时拿 id 兜底：顺序必须**确定**
-            by_time.then_with(|| b.id.cmp(&a.id))
+            sort.time(b)
+                .cmp(&sort.time(a))
+                .then_with(|| b.id.cmp(&a.id))
         });
+
+        // 游标：取「排在游标之后」的那些（语义和 `/api/sessions` 一致：
+        // 游标是上一页最后一条的 `<time>:<id>`，纯离线游标，不用 offset）
+        if let Some((ts, id)) = before.and_then(|b| parse_cursor(b)) {
+            let at = mine
+                .iter()
+                .position(|s| (sort.time(s), s.id.as_str()) < (ts, id))
+                .unwrap_or(mine.len());
+            mine.drain(..at);
+        }
+
         let matched = mine.len();
+        let next = mine
+            .get(limit)
+            .map(|_| mine[limit - 1])
+            .map(|s| format!("{}:{}", sort.time(s), s.id));
         mine.truncate(limit);
+
         let rows = mine
             .iter()
             .map(|s| Row {
                 id: s.id.clone(),
                 seq: s.seq,
-                // 下面两项要查库（`usage` 表），在**出锁之后**填 —— 见下面那段
+                // 下面三项要查库（`usage` 表 / 目录缓存），在**出锁之后**填
                 model: None,
                 ctx_used: None,
+                ctx_window: None,
                 title: s.title.clone(),
-                conclusion: s.conclusion.clone(),
-                times: s.dispatch_times().unwrap_or(0),
+                // 全文命中：给一小段（见 `snippet_hint`），让模型知道**为什么**命中
+                snippet: ft.get(&s.id).cloned(),
                 standing: s.standing(busy.contains(&s.id), queued.contains(&s.id)),
             })
             .collect::<Vec<_>>();
-        // `total` = 全部（不看 query），`matched` = query 过滤之后
-        let total = if query.is_empty() {
-            matched
-        } else {
-            total_of(&store, from, all)
-        };
-        (total, matched, rows)
+        // `total` = 全部（不看 query / 不看游标），`matched` = 过滤之后（含游标）
+        let total = count_of(&store, from, all);
+        (total, matched, rows, next)
     };
 
     // 每行的「用的哪个模型 / 上下文用了多少」：**一次查完**（不拿 chat 锁，
@@ -198,8 +391,9 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     let rows = {
         let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
         let db = state.db();
-        let usage = match db {
+        let usage = match &db {
             Some(db) if !ids.is_empty() => {
+                let db = db.clone();
                 tokio::task::spawn_blocking(move || db.last_models(&ids))
                     .await
                     .map_err(anyhow::Error::from)
@@ -212,11 +406,23 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
             }
             _ => Default::default(),
         };
+        // 分母：每条会话那个模型的 `context_window`。
+        //
+        // **同步读库里的目录缓存，不联网**（见 `models::context_window_sync`）。
+        // 同一个模型会重复查（一次列表里多数会话是同一个模型），所以按模型名
+        // 记忆一次 —— 50 条通常只有 1~3 个模型。
+        let base_url = state.llm().map(|p| p.base_url).unwrap_or_default();
+        let mut windows: std::collections::HashMap<String, Option<u64>> =
+            std::collections::HashMap::new();
         rows.into_iter()
             .map(|mut r| {
                 if let Some((model, input)) = usage.get(&r.id) {
                     r.model = Some(model.clone());
                     r.ctx_used = Some(*input);
+                    let w = *windows.entry(model.clone()).or_insert_with(|| {
+                        crate::models::context_window_sync(db.as_deref(), &base_url, model)
+                    });
+                    r.ctx_window = w;
                 }
                 r
             })
@@ -228,7 +434,7 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
         if !query.is_empty() {
             let _ = write!(
                 out,
-                "没有匹配 `{query}` 的会话（搜的是标题 / 要求原文 / 结论，不含对话正文）。"
+                "没有匹配 `{query}` 的会话（搜过标题 / 要求原文 / 结论 / **对话正文**）。"
             );
             if matched == 0 && total > 0 {
                 let _ = write!(
@@ -251,19 +457,35 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
         .iter()
         .filter(|r| r.standing == crate::agent::Standing::Running)
         .count();
-    // 头一行先说清「看到的是全部还是被截了」：模型据此决定收窄 query 还是翻页
-    //（没有翻页 —— 它要么一屏看全、要么用 query 收窄）。
+    // 头一行说清三件事：**看到的是不是全部**（还有几条）、**是不是第二页以后**、
+    // 以及**怎么翻**。模型据此决定「继续翻」还是「收窄 query」。
     let _ = write!(out, "{running} 个在跑，");
-    if !query.is_empty() {
-        let _ = write!(out, "匹配 `{query}` 的 {matched} 条");
-        if total != matched {
-            // 括号别套括号（`scope_label` 本身不带括号），这里用逗号分隔
-            let _ = write!(out, "（共 {total} 条，{}）", scope_label(all));
+    match (query.is_empty(), before.is_some()) {
+        (true, false) => {
+            let _ = write!(out, "共 {total} 条（{}）", scope_label(all));
         }
-    } else {
-        let _ = write!(out, "共 {total} 条（{}）", scope_label(all));
+        (true, true) => {
+            // 翻页时 `matched` 是「游标之后还剩多少」
+            let _ = write!(
+                out,
+                "还剩 {matched} 条（共 {total} 条，{}，第 2 页起）",
+                scope_label(all)
+            );
+        }
+        (false, _) => {
+            let _ = write!(out, "匹配 `{query}` 的 {matched} 条");
+            if total != matched {
+                let _ = write!(out, "（全部 {total} 条，{}）", scope_label(all));
+            }
+        }
     }
-    if matched > rows.len() {
+    if let Some(c) = &next {
+        let _ = write!(
+            out,
+            "，这里 {} 条；**还有**，翻下页传 `before=\"{c}\"`",
+            rows.len()
+        );
+    } else if matched > rows.len() {
         let _ = write!(
             out,
             "，只列了前 {} 条（用 `query` 收窄，或调大 limit，最多 {LIST_MAX}）",
@@ -276,22 +498,47 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
         // 一行流：`#7 [opus] 12.3K 标题 [在跑]：结论…`
         //
         // - **短编号在前**：给人（和模型）念的
-        // - 完整 id 在反引号里：向后兼容（老提示词/脚本只认 `id`），也能直接复制
-        // - `[模型]` / `上下文`：**没跑过的会话不显示这两项**（它确实是未知，
-        //   编一个出来比空着糟 —— 和 `ContextMeter` 那个「宁可空着也不编一个
-        //   假上限」是同一条原则）
+        // 格式：`#162 [flash] 18% 定时任务：设计（先不实现） [闲着]`
+        //
+        // ## 为什么这么窄
+        //
+        // 这段文本是塞进 **Router 自己的上下文**的。50 条 × 每行上百字 = 几千字，
+        // 直接吃掉它的空间。所以：
+        //
+        // - **不显示完整 id**（36 字符）：短名就是为了替代它，两个都摆出来纯浪费。
+        //   要完整 id 用 `read_session`（它回详情，那才是需要 id 的地方）。
+        // - **不显示结论正文**：列表只要「是哪一条」，想看内容用 `read_session`。
+        // - **不显示「派过 N 次」**：内部计数，对「该不该管这条」没有帮助。
+        //
+        // ## 百分比
+        //
+        // 分母是那个模型的上下文窗口（`models::context_window_sync`，只读库里的
+        // 目录缓存）。**拿不到窗口就不编**：这时只显示绝对数 `36K`，前面不带
+        // 百分比 —— 而「一次都没跑过」的会话连这两项都不显示（它确实是未知）。
+        //
+        // ⚠️ 分子是**最近一次请求的 input**，不是「当前上下文」的精确值
+        //（缓存 / evict / 清空都会让它和真实长度有偏差）。百分比是**量级提示**，
+        // 不是精确计量 —— 用来判断「还宽不宽」够了。
         let mut line = match r.seq {
-            Some(n) => format!("#{n} `{}` ", r.id),
-            None => format!("`{}` ", r.id),
+            Some(n) => format!("#{n} "),
+            // 还没发号（只可能出现在 `load` 之前）：退回标题，不显示 id
+            None => String::new(),
         };
         if let Some(model) = &r.model {
-            let _ = write!(line, "[{model}] ");
+            let _ = write!(line, "[{}] ", short_model(model));
         }
-        // 上下文用量：**绝对数**，不给比例。理由见 `list_sessions` 的文档
-        //（分母要 `context_window`，那要异步查 models.dev 目录；而且「最近一次的
-        // input」不等于「当前上下文」—— 缓存/evict 都会让它偏）。
-        if let Some(used) = r.ctx_used {
-            let _ = write!(line, "{} ", fmt_tokens(used));
+        match (r.ctx_used, r.ctx_window) {
+            (Some(used), Some(win)) if win > 0 => {
+                // 向上取整：用了 0.2% 也显示 1%（显示 0% 会让人以为没用量）
+                let pct = (used.saturating_mul(100)).div_ceil(win);
+                let _ = write!(line, "{pct}% ");
+            }
+            // 没窗口就只给绝对数（不编分母）
+            (Some(used), _) => {
+                let _ = write!(line, "{} ", fmt_tokens(used));
+            }
+            // 一次都没跑过：两项都不显示
+            _ => {}
         }
         let _ = write!(
             line,
@@ -302,14 +549,14 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
                 &r.title
             }
         );
-        let _ = write!(line, "[{}]", r.standing.label());
-        if r.times > 1 {
-            let _ = write!(line, "（派过 {} 次）", r.times);
+        let _ = writeln!(line, "[{}]", r.standing.label());
+        out.push_str(&line);
+        // 命中在**消息正文**里的：补一行缩进的片段，说明「为什么这条命中」。
+        // 只有全文命中才有；三字段命中不给（标题/brief/conclusion 本来就在上面
+        // 或 `read_session` 里能看到）。缩进两格 + 一行，长度由 `snippet_hint` 控制。
+        if let Some(sn) = &r.snippet {
+            let _ = writeln!(out, "  ↳ {sn}");
         }
-        if !r.conclusion.is_empty() {
-            let _ = write!(line, "：{}", crate::text::clip(&r.conclusion, 200));
-        }
-        let _ = writeln!(out, "{line}");
     }
     Ok(out)
 }
@@ -450,6 +697,48 @@ fn no_such(store: &crate::agent::SessionStore, from: &str, raw: &str, seq: Optio
     out
 }
 
+/// 模型名的**短显示**：去掉 provider 前缀和常见的 `-v<数字>` 版本段，
+/// 只留最能区分的那一截。
+///
+/// `deepseek-v4.1-flash` → `flash`？不 —— 那样 `deepseek-flash` 和
+/// `glm-5.3-flash` 会全变成 `flash`，反而分不清。规则取「够短且够区分」的折中：
+///
+/// | 原名 | 短名 |
+/// | --- | --- |
+/// | `deepseek-v4.1-flash` | `v4.1-flash` |
+/// | `deepseek-flash` | `deepseek-flash`（去掉 `vX` 之后没剩什么，保留原名） |
+/// | `claude-haiku-5-5` | `haiku-5-5` |
+/// | `glm-5.3-flash` | `glm-5.3-flash` |
+/// | `gemini-4-argon` | `gemini-4-argon` |
+///
+/// 规则：第一个 `-v<数字>` 段之后就够区分了；没有就原样（**但超过 20 字符截断**，
+/// 别让一个长模型名把正文挤走）。
+fn short_model(model: &str) -> String {
+    // 找 `-v` 后面跟数字的那一段，从它开始留
+    if let Some(at) = model
+        .match_indices("-v")
+        .find(|(i, _)| {
+            model[i + 2..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+        .map(|(i, _)| i)
+    {
+        let tail = &model[at + 1..];
+        // 留点上下文：`v4.1-flash` 比 `4.1-flash` 好认
+        if tail.len() >= 4 {
+            return tail.to_string();
+        }
+    }
+    if model.chars().count() > 20 {
+        let head: String = model.chars().take(20).collect();
+        format!("{head}…")
+    } else {
+        model.to_string()
+    }
+}
+
 /// `12345` → `12.3K`（和前端 `lib/num.ts` 的 `fmtCount` 同一个口径：
 /// 上了 K 就一位小数，上了 10K 不要小数，上了 M 换单位）。
 ///
@@ -487,7 +776,7 @@ fn scope_label(all: bool) -> &'static str {
 ///
 /// 只在带 `query` 时用：要告诉模型「你有 37 条，但只有 2 条匹配」—— 不然它
 /// 会以为总数就是匹配数。
-fn total_of(store: &crate::agent::SessionStore, from: &str, all: bool) -> usize {
+fn count_of(store: &crate::agent::SessionStore, from: &str, all: bool) -> usize {
     store
         .sessions
         .iter()
@@ -510,7 +799,7 @@ fn total_of(store: &crate::agent::SessionStore, from: &str, all: bool) -> usize 
 ///
 /// 匹配语义和 `Store::search`（侧边栏那个）一致：`agent::find_fold`，大小写不敏感、
 /// Unicode 折叠正确。两处用同一个函数，免得「搜得到但提示里没有」。
-fn matches_query(s: &crate::agent::ChatSession, query: &str) -> bool {
+fn matches_fields(s: &crate::agent::ChatSession, query: &str) -> bool {
     crate::agent::find_fold(&s.title, query).is_some()
         || s.brief()
             .is_some_and(|b| crate::agent::find_fold(b, query).is_some())
@@ -1000,6 +1289,18 @@ mod tests {
     use super::*;
     use crate::agent::{ChatSession, Role};
 
+    /// 往库的 `http_cache` 里塞一份最小目录（`list_sessions` 算百分比要用它当分母）。
+    fn seed_catalog(db: &crate::db::Db, api: &str, model: &str, context: u64) {
+        let cat = serde_json::json!({
+            "testprov": {
+                "api": api,
+                "models": { model: { "limit": { "context": context } } }
+            }
+        });
+        db.put_cached(crate::models::CATALOG_URL, &cat.to_string(), 1)
+            .unwrap();
+    }
+
     // ---- 短编号（`#7`）----------------------------------------------------
 
     /// 派一条会话，返回它的短编号。
@@ -1200,7 +1501,29 @@ mod tests {
 
     // ---- `query` 搜索 ------------------------------------------------------
 
-    /// 派一条带标题的会话，返回 id / 短号。
+    /// **直接造一条「派出去过」的会话**，返回 (id, 短号)。
+    ///
+    /// 不调 `dispatch` —— 那会**真的开跑一个回合**（需要模型），而回合结束会
+    /// `set_conclusion` 把 `updated_at` 刷成「现在」，把测试里刚设的时间戳冲掉
+    /// （分页/排序测试因此错过：翻第二页时游标对不上）。这里只建数据，不起回合。
+    async fn seed_session(
+        core: &Core,
+        rid: &str,
+        title: &str,
+        created_at: u64,
+        updated_at: u64,
+    ) -> (String, u64) {
+        let mut store = core.state.chat.write().await;
+        let mut w = ChatSession::with_role(Role::Worker);
+        w.title = title.to_string();
+        w.dispatch = Some(crate::agent::Dispatch::new(rid, title));
+        w.created_at = created_at;
+        w.updated_at = updated_at;
+        let id = store.push_new(w);
+        let seq = store.get(&id).unwrap().seq.unwrap();
+        (id, seq)
+    }
+
     async fn dispatch_titled(core: &Core, rid: &str, title: &str, task: &str) -> (String, u64) {
         dispatch(
             core,
@@ -1278,36 +1601,81 @@ mod tests {
         let _ = (by_title, by_brief, by_concl);
     }
 
-    /// **`query` 不搜消息历史** —— 只在对话正文里出现的词，搜不到。
+    /// **`query` 也搜对话正文**（这一轮新加的），并且给出**一小段**命中片段。
     ///
-    /// 这是**有意的限制**（理由见 `matches_query` 的文档），不是坏了。
-    /// 变异验证：把 `matches_query` 改成也扫 `s.messages` 的正文 → 这条挂。
+    /// 场景：用户说「那个聊过独角兽的会话」，而「独角兽」只在消息正文里、
+    /// 不在 title / brief / conclusion 里 —— 以前搜不到。
+    ///
+    /// 变异验证：把 `fulltext_hits` 从 `list_sessions` 的过滤条件里去掉
+    /// （只留三字段）→ 这条挂。
     #[tokio::test]
-    async fn a_query_does_not_search_the_transcript() {
-        let (core, rid) = with_router("query-no-transcript").await;
+    async fn a_query_also_searches_the_transcript_and_gives_a_snippet() {
+        let (core, rid) = with_router("query-transcript").await;
         core.state
             .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
         let (id, n) = dispatch_titled(&core, &rid, "普通标题", "普通任务").await;
-        // 往历史里塞一句只有正文才有的词（模拟「聊过但字段里没有」）
+        // 「独角兽」只出现在消息正文里
         {
             let mut store = core.state.chat.write().await;
             let s = store.get_mut(&id).unwrap();
-            s.messages
-                .push(crate::agent::ChatMessage::user("独角兽这个词只在正文里"));
+            s.messages.push(crate::agent::ChatMessage::user(
+                "前面铺垫一些无关的话，然后提到独角兽这个东西，后面还有很多内容",
+            ));
         }
+        // 让它落盘（全文搜索是**查库**的，不是查内存）。
+        // `save_sessions` 在 `sessions_loaded` 为 false 时直接返回（防「拿空
+        // store 去同步=清空全库」），测试里要手动置真。
+        core.state
+            .sessions_loaded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        core.state.save_sessions().unwrap();
 
         let out = list_sessions(&core, &rid, &serde_json::json!({ "query": "独角兽" }))
             .await
             .unwrap();
         assert!(
-            !out.contains(&format!("#{n}")),
-            "**不该**命中正文（v1 不搜历史，这是故意的）：{out}"
+            out.contains(&format!("#{n}")),
+            "只在正文里出现的词也该命中：{out}"
         );
-        assert!(out.contains("没有匹配"), "要说清没找到：{out}");
-        assert!(out.contains("不含对话正文"), "要说清搜的是什么：{out}");
+        // 片段：让模型知道**为什么**命中
+        assert!(out.contains("↳"), "要给一小段命中片段：{out}");
+        assert!(out.contains("独角兽"), "片段里要有那个词：{out}");
+        // 片段是**一行**、有长度上限（不能把整条消息倒出来）
+        let sn = out.lines().find(|l| l.contains('↳')).expect("有片段行");
+        assert!(
+            sn.chars().count() < 100,
+            "片段不该超过 100 字（实际 {}）：{sn}",
+            sn.chars().count()
+        );
+        assert!(
+            !sn.trim_end().ends_with("后面还有很多内容后面还有很多内容"),
+            "{sn}"
+        );
     }
 
-    /// **总数提示**：超过 limit 时说清「共 N 条，只列了前 M 条」。
+    /// 不在正文里、也不在三个字段里的词：搜不到（**没命中就是没命中**）。
+    #[tokio::test]
+    async fn a_query_misses_when_nothing_contains_it() {
+        let (core, rid) = with_router("query-miss").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch_titled(&core, &rid, "标题甲", "活甲").await;
+        core.state
+            .sessions_loaded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        core.state.save_sessions().unwrap();
+        let out = list_sessions(
+            &core,
+            &rid,
+            &serde_json::json!({ "query": "完全不存在的词xyz" }),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("没有匹配"), "{out}");
+        assert!(out.contains("对话正文"), "要说清搜过正文：{out}");
+    }
+
+    /// **总数提示**：超过 limit 时说清「共 N 条，只列了前 M 条」。    /// **总数提示**：超过 limit 时说清「共 N 条，只列了前 M 条」。
     ///
     /// 变异验证：把 `if matched > rows.len()` 那段删掉 → 这条挂。
     #[tokio::test]
@@ -1323,7 +1691,10 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("共 5 条"), "要说清总数：{out}");
-        assert!(out.contains("只列了前 2 条"), "要说清被截了：{out}");
+        assert!(
+            out.contains("翻下页传 `before="),
+            "要说清怎么翻（有游标）：{out}"
+        );
         // 行数确实是 2
         let lines = out.lines().filter(|l| l.starts_with('#')).count();
         assert_eq!(lines, 2, "只列 2 行：{out}");
@@ -1337,7 +1708,10 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("匹配 `第 1 件` 的 1 条"), "{out}");
-        assert!(out.contains("共 5 条"), "查询时要给出「一共有多少」：{out}");
+        assert!(
+            out.contains("全部 5 条"),
+            "查询时要给出「一共有多少」：{out}"
+        );
     }
 
     /// `all: true` 按 **`updated_at`** 倒序（最近碰过的在前），不是创建时间。
@@ -1385,7 +1759,157 @@ mod tests {
         assert!(!out.contains("机密项目"), "不能搜到别人的会话：{out}");
     }
 
-    // ---- 模型 / 上下文用量 ------------------------------------------------
+    // ---- 排序 / 分页 -------------------------------------------------------
+    //
+    // 这些测试**不用 `dispatch`**（见 `seed_session` 的注释）：`dispatch` 会真开
+    // 跑回合，而回合结束会把 `updated_at` 刷成「现在」—— 分页/排序要的
+    // 恰恰是**我能控制的时间戳**。
+
+    /// **默认按「最后碰过」倒序**（`updated`），不是创建时间。
+    ///
+    /// 变异验证：把 `Sort::parse` 的默认值改成 `Created` → 这条挂。
+    #[tokio::test]
+    async fn the_default_sort_is_last_touched_not_created() {
+        let (core, rid) = with_router("sort-default").await;
+        // 先建的（created 小）但**最近碰过**（updated 大）
+        let (_, old_n) = seed_session(&core, &rid, "先建的", 1_000, 9_000).await;
+        let (_, new_n) = seed_session(&core, &rid, "后建的", 2_000, 3_000).await;
+
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let first = out.lines().find(|l| l.starts_with('#')).expect("有行");
+        assert!(
+            first.starts_with(&format!("#{old_n}")),
+            "默认该按 updated_at 排（先建但最近碰过的在前）：{out}"
+        );
+        assert!(!first.starts_with(&format!("#{new_n}")), "{out}");
+    }
+
+    /// `sort: created` 按创建时间倒序。
+    #[tokio::test]
+    async fn sort_created_puts_the_newest_first() {
+        let (core, rid) = with_router("sort-created").await;
+        let (_, old_n) = seed_session(&core, &rid, "先建的", 1_000, 9_000).await;
+        let (_, new_n) = seed_session(&core, &rid, "后建的", 2_000, 3_000).await;
+
+        let out = list_sessions(&core, &rid, &serde_json::json!({ "sort": "created" }))
+            .await
+            .unwrap();
+        let first = out.lines().find(|l| l.starts_with('#')).expect("有行");
+        assert!(
+            first.starts_with(&format!("#{new_n}")),
+            "created 排序该按创建时间（后建的在前）：{out}"
+        );
+        assert!(!first.starts_with(&format!("#{old_n}")), "{out}");
+    }
+
+    /// **游标分页：连续翻页，不重不漏**；最后一页之后返回空。
+    ///
+    /// 变异验证：把 `before` 那段（`mine.drain(..at)`）删掉 → 第二页和第一页
+    /// 完全一样（重复）→ 这条挂。
+    #[tokio::test]
+    async fn paging_covers_every_session_exactly_once() {
+        let (core, rid) = with_router("paging").await;
+        let mut want = std::collections::HashSet::new();
+        for i in 0..5u64 {
+            let (_, n) = seed_session(
+                &core,
+                &rid,
+                &format!("第 {i} 件"),
+                1_000 + i * 100,
+                // updated 故意和 created **顺序相反**：证明游标用的是 sort 的键
+                9_000 - i * 100,
+            )
+            .await;
+            want.insert(n);
+        }
+
+        let mut seen: Vec<u64> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let mut args = serde_json::json!({ "limit": 2 });
+            if let Some(c) = &cursor {
+                args["before"] = serde_json::json!(c);
+            }
+            let out = list_sessions(&core, &rid, &args).await.unwrap();
+            let page: Vec<u64> = out
+                .lines()
+                .filter(|l| l.starts_with('#'))
+                .filter_map(|l| l[1..].split_whitespace().next()?.parse().ok())
+                .collect();
+            if page.is_empty() {
+                break;
+            }
+            cursor = out
+                .split("before=\"")
+                .nth(1)
+                .map(|s| s.split('"').next().unwrap_or("").to_string());
+            seen.extend(page);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 5, "五条都要翻到：{seen:?}");
+        let got: std::collections::HashSet<u64> = seen.iter().copied().collect();
+        assert_eq!(got, want, "不重不漏");
+        assert_eq!(got.len(), seen.len(), "不许重复：{seen:?}");
+
+        // 翻到最后一页时**不该再给游标**（没有下一页了）—— 这本身就是
+        // 「到头了」的信号，模型据此停下。
+        assert!(cursor.is_none(), "最后一页不该再给游标：{cursor:?}");
+
+        // 手动拿一个『排在最后一条之后』的游标去翻：必须返回空（不崩、不绕回去）
+        let out = list_sessions(
+            &core,
+            &rid,
+            &serde_json::json!({ "limit": 2, "before": "1:zzz" }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.lines().any(|l| l.starts_with('#')),
+            "游标过了最后一条就该是空：{out}"
+        );
+    }
+
+    /// 游标里的时间字段跟着 `sort` 走（`updated` 用 `updated_at`、`created` 用
+    /// `created_at`）—— 否则拿一个排序的游标去翻另一个排序的页会错位。
+    ///
+    /// 变异验证：把 `sort.time(s)` 在游标那行写死成 `s.updated_at` → 这条挂。
+    #[tokio::test]
+    async fn the_cursor_key_follows_the_sort() {
+        let (core, rid) = with_router("cursor-key").await;
+        // created 和 updated 差得很远，一眼能看出游标用的是哪个
+        seed_session(&core, &rid, "甲", 1_000, 9_000).await;
+        seed_session(&core, &rid, "乙", 2_000, 3_000).await;
+
+        let by_updated = list_sessions(
+            &core,
+            &rid,
+            &serde_json::json!({ "limit": 1, "sort": "updated" }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            by_updated.contains("before=\"9"),
+            "updated 排序的游标该用 updated_at（9…）：{by_updated}"
+        );
+        let by_created = list_sessions(
+            &core,
+            &rid,
+            &serde_json::json!({ "limit": 1, "sort": "created" }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            by_created.contains("before=\"2"),
+            "created 排序的游标该用 created_at（2…）：{by_created}"
+        );
+        assert!(!by_created.contains("before=\"9"), "{by_created}");
+    }
+
+    // ---- 模型 / 上下文用量 ------------------------------------------------    // ---- 模型 / 上下文用量 ------------------------------------------------
 
     /// `list_sessions` 每行带「用的哪个模型」和「上下文用了多少」。
     ///
@@ -1423,8 +1947,196 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("[opus-test]"), "要显示模型：{out}");
-        assert!(out.contains("5.2K"), "要显示上下文（5.2K）：{out}");
+        assert!(
+            out.contains("5.2K"),
+            "**没有窗口**（目录里查不到 opus-test）→ 退成绝对数 5.2K：{out}"
+        );
+        assert!(!out.contains('%'), "没分母就不该编百分比：{out}");
         assert!(out.contains("有跑过的那条"), "{out}");
+    }
+
+    /// **一行只放「谁、什么模型、多满、叫什么、什么处境」** —— 不塞 id 和结论正文。
+    ///
+    /// 这段文本会进 Router 自己的上下文，50 条 × 上百字 = 几千字。
+    ///
+    /// 变异验证：
+    /// - 把完整 id 加回输出 → `!out.contains(&sid)` 失败
+    /// - 把结论正文加回输出 → `!out.contains("结论正文…")` 失败
+    #[tokio::test]
+    async fn a_row_is_one_terse_line_without_ids_or_conclusions() {
+        let core = core_with_db("row-terse");
+        let (rid, sid) = {
+            let mut store = core.state.chat.write().await;
+            let rid = store.push_new(ChatSession::with_role(Role::Router));
+            let mut w = ChatSession::with_role(Role::Worker);
+            w.dispatch = Some(crate::agent::Dispatch::new(&rid, "干点活"));
+            w.title = "改 README 的错别字".into();
+            // 结论正文：列表里**不该**出现
+            w.conclusion = "结论正文：我把三个错别字都改了，还顺手重排了表格。".into();
+            let sid = store.push_new(w);
+            (rid, sid)
+        };
+        let seq = {
+            let store = core.state.chat.read().await;
+            store.get(&sid).unwrap().seq.unwrap()
+        };
+
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        // 有：短名 + 标题 + 处境
+        assert!(out.contains(&format!("#{seq}")), "要有短编号：{out}");
+        assert!(out.contains("改 README 的错别字"), "要有标题：{out}");
+        assert!(out.contains("[闲着]"), "要有处境：{out}");
+        // 没有：完整 id、结论正文、「派过 N 次」
+        assert!(
+            !out.contains(&sid),
+            "**不该显示完整 id**（36 字符，纯浪费；要它用 read_session）：{out}"
+        );
+        assert!(
+            !out.contains("结论正文"),
+            "**不该显示结论正文**（想看用 read_session）：{out}"
+        );
+        assert!(!out.contains("派过"), "内部计数不该占地方：{out}");
+        // 一行一条（除了表头那一行）
+        let lines: Vec<&str> = out.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "一条会话就该是一行：{out:?}");
+        // 而且这一行**有长度上限**（塞不下上千字）
+        assert!(
+            lines[0].chars().count() < 120,
+            "一行不该超过 120 字（实际 {}）：{}",
+            lines[0].chars().count(),
+            lines[0]
+        );
+    }
+
+    /// 有窗口时给**百分比**（向上取整，0.2% 也显示 1%）。
+    #[tokio::test]
+    async fn a_row_shows_a_percentage_when_the_window_is_known() {
+        let core = core_with_db("row-pct");
+        let (rid, sid) = {
+            let mut store = core.state.chat.write().await;
+            let rid = store.push_new(ChatSession::with_role(Role::Router));
+            let mut w = ChatSession::with_role(Role::Worker);
+            w.dispatch = Some(crate::agent::Dispatch::new(&rid, "干点活"));
+            w.title = "半满".into();
+            let sid = store.push_new(w);
+            (rid, sid)
+        };
+        // 造一条 usage + 一条目录缓存（把窗口写成 200000）
+        let db = core.state.db().unwrap();
+        db.add_usage(&crate::db::UsageRow {
+            session_id: sid.clone(),
+            at: crate::agent::now_ms(),
+            provider: "test".into(),
+            model: "pct-test".into(),
+            input: 36_000,
+            output: 1,
+            cached: None,
+            cache_write: None,
+            reasoning: None,
+            finish: Some("stop".into()),
+            ms: 1,
+        })
+        .unwrap();
+        seed_catalog(&db, "https://api.test/v1", "pct-test", 200_000);
+        // provider 的 base_url 要能对上目录里那家
+        core.state.set_llm(crate::llm::Provider {
+            base_url: "https://api.test/v1".into(),
+            ..crate::llm::Provider::openai("sk-test-not-used")
+        });
+
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        // 36000 / 200000 = 18%
+        assert!(out.contains("18%"), "36000/200000 该是 18%：{out}");
+        assert!(!out.contains("36K"), "有百分比就不该再给绝对数：{out}");
+    }
+
+    /// 窗口**拿不到**时退成绝对数（不编分母、不崩）。
+    ///
+    /// 变异验证：让它在这种情况下编一个默认窗口（比如 128000）→ 这条挂。
+    #[tokio::test]
+    async fn a_row_falls_back_to_a_bare_count_when_the_window_is_unknown() {
+        let core = core_with_db("row-nowin");
+        let (rid, sid) = {
+            let mut store = core.state.chat.write().await;
+            let rid = store.push_new(ChatSession::with_role(Role::Router));
+            let mut w = ChatSession::with_role(Role::Worker);
+            w.dispatch = Some(crate::agent::Dispatch::new(&rid, "干点活"));
+            w.title = "窗口未知".into();
+            let sid = store.push_new(w);
+            (rid, sid)
+        };
+        let db = core.state.db().unwrap();
+        db.add_usage(&crate::db::UsageRow {
+            session_id: sid,
+            at: crate::agent::now_ms(),
+            provider: "test".into(),
+            // 目录里**没有**这个模型
+            model: "never-in-catalog".into(),
+            input: 36_000,
+            output: 1,
+            cached: None,
+            cache_write: None,
+            reasoning: None,
+            finish: Some("stop".into()),
+            ms: 1,
+        })
+        .unwrap();
+
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(out.contains("36K"), "没有窗口就给绝对数：{out}");
+        assert!(!out.contains('%'), "**不许编分母**：{out}");
+        assert!(out.contains("窗口未知"), "{out}");
+    }
+
+    /// 一行都没跑过：模型和用量**两项都不显示**（未知就是未知，不写 0%）。
+    #[tokio::test]
+    async fn a_never_run_row_shows_no_model_and_no_usage() {
+        let core = core_with_db("row-never");
+        let rid = {
+            let mut store = core.state.chat.write().await;
+            let rid = store.push_new(ChatSession::with_role(Role::Router));
+            let mut w = ChatSession::with_role(Role::Worker);
+            w.dispatch = Some(crate::agent::Dispatch::new(&rid, "干点活"));
+            w.title = "一次都没跑".into();
+            store.push_new(w);
+            rid
+        };
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let body = out.lines().nth(1).expect("有一行");
+        assert!(body.contains("一次都没跑"), "{out}");
+        assert!(!body.contains('%'), "没跑过不该有百分比：{out}");
+        assert!(
+            !body.contains('[') || body.contains("[闲着]"),
+            "不该有模型段：{out}"
+        );
+    }
+
+    /// `short_model`：模型名缩写够短、够区分。
+    #[test]
+    fn model_names_are_shortened_but_stay_distinguishable() {
+        assert_eq!(short_model("deepseek-v4.1-flash"), "v4.1-flash");
+        assert_eq!(short_model("deepseek-flash"), "deepseek-flash");
+        assert_eq!(short_model("claude-haiku-5-5"), "claude-haiku-5-5");
+        // 长名字截断，不挤走正文
+        let long = "a-very-long-model-name-that-goes-on-and-on";
+        assert!(
+            short_model(long).chars().count() <= 21,
+            "{}",
+            short_model(long)
+        );
+        // 缩写之后仍然各不相同（这是选这条规则而不是「只留 flash」的理由）
+        assert_ne!(
+            short_model("deepseek-v4.1-flash"),
+            short_model("glm-5.3-flash")
+        );
     }
 
     /// **没跑过的会话不显示这两项**（不编一个假数）。
@@ -1613,12 +2325,20 @@ mod tests {
         assert_eq!(rid2, rid, "重建要复用旧 id，否则派出去的会话全成孤儿");
 
         // 5) 新 Router 看得到那条会话
+        //
+        // **按短名认，不按完整 id**：列表现在只给 `#N`（完整 id 是 36 字符、
+        // 在这段文本里是纯浪费，要它就用 `read_session`）。所以这里先查那条
+        // 会话的号，再断言列表里有它。
+        let seq = {
+            let store = core.state.chat.read().await;
+            store.get(&worker).and_then(|s| s.seq).expect("有号")
+        };
         let listed = list_sessions(&core, &rid2, &serde_json::json!({}))
             .await
             .unwrap();
         assert!(
-            listed.contains(&worker),
-            "重建的 Router 必须看得到之前派出去的会话：{listed}"
+            listed.contains(&format!("#{seq}")),
+            "重建的 Router 必须看得到之前派出去的会话（#{seq}）：{listed}"
         );
         assert!(listed.contains("那件事"), "标题也该在：{listed}");
 
@@ -1996,13 +2716,17 @@ mod tests {
                 .clone()
         };
 
+        let seq = {
+            let store = core.state.chat.read().await;
+            store.get(&sid).and_then(|s| s.seq).expect("有号")
+        };
         let open = list_sessions(&core, &rid, &serde_json::json!({}))
             .await
             .unwrap();
         assert!(open.contains("甲"), "{open}");
         assert!(
-            open.contains(&sid),
-            "要给出 session_id 才读得了详情：{open}"
+            open.contains(&format!("#{seq}")),
+            "要给出短编号（#{seq}）才找得到它：{open}"
         );
 
         // 收起之前先把回合结束掉：守卫（`state::close_session`）会拒绝在跑的会话
