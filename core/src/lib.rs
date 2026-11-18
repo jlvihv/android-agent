@@ -63,6 +63,7 @@ pub(crate) mod sse;
 pub mod state;
 pub(crate) mod status;
 pub(crate) mod text;
+pub mod ticket;
 /// 把分配器攥着的空闲内存还给内核。**只在安卓上编**：桌面是 musl 静态二进制，
 /// 它本就没 arena 这层（`free` 即 `munmap`），不需要也不该跑这段 ——
 /// 两个调用点（`TurnGuard::drop`、落盘定时器）也跟着一起不编进去。见 `trim` 的文件头。

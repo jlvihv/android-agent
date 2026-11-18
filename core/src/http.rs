@@ -95,6 +95,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(list_sessions).post(new_session))
         // 协调层那个会话（双层架构）。只有一个，没有就现建。
         .route("/api/router", post(router_session))
+        // 某个 Router 名下的工作项（双层架构里「派出去的活」）。前端在 Router
+        // 那条会话里画一块「在干的活」，靠它。
+        .route("/api/tickets", get(list_tickets))
         .route("/api/search", get(search_sessions))
         .route("/api/sessions/rename", post(rename_session))
         .route("/api/sessions/delete", post(delete_session))
@@ -3210,6 +3213,70 @@ async fn ensure_router(st: &AppState) -> String {
     st.set_meta(ROUTER_META_KEY, &id);
     st.mark_sessions_dirty();
     id
+}
+
+/// `GET /api/tickets?router=<id>&all=1` → 这个 Router 名下的工作项。
+///
+/// 前端在 Router 那条会话里画「在干的活」，靠它。形状**故意和给模型看的那份
+/// 一致**（同样的 stage / result / ended），这样界面和模型看到的是同一件事，
+/// 不会出现「界面说在干、模型以为完了」。
+async fn list_tickets(State(st): State<Arc<AppState>>, Query(q): Query<TicketsQuery>) -> Response {
+    let Some(router) = q.router.as_deref().filter(|s| !s.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "要带 router（协调层会话的 id）").into_response();
+    };
+    let Some(db) = st.db() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "没有库").into_response();
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 100);
+    let tickets = match db.ticket_list(router, !q.all, limit) {
+        Ok(t) => t,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+        }
+    };
+    let counts = db.ticket_counts(router).unwrap_or((0, 0));
+    Json(json!({
+        "working": counts.0,
+        "waiting": counts.1,
+        "tickets": tickets.iter().map(|t| json!({
+            "id": t.id,
+            "number": t.number(),
+            "title": t.title,
+            "stage": t.stage.as_str(),
+            "label": t.stage.label(),
+            "needsPerson": t.stage.needs_person(),
+            "open": t.open(),
+            "report": t.report.map(|r| r.as_str()),
+            "preview": t.preview(200),
+            "dispatches": t.dispatches,
+            "createdAt": t.created_at,
+            "updatedAt": t.updated_at,
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct TicketsQuery {
+    router: Option<String>,
+    /// 连结束的一起列。**`all=1` 也要认**：serde 的 bool 只吃 `true`/`false`，
+    /// 而手敲 curl / 脚本习惯写 `1`。给个宽松的解析，两种都收。
+    #[serde(default, deserialize_with = "de_bool_lenient")]
+    all: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `1` / `0` / `true` / `false` / 空 都认。
+fn de_bool_lenient<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(d)?;
+    Ok(matches!(
+        s.as_deref().map(str::trim),
+        Some("1" | "true" | "yes" | "on")
+    ))
 }
 
 /// `POST /api/router` → 拿协调层会话的 id（没有就建）。

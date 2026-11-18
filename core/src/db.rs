@@ -160,20 +160,53 @@ CREATE TABLE IF NOT EXISTS usage (
 
 CREATE INDEX IF NOT EXISTS idx_usage_session ON usage(session_id, id);
 
--- 双层架构：「这个 worker 会话是哪一次 dispatch 派出去的」。
--- 一个 worker 会话可以先后被派过好几次，所以主键是 session_id，后来的覆盖先前的。
+-- 工作项（Ticket）：双层架构里**被派出去的那件事**本身。
 --
--- 为什么要落库：Worker 做完要把结果送回 Router（见 `router::report_back`），
--- 而 Worker 的一个回合可能跑很久、中间核心被杀过 —— 只在内存里记「谁派的」
--- 的话，重启后这条活就断了，Router 永远等不到结果。
-CREATE TABLE IF NOT EXISTS dispatched (
+-- 为什么不是「一个会话」：会话是容器 —— 没有状态、没有产出契约、没有终点，
+-- 可以一直开着改十件事。Router 派完就失去了对这件事的掌控（那个活变成了
+-- 「某个会话里的一段对话」）。而 Router 需要回答的是「这活干完了吗 / 结果在哪 /
+-- 需要我做什么吗」，这些都得有个东西承载。
+--
+-- 会话仍然是**载体**（`session_id`）：真正干活的还是那条会话里的一次回合。
+-- 但「这件事到哪一步了」记在这里，不记在会话上。
+CREATE TABLE IF NOT EXISTS tickets (
+  id            TEXT PRIMARY KEY,
+  -- 一句话标题（Router 起的名，用户在列表里看到的就是它）
+  title         TEXT NOT NULL,
+  -- 要做什么。Worker 只拿到这一段 —— 它看不到 Router 的对话（上下文隔离）
+  brief         TEXT NOT NULL,
+  -- 派给哪条会话（worker）。干活的是它
+  session_id    TEXT NOT NULL,
+  -- 谁派的（Router 会话 id）
+  router_id     TEXT NOT NULL,
+  -- 状态机，见 `ticket::Stage`
+  stage         TEXT NOT NULL,
+  -- 最新一次汇报的正文（Worker 最后说的那句话），没汇报过是空串
+  result        TEXT NOT NULL DEFAULT '',
+  -- 汇报的类型：ready / blocked / failed / progress / ''（还没汇报）
+  report        TEXT NOT NULL DEFAULT '',
+  -- 结束的时刻；0 = 还开着
+  ended_at      INTEGER NOT NULL DEFAULT 0,
+  -- 结束方式：done / cancelled / ''（还开着）
+  ended_by      TEXT NOT NULL DEFAULT '',
+  -- 给它派过几次活（同一个工作项中途补充要求会 +1）
+  dispatches    INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tickets_router ON tickets(router_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_session ON tickets(session_id);
+
+-- 「这条会话现在在干哪个工作项」。
+--
+-- 一个会话同一时刻只干一件事（回合本来就是串行的），所以主键是 session_id。
+-- Worker 的回合结束时，靠它找到「这一轮该汇报给哪个工作项」。
+-- 会话被派了新活就覆盖 —— 旧的那个工作项在被覆盖前已经记下过它的结果了。
+CREATE TABLE IF NOT EXISTS session_ticket (
   session_id TEXT PRIMARY KEY,
-  -- 派出去的那条会话（Router）
-  by_session TEXT NOT NULL,
-  -- 派出去时 Router 说那句话所在的「一轮」（用户那次请求的 id）：
-  -- 结果送回 Router 时挂在同一轮下，用户看到的是「一件事的完整来回」
-  dispatch_id TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  ticket_id  TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 -- 远端资源的缓存（models.dev 的模型目录）：原样存下响应和抓取时刻
@@ -810,7 +843,7 @@ impl Db {
         })
     }
 
-    fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
         let g = self
             .inner
             .lock()

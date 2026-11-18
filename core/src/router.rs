@@ -1,187 +1,250 @@
-//! 协调层（Router）的四个工具：**看**和**说**，没有**做**。
+//! 协调层（Router）的工具：**看工作项**、**派工作项**，没有「做」。
 //!
 //! 这个文件只放「工具被调用时干什么」。工具表的定义（名字、描述、schema）在
 //! `agent::build_router_tools` + `prompt`，两边是一对一的关系：
 //!
 //! | 工具 | 在这儿的入口 | 干什么 |
 //! | --- | --- | --- |
-//! | `list_sessions` | [`list_sessions`] | 报有哪些会话、谁在跑 |
-//! | `read_session` | [`read_session`] | 读某个会话最近几条，摘要不拉全文 |
-//! | `dispatch` | [`dispatch`] | 把任务投进某个会话（不给 id 就新建） |
+//! | `list_tickets` | [`list_tickets`] | 有哪些工作项、各自卡在哪 |
+//! | `read_ticket` | [`read_ticket`] | 读一个工作项的详情（含结果全文、执行记录） |
+//! | `dispatch` | [`dispatch`] | 开一个工作项并派出去（给了 ticket_id 就是再派一次） |
+//!
+//! ## 为什么是「工作项」而不是「会话」
+//!
+//! 一开始这条路是错的：`dispatch` 往一条会话里塞一条消息就算派了活，Router 只能
+//! 靠 `list_sessions` 看到「这条会话忙不忙」。而会话是容器 —— 没有状态、没有产出
+//! 契约、没有终点。Router 派完就对那件事一无所知。
+//!
+//! 现在派出去的是 `ticket::Ticket`：有标题、有状态机、有产出契约、有终点。
+//! 会话只是它的**载体**（`session_id`）。
+//!
+//! ## 引用图
+//!
+//! 每个条目都带 `read: ticket/<id>` 指针（照 dsh 的 `ticketCard`），模型能顺着
+//! 从列表走到详情、再走到执行记录。**走一步就断的列表等于没有列表**。
 //!
 //! ## 为什么 `dispatch` 走 `enqueue` 而不是直接 `run_turn`
 //!
-//! 复用 `AppState::enqueue` + `agent::continue_with_queued`，原因有三：
-//!
-//! 1. **回合串行、跨会话并行**这条不变式已经在那儿写好了：`enqueue` 只是把消息
-//!    投进队列，`continue_with_queued` 先试 `begin_turn` 占坑、占不到就把消息留在
-//!    队列里让正在跑的那个回合在步边界取走。`dispatch` 自己起回合的话，就得把这
-//!    两条规则再写一遍，而且两处一定会走偏。
-//! 2. **立即返回**：派完就结束，不等 Worker 做完 —— 这正是 4.1 节要的语义
-//!    （Router 的回合不能被一个跑半小时的 Worker 卡住）。
-//! 3. **不需要新概念**：没有「派工单」表、没有 Ticket。任务的归属就是
-//!    「那条会话里的一条用户消息」，和工作台本来的模型完全一样。
-//!
-//! 代价：`dispatch` 的返回里拿不到 Worker 的最终结果 —— 结果以那条会话里新
-//! 消息的形式存在，用户和 Router 下次唤醒时才看得到。这是有意的：**同步等待就是
-//! 把双层塌成一层**。
+//! 复用「回合串行、跨会话并行」那条不变式：`enqueue` 只是把消息投进队列，
+//! `continue_with_queued` 先试 `begin_turn` 占坑、占不到就把消息留在队列里让正在
+//! 跑的那个回合在步边界取走。自己起回合就得把那两条规则再写一遍，而且两处一定
+//! 会走偏。
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use serde_json::Value;
 
 use crate::agent::Role;
 use crate::state::{AppState, QueuedMsg};
+use crate::ticket::{self, Report, Stage, Ticket};
 use crate::Core;
 
-/// 一次 `read_session` 最多看多少条（模型给大了就削到这个）。
-const READ_LINES_MAX: usize = 30;
-/// `read_session` 不给 `lines` 时看多少条。
-const READ_LINES_DEFAULT: usize = 8;
-/// `read_session` 里一条消息最多多少字（超了截断，带全文长度）。
-const READ_LINE_CHARS: usize = 600;
+/// `read_ticket` 里执行记录最多给多少条消息。
+const TRANSCRIPT_LINES_MAX: usize = 40;
+const TRANSCRIPT_LINES_DEFAULT: usize = 12;
+/// 执行记录里一条消息最多多少字。
+const TRANSCRIPT_LINE_CHARS: usize = 600;
+/// `list_tickets` 一次最多列多少个。
+const LIST_MAX: usize = 50;
 
 /// 工具调用的结果：给模型看的那段文本。
 pub type Reply = Result<String, String>;
 
-/// `list_sessions`：有哪些会话、谁在跑、最近说了什么。
+/// 现在在哪儿（Router 自己的会话 id）。
 ///
-/// **不列 router 自己**（`role = Router` 那些）：Router 不需要看见自己，而且
-/// 「派活给 Router」是个无意义的动作 —— 在这里就不给它这个机会。
-pub async fn list_sessions(core: &Core) -> Reply {
-    let state = &core.state;
-    let busy: HashSet<String> = state.busy_sessions().into_iter().collect();
-    let store = state.chat.read().await;
-    let mut rows: Vec<&crate::agent::ChatSession> = store
-        .sessions
-        .iter()
-        .filter(|s| s.role == Role::Worker && s.has_content())
-        .collect();
-    // 最近更新的排前面：Router 要「哪个还在动」一眼可见。和侧边栏按创建时间
-    // 排不一样 —— 那是给人看的位置稳定，这是给模型看的相关性。
-    rows.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+/// 工作项按 `router_id` 分组 —— 一个部署只有一个 Router，但库里记着这件事，
+/// 将来多 Router 时不用改表。
+fn me(sid: &str) -> &str {
+    sid
+}
 
-    if rows.is_empty() {
-        return Ok("现在还没有任何会话。用 dispatch 不给 session_id 就能开一个。".to_string());
+/// `list_tickets`：有哪些工作项、各自卡在哪。
+///
+/// **只列这个 Router 名下的**。默认只看还开着的 —— Router 平时关心的就是
+/// 「还没完的」，翻旧账是另一种需求（`all: true`）。
+pub async fn list_tickets(core: &Core, from: &str, args: &Value) -> Reply {
+    let state = &core.state;
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(LIST_MAX, |n| (n as usize).clamp(1, LIST_MAX));
+
+    let db = state.db().ok_or("没有库，工作项不可用")?;
+    let tickets = db
+        .ticket_list(me(from), !all, limit)
+        .map_err(|e| format!("读工作项失败：{e:#}"))?;
+    let (working, waiting) = db
+        .ticket_counts(me(from))
+        .map_err(|e| format!("读工作项失败：{e:#}"))?;
+
+    let mut out = String::new();
+    if tickets.is_empty() {
+        if all {
+            out.push_str("还没有任何工作项。用 dispatch 派一个。");
+        } else {
+            out.push_str("现在没有未完成的工作项。用 dispatch 派一个。");
+        }
+        return Ok(out);
     }
 
-    let mut out = String::from("会话（最近的在前）：\n");
-    for s in rows {
-        let title = if s.title.is_empty() {
-            "新对话"
-        } else {
-            &s.title
-        };
-        let running = if busy.contains(&s.id) {
-            "（正在跑）"
-        } else {
-            ""
-        };
-        // 最后一句话是「它做到哪了」最省 token 的近似：不去读全文，只取消息的
-        // 正文头一段。消息不在内存里的会话（stub）就算了，不为了列表去读库。
-        let last = latest_line(s);
-        let _ = writeln!(
-            out,
-            "- `{id}` {title}{running}{last}",
-            id = s.id,
-            title = title,
-            running = running,
-            last = last,
-        );
+    // 抬头先给两个数：这是 Router 每次醒来最该先知道的东西
+    let _ = writeln!(
+        out,
+        "{working} 件在干，{waiting} 件在等人{}：",
+        if all { "（含已结束的）" } else { "" }
+    );
+    for t in &tickets {
+        let _ = writeln!(out, "- {}", ticket::card(t));
     }
     Ok(out)
 }
 
-/// 会话最后一条有内容的消息，压成一行（没有就空串）。
-fn latest_line(s: &crate::agent::ChatSession) -> String {
-    if !s.resident() {
-        return String::new();
-    }
-    for m in s.messages.iter().rev() {
-        let (who, text) = match m {
-            crate::agent::ChatMessage::User { text, .. } => ("用户", text.as_str()),
-            crate::agent::ChatMessage::Assistant { content, .. } => ("助手", content.as_ref()),
-            _ => continue,
-        };
-        let t = text.trim();
-        if t.is_empty() {
-            continue;
-        }
-        return format!("，{who}最后说：{}", clip(t, 80));
-    }
-    String::new()
-}
-
-/// `read_session`：某个会话最近几条消息。
+/// `read_ticket`：一个工作项的详情。
 ///
-/// **按需从库里读**（`ensure_loaded`），读完不会把它常驻在内存里 —— Router 翻
-/// 十个会话不该让内存涨十倍。这条是 DeepSeek 那篇 Inline & Spill 的最小版本：
-/// 窗口里只放「最近几条 + 截断」，要看更多就再调一次。
-pub async fn read_session(core: &Core, args: &Value) -> Reply {
+/// 三段：**它是什么**（标题 / 要求 / 状态 / 结果）、**它干过什么**（执行记录，
+/// `what=transcript` 时给）、以及**下一步能做什么**。
+///
+/// 「结果」和「执行记录」分开是有意的：Router 关心的是「它做完了说了什么」，
+/// 中间跑了多少条命令是另一种信息，混在一起就是噪音。默认只给前两段的摘要，
+/// 要过程得显式要。
+pub async fn read_ticket(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
     let id = args
-        .get("session_id")
+        .get("ticket_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
     if id.is_empty() {
-        return Err("缺少参数 session_id".to_string());
+        return Err("缺少参数 ticket_id（`list_tickets` 给的那些反引号里的串）".to_string());
     }
-    let lines = args
-        .get("lines")
-        .and_then(Value::as_u64)
-        .map_or(READ_LINES_DEFAULT, |n| {
-            (n as usize).clamp(1, READ_LINES_MAX)
-        });
+    let db = state.db().ok_or("没有库，工作项不可用")?;
+    let t = db
+        .ticket_get(id)
+        .map_err(|e| format!("读工作项失败：{e:#}"))?
+        .ok_or_else(|| format!("没有这个工作项: `{id}`"))?;
+    // 权限：只能看自己名下的。不是自己的当作不存在（不泄露别人有什么）。
+    if t.router_id != me(from) {
+        return Err(format!("没有这个工作项: `{id}`"));
+    }
 
-    // 权限：只能看 worker。看 router（包括自己）没有意义，也不该能看。
-    {
-        let store = state.chat.read().await;
-        match store.get(id) {
-            Some(s) if s.role == Role::Worker => {}
-            Some(_) => return Err(format!("`{id}` 是协调层会话，不归你读")),
-            None => return Err(format!("没有这个会话: `{id}`")),
+    let mut out = String::new();
+    let _ = writeln!(out, "工作项 #{} `{}`", t.number(), t.id);
+    let _ = writeln!(out, "标题：{}", t.title);
+    let _ = writeln!(out, "状态：{}", t.stage.label());
+    let _ = writeln!(out, "派过 {} 次，载体会话 `{}`", t.dispatches, t.session_id);
+    let _ = writeln!(out, "要求：{}", t.brief);
+    if t.result.trim().is_empty() {
+        let _ = writeln!(out, "结果：（还没汇报）");
+    } else {
+        let _ = writeln!(out, "结果（{}）：", report_label(t.report));
+        let _ = writeln!(out, "{}", t.result.trim());
+    }
+
+    // 执行记录：要了才给。它是「过程」，默认不给
+    let want = args
+        .get("what")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if want == "transcript" {
+        let lines = args
+            .get("lines")
+            .and_then(Value::as_u64)
+            .map_or(TRANSCRIPT_LINES_DEFAULT, |n| {
+                (n as usize).clamp(1, TRANSCRIPT_LINES_MAX)
+            });
+        let _ = writeln!(out);
+        match transcript(core, &t.session_id, lines).await {
+            Ok(text) => out.push_str(&text),
+            Err(e) => {
+                let _ = writeln!(out, "执行记录读不出来：{e}");
+            }
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "（要看它中间跑了什么：`read_ticket {{ticket_id: \"{}\", what: \"transcript\"}}`）",
+            t.id
+        );
+    }
+
+    // 下一步能做什么：按状态给，别让模型自己猜
+    let _ = writeln!(out);
+    match t.stage {
+        Stage::WaitingReview => {
+            let _ = writeln!(
+                out,
+                "它做完了，等验收。看结果可以；要它接着改就再派一次（dispatch 带 ticket_id）。"
+            );
+        }
+        Stage::Blocked | Stage::Failed => {
+            let _ = writeln!(
+                out,
+                "它卡住了/失败了。看结果里说的原因；要它继续就再派一次（dispatch 带 ticket_id）。"
+            );
+        }
+        Stage::Working | Stage::Queued => {
+            let _ = writeln!(out, "它还在跑。等它的汇报，不要重复派同一个活。");
+        }
+        Stage::Done | Stage::Cancelled => {
+            let _ = writeln!(out, "这件事已经结束了（{}）。", stage_end(&t));
         }
     }
-    // 消息可能不在内存里（stub）：读回来。回合正在跑的那个会话已经在内存里，
-    // `ensure_loaded` 对它是空操作。
-    state
-        .ensure_loaded(id)
-        .await
-        .map_err(|e| format!("读会话失败：{e:#}"))?;
+    Ok(out)
+}
 
-    let busy = state.busy_sessions().iter().any(|s| s == id);
-    let store = state.chat.read().await;
-    let Some(s) = store.get(id) else {
-        return Err(format!("没有这个会话: `{id}`"));
-    };
-    let title = if s.title.is_empty() {
-        "新对话"
+fn report_label(r: Option<Report>) -> &'static str {
+    match r {
+        Some(Report::Ready) => "做完了",
+        Some(Report::Blocked) => "卡住了",
+        Some(Report::Failed) => "失败了",
+        Some(Report::Progress) => "进行中",
+        None => "汇报",
+    }
+}
+
+fn stage_end(t: &Ticket) -> &'static str {
+    if t.ended_by == "cancelled" {
+        "取消"
     } else {
-        &s.title
+        "完成"
+    }
+}
+
+/// 一个会话最近 `lines` 条消息，压成给模型看的一段。
+///
+/// 工具结果只留名字（`调用 bash`），不留输出 —— Router 要的是「它做到哪了」，
+/// 不是它跑过的每条命令的原文（那些要看就 `read_ticket ... what=transcript`
+/// 之后再问，或者干脆让它自己说）。
+async fn transcript(core: &Core, session_id: &str, lines: usize) -> Result<String, String> {
+    let state = &core.state;
+    // 消息可能不在内存里（stub）：读回来
+    state
+        .ensure_loaded(session_id)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let store = state.chat.read().await;
+    let Some(s) = store.get(session_id) else {
+        return Err("载体会话已经不在了".to_string());
     };
-    let total = s.message_count();
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "会话「{title}」（`{id}`）{run}，共 {total} 条消息。最近 {lines} 条：",
-        run = if busy { "，正在跑" } else { "" },
-    );
     if !s.resident() {
-        // 读过了还是 stub：说明这会话没有消息（不该发生，但别骗模型）
-        out.push_str("（没有可读的消息）\n");
-        return Ok(out);
+        return Ok("（没有可读的消息）".to_string());
     }
     let msgs = &s.messages;
     let start = msgs.len().saturating_sub(lines);
+    let mut out = format!("执行记录（最近 {lines} 条，共 {} 条）：\n", msgs.len());
     if start > 0 {
         let _ = writeln!(out, "（前面还有 {start} 条没显示）");
     }
     for m in &msgs[start..] {
         match m {
             crate::agent::ChatMessage::User { text, .. } => {
-                let _ = writeln!(out, "- 用户：{}", clip(text.trim(), READ_LINE_CHARS));
+                let _ = writeln!(
+                    out,
+                    "- 派活：{}",
+                    ticket::clip(text.trim(), TRANSCRIPT_LINE_CHARS)
+                );
             }
             crate::agent::ChatMessage::Assistant {
                 content,
@@ -191,193 +254,288 @@ pub async fn read_session(core: &Core, args: &Value) -> Reply {
             } => {
                 let c = content.trim();
                 if !c.is_empty() {
-                    let _ = writeln!(out, "- 助手：{}", clip(c, READ_LINE_CHARS));
+                    let _ = writeln!(out, "- 它：{}", ticket::clip(c, TRANSCRIPT_LINE_CHARS));
                 } else if !tool_calls.is_empty() {
                     let names: Vec<&str> = tool_calls.iter().map(|t| t.name.as_str()).collect();
-                    let _ = writeln!(out, "- 助手：调用 {}", names.join("、"));
+                    let _ = writeln!(out, "- 它：调用 {}", names.join("、"));
                 } else if !reasoning.trim().is_empty() {
-                    let _ = writeln!(out, "- 助手：（在思考）");
+                    let _ = writeln!(out, "- 它：（在思考）");
                 }
             }
-            // 工具结果是它自己的噪音，Router 只要知道「它做到哪了」，不要管道原文
-            crate::agent::ChatMessage::Tool { .. } => {}
+            crate::agent::ChatMessage::Tool { .. } => {
+                // 工具输出是它自己的噪音，这里只要「跑过」
+            }
             crate::agent::ChatMessage::System(_) => {}
         }
     }
     Ok(out)
 }
 
-/// `dispatch`：把任务投进某个会话（不给 id 就新建一个）。
+/// `dispatch`：开一个工作项并派出去。
 ///
-/// 返回**立即**给出 —— 任务只是排进了那条会话的队列。真正开跑由
+/// - 不给 `ticket_id` → **新建**一个工作项，给一个 worker 会话去干
+/// - 给了 `ticket_id` → **再派一次**（补充要求 / 让它接着改）：工作项还是那个，
+///   派工次数 +1，状态回到「排队中」
+///
+/// 返回**立即**给出 —— 活只是排进了那条会话的队列。真正开跑由
 /// `continue_with_queued` 负责（它会先试 `begin_turn`；那条会话正忙就把消息留在
-/// 队列里，等它的回合在步边界取）。
-pub async fn dispatch(core: &Core, args: &Value) -> Reply {
-    dispatch_from(core, "", args).await
-}
-
-/// `dispatch` 的实现。`by` 是派活的那个会话（Router）；空串 = 不知道（直接调的测试）。
-///
-/// 分成两层是因为「谁派的」不在工具参数里（模型不该能指定它）—— 它由
-/// **调用这个工具的会话**决定，从 `execute_tool` 的 `sid` 传进来。
-pub async fn dispatch_from(core: &Core, by: &str, args: &Value) -> Reply {
+/// 队列里等它）。同步等待就是把双层塌成一层。
+pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
-    let dispatch_id = uuid::Uuid::now_v7().to_string();
     let task = args
         .get("task")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
     if task.is_empty() {
-        return Err("缺少参数 task".to_string());
+        return Err(
+            "缺少参数 task（要它做什么，写成不知道前因后果的人也能看懂的样子）".to_string(),
+        );
     }
-    let want = args
-        .get("session_id")
+    let router = me(from).to_string();
+    let db = state.db().ok_or("没有库，工作项不可用")?;
+
+    // 再派一次：工作项已经在
+    let again = args
+        .get("ticket_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_string();
+
+    if !again.is_empty() {
+        let t = db
+            .ticket_get(&again)
+            .map_err(|e| format!("读工作项失败：{e:#}"))?
+            .ok_or_else(|| format!("没有这个工作项: `{again}`"))?;
+        if t.router_id != router {
+            return Err(format!("没有这个工作项: `{again}`"));
+        }
+        if !t.open() {
+            return Err(format!(
+                "工作项 #{} 已经结束了（{}）。要重开就新建一个，别往结束的上头派。",
+                t.number(),
+                t.stage.label()
+            ));
+        }
+        // 会话没了（被删了）就新开一个：工作项还是同一个，换个载体
+        let sid = ensure_session(core, &t.session_id, &t.title).await?;
+        return redispatch(core, &db, &t, &sid, task).await;
+    }
+
+    // 新建
     let title = args
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_string();
+    let title = if title.is_empty() {
+        // 没给标题就用要求的前一段：模型经常只给 task，不能因此失败
+        ticket::clip(task.lines().next().unwrap_or("未命名").trim(), 40)
+    } else {
+        ticket::clip(&title, 60)
+    };
 
-    // **先看有没有模型**，再动会话：没配模型时把活派出去是「派了也没人跑」，
-    // 那就不该先建一个空会话、再把它丢在那儿（它没内容、不进列表，只在内存里
-    // 占一个位置 —— 用户看不见，也删不掉）。顺序反过来的话，连点几次 dispatch
-    // 就攒一堆看不见的空 worker。
+    // **先看有没有模型**，再动会话：没配模型时派出去也没人跑，那就不该先建一个
+    // 空会话再丢在那儿（它没内容、不进列表，用户看不见也删不掉）。
     let Some(provider) = state.llm() else {
         return Err("还没配置模型，派出去的活没人能跑（先去设置里配一个）".to_string());
     };
 
-    // 找目标会话，没有就新建一个 worker。
-    let (sid, created) = {
+    // 新工作项一个自己的会话（上下文隔离：它看不到 Router 的对话）
+    let sid = {
         let mut store = state.chat.write().await;
-        if want.is_empty() {
-            let id = store.create(); // = worker（见 `SessionStore::create`）
-            if !title.is_empty() {
-                if let Some(s) = store.get_mut(&id) {
-                    s.title = title.chars().take(60).collect();
-                }
-            }
-            (id, true)
-        } else {
-            match store.get(&want) {
-                Some(s) if s.role == Role::Worker => (want.clone(), false),
-                Some(_) => return Err(format!("`{want}` 是协调层会话，不能往里派活")),
-                None => return Err(format!("没有这个会话: `{want}`")),
-            }
+        let s = crate::agent::ChatSession::with_role(Role::Worker);
+        let id = s.id.clone();
+        store.sessions.push(s);
+        if let Some(s) = store.get_mut(&id) {
+            s.title = title.clone();
         }
+        id
     };
     state.mark_sessions_dirty();
 
-    // 投进队列（`enqueue` 的唯一入口，见它和 `continue_with_queued` 的注释）。
+    let tid = uuid::Uuid::now_v7().to_string();
+    let now = crate::agent::now_ms();
+    if let Err(e) = db.ticket_create(&tid, &title, task, &sid, &router, now) {
+        return Err(format!("建工作项失败：{e:#}"));
+    }
+    if let Err(e) = db.ticket_bind_session(&sid, &tid, now) {
+        tracing::warn!("工作项和会话没绑定上（它的汇报会丢）: {e:#}");
+    }
+
+    // 投活 + 开跑
+    if let Err(e) = deliver(core, &sid, task, &provider) {
+        // 派不出去就把工作项标成失败，别让它挂在「排队中」永远不动
+        let _ = db.ticket_report(&tid, Report::Failed, &e, crate::agent::now_ms());
+        return Err(e);
+    }
+
+    Ok(format!(
+        "开了工作项 #{}（`{tid}`），交给一条新会话去干。它做完会把结果送回来。",
+        db.ticket_get(&tid).ok().flatten().map_or(0, |t| t.number())
+    ))
+}
+
+/// 往已有工作项再派一次。
+async fn redispatch(
+    core: &Core,
+    db: &std::sync::Arc<crate::db::Db>,
+    t: &Ticket,
+    sid: &str,
+    task: &str,
+) -> Reply {
+    let state = &core.state;
+    let Some(provider) = state.llm() else {
+        return Err("还没配置模型，派出去的活没人能跑".to_string());
+    };
+    // 要求变了：工作项的描述跟着更新（它下一步要看的是最新的要求）
+    if let Err(e) = db.ticket_redispatch(&t.id, crate::agent::now_ms()) {
+        return Err(format!("改工作项失败：{e:#}"));
+    }
+    if let Err(e) = db.ticket_bind_session(sid, &t.id, crate::agent::now_ms()) {
+        tracing::warn!("工作项和会话没绑定上: {e:#}");
+    }
+    if let Err(e) = deliver(core, sid, task, &provider) {
+        let _ = db.ticket_report(&t.id, Report::Failed, &e, crate::agent::now_ms());
+        return Err(e);
+    }
+    Ok(format!(
+        "又派给工作项 #{}（`{}`）了，还是那条会话接着干。",
+        t.number(),
+        t.id
+    ))
+}
+
+/// 确认这条会话还在（不在了就新开一个，标题沿用）。
+async fn ensure_session(core: &Core, want: &str, title: &str) -> Result<String, String> {
+    let state = &core.state;
+    {
+        let store = state.chat.read().await;
+        if store.get(want).is_some_and(|s| s.role == Role::Worker) {
+            return Ok(want.to_string());
+        }
+    }
+    let mut store = state.chat.write().await;
+    if store.get(want).is_some_and(|s| s.role == Role::Worker) {
+        return Ok(want.to_string());
+    }
+    let s = crate::agent::ChatSession::with_role(Role::Worker);
+    let id = s.id.clone();
+    store.sessions.push(s);
+    if let Some(s) = store.get_mut(&id) {
+        s.title = title.to_string();
+    }
+    drop(store);
+    state.mark_sessions_dirty();
+    Ok(id)
+}
+
+/// 把活投进会话并开跑（`enqueue` + `continue_with_queued`）。
+fn deliver(
+    core: &Core,
+    sid: &str,
+    task: &str,
+    provider: &crate::llm::Provider,
+) -> Result<(), String> {
     let msg = QueuedMsg {
         id: uuid::Uuid::now_v7().to_string(),
         text: task.to_string(),
         attachments: Vec::new(),
     };
-    if state.enqueue(&sid, msg).is_err() {
+    if core.state.enqueue(sid, msg).is_err() {
         return Err(format!(
-            "那个会话排队等着交给模型的消息太多了（上限 {}），等它跑完再派",
+            "那条会话排队等着交给模型的消息太多了（上限 {}），等它跑完再派",
             AppState::MAX_QUEUED
         ));
     }
-
-    // 记一笔「谁派出去的」：Worker 做完要把结果送回 Router（`report_back`），
-    // 而一个回合可能跑很久、中间核心被杀过 —— 只在内存里记的话，重启后这条活
-    // 就断了。落库之后重启也能接上。
-    if let Some(db) = state.db() {
-        if let Err(e) = db.set_dispatch(&sid, by, &dispatch_id, crate::agent::now_ms()) {
-            tracing::warn!("记派工失败（不影响派活，只是做完可能回不到 Router）: {e:#}");
-        }
-    }
-
-    // 试着立刻开跑：那条会话空着就现在开，正忙就把消息留在队列里等它。
-    // `continue_with_queued` 自己会先试 `begin_turn`，所以这里不需要判断忙不忙。
-    crate::agent::continue_with_queued(core, &provider, &sid);
-
-    Ok(if created {
-        format!("已经开了一个新会话 `{sid}`，把这件事交给它去做；做完会有消息回来。")
-    } else {
-        format!("已经派给 `{sid}`，它会接着那边的上下文做；做完会有消息回来。")
-    })
+    crate::agent::continue_with_queued(core, provider, sid);
+    Ok(())
 }
 
-/// Worker 的一个回合结束了：把结果送回派它的那个 Router。
+/// Worker 的一个回合结束了：把结果记进工作项，并让 Router 知道。
 ///
-/// 这是双层的**闭环**，也是唯一一处 Worker 能「主动」影响 Router 的地方。没有它，
-/// `dispatch` 就是单向的 —— Router 派出去、再也听不到回音，用户得自己去翻每个人的
-/// 会话才知道做完了没有。
+/// 这是双层的**闭环**，也是唯一一处 Worker 能影响 Router 的地方。
 ///
-/// 什么时候不送：
-/// - 这个会话不是被派出去的（`dispatched` 表里没有它）—— 用户自己开的会话不该
-///   凭空往 Router 里塞消息；
-/// - 它派出去的 Router 会话已经没了；
-/// - 这一回合**失败了**也送：失败正是 Router 最该知道的（照 `notify` 那条路，
-///   失败不送的话 Router 会一直以为它还在干）。
+/// 记什么：最后说的那段话（`result`）+ 一句进度判断（`report`）。判断的规则
+/// 是**确定性的**，不让模型猜（它此刻已经不在推理了）：
 ///
-/// 送法：往 Router 的队列里排一条（和 `dispatch` 派活走同一条路）—— Router 空着
-/// 就立刻开一轮，正忙就在步边界取。**不直接调 `run_turn`**：那样就绕过了
-/// 串行/并行那套规则。
-pub async fn report_back(core: &Core, from: &str, said: &str, ok: bool) {
+/// - 回合正常结束 → `ready`（做完了，等人验收）
+/// - 回合出错 → `failed`
+/// - 用户按了停止 → `progress`（不是「做完」也不是「失败」，是中途中止）
+///
+/// 然后往 Router 的队列里排一条**结构化的**回执（带 ticket id 和状态），
+/// 而不是一句散文 —— Router 醒来要知道「哪个工作项、什么状态、结果在哪」。
+pub async fn report_back(core: &Core, from_session: &str, said: &str, ok: bool, stopped: bool) {
     let state = &core.state;
     let Some(db) = state.db() else { return };
-    let Ok(Some((router, _dispatch_id))) = db.dispatch_of(from) else {
-        return; // 不是派出去的会话（或没有库）：不关它的事
+    let Ok(Some(tid)) = db.ticket_of_session(from_session) else {
+        return; // 这条会话不是在干工作项（用户自己开的）
     };
-    // Router 还在不在、还是不是 router
+    let Ok(Some(t)) = db.ticket_get(&tid) else {
+        return;
+    };
+    // 已经结束的工作项不再收汇报（结束了就是结束了）
+    if !t.open() {
+        return;
+    }
+    let report = if stopped {
+        Report::Progress
+    } else if ok {
+        Report::Ready
+    } else {
+        Report::Failed
+    };
+    let text = if said.trim().is_empty() {
+        match report {
+            Report::Ready => "（这一轮没有输出）".to_string(),
+            Report::Failed => "这一轮失败了".to_string(),
+            _ => "（中途中止）".to_string(),
+        }
+    } else {
+        said.to_string()
+    };
+    let now = crate::agent::now_ms();
+    if let Err(e) = db.ticket_report(&tid, report, &text, now) {
+        tracing::warn!("记工作项汇报失败（Router 会收不到）: {e:#}");
+        return;
+    }
+    // **重新读一遍**：上面那个 `t` 是写入**之前**的快照，`stage` 还是旧的
+    //（典型是 `Queued`）。拿旧状态去告诉 Router「现在是什么状态」就是在撒谎。
+    let Ok(Some(t)) = db.ticket_get(&tid) else {
+        return;
+    };
+
+    // 让 Router 知道。**结构化**：哪个工作项、什么状态、结果在哪
+    let router = t.router_id.clone();
     {
         let store = state.chat.read().await;
         match store.get(&router) {
             Some(s) if s.role == Role::Router => {}
-            _ => return,
+            _ => return, // Router 没了就只记账，不叫醒谁
         }
     }
-    let title = {
-        let store = state.chat.read().await;
-        store
-            .get(from)
-            .map(|s| {
-                if s.title.is_empty() {
-                    "新对话".to_string()
-                } else {
-                    s.title.clone()
-                }
-            })
-            .unwrap_or_else(|| "一个会话".to_string())
-    };
-    // 给它一段能直接看懂的话：谁的、成没成、说了什么。
-    let body = if ok {
-        format!("「{title}」做完了，说：\n{said}")
-    } else {
-        format!("「{title}」这一轮失败了，说：\n{said}")
-    };
+    let body = format!(
+        "工作项 #{}「{}」{}。\n说：{}\n（要看全文：read_ticket {{ticket_id: \"{}\"}}）",
+        t.number(),
+        t.title,
+        t.stage.label(),
+        ticket::clip(&text, 800),
+        t.id,
+    );
     let msg = QueuedMsg {
         id: uuid::Uuid::now_v7().to_string(),
         text: body,
         attachments: Vec::new(),
     };
     if state.enqueue(&router, msg).is_err() {
-        tracing::warn!("Router 的队列满了，这条回执丢了（{from} → {router}）");
+        tracing::warn!("Router 的队列满了，工作项 #{} 的回执丢了", t.number());
         return;
     }
-    // 和 `dispatch` 一样：能开就跑，正忙就排队。
     if let Some(provider) = state.llm() {
         crate::agent::continue_with_queued(core, &provider, &router);
     }
-}
-
-/// 把一段文本压到 `max` 字（按字符，不按字节 —— 中文不该被切在半个字上）。
-fn clip(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max).collect();
-    format!("{head}…（共 {n} 字）")
 }
 
 #[cfg(test)]
@@ -385,266 +543,337 @@ mod tests {
     use super::*;
     use crate::agent::{ChatMessage, ChatSession};
 
-    fn session() -> ChatSession {
-        ChatSession::new()
-    }
-
-    /// `dispatch` 不给 session_id 时**建一个 worker**（不是 router），
-    /// 并且把任务排进它的队列 —— 这是 L1 真正的功能点。
-    ///
-    /// 配一个假 provider：`continue_with_queued` 会真的去开回合（然后因为连不上
-    /// 而失败，那是它的事，与本测试无关）；这里只验证「会话建对了、消息排进去了」。
-    #[tokio::test]
-    async fn dispatch_creates_a_worker_and_queues_the_task() {
-        let core = Core::new();
-        core.state
-            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
-
-        let out = dispatch(&core, &serde_json::json!({ "task": "把 README 改一下" }))
-            .await
-            .expect("配了模型就该派得出去");
-
-        // 新建的那个会话：是 worker，而且是唯一一个
-        let store = core.state.chat.read().await;
-        assert_eq!(store.sessions.len(), 1, "应当正好建了一个会话");
-        let s = &store.sessions[0];
-        assert_eq!(s.role, Role::Worker, "派活的目标必须是 worker");
-        assert!(out.contains(&s.id), "返回里要写明派给了谁：{out}");
-    }
-
-    /// 没配模型时 `dispatch` 必须**什么都不建**，直接报错。
-    ///
-    /// 反过来的话，连点几次就攒一堆没内容的空 worker：它们不进侧边栏（空会话
-    /// 不列），用户看不见也删不掉，只在内存和下次落盘时碍事。
-    #[tokio::test]
-    async fn dispatch_without_a_model_creates_nothing() {
-        let core = Core::new();
-        let err = dispatch(&core, &serde_json::json!({ "task": "随便干点什么" }))
-            .await
-            .expect_err("没模型就不该派得出去");
-        assert!(err.contains("模型"), "错误里要说是模型的事：{err}");
-        assert!(
-            core.state.chat.read().await.sessions.is_empty(),
-            "派不出去就不该留下空会话"
-        );
-    }
-
-    /// `dispatch` 不能往 router 会话里派活 —— 那会让协调层自己变成执行者。
-    #[tokio::test]
-    async fn dispatch_refuses_to_target_a_router_session() {
-        let core = Core::new();
-        core.state
-            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
-        let router = {
-            let mut store = core.state.chat.write().await;
-            let s = crate::agent::ChatSession::with_role(Role::Router);
-            let id = s.id.clone();
-            store.sessions.push(s);
-            id
-        };
-        let err = dispatch(
-            &core,
-            &serde_json::json!({ "task": "派给我自己", "session_id": router }),
-        )
-        .await
-        .expect_err("不能派给 router");
-        assert!(err.contains("协调层"), "错误要说清为什么不行：{err}");
-    }
-
-    /// `read_session` 读不到 router 会话（那是它自己的层），也读不到不存在的会话。
-    #[tokio::test]
-    async fn read_session_refuses_routers_and_unknown_ids() {
-        let core = Core::new();
-        let router = {
-            let mut store = core.state.chat.write().await;
-            let s = crate::agent::ChatSession::with_role(Role::Router);
-            let id = s.id.clone();
-            store.sessions.push(s);
-            id
-        };
-        let e = read_session(&core, &serde_json::json!({ "session_id": router }))
-            .await
-            .expect_err("不该能读 router");
-        assert!(e.contains("协调层"), "{e}");
-
-        let e = read_session(&core, &serde_json::json!({ "session_id": "没有这个" }))
-            .await
-            .expect_err("不该能读不存在的会话");
-        assert!(e.contains("没有这个会话"), "{e}");
-    }
-
-    /// `list_sessions` **不列 router 自己** —— 它不需要看见自己，也不该有
-    /// 「派活给 router」的念头。同时 worker 要列出来。
-    #[tokio::test]
-    async fn list_sessions_hides_the_router_and_shows_workers() {
-        let core = Core::new();
-        let (worker, router) = {
-            let mut store = core.state.chat.write().await;
-            let w = store.create();
-            store
-                .get_mut(&w)
-                .unwrap()
-                .messages
-                .push(crate::agent::ChatMessage::user("干活"));
-            let r = crate::agent::ChatSession::with_role(Role::Router);
-            let rid = r.id.clone();
-            store.sessions.push(r);
-            (w, rid)
-        };
-        let out = list_sessions(&core).await.unwrap();
-        assert!(out.contains(&worker), "worker 要列出来：{out}");
-        assert!(!out.contains(&router), "router 不该出现在自己的列表里");
-    }
-
-    /// 派出去的活做完，要能把结果**送回 Router**。
-    ///
-    /// 这是双层唯一一条反向的路（Worker → Router）。没有它，`dispatch` 就是
-    /// 单向的：Router 派出去、再也听不到回音。
-    /// 带库的核心（`report_back` 要查派工记录，没库就什么都不做）。
-    ///
-    /// **不配 provider**：`report_back` 末尾会尝试 `continue_with_queued` 开一轮，
-    /// 配了的话真回合会立刻把队列取走（连不上端点、然后失败），测试就查不到那条
-    /// 回执了。不配 provider 时它什么都不做 —— 队列原样留着，正好可以断言。
     fn core_with_db(tag: &str) -> Core {
         let core = Core::new();
-        let dir = std::env::temp_dir().join(format!("agent-router-{tag}-{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("agent-ticket-{tag}-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         core.set_data_dir(dir);
         core
     }
 
-    #[tokio::test]
-    async fn a_dispatched_worker_reports_back_to_its_router() {
-        let core = core_with_db("report");
-        // 一个 router + 一个 worker，并在库里记下「worker 是 router 派的」
-        let (router, worker) = {
+    /// 建一个 Router 会话，返回 (core, router_id)
+    async fn with_router(tag: &str) -> (Core, String) {
+        let core = core_with_db(tag);
+        let rid = {
             let mut store = core.state.chat.write().await;
-            let r = crate::agent::ChatSession::with_role(Role::Router);
-            let rid = r.id.clone();
-            store.sessions.push(r);
-            let w = store.create();
-            // worker 得有点内容，不然它不进列表、也不像一个真的干了活的会话
-            store
-                .get_mut(&w)
-                .unwrap()
-                .messages
-                .push(crate::agent::ChatMessage::user("干活"));
-            (rid, w)
+            let s = ChatSession::with_role(Role::Router);
+            let id = s.id.clone();
+            store.sessions.push(s);
+            id
         };
+        (core, rid)
+    }
+
+    #[tokio::test]
+    async fn dispatch_creates_a_ticket_with_state_not_just_a_session() {
+        let (core, rid) = with_router("create").await;
         core.state
-            .db()
-            .unwrap()
-            .set_dispatch(&worker, &router, "d-1", 0)
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+
+        let out = dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "把 README 的错别字改掉", "title": "改错别字" }),
+        )
+        .await
+        .expect("配了模型就该派得出去");
+        assert!(out.contains("工作项 #"), "返回要说清开了哪个工作项：{out}");
+
+        // 库里真的有一个工作项，状态是「排队中」
+        let db = core.state.db().unwrap();
+        let list = db.ticket_list(&rid, true, 10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].stage, Stage::Queued);
+        assert_eq!(list[0].title, "改错别字");
+        assert!(list[0].open());
+    }
+
+    #[tokio::test]
+    async fn dispatch_without_a_model_creates_no_ticket_and_no_session() {
+        let (core, rid) = with_router("nomodel").await;
+        let err = dispatch(&core, &rid, &serde_json::json!({ "task": "随便干点什么" }))
+            .await
+            .expect_err("没模型就不该派得出去");
+        assert!(err.contains("模型"), "{err}");
+        // 库里没有工作项，也没有多出来的会话
+        let db = core.state.db().unwrap();
+        assert!(db.ticket_list(&rid, false, 10).unwrap().is_empty());
+        let store = core.state.chat.read().await;
+        assert_eq!(store.sessions.len(), 1, "只有那个 Router，没多建 worker");
+    }
+
+    #[tokio::test]
+    async fn a_worker_report_moves_the_ticket_and_tells_the_router() {
+        let (core, rid) = with_router("report").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
             .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
 
-        report_back(&core, &worker, "改好了，PR 已提交", true).await;
+        // 把 provider 清掉再汇报：配着的话 `continue_with_queued` 会立刻开一轮
+        // 把回执取走（连不上端点、然后失败），队列里就查不到那条了。
+        core.state.clear_llm();
+        // Worker 干完了
+        report_back(&core, &t.session_id, "改好了，PR 已提交", true, false).await;
 
-        // Router 的队列里该有一条回执
-        let q = core.state.queued_list(&router);
-        assert_eq!(q.len(), 1, "Router 没收到回执（队列长度 {}）", q.len());
+        let after = db.ticket_get(&t.id).unwrap().unwrap();
+        assert_eq!(after.stage, Stage::WaitingReview, "做完该是「待验收」");
+        assert!(after.result.contains("改好了"));
+
+        // Router 收到一条**结构化**回执（带工作项身份）
+        let q = core.state.queued_list(&rid);
+        assert_eq!(q.len(), 1);
         assert!(
-            q[0].text.contains("改好了"),
-            "回执要带上 Worker 说的话：{}",
+            q[0].text.contains("工作项 #"),
+            "要带工作项身份：{}",
             q[0].text
         );
+        assert!(q[0].text.contains("待验收"), "要带状态：{}", q[0].text);
+        assert!(q[0].text.contains(&t.id), "要带 read 指针：{}", q[0].text);
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_marks_the_ticket_failed() {
+        let (core, rid) = with_router("fail").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+
+        report_back(&core, &t.session_id, "连不上数据库", false, false).await;
+        assert_eq!(db.ticket_get(&t.id).unwrap().unwrap().stage, Stage::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_turn_does_not_claim_the_work_is_done() {
+        let (core, rid) = with_router("stop").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+
+        report_back(&core, &t.session_id, "干到一半被叫停", true, true).await;
+        let after = db.ticket_get(&t.id).unwrap().unwrap();
+        // 中途中止**不是**「做完了」—— 那是人不想让它继续，不是 ready
+        assert_ne!(after.stage, Stage::WaitingReview);
+        assert_eq!(after.report, Some(Report::Progress));
+    }
+
+    #[tokio::test]
+    async fn list_shows_counts_and_read_pointers() {
+        let (core, rid) = with_router("list").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "做甲", "title": "甲" }),
+        )
+        .await
+        .unwrap();
+        let out = list_tickets(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(out.contains("件在干"), "抬头要有数：{out}");
+        assert!(out.contains("甲"), "{out}");
         assert!(
-            q[0].text.contains("做完"),
-            "成功的回执要说做完了：{}",
-            q[0].text
+            out.contains("read: ticket/"),
+            "每个条目要带 read 指针：{out}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_ticket_gives_the_result_and_hides_the_transcript_by_default() {
+        let (core, rid) = with_router("read").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "干点活", "title": "一件事" }),
+        )
+        .await
+        .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+        report_back(&core, &t.session_id, "做完了，结果是 X", true, false).await;
+
+        let out = read_ticket(&core, &rid, &serde_json::json!({ "ticket_id": t.id }))
+            .await
+            .unwrap();
+        assert!(out.contains("结果是 X"), "要能看到结果：{out}");
+        assert!(out.contains("待验收"), "{out}");
+        // 默认不给执行记录（那是过程），但要告诉它怎么要
+        assert!(
+            !out.contains("执行记录（最近"),
+            "默认不该倒出执行记录：{out}"
+        );
+        assert!(
+            out.contains("what: \"transcript\""),
+            "要告诉它怎么要：{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_router_cannot_read_or_dispatch_another_routers_ticket() {
+        let (core, rid) = with_router("acl").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+
+        // 别人的 Router 看它：当作不存在（不泄露有什么）
+        let err = read_ticket(
+            &core,
+            "another-router",
+            &serde_json::json!({ "ticket_id": t.id }),
+        )
+        .await
+        .expect_err("不该能读别人的");
+        assert!(err.contains("没有这个工作项"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn redispatch_keeps_the_same_ticket() {
+        let (core, rid) = with_router("again").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "干点活", "title": "一件事" }),
+        )
+        .await
+        .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+        report_back(&core, &t.session_id, "做完了", true, false).await;
+
+        // 再派一次（让它接着改）：还是同一个工作项，派工次数 +1
+        let out = dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "再改一下第二段", "ticket_id": t.id }),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("又派给"), "{out}");
+        let after = db.ticket_get(&t.id).unwrap().unwrap();
+        assert_eq!(after.dispatches, 2);
+        assert_eq!(
+            db.ticket_list(&rid, true, 10).unwrap().len(),
+            1,
+            "没有变成两个"
+        );
+    }
+
+    #[tokio::test]
+    async fn cannot_redispatch_a_finished_ticket() {
+        let (core, rid) = with_router("ended").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+        db.ticket_end(&t.id, "done", 0).unwrap();
+
+        let err = dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "再干", "ticket_id": t.id }),
+        )
+        .await
+        .expect_err("结束的不该能再派");
+        assert!(err.contains("已经结束"), "{err}");
+    }
+
+    #[test]
+    fn stage_round_trips_and_unknown_is_never_open() {
+        for st in [
+            Stage::Queued,
+            Stage::Working,
+            Stage::WaitingReview,
+            Stage::Blocked,
+            Stage::Failed,
+            Stage::Done,
+            Stage::Cancelled,
+        ] {
+            assert_eq!(Stage::parse(st.as_str()), st);
+        }
+        // 读不懂的状态读成 `Failed`，不是「还在干」：说成「在干」会让 Router
+        // 永远等一个不会来的结果；说成失败至少会被人看见、能被处理。
+        // 注意 `Failed` 本身仍然是**开着的**（等人处理），所以这里断的是
+        // 「它不是 Working / Queued」那个意思。
+        assert_eq!(Stage::parse("something-new"), Stage::Failed);
+        assert_ne!(Stage::parse("something-new"), Stage::Working);
+        assert!(Stage::parse("something-new").needs_person());
+    }
+
+    #[test]
+    fn only_person_stages_need_a_person() {
+        assert!(Stage::WaitingReview.needs_person());
+        assert!(Stage::Blocked.needs_person());
+        assert!(Stage::Failed.needs_person());
+        assert!(!Stage::Working.needs_person());
+        assert!(!Stage::Queued.needs_person());
+        assert!(!Stage::Done.needs_person());
+    }
+
+    #[test]
+    fn clip_counts_chars_not_bytes() {
+        assert_eq!(
+            ticket::clip("一二三四五六七八九十", 5),
+            "一二三四五…（共 10 字）"
+        );
+        assert_eq!(ticket::clip("abc", 5), "abc");
     }
 
     /// 不是派出去的会话（用户自己开的）不该凭空往 Router 里塞消息。
     #[tokio::test]
     async fn an_undispatched_session_reports_nowhere() {
-        let core = Core::new();
+        let (core, rid) = with_router("undispatched").await;
+        let sid = {
+            let mut store = core.state.chat.write().await;
+            store.create()
+        };
+        report_back(&core, &sid, "我干完了", true, false).await;
+        assert!(core.state.queued_list(&rid).is_empty());
+    }
+
+    /// 会话里的对话内容不该影响工作项 —— 工作项自己记着 `result`。
+    #[tokio::test]
+    async fn the_ticket_keeps_its_own_result_even_if_the_session_is_gone() {
+        let (core, rid) = with_router("gone").await;
         core.state
             .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
-        let (router, worker) = {
-            let mut store = core.state.chat.write().await;
-            let r = crate::agent::ChatSession::with_role(Role::Router);
-            let rid = r.id.clone();
-            store.sessions.push(r);
-            (rid, store.create())
-        };
-        // **不**记派工：这个会话是自己开的
-        report_back(&core, &worker, "我干完了", true).await;
-        assert!(
-            core.state.queued_list(&router).is_empty(),
-            "不是派出去的会话不该有回执"
-        );
-    }
-
-    /// 失败的回合**也要**回报 —— 失败正是 Router 最该知道的。
-    #[tokio::test]
-    async fn a_failed_turn_reports_back_as_a_failure() {
-        let core = core_with_db("fail");
-        let (router, worker) = {
-            let mut store = core.state.chat.write().await;
-            let r = crate::agent::ChatSession::with_role(Role::Router);
-            let rid = r.id.clone();
-            store.sessions.push(r);
-            let w = store.create();
-            store
-                .get_mut(&w)
-                .unwrap()
-                .messages
-                .push(crate::agent::ChatMessage::user("干活"));
-            (rid, w)
-        };
-        core.state
-            .db()
-            .unwrap()
-            .set_dispatch(&worker, &router, "d-2", 0)
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
             .unwrap();
-
-        report_back(&core, &worker, "连不上数据库", false).await;
-        let q = core.state.queued_list(&router);
-        assert_eq!(q.len(), 1);
-        assert!(
-            q[0].text.contains("失败"),
-            "失败要说明是失败：{}",
-            q[0].text
-        );
-    }
-
-    #[test]
-    fn clip_counts_chars_not_bytes() {
-        // 10 个汉字 = 30 字节；按字节切会切出半个字
-        let s = "一二三四五六七八九十";
-        assert_eq!(clip(s, 5), "一二三四五…（共 10 字）");
-        assert_eq!(clip("abc", 5), "abc");
-    }
-
-    #[test]
-    fn latest_line_skips_empty_and_tools() {
-        let mut s = session();
-        s.messages.push(ChatMessage::User {
-            text: "先问一句".into(),
-            attachments: Vec::new(),
-        });
-        // 一条没有正文、只有工具调用的助手消息，不该被当成「最后说的话」
-        s.messages.push(ChatMessage::Assistant {
-            content: "".into(),
-            reasoning: "".into(),
-            tool_calls: vec![crate::agent::RecordedToolCall {
-                id: "t".into(),
-                name: "bash".into(),
-                arguments: "{}".into(),
-            }],
-            reasoning_items: Vec::new(),
-        });
-        let line = latest_line(&s);
-        assert!(line.contains("用户"), "{line}");
-        assert!(line.contains("先问一句"), "{line}");
-    }
-
-    #[test]
-    fn latest_line_is_empty_for_a_resident_session_with_nothing_said() {
-        // stub 会话（消息不在内存）不为了列表去读库
-        let mut s = session();
-        s.messages.clear();
-        s.stub = Some(crate::agent::Stub { len: 3, users: 1 });
-        assert_eq!(latest_line(&s), "");
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+        report_back(&core, &t.session_id, "结果很重要", true, false).await;
+        // 会话被删了
+        {
+            let mut store = core.state.chat.write().await;
+            store.delete(&t.session_id);
+        }
+        // 工作项的结果还在（它没存在会话里）
+        let after = db.ticket_get(&t.id).unwrap().unwrap();
+        assert!(after.result.contains("结果很重要"));
+        let _ = ChatMessage::user("x"); // 用一下导入
     }
 }

@@ -94,14 +94,14 @@ fn build_tools(p: Platform) -> Vec<ToolSpec> {
 fn build_router_tools(_p: Platform) -> Vec<ToolSpec> {
     vec![
         ToolSpec {
-            name: "list_sessions",
-            description: prompt::list_sessions_description(),
-            schema: prompt::list_sessions_schema,
+            name: "list_tickets",
+            description: prompt::list_tickets_description(),
+            schema: prompt::list_tickets_schema,
         },
         ToolSpec {
-            name: "read_session",
-            description: prompt::read_session_description(),
-            schema: prompt::read_session_schema,
+            name: "read_ticket",
+            description: prompt::read_ticket_description(),
+            schema: prompt::read_ticket_schema,
         },
         ToolSpec {
             name: "dispatch",
@@ -1974,10 +1974,10 @@ async fn turn_once(
     //
     // **用户自己按的停止不回报**：那是人不想让它继续了，不是「做完了」或
     // 「失败了」，往 Router 塞一条反而多一次没意义的唤醒。
-    if !turn.abort_requested() {
-        let said = last_assistant_text(core, sid).await;
-        crate::router::report_back(core, sid, &said, res.is_ok()).await;
-    }
+    // 用户按的停止**也要记**：那不是「做完」也不是「失败」，是中途中止 ——
+    // 工作项得知道，不然它会永远挂在「在干」上。
+    let said = last_assistant_text(core, sid).await;
+    crate::router::report_back(core, sid, &said, res.is_ok(), turn.abort_requested()).await;
     res
 }
 
@@ -3406,10 +3406,10 @@ fn tool_output_event(id: &str, text: &str, images: &[ImagePart]) -> Value {
 /// 这里只是「这个名字归 `router` 模块管」。多一层角色判断反而多一处要同步的地方。
 async fn router_tool(core: &Core, name: &str, args: &Value, sid: &str) -> Option<ToolOutcome> {
     let out = match name {
-        "list_sessions" => crate::router::list_sessions(core).await,
-        "read_session" => crate::router::read_session(core, args).await,
-        // 传 sid：派工要记「谁派的」，做完才知道回报给谁
-        "dispatch" => crate::router::dispatch_from(core, sid, args).await,
+        "list_tickets" => crate::router::list_tickets(core, sid, args).await,
+        "read_ticket" => crate::router::read_ticket(core, sid, args).await,
+        // 传 sid：工作项要记「谁派的」，做完才知道汇报给谁
+        "dispatch" => crate::router::dispatch(core, sid, args).await,
         _ => return None,
     };
     Some(match out {
@@ -4115,7 +4115,7 @@ mod tests {
             // 三个编排工具都在（少一个就是某个能力悄悄没了）
             // 并且**没有** `answer`：模型的正文本来就是给用户看的那句话，
             // 专门为说话开一个工具只会白多一轮请求。
-            for required in ["list_sessions", "read_session", "dispatch"] {
+            for required in ["list_tickets", "read_ticket", "dispatch"] {
                 assert!(
                     names.contains(&required),
                     "{p:?} 的 router 表里缺少 `{required}`"
@@ -4123,7 +4123,7 @@ mod tests {
             }
             // 反过来的那一半：worker 表里不该有编排工具（它没有派活的对象）
             let worker: Vec<&str> = tools(p, Role::Worker).iter().map(|t| t.name).collect();
-            for orchestration in ["list_sessions", "read_session", "dispatch"] {
+            for orchestration in ["list_tickets", "read_ticket", "dispatch"] {
                 assert!(
                     !worker.contains(&orchestration),
                     "{p:?} 的 worker 表里出现了 `{orchestration}`：那是协调层的事"

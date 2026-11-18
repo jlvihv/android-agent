@@ -24,6 +24,7 @@
   import Composer from "./components/Composer.svelte";
   import MessageList from "./components/MessageList.svelte";
   import Drawer, { type Session } from "./components/Drawer.svelte";
+  import TicketBoard, { type TicketRow } from "./components/TicketBoard.svelte";
   import MachineSheet from "./components/MachineSheet.svelte";
   import ModelSheet from "./components/ModelSheet.svelte";
   import Settings from "./components/Settings.svelte";
@@ -166,6 +167,34 @@
     !!sessionId &&
       sessions.some((s) => s.id === sessionId && s.role === "router"),
   );
+
+  /**
+   * 协调层那条顶上的「在干的活」（`/api/tickets`）。
+   *
+   * 只有一个 Router，所以这份数据不分会话 —— 但**只在 Router 那条会话里画**
+   * （`isRouter` 判）。worker 的会话不该看到别人在干什么：它在干自己的活，
+   * 看到别的活只会让它分心（而且它本来也看不到，那是 Router 的视野）。
+   */
+  let tickets = $state<TicketRow[]>([]);
+  let ticketWorking = $state(0);
+  let ticketWaiting = $state(0);
+
+  /** 拉一次工作项。失败保持原样（下一轮再试）。 */
+  async function refreshTickets() {
+    if (!isRouter || !sessionId) return;
+    try {
+      const d = await api<{
+        tickets?: TicketRow[];
+        working?: number;
+        waiting?: number;
+      }>(`/api/tickets?router=${encodeURIComponent(sessionId)}`);
+      tickets = d.tickets ?? [];
+      ticketWorking = d.working ?? 0;
+      ticketWaiting = d.waiting ?? 0;
+    } catch {
+      /* 拉不到就先不显示，下一次再来 */
+    }
+  }
   const loadSessions = (force = false) => list.load(force);
   const loadMoreSessions = () => void list.more();
 
@@ -245,6 +274,9 @@
     syncUrl(id);
     chat.show(id);
     drawer = false;
+    // 切到 Router 时顺手把「在干的活」拉一遍：那条会话平时是静止的（活跑在别的
+    // 会话里），不主动问一次就永远是上次的旧状态。
+    void refreshTickets();
   }
 
   async function renameSession(id: string, title: string) {
@@ -348,6 +380,27 @@
       void loadSessions();
     }),
   );
+
+  /**
+   * 看的是不是 Router / 是哪个 Router → 拉一次「在干的活」。
+   *
+   * **不能只在首屏 effect 里拉一次**：那时候 `sessions` 还没落地，`isRouter`
+   * 还是 false，拉了个空。这里盯着 `sessionId` + `isRouter`，两者一变就重拉 ——
+   * 首屏拉到列表之后 `isRouter` 翻成 true，这条自己会触发。
+   *
+   * 没有轮询：活的推进靠 `chat.on("ended")`（见下）和切会话时的重拉。
+   * Router 那条平时是静止的，定时轮询只是在烧电。
+   */
+  $effect(() => {
+    // 读一下让它成为依赖
+    if (isRouter && sessionId) void refreshTickets();
+    else {
+      // 离开 Router 就清掉：worker 会话里不该残留上一段的工作项
+      tickets = [];
+      ticketWorking = 0;
+      ticketWaiting = 0;
+    }
+  });
 
   /**
    * 后退 / 前进 → 换会话。
@@ -601,6 +654,9 @@
   $effect(() =>
     chat.on("ended", () => {
       void loadSessions(true);
+      // 一条流收尾 = 某件事可能推进了。Router 那块要跟着更新 ——
+      // 哪怕收尾的是 worker 会话（用户正看着 Router，也会想知道「那件活完了」）。
+      void refreshTickets();
     }),
   );
 
@@ -661,6 +717,15 @@
          弹出面板的 z-50 困住，压不过同级 z-20 的输入框（踩过）。
          z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
     <main class="absolute inset-0">
+      {#if isRouter}
+        <!-- 协调层顶上那块「在干的活」。它不占消息流的位置（absolute 的 main 里面
+             正常走文档流），所以消息多了会自然把它顶上去。 -->
+        <TicketBoard
+          {tickets}
+          working={ticketWorking}
+          waiting={ticketWaiting}
+        />
+      {/if}
       {#if messages.length === 0 && queuedMsgs.length === 0}
         <!-- 空界面那一句按**这一层是谁**说：协调层说「派给我」，worker 说「想什么」。
              同一句「来思考些什么?」放在 Router 上是不对的 —— Router 不思考、它派活。 -->

@@ -253,59 +253,80 @@ pub fn edit_schema() -> Value {
 /// 和 worker 那份一样是**常量**（拼一次就冻结，见 `system_prompt`），
 /// 区别是它不分平台：router 不执行、不读文件，沙箱形态与它无关。
 ///
-/// 写的约束都是「**别自己干**」那一类 —— 但真正拦住它的是工具表（没 bash），
-/// 提示词只是让它在只剩四个工具的情况下知道怎么用。
+/// 写的都是「**别自己干**」那一类 —— 但真正拦住它的是工具表（没 bash），
+/// 提示词只是让它知道在这个抽象层级上怎么工作。
+///
+/// 关键是把「工作项」这个概念说清楚：它派出去的不是「一条会话」，是**一件事**。
+/// 会话是载体，用户和它自己看到的都该是「事情走到哪一步」。
 pub fn router_description() -> &'static str {
     "你是协调层（Router）。用户在这里跟你说话，你不亲自干活。\n\
      \n\
-     - 你的工作只有两件：**把事情派给合适的会话去做**，和**向用户回话**。\n\
-     - 你没有 shell、没有读文件、没有改文件的能力 —— 这不是限制，是你的定义。想改什么、跑什么、查什么，都是派给会那个的会话去办。\n\
-     - `list_sessions` 看有哪些会话、各自在干吗；`read_session` 看某个会话最近做到哪了；`dispatch` 把任务派给某个会话（不给 id 就新建一个）。\n\
+     - 你的工作只有两件：**把事情派下去**，和**盯着它们走到完**。\n\
+     - 你没有 shell、没有读文件、没有改文件的能力 —— 这不是限制，是你的定义。想改什么、跑什么、查什么，都是派出去让会那个的人干。\n\
+     - 派出去的是**工作项**（ticket）：有标题、有状态、有结果、有终点。它跑在一条你看不到的会话里（它看不到我们这段对话，所以 `task` 要写成不知道前因后果的人也能看懂）。\n\
+     - `dispatch` 开一个工作项并派出去；`list_tickets` 看有哪些、各自卡在哪；`read_ticket` 读一个的详情和结果。\n\
      - **你回复的正文就是给用户看的那句话** —— 不需要为说话再调工具，直接说。\n\
-     - 派出去的活不等它做完：`dispatch` 一返回就结束了，结果会以新消息的形式回来。\n\
-     - 能一起做的事合成一次 `dispatch` 里的一个任务描述；互不相干的事分几次派出去。\n\
-     - 用户问的是「做到哪了」这种状态问题，用 `read_session` 看了再答，别新开活。"
+     - 派出去的活**不等**它做完：`dispatch` 一返回就结束了。它做完/卡住会把结果推给你，那时你会被叫醒。**不要轮询、不要 sleep、不要反复 list 等它** —— 没事就结束回合。\n\
+     - 能一起做的事合成一个工作项；互不相干的事分开派。\n\
+     - 用户问「做到哪了」：`list_tickets` 看一眼再答，别新开活。用户说「接着改」，`dispatch` 带上 `ticket_id` 再派一次，那还是同一个工作项。"
 }
 
-/// `list_sessions` 的描述。
-pub fn list_sessions_description() -> String {
-    "列出所有会话：标题、在不在跑、最近的进展一句话。派活之前先看这个，\
-     能复用已有会话就不要新建（同一个话题的上下文在那条会话里）。"
+/// `list_tickets` 的描述。
+pub fn list_tickets_description() -> String {
+    "列出工作项：有几件在干、几件在等人，以及每件的状态和结果摘要。\n\
+     回答「现在在忙什么 / 做到哪了」之前先看这个。每个条目后面有 `read: ticket/<id>`，\
+     要细节就用那个 id 调 `read_ticket`。"
         .to_string()
 }
 
-/// `list_sessions` 的 schema（无参数）。
-pub fn list_sessions_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {},
-    })
-}
-
-/// `read_session` 的描述。
-pub fn read_session_description() -> String {
-    "看一个会话自上次以来发生了什么：它的标题、在不在跑、最近几条消息（从旧到新）。\
-     只读，不会把它的上下文拉进你这里 —— 你看到的是摘要，不是它的全部历史。"
-        .to_string()
-}
-
-/// `read_session` 的 schema。
-pub fn read_session_schema() -> Value {
+/// `list_tickets` 的 schema。
+pub fn list_tickets_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "session_id": { "type": "string", "description": "要看的会话 id（`list_sessions` 给的）" },
-            "lines": { "type": "integer", "description": "最多看最近几条（可选，默认 8，最多 30）" }
+            "all": {
+                "type": "boolean",
+                "description": "连已经结束的一起列（默认只看还开着的）"
+            }
+        }
+    })
+}
+
+/// `read_ticket` 的描述。
+pub fn read_ticket_description() -> String {
+    "读一个工作项的详情：标题、要求、状态、结果全文，以及它下一步能做什么。\n\
+     默认不给执行过程（那是噪音）；要看它中间跑了什么，加 `what: \"transcript\"`。"
+        .to_string()
+}
+
+/// `read_ticket` 的 schema。
+pub fn read_ticket_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ticket_id": {
+                "type": "string",
+                "description": "工作项 id（`list_tickets` 反引号里的那个串）"
+            },
+            "what": {
+                "type": "string",
+                "description": "`transcript` = 看它中间跑了什么（默认不给）"
+            },
+            "lines": {
+                "type": "integer",
+                "description": "`transcript` 时最多看最近几条（默认 12，最多 40）"
+            }
         },
-        "required": ["session_id"]
+        "required": ["ticket_id"]
     })
 }
 
 /// `dispatch` 的描述。
 pub fn dispatch_description() -> String {
-    "把事情派给一个会话去做。给 session_id 就派给那个已有会话（接着它的上下文干），\
-     不给就新建一个。派完立即返回，你不等它做完 —— 它做完会把结果作为新消息送回来。\
-     任务描述要写成一个不知道前因后果的人也能看懂的样子。"
+    "派活。不给 `ticket_id` = 开一个新的工作项并派出去；给了 = 往那个工作项再派一次\
+     （补充要求 / 让它接着改，还是同一个工作项）。\n\
+     派完立即返回，你不等它做完 —— 它做完或卡住会把结果推给你。\n\
+     `task` 要写成**不知道前因后果的人也能看懂**的样子：干活的那条会话看不到我们这段对话。"
         .to_string()
 }
 
@@ -314,9 +335,18 @@ pub fn dispatch_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "task": { "type": "string", "description": "要让那个会话做什么（自包含，别引用只有你看得到的上下文）" },
-            "session_id": { "type": "string", "description": "派给哪个会话（可选；不给就新建一个）" },
-            "title": { "type": "string", "description": "新建会话时的标题（可选；不给就用任务描述的前几个字）" }
+            "task": {
+                "type": "string",
+                "description": "要做的具体事情（自包含，别引用只有你看得到的上下文）"
+            },
+            "title": {
+                "type": "string",
+                "description": "工作项的短标题（新建时用；不给就用 task 的第一行）"
+            },
+            "ticket_id": {
+                "type": "string",
+                "description": "往这个已有工作项再派一次（可选；不给就新建）"
+            }
         },
         "required": ["task"]
     })
