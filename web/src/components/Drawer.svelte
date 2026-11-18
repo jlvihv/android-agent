@@ -612,7 +612,7 @@
             {:else if s.state === "done" || s.state === "cancelled"}
               <span
                 class="shrink-0 text-xs text-faint
-                       {s.state === "cancelled" ? 'line-through' : ''}"
+                       {s.state === 'cancelled' ? 'line-through' : ''}"
               >
                 {s.label || (s.state === "done" ? "已验收" : "已取消")}
               </span>

@@ -200,23 +200,23 @@ App 随时被杀都没关系。
 
 ## 文档
 
-| 文件                                                                           | 内容                                                                                                                      |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| [docs/01-tech-selection.md](docs/01-tech-selection.md)                         | 选型决策记录（含被否决的选项和理由）                                                                                      |
-| [docs/02-linux-sandbox.md](docs/02-linux-sandbox.md)                           | **OpenMinis 怎么在 Android 上跑 Alpine**（W^X 问题与解法）                                                                |
-| [docs/03-prompt-cache.md](docs/03-prompt-cache.md)                             | 提示词前缀不变式 + 命中率                                                                                                 |
-| [docs/04-android-shell.md](docs/04-android-shell.md)                           | Android 壳：三个架构决策的落点、真机上的坑                                                                                |
-| [docs/05-ui.md](docs/05-ui.md)                                                 | 界面：设计令牌、edge-to-edge、对话渲染                                                                                    |
-| [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）、后台运行与**实时更新的通知**                                                               |
-| [docs/07-debugging.md](docs/07-debugging.md)                                   | 无线调试 + agentctl + `/api/debug/*`：不重装 APK 也能调                                                                   |
-| [docs/08-browser.md](docs/08-browser.md)                                       | agent 的浏览器：无头 WebView、看板、截图                                                                                  |
-| [docs/09-search.md](docs/09-search.md)                                         | 联网搜索：Exa 的两种接口、为什么不要钱                                                                                    |
-| [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md)                     | **工具表为什么只有三个**：判据、代价、加能力的步骤                                                                        |
-| [docs/11-host-mode.md](docs/11-host-mode.md)                                   | **桌面**：桌面上不套沙箱，直接用这台机器（怎么做的、代价）                                                                |
-| [docs/12-relay.md](docs/12-relay.md)                                           | **换机器**：手机/电脑连到另一台机器上的核心（隧道、局域网/中继、页面不拿凭据、部署与验证）                                |
-| [docs/15-shizuku.md](docs/15-shizuku.md)                                       | **特权命令** `agent shizuku`：binder 优先的状态机、反射调隐藏 API、为什么判断留在 Rust 侧、以及「不审批」的代价           |
-| [docs/13-phone.md](docs/13-phone.md)                                           | **手机系统能力**：闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板 / 通知 / 朗读，以及「按机器显示不同子命令」与权限那套阻塞桥 |
-| [docs/14-mcp-and-skills.md](docs/14-mcp-and-skills.md)                         | **MCP 和 Skill**：只接远程 MCP（`agent mcp`）、skill 目录 + 提示词索引，都不进工具表                                      |
+| 文件                                                                           | 内容                                                                                                                             |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| [docs/01-tech-selection.md](docs/01-tech-selection.md)                         | 选型决策记录（含被否决的选项和理由）                                                                                             |
+| [docs/02-linux-sandbox.md](docs/02-linux-sandbox.md)                           | **OpenMinis 怎么在 Android 上跑 Alpine**（W^X 问题与解法）                                                                       |
+| [docs/03-prompt-cache.md](docs/03-prompt-cache.md)                             | 提示词前缀不变式 + 命中率                                                                                                        |
+| [docs/04-android-shell.md](docs/04-android-shell.md)                           | Android 壳：三个架构决策的落点、真机上的坑                                                                                       |
+| [docs/05-ui.md](docs/05-ui.md)                                                 | 界面：设计令牌、edge-to-edge、对话渲染                                                                                           |
+| [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）、后台运行与**实时更新的通知**                                                                      |
+| [docs/07-debugging.md](docs/07-debugging.md)                                   | 无线调试 + agentctl + `/api/debug/*`：不重装 APK 也能调                                                                          |
+| [docs/08-browser.md](docs/08-browser.md)                                       | agent 的浏览器：无头 WebView、看板、截图                                                                                         |
+| [docs/09-search.md](docs/09-search.md)                                         | 联网搜索：Exa 的两种接口、为什么不要钱                                                                                           |
+| [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md)                     | **工具表为什么只有三个**：判据、代价、加能力的步骤                                                                               |
+| [docs/11-host-mode.md](docs/11-host-mode.md)                                   | **桌面**：桌面上不套沙箱，直接用这台机器（怎么做的、代价）                                                                       |
+| [docs/12-relay.md](docs/12-relay.md)                                           | **换机器**：手机/电脑连到另一台机器上的核心（隧道、局域网/中继、页面不拿凭据、部署与验证）                                       |
+| [docs/15-shizuku.md](docs/15-shizuku.md)                                       | **特权命令** `agent shizuku`：binder 优先的状态机、反射调隐藏 API、为什么判断留在 Rust 侧、以及「不审批」的代价                  |
+| [docs/13-phone.md](docs/13-phone.md)                                           | **手机系统能力**：闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板 / 通知 / 朗读，以及「按机器显示不同子命令」与权限那套阻塞桥        |
+| [docs/14-mcp-and-skills.md](docs/14-mcp-and-skills.md)                         | **MCP 和 Skill**：只接远程 MCP（`agent mcp`）、skill 目录 + 提示词索引，都不进工具表                                             |
 | [docs/16-super-agent.md](docs/16-super-agent.md)                               | **双层架构**：Router（只派活，没有 shell）与 Worker；靠工具表而不靠提示词分工；`dispatch` 立即返回、做完 `report_back` 回 Router |
 
 ## 脚本

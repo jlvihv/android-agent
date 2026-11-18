@@ -772,11 +772,15 @@
   {@const text = msg.parts
     .map((p) => (p.type === "text" ? p.text : ""))
     .join("")}
-  <div class="flex max-w-[92%] flex-col gap-1.5 self-start rounded-card bg-surface px-3.5 py-2.5">
+  <div
+    class="flex max-w-[92%] flex-col gap-1.5 self-start rounded-card bg-surface px-3.5 py-2.5"
+  >
     <p class="flex items-center gap-1.5 text-xs text-faint">
       <Icon name="sparkle" size={12} class="shrink-0 text-muted" />
       <span>子会话报告</span>
-      <span class="truncate opacity-60">{(msg.fromWorker ?? "").slice(0, 8)}</span>
+      <span class="truncate opacity-60"
+        >{(msg.fromWorker ?? "").slice(0, 8)}</span
+      >
     </p>
     <p class="whitespace-pre-wrap break-words text-sm leading-6 text-muted">
       {text}

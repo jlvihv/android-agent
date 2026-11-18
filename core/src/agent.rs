@@ -245,7 +245,9 @@ impl ChatMessage {
         ChatMessage::User {
             text: text.into(),
             attachments: Vec::new(),
-            origin: Origin::WorkerReport { session_id: session_id.into() },
+            origin: Origin::WorkerReport {
+                session_id: session_id.into(),
+            },
         }
     }
 
@@ -269,7 +271,9 @@ impl ChatMessage {
     fn to_openai(&self) -> Message {
         match self {
             ChatMessage::System(s) => Message::System { content: s.clone() },
-            ChatMessage::User { text, attachments, .. } => {
+            ChatMessage::User {
+                text, attachments, ..
+            } => {
                 let mut body = text.clone();
                 for a in attachments {
                     let _ = write!(body, "\n[附件：{}（{}）]", a.name, a.mime);
@@ -460,7 +464,9 @@ impl Closed {
             // `at == 0` 却有 `by`：时刻丢了，收尾这件事**不能成立**（没法排序、
             // 没法显示时间），当没发生过。但要 warn —— 这说明有人写坏了数据。
             (0, other) => {
-                tracing::warn!("会话的 closed_at=0 但 closed_by={other:?}：脏数据，按「还开着」处理");
+                tracing::warn!(
+                    "会话的 closed_at=0 但 closed_by={other:?}：脏数据，按「还开着」处理"
+                );
                 Self::Open
             }
             (at, "done") => Self::Done { at },
@@ -1210,9 +1216,7 @@ fn build_messages(
         // 回执（`origin == WorkerReport`）和普通用户消息在这里一视同仁：**原样发**。
         // `origin` 只给本地用（见 `ChatMessage::User.origin`），不进请求体。
         if let ChatMessage::User {
-            text,
-            attachments,
-            ..
+            text, attachments, ..
         } = &msgs[i]
         {
             out.push(user_message(
@@ -2321,7 +2325,11 @@ async fn turn_once(
         }
         // 一条消息装下正文和附件。整批一起进历史 —— 模型一次就看到全部。
         for (text, attachments, origin) in msgs {
-            sess.messages.push(ChatMessage::User { text, attachments, origin });
+            sess.messages.push(ChatMessage::User {
+                text,
+                attachments,
+                origin,
+            });
         }
         sess.updated_at = now_ms();
         // 通知栏那一行要显示哪个会话在跑（标题刚定下来，顺手取走，
@@ -2870,9 +2878,7 @@ fn build_responses_input(
             }
             // 同 `build_messages`：回执与普通用户消息一视同仁，原样发。
             ChatMessage::User {
-                text,
-                attachments,
-                ..
+                text, attachments, ..
             } => out.push(message_item(
                 "user",
                 user_message_content(text, attachments, supports_images, supports_files),
@@ -4079,10 +4085,7 @@ mod tests {
         s.closed = Closed::Done { at: 42 };
         assert_eq!(s.standing(true, true), Standing::Done { at: 42 });
         s.closed = Closed::Cancelled { at: 7 };
-        assert_eq!(
-            s.standing(false, false),
-            Standing::Cancelled { at: 7 }
-        );
+        assert_eq!(s.standing(false, false), Standing::Cancelled { at: 7 });
     }
 
     /// **`Queued` 不算「等你」。** 派了活、还没轮到，那不是等你，是等它。
@@ -4114,20 +4117,14 @@ mod tests {
         assert_eq!(Closed::from_db(0, "done"), Closed::Open);
         assert_eq!(Closed::from_db(0, ""), Closed::Open);
         // 认不出的 by 当 Done（宁可说「验收过」，别留一个说不清的状态）
-        assert_eq!(
-            Closed::from_db(500, "whatever"),
-            Closed::Done { at: 500 }
-        );
+        assert_eq!(Closed::from_db(500, "whatever"), Closed::Done { at: 500 });
     }
 
     /// **未知的 `closed_by` 不静默**：归为 `Done`，不 panic，但会 warn。
     #[test]
     fn closed_from_db_never_silently_swallows_garbage() {
         // 认不出的串：归 Done（不是 Cancelled，也不是悄悄丢掉）
-        assert_eq!(
-            Closed::from_db(500, "whatever"),
-            Closed::Done { at: 500 }
-        );
+        assert_eq!(Closed::from_db(500, "whatever"), Closed::Done { at: 500 });
         assert_eq!(Closed::from_db(500, ""), Closed::Done { at: 500 });
         // 大小写/空白都不认（严格匹配，别猜）
         assert_eq!(Closed::from_db(500, "DONE"), Closed::Done { at: 500 });

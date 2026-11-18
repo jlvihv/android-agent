@@ -165,7 +165,11 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
         let mut line = format!(
             "- `{}` {} ",
             r.id,
-            if r.title.is_empty() { "（无标题）" } else { &r.title }
+            if r.title.is_empty() {
+                "（无标题）"
+            } else {
+                &r.title
+            }
         );
         let _ = write!(line, "[{}]", r.standing.label());
         if r.times > 1 {
@@ -217,7 +221,15 @@ pub async fn read_session(core: &Core, from: &str, args: &Value) -> Reply {
 
     let mut out = String::new();
     let _ = writeln!(out, "会话 `{id}`");
-    let _ = writeln!(out, "标题：{}", if title.is_empty() { "（无）" } else { &title });
+    let _ = writeln!(
+        out,
+        "标题：{}",
+        if title.is_empty() {
+            "（无）"
+        } else {
+            &title
+        }
+    );
     let _ = writeln!(out, "派过 {dispatches} 次");
     match &brief {
         Some(b) => {
@@ -299,12 +311,9 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     if !again.is_empty() {
         let found = {
             let store = state.chat.read().await;
-            store.get(again).map(|s| {
-                (
-                    s.dispatched_by().map(str::to_string),
-                    s.closed.is_closed(),
-                )
-            })
+            store
+                .get(again)
+                .map(|s| (s.dispatched_by().map(str::to_string), s.closed.is_closed()))
         };
         let Some((owner, closed)) = found else {
             return Err(format!("没有这条会话: `{again}`"));
@@ -596,7 +605,8 @@ mod tests {
 
     fn core_with_db(tag: &str) -> Core {
         let core = Core::new();
-        let dir = std::env::temp_dir().join(format!("agent-session-{tag}-{}", uuid::Uuid::now_v7()));
+        let dir =
+            std::env::temp_dir().join(format!("agent-session-{tag}-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         core.set_data_dir(dir);
         core
@@ -643,7 +653,10 @@ mod tests {
         assert_eq!(w.title, "改错别字");
         assert_eq!(w.brief(), Some("把 README 的错别字改掉"), "要求原文要记着");
         assert_eq!(w.dispatch_times(), Some(1));
-        assert!(matches!(w.closed, crate::agent::Closed::Open), "刚派出去还没收尾");
+        assert!(
+            matches!(w.closed, crate::agent::Closed::Open),
+            "刚派出去还没收尾"
+        );
         // 关键：**没有任何 state 字段**。有的只是能算出来的事实。
         assert!(!core.state.is_closed(&w.id));
     }
@@ -831,7 +844,15 @@ mod tests {
         end_running_turns(&core);
 
         // ① 派活那一轮结束，交出交付物 X
-        report_back(&core, &sid, "这是交付物 X，要验收的就是它", true, false, true).await;
+        report_back(
+            &core,
+            &sid,
+            "这是交付物 X，要验收的就是它",
+            true,
+            false,
+            true,
+        )
+        .await;
         let after_dispatch = {
             let store = core.state.chat.read().await;
             store.get(&sid).unwrap().conclusion.clone()
@@ -931,10 +952,7 @@ mod tests {
             !core.state.close_session(&sid, "done").await,
             "底层写点自己就该拒绝在跑的会话"
         );
-        assert!(
-            !core.state.is_closed(&sid),
-            "被拒之后不该留下任何收尾痕迹"
-        );
+        assert!(!core.state.is_closed(&sid), "被拒之后不该留下任何收尾痕迹");
 
         // 停下来之后同一调用点放行
         end_running_turns(&core);
@@ -948,9 +966,13 @@ mod tests {
         let (core, rid) = with_router("list").await;
         core.state
             .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
-        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活", "title": "甲" }))
-            .await
-            .unwrap();
+        dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "干点活", "title": "甲" }),
+        )
+        .await
+        .unwrap();
         let sid = {
             let store = core.state.chat.read().await;
             store
@@ -966,11 +988,17 @@ mod tests {
             .await
             .unwrap();
         assert!(open.contains("甲"), "{open}");
-        assert!(open.contains(&sid), "要给出 session_id 才读得了详情：{open}");
+        assert!(
+            open.contains(&sid),
+            "要给出 session_id 才读得了详情：{open}"
+        );
 
         // 收起之前先把回合结束掉：守卫（`state::close_session`）会拒绝在跑的会话
         end_running_turns(&core);
-        assert!(core.state.close_session(&sid, "done").await, "闲着的时候该收得了");
+        assert!(
+            core.state.close_session(&sid, "done").await,
+            "闲着的时候该收得了"
+        );
         let open = list_sessions(&core, &rid, &serde_json::json!({}))
             .await
             .unwrap();
@@ -1014,7 +1042,10 @@ mod tests {
         assert!(out.contains("结果是 X"), "要能看到结论：{out}");
         // 默认不给执行记录（那是过程），但要告诉它怎么要
         assert!(!out.contains("执行记录（最近"), "默认不该倒出过程：{out}");
-        assert!(out.contains("what: \"transcript\""), "要告诉它怎么要：{out}");
+        assert!(
+            out.contains("what: \"transcript\""),
+            "要告诉它怎么要：{out}"
+        );
     }
 
     /// 别的 Router 看不到、也派不动我的会话。
@@ -1244,6 +1275,9 @@ mod tests {
         let out = list_sessions(&core, &rid, &serde_json::json!({ "all": true }))
             .await
             .unwrap();
-        assert!(!out.contains(&own), "自己开的会话不该出现在 Router 的列表里：{out}");
+        assert!(
+            !out.contains(&own),
+            "自己开的会话不该出现在 Router 的列表里：{out}"
+        );
     }
 }

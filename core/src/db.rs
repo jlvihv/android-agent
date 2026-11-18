@@ -308,8 +308,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     let newest = "WHERE t.session_id = sessions.id
                   ORDER BY t.created_at DESC, t.id DESC LIMIT 1";
     let migrated = conn
-        .execute(&format!(
-            "UPDATE sessions SET
+        .execute(
+            &format!(
+                "UPDATE sessions SET
                brief = COALESCE(brief, (SELECT t.brief FROM tickets t {newest})),
                dispatched_by = COALESCE(dispatched_by,
                                         (SELECT t.router_id FROM tickets t {newest})),
@@ -325,7 +326,9 @@ fn migrate(conn: &Connection) -> Result<()> {
                            ELSE closed_by END
              WHERE brief IS NULL
                AND EXISTS (SELECT 1 FROM tickets t WHERE t.session_id = sessions.id);"
-        ), [])
+            ),
+            [],
+        )
         .context("把老 tickets 搬进 sessions")
         .or_else(|e| {
             // 全新库里没有 tickets 表：`EXISTS` 那句会报 no such table。
@@ -623,8 +626,22 @@ impl Db {
             })?;
 
             for row in rows {
-                let (id, title, created_at, updated_at, provider_session, role, len, users,
-                     brief, dispatched_by, conclusion, dispatches, closed_at, closed_by) = row?;
+                let (
+                    id,
+                    title,
+                    created_at,
+                    updated_at,
+                    provider_session,
+                    role,
+                    len,
+                    users,
+                    brief,
+                    dispatched_by,
+                    conclusion,
+                    dispatches,
+                    closed_at,
+                    closed_by,
+                ) = row?;
                 // **列 → 类型的唯一转换点**（写入方向见 `Saved::of` / INSERT 那段）。
                 //
                 // `tickets` 时代允许「有 brief 没 by」这种半份数据（迁移会产出它）。
@@ -1536,7 +1553,10 @@ mod tests {
     /// `has_column` 跳过）—— 那等于测了一条用户永远不会走的路。
     ///
     /// 最老那个版本（连 `role` 都没有）单独用 [`legacy_db_oldest`] 测。
-    fn legacy_db(sessions: &[(&str, &str)], tickets: &[(&str, &str, &str, i64, &str)]) -> Connection {
+    fn legacy_db(
+        sessions: &[(&str, &str)],
+        tickets: &[(&str, &str, &str, i64, &str)],
+    ) -> Connection {
         legacy_db_with(sessions, tickets, true)
     }
 
@@ -1695,10 +1715,7 @@ CREATE TABLE tickets (
     /// **幂等**：跑两遍 migrate，第二次一个字节都不改。
     #[test]
     fn migration_is_idempotent() {
-        let conn = legacy_db(
-            &[("s1", "t")],
-            &[("t1", "s1", "要求", 100, "done")],
-        );
+        let conn = legacy_db(&[("s1", "t")], &[("t1", "s1", "要求", 100, "done")]);
         migrate(&conn).unwrap();
         let first = migrated_row(&conn, "s1");
 
@@ -1757,7 +1774,9 @@ CREATE TABLE tickets (
         assert_eq!(closed_by, "done");
         // `role` 被补上了，且默认 worker（老会话全是 worker）
         let role: String = conn
-            .query_row("SELECT role FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .query_row("SELECT role FROM sessions WHERE id = 's1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(role, "worker");
     }
@@ -1775,14 +1794,32 @@ CREATE TABLE tickets (
             let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
             rows.map(|r| r.unwrap()).collect()
         };
-        for must in ["id", "title", "created_at", "updated_at", "provider_session", "role"] {
-            assert!(cols.contains(&must.to_string()), "main 的 sessions 有 {must}：{cols:?}");
+        for must in [
+            "id",
+            "title",
+            "created_at",
+            "updated_at",
+            "provider_session",
+            "role",
+        ] {
+            assert!(
+                cols.contains(&must.to_string()),
+                "main 的 sessions 有 {must}：{cols:?}"
+            );
         }
         // 本次新加的那六列**不该**在起点里（否则 migrate 就没事可做了）
         for newly in [
-            "brief", "dispatched_by", "conclusion", "dispatches", "closed_at", "closed_by",
+            "brief",
+            "dispatched_by",
+            "conclusion",
+            "dispatches",
+            "closed_at",
+            "closed_by",
         ] {
-            assert!(!cols.contains(&newly.to_string()), "起点不该有 {newly}：{cols:?}");
+            assert!(
+                !cols.contains(&newly.to_string()),
+                "起点不该有 {newly}：{cols:?}"
+            );
         }
         // tickets 的列名逐字对齐 main
         let tcols: Vec<String> = {
@@ -1791,10 +1828,24 @@ CREATE TABLE tickets (
             rows.map(|r| r.unwrap()).collect()
         };
         for must in [
-            "id", "title", "brief", "session_id", "router_id", "stage", "result", "report",
-            "ended_at", "ended_by", "dispatches", "created_at", "updated_at",
+            "id",
+            "title",
+            "brief",
+            "session_id",
+            "router_id",
+            "stage",
+            "result",
+            "report",
+            "ended_at",
+            "ended_by",
+            "dispatches",
+            "created_at",
+            "updated_at",
         ] {
-            assert!(tcols.contains(&must.to_string()), "tickets 有 {must}：{tcols:?}");
+            assert!(
+                tcols.contains(&must.to_string()),
+                "tickets 有 {must}：{tcols:?}"
+            );
         }
     }
 

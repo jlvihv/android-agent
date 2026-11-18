@@ -499,7 +499,10 @@ pub fn reply_preview(text: &str) -> Option<String> {
 /// `text::cap`）—— 以前这里另写了一份内容一样的 `collapsed`，同一条通知和
 /// 同一条搜索摘要的空白折叠规则各走一路，改一处忘一处就会漂。
 fn first_line(s: &str) -> &str {
-    s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
 }
 
 /// 「最多看头部 `max` 字节」的终点，落在合法字符边界上。
@@ -569,8 +572,20 @@ mod tests {
     fn an_outcome_never_contradicts_itself() {
         let cases = [
             (Outcome::Running, true, false, false, None),
-            (Outcome::Done { finished_at_ms: 7 }, false, true, false, Some(7)),
-            (Outcome::Failed { finished_at_ms: 8 }, false, false, false, Some(8)),
+            (
+                Outcome::Done { finished_at_ms: 7 },
+                false,
+                true,
+                false,
+                Some(7),
+            ),
+            (
+                Outcome::Failed { finished_at_ms: 8 },
+                false,
+                false,
+                false,
+                Some(8),
+            ),
             (
                 Outcome::Stopped { finished_at_ms: 9 },
                 false,

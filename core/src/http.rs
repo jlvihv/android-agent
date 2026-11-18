@@ -4275,8 +4275,8 @@ mod tests {
         // 这条是必需的 —— 少了它，`standing()` 里 `queued` 那个分支就没人验，
         // 而「handler 自己另拼一遍判断」这种变异恰恰会在 `queued` 上露馅
         // （实测：没有这条会话时，那个变异测试照样绿）。
-        assert!(
-            st.enqueue(
+        assert!(st
+            .enqueue(
                 &queued,
                 crate::state::QueuedMsg {
                     id: "q1".into(),
@@ -4285,8 +4285,7 @@ mod tests {
                     origin: crate::agent::Origin::Human,
                 }
             )
-            .is_ok()
-        );
+            .is_ok());
 
         let (base, c) = serve(st.clone()).await;
         let v: serde_json::Value = c
@@ -4334,7 +4333,11 @@ mod tests {
         assert_eq!(by(&done)["state"], json!("done"));
         assert_eq!(by(&cancelled)["state"], json!("cancelled"));
         assert_eq!(by(&running)["state"], json!("working"));
-        assert_eq!(by(&queued)["state"], json!("queued"), "排队中不能被说成闲着");
+        assert_eq!(
+            by(&queued)["state"],
+            json!("queued"),
+            "排队中不能被说成闲着"
+        );
         // `busy` 只对真在跑的那条为真
         assert_eq!(by(&running)["busy"], json!(true));
         assert_eq!(by(&idle)["busy"], json!(false));
