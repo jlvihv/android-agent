@@ -73,8 +73,11 @@ CREATE TABLE IF NOT EXISTS messages (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
--- 短编号唯一（NULL 不算重复：多行没号是合法的，那是「还没补」的状态）
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_seq ON sessions(seq);
+-- **`idx_sessions_seq` 不能放这儿**：它索引的 `seq` 列在老库上要等 `migrate()`
+-- 才 ALTER 出来，而 `execute_batch(SCHEMA)` 在 `migrate()` **之前**跑 ——
+-- 放这儿就是 `no such column: seq`，**任何**升级上来的老库都打不开
+-- （实测：一个只有 id/title/... 的 162 条会话的库，`Db::open` 直接失败）。
+-- 它现在由 `migrate()` 负责建（见那里）。
 
 -- 配置按列存，不往一个值里塞 JSON。`meta` 只放单个的值（instance_id、token……）。
 
@@ -306,11 +309,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_column(conn, "sessions", "seq")? {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN seq INTEGER")
             .context("加 sessions.seq")?;
-        // 老库补完这一列之后才建得上索引（`CREATE TABLE IF NOT EXISTS` 那段
-        // 对新库已经建了，这里是给老库的）
-        conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_seq ON sessions(seq)")
-            .context("给老库建 sessions.seq 的唯一索引")?;
     }
+    // **索引在列之后建，且无条件建**（`IF NOT EXISTS` 自己就是幂等的）：
+    // 它**不能**放在上面的 `SCHEMA` 里 —— 那段在 `migrate()` 之前跑，而老库的
+    // `seq` 列这时还没 ALTER 出来，`CREATE INDEX ... (seq)` 会直接
+    // `no such column: seq`，于是**任何**升级上来的老库都打不开（实测过）。
+    // 也不能放进上面那个 `if` 里：新库的列是 `CREATE TABLE` 建的，
+    // `has_column` 为真，索引就永远建不上了。
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_seq ON sessions(seq)")
+        .context("建 sessions.seq 的唯一索引")?;
 
     // sessions.role（worker | router）—— 双层架构那一批加的。
     // 用 `DEFAULT 'worker'`：老库里的会话全都是 worker，跟它们本来的行为一致。
@@ -420,6 +427,70 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if migrated > 0 {
         tracing::info!("从老 tickets 搬了 {migrated} 条会话的派活记录");
+    }
+
+    migrate_schedules(conn)?;
+    Ok(())
+}
+
+/// 把**已存在但列名不同**的 `schedules` 表修正到当前 schema。
+///
+/// ## 为什么必须有这一步
+///
+/// `CREATE TABLE IF NOT EXISTS` 遇到同名表**什么都不做** —— 它不会比对列。
+/// 而这张表在开发中间版本里叫过 `created_at`（那一版把「这一版节奏的起点」还叫
+/// 「创建时刻」），后来改成了 `anchor_at`。用户的库里存在那张旧表时：
+///
+/// - `SCHEMA` 的 `CREATE TABLE IF NOT EXISTS` 静默跳过（表在）
+/// - `Db::open` 本身**成功**（建表这一步没报错）
+/// - 但 `Db::schedules()` 的 `SELECT ... anchor_at` 会 `no such column`
+///
+/// 实测（`/tmp/onlyseq.db` 那种库）：打开成功、读任务失败。对**定时任务**是致命的
+/// （整个功能不可用），对会话不是（会话读得出来）。所以它比「库打不开」轻，
+/// 但同样是**上线就会中**的那类。
+///
+/// ## 怎么修
+///
+/// 表**还没发布过**（`git log --all -S schedules` 只在本机分支上），所以不需要
+/// 写数据迁移：直接把旧表改名让开，`SCHEMA` 那段会在下一次 `execute_batch` 里
+/// 建出正确的新表。旧数据留在 `<表名>_legacy` 里（不删 —— 删了找不回来），
+/// 而且**只在这个旧表确实是旧形状时**才动它（新库/已修好的库一句也不做）。
+fn migrate_schedules(conn: &Connection) -> Result<()> {
+    // 表不存在（新库）：`SCHEMA` 已经按当前形状建好了，什么都不用做
+    if !has_column(conn, "schedules", "id")? {
+        return Ok(());
+    }
+    // 已经是对的（有 anchor_at）：也不必做
+    if has_column(conn, "schedules", "anchor_at")? {
+        return Ok(());
+    }
+    // 旧形状（有 created_at 没 anchor_at）：改名让开，新表由下面重建
+    tracing::warn!("schedules 表是旧形状（created_at 而不是 anchor_at），改名留档后重建");
+    conn.execute_batch("ALTER TABLE schedules RENAME TO schedules_legacy")
+        .context("把旧 schedules 表改名留档")?;
+    // 建当前形状的表（和 SCHEMA 里那段逐字一致 —— 只多这一处入口，
+    // 所以把建表语句抽成常量会好，但那是重构，这轮不做）
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schedules (
+           id              TEXT PRIMARY KEY,
+           prompt          TEXT NOT NULL,
+           every_secs      INTEGER CHECK (every_secs IS NULL OR (every_secs >= 60 AND every_secs <= 2592000)),
+           cron            TEXT,
+           anchor_at       INTEGER NOT NULL,
+           handled_through INTEGER NOT NULL,
+           paused_at       INTEGER,
+           CHECK (handled_through >= anchor_at),
+           CHECK ((every_secs IS NULL) <> (cron IS NULL))
+         )",
+    )
+    .context("按当前形状重建 schedules 表")?;
+    // 旧表里有几行？留个日志 —— 数据在 `schedules_legacy` 里，人能看到
+    if let Ok(n) = conn.query_row("SELECT COUNT(*) FROM schedules_legacy", [], |r| {
+        r.get::<_, i64>(0)
+    }) {
+        if n > 0 {
+            tracing::warn!("旧 schedules 表的 {n} 条数据留在 schedules_legacy（新表是空的）");
+        }
     }
     Ok(())
 }
@@ -1829,7 +1900,125 @@ mod tests {
         legacy_db_with(sessions, tickets, false)
     }
 
-    /// `with_role` = 造 `main` 上的 schema（有 `role`）还是最老那个（没有）。
+    /// **升级上来的老库必须打得开。**
+    ///
+    /// 这是本次最要紧的一条：用户机器上跑着一个常驻实例，升级后库打不开就是灾难。
+    /// 两个独立的坑，各造一个库：
+    ///
+    /// 1. 老库没有 `sessions.seq`，而 `idx_sessions_seq` 一度写在 `SCHEMA` 里 ——
+    ///    那段在 `migrate()` **之前**跑，于是 `CREATE INDEX ... (seq)` 报
+    ///    `no such column: seq`，**任何**升级上来的库都打不开（实测一个 162 条会话
+    ///    的真库直接失败）。
+    /// 2. 老库的 `schedules` 表用 `created_at`（中间版本叫法）而不是 `anchor_at`，
+    ///    而 `CREATE TABLE IF NOT EXISTS` 遇到同名表静默跳过 —— 打开成功、但
+    ///    `schedules()` 读的时候 `no such column: anchor_at`。
+    ///
+    /// 变异验证：
+    /// - 把 `idx_sessions_seq` 挪回 `SCHEMA` → 第一个场景 `Db::open` 直接报错；
+    /// - 把 `migrate_schedules` 那一步删掉 → 第二个场景读任务失败。
+    #[test]
+    fn an_upgraded_old_db_opens_and_can_read_everything() {
+        // ---- 场景 1：最老那种库（没有 seq、没有 schedules 表）----
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+               id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL, provider_session TEXT NOT NULL,
+               role TEXT NOT NULL DEFAULT 'worker', brief TEXT, dispatched_by TEXT,
+               conclusion TEXT NOT NULL DEFAULT '', dispatches INTEGER NOT NULL DEFAULT 0,
+               closed_at INTEGER NOT NULL DEFAULT 0, closed_by TEXT NOT NULL DEFAULT '');
+             INSERT INTO sessions(id,title,created_at,updated_at,provider_session,role)
+               VALUES('s1','老会话',1,1,'p','worker');",
+        )
+        .unwrap();
+        // 走**和真库一样的两步**（SCHEMA 先、migrate 后）—— 这正是那个坑的现场
+        conn.execute_batch(SCHEMA)
+            .expect("SCHEMA 这一关就该过（索引不能在它里面）");
+        migrate(&conn).expect("migrate 该成功");
+        // 会话还在，seq 列补上了
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "老会话不能丢"
+        );
+        assert!(
+            has_column(&conn, "sessions", "seq").unwrap(),
+            "seq 列要补上"
+        );
+        // 新表也建出来了，能读
+        conn.query_row("SELECT COUNT(*) FROM schedules", [], |r| r.get::<_, i64>(0))
+            .expect("新 schedules 表要能读");
+
+        // ---- 场景 2：`schedules` 是旧形状（created_at，没有 anchor_at）----
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schedules (
+               id TEXT PRIMARY KEY, prompt TEXT NOT NULL, every_secs INTEGER, cron TEXT,
+               created_at INTEGER NOT NULL, handled_through INTEGER NOT NULL, paused_at INTEGER,
+               CHECK (handled_through >= created_at),
+               CHECK (paused_at IS NULL OR paused_at >= created_at),
+               CHECK ((every_secs IS NULL) <> (cron IS NULL)));
+             INSERT INTO schedules(id,prompt,every_secs,created_at,handled_through)
+               VALUES('t1','旧任务',60,1,1);",
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap(); // 这一步要把旧表改名让开
+        assert!(
+            has_column(&conn, "schedules", "anchor_at").unwrap(),
+            "旧 schedules 表要换成当前形状（有 anchor_at）"
+        );
+        assert!(
+            !has_column(&conn, "schedules", "created_at").unwrap(),
+            "旧列不该还在"
+        );
+        // 旧数据**不删**，留在 _legacy 里
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM schedules_legacy", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1,
+            "旧表的 1 行要留在 schedules_legacy（不许删）"
+        );
+        // 新表是空的、可读
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM schedules", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    /// `migrate()` 对**已经是当前形状**的库一句也不做（幂等）。
+    ///
+    /// 钉的是 `migrate_schedules` 那两个提前返回：少了它们，一个正常库每启动一次
+    /// 就会把 `schedules` 改名成 `schedules_legacy`（第二次就撞上重名而失败）。
+    #[test]
+    fn migrating_a_current_db_twice_changes_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
+        // 造一条任务，再 migrate 一次（模拟重启）
+        conn.execute_batch(
+            "INSERT INTO schedules(id,prompt,every_secs,anchor_at,handled_through)
+             VALUES('t1','我的任务',60,1,1)",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM schedules", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "正常库重启一次不该把任务弄丢"
+        );
+        assert!(
+            !has_column(&conn, "schedules_legacy", "id").unwrap(),
+            "正常库不该被改名（表都不该存在）"
+        );
+    }
+
+    /// `with_role` = 造 `main` 上的 schema（有 `role`）还是最老那个（没有）。    /// `with_role` = 造 `main` 上的 schema（有 `role`）还是最老那个（没有）。
     fn legacy_db_with(
         sessions: &[(&str, &str)],
         tickets: &[(&str, &str, &str, i64, &str)],
