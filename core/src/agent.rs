@@ -1984,7 +1984,11 @@ async fn turn_once(
 /// 这个会话最后一条助手消息的正文（回报给 Router 用）。
 ///
 /// 只要正文，不要工具调用和思考：Router 关心的是「它做完说了什么」，不是它
-/// 中间跑了多少条命令（那些在它自己的会话里，要看再 `read_session`）。
+/// 中间跑了多少条命令（那些在它自己的会话里，要看再 `read_ticket`）。
+///
+/// **一个字都不截**。worker 认认真真干完一件事，末尾那段就是全部的交付说明 ——
+/// 截断它等于把交付物撕掉一半。上下文顶满了是另一个问题（有 compaction 管），
+/// 不该在这里用截断来「预防」。
 async fn last_assistant_text(core: &Core, sid: &str) -> String {
     let store = core.state.chat.read().await;
     let Some(s) = store.get(sid) else {
@@ -1997,12 +2001,7 @@ async fn last_assistant_text(core: &Core, sid: &str) -> String {
         if let ChatMessage::Assistant { content, .. } = m {
             let t = content.trim();
             if !t.is_empty() {
-                // 压一下：一条长报告不该把 Router 的上下文顶满
-                return if t.chars().count() > 1500 {
-                    format!("{}…", t.chars().take(1500).collect::<String>())
-                } else {
-                    t.to_string()
-                };
+                return t.to_string();
             }
         }
     }

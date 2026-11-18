@@ -516,13 +516,23 @@ pub async fn report_back(core: &Core, from_session: &str, said: &str, ok: bool, 
             _ => return, // Router 没了就只记账，不叫醒谁
         }
     }
+    // **全文给，一个字都不截。**
+    //
+    // 一开始照 dsh 抄了个 600 字上限 + 「要看全文就调 read_ticket」的指针。两处都蠢：
+    //
+    // 1. dsh 那边是团队共享一个 Router、几十个活同时汇报，才需要抠 token；
+    //    这里是一个人、一个 Router，worker 干完一件事写的那段报告就是**全部的
+    //    交付说明**，截断它等于把交付物撕掉一半。
+    // 2. 短的回执还附一句「要看全文就调工具」，是白让模型多烧一轮请求去读同一段话。
+    //
+    // 如果某天报告真的大到顶爆上下文，那是 compaction 的事（`eta-compaction` 那一层），
+    // 不该在回执这里用截断来「预防」—— 那只会让人看不到自己写的东西。
     let body = format!(
-        "工作项 #{}「{}」{}。\n说：{}\n（要看全文：read_ticket {{ticket_id: \"{}\"}}）",
+        "工作项 #{}「{}」{}。\n{}",
         t.number(),
         t.title,
         t.stage.label(),
-        ticket::clip(&text, 800),
-        t.id,
+        text.trim(),
     );
     let msg = QueuedMsg {
         id: uuid::Uuid::now_v7().to_string(),
@@ -632,7 +642,39 @@ mod tests {
             q[0].text
         );
         assert!(q[0].text.contains("待验收"), "要带状态：{}", q[0].text);
-        assert!(q[0].text.contains(&t.id), "要带 read 指针：{}", q[0].text);
+        // **全文给，不截断、不要模型再调工具**
+        assert!(q[0].text.contains("改好了"), "要带结果原文：{}", q[0].text);
+        assert!(
+            !q[0].text.contains("read_ticket"),
+            "回执就是全部内容，不该再要一次工具调用：{}",
+            q[0].text
+        );
+    }
+
+    /// **回执不截断。** worker 干完一件事写的那段报告就是全部的交付说明 ——
+    /// 截断它等于把交付物撕掉一半，还逼模型再发一轮工具调用去读回来。
+    #[tokio::test]
+    async fn a_long_report_is_delivered_whole() {
+        let (core, rid) = with_router("whole").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+        core.state.clear_llm(); // 让回执留在队列里可查
+
+        let long = "很长的结果。".repeat(500); // 3000 字
+        report_back(&core, &t.session_id, &long, true, false).await;
+        let q = core.state.queued_list(&rid);
+        assert_eq!(q.len(), 1);
+        assert!(
+            q[0].text.contains(&long),
+            "3000 字的报告要被**整段**送到，不能截（实际 {} 字）",
+            q[0].text.chars().count()
+        );
+        assert!(!q[0].text.contains("…（共"), "不许截断");
     }
 
     #[tokio::test]

@@ -51,6 +51,27 @@
   const dot = (t: TicketRow): string =>
     t.needsPerson ? "bg-warn" : t.open ? "bg-muted" : "bg-faint";
 
+  /**
+   * 预览压成**一行**。
+   *
+   * `/api/tickets` 给的 `preview` 是 200 字（模型要看全，界面不要）。一段 3000 字的
+   * 报告在面板上铺开就是灾难 —— 它会把聊天内容整个挤下去（实测：一个工作项占了
+   * 大半屏）。这里只取第一句 / 第一行、再压到 60 字，**要看全的点进去看会话**。
+   */
+  const oneLine = (t: TicketRow): string => {
+    const raw = (t.preview ?? "").trim();
+    if (!raw) return "";
+    // Markdown 的标题井号、表格的竖线、代码块的反引号都不是给人看的一行摘要
+    const first =
+      raw
+        .split(/\n/)
+        .map((l) => l.replace(/^[#>*\-\s]+/, "").trim())
+        .find((l) => l.length > 0) ?? "";
+    const clean = first.replace(/\|/g, " ").replace(/`/g, "");
+    const n = clean.length;
+    return n <= 60 ? clean : `${clean.slice(0, 60)}…`;
+  };
+
   /** 抬头那一句。一件事都没有时整块不显示（别占地方）。 */
   const summary = $derived(
     waiting > 0 ? `${working} 件在干，${waiting} 件等你` : `${working} 件在干`,
@@ -77,9 +98,9 @@
             <span class="min-w-0 flex-1">
               <span class="text-fg">{t.title}</span>
               <span class="ml-1.5 text-xs text-faint">{t.label}</span>
-              {#if t.preview}
+              {#if oneLine(t)}
                 <span class="block truncate text-xs text-muted"
-                  >{t.preview}</span
+                  >{oneLine(t)}</span
                 >
               {/if}
             </span>
