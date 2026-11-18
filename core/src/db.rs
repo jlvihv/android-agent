@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS meta (
 
 CREATE TABLE IF NOT EXISTS sessions (
   id               TEXT PRIMARY KEY,
+  -- 给人看的短编号（`#7`，见 agent.rs 的 `ChatSession::seq`）。
+  -- **NULL = 还没发号**（这一列加进来之前建的老会话），`load()` 会补。
+  -- UNIQUE：万一发号逻辑被改坏，落盘这一步就会报错，而不是静默重号。
+  seq              INTEGER,
   title            TEXT NOT NULL,
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
@@ -69,6 +73,8 @@ CREATE TABLE IF NOT EXISTS messages (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+-- 短编号唯一（NULL 不算重复：多行没号是合法的，那是「还没补」的状态）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_seq ON sessions(seq);
 
 -- 配置按列存，不往一个值里塞 JSON。`meta` 只放单个的值（instance_id、token……）。
 
@@ -295,6 +301,17 @@ CREATE TABLE IF NOT EXISTS schedules (
 /// 引导了 `execute_batch(SCHEMA)` 之后：新库在 `CREATE TABLE` 里已经有这些列，
 /// 这里就全是空操作；只有「在加列之前建的老库」会真的 ALTER。
 fn migrate(conn: &Connection) -> Result<()> {
+    // sessions.seq（给人看的短编号，见 agent.rs 的 `ChatSession::seq`）。
+    // 不加 DEFAULT：NULL 就是「还没发号」，`load()` 里补（`SessionStore::recover_seq`）。
+    if !has_column(conn, "sessions", "seq")? {
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN seq INTEGER")
+            .context("加 sessions.seq")?;
+        // 老库补完这一列之后才建得上索引（`CREATE TABLE IF NOT EXISTS` 那段
+        // 对新库已经建了，这里是给老库的）
+        conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_seq ON sessions(seq)")
+            .context("给老库建 sessions.seq 的唯一索引")?;
+    }
+
     // sessions.role（worker | router）—— 双层架构那一批加的。
     // 用 `DEFAULT 'worker'`：老库里的会话全都是 worker，跟它们本来的行为一致。
     if !has_column(conn, "sessions", "role")? {
@@ -488,6 +505,7 @@ struct Saved {
     /// 落盘时的清空次数（`ChatSession::epoch`）。变了 = 整段换过
     epoch: u32,
     updated_at: u64,
+    seq: Option<u64>,
     title: String,
     provider_session: String,
     role: crate::agent::Role,
@@ -507,6 +525,10 @@ impl Saved {
             len: s.message_count(),
             epoch: s.epoch,
             updated_at: s.updated_at,
+            // **必须参与比对**：`load()` 会给没号的老会话补号，补完之后
+            // `Saved::of(s)` 就和库里读下来的那份对不上了 → 下一次落盘把号写进去。
+            // 少了这一行，补的号只活在内存里，重启就白补了。
+            seq: s.seq,
             title: s.title.clone(),
             provider_session: s.provider_session.clone(),
             role: s.role,
@@ -542,6 +564,7 @@ struct PendingSession<'a> {
 
 struct PlannedSession {
     id: String,
+    seq: Option<u64>,
     title: String,
     created_at: u64,
     updated_at: u64,
@@ -645,7 +668,7 @@ impl Db {
                 //（漏掉 = 读不回来 = 下次又要重建一个、换新 id，见上面那段）。
                 // 普通空会话不落盘，所以 LEFT JOIN 不会让它们冒出来 —— 库里本来
                 // 就没有它们的行。
-                r#"SELECT s.id, s.title, s.created_at, s.updated_at, s.provider_session, s.role,
+                r#"SELECT s.id, s.seq, s.title, s.created_at, s.updated_at, s.provider_session, s.role,
                           COUNT(m.seq), COALESCE(SUM(m.payload LIKE '{"User%'), 0),
                           s.brief, s.dispatched_by, s.conclusion, s.dispatches, s.closed_at, s.closed_by
                    FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
@@ -655,25 +678,27 @@ impl Db {
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(4)?,
                     r.get::<_, String>(5)?,
-                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(6)?,
                     r.get::<_, i64>(7)?,
-                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, i64>(8)?,
                     r.get::<_, Option<String>>(9)?,
-                    r.get::<_, String>(10)?,
-                    r.get::<_, i64>(11)?,
+                    r.get::<_, Option<String>>(10)?,
+                    r.get::<_, String>(11)?,
                     r.get::<_, i64>(12)?,
-                    r.get::<_, String>(13)?,
+                    r.get::<_, i64>(13)?,
+                    r.get::<_, String>(14)?,
                 ))
             })?;
 
             for row in rows {
                 let (
                     id,
+                    seq,
                     title,
                     created_at,
                     updated_at,
@@ -704,6 +729,9 @@ impl Db {
                         });
                 let s = ChatSession {
                     id,
+                    // NULL = 还没发号（这一列加进来之前建的老会话）：
+                    // `AppState::load_sessions` 随后会调 `recover_seq` 补上。
+                    seq: seq.map(|n| n.max(0) as u64),
                     title,
                     created_at: created_at.max(0) as u64,
                     updated_at: updated_at.max(0) as u64,
@@ -728,11 +756,24 @@ impl Db {
             store
         };
 
+        // 发号水位线从读出来的号恢复；没号的老会话在这里补上
+        //（补完之后 `Saved::of` 会和库里的对不上 → 下一次落盘把号写进去，
+        // 这正是我们要的：不新增机制，复用现有的 `sessions_dirty` 通路）。
+        let mut store = store;
+        let assigned = store.recover_seq();
+
         // 水位线 = 刚读出来的样子，这样下次 sync 只写新增的
         g.generation += 1;
         g.saved.clear();
         for s in &store.sessions {
-            g.saved.insert(s.id.clone(), Saved::of(s));
+            let mut was = Saved::of(s);
+            // **补过号的那几条：水位线里记「库里还是 NULL」**，于是下一次 `plan`
+            // 会认为它们变了、把号写进去。不这么写的话，库里那行一直是 NULL 而
+            // 水位线说「有号了」，补的号永远落不了盘（每次重启重补一遍）。
+            if assigned.contains(&s.id) {
+                was.seq = None;
+            }
+            g.saved.insert(s.id.clone(), was);
         }
         g.saved_active = None;
 
@@ -904,6 +945,7 @@ impl Db {
             };
             sessions.push(PlannedSession {
                 id: s.id.clone(),
+                seq: s.seq,
                 title: s.title.clone(),
                 created_at: s.created_at,
                 updated_at: s.updated_at,
@@ -944,10 +986,13 @@ impl Db {
         let tx = g.conn.transaction()?;
         for s in &plan.sessions {
             tx.execute(
-                "INSERT INTO sessions(id, title, created_at, updated_at, provider_session, role,
+                "INSERT INTO sessions(id, seq, title, created_at, updated_at, provider_session, role,
                                       brief, dispatched_by, conclusion, dispatches, closed_at, closed_by)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
+                   -- 号只在「库里还没有」时写进去（`COALESCE`）：已经发过的号不许被
+                   -- 一次正常的落盘覆盖成别的（那等于回收/换号，见 `ChatSession::seq`）。
+                   seq = COALESCE(sessions.seq, excluded.seq),
                    title = excluded.title,
                    updated_at = excluded.updated_at,
                    provider_session = excluded.provider_session,
@@ -960,6 +1005,7 @@ impl Db {
                    closed_by = excluded.closed_by",
                 params![
                     s.id,
+                    s.seq.map(|n| n as i64),
                     s.title,
                     s.created_at as i64,
                     s.updated_at as i64,
@@ -2084,6 +2130,86 @@ CREATE TABLE tickets (
         assert_eq!(found.message_count(), 0, "它确实是空的");
         // worker 也在，谁都没被误删
         assert!(back.get(&w).is_some());
+    }
+
+    /// **老数据补号**：库里 `seq IS NULL` 的会话，`load()` 之后都有号，且从 1 开始
+    /// 连续、不重复。
+    ///
+    /// 这条钉的是 `SessionStore::recover_seq`。变异验证：把它整段删掉（或只恢复
+    /// 水位线、不补号）→ 这条挂。
+    #[test]
+    fn loading_an_old_db_assigns_numbers_to_every_session() {
+        let db = Db::in_memory().unwrap();
+        let mut st = SessionStore::default();
+        // 三条有内容的会话（空会话不落盘）
+        let mut ids = Vec::new();
+        for t in ["第一件", "第二件", "第三件"] {
+            let id = st.push_new(crate::agent::ChatSession::new());
+            st.get_mut(&id).unwrap().messages.push(msg_user(t));
+            ids.push(id);
+        }
+        db.sync(&st).unwrap();
+
+        // 模拟「`seq` 这一列加进来之前」的库：把号清空
+        db.with(|c| c.execute_batch("UPDATE sessions SET seq = NULL"))
+            .unwrap();
+
+        let back = db.load().unwrap();
+        assert_eq!(back.sessions.len(), ids.len(), "三条都读回来了");
+        let seqs: Vec<u64> = back.sessions.iter().filter_map(|s| s.seq).collect();
+        assert_eq!(seqs.len(), ids.len(), "每条都要有号（不能留 NULL）");
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seqs.len(), "号不能重复：{seqs:?}");
+        assert_eq!(
+            sorted,
+            (1..=ids.len() as u64).collect::<Vec<_>>(),
+            "补出来的号从 1 开始连续：{seqs:?}"
+        );
+        // 补完的号也恢复出水位线了：下一个新会话要接着发
+        let mut back = back;
+        let next = back.push_new(crate::agent::ChatSession::new());
+        let n = back.get(&next).unwrap().seq.expect("新会话有号");
+        assert_eq!(
+            n,
+            ids.len() as u64 + 1,
+            "水位线要从读出来的最大号恢复（拿到 {n}）"
+        );
+    }
+
+    /// 补的号要**落盘**（否则重启一次补一遍，号每次都可能变）。
+    ///
+    /// 钉的是 `Saved::of` / `PlannedSession` / INSERT 三处都带上 `seq`。
+    /// 变异验证：把 `Saved::of` 里那行 `seq: s.seq` 删掉 → 补的号只活在内存里，
+    /// 这条挂。
+    #[test]
+    fn numbers_assigned_on_load_are_saved_back() {
+        let db = Db::in_memory().unwrap();
+        let mut st = SessionStore::default();
+        let id = st.push_new(crate::agent::ChatSession::new());
+        st.get_mut(&id).unwrap().messages.push(msg_user("活"));
+        db.sync(&st).unwrap();
+        db.with(|c| c.execute_batch("UPDATE sessions SET seq = NULL"))
+            .unwrap();
+
+        // load（补号）→ sync（应该把号写回去）
+        let back = db.load().unwrap();
+        db.sync(&back).unwrap();
+        let n1 = back.get(&id).unwrap().seq.expect("内存里有号");
+        // **直接查库**：补出来的号必须真的写进去了。
+        //
+        // 不能只靠「再 load 一次看号一样」—— 补号是按 `created_at` 排的确定性算法，
+        // 每次补出来都是同一个号，那样测不出「有没有落盘」（变异体验证过：
+        // `Saved::of` 里去掉 `seq` 之后，那个弱版本照样绿）。
+        let in_db: Option<i64> = db
+            .with(|c| {
+                c.query_row("SELECT seq FROM sessions WHERE id = ?1", [&id], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(in_db, Some(n1 as i64), "号必须写进库，不能只活在内存里");
     }
 
     /// 普通空会话还是**不该**落盘 —— 「新对话」点了没说话，重启后不该冒出来。

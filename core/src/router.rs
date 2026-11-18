@@ -87,6 +87,8 @@ fn arg_usize(args: &Value, key: &str, default: usize, min: usize, max: usize) ->
 /// `list_sessions` 里一行（锁里挑出来、锁外格式化）。
 struct Row {
     id: String,
+    /// 短编号（`#7`）。`None` = 还没发号（只可能出现在 `load` 之前）
+    seq: Option<u64>,
     title: String,
     conclusion: String,
     times: u32,
@@ -139,6 +141,7 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
             .iter()
             .map(|s| Row {
                 id: s.id.clone(),
+                seq: s.seq,
                 title: s.title.clone(),
                 conclusion: s.conclusion.clone(),
                 times: s.dispatch_times().unwrap_or(0),
@@ -169,9 +172,16 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     );
     // 到这里已经不持锁了：clip / format! 都在锁外
     for r in &rows {
-        let mut line = format!(
-            "- `{}` {} ",
-            r.id,
+        // **短编号在前、完整 id 在反引号里**：编号是给人（和模型）念的，
+        // 完整 id 仍然给出来 —— 向后兼容（老提示词/脚本只认 `id`），而且复制粘贴
+        // 一条长串比猜一个短号可靠。两者指同一条会话，`resolve` 都认。
+        let mut line = match r.seq {
+            Some(n) => format!("#{n} `{}` ", r.id),
+            None => format!("`{}` ", r.id),
+        };
+        let _ = write!(
+            line,
+            "{} ",
             if r.title.is_empty() {
                 "（无标题）"
             } else {
@@ -190,6 +200,142 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// 短编号（`#7`）解析
+//
+// **三个工具共用这一个函数**（`read_session` / `dispatch` / `close_session`）。
+// 分开写就是我以前最讨厌的那种「三处各判一遍、语义迟早走偏」。
+// ---------------------------------------------------------------------------
+
+/// 把模型给的那个串解析成一条会话的 id。
+///
+/// 顺序（**先短名、后完整 id**，两者不会互相吃掉）：
+///
+/// 1. `#7` / `7`（纯数字）→ 按 `seq` 找
+/// 2. 其它 → 当完整 id 精确匹配（**完全向后兼容**：老调用方/老提示词照旧传 uuid）
+///
+/// ## 权限在这里就判
+///
+/// 每条路都要求 `dispatched_by == Some(from)`。**短名不是权限的后门**：猜别人的
+/// `#3` 也是一句「没有这条会话」。不是自己的会话当作不存在（和三处调用点原来的
+/// 行为一致，理由也一致：不泄露别人有什么）。
+///
+/// ## 找不到时给候选
+///
+/// 「没有这条会话」是**最没用的一句话** —— 调用方手里只有这个串，它能做的最好的
+/// 事就是再猜一次。所以这里顺手做一次模糊匹配（号、id 前缀、标题子串），最多列
+/// 3 条。这不是替调用方决定，是把「它可能想问的是哪几条」摆出来。
+pub fn resolve<'a>(
+    store: &'a crate::agent::SessionStore,
+    from: &str,
+    raw: &str,
+) -> Result<&'a crate::agent::ChatSession, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("缺少参数 session_id（可以用短编号 `#7`，也可以用完整 id）".to_string());
+    }
+
+    // 只看自己名下的：权限而不是过滤（不是自己的当作不存在）
+    let mine = || {
+        store
+            .sessions
+            .iter()
+            .filter(|s| s.dispatched_by() == Some(from))
+    };
+
+    // 1) `#7` 或 `7`
+    let digits = raw.strip_prefix('#').unwrap_or(raw);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = digits.parse::<u64>() {
+            if let Some(s) = mine().find(|s| s.seq == Some(n)) {
+                return Ok(s);
+            }
+            // 是号但没这条：给候选（比「完整 id 找不到」有用得多）
+            return Err(no_such(store, from, raw, Some(n)));
+        }
+    }
+
+    // 2) 完整 id（向后兼容：行为和三处调用点原来那行 `store.get(id)` 完全一样）
+    if let Some(s) = mine().find(|s| s.id == raw) {
+        return Ok(s);
+    }
+    Err(no_such(store, from, raw, None))
+}
+
+/// 「没有这条会话」那句话 —— 带上最多 3 条**最可能想问的**。
+///
+/// 候选的挑法**看输入是哪一类**：
+///
+/// - **数字**（`#999`）：按「号离它多近」排，最近的三条。`#7` 记成 `#9` 时正好
+///   列出 `#7` / `#8` / `#10`，一眼能挑回来。
+/// - **非数字**（`代码审查`）：① id 前缀能对上的；② 标题里含这个串的
+///   （大小写不敏感，复用 `agent::find_fold`）。
+///
+/// 挑不到就只是那句话本身 —— **别硬凑几条不相关的**（那比没有更误导）。
+fn no_such(store: &crate::agent::SessionStore, from: &str, raw: &str, seq: Option<u64>) -> String {
+    const MAX_HINTS: usize = 3;
+    let mine = || {
+        store
+            .sessions
+            .iter()
+            .filter(|s| s.dispatched_by() == Some(from))
+    };
+    let mut hits: Vec<&crate::agent::ChatSession> = Vec::new();
+
+    match seq {
+        // 数字输错：给「号最接近的那几条」
+        Some(n) => {
+            let mut all: Vec<&crate::agent::ChatSession> =
+                mine().filter(|s| s.seq.is_some()).collect();
+            all.sort_by_key(|s| s.seq.unwrap_or(0).abs_diff(n));
+            hits.extend(all.into_iter().take(MAX_HINTS));
+        }
+        // 非数字：id 前缀 + 标题子串
+        None => {
+            for s in mine() {
+                if raw.len() >= 4 && s.id.starts_with(raw) {
+                    hits.push(s);
+                    if hits.len() >= MAX_HINTS {
+                        break;
+                    }
+                }
+            }
+            if hits.len() < MAX_HINTS {
+                for s in mine() {
+                    if hits.iter().any(|h| h.id == s.id) {
+                        continue;
+                    }
+                    if crate::agent::find_fold(&s.title, raw).is_some() {
+                        hits.push(s);
+                    }
+                    if hits.len() >= MAX_HINTS {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    hits.truncate(MAX_HINTS);
+
+    let mut out = format!("没有这条会话: `{raw}`");
+    if hits.is_empty() {
+        out.push_str("。用 `list_sessions` 看看有哪些（每个条目开头是短编号，`#7` 这种）。");
+        return out;
+    }
+    out.push_str("。你是不是想找：");
+    for s in hits {
+        let _ = write!(
+            out,
+            " {}「{}」",
+            s.seq
+                .map(|n| format!("#{n}"))
+                .unwrap_or_else(|| "（无号）".into()),
+            crate::text::clip(&s.title, 30)
+        );
+    }
+    out
+}
+
 /// `read_session`：一条会话的详情。
 ///
 /// 四段：**当初要它干什么**（`brief`，免疫压缩）、**它最后说成了什么**
@@ -200,31 +346,28 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
 /// 中间跑了多少条命令是另一种信息，混在一起就是噪音。
 pub async fn read_session(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
-    let id = arg_str(args, "session_id");
-    if id.is_empty() {
-        return Err("缺少参数 session_id（`list_sessions` 给的那些反引号里的串）".to_string());
+    let raw = arg_str(args, "session_id");
+    if raw.is_empty() {
+        return Err("缺少参数 session_id（短编号 `#7` 或完整 id 都行）".to_string());
     }
 
+    // 解析 + 权限**同一处**（`resolve` 里已经要求 `dispatched_by == from`）
     let info = {
         let store = state.chat.read().await;
-        store.get(id).map(|s| {
-            (
+        match resolve(&store, from, raw) {
+            Err(e) => return Err(e),
+            Ok(s) => (
+                s.id.clone(),
                 s.title.clone(),
                 s.brief().map(str::to_string),
                 s.conclusion.clone(),
                 s.dispatch_times().unwrap_or(0),
                 s.closed,
-                s.dispatched_by().map(str::to_string),
-            )
-        })
+            ),
+        }
     };
-    let Some((title, brief, conclusion, dispatches, closed, owner)) = info else {
-        return Err(format!("没有这条会话: `{id}`"));
-    };
-    // 权限：只能看自己派出去的（不是自己的当作不存在，不泄露别人有什么）
-    if owner.as_deref() != Some(from) {
-        return Err(format!("没有这条会话: `{id}`"));
-    }
+    let (id, title, brief, conclusion, dispatches, closed) = info;
+    let id = id.as_str();
 
     let mut out = String::new();
     let _ = writeln!(out, "会话 `{id}`");
@@ -314,26 +457,21 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     }
 
     // 再派一次：会话已经在
-    let again = arg_str(args, "session_id");
-    if !again.is_empty() {
-        let found = {
+    let raw = arg_str(args, "session_id");
+    if !raw.is_empty() {
+        let (again, closed) = {
             let store = state.chat.read().await;
-            store
-                .get(again)
-                .map(|s| (s.dispatched_by().map(str::to_string), s.closed.is_closed()))
+            // 解析（含权限）。短名 `#7` 和完整 id 都认 —— 这里必须走 `resolve`，
+            // 否则「list 里看到 #7、dispatch 说没有这条会话」这种割裂会出现。
+            let s = resolve(&store, from, raw)?;
+            (s.id.clone(), s.closed.is_closed())
         };
-        let Some((owner, closed)) = found else {
-            return Err(format!("没有这条会话: `{again}`"));
-        };
-        if owner.as_deref() != Some(from) {
-            return Err(format!("没有这条会话: `{again}`"));
-        }
         if closed {
             return Err(format!(
                 "会话 `{again}` 已经收尾了。要重开就新建一个，别往收尾的上头派。"
             ));
         }
-        return redispatch(core, again, task).await;
+        return redispatch(core, &again, task).await;
     }
 
     // 新建
@@ -383,16 +521,19 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
 /// 不需要别的状态：结束就是结束，没有「正在结束」。
 pub async fn close_session(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
-    let id = arg_str(args, "session_id");
-    if id.is_empty() {
-        return Err("缺少参数 session_id".to_string());
+    let raw = arg_str(args, "session_id");
+    if raw.is_empty() {
+        return Err("缺少参数 session_id（短编号 `#7` 或完整 id 都行）".to_string());
     }
     let outcome = arg_str(args, "outcome");
     let done = outcome != "cancelled";
 
-    if state.dispatched_by(id).as_deref() != Some(from) {
-        return Err(format!("没有这条会话: `{id}`"));
-    }
+    // 解析（含权限）+ 取出真 id：后面全用真 id（`seq` 不是身份，`id` 才是）
+    let id = {
+        let store = state.chat.read().await;
+        resolve(&store, from, raw)?.id.clone()
+    };
+    let id = id.as_str();
     if state.is_closed(id) {
         return Ok(format!("会话 `{id}` 已经收尾过了。"));
     }
@@ -447,8 +588,8 @@ async fn new_worker_session(
     // 用 `Dispatch::new` 一次建完整份 —— 以前是三个字段各写一行，
     // 少写一个就是「半份派活记录」。类型上现在只有「有」和「没有」。
     s.dispatch = Some(crate::agent::Dispatch::new(router, task));
-    let id = s.id.clone();
-    store.sessions.push(s);
+    // `push_new` 给新会话发短编号（`seq` 的唯一写点，见 `SessionStore`）
+    let id = store.push_new(s);
     drop(store);
     state.mark_sessions_dirty();
     Ok(id)
@@ -660,8 +801,7 @@ pub async fn ensure(st: &AppState) -> String {
     // 建会话时写进 `title`，`maybe_title` 只在该字段为空时才动手，所以用户
     // 聊起来之后这个初始名字不会被第一句话顶掉（Router 的名字该稳定）。
     s.title = ROUTER_TITLE.to_string();
-    let id = s.id.clone();
-    store.sessions.push(s);
+    let id = store.push_new(s);
     drop(store);
     st.set_meta(ROUTER_META_KEY, &id);
     st.mark_sessions_dirty();
@@ -678,6 +818,204 @@ const ROUTER_TITLE: &str = "协调";
 mod tests {
     use super::*;
     use crate::agent::{ChatSession, Role};
+
+    // ---- 短编号（`#7`）----------------------------------------------------
+
+    /// 派一条会话，返回它的短编号。
+    async fn dispatch_one(core: &Core, rid: &str, task: &str) -> u64 {
+        let out = dispatch(core, rid, &serde_json::json!({ "task": task }))
+            .await
+            .expect("派得出去");
+        assert!(out.contains("开了会话"), "{out}");
+        let store = core.state.chat.read().await;
+        store
+            .sessions
+            .iter()
+            .filter(|s| s.dispatched_by() == Some(rid))
+            .filter(|s| s.brief().is_some_and(|b| b == task))
+            .filter_map(|s| s.seq)
+            .next()
+            .expect("新会话必须发到号")
+    }
+
+    /// **`#7` 和 `7` 都解析到同一条；完整 id 也仍然能用**（向后兼容）。
+    ///
+    /// 变异验证：把 `resolve` 里 `strip_prefix('#')` 那行删掉 → `#7` 会落到
+    /// 「完整 id 精确匹配」分支、找不到 → 这条挂。
+    #[tokio::test]
+    async fn all_three_spellings_of_a_session_resolve_to_the_same_one() {
+        let (core, rid) = with_router("resolve-three").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        let n = dispatch_one(&core, &rid, "干点活").await;
+        let id = {
+            let store = core.state.chat.read().await;
+            store.by_seq(n).expect("有这个号").id.clone()
+        };
+
+        let store = core.state.chat.read().await;
+        // 三种写法
+        for raw in [format!("#{n}"), format!("{n}"), id.clone()] {
+            let got =
+                resolve(&store, &rid, &raw).unwrap_or_else(|e| panic!("`{raw}` 该解析得了：{e}"));
+            assert_eq!(got.id, id, "`{raw}` 要解析到同一条");
+        }
+        // 带空格也认（`arg_str` 会 trim，这里直接测 resolve 也 trim）
+        assert_eq!(resolve(&store, &rid, &format!("  #{n}  ")).unwrap().id, id);
+        // 不带 `#` 的纯数字**不会**被当成完整 id
+        assert!(
+            resolve(&store, &rid, &format!("#{n}9")).is_err(),
+            "#79 不是 #7"
+        );
+    }
+
+    /// **短名不是权限的后门**：猜别人的号 → 「没有这条会话」。
+    ///
+    /// 场景：两个 Router（A 和 B），A 派了一条（`#1`），B 拿 `#1` 去 read/close/dispatch
+    /// 都必须失败 —— 而且**失败信息里不能泄露 A 那条的标题**。
+    ///
+    /// 变异验证：把 `resolve` 里 `mine()` 的 `dispatched_by == Some(from)` 过滤去掉
+    /// → 这条挂（B 能读到 A 的会话）。
+    #[tokio::test]
+    async fn a_short_name_cannot_reach_another_routers_session() {
+        let (core, rid_a) = with_router("resolve-perm").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        let n = dispatch_one(&core, &rid_a, "A 的秘密任务").await;
+
+        // 再建一个 Router（B）
+        let rid_b = {
+            let mut store = core.state.chat.write().await;
+            store.push_new(ChatSession::with_role(Role::Router))
+        };
+        assert_ne!(rid_a, rid_b);
+
+        let short = format!("#{n}");
+        // read_session
+        let err = read_session(&core, &rid_b, &serde_json::json!({ "session_id": short }))
+            .await
+            .expect_err("B 不该读得到 A 的会话");
+        assert!(err.contains("没有这条会话"), "{err}");
+        assert!(
+            !err.contains("A 的秘密任务"),
+            "错误信息**不能泄露**别人会话的标题：{err}"
+        );
+        // close_session
+        assert!(
+            close_session(&core, &rid_b, &serde_json::json!({ "session_id": short }))
+                .await
+                .is_err()
+        );
+        // dispatch 再派一次
+        assert!(dispatch(
+            &core,
+            &rid_b,
+            &serde_json::json!({ "task": "改一下", "session_id": short })
+        )
+        .await
+        .is_err());
+        // A 自己照常能用
+        assert!(
+            read_session(&core, &rid_a, &serde_json::json!({ "session_id": short }))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// **编号不复用**：删掉 `#7`，下一个拿到的是 `#8`。
+    ///
+    /// 变异验证：把 `next_seq` 里的 `self.high_seq.max(self.max_seq())` 改成只用
+    /// `self.max_seq()`（即「读 max + 1」）→ 删掉最大的号之后新会话会拿回那个号
+    /// → 这条挂。
+    #[tokio::test]
+    async fn a_deleted_number_is_never_handed_out_again() {
+        let (core, rid) = with_router("resolve-noreuse").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        let first = dispatch_one(&core, &rid, "第一件").await;
+        let second = dispatch_one(&core, &rid, "第二件").await;
+        assert_eq!(second, first + 1, "连号");
+
+        // 删掉**最大的**那个（最容易暴露 rowid 复用的那个位置）
+        let victim = {
+            let store = core.state.chat.read().await;
+            store.by_seq(second).unwrap().id.clone()
+        };
+        core.state.delete_session(&victim).await;
+        {
+            let store = core.state.chat.read().await;
+            assert!(store.by_seq(second).is_none(), "删掉了");
+        }
+
+        // 下一个必须是 second + 1，不能是 second
+        let third = dispatch_one(&core, &rid, "第三件").await;
+        assert_eq!(
+            third,
+            second + 1,
+            "删掉的号永不回收（拿到 {third}，期望 {}）",
+            second + 1
+        );
+        // 而且 `#second` 现在指向「没有」，不是指向第三件
+        let store = core.state.chat.read().await;
+        assert!(store.by_seq(second).is_none(), "旧号必须永久空缺");
+    }
+
+    /// **报错里有候选**：给一个错号，能看到正确的那几条。
+    #[tokio::test]
+    async fn a_wrong_number_suggests_the_right_ones() {
+        let (core, rid) = with_router("resolve-hint").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        let n = dispatch_one(&core, &rid, "代码审查那件事").await;
+
+        // 1) 号错得离谱：给出「号最接近的几条」+ 它们是什么
+        let err = read_session(&core, &rid, &serde_json::json!({ "session_id": "#999" }))
+            .await
+            .expect_err("没这个号");
+        assert!(err.contains("没有这条会话"), "{err}");
+        assert!(
+            err.contains(&format!("#{n}")),
+            "错号要把**最接近的号**列出来（正确那个就是 #{n}）：{err}"
+        );
+        assert!(
+            err.contains("代码审查"),
+            "连标题一起给，才认得出是哪条：{err}"
+        );
+
+        // 2) 号打错一位（7 记成 79）：同样能看到正确的那条
+        let err = read_session(
+            &core,
+            &rid,
+            &serde_json::json!({ "session_id": format!("#{n}9") }),
+        )
+        .await
+        .expect_err("没这个号");
+        assert!(err.contains(&format!("#{n}")), "错号也要给出候选：{err}");
+
+        // 3) 一份完全沾不上的输入：只给那句「用 list_sessions 看看」
+        let err = read_session(&core, &rid, &serde_json::json!({ "session_id": "zzzqqq" }))
+            .await
+            .expect_err("找不到");
+        assert!(err.contains("list_sessions"), "没有候选时要指路：{err}");
+    }
+
+    /// **报错里的候选也走同一套权限**（不能给 B 列出 A 的标题）。
+    #[tokio::test]
+    async fn hints_do_not_leak_another_routers_titles() {
+        let (core, rid_a) = with_router("resolve-hint-perm").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch_one(&core, &rid_a, "A 的机密项目").await;
+        let rid_b = {
+            let mut store = core.state.chat.write().await;
+            store.push_new(ChatSession::with_role(Role::Router))
+        };
+        // B 用一个沾边的串去猜（标题里有的词）
+        let err = read_session(&core, &rid_b, &serde_json::json!({ "session_id": "机密" }))
+            .await
+            .expect_err("不是 B 的会话");
+        assert!(!err.contains("A 的机密项目"), "候选也不能泄露：{err}");
+    }
 
     /// 派完一条会话之后，把那个刚被 `continue_with_queued` 占住的回合结束掉。
     ///
@@ -705,9 +1043,7 @@ mod tests {
         let rid = {
             let mut store = core.state.chat.write().await;
             let s = ChatSession::with_role(Role::Router);
-            let id = s.id.clone();
-            store.sessions.push(s);
-            id
+            store.push_new(s)
         };
         (core, rid)
     }
@@ -736,9 +1072,13 @@ mod tests {
         );
 
         // 2) 派一条活
-        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活", "title": "那件事" }))
-            .await
-            .unwrap();
+        dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "干点活", "title": "那件事" }),
+        )
+        .await
+        .unwrap();
         let worker = {
             let store = core.state.chat.read().await;
             store

@@ -46,6 +46,16 @@
 
   export type Session = {
     id: string;
+    /**
+     * 短编号（`#7`），服务端发的、**永不回收**。
+     *
+     * 标题旁边显示它：用户看到 `#7` 就能对 Router 说「#7 那个改一下」，不用抄
+     * 36 字符的 uuid（抄错过一次，见 `core/src/agent.rs` 的 `ChatSession::seq`）。
+     *
+     * ⚠️ 这份是 `Drawer.svelte` 自己声明的类型（和 `lib/sessions.svelte.ts` 那个
+     * 是两份 —— 历史上各自长出来的）。加字段时**两边都要加**，否则这边报 TS 错。
+     */
+    seq?: number | null;
     title: string;
     count: number;
     /**
@@ -580,6 +590,13 @@
               size={18}
               class="shrink-0 {isRouter ? 'text-fg' : 'text-muted'}"
             />
+            <!-- 短编号（`#7`）在标题**前面**：它是给人念的（「#7 那个改一下」），
+                 和标题一样长驻，不藏进详情。`seq` 为空（老数据还没补号）就不占位。 -->
+            {#if s.seq != null}
+              <span class="shrink-0 text-meta tabular-nums text-faint"
+                >#{s.seq}</span
+              >
+            {/if}
             <span
               class="min-w-0 flex-1 truncate text-base
                      {isRouter ? 'font-medium' : ''}"

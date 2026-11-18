@@ -358,7 +358,7 @@ pub fn read_session_schema() -> Value {
         "properties": {
             "session_id": {
                 "type": "string",
-                "description": "会话 id（`list_sessions` 反引号里的那个串）"
+                "description": "会话：短编号 `#7` 或完整 id 都行（`list_sessions` 每行开头是短编号）"
             },
             "what": {
                 "type": "string",
@@ -397,7 +397,7 @@ pub fn dispatch_schema() -> Value {
             },
             "session_id": {
                 "type": "string",
-                "description": "往这条已有会话再派一次（可选；不给就新建）"
+                "description": "往这条已有会话再派一次（可选；不给就新建）。短编号 `#7` 或完整 id 都行"
             }
         },
         "required": ["task"]
@@ -419,7 +419,7 @@ pub fn close_session_schema() -> Value {
         "properties": {
             "session_id": {
                 "type": "string",
-                "description": "要收尾的会话 id"
+                "description": "要收尾的会话：短编号 `#7` 或完整 id 都行"
             },
             "outcome": {
                 "type": "string",

@@ -587,6 +587,23 @@ impl Standing {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatSession {
     pub id: String,
+    /// **给人看的短编号**（`#7`）。`None` = 还没有号（老数据，`load()` 里补）。
+    ///
+    /// 为什么必须**存**而不是算：
+    ///
+    /// - 从 `Vec` 的下标算 → 删掉一条后面全错位，同一个 `#7` 昨天指 A 今天指 B。
+    /// - 从 SQLite 的 `rowid` 算 → `sessions` 表的主键是 `id TEXT`，rowid 是隐式的
+    ///   `max(rowid)+1`；**删掉最大的那条之后，新插入的行会复用同一个 rowid**
+    ///   （`db.rs` 的 `DELETE FROM sessions` 真的会发生）。复用比没有更糟。
+    /// - 从 `created_at` 后几位算（上一版干过）→ 同一毫秒建的两条会撞。
+    ///
+    /// 所以发一个号、存下来、**永不回收**（删掉 `#7`，`#7` 就永久空缺）。
+    /// 唯一的写点是 [`SessionStore::push_new`]（受 `chat` 写锁保护）。
+    ///
+    /// 它也**不是状态**：没有跃迁规则，写一次就不再改 —— 和 `brief` / `conclusion`
+    /// 那类「不可变记录」同性质。
+    #[serde(default)]
+    pub seq: Option<u64>,
     /// 标题：取第一条用户输入的前若干字（Claude 的侧边栏就是这样）
     pub title: String,
     pub created_at: u64,
@@ -676,6 +693,8 @@ impl ChatSession {
         let now = now_ms();
         Self {
             id,
+            // 号由 `SessionStore::push_new` 发（那里才拿得到全局水位线）
+            seq: None,
             title: String::new(),
             created_at: now,
             updated_at: now,
@@ -880,7 +899,11 @@ fn hit_snippet(text: &str, needle: &str) -> Option<String> {
 ///    - 其余（查询里有全角字母、`Σ`、`İ` 这类）才需要精确折叠。
 /// 2. **精确折叠**（`exact_fold_find`）：逐 `char` 算 `to_lowercase`，
 ///    能把 `İ` → `i̇`（一个变两个）、`Ａ` → `ａ` 算对。
-fn find_fold(text: &str, needle: &str) -> Option<(usize, usize)> {
+///
+/// `pub(crate)`：`router` 的短名候选提示和 `list_sessions` 的 `query` 搜索都要它
+/// （同一套大小写不敏感语义 —— 两处各写一份的话，「搜得到但提示里没有」这种
+/// 不一致迟早出现）。
+pub(crate) fn find_fold(text: &str, needle: &str) -> Option<(usize, usize)> {
     if needle.is_empty() {
         return None;
     }
@@ -1005,9 +1028,85 @@ fn exact_fold_find(text: &str, needle: &str) -> Option<(usize, usize)> {
 #[derive(Default, Serialize, Deserialize)]
 pub struct SessionStore {
     pub sessions: Vec<ChatSession>,
+    /// 下一个可用的短编号（进程内的发号水位线）。
+    ///
+    /// **不落库**：它从每条会话的 `seq` 恢复（`seq` 才是事实），见
+    /// [`Self::recover_seq`]。落库就成了第二个真相，两者迟早对不上。
+    #[serde(skip)]
+    high_seq: u64,
 }
 
 impl SessionStore {
+    /// 把会话放进表里，**并给它发一个号**（`seq`）。
+    ///
+    /// **这是新会话进入 store 的唯一入口**，也是 `seq` 的唯一写点。号在
+    /// `chat` 写锁保护下发（调用方都拿着写锁），所以不存在「读 max + 1」的竞态。
+    pub fn push_new(&mut self, mut s: ChatSession) -> String {
+        let id = s.id.clone();
+        // 已经带了号（Router 用旧 id 重建时从旧记录抄过来的那种）就不再发
+        if s.seq.is_none() {
+            s.seq = Some(self.next_seq());
+        }
+        self.sessions.push(s);
+        id
+    }
+
+    /// 下一个号。**只增不减**（删掉的号永不回收）。
+    fn next_seq(&mut self) -> u64 {
+        self.high_seq = self.high_seq.max(self.max_seq()).saturating_add(1);
+        self.high_seq
+    }
+
+    fn max_seq(&self) -> u64 {
+        self.sessions
+            .iter()
+            .filter_map(|s| s.seq)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 从会话表里已有的号恢复发号水位线（`load()` 之后调一次），并**给没号的会话补号**
+    /// （老数据、`seq` 列加进来之前建的）。
+    ///
+    /// 补号顺序是 `created_at`（再拿 id 兜底），于是老会话的号大致等于它们建出来的
+    /// 先后 —— 不是精确的历史顺序，但这批号本来就是补救的，**连续不重复**才是要求。
+    ///
+    /// 返回**补过号的那几条 id**。调用方（`Db::load`）要用它把落盘水位线里的
+    /// `seq` 改回 `None` —— 否则库里的行还是 NULL、而水位线说「序号已经有了」，
+    /// **补的号永远写不进库**（每次重启都重新补一遍，号还可能不一样）。
+    pub fn recover_seq(&mut self) -> Vec<String> {
+        self.high_seq = self.max_seq();
+        // 没号的按创建时间排，一条一条接着发
+        let mut missing: Vec<usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.seq.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        if missing.is_empty() {
+            return Vec::new();
+        }
+        missing.sort_by(|&a, &b| {
+            let (x, y) = (&self.sessions[a], &self.sessions[b]);
+            x.created_at
+                .cmp(&y.created_at)
+                .then_with(|| x.id.cmp(&y.id))
+        });
+        let mut assigned = Vec::with_capacity(missing.len());
+        for i in missing {
+            let n = self.next_seq();
+            self.sessions[i].seq = Some(n);
+            assigned.push(self.sessions[i].id.clone());
+        }
+        assigned
+    }
+
+    /// 找一条会话的号（`None` = 它没有 id 也没有号）。
+    pub fn by_seq(&self, seq: u64) -> Option<&ChatSession> {
+        self.sessions.iter().find(|s| s.seq == Some(seq))
+    }
+
     /// 当前会话，没有就建一个
     pub fn get(&self, id: &str) -> Option<&ChatSession> {
         self.sessions.iter().find(|s| s.id == id)
@@ -1019,10 +1118,7 @@ impl SessionStore {
 
     /// 建一条空会话，返回它的 id。**不改任何「当前会话」**（见上面的说明）。
     pub fn create(&mut self) -> String {
-        let s = ChatSession::new();
-        let id = s.id.clone();
-        self.sessions.push(s);
-        id
+        self.push_new(ChatSession::new())
     }
 
     /// 删掉并交还这个会话（调用方要清它引用的文件）。
@@ -1113,6 +1209,9 @@ impl SessionStore {
             .map(|s| {
                 let mut row = json!({
                     "id": s.id,
+                    // 短编号（`#7`）。界面在标题旁边显示它 —— 用户看到 `#7`
+                    // 就能对 Router 说「#7 那个改一下」。`null` = 还没发号。
+                    "seq": s.seq,
                     "title": if s.title.is_empty() { "新对话" } else { &s.title },
                     "updatedAt": s.updated_at,
                     "count": s.user_count(),
@@ -4759,8 +4858,7 @@ mod tests {
         // 空的 worker（不该出现）、空的 router（该出现）、一个有内容的 worker
         let empty_worker = st.create();
         let router = ChatSession::with_role(Role::Router);
-        let rid = router.id.clone();
-        st.sessions.push(router);
+        let rid = st.push_new(router);
         let busy = st.create();
         st.get_mut(&busy)
             .unwrap()

@@ -4336,7 +4336,7 @@ mod tests {
                 // 有内容才会进 `list_page`（空会话不进列表）
                 s.messages.push(crate::agent::ChatMessage::user("干点活"));
                 let id = s.id.clone();
-                store.sessions.push(s);
+                store.push_new(s);
                 id
             };
             (

@@ -23,6 +23,14 @@ import { api } from "./api";
  */
 export type Session = {
   id: string;
+  /**
+   * 短编号（`#7`），服务端发的、**永不回收**。
+   *
+   * 抽屉里显示在标题旁边：用户看到 `#7` 就能对 Router 说「#7 那个改一下」，
+   * 不用抄 36 字符的 uuid（抄错过一次，见 `core/src/agent.rs` 的 `ChatSession::seq`）。
+   * `null` = 还没发号（老数据，下次启动补）。
+   */
+  seq?: number | null;
   title: string;
   /** 这条会话有几条消息（抽屉里那行小字） */
   count: number;
