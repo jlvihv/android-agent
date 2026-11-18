@@ -469,7 +469,7 @@ pub fn tool_detail(name: &str, args: &str) -> Option<String> {
         _ => return None,
     };
     let line = first_line(&raw);
-    (!line.is_empty()).then_some(text::cap(&line, DETAIL_MAX))
+    (!line.is_empty()).then_some(text::cap(line, DETAIL_MAX))
 }
 
 /// 回复预览：正文**尾部**最后一个非空行。

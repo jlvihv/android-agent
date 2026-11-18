@@ -286,7 +286,7 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
 
     let tid = uuid::Uuid::now_v7().to_string();
     let now = crate::agent::now_ms();
-    if let Err(e) = db.ticket_create(&tid, &title, task, &sid, &router, now) {
+    if let Err(e) = db.ticket_create(&tid, &title, task, &sid, router, now) {
         return Err(format!("建工作项失败：{e:#}"));
     }
     if let Err(e) = db.ticket_bind_session(&sid, &tid, now) {
