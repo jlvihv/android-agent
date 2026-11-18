@@ -1109,7 +1109,7 @@ impl AppState {
     ///
     /// 没人听就是广播没人收，不是错误 —— 桌面上单独跑、没有订阅者时也一样发。
     pub fn push_turn_status(&self, status: crate::status::Snapshot) {
-        if status.active {
+        if status.active() {
             if let Ok(mut g) = self.turn_status.lock() {
                 g.insert(status.sid.clone(), status.clone());
             }

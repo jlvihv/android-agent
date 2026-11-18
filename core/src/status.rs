@@ -63,9 +63,74 @@ pub enum Phase {
     Done,
 }
 
+/// 一个回合**到哪一步了**：还在跑，还是已经结束、怎么结束的。
+///
+/// 以前这是三个平铺的字段（`active: bool` + `finished_at_ms: Option<u64>` +
+/// `ok: bool` + `stopped: bool`），于是「还在跑但已经有结束时刻」「成功了同时
+/// 又是被停的」这些组合全都能写出来，谁读谁得自己判优先级 —— 而三个消费者
+/// （`notify::compose`、壳的 `AgentNotifications`、页面）判的顺序还不一样。
+///
+/// 现在只有三种结束方式，互斥且各自带着自己的结束时刻：非法状态写不出来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// 还在跑（没有结束时刻；成功 / 停止都无意义）
+    Running,
+    /// 正常跑完了
+    Done { finished_at_ms: u64 },
+    /// 出错了
+    Failed { finished_at_ms: u64 },
+    /// 用户按了停止（壳据此说「已停止」而不是「出错了」）
+    Stopped { finished_at_ms: u64 },
+}
+
+impl Outcome {
+    /// 还在跑吗（壳的前台服务、`turn_status` 的存活都跟它走）
+    pub const fn active(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    /// 结束时刻，只有结束那几条才有
+    pub const fn finished_at_ms(self) -> Option<u64> {
+        match self {
+            Self::Running => None,
+            Self::Done { finished_at_ms }
+            | Self::Failed { finished_at_ms }
+            | Self::Stopped { finished_at_ms } => Some(finished_at_ms),
+        }
+    }
+
+    /// 跑成功了没有（还在跑、被停的都不算）
+    pub const fn ok(self) -> bool {
+        matches!(self, Self::Done { .. })
+    }
+
+    /// 是不是用户按的停止
+    pub const fn stopped(self) -> bool {
+        matches!(self, Self::Stopped { .. })
+    }
+
+    /// 一个回合跑完了，按结果定它是哪一种。
+    ///
+    /// `stopped` 优先：按了停止的回合在 loop 里也是「正常返回」，但界面上那句
+    /// 该是「已停止」而不是「完成」—— 所以先判它。
+    pub fn ended(ok: bool, stopped: bool, finished_at_ms: u64) -> Self {
+        if stopped {
+            Self::Stopped { finished_at_ms }
+        } else if ok {
+            Self::Done { finished_at_ms }
+        } else {
+            Self::Failed { finished_at_ms }
+        }
+    }
+}
+
 /// 推给壳的一份快照。字段刻意全是「原样的事实」，文案在壳那边（`strings.xml`）——
 /// 通知栏的话术是界面的事，而这里的字段是 agent loop 的事实。
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// 线上 JSON 形状没变（`active` / `finished_at_ms` / `ok` / `stopped` 四个平铺
+/// 字段，见 [`SnapshotWire`]）：壳、页面、老版本核心都照旧读得懂。换来的是
+/// **核心里**只有一个 `outcome`，写不出自相矛盾的状态。
+#[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
     /// 哪个会话（多会话同时跑时，壳要能分清谁是谁）
     pub sid: String,
@@ -73,25 +138,105 @@ pub struct Snapshot {
     pub title: String,
     pub phase: Phase,
     /// 正在跑的工具名（`bash` / `read` / `edit`），没有就是不带这个字段
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     /// 一行细节：`bash` 的命令、`read`/`edit` 的路径、流式正文的最后一行
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// 本回合开始的时刻（**wall clock 毫秒**）。
     ///
     /// 刻意不是 `elapsedRealtime`：通知的 `setWhen` 用的是 wall clock，混着用的话
     /// 计时器的原点落在「开机时刻」，一台开了五天的手机显示 `120:00:00`。
     pub started_at_ms: u64,
-    /// 还在跑吗（`false` = 这一条是「已经完事」的状态）
-    pub active: bool,
-    /// 结束时刻，只有结束那一条才有
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at_ms: Option<u64>,
-    /// 结束时的结果：正常跑完 = true，出错 = false
-    pub ok: bool,
-    /// 结束是不是因为用户按了停止（壳据此说「已停止」而不是「出错了」）
-    pub stopped: bool,
+    /// 到哪一步了（还在跑 / 完了 / 出错 / 被停）
+    pub outcome: Outcome,
+}
+
+impl Snapshot {
+    /// 还在跑吗
+    pub const fn active(&self) -> bool {
+        self.outcome.active()
+    }
+
+    /// 跑成功了没有
+    pub const fn ok(&self) -> bool {
+        self.outcome.ok()
+    }
+
+    /// 是不是用户按的停止
+    pub const fn stopped(&self) -> bool {
+        self.outcome.stopped()
+    }
+}
+
+/// `Snapshot` 的线上形状（见 [`Snapshot`] 的说明）。
+///
+/// 只在这一层出现：序列化时由 `outcome` 摊开成四个字段，反序列化时再收回来。
+/// 反序列化要**宽容**：对端可能是老版本核心（那时 `stopped` 和 `ok` 可以同时
+/// 为真），所以按「停止 > 失败 > 完成」的优先级收，和壳那边的判断顺序一致。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotWire {
+    sid: String,
+    title: String,
+    phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    started_at_ms: u64,
+    active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finished_at_ms: Option<u64>,
+    ok: bool,
+    stopped: bool,
+}
+
+impl From<&Snapshot> for SnapshotWire {
+    fn from(s: &Snapshot) -> Self {
+        Self {
+            sid: s.sid.clone(),
+            title: s.title.clone(),
+            phase: s.phase,
+            tool: s.tool.clone(),
+            detail: s.detail.clone(),
+            started_at_ms: s.started_at_ms,
+            active: s.outcome.active(),
+            finished_at_ms: s.outcome.finished_at_ms(),
+            ok: s.outcome.ok(),
+            stopped: s.outcome.stopped(),
+        }
+    }
+}
+
+impl From<SnapshotWire> for Snapshot {
+    fn from(w: SnapshotWire) -> Self {
+        // `finished_at_ms` 缺席时用 0：老核心 / 半截帧不该让整条状态读不出来
+        let at = w.finished_at_ms.unwrap_or(0);
+        let outcome = if w.active {
+            Outcome::Running
+        } else {
+            Outcome::ended(w.ok, w.stopped, at)
+        };
+        Self {
+            sid: w.sid,
+            title: w.title,
+            phase: w.phase,
+            tool: w.tool,
+            detail: w.detail,
+            started_at_ms: w.started_at_ms,
+            outcome,
+        }
+    }
+}
+
+impl serde::Serialize for Snapshot {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        SnapshotWire::from(self).serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Snapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        SnapshotWire::deserialize(d).map(Self::from)
+    }
 }
 
 /// 一个回合的状态播报器。`run_turn` 建一个，agent loop 拿着它推。
@@ -215,10 +360,7 @@ impl Reporter {
         self.send(
             Snapshot {
                 detail: reply,
-                active: false,
-                finished_at_ms: Some(crate::agent::now_ms()),
-                ok,
-                stopped,
+                outcome: Outcome::ended(ok, stopped, crate::agent::now_ms()),
                 ..self.running(Phase::Done, None, None)
             },
             // 结束那一条必须落地：它是壳发「任务完成」通知的依据
@@ -230,7 +372,7 @@ impl Reporter {
         self.last.lock().ok().and_then(|l| l.phase())
     }
 
-    /// 还在跑的那几个阶段共用的形状（没有结束时刻，`ok` 无意义）。
+    /// 还在跑的那几个阶段共用的形状（一定是 `Running`：结束时刻、成败都还没意义）。
     fn running(&self, phase: Phase, tool: Option<String>, detail: Option<String>) -> Snapshot {
         Snapshot {
             sid: self.sid.clone(),
@@ -239,10 +381,7 @@ impl Reporter {
             tool,
             detail,
             started_at_ms: self.started_at_ms,
-            active: true,
-            finished_at_ms: None,
-            ok: true,
-            stopped: false,
+            outcome: Outcome::Running,
         }
     }
 
@@ -438,5 +577,63 @@ mod tests {
         // 新的一步（工具跑完 / 下一轮）：允许切回 Thinking
         r.new_step();
         assert_eq!(phases(&mut rx), vec![Phase::Thinking]);
+    }
+
+    /// 结束那一条的四种说法**互斥**：`outcome` 一个字段决定全部，
+    /// 所以「还在跑但有结束时刻」「成功了又是被停的」这些组合写不出来。
+    #[test]
+    fn an_outcome_never_contradicts_itself() {
+        let cases = [
+            (Outcome::Running, true, false, false, None),
+            (Outcome::Done { finished_at_ms: 7 }, false, true, false, Some(7)),
+            (Outcome::Failed { finished_at_ms: 8 }, false, false, false, Some(8)),
+            (
+                Outcome::Stopped { finished_at_ms: 9 },
+                false,
+                false,
+                true,
+                Some(9),
+            ),
+        ];
+        for (o, active, ok, stopped, at) in cases {
+            assert_eq!(o.active(), active, "{o:?}");
+            assert_eq!(o.ok(), ok, "{o:?}");
+            assert_eq!(o.stopped(), stopped, "{o:?}");
+            assert_eq!(o.finished_at_ms(), at, "{o:?}");
+        }
+        // 「停止」优先于「成功」：loop 里按了停止也是正常返回
+        assert_eq!(
+            Outcome::ended(true, true, 1),
+            Outcome::Stopped { finished_at_ms: 1 }
+        );
+    }
+
+    /// 线上 JSON 形状没变（壳、页面读的还是那四个平铺字段）。
+    #[test]
+    fn the_wire_shape_keeps_the_flat_booleans() {
+        let st = AppState::new();
+        let r = Reporter::new(st, "s1", "标题");
+        r.new_step();
+        r.finish(true, false);
+        let snap = r.last.lock().unwrap().sent.clone().unwrap();
+        let v = serde_json::to_value(&snap).unwrap();
+        for k in ["active", "ok", "stopped", "finished_at_ms", "phase"] {
+            assert!(v.get(k).is_some(), "少了 {k}：{v}");
+        }
+        assert_eq!(v["active"], serde_json::json!(false));
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["stopped"], serde_json::json!(false));
+
+        // 回得去（壳 → 核心的那条路 / 中继转发）
+        let back: Snapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(back.outcome, snap.outcome);
+
+        // 老核心发来的「既成功又被停」：按「停止」收，不造出非法状态
+        let old = serde_json::json!({
+            "sid": "s", "title": "t", "phase": "done", "started_at_ms": 1,
+            "active": false, "finished_at_ms": 2, "ok": true, "stopped": true
+        });
+        let got: Snapshot = serde_json::from_value(old).unwrap();
+        assert_eq!(got.outcome, Outcome::Stopped { finished_at_ms: 2 });
     }
 }

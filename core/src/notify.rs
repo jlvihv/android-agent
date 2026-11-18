@@ -28,7 +28,7 @@
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command as Proc, Stdio};
 
-use crate::status::Snapshot;
+use crate::status::{Outcome, Snapshot};
 use crate::text;
 
 /// 一条要发出去的通知（拼好的文案）。
@@ -51,22 +51,21 @@ const BODY_MAX: usize = 140;
 /// 纯函数，测试钉在这里（`tests` 模块）：文案规则是界面的一部分，散在系统调用
 /// 旁边就只能靠手测。
 pub fn compose(s: &Snapshot) -> Option<Notice> {
-    if s.active {
-        return None;
+    // 还在跑、或者用户自己按的停止（他看着这一刻发生的，不用再提醒一次）
+    match s.outcome {
+        Outcome::Running | Outcome::Stopped { .. } => return None,
+        Outcome::Done { .. } | Outcome::Failed { .. } => {}
     }
-    // 用户自己按的停止：他看着这一刻发生的，不用再提醒一次
-    if s.stopped {
-        return None;
-    }
+    let ok = s.outcome.ok();
     let title = format!(
         "{} · {}",
-        if s.ok { "完成" } else { "出错了" },
+        if ok { "完成" } else { "出错了" },
         name_or(&s.title, "新对话")
     );
     // 正文 = 回复预览（`Snapshot::detail`，核心里是「模型最后说的那行」）
     let body = match s.detail.as_deref().map(text::one_line) {
         Some(d) if !d.is_empty() => text::cap(&d, BODY_MAX),
-        _ => if s.ok {
+        _ => if ok {
             "任务跑完了"
         } else {
             "任务失败了"
