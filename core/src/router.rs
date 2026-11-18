@@ -575,17 +575,33 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
 /// 1. `#7` / `7`（纯数字）→ 按 `seq` 找
 /// 2. 其它 → 当完整 id 精确匹配（**完全向后兼容**：老调用方/老提示词照旧传 uuid）
 ///
-/// ## 权限在这里就判
+/// ## 权限在这里就判，但**错误信息要分清两种**
 ///
 /// 每条路都要求 `dispatched_by == Some(from)`。**短名不是权限的后门**：猜别人的
-/// `#3` 也是一句「没有这条会话」。不是自己的会话当作不存在（和三处调用点原来的
-/// 行为一致，理由也一致：不泄露别人有什么）。
+/// `#3` 拿不到那条会话。
+///
+/// 但「拿不到」有两种，以前**混成一句话**了 —— 那是撒谎：
+///
+/// | 情况 | 说什么 |
+/// | --- | --- |
+/// | 号/ id **压根不存在** | `没有 #161 这条会话` |
+/// | 号/ id **存在，但不是这个 Router 派的** | `#161 不是你派出去的会话，你看不到它` |
+///
+/// 为什么必须分开：用户说「#161 怎么样了」，模型如果回「没有这条会话」，那是
+/// **一句假话**（它明明存在），用户会以为库里没这条、去别处找。这和这个项目一直
+/// 在清的那类问题（静默失败、错误信息不指向真实原因）是同一种病。
+///
+/// **分开的同时一个字的正文都不给**：只说「存在、但不是你的」，标题 / brief /
+/// conclusion / 消息一律不回。确认存在不等于泄露内容 —— 编号是全局发的、用户
+/// 自己看得见（抽屉里就显示 `#161`），所以「这个号存在」本来就不是秘密。
 ///
 /// ## 找不到时给候选
 ///
 /// 「没有这条会话」是**最没用的一句话** —— 调用方手里只有这个串，它能做的最好的
 /// 事就是再猜一次。所以这里顺手做一次模糊匹配（号、id 前缀、标题子串），最多列
 /// 3 条。这不是替调用方决定，是把「它可能想问的是哪几条」摆出来。
+///
+/// （候选**只从自己名下的**里挑 —— 别人的标题一个字都不给。）
 pub fn resolve<'a>(
     store: &'a crate::agent::SessionStore,
     from: &str,
@@ -596,13 +612,16 @@ pub fn resolve<'a>(
         return Err("缺少参数 session_id（可以用短编号 `#7`，也可以用完整 id）".to_string());
     }
 
-    // 只看自己名下的：权限而不是过滤（不是自己的当作不存在）
+    // 只看自己名下的：权限而不是过滤（不是自己的**内容**一个字都不给）
     let mine = || {
         store
             .sessions
             .iter()
             .filter(|s| s.dispatched_by() == Some(from))
     };
+    // 全表的查找（**只用来判断「这个号/ id 到底存不存在」**，绝不读它的字段）
+    let exists =
+        |pred: &dyn Fn(&crate::agent::ChatSession) -> bool| store.sessions.iter().any(pred);
 
     // 1) `#7` 或 `7`
     let digits = raw.strip_prefix('#').unwrap_or(raw);
@@ -611,7 +630,10 @@ pub fn resolve<'a>(
             if let Some(s) = mine().find(|s| s.seq == Some(n)) {
                 return Ok(s);
             }
-            // 是号但没这条：给候选（比「完整 id 找不到」有用得多）
+            // 是号但拿不到：**先分清是「没有」还是「不是你的」**
+            if exists(&|s| s.seq == Some(n)) {
+                return Err(not_mine(raw));
+            }
             return Err(no_such(store, from, raw, Some(n)));
         }
     }
@@ -620,7 +642,24 @@ pub fn resolve<'a>(
     if let Some(s) = mine().find(|s| s.id == raw) {
         return Ok(s);
     }
+    if exists(&|s| s.id == raw) {
+        return Err(not_mine(raw));
+    }
     Err(no_such(store, from, raw, None))
+}
+
+/// 「这条会话**存在**，但不是你派出去的」。
+///
+/// **只说这一句，不给任何内容**（标题 / 结论 / 消息都不回）。确认存在不算泄露：
+/// 编号是全局发的、用户自己在抽屉里就看得见 `#161`。
+///
+/// 为什么不干脆说「没有这条会话」（以前的做法）：那是**假话** —— 用户问
+/// 「#161 怎么样了」时，模型会答「库里没这条」，人就去别处找了。
+fn not_mine(raw: &str) -> String {
+    format!(
+        "{raw} 不是你派出去的会话，你看不到它（它确实存在，只是不归你管）。\
+         用 `list_sessions` 看你自己的。"
+    )
 }
 
 /// 「没有这条会话」那句话 —— 带上最多 3 条**最可能想问的**。
@@ -1351,6 +1390,66 @@ mod tests {
         );
     }
 
+    /// **「没有这条」和「存在但不归你」是两句不同的话。**
+    ///
+    /// 以前混成一句「没有这条会话」—— 那是**撒谎**：用户问「#161 怎么样了」时，
+    /// 模型会答「库里没这条」，人就跑去别处找了。
+    ///
+    /// 三种断言：
+    /// 1. 号**不存在** → `没有 #N 这条会话`
+    /// 2. 号**存在但不是我的** → `#N 不是你派出去的会话`（**不说「没有」**）
+    /// 3. 后者的错误里**一个字的内容都没有**（标题 / 结论都不给）
+    ///
+    /// 变异验证：把 `resolve` 里那个 `if exists(..) { return Err(not_mine(..)) }`
+    /// 删掉（退回统一「没有」）→ 这条挂。
+    #[tokio::test]
+    async fn a_missing_number_and_someone_elses_number_get_different_errors() {
+        let (core, rid_a) = with_router("two-errors").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        let n = dispatch_one(&core, &rid_a, "A 的机密任务").await;
+        let rid_b = {
+            let mut store = core.state.chat.write().await;
+            store.push_new(ChatSession::with_role(Role::Router))
+        };
+
+        // ① 号压根不存在（用一个远大于任何已发号的数）
+        let err = resolve(
+            &*core.state.chat.read().await,
+            &rid_b,
+            &format!("#{}", n + 9000),
+        )
+        .expect_err("没这个号");
+        assert!(err.contains("没有"), "不存在的号要说「没有」：{err}");
+        assert!(
+            !err.contains("不是你派出去的"),
+            "不存在的号**不该**说「不归你」（它根本不存在）：{err}"
+        );
+
+        // ② 号存在，但是 A 的
+        let store = core.state.chat.read().await;
+        let err = resolve(&store, &rid_b, &format!("#{n}")).expect_err("不是 B 的");
+        assert!(
+            err.contains("不是你派出去的会话"),
+            "存在但不归 B：要说清这一点：{err}"
+        );
+        assert!(
+            !err.contains("没有"),
+            "**不许出现「没有」**（它在撒谎，那条会话明明在）：{err}"
+        );
+        // ③ 一个字的正文都不给
+        assert!(!err.contains("机密任务"), "不能泄露标题：{err}");
+
+        // ④ 完整 id 走同一条路（不只是短名）
+        let sid = {
+            let s = store.sessions.iter().find(|s| s.seq == Some(n)).unwrap();
+            s.id.clone()
+        };
+        let err = resolve(&store, &rid_b, &sid).expect_err("不是 B 的");
+        assert!(err.contains("不是你派出去的会话"), "{err}");
+        assert!(!err.contains("机密任务"), "{err}");
+    }
+
     /// **短名不是权限的后门**：猜别人的号 → 「没有这条会话」。
     ///
     /// 场景：两个 Router（A 和 B），A 派了一条（`#1`），B 拿 `#1` 去 read/close/dispatch
@@ -1377,7 +1476,11 @@ mod tests {
         let err = read_session(&core, &rid_b, &serde_json::json!({ "session_id": short }))
             .await
             .expect_err("B 不该读得到 A 的会话");
-        assert!(err.contains("没有这条会话"), "{err}");
+        assert!(
+            err.contains("不是你派出去的会话"),
+            "**要如实说「存在但不归你」**，不能说「没有」（那是撒谎）：{err}"
+        );
+        assert!(!err.contains("没有"), "不能出现「没有」（它在撒谎）：{err}");
         assert!(
             !err.contains("A 的秘密任务"),
             "错误信息**不能泄露**别人会话的标题：{err}"
@@ -2811,7 +2914,7 @@ mod tests {
         )
         .await
         .expect_err("不该能读别人的");
-        assert!(err.contains("没有这条会话"), "{err}");
+        assert!(err.contains("不是你派出去的会话"), "{err}");
 
         let err = dispatch(
             &core,
@@ -2820,7 +2923,7 @@ mod tests {
         )
         .await
         .expect_err("不该能派别人的");
-        assert!(err.contains("没有这条会话"), "{err}");
+        assert!(err.contains("不是你派出去的会话"), "{err}");
     }
 
     /// **再派一次：同一条会话，要求追加而不是覆盖。**
