@@ -640,7 +640,21 @@ pub async fn ensure(st: &AppState) -> String {
             return id.clone();
         }
     }
-    let mut s = crate::agent::ChatSession::with_role(Role::Router);
+    // **复用原来的 id 重建**（如果有）。
+    //
+    // 这一行是「Router 被删之后看不到之前派出去的会话」那个 bug 的修法。
+    // 派出去的会话记着 `dispatched_by = <旧 Router id>`，而 `list_sessions` /
+    // `read_session` / `dispatch` 的归属判定全是「等于当前 Router 的 id」——
+    // 换个新 id 就等于把它们全变成孤儿，新 Router 一条都看不见。
+    //
+    // 复用的是**身份**不是内容：这条重建出来的会话历史是空的（旧历史真的没了），
+    // 但名字没变，所以那些会话仍然认这个 Router。
+    //
+    // 没有 `remembered`（第一次建、或者从来没存过 id）时才生成新的。
+    let mut s = match &remembered {
+        Some(prev) => crate::agent::ChatSession::with_id(Role::Router, prev.clone()),
+        None => crate::agent::ChatSession::with_role(Role::Router),
+    };
     // 起个名字：它空着的时候侧边栏得有个能认的东西。
     // **不是硬编码在界面里**的「协调」—— 那样换个客户端、换个语言就没了。
     // 建会话时写进 `title`，`maybe_title` 只在该字段为空时才动手，所以用户
@@ -696,6 +710,83 @@ mod tests {
             id
         };
         (core, rid)
+    }
+
+    /// **Router 被删之后重建，仍然看得到之前派出去的会话。**
+    ///
+    /// 这是真 bug 的回归测试：`ensure()` 以前重建时生成一个**新 id**，而
+    /// `list_sessions` / `read_session` / `dispatch` 的归属判定都是
+    /// 「`dispatched_by == 当前 Router 的 id`」—— 于是新 Router 一条都看不到，
+    /// 那些会话全成了孤儿。
+    ///
+    /// 修法是**复用旧 id 重建**（`ChatSession::with_id`）。这条测试走真实的
+    /// `ensure()`（不是 `with_router` 那个手搓 helper，它不写 `meta`）。
+    #[tokio::test]
+    async fn a_rebuilt_router_still_sees_what_it_dispatched_before() {
+        let core = core_with_db("rebuild");
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+
+        // 1) 走真实路径拿到 Router（它会写 meta.router_session）
+        let rid = ensure(&core.state).await;
+        assert_eq!(
+            core.state.meta_get(ROUTER_META_KEY).as_deref(),
+            Some(rid.as_str()),
+            "ensure 要把 id 记进 meta"
+        );
+
+        // 2) 派一条活
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活", "title": "那件事" }))
+            .await
+            .unwrap();
+        let worker = {
+            let store = core.state.chat.read().await;
+            store
+                .sessions
+                .iter()
+                .find(|s| s.dispatched_by() == Some(rid.as_str()))
+                .expect("派出去的会话该认得这个 Router")
+                .id
+                .clone()
+        };
+        end_running_turns(&core);
+
+        // 3) 把 Router 删掉（后端 `/api/sessions/delete` 没有角色守卫，真能删）
+        core.state.delete_session(&rid).await;
+        {
+            let store = core.state.chat.read().await;
+            assert!(store.get(&rid).is_none(), "前提：Router 真的没了");
+        }
+
+        // 4) 再要一次 —— 它会被重建
+        let rid2 = ensure(&core.state).await;
+
+        // **关键断言：id 没变**，所以归属关系还在
+        assert_eq!(rid2, rid, "重建要复用旧 id，否则派出去的会话全成孤儿");
+
+        // 5) 新 Router 看得到那条会话
+        let listed = list_sessions(&core, &rid2, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(
+            listed.contains(&worker),
+            "重建的 Router 必须看得到之前派出去的会话：{listed}"
+        );
+        assert!(listed.contains("那件事"), "标题也该在：{listed}");
+
+        // `read_session` 也认（它有一条独立的归属检查）
+        let detail = read_session(&core, &rid2, &serde_json::json!({ "session_id": worker }))
+            .await
+            .expect("重建的 Router 该读得了自己派出去的会话");
+        assert!(detail.contains("干点活"), "当初的要求该看得到：{detail}");
+
+        // 6) 旧历史确实没了（复用的是身份，不是内容）
+        let store = core.state.chat.read().await;
+        let rebuilt = store.get(&rid2).unwrap();
+        assert!(
+            rebuilt.messages.is_empty(),
+            "重建的会话历史该是空的（身份复用、内容不复活）"
+        );
     }
 
     /// **派活建的是会话，不是 ticket。** 而且「当初要它干什么 / 谁派的」

@@ -659,9 +659,23 @@ impl ChatSession {
     }
 
     pub fn with_role(role: Role) -> Self {
+        Self::with_id(role, uuid::Uuid::now_v7().to_string())
+    }
+
+    /// 同 [`Self::with_role`]，但**指定 id**。
+    ///
+    /// 只在一处用：Router 被删之后**用原来的 id 重建**（`router::ensure`）——
+    /// 派出去的会话记着 `dispatched_by = <旧 Router id>`，换个新 id 就等于
+    /// 把它们全变成孤儿（新的 Router 一条都看不到）。复用旧 id 是让那层归属
+    /// 关系在重建之后仍然成立的最省事的办法。
+    ///
+    /// 注意 id 是**会话身份**，不是内容：这条重建出来的会话历史是空的，
+    /// 只是**名字没变**。所以「之前派过什么」仍然查得到（那些会话还在，
+    /// `dispatched_by` 仍然指着这个名字），而「之前聊过什么」是真的没了。
+    pub fn with_id(role: Role, id: String) -> Self {
         let now = now_ms();
         Self {
-            id: uuid::Uuid::now_v7().to_string(),
+            id,
             title: String::new(),
             created_at: now,
             updated_at: now,
