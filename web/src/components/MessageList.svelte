@@ -765,6 +765,25 @@
      那条带 1px 边，发出去边一去掉气泡就宽、高各少 2px（实测 66×46 → 64×44），
      贴底的列表里顶边往下一挪、文字贴着 84% 上限时还会重新折行 —— 看着就是
      「跳一下」。现在只有颜色变（虚线淡掉、底色变实），盒子一像素都不动。 -->
+{#snippet workerReport(msg: Message & { fromWorker?: string })}
+  <!-- 子会话推回来的回执。**不画成用户气泡**：用户没说过这些话。
+       服务端在历史里只能把它存成 user 角色（OpenAI 协议要求，见 docs/16），
+       但那条消息带了 `origin: WorkerReport`，所以这里能认出来。 -->
+  {@const text = msg.parts
+    .map((p) => (p.type === "text" ? p.text : ""))
+    .join("")}
+  <div class="flex max-w-[92%] flex-col gap-1.5 self-start rounded-card bg-surface px-3.5 py-2.5">
+    <p class="flex items-center gap-1.5 text-xs text-faint">
+      <Icon name="sparkle" size={12} class="shrink-0 text-muted" />
+      <span>子会话报告</span>
+      <span class="truncate opacity-60">{(msg.fromWorker ?? "").slice(0, 8)}</span>
+    </p>
+    <p class="whitespace-pre-wrap break-words text-sm leading-6 text-muted">
+      {text}
+    </p>
+  </div>
+{/snippet}
+
 {#snippet userMessage(msg: Message)}
   {@const atts = msg.parts.filter(
     (p) => p.type === "image" || p.type === "file",
@@ -852,7 +871,9 @@
        同一个节点，只是 `done` 翻了 —— 于是颜色能真的过渡（虚线淡掉、底色变实）。
        分两个 each 的话是旧节点销毁、新节点创建，什么过渡都谈不上。 -->
     {#each shown as msg (msg.id)}
-      {#if msg.role === "user"}
+      {#if msg.role === "user" && msg.fromWorker}
+        {@render workerReport(msg)}
+      {:else if msg.role === "user"}
         {@render userMessage(msg)}
       {:else}
         <div class="flex flex-col gap-2.5 text-base leading-relaxed">

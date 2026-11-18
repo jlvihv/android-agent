@@ -99,6 +99,19 @@ fn frame_end(buf: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
+/// 把一段文本压到 `max` **字符**（按字符，不按字节），超了加「共 N 字」。
+///
+/// 和 [`cap`] 的区别：`cap` 只加省略号，这个会带上总长。用在「列表里那一行摘要」
+/// 这类地方 —— 一眼能看出原文有多长，就知道要不要去读全文。
+pub fn clip(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…（共 {n} 字）")
+}
+
 /// 压成一行：连续空白折成一个空格，首尾不留空白。
 ///
 /// 通知只有一段（多个换行会被系统折成一堆空白），登记表里也只需要一条线索；

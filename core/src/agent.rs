@@ -89,24 +89,29 @@ fn build_tools(p: Platform) -> Vec<ToolSpec> {
 /// 一层。靠提示词写「你别自己干」拦不住（DeepSeek 那篇的消融实验就是反面教材：
 /// 中性提示下模型 5 次运行一次都不委派）；靠工具表拦得住，因为它根本没那手。
 ///
-/// 四个工具对应两件事：**看**（`list_sessions` / `read_session`）和**说**
-/// （`dispatch` 派活给 Worker、`answer` 回话给用户）。
+/// 四个工具：**看**（`list_sessions` / `read_session`）、**说**（`dispatch`）、
+/// **收尾**（`close_session`）。`answer` 故意没有 —— 正文就是给用户看的话。
 fn build_router_tools(_p: Platform) -> Vec<ToolSpec> {
     vec![
         ToolSpec {
-            name: "list_tickets",
-            description: prompt::list_tickets_description(),
-            schema: prompt::list_tickets_schema,
+            name: "list_sessions",
+            description: prompt::list_sessions_description(),
+            schema: prompt::list_sessions_schema,
         },
         ToolSpec {
-            name: "read_ticket",
-            description: prompt::read_ticket_description(),
-            schema: prompt::read_ticket_schema,
+            name: "read_session",
+            description: prompt::read_session_description(),
+            schema: prompt::read_session_schema,
         },
         ToolSpec {
             name: "dispatch",
             description: prompt::dispatch_description(),
             schema: prompt::dispatch_schema,
+        },
+        ToolSpec {
+            name: "close_session",
+            description: prompt::close_session_description(),
+            schema: prompt::close_session_schema,
         },
     ]
 }
@@ -115,6 +120,21 @@ fn build_router_tools(_p: Platform) -> Vec<ToolSpec> {
 // 会话状态
 // ---------------------------------------------------------------------------
 
+/// 一条用户角色消息的来源。
+///
+/// 只做一件事：让代码分得清「这句是人说的」和「这句是子会话的回执」。
+/// 它**不进请求体**（`to_openai` / `build_responses_input` 都不读），
+/// 所以对 provider 零风险。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// 真人在输入框里打的（也包括 `/api/chat` 来的、脚本发的）
+    #[default]
+    Human,
+    /// 子会话回合结束时推回来的回执（见 `router::report_back`）
+    WorkerReport { session_id: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatMessage {
     System(String),
@@ -122,6 +142,17 @@ pub enum ChatMessage {
     User {
         text: String,
         attachments: Vec<Attachment>,
+        /// 这句话是谁送来的。默认 `Human`（老库没有这个字段，`serde(default)` 兜着）。
+        ///
+        /// **它不发给模型**：`to_openai` / `build_responses_input` 都不读它，
+        /// 所以对任何 provider 都是零风险（不需要靠 provider 宽容地忽略未知字段）。
+        /// 它的作用是让**代码**分得清「这句话是人说的」还是「这句是子会话的回执」，
+        /// 前端也因此不再把回执画成用户气泡。
+        ///
+        /// 要让**模型**也分得清，得靠正文里的结构化标记（见 `router::report_back`
+        /// 拼的 `<worker_report>` 块）—— 那是两件不同的事，这个字段替代不了它。
+        #[serde(default)]
+        origin: Origin,
     },
     Assistant {
         /// 正文 / 思考（可能几十 KB）。和 `Tool::content` 同理：每一步都会把整段
@@ -197,6 +228,16 @@ impl ChatMessage {
         ChatMessage::User {
             text: text.into(),
             attachments: Vec::new(),
+            origin: Origin::Human,
+        }
+    }
+
+    /// 一条**带来源**的用户消息（子会话的回执用它，见 `router::report_back`）。
+    pub fn from_worker(text: impl Into<String>, session_id: impl Into<String>) -> Self {
+        ChatMessage::User {
+            text: text.into(),
+            attachments: Vec::new(),
+            origin: Origin::WorkerReport { session_id: session_id.into() },
         }
     }
 
@@ -220,7 +261,7 @@ impl ChatMessage {
     fn to_openai(&self) -> Message {
         match self {
             ChatMessage::System(s) => Message::System { content: s.clone() },
-            ChatMessage::User { text, attachments } => {
+            ChatMessage::User { text, attachments, .. } => {
                 let mut body = text.clone();
                 for a in attachments {
                     let _ = write!(body, "\n[附件：{}（{}）]", a.name, a.mime);
@@ -324,6 +365,36 @@ pub struct ChatSession {
     pub messages: Vec<ChatMessage>,
     /// 给 provider 做 prompt cache 路由用的稳定会话 ID
     pub provider_session: String,
+    /// 这条会话是**被派活的**时，当初要它干什么（原文，一字不改）。
+    ///
+    /// ## 为什么这行字要单独存，而不是只留在历史里
+    ///
+    /// 历史会被压缩、会被 `evict` 掉，压缩之后「当初到底要它干什么」就变成一个
+    /// 模糊的摘要了 —— 而这句话是**验收的合同**：判断它干得对不对，靠的是原话，
+    /// 不是摘要。这一行独立存在，所以免疫压缩。
+    ///
+    /// `None` = 这条会话不是被派的（用户在输入框里自己开的）。
+    pub brief: Option<String>,
+    /// 派这条会话的 Router（会话 id）。`None` = 同上。
+    ///
+    /// 回合结束时靠它找到「这轮结果该告诉谁」。
+    pub dispatched_by: Option<String>,
+    /// 最近一次回合结束时它说的那段话（给人看的一句话结论）。
+    ///
+    /// 和 `brief` 同理：历史压缩之后，「它最后说成了什么」不能靠摘要。
+    /// 空串 = 还没跑过回合。
+    pub conclusion: String,
+    /// 给它派过几次活（同一个会话被补充要求会 +1）。
+    pub dispatches: u32,
+    /// 这条会话的**活**结束于什么时候（0 = 还没结束）。
+    ///
+    /// 只记「人把这件活收尾了」这一个事实：验收过了、或者不要了。
+    /// 它**不参与任何状态判定** —— 「现在在不在跑」看的是 `AppState::turns`
+    /// （回合是真的在跑），「上一轮成没成」看的是历史里的事实。这里只有一个
+    /// 布尔量级的东西：人有没有把这件活划掉。
+    pub closed_at: u64,
+    /// 划掉它的方式：`done` / `cancelled` / 空串。只用于显示。
+    pub closed_by: String,
     /// 消息**不在内存里**时的摘要；`None` = 消息都在 `messages` 里。
     ///
     /// 不活跃的会话只留元数据（几十个会话、每个带一堆几十 KB 的 bash 输出，
@@ -375,6 +446,12 @@ impl ChatSession {
             role,
             messages: Vec::new(),
             provider_session: new_provider_session(),
+            brief: None,
+            dispatched_by: None,
+            conclusion: String::new(),
+            dispatches: 0,
+            closed_at: 0,
+            closed_by: String::new(),
             stub: None,
             loaded_at: None,
             epoch: 0,
@@ -873,12 +950,25 @@ fn build_messages(
     let msgs = &sess.messages;
     let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
     let mut budget = ImageBudget::new(sess);
+    let mut reports = ReportBudget::iterator(sess);
     let mut i = 0;
     while i < msgs.len() {
         // 带附件的用户消息：正文 + 图片 / PDF 内容块拼在一条消息里。
-        if let ChatMessage::User { text, attachments } = &msgs[i] {
+        if let ChatMessage::User {
+            text,
+            attachments,
+            origin,
+        } = &msgs[i]
+        {
+            // 回执：新的是全文，攒够 `KEEP_REPORTS` 条之后更早的那些降级成指针。
+            let body = match origin {
+                Origin::WorkerReport { session_id } if !reports.full() => {
+                    demoted_report(session_id)
+                }
+                _ => text.clone(),
+            };
             out.push(user_message(
-                text,
+                &body,
                 attachments,
                 supports_images,
                 supports_files,
@@ -975,6 +1065,75 @@ const KEEP_IMAGES: usize = 4;
 /// 截断点**按整块往前挪**：内联的张数在 `KEEP_IMAGES` 到 `2 * KEEP_IMAGES - 1`
 /// 之间摆动，每多读 `KEEP_IMAGES` 张图才挪一次。每挪一次前缀就变了、prompt
 /// cache 断一次，一张一挪的话每步都断。截断点只由历史推导，请求仍然是确定的。
+/// 历史里最多保留几条回执的**全文**。更早的降级成一行指针（见 [`ReportBudget`]）。
+///
+/// ## 为什么是「旧回执降级」而不是「到手就截断」
+///
+/// 用户明确否决了「回执一到就砍到 600 字」—— 那会让 Router **永远**看不到
+/// 那次汇报的全文。这里做的是另一件事：**回执到达时永远是全文**（模型当时
+/// 看得到），只有等它攒够若干条之后，更早的那些才换成指针。全文仍在会话
+/// 历史里（`conclusion` 字段 + 消息本体），随时 `read_session` 取回。
+///
+/// ## 为什么按块取整
+///
+/// 和 [`KEEP_IMAGES`] 完全同一个理由：每来一条新回执就把边界往前挪一格的话，
+/// 每轮请求的前缀都不一样，prompt cache 永远不命中。这里一次降级一整块。
+const KEEP_REPORTS: usize = 4;
+
+/// 决定历史里每一条回执要不要给全文（见 [`KEEP_REPORTS`]）。
+///
+/// 和 `ImageBudget` 是同一个套路：数历史里一共有几条回执，算出「从第几条开始
+/// 只给指针」，然后按顺序判断。
+struct ReportBudget {
+    /// 从第几条（从 0 数）开始降级
+    from: usize,
+    seen: usize,
+}
+
+impl ReportBudget {
+    fn new(sess: &ChatSession) -> Self {
+        let total = sess
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    ChatMessage::User {
+                        origin: Origin::WorkerReport { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        Self {
+            // 按整块往前挪（和 ImageBudget 一字不差的理由：保住 prompt cache）
+            from: total.saturating_sub(KEEP_REPORTS) / KEEP_REPORTS * KEEP_REPORTS,
+            seen: 0,
+        }
+    }
+
+    /// 历史里的下一条回执要不要给全文
+    fn full(&mut self) -> bool {
+        let full = self.seen >= self.from;
+        self.seen += 1;
+        full
+    }
+
+    /// 历史里从头扫到尾的迭代器（`build_messages` / `build_responses_input` 用）
+    fn iterator(sess: &ChatSession) -> Self {
+        Self::new(sess)
+    }
+}
+
+/// 一条被降级的旧回执的正文：一行指针，指向还能读到全文的地方。
+fn demoted_report(session_id: &str) -> String {
+    format!(
+        "<worker_report session=\"{session_id}\" demoted=\"true\">\n\
+         （这条回报较早，全文已不在上下文里；要看就用 read_session 读会话 `{session_id}`。）\n\
+         </worker_report>"
+    )
+}
+
 struct ImageBudget {
     /// 从第几张（从 0 数）开始内联
     from: usize,
@@ -1604,13 +1763,25 @@ pub fn session_view_range_clipped(
             // 系统提示词（第一条，以及后续的“提示词升级”）是给模型看的，不给用户看
             ChatMessage::System(_) => {}
 
-            ChatMessage::User { text, attachments } => out.push(json!({
-                "id": format!("u{i}"),
-                "role": "user",
-                "steps": 0,
-                "done": true,
-                "parts": user_view_parts(text, attachments),
-            })),
+            ChatMessage::User {
+                text,
+                attachments,
+                origin,
+            } => {
+                let mut v = json!({
+                    "id": format!("u{i}"),
+                    "role": "user",
+                    "steps": 0,
+                    "done": true,
+                    "parts": user_view_parts(text, attachments),
+                });
+                // 回执不是人说的话：告诉前端，别把它画成用户气泡。
+                // 老客户端不认这个字段也没关系（它只知道 user/assistant）。
+                if let crate::agent::Origin::WorkerReport { session_id } = origin {
+                    v["fromWorker"] = json!(session_id);
+                }
+                out.push(v);
+            }
 
             ChatMessage::Assistant {
                 content,
@@ -1876,7 +2047,7 @@ pub async fn run_turn(
     run_turn_with(
         core,
         provider,
-        vec![(user_text.to_string(), attachments)],
+        vec![(user_text.to_string(), attachments, Origin::Human)],
         sid,
         turn,
         tx,
@@ -1892,7 +2063,7 @@ pub async fn run_turn(
 async fn run_turn_with(
     core: &Core,
     provider: &Provider,
-    msgs: Vec<(String, Vec<Attachment>)>,
+    msgs: Vec<(String, Vec<Attachment>, Origin)>,
     sid: &str,
     turn: std::sync::Arc<crate::state::Turn>,
     tx: mpsc::Sender<Value>,
@@ -1925,19 +2096,12 @@ async fn run_turn_with(
 async fn turn_once(
     core: &Core,
     provider: &Provider,
-    msgs: Vec<(String, Vec<Attachment>)>,
+    msgs: Vec<(String, Vec<Attachment>, Origin)>,
     sid: &str,
     turn: std::sync::Arc<crate::state::Turn>,
     tx: mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     let _guard = TurnGuard(core.clone(), sid.to_string());
-    // 这一轮如果是在干一个工作项，把它推到「在干」。
-    //
-    // **必须在这里**（回合真的开始了），不能在 `dispatch` 里：`dispatch` 只是把
-    // 消息排进队列，那条会话可能正忙着，几秒甚至几分钟之后才真正开跑。在
-    // `dispatch` 里就标「在干」等于撒谎（还没跑）；永远不标又会让界面一直显示
-    // 「排队中」（跑完了还显示排队中，那是之前的样子）。
-    crate::ticket::mark_started(core, sid).await;
     // 不活跃的会话消息不在内存里，先从库里读回来（回合进行中不会被放掉，
     // 见 `AppState::evict_idle`）
     core.state.ensure_loaded(sid).await?;
@@ -1965,12 +2129,12 @@ async fn turn_once(
         // 和这条用户消息。不插任何“每轮重发”的上下文块。
         ensure_system_prompt(sess, &system_prompt);
         // 标题用这一批的第一条（这个会话的第一条用户消息才真正生效）
-        if let Some((text, _)) = msgs.first() {
+        if let Some((text, _, _)) = msgs.first() {
             sess.maybe_title(text);
         }
         // 一条消息装下正文和附件。整批一起进历史 —— 模型一次就看到全部。
-        for (text, attachments) in msgs {
-            sess.messages.push(ChatMessage::User { text, attachments });
+        for (text, attachments, origin) in msgs {
+            sess.messages.push(ChatMessage::User { text, attachments, origin });
         }
         sess.updated_at = now_ms();
         // 通知栏那一行要显示哪个会话在跑（标题刚定下来，顺手取走，
@@ -2025,7 +2189,7 @@ pub async fn session_digest(
     if !s.resident() {
         return Ok("（没有可读的消息）".to_string());
     }
-    let clip = |t: &str| crate::ticket::clip(t, line_chars);
+    let clip = |t: &str| crate::text::clip(t, line_chars);
     let msgs = &s.messages;
     let start = msgs.len().saturating_sub(lines);
     let mut out = format!("执行记录（最近 {lines} 条，共 {} 条）：\n", msgs.len());
@@ -2064,7 +2228,7 @@ pub async fn session_digest(
 /// 这个会话最后一条助手消息的正文（回报给 Router 用）。
 ///
 /// 只要正文，不要工具调用和思考：Router 关心的是「它做完说了什么」，不是它
-/// 中间跑了多少条命令（那些在它自己的会话里，要看再 `read_ticket`）。
+/// 中间跑了多少条命令（那些在它自己的会话里，要看再 `read_session`）。
 ///
 /// **一个字都不截**。worker 认认真真干完一件事，末尾那段就是全部的交付说明 ——
 /// 截断它等于把交付物撕掉一半。上下文顶满了是另一个问题（有 compaction 管），
@@ -2360,6 +2524,7 @@ async fn deliver_queued(
         let msg = ChatMessage::User {
             text: m.text,
             attachments: m.attachments,
+            origin: m.origin,
         };
         append(core, sid, msg).await;
     }
@@ -2390,11 +2555,11 @@ pub fn continue_with_queued(core: &Core, provider: &Provider, sid: &str) {
     let Some(turn) = core.state.begin_turn(sid) else {
         return;
     };
-    let msgs: Vec<(String, Vec<Attachment>)> = core
+    let msgs: Vec<(String, Vec<Attachment>, Origin)> = core
         .state
         .drain_queued(sid)
         .into_iter()
-        .map(|m| (m.text, m.attachments))
+        .map(|m| (m.text, m.attachments, m.origin))
         .collect();
     if msgs.is_empty() {
         core.state.end_turn(sid);
@@ -2503,15 +2668,29 @@ fn build_responses_input(
 ) -> Vec<InputItem> {
     let mut out: Vec<InputItem> = Vec::new();
     let mut budget = ImageBudget::new(sess);
+    let mut reports = ReportBudget::iterator(sess);
     for m in &sess.messages {
         match m {
             ChatMessage::System(s) => {
                 out.push(message_item("system", MessageContent::Text(s.clone())));
             }
-            ChatMessage::User { text, attachments } => out.push(message_item(
-                "user",
-                user_message_content(text, attachments, supports_images, supports_files),
-            )),
+            ChatMessage::User {
+                text,
+                attachments,
+                origin,
+            } => {
+                // 同 `build_messages`：老回执降级成指针，新回执给全文
+                let body = match origin {
+                    Origin::WorkerReport { session_id } if !reports.full() => {
+                        demoted_report(session_id)
+                    }
+                    _ => text.clone(),
+                };
+                out.push(message_item(
+                    "user",
+                    user_message_content(&body, attachments, supports_images, supports_files),
+                ));
+            }
             ChatMessage::Assistant {
                 content,
                 tool_calls,
@@ -3489,10 +3668,11 @@ fn tool_output_event(id: &str, text: &str, images: &[ImagePart]) -> Value {
 /// 这里只是「这个名字归 `router` 模块管」。多一层角色判断反而多一处要同步的地方。
 async fn router_tool(core: &Core, name: &str, args: &Value, sid: &str) -> Option<ToolOutcome> {
     let out = match name {
-        "list_tickets" => crate::router::list_tickets(core, sid, args).await,
-        "read_ticket" => crate::router::read_ticket(core, sid, args).await,
-        // 传 sid：工作项要记「谁派的」，做完才知道汇报给谁
+        "list_sessions" => crate::router::list_sessions(core, sid, args).await,
+        "read_session" => crate::router::read_session(core, sid, args).await,
+        // 传 sid：新会话要记「谁派的」，做完才知道汇报给谁
         "dispatch" => crate::router::dispatch(core, sid, args).await,
+        "close_session" => crate::router::close_session(core, sid, args).await,
         _ => return None,
     };
     Some(match out {
@@ -4081,6 +4261,89 @@ mod tests {
             .contains("brew"));
     }
 
+    /// **新到的回执永远是全文**（用户明确否决了「到手就截断」）。
+    ///
+    /// 只有攒够 `KEEP_REPORTS` 条之后，**更早的**那些才降级成指针 ——
+    /// 那时 Router 已经看过全文了，指针指向 `read_session` 还能取回。
+    #[test]
+    fn a_fresh_report_is_always_delivered_in_full() {
+        let mut sess = ChatSession::with_role(Role::Router);
+        ensure_system_prompt(&mut sess, crate::prompt::router_description());
+
+        // 塞 4 条旧回执，每条都带上标记
+        for i in 0..KEEP_REPORTS {
+            sess.messages.push(ChatMessage::from_worker(
+                format!("<worker_report session=\"s{i}\">\n第 {i} 条的正文，要够长才能验出来。\n</worker_report>"),
+                format!("s{i}"),
+            ));
+        }
+        // 再来一条**新的**：它必须是全文
+        let fresh = "<worker_report session=\"new\">\n这是刚到的第 5 条，全文都该在。\n</worker_report>";
+        sess.messages.push(ChatMessage::from_worker(fresh, "new"));
+
+        let msgs = build_messages(&sess, true, false).unwrap();
+        let joined: String = msgs
+            .iter()
+            .map(|m| match m {
+                Message::User {
+                    content: UserContent::Text(t),
+                } => t.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            joined.contains("这是刚到的第 5 条"),
+            "新到的回执必须是全文：{joined}"
+        );
+        // 全局设定 KEEP_REPORTS=4 时会话里共有 5 条，按整块取整后 from=0，
+        // 所以这一轮全都还是全文。再塞 4 条才会开始降级。
+        for i in (0..KEEP_REPORTS).rev().take(3) {
+            assert!(
+                joined.contains(&format!("第 {i} 条的正文")),
+                "还没到降级点，第 {i} 条也该是全文：{joined}"
+            );
+        }
+    }
+
+    /// 攒够一整块之后，更早的回执降级成指针 —— 但**指针里有会话 id**，
+    /// 所以全文仍然可以 `read_session` 取回（不是丢失，是折叠）。
+    #[test]
+    fn old_reports_collapse_to_a_pointer_that_can_still_be_followed() {
+        let mut sess = ChatSession::with_role(Role::Router);
+        ensure_system_prompt(&mut sess, crate::prompt::router_description());
+        // 两整块
+        for i in 0..(KEEP_REPORTS * 2) {
+            sess.messages.push(ChatMessage::from_worker(
+                format!("<worker_report session=\"s{i}\">\n第 {i} 条的正文\n</worker_report>"),
+                format!("s{i}"),
+            ));
+        }
+        let msgs = build_messages(&sess, true, false).unwrap();
+        let joined: String = msgs
+            .iter()
+            .map(|m| match m {
+                Message::User {
+                    content: UserContent::Text(t),
+                } => t.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 最早那一条被折叠了
+        assert!(!joined.contains("第 0 条的正文"), "第 0 条该被降级：{joined}");
+        assert!(joined.contains("demoted=\"true\""), "要标出这是降级过的：{joined}");
+        assert!(joined.contains("read_session"), "要给回去读的办法：{joined}");
+        assert!(joined.contains("s0"), "要带上是哪条会话（否则取不回来）：{joined}");
+        // 最新的那条仍然是全文
+        assert!(
+            joined.contains(&format!("第 {} 条的正文", KEEP_REPORTS * 2 - 1)),
+            "最新的必须是全文：{joined}"
+        );
+    }
+
     /// 只比 `messages` 不够：工具表也是可缓存前缀的一部分。
     /// 完整请求体（含 tools / stream_options）跨轮必须是前缀关系。
     #[test]
@@ -4195,10 +4458,11 @@ mod tests {
                     "{p:?} 的 router 表里出现了 `{forbidden}`：协调层不能有执行能力"
                 );
             }
-            // 三个编排工具都在（少一个就是某个能力悄悄没了）
+            // 四个编排工具都在（少一个就是某个能力悄悄没了）：
+            // 看（list_sessions / read_session）、派（dispatch）、收尾（close_session）。
             // 并且**没有** `answer`：模型的正文本来就是给用户看的那句话，
             // 专门为说话开一个工具只会白多一轮请求。
-            for required in ["list_tickets", "read_ticket", "dispatch"] {
+            for required in ["list_sessions", "read_session", "dispatch", "close_session"] {
                 assert!(
                     names.contains(&required),
                     "{p:?} 的 router 表里缺少 `{required}`"
@@ -4206,7 +4470,7 @@ mod tests {
             }
             // 反过来的那一半：worker 表里不该有编排工具（它没有派活的对象）
             let worker: Vec<&str> = tools(p, Role::Worker).iter().map(|t| t.name).collect();
-            for orchestration in ["list_tickets", "read_ticket", "dispatch"] {
+            for orchestration in ["list_sessions", "read_session", "dispatch", "close_session"] {
                 assert!(
                     !worker.contains(&orchestration),
                     "{p:?} 的 worker 表里出现了 `{orchestration}`：那是协调层的事"
@@ -4489,10 +4753,7 @@ mod bench_search {
         let reasoning = "想".repeat(1000);
         let content = "回答".repeat(10);
         let output = "输出行\n".repeat(2000);
-        sess.messages.push(ChatMessage::User {
-            text: "问一句".into(),
-            attachments: vec![],
-        });
+        sess.messages.push(ChatMessage::user("问一句"));
         sess.messages.push(ChatMessage::Assistant {
             // 三个都不再用了：直接 move 进来，不用 clone
             content: content.into(),
@@ -4579,10 +4840,7 @@ mod bench_search {
             r#"{{"command":"ls -la\n{}","timeout":30}}"#,
             "x".repeat(4000)
         );
-        sess.messages.push(ChatMessage::User {
-            text: "跑".into(),
-            attachments: vec![],
-        });
+        sess.messages.push(ChatMessage::user("跑"));
         sess.messages.push(ChatMessage::Assistant {
             content: String::new().into(),
             reasoning: String::new().into(),

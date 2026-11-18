@@ -257,6 +257,9 @@ pub struct QueuedMsg {
     pub text: String,
     /// 已经从 `pending_attachments` 里取出来的附件（排队期间留着，交给模型时用）
     pub attachments: Vec<crate::agent::Attachment>,
+    /// 这条排进来的消息是谁送的：真人（界面 `/api/chat`）还是子会话的回执。
+    /// 投进会话历史时原样带到 `ChatMessage::User.origin` 上。
+    pub origin: crate::agent::Origin,
 }
 
 pub struct AppState {
@@ -1292,6 +1295,7 @@ impl AppState {
             .map(|m| crate::agent::ChatMessage::User {
                 text: m.text,
                 attachments: m.attachments,
+                origin: m.origin,
             })
             .collect();
         if msgs.is_empty() {
@@ -1406,6 +1410,85 @@ impl AppState {
         // 读库那会儿 `record_usage` 可能已经记上了：以内存里的为准
         let mut g = self.usage.lock().ok()?;
         g.entry(sid.to_string()).or_insert(u).clone()
+    }
+
+    // ---- 会话上的「被派活」记录（见 `agent::ChatSession` 的 brief 那一段） ----
+
+    /// 这条会话是被哪个 Router 派出去的？`None` = 用户自己开的。
+    ///
+    /// 同步读内存里的会话表（`ChatSession` 在 `chat` 锁里），不查库。
+    pub fn dispatched_by(&self, sid: &str) -> Option<String> {
+        let store = self.chat.try_read().ok()?;
+        store.get(sid)?.dispatched_by.clone()
+    }
+
+    /// 这条会话的活被划掉了吗（验收过 / 不要了）。
+    pub fn is_closed(&self, sid: &str) -> bool {
+        self.chat
+            .try_read()
+            .ok()
+            .and_then(|s| s.get(sid).map(|x| x.closed_at != 0))
+            .unwrap_or(false)
+    }
+
+    /// 把一件活收尾（验收过 / 不要了）。
+    ///
+    /// 只写两个事实：`closed_at`（什么时候）、`closed_by`（怎么收的）。
+    /// **不写任何「状态」** —— 「在不在跑」永远看 `turns`，「成没成」看历史。
+    pub fn close_session(&self, sid: &str, by: &str) {
+        if let Ok(mut store) = self.chat.try_write() {
+            if let Some(s) = store.get_mut(sid) {
+                s.closed_at = crate::agent::now_ms();
+                s.closed_by = by.to_string();
+                s.updated_at = crate::agent::now_ms();
+            }
+        }
+        self.mark_sessions_dirty();
+    }
+
+    /// 再派一次之前把「已收尾」清掉（不然回执会被 `is_closed` 挡住）。
+    pub fn reopen_session(&self, sid: &str) {
+        if let Ok(mut store) = self.chat.try_write() {
+            if let Some(s) = store.get_mut(sid) {
+                s.closed_at = 0;
+                s.closed_by.clear();
+                s.dispatches = s.dispatches.saturating_add(1);
+                s.updated_at = crate::agent::now_ms();
+            }
+        }
+        self.mark_sessions_dirty();
+    }
+
+    /// 补充要求：追加到 `brief` 末尾，**不覆盖原文**。
+    ///
+    /// 当初的要求是验收合同 —— 直接覆盖就没人记得原话是什么了。
+    pub fn append_brief(&self, sid: &str, addition: &str) {
+        if let Ok(mut store) = self.chat.try_write() {
+            if let Some(s) = store.get_mut(sid) {
+                match &mut s.brief {
+                    Some(b) => {
+                        b.push_str("\n\n---\n\n（补充要求）\n");
+                        b.push_str(addition);
+                    }
+                    None => s.brief = Some(addition.to_string()),
+                }
+                s.updated_at = crate::agent::now_ms();
+            }
+        }
+        self.mark_sessions_dirty();
+    }
+
+    /// 记下这条会话最近一次的结论（`ChatSession::conclusion`）。
+    ///
+    /// 只在内存里改字段 + 标脏；落盘由 2 秒的定时器做。
+    pub fn set_conclusion(&self, sid: &str, text: &str) {
+        if let Ok(mut store) = self.chat.try_write() {
+            if let Some(s) = store.get_mut(sid) {
+                s.conclusion = text.to_string();
+                s.updated_at = crate::agent::now_ms();
+            }
+        }
+        self.mark_sessions_dirty();
     }
 
     /// 会话没了：内存里那份扔掉。库里的行**留着**（分析用，见 db.rs 的 `usage` 表）。

@@ -377,6 +377,14 @@ export type Message = {
   role: "user" | "assistant";
   parts: Part[];
   /**
+   * 这条 user 消息其实是**子会话推回来的回执**（服务端 `ChatMessage::User.origin`
+   * 是 `WorkerReport`）。有值就是那条子会话的 id。
+   *
+   * 服务端在历史里只能把它存成 `user`（协议要求，见 docs/16），但没有这个标记的话
+   * 用户会在 Router 会话里看到一堆自己没说过的话、还显示成自己说的样子。
+   */
+  fromWorker?: string;
+  /**
    * 流里的 `data-warning`（「输出被长度上限截断」「LLM 重试中」…）。
    *
    * **不是 part**，故意：`parts` 的下标要和**服务端**的 `view_parts_len` 对齐

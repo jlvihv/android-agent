@@ -46,7 +46,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at       INTEGER NOT NULL,
   provider_session TEXT NOT NULL,
   -- worker | router（见 agent::Role）。默认 worker：老库加这一列时已有的会话全是 worker。
-  role             TEXT NOT NULL DEFAULT 'worker'
+  role             TEXT NOT NULL DEFAULT 'worker',
+  -- 下面五列以前在 `tickets` 表上（那一层已经删了，见 docs/16）。
+  -- 它们是**不可变记录**，不是状态机：只记「当初要它干什么 / 谁派的 /
+  -- 最后说成了什么 / 人有没有把它划掉」。没有一处代码靠它们做状态判定。
+  --
+  -- 为什么单独存而不只留历史里：历史会被压缩、会被 evict，而
+  -- brief 是验收的合同、conclusion 是交付物 —— 两者都必须免疫压缩。
+  brief            TEXT,
+  dispatched_by    TEXT,
+  conclusion       TEXT NOT NULL DEFAULT '',
+  dispatches       INTEGER NOT NULL DEFAULT 0,
+  closed_at        INTEGER NOT NULL DEFAULT 0,
+  closed_by        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -160,7 +172,15 @@ CREATE TABLE IF NOT EXISTS usage (
 
 CREATE INDEX IF NOT EXISTS idx_usage_session ON usage(session_id, id);
 
--- 工作项（Ticket）：双层架构里**被派出去的那件事**本身。
+-- 【已废弃，只读不写】工作项（Ticket）表。
+--
+-- 这一层已经删掉了：ticket 的字段并进了 `sessions`（见上面的五列）。
+-- 表**留着不删**只为一件事：老库里的派工记录（brief / result / 谁派的）
+-- 还有价值，`migrate()` 会把它们搬进 sessions。搬完之后这张表没人再读。
+--
+-- **不要往这里写新数据**。
+--
+-- 原来的说明（留档）：双层架构里**被派出去的那件事**本身。
 --
 -- 为什么不是「一个会话」：会话是容器 —— 没有状态、没有产出契约、没有终点，
 -- 可以一直开着改十件事。Router 派完就失去了对这件事的掌控（那个活变成了
@@ -198,7 +218,9 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE INDEX IF NOT EXISTS idx_tickets_router ON tickets(router_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tickets_session ON tickets(session_id);
 
--- 「这条会话现在在干哪个工作项」。
+-- 【已废弃，只读不写】「这条会话现在在干哪个工作项」。
+--
+-- 已由 `sessions.dispatched_by` 取代。留着只为兼容老库。
 --
 -- 一个会话同一时刻只干一件事（回合本来就是串行的），所以主键是 session_id。
 -- Worker 的回合结束时，靠它找到「这一轮该汇报给哪个工作项」。
@@ -233,6 +255,73 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'")
             .context("加 sessions.role")?;
     }
+
+    // ticket 那一层并进 session 之后加的五列（见 docs/16）。
+    //
+    // 老库的 `tickets` 表**不删**：里面有派过的活的 brief / 结果，那是历史，
+    // 删了就找不回来。它只是不再被读（`drop_tickets_table` 单独处理，见下）。
+    for (col, ddl) in [
+        ("brief", "ALTER TABLE sessions ADD COLUMN brief TEXT"),
+        (
+            "dispatched_by",
+            "ALTER TABLE sessions ADD COLUMN dispatched_by TEXT",
+        ),
+        (
+            "conclusion",
+            "ALTER TABLE sessions ADD COLUMN conclusion TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "dispatches",
+            "ALTER TABLE sessions ADD COLUMN dispatches INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "closed_at",
+            "ALTER TABLE sessions ADD COLUMN closed_at INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "closed_by",
+            "ALTER TABLE sessions ADD COLUMN closed_by TEXT NOT NULL DEFAULT ''",
+        ),
+    ] {
+        if !has_column(conn, "sessions", col)? {
+            conn.execute_batch(ddl)
+                .with_context(|| format!("加 sessions.{col}"))?;
+        }
+    }
+
+    // 老 `tickets` 里有、而新 `sessions` 里还没有的记录，**搬一次**：
+    // 每条 ticket 本来就对应一条 worker 会话（`tickets.session_id`），
+    // 把 brief / 结论 / 派工次数搬过去，会话就同时是那条活的载体了。
+    //
+    // 幂等：只在 `brief IS NULL` 时写（搬过的不会再被覆盖）。
+    conn.execute_batch(
+        "UPDATE sessions SET
+           brief = COALESCE(brief, (SELECT t.brief FROM tickets t WHERE t.session_id = sessions.id)),
+           dispatched_by = COALESCE(dispatched_by,
+                                    (SELECT t.router_id FROM tickets t WHERE t.session_id = sessions.id)),
+           conclusion = CASE WHEN conclusion = '' THEN
+                             COALESCE((SELECT t.result FROM tickets t WHERE t.session_id = sessions.id), '')
+                        ELSE conclusion END,
+           dispatches = MAX(dispatches,
+                            COALESCE((SELECT t.dispatches FROM tickets t WHERE t.session_id = sessions.id), 0)),
+           closed_at = COALESCE(NULLIF(closed_at, 0),
+                                (SELECT t.ended_at FROM tickets t WHERE t.session_id = sessions.id), 0),
+           closed_by = CASE WHEN closed_by = '' THEN
+                            COALESCE((SELECT t.ended_by FROM tickets t WHERE t.session_id = sessions.id), '')
+                       ELSE closed_by END
+         WHERE brief IS NULL
+           AND EXISTS (SELECT 1 FROM tickets t WHERE t.session_id = sessions.id);",
+    )
+    .context("把老 tickets 搬进 sessions")
+    .or_else(|e| {
+        // 全新库里没有 tickets 表：`EXISTS` 那句会报 no such table。
+        // 那不是错误，只是没东西可搬。
+        if e.to_string().contains("no such table") {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })?;
     Ok(())
 }
 
@@ -320,6 +409,14 @@ struct Saved {
     title: String,
     provider_session: String,
     role: crate::agent::Role,
+    /// 下面几项必须进水线线：不认它们的话「只是验收了、没新消息」的改动
+    /// 永远落不了盘（`plan` 会认为这条会话没变）。
+    brief: Option<String>,
+    dispatched_by: Option<String>,
+    conclusion: String,
+    dispatches: u32,
+    closed_at: u64,
+    closed_by: String,
 }
 
 impl Saved {
@@ -331,6 +428,12 @@ impl Saved {
             title: s.title.clone(),
             provider_session: s.provider_session.clone(),
             role: s.role,
+            brief: s.brief.clone(),
+            dispatched_by: s.dispatched_by.clone(),
+            conclusion: s.conclusion.clone(),
+            dispatches: s.dispatches,
+            closed_at: s.closed_at,
+            closed_by: s.closed_by.clone(),
         }
     }
 }
@@ -365,6 +468,12 @@ struct PlannedSession {
     updated_at: u64,
     provider_session: String,
     role: crate::agent::Role,
+    brief: Option<String>,
+    dispatched_by: Option<String>,
+    conclusion: String,
+    dispatches: u32,
+    closed_at: u64,
+    closed_by: String,
     /// 消息不在内存里的会话只更新会话头：`None`
     messages: Option<PlannedMessages>,
     /// 写成之后的水位线
@@ -461,7 +570,8 @@ impl Db {
                 // 普通空会话不落盘，所以 LEFT JOIN 不会让它们冒出来 —— 库里本来
                 // 就没有它们的行。
                 r#"SELECT s.id, s.title, s.created_at, s.updated_at, s.provider_session, s.role,
-                          COUNT(m.seq), COALESCE(SUM(m.payload LIKE '{"User%'), 0)
+                          COUNT(m.seq), COALESCE(SUM(m.payload LIKE '{"User%'), 0),
+                          s.brief, s.dispatched_by, s.conclusion, s.dispatches, s.closed_at, s.closed_by
                    FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
                    GROUP BY s.id
                    ORDER BY s.updated_at DESC"#,
@@ -476,11 +586,18 @@ impl Db {
                     r.get::<_, String>(5)?,
                     r.get::<_, i64>(6)?,
                     r.get::<_, i64>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, i64>(12)?,
+                    r.get::<_, String>(13)?,
                 ))
             })?;
 
             for row in rows {
-                let (id, title, created_at, updated_at, provider_session, role, len, users) = row?;
+                let (id, title, created_at, updated_at, provider_session, role, len, users,
+                     brief, dispatched_by, conclusion, dispatches, closed_at, closed_by) = row?;
                 let s = ChatSession {
                     id,
                     title,
@@ -489,6 +606,12 @@ impl Db {
                     role: crate::agent::Role::from_db(&role),
                     messages: Vec::new(),
                     provider_session,
+                    brief,
+                    dispatched_by,
+                    conclusion,
+                    dispatches: dispatches.max(0) as u32,
+                    closed_at: closed_at.max(0) as u64,
+                    closed_by,
                     stub: Some(Stub {
                         len: len.max(0) as usize,
                         users: users.max(0) as usize,
@@ -685,6 +808,12 @@ impl Db {
                 updated_at: s.updated_at,
                 provider_session: s.provider_session.clone(),
                 role: s.role,
+                brief: s.brief.clone(),
+                dispatched_by: s.dispatched_by.clone(),
+                conclusion: s.conclusion.clone(),
+                dispatches: s.dispatches,
+                closed_at: s.closed_at,
+                closed_by: s.closed_by.clone(),
                 messages,
                 saved: p.saved,
             });
@@ -717,20 +846,33 @@ impl Db {
         let tx = g.conn.transaction()?;
         for s in &plan.sessions {
             tx.execute(
-                "INSERT INTO sessions(id, title, created_at, updated_at, provider_session, role)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO sessions(id, title, created_at, updated_at, provider_session, role,
+                                      brief, dispatched_by, conclusion, dispatches, closed_at, closed_by)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(id) DO UPDATE SET
                    title = excluded.title,
                    updated_at = excluded.updated_at,
                    provider_session = excluded.provider_session,
-                   role = excluded.role",
+                   role = excluded.role,
+                   brief = excluded.brief,
+                   dispatched_by = excluded.dispatched_by,
+                   conclusion = excluded.conclusion,
+                   dispatches = excluded.dispatches,
+                   closed_at = excluded.closed_at,
+                   closed_by = excluded.closed_by",
                 params![
                     s.id,
                     s.title,
                     s.created_at as i64,
                     s.updated_at as i64,
                     s.provider_session,
-                    s.role.as_str()
+                    s.role.as_str(),
+                    s.brief,
+                    s.dispatched_by,
+                    s.conclusion,
+                    s.dispatches as i64,
+                    s.closed_at as i64,
+                    s.closed_by
                 ],
             )?;
             let Some(m) = &s.messages else { continue };

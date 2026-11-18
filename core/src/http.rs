@@ -1849,6 +1849,8 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Re
                         id: id.clone(),
                         text: body.text,
                         attachments,
+                        // 走 HTTP 进来的都是真人（或脚本替人发的）
+                        origin: crate::agent::Origin::Human,
                     },
                 );
                 if let Err(m) = queued {
@@ -3233,46 +3235,80 @@ async fn ensure_router(st: &AppState) -> String {
     id
 }
 
-/// `GET /api/tickets?router=<id>&all=1` → 这个 Router 名下的工作项。
+/// `GET /api/tickets?router=<id>&all=1` → 这个 Router 派出去的会话。
 ///
-/// 前端在 Router 那条会话里画「在干的活」，靠它。形状**故意和给模型看的那份
-/// 一致**（同样的 stage / result / ended），这样界面和模型看到的是同一件事，
-/// 不会出现「界面说在干、模型以为完了」。
+/// **路径和字段名保留**（`tickets` / `stage` / `label` / `needsPerson` / `open`）：
+/// 前端那个看板读的就是它们。但底下已经没有 ticket 这一层了 ——
+/// 每一「行」现在是一条会话，「状态」是**现算**的，不是存出来的。
+///
+/// 现算的三个事实：
+/// - `open` = 还没被收尾（`closed_at == 0`）**而且**这条活是派出去的
+/// - `needsPerson` = 没在跑、也没收尾（也就是「它停了，等人看一眼」）
+/// - `label` = 在跑 / 闲着 / 已收尾
+///
+/// 以前这里 `GROUP BY stage` 查库。现在不查库了：会话表在内存里，
+/// 「在不在跑」问 `turns` 就是权威答案。
 async fn list_tickets(State(st): State<Arc<AppState>>, Query(q): Query<TicketsQuery>) -> Response {
     let Some(router) = q.router.as_deref().filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "要带 router（协调层会话的 id）").into_response();
     };
-    let Some(db) = st.db() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "没有库").into_response();
-    };
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
-    let tickets = match db.ticket_list(router, !q.all, limit) {
-        Ok(t) => t,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
-        }
-    };
-    let counts = db.ticket_counts(router).unwrap_or((0, 0));
+
+    let store = st.chat.read().await;
+    let mut mine: Vec<&crate::agent::ChatSession> = store
+        .sessions
+        .iter()
+        .filter(|s| s.dispatched_by.as_deref() == Some(router))
+        .filter(|s| q.all || s.closed_at == 0)
+        .collect();
+    mine.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    mine.truncate(limit);
+    let rows: Vec<Value> = mine
+        .iter()
+        .map(|s| {
+            let closed = s.closed_at != 0;
+            let busy = st.is_busy(&s.id);
+            let (stage, label) = if closed {
+                (
+                    if s.closed_by == "done" { "done" } else { "cancelled" },
+                    if s.closed_by == "done" { "已验收" } else { "已取消" },
+                )
+            } else if busy {
+                ("working", "在跑")
+            } else {
+                ("idle", "闲着")
+            };
+            json!({
+                "id": s.id,
+                // 前端拿它当「#N」显示。会话没有 rowid，用创建时间的后 4 位
+                // 当一个稳定又短的编号（同一毫秒建的两条会撞，但那种情况极少
+                // 且只是显示重号，不影响 id）。
+                "number": (s.created_at % 10000) as i64,
+                "title": if s.title.is_empty() { "（无标题）" } else { &s.title },
+                "stage": stage,
+                "label": label,
+                // 「等人」= 停了但还没收尾。在跑的不需要人管，收尾的更不需要。
+                "needsPerson": !busy && !closed,
+                "open": !closed,
+                "report": if s.conclusion.is_empty() { None } else { Some("worker_report") },
+                "moving": busy,
+                "preview": crate::text::clip(&s.conclusion, 200),
+                "dispatches": s.dispatches,
+                "createdAt": s.created_at,
+                "updatedAt": s.updated_at,
+            })
+        })
+        .collect();
+    let working = rows.iter().filter(|r| r["moving"] == json!(true)).count();
+    let waiting = rows.iter().filter(|r| r["needsPerson"] == json!(true)).count();
     Json(json!({
-        "working": counts.0,
-        "waiting": counts.1,
-        "tickets": tickets.iter().map(|t| json!({
-            "id": t.id,
-            "number": t.number(),
-            "title": t.title,
-            "stage": t.stage.as_str(),
-            "label": t.stage.label(),
-            "needsPerson": t.stage.needs_person(),
-            "open": t.open(),
-            "report": t.report.map(|r| r.as_str()),
-            // 「还在动」的**唯一**判据（见 `Ticket::still_moving`）：`report`
-            // 单独看不准 —— 中止也记 `progress`。界面只读这一个字段。
-            "moving": t.still_moving(),
-            "preview": t.summary(200),
-            "dispatches": t.dispatches,
-            "createdAt": t.created_at,
-            "updatedAt": t.updated_at,
-        })).collect::<Vec<_>>(),
+        "working": working,
+        "waiting": waiting,
+        "tickets": rows,
     }))
     .into_response()
 }
