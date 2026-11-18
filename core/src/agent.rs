@@ -89,8 +89,12 @@ fn build_tools(p: Platform) -> Vec<ToolSpec> {
 /// 一层。靠提示词写「你别自己干」拦不住（DeepSeek 那篇的消融实验就是反面教材：
 /// 中性提示下模型 5 次运行一次都不委派）；靠工具表拦得住，因为它根本没那手。
 ///
-/// 四个工具：**看**（`list_sessions` / `read_session`）、**说**（`dispatch`）、
-/// **收尾**（`close_session`）。`answer` 故意没有 —— 正文就是给用户看的话。
+/// 六个工具：**看**（`list_sessions` / `read_session`）、**说**（`dispatch`）、
+/// **收尾**（`close_session`）、**定时**（`schedule_task` / `schedules`）。
+/// `answer` 故意没有 —— 正文就是给用户看的话。
+///
+/// 「定时」那两个是唯一**让 Router 影响未来**的工具（前四个都只作用于当下这一轮）。
+/// 它们只往定时器里写一条待办，到点还是投回这里 —— 指挥系统始终只有一套。
 fn build_router_tools(_p: Platform) -> Vec<ToolSpec> {
     vec![
         ToolSpec {
@@ -112,6 +116,19 @@ fn build_router_tools(_p: Platform) -> Vec<ToolSpec> {
             name: "close_session",
             description: prompt::close_session_description(),
             schema: prompt::close_session_schema,
+        },
+        // 定时任务（见 `schedule`）。**两个不是三个**：`schedule_task` 是高频路径，
+        // 剩下三个低频 CRUD 收进一个多动作工具 —— 工具面从 4 涨到 6 而不是 7，
+        // 而「选错工具」的概率跟工具数一起涨。
+        ToolSpec {
+            name: "schedule_task",
+            description: prompt::schedule_task_description(),
+            schema: prompt::schedule_task_schema,
+        },
+        ToolSpec {
+            name: "schedules",
+            description: prompt::schedules_description(),
+            schema: prompt::schedules_schema,
         },
     ]
 }
@@ -141,6 +158,15 @@ pub enum Origin {
     Dispatch,
     /// 子会话回合结束时推回来的回执（见 `router::report_back`）
     WorkerReport { session_id: String },
+    /// **定时器**到点投给 Router 的那句话（见 `schedule`）。
+    ///
+    /// 为什么不复用别的三个：`Human` 会让一句三天前写下的话取得「用户刚才说过」
+    /// 的身份（Router 的提示词里明写着「用户是否同意，以用户在这个对话里说的为准」）；
+    /// `Dispatch` 会翻转「这一轮算不算派活」那个判定，进而影响 `conclusion` 的
+    /// 覆盖；`WorkerReport` 带 `session_id`、前端会画成「子会话报告」。
+    ///
+    /// 它只出现在 Router 的会话里（投递目标只有 Router，见 `schedule::fire`）。
+    Schedule { task_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1570,13 +1596,23 @@ fn user_view_parts(text: &str, attachments: &[Attachment]) -> Vec<Value> {
 pub fn queued_view(msgs: &[crate::state::QueuedMsg]) -> Vec<Value> {
     msgs.iter()
         .map(|m| {
-            json!({
+            let mut v = json!({
                 "id": m.id,
                 "role": "user",
                 "steps": 0,
                 "done": false,
                 "parts": user_view_parts(&m.text, &m.attachments),
-            })
+            });
+            // **排队中的那一条也要带来源**。以前这里不看 `origin`：一条等着交给
+            // 模型的回执在界面上是一个「用户气泡」，交出去之后又变成「子会话报告」
+            // —— 同一个东西在排队前后换了个样子。`fromWorker` / `fromSchedule` 和
+            // `session_view_range_clipped` 用的是同一组键（前端只认这两组）。
+            match &m.origin {
+                Origin::WorkerReport { session_id } => v["fromWorker"] = json!(session_id),
+                Origin::Schedule { task_id } => v["fromSchedule"] = json!(task_id),
+                Origin::Human | Origin::Dispatch => {}
+            }
+            v
         })
         .collect()
 }
@@ -1960,8 +1996,15 @@ pub fn session_view_range_clipped(
                 });
                 // 回执不是人说的话：告诉前端，别把它画成用户气泡。
                 // 老客户端不认这个字段也没关系（它只知道 user/assistant）。
-                if let crate::agent::Origin::WorkerReport { session_id } = origin {
-                    v["fromWorker"] = json!(session_id);
+                match origin {
+                    crate::agent::Origin::WorkerReport { session_id } => {
+                        v["fromWorker"] = json!(session_id);
+                    }
+                    // 定时器投的：同理，用户没说过这些话（`queued_view` 也认这个键）
+                    crate::agent::Origin::Schedule { task_id } => {
+                        v["fromSchedule"] = json!(task_id);
+                    }
+                    crate::agent::Origin::Human | crate::agent::Origin::Dispatch => {}
                 }
                 out.push(v);
             }
@@ -3865,6 +3908,9 @@ async fn router_tool(core: &Core, name: &str, args: &Value, sid: &str) -> Option
         // 传 sid：新会话要记「谁派的」，做完才知道汇报给谁
         "dispatch" => crate::router::dispatch(core, sid, args).await,
         "close_session" => crate::router::close_session(core, sid, args).await,
+        // 定时任务（见 `schedule`）：和上面四个一样，只是「写一条待办」，不执行任何东西
+        "schedule_task" => crate::schedule::tool_schedule_task(core, args).await,
+        "schedules" => crate::schedule::tool_schedules(core, sid, args).await,
         _ => return None,
     };
     Some(match out {
@@ -4830,6 +4876,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(once, twice);
+    }
+
+    /// **排队中的那一条也要带来源。**
+    ///
+    /// 以前 `queued_view` 不看 `origin`：一条等着交给模型的回执在界面上是一个
+    /// 「用户气泡」，交出去之后才变成「子会话报告」—— 同一个东西在排队前后换了
+    /// 个样子。定时器投的那条同理（`fromSchedule`）。
+    ///
+    /// 变异验证：把 `queued_view` 里那个 `match` 删掉，这条会挂。
+    #[test]
+    fn a_queued_message_carries_its_origin_to_the_client() {
+        let queued = |id: &str, origin: Origin| crate::state::QueuedMsg {
+            id: id.into(),
+            text: "一句话".into(),
+            attachments: Vec::new(),
+            origin,
+        };
+        let view = queued_view(&[
+            queued("q1", Origin::Human),
+            queued(
+                "q2",
+                Origin::WorkerReport {
+                    session_id: "s-1".into(),
+                },
+            ),
+            queued(
+                "q3",
+                Origin::Schedule {
+                    task_id: "t-1".into(),
+                },
+            ),
+        ]);
+        assert_eq!(view.len(), 3);
+        assert!(view[0].get("fromWorker").is_none(), "人说的话没有来源标记");
+        assert!(view[0].get("fromSchedule").is_none());
+        assert_eq!(
+            view[1]["fromWorker"],
+            json!("s-1"),
+            "排队中的回执也要标出来"
+        );
+        assert_eq!(
+            view[2]["fromSchedule"],
+            json!("t-1"),
+            "排队中的闹钟也要标出来"
+        );
     }
 
     /// 增量同步的核心不变式：从任意「回合边界」切开，

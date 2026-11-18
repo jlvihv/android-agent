@@ -95,6 +95,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(list_sessions).post(new_session))
         // 协调层那个会话（双层架构）。只有一个，没有就现建。
         .route("/api/router", post(router_session))
+        // 定时任务（见 schedule.rs）。到点往 Router 的队列里投一句话，把它叫醒。
+        // 和 Router 的 `schedule_task` / `schedules` 两个工具是同一组底层函数
+        // （`schedule::create` / `set_state` / `rows`）—— 两条入口，一套校验。
+        .route("/api/schedules", get(list_schedules).post(create_schedule))
+        .route("/api/schedules/paused", post(set_schedule_paused))
+        .route("/api/schedules/delete", post(delete_schedule))
         // 某个 Router 派出去的会话（带每条的 state / label）。
         //
         // ⚠️ **当前没有已知的前端或脚本消费者。**
@@ -3208,59 +3214,6 @@ async fn new_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({ "id": id }))
 }
 
-/// 协调层那个会话的固定位置（`meta` 表里的一行）。
-///
-/// **只有一个 Router**：双层架构里它是「全局序点」，多开一个就是两个都在跟用户
-/// 说话。所以不放在 `sessions` 列表里让用户新建 / 删除，而是用 `meta` 记住
-/// 「那一个是谁」，要用时找不到就现建一个。
-const ROUTER_META_KEY: &str = "router_session";
-
-/// 协调层会话的初始标题（见 `ensure_router`）。
-const ROUTER_TITLE: &str = "协调";
-
-/// 拿到 Router 会话，没有就建一个。返回它的 id。
-///
-/// 为什么"没有就建"而不是启动时就建：Router 的提示词和工具表跟 worker 不一样，
-/// 一个**从来不用双层**的部署不该凭空多出一个会话（它会出现在侧边栏里、会占一份
-/// 落盘）。第一次真正要用协调层时才建。
-async fn ensure_router(st: &AppState) -> String {
-    // 先看记着的那一个还在不在。记着但会话没了（用户删了 / 换库了）就重建。
-    let remembered = st.meta_get(ROUTER_META_KEY);
-    {
-        let store = st.chat.read().await;
-        if let Some(id) = &remembered {
-            if store
-                .get(id)
-                .is_some_and(|s| s.role == crate::agent::Role::Router)
-            {
-                return id.clone();
-            }
-        }
-    }
-    // 建。写锁里再查一次：两个并发的请求同时发现"没有"，不能各建一个。
-    let mut store = st.chat.write().await;
-    if let Some(id) = &remembered {
-        if store
-            .get(id)
-            .is_some_and(|s| s.role == crate::agent::Role::Router)
-        {
-            return id.clone();
-        }
-    }
-    let mut s = crate::agent::ChatSession::with_role(crate::agent::Role::Router);
-    // 起个名字：它空着的时候侧边栏得有个能认的东西。
-    // **不是硬编码在界面里**的「协调」—— 那样换个客户端、换个语言就没了。
-    // 建会话时写进 `title`，`maybe_title` 只在该字段为空时才动手，所以用户
-    // 聊起来之后这个初始名字不会被第一句话顶掉（Router 的名字该稳定）。
-    s.title = ROUTER_TITLE.to_string();
-    let id = s.id.clone();
-    store.sessions.push(s);
-    drop(store);
-    st.set_meta(ROUTER_META_KEY, &id);
-    st.mark_sessions_dirty();
-    id
-}
-
 /// `GET /api/sessions/dispatched?router=<id>&all=1` → 这个 Router 派出去的会话。
 ///
 /// 名字里的 `dispatched` 是字面意思：**派出去的那些会话**。底下没有 ticket 这一层了
@@ -3393,11 +3346,98 @@ where
     ))
 }
 
+// ---------------------------------------------------------------------------
+// 定时任务（`GET/POST /api/schedules*`，见 schedule.rs）
+//
+// 三个 handler 都只是把 JSON 摊开交给 `schedule` 模块的那几个函数：**校验只有一份**
+// （`schedule::create` / `schedule::set_state`），所以「工具能建、HTTP 不能」这种
+// 不一致不可能发生。
+// ---------------------------------------------------------------------------
+
+/// 全部定时任务。`nextAt` 是**现算的**（服务端算，前端不自己推 —— 两处算法迟早走偏，
+/// 这个项目在 `standing` 上吃过一次亏，见 docs/16 §3.1）。
+async fn list_schedules(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let now = crate::agent::now_ms();
+    Json(json!({
+        "schedules": crate::schedule::rows(&st, now, crate::schedule::utc_offset_secs(now)),
+        "max": crate::schedule::MAX_SCHEDULES,
+        "promptMaxChars": crate::schedule::MAX_PROMPT_CHARS,
+        // 界面显示「按当前时区算」用；也让人能看出服务端读到的偏移对不对
+        "tzOffsetMinutes": crate::schedule::utc_offset_secs(now) / 60,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreateScheduleBody {
+    /// 到点要投给 Router 的那句话
+    prompt: String,
+    /// 每 N 分钟（和 `cron` 二选一）
+    #[serde(default)]
+    every_minutes: Option<u64>,
+    /// cron 表达式（和 `every_minutes` 二选一）
+    #[serde(default)]
+    cron: Option<String>,
+}
+
+/// `POST /api/schedules` → 建一条。
+async fn create_schedule(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<CreateScheduleBody>,
+) -> Response {
+    match crate::schedule::create(&st, &body.prompt, body.every_minutes, body.cron.as_deref()) {
+        Ok(t) => {
+            // 建出来先保证有个 Router 可投（`ensure` 本来就「第一次真要用时才建」）
+            let _ = crate::router::ensure(&st).await;
+            let now = crate::agent::now_ms();
+            Json(json!({ "schedule": crate::schedule::rows(&st, now, crate::schedule::utc_offset_secs(now))
+                .into_iter()
+                .find(|v| v["id"] == json!(t.id))
+                .unwrap_or(Value::Null) }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PauseScheduleBody {
+    id: String,
+    paused: bool,
+}
+
+/// `POST /api/schedules/paused` → 停 / 恢复。
+async fn set_schedule_paused(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<PauseScheduleBody>,
+) -> Response {
+    let action = if body.paused { "pause" } else { "resume" };
+    match crate::schedule::set_state(&st, &body.id, action) {
+        Ok(msg) => Json(json!({ "ok": true, "message": msg })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteScheduleBody {
+    id: String,
+}
+
+/// `POST /api/schedules/delete` → 删。
+async fn delete_schedule(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<DeleteScheduleBody>,
+) -> Response {
+    match crate::schedule::set_state(&st, &body.id, "delete") {
+        Ok(msg) => Json(json!({ "ok": true, "message": msg })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
 /// `POST /api/router` → 拿协调层会话的 id（没有就建）。
 ///
 /// 前端「新对话」在双层模式下走这条：它不建 worker，而是把用户领到 Router 那里。
 async fn router_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let id = ensure_router(&st).await;
+    let id = crate::router::ensure(&st).await;
     Json(json!({ "id": id }))
 }
 

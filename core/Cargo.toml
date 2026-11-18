@@ -68,6 +68,19 @@ thiserror = "2"
 anyhow = "1"
 http = "1"
 
+# 定时任务的 cron 表达式（`schedule.rs`）。**为什么引库而不是自己算**：`0 9 * * 1`
+# 要处理月末、闰年、DST 边界 —— 手写这些没有一天能写对。
+#
+# 为什么是 croner 而不是 cron/caffron：只有它 *不* 强拉 `chrono` 的 `clock` feature
+# （那会经 iana-time-zone 把 windows-*、windows-core 一串拖进来），默认关掉之后
+# 我们只吃 `chrono` 的 `alloc`。实测新增 12 个 crate（croner + chrono +
+# derive_builder/strum 两串过程宏），Android 交叉编译 `--no-default-features`
+# 编得过（见 docs/17）。
+croner = { version = "4", default-features = false, features = ["chrono"] }
+# 只用来算 cron 的「下一次 / 上一次」，**不要 clock feature**（那是读本机时区，
+# 而本机时区我们自己从 libc 读，安卓上那份更靠得住，见 schedule::utc_offset_secs）。
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+
 # 自己造 reqwest client，绕开 rustls-platform-verifier（R9）。
 # Android 上后者要求先 init_with_env(env, context)，否则第一次请求就 panic。
 # 见 src/llm.rs 的 tls_config() 说明。

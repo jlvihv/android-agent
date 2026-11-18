@@ -788,6 +788,29 @@
   </div>
 {/snippet}
 
+<!-- 定时器到点投进来的那句话。**也不画成用户气泡**：用户没说过它 ——
+     是「过去的用户」设的闹钟（服务端 `origin: Schedule`）。用虚线边 + 闹钟图标，
+     和用户消息（实心、贴右）区分开。 -->
+{#snippet clockNote(msg: Message & { fromSchedule?: string })}
+  {@const text = msg.parts
+    .map((p) => (p.type === "text" ? p.text : ""))
+    .join("")}
+  <div
+    class="flex max-w-[92%] flex-col gap-1.5 self-start rounded-card border border-dashed border-control bg-surface px-3.5 py-2.5"
+  >
+    <p class="flex items-center gap-1.5 text-xs text-faint">
+      <Icon name="clock" size={12} class="shrink-0 text-muted" />
+      <span>定时任务</span>
+      <span class="truncate opacity-60"
+        >{(msg.fromSchedule ?? "").slice(0, 8)}</span
+      >
+    </p>
+    <p class="whitespace-pre-wrap break-words text-sm leading-6 text-muted">
+      {text}
+    </p>
+  </div>
+{/snippet}
+
 {#snippet userMessage(msg: Message)}
   {@const atts = msg.parts.filter(
     (p) => p.type === "image" || p.type === "file",
@@ -877,6 +900,8 @@
     {#each shown as msg (msg.id)}
       {#if msg.role === "user" && msg.fromWorker}
         {@render workerReport(msg)}
+      {:else if msg.role === "user" && msg.fromSchedule}
+        {@render clockNote(msg)}
       {:else if msg.role === "user"}
         {@render userMessage(msg)}
       {:else}

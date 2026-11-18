@@ -237,6 +237,39 @@ CREATE TABLE IF NOT EXISTS http_cache (
   body       TEXT NOT NULL,
   fetched_at INTEGER NOT NULL
 );
+
+-- 定时任务：到点往 Router 的队列里投一句话，把它叫醒（见 schedule.rs）。
+--
+-- **没有 `next_at` 列**。那是算出来的（`created_at + k*周期`，或者 cron 从水位线往后
+-- 找一次），存一份就是给「没人负责推进它」留后门 —— 上一版 ticket 的 `Stage::Done`
+-- 零调用点就是这么烂掉的（见 docs/16）。
+--
+-- `handled_through` 是**水位线**（截止这一刻的触发点都处理过了），不是状态标签：
+-- 没有跃迁规则，只有「单调不减」一条，唯一的写点是 `Schedules::claim_due`。
+--
+-- `every_secs` 和 `cron` **恰好有一个非空**（下面的 CHECK 钉着）：两种周期语义不同
+-- （锚在创建时刻 vs 挂在墙上时钟），用一个 NULL 的列表达「这条是哪种」比存个
+-- `kind` 字符串再分叉更实在 —— 那个 kind 一存进来就能和两个数据列对不上。
+CREATE TABLE IF NOT EXISTS schedules (
+  id              TEXT PRIMARY KEY,
+  -- 到点投给 Router 的那句话，原文一字不改
+  prompt          TEXT NOT NULL,
+  -- 固定间隔（秒）。NULL = 这条是 cron
+  every_secs      INTEGER CHECK (every_secs IS NULL OR (every_secs >= 60 AND every_secs <= 2592000)),
+  -- cron 表达式原文（5 或 6 字段）。NULL = 这条是固定间隔
+  cron            TEXT,
+  created_at      INTEGER NOT NULL,
+  -- 截止此刻的触发点都处理过了（投出去，或按策略放弃）。不补跑，见 schedule.rs
+  handled_through INTEGER NOT NULL,
+  -- NULL = 启用中。用 NULL 而不是 0 当哨兵（和 usage.cached / machines.relay_addr 一致）
+  paused_at       INTEGER,
+  -- 建它时机器所在的 UTC 偏移（分钟）。**只作参考**，不参与任何计算
+  tz_offset_minutes INTEGER,
+  CHECK (handled_through >= created_at),
+  CHECK (paused_at IS NULL OR paused_at >= created_at),
+  -- 「两种周期，恰好一种」—— 两个都空 / 两个都有 都在这里被挡掉
+  CHECK ((every_secs IS NULL) <> (cron IS NULL))
+);
 ";
 
 /// 把老库补齐到当前 schema。**幂等**：每次打开都跑一遍，已经升过的一句也不做。
@@ -648,14 +681,14 @@ impl Db {
                 // 这里把「有 by 才算派出去的」当判据：`by` 空就没法回执，那这份
                 // dispatch 记录毫无用处，整份丢掉 —— 好过留一个半份对象在后面
                 // 每个权限过滤上静默消失。
-                let dispatch = match dispatched_by.filter(|b| !b.is_empty()) {
-                    Some(by) => Some(crate::agent::Dispatch {
-                        by,
-                        brief: brief.unwrap_or_default(),
-                        times: dispatches.max(0) as u32,
-                    }),
-                    None => None,
-                };
+                let dispatch =
+                    dispatched_by
+                        .filter(|b| !b.is_empty())
+                        .map(|by| crate::agent::Dispatch {
+                            by,
+                            brief: brief.unwrap_or_default(),
+                            times: dispatches.max(0) as u32,
+                        });
                 let s = ChatSession {
                     id,
                     title,
@@ -1264,6 +1297,132 @@ impl Db {
                 [endpoint],
             )
             .map(|_| ())
+        })
+    }
+
+    // ---- 定时任务（`schedules` 表，见 schedule.rs） -------------------------
+    //
+    // 这一层只做 SQL：它不认识 `Recurrence`，也不判「该不该触发」——那是纯函数
+    // `schedule::due_at` 的事。唯一有点意思的是 `every_secs` / `cron` 那两列的
+    // 二选一：库里用「恰好一个 NULL」表达，翻译成本在这里收敛成唯一一处。
+
+    /// 全部定时任务（启动时读一次）。
+    pub fn schedules(&self) -> Result<Vec<crate::schedule::ScheduledTask>> {
+        use crate::schedule::{CronExpr, Period, Recurrence, ScheduledTask};
+        // `QueryReturnedNoRows` 之类不是错误路径，所以先在闭包里把**原始列**取出来，
+        // 出来再翻译成类型 —— 这样「周期看不懂就跳过这一行」不用写在 SQL 闭包里。
+        type Row = (
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i32>,
+        );
+        let rows: Vec<Row> = self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT id, prompt, every_secs, cron, created_at, handled_through, paused_at,
+                        tz_offset_minutes
+                   FROM schedules ORDER BY created_at, id",
+            )?;
+            let it = st.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })?;
+            it.collect()
+        })?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, prompt, every_secs, cron, created_at, handled_through, paused_at, tz) in rows {
+            // 「恰好一列非空」由建表时的 CHECK 守着。这里再兜一层：周期看不懂的那行
+            // **跳过**（一条脏数据不该让**所有**闹钟都不响）——但要 warn，别静默。
+            let every: Option<Recurrence> = match (every_secs, cron) {
+                (Some(s), None) => u64::try_from(s)
+                    .ok()
+                    .and_then(Period::try_new_secs)
+                    .map(Recurrence::Every),
+                (None, Some(e)) => CronExpr::parse(&e)
+                    .ok()
+                    .map(|c| Recurrence::Cron(Box::new(c))),
+                _ => None,
+            };
+            let Some(every) = every else {
+                tracing::warn!("定时任务 {id} 的周期读不出来，跳过（它在库里还能改）");
+                continue;
+            };
+            out.push(ScheduledTask {
+                id,
+                prompt,
+                every,
+                created_at: created_at.max(0) as u64,
+                handled_through: handled_through.max(0) as u64,
+                paused_at: paused_at.map(|v| v.max(0) as u64),
+                tz_offset_minutes: tz,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 写一条（新建或改）。
+    pub fn put_schedule(&self, t: &crate::schedule::ScheduledTask) -> Result<()> {
+        use crate::schedule::Recurrence;
+        // 类型 → 列的唯一转换点（读方向见 `schedules()`）
+        let (every_secs, cron) = match &t.every {
+            Recurrence::Every(p) => (Some(p.secs() as i64), None),
+            Recurrence::Cron(c) => (None, Some(c.as_str())),
+        };
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO schedules(id, prompt, every_secs, cron, created_at, handled_through,
+                                      paused_at, tz_offset_minutes)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                   prompt = excluded.prompt,
+                   every_secs = excluded.every_secs,
+                   cron = excluded.cron,
+                   handled_through = excluded.handled_through,
+                   paused_at = excluded.paused_at,
+                   tz_offset_minutes = excluded.tz_offset_minutes",
+                params![
+                    t.id,
+                    t.prompt,
+                    every_secs,
+                    cron,
+                    t.created_at as i64,
+                    t.handled_through as i64,
+                    t.paused_at.map(|v| v as i64),
+                    t.tz_offset_minutes,
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// 只推水位线（tick 里每条触发一次，最热的那个写）。
+    pub fn set_schedule_cursor(&self, id: &str, handled_through: u64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE schedules SET handled_through = MAX(handled_through, ?2) WHERE id = ?1",
+                params![id, handled_through as i64],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn delete_schedule(&self, id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM schedules WHERE id = ?1", [id])
+                .map(|_| ())
         })
     }
 

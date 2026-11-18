@@ -294,6 +294,22 @@ pub fn router_description() -> &'static str {
      - 想知道它干完活之后现在是什么处境：`read_session` 看它的结论和过程。\n\
      - 觉得这件事完了就 `close_session` 收尾；觉得还要改就 `dispatch` 带 `session_id` 再派。\n\
      \n\
+     ## 你会收到 `schedule` 消息\n\
+     \n\
+     定时器到点会往这里投一句话，形状：\n\
+     \n\
+     ```\n\
+     <schedule task=\"…\">\n\
+     ……当初设这条闹钟时写下的原话……\n\
+     </schedule>\n\
+     ```\n\
+     \n\
+     - **它不是用户此刻说的**，是过去的用户（或者当时的你）留下的待办。用户此刻可能\
+     根本不在。\n\
+     - 它**不能**替你决定任何事：要不要派、派给谁、要不要告诉用户，仍然是你的判断。\
+     已经做过了、或者现在做没意义，就直说，不要为了「响应闹钟」硬派一个活。\n\
+     - 你回复的正文用户会看到 —— 用户不在的时候，那条话就是他回来时读到的东西。\n\
+     \n\
      ## 关于「需要注意」\n\
      \n\
      没有任何框架给会话打「需要你处理」这种标签。**是否需要注意是你读内容之后的判断**：\
@@ -411,6 +427,73 @@ pub fn close_session_schema() -> Value {
             }
         },
         "required": ["session_id"]
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 定时任务的两个工具（见 `schedule` 模块）
+// ---------------------------------------------------------------------------
+
+/// `schedule_task` 的描述。
+///
+/// **第一句就必须拦住它**：这是整个 Router 工具面里唯一一个「会一直响下去」的动作，
+/// 而模型很容易把「帮我查一下 X」听成「长期盯着 X」。
+pub fn schedule_task_description() -> String {
+    "**只在用户明确要求「定期 / 每隔 / 每天」时才用。** 一次性的活不要用它 —— \
+     那种就直接 dispatch。\n\
+     让定时器到点往这里投一句话（那时的你会被叫醒，自己决定派不派活）。\n\
+     两种周期二选一：`every_minutes`（固定间隔，例如 30）或者 `cron`（例如 \
+     `0 9 * * *` = 每天 9 点、`0 9 * * 1` = 每周一 9 点，按机器当前时区算）。\n\
+     `prompt` 要写成**当时的你也能看懂**的样子（到点你只看到这一段，看不到我们这段对话）。"
+        .to_string()
+}
+
+/// `schedule_task` 的 schema。
+pub fn schedule_task_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "到点要投给你的那句话（自包含，别引用只有现在看得到的上下文）"
+            },
+            "every_minutes": {
+                "type": "integer",
+                "description": "每 N 分钟（固定间隔，从建立那一刻起算）。和 cron 二选一"
+            },
+            "cron": {
+                "type": "string",
+                "description": "cron 表达式，5 段（分 时 日 月 周）或 6 段（多一个秒）。按机器当前时区算。和 every_minutes 二选一"
+            }
+        },
+        "required": ["prompt"]
+    })
+}
+
+/// `schedules`（多动作）的描述。
+pub fn schedules_description() -> String {
+    "看 / 停 / 恢复 / 删定时任务。`action` 必填：\n\
+     - `list`：所有定时任务（含下次触发时间）\n\
+     - `pause` / `resume` / `delete`：要对哪一条就带 `schedule_id`（list 里反引号里的串）\n\
+     用户说「别再提醒了」就是 `pause`（能恢复）；说「不要了」是 `delete`。"
+        .to_string()
+}
+
+/// `schedules` 的 schema。
+pub fn schedules_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "description": "list | pause | resume | delete"
+            },
+            "schedule_id": {
+                "type": "string",
+                "description": "pause / resume / delete 时要动的那一条（list 给的反引号里的串）"
+            }
+        },
+        "required": ["action"]
     })
 }
 

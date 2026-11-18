@@ -385,6 +385,15 @@ export type Message = {
    */
   fromWorker?: string;
   /**
+   * 这条 user 消息是**定时器**投进来的（服务端 `ChatMessage::User.origin` 是
+   * `Schedule`）。有值就是那条定时任务的 id。
+   *
+   * 和 `fromWorker` 同一个理由：它也是 `user` 角色，但用户没说过 —— 不标出来就会在
+   * Router 会话里显示成用户自己说的话。**排队中的那一条也带**（服务端 `queued_view`
+   * 一起给），否则同一个东西在「排队中」和「交出去了」两个状态之间会换个样子。
+   */
+  fromSchedule?: string;
+  /**
    * 流里的 `data-warning`（「输出被长度上限截断」「LLM 重试中」…）。
    *
    * **不是 part**，故意：`parts` 的下标要和**服务端**的 `view_parts_len` 对齐

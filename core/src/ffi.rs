@@ -458,6 +458,10 @@ impl AgentCore {
         }
         .with_shared_storage(env.shared_storage.as_deref().map(std::path::Path::new));
         self.core.set_linux_sandbox(cfg);
+        // 同一个偏移也给定时任务一份（`schedule::utc_offset_secs` 优先从 libc 读
+        // `localtime_r`，读不到时才用它兜底）。**复用这条通道而不是新加启动参数**：
+        // `AndroidEnv` 本来就是「安卓侧的系统事实一次性交进来」那个口，时区就是其中一条。
+        crate::schedule::set_fallback_offset_minutes(env.tz_offset_minutes);
         Ok(())
     }
 

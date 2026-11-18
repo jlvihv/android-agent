@@ -34,6 +34,7 @@
    * - 手机权限（PermissionsSection）：只在手机 App 里有
    * - MCP 服务、技能（McpSection / SkillsSection）
    * - 联网搜索（SearchSection）：Exa key，可选
+   * - 定时任务（ScheduleSection）：到点往协调层投一句话
    * - 用量（UsageSection）
    * - 连接手机（PairingSection）：配对码，只有电脑上自己开这个页面时才有
    * - Linux 沙箱（SandboxSection）：Alpine 版本 / 升级，桌面宿主模式下没有
@@ -49,6 +50,7 @@
   import PermissionsSection from "./PermissionsSection.svelte";
   import ProviderPage from "./ProviderPage.svelte";
   import SandboxSection from "./SandboxSection.svelte";
+  import ScheduleSection from "./ScheduleSection.svelte";
   import SearchSection from "./SearchSection.svelte";
   import SkillsSection from "./SkillsSection.svelte";
   import StatusSection from "./StatusSection.svelte";
@@ -118,6 +120,7 @@
   <McpSection />
   <SkillsSection />
   <SearchSection />
+  <ScheduleSection />
   <NotifySection />
   <UsageSection />
   <PairingSection />

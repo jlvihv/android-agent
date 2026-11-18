@@ -61,6 +61,13 @@ pub type Reply = Result<String, String>;
 // ---------------------------------------------------------------------------
 
 /// 取一个字符串字段（去掉首尾空白）。没给 / 类型不对都是空串。
+///
+/// `pub(crate)`：`schedule` 那两个工具的参数解析走同一套语义（空串要算「没给」），
+/// 再抄一遍就是第二份定义。
+pub(crate) fn arg_str_pub<'a>(args: &'a Value, key: &str) -> &'a str {
+    arg_str(args, key)
+}
+
 fn arg_str<'a>(args: &'a Value, key: &str) -> &'a str {
     args.get(key).and_then(Value::as_str).unwrap_or("").trim()
 }
@@ -578,14 +585,80 @@ pub async fn report_back(
             session_id: from_session.to_string(),
         },
     };
-    if state.enqueue(&router, msg).is_err() {
+    if wake(core, &router, msg).is_err() {
         tracing::warn!("Router 的队列满了，会话 {from_session} 的回执丢了");
-        return;
-    }
-    if let Some(provider) = state.llm() {
-        crate::agent::continue_with_queued(core, &provider, &router);
     }
 }
+
+/// 往 Router 的队列里投一条，并把它叫醒。**「叫醒 Router」的唯一实现**。
+///
+/// 两条路都走它：子会话的回执（[`report_back`]）和定时器到点（`schedule::fire`）。
+/// 以前 `report_back` 自己写了一遍「enqueue + continue_with_queued」—— 多一处
+/// 就多一个「忘了叫醒、消息躺在队列里没人取」的机会。
+///
+/// 队列满了就把消息**原样交还**（`Err`），由调用方决定怎么记一笔：回执是 warn，
+/// 定时任务是「这一次丢了」，都不重试。
+///
+/// 没有配模型时**照样入队**（不叫醒）：消息留在那儿，等用户配好模型那一轮一起
+/// 看到（`continue_with_queued` 一次全带上）。反过来丢弃的话，一份回执/一次提醒
+/// 会因为「刚好没配模型」永久消失。
+pub fn wake(core: &Core, router: &str, msg: QueuedMsg) -> Result<(), QueuedMsg> {
+    core.state.enqueue(router, msg)?;
+    if let Some(provider) = core.state.llm() {
+        crate::agent::continue_with_queued(core, &provider, router);
+    }
+    Ok(())
+}
+
+/// 拿到 Router 会话，没有就建一个。返回它的 id。
+///
+/// 从 `http.rs` 搬过来的（见 `docs/16`）：它管的是 Router 的**身份**，不是 HTTP。
+/// 定时任务也要它（到点得有个会话可投），而 `http` 那一层不该被 `schedule` 调用。
+///
+/// **只有一个 Router**：双层架构里它是「全局序点」，多开一个就是两个都在跟用户
+/// 说话。所以不放在 `sessions` 列表里让用户新建 / 删除，而是用 `meta` 记住
+/// 「那一个是谁」，要用时找不到就现建一个。
+///
+/// 为什么"没有就建"而不是启动时就建：Router 的提示词和工具表跟 worker 不一样，
+/// 一个**从来不用双层**的部署不该凭空多出一个会话（它会出现在侧边栏里、会占一份
+/// 落盘）。第一次真正要用协调层时才建。
+pub async fn ensure(st: &AppState) -> String {
+    // 先看记着的那一个还在不在。记着但会话没了（用户删了 / 换库了）就重建。
+    let remembered = st.meta_get(ROUTER_META_KEY);
+    {
+        let store = st.chat.read().await;
+        if let Some(id) = &remembered {
+            if store.get(id).is_some_and(|s| s.role == Role::Router) {
+                return id.clone();
+            }
+        }
+    }
+    // 建。写锁里再查一次：两个并发的请求同时发现"没有"，不能各建一个。
+    let mut store = st.chat.write().await;
+    if let Some(id) = &remembered {
+        if store.get(id).is_some_and(|s| s.role == Role::Router) {
+            return id.clone();
+        }
+    }
+    let mut s = crate::agent::ChatSession::with_role(Role::Router);
+    // 起个名字：它空着的时候侧边栏得有个能认的东西。
+    // **不是硬编码在界面里**的「协调」—— 那样换个客户端、换个语言就没了。
+    // 建会话时写进 `title`，`maybe_title` 只在该字段为空时才动手，所以用户
+    // 聊起来之后这个初始名字不会被第一句话顶掉（Router 的名字该稳定）。
+    s.title = ROUTER_TITLE.to_string();
+    let id = s.id.clone();
+    store.sessions.push(s);
+    drop(store);
+    st.set_meta(ROUTER_META_KEY, &id);
+    st.mark_sessions_dirty();
+    id
+}
+
+/// 协调层那个会话的固定位置（`meta` 表里的一行）。
+const ROUTER_META_KEY: &str = "router_session";
+
+/// 协调层会话的初始标题（见 [`ensure`]）。
+const ROUTER_TITLE: &str = "协调";
 
 #[cfg(test)]
 mod tests {

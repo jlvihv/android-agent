@@ -54,6 +54,8 @@ pub mod remote;
 pub(crate) mod resident;
 pub(crate) mod responses;
 pub mod router;
+/// 定时任务：到点往 Router 队列里投一句话（见模块文档）。
+pub mod schedule;
 pub(crate) mod search;
 pub(crate) mod shizuku;
 pub(crate) mod shizuku_parse;
@@ -881,6 +883,13 @@ impl Core {
             sb.set_agent_port(actual);
             sb.set_agent_token(self.state.token());
         }
+
+        // 定时任务的那个 10 秒 tick（见 `schedule::run`）。
+        //
+        // **不搭落盘定时器的便车**：那个 loop 的语义是「有脏数据才写」，而这里要
+        // 「每 tick 都看一遍有没有到点」。混在一起的话，调落盘频率会顺手改掉闹钟的
+        // 准时性 —— 两件无关的事不该共用一个周期。
+        tokio::spawn(schedule::run(Core::from(self.state.clone())));
 
         // 后台把常用工具装上（rg/fd/jq/python3…）。幂等：装过就秒退。
         tokio::spawn(provision_tools(self.state.clone()));

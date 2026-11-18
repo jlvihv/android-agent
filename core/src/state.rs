@@ -384,6 +384,11 @@ pub struct AppState {
     /// 不用「改一次写一次」：一轮对话会产生几十次变更，每次都写盘太浪费。
     /// 也不能不写：进程被 kill 会话就没了（force-stop 之后抽屉会空）。
     pub sessions_dirty: AtomicBool,
+    /// 定时任务表（`schedules` 表的内存副本，见 `schedule` 模块）。
+    ///
+    /// 和 `mcp` / `api_styles` 同构：内存是权威的读副本，写的时候一同进库。
+    /// 上限 32 条，tick 里一条 SQL 都不发。
+    pub schedules: crate::schedule::Schedules,
     /// 运行时覆盖的系统提示词（`POST /api/debug/system-prompt`）。
     ///
     /// `None` = 用编译进二进制的那份（`prompt::system_prompt`）。存在的理由就一个：
@@ -447,6 +452,7 @@ impl AppState {
                 sandbox_key: random_secret(),
             }),
             db: RwLock::new(None),
+            schedules: Default::default(),
             sessions_dirty: AtomicBool::new(false),
             system_prompt: RwLock::new(None),
             vision: RwLock::new(None),
@@ -558,6 +564,12 @@ impl AppState {
                 match db.mcp_servers() {
                     Ok(list) => self.mcp.set_servers(list),
                     Err(e) => tracing::warn!("读 MCP 服务失败: {e:#}"),
+                }
+                // 定时任务很少（上限 32），同步读一下没关系；读不出来就当没有
+                //（**不能**反过来把内存那份（空的）写回去 —— 那等于删掉用户所有闹钟）
+                match db.schedules() {
+                    Ok(list) => self.schedules.load(list),
+                    Err(e) => tracing::warn!("读定时任务失败（这一轮不响）：{e:#}"),
                 }
                 match db.api_styles() {
                     Ok(rows) => {
