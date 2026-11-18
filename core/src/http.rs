@@ -3247,6 +3247,9 @@ async fn list_tickets(State(st): State<Arc<AppState>>, Query(q): Query<TicketsQu
             "needsPerson": t.stage.needs_person(),
             "open": t.open(),
             "report": t.report.map(|r| r.as_str()),
+            // 「还在动」的**唯一**判据（见 `Ticket::still_moving`）：`report`
+            // 单独看不准 —— 中止也记 `progress`。界面只读这一个字段。
+            "moving": t.still_moving(),
             "preview": t.summary(200),
             "dispatches": t.dispatches,
             "createdAt": t.created_at,

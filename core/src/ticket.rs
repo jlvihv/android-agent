@@ -205,6 +205,14 @@ impl Ticket {
         self.stage.open()
     }
 
+    /// 「还在动」：最近一次汇报是 `progress`，**而且**状态确实还是「在跑」那种。
+    ///
+    /// 后者不能省：`ticket_interrupted` 记的也是 `progress`（中止也是进度汇报），
+    /// 但它同时把状态推到了 `Blocked` —— 那时说「还在动」就是撒谎。
+    pub fn still_moving(&self) -> bool {
+        self.report == Some(Report::Progress) && matches!(self.stage, Stage::Queued | Stage::Working)
+    }
+
     /// 结果的一句话摘要（列表里那一行）。
     ///
     /// 取**第一行非空的**，压到 `max` 字。以前有两个几乎一样的方法
@@ -515,12 +523,17 @@ pub async fn mark_started(core: &crate::Core, session_id: &str) {
 ///
 /// 形状照抄 dsh 的 `ticketCard`：**紧凑 + 带 `read:` 指针**。
 /// 每个条目都要能顺着指针走到下一个对象 —— 否则模型的探索走一步就断了。
+///
+/// 「还在动」只由 `report` 说，但**得看状态允许不允许**：`ticket_interrupted`
+/// 会把 `report` 记成 `progress`（中止也是「进度汇报」的一种）同时把 state 推到
+/// `Blocked`。以前这里只看 `report`，于是停止之后列表里那一行是
+/// 「被卡住（还在动）」—— 两句话互相打脸。
+///
+/// 判据收敛在 [`Ticket::still_moving`] 一处，界面和模型看到的是同一个结论。
 pub fn card(t: &Ticket) -> String {
     let mut line = format!("`{}` {} [{}]", t.id, t.title, t.stage.label());
-    if let Some(r) = t.report {
-        if r == Report::Progress {
-            let _ = write!(line, "（还在动）");
-        }
+    if t.still_moving() {
+        let _ = write!(line, "（还在动）");
     }
     let head = t.summary(160);
     if !head.is_empty() {

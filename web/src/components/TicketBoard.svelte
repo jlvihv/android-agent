@@ -27,6 +27,8 @@
     needsPerson: boolean;
     open: boolean;
     report?: string | null;
+    /** 「还在动」（最近一次汇报是 progress，**而且**状态真的还在跑） */
+    moving?: boolean;
     preview?: string;
     dispatches?: number;
   };

@@ -719,6 +719,45 @@ mod tests {
         assert_eq!(after.report, Some(Report::Progress));
     }
 
+    /// **中止之后不能说「还在动」。**
+    ///
+    /// `ticket_interrupted` 把 `report` 记成 `progress`（中止也是进度汇报）同时把
+    /// stage 推到 `Blocked`。以前 `card()` 只看 `report`，于是列表里那一行是
+    /// 「被卡住（还在动）」—— 两句话互相打脸，模型也会误以为不用管它。
+    #[tokio::test]
+    async fn a_stopped_ticket_is_not_still_moving() {
+        let (core, rid) = with_router("moving").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+
+        // 还在跑的时候，一条 progress 确实意味着「还在动」
+        crate::ticket::mark_started(&core, &t.session_id).await;
+        db.ticket_report(&t.id, Report::Progress, "跑到一半", 1).unwrap();
+        let moving = db.ticket_get(&t.id).unwrap().unwrap();
+        assert!(moving.still_moving(), "在跑的时候该说还在动");
+        assert!(ticket::card(&moving).contains("（还在动）"));
+
+        core.state.clear_llm();
+        report_back(&core, &t.session_id, "干到一半被叫停", true, true).await;
+        let stopped = db.ticket_get(&t.id).unwrap().unwrap();
+        assert_eq!(stopped.stage, Stage::Blocked);
+        assert!(
+            !stopped.still_moving(),
+            "停下了就不是「还在动」：stage={:?} report={:?}",
+            stopped.stage, stopped.report
+        );
+        let line = ticket::card(&stopped);
+        assert!(
+            !line.contains("（还在动）"),
+            "词不能自相矛盾（被卡住又说还在动）：{line}"
+        );
+    }
+
     #[tokio::test]
     async fn list_shows_counts_and_read_pointers() {
         let (core, rid) = with_router("list").await;

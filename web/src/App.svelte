@@ -301,7 +301,7 @@
     // **协调层删不掉**：它是「唯一的那个」（服务端 `POST /api/router` 幂等，
     // id 记在 `meta.router_session` 里）。删了之后 `ensureRouter` 会重建一个
     // 新的、换新 id，看起来就像「Router 不见了又出现」，而且它派出去的活
-    // 全成了孤儿（`dispatched` 表里 `by_session` 指向一个不存在的会话）。
+    // 全成了孤儿（`tickets.router_id` 指向一个不存在的会话）。
     // 界面上也不该有这条路径 —— Drawer 那边同样过滤掉（见那里的长按菜单）。
     if (sessions.some((s) => s.id === id && s.role === "router")) return;
 

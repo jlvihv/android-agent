@@ -803,46 +803,6 @@ impl Db {
         Ok(())
     }
 
-    /// 记一笔「这个 worker 会话是 Router 派出去的」。
-    ///
-    /// 同一个会话可以被派好几次，后来的覆盖先前的：Worker 做完时回报给
-    /// **最近一次**派它的那个 Router 就行（更早那次的来回早就结束了）。
-    pub fn set_dispatch(
-        &self,
-        session_id: &str,
-        by_session: &str,
-        dispatch_id: &str,
-        at: u64,
-    ) -> Result<()> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
-        g.conn.execute(
-            "INSERT INTO dispatched(session_id, by_session, dispatch_id, created_at)
-             VALUES(?1, ?2, ?3, ?4)
-             ON CONFLICT(session_id) DO UPDATE SET
-               by_session = excluded.by_session,
-               dispatch_id = excluded.dispatch_id,
-               created_at = excluded.created_at",
-            rusqlite::params![session_id, by_session, dispatch_id, at as i64],
-        )?;
-        Ok(())
-    }
-
-    /// 这个会话是谁派出去的（`(by_session, dispatch_id)`）。没有派工记录就是 `None`。
-    pub fn dispatch_of(&self, session_id: &str) -> Result<Option<(String, String)>> {
-        self.with(|c| {
-            let mut stmt =
-                c.prepare("SELECT by_session, dispatch_id FROM dispatched WHERE session_id = ?1")?;
-            let mut rows = stmt.query([session_id])?;
-            match rows.next()? {
-                Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
-                None => Ok(None),
-            }
-        })
-    }
-
     pub(crate) fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
         let g = self
             .inner
