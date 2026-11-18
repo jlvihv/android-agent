@@ -26,7 +26,12 @@ import type { Message, Part } from "./sse";
  *
  * 每条记着自己属于哪个会话（`sid`）：回合在后台跑着时用户可能已经切走了。
  */
-export type Queued = { id: string; sid: string; parts: Part[]; pending?: boolean };
+export type Queued = {
+  id: string;
+  sid: string;
+  parts: Part[];
+  pending?: boolean;
+};
 
 export class QueueMirror {
   /** 所有会话的排队项（画的时候按 `sid` 过滤） */

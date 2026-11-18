@@ -49,7 +49,11 @@ describe("整窗", () => {
   test("首屏：整份换上，起点用服务端的 from", async () => {
     const api = fakeApi();
     const p = pager();
-    api.next({ messages: [msg("u1"), msg("a1", "assistant")], from: 0, busy: false });
+    api.next({
+      messages: [msg("u1"), msg("a1", "assistant")],
+      from: 0,
+      busy: false,
+    });
     await p.load(() => {});
     expect(p.messages.map((m) => m.id)).toEqual(["u1", "a1"]);
     expect(p.windowFrom).toBe(0);

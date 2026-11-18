@@ -262,8 +262,12 @@ export class Pager {
    *     翻译的，下标不作数
    */
   #stale(sid: string, at: number, winAt: number): boolean {
-    return !this.alive() || this.sid() !== sid || at !== this.sent ||
-      winAt !== this.windowFrom;
+    return (
+      !this.alive() ||
+      this.sid() !== sid ||
+      at !== this.sent ||
+      winAt !== this.windowFrom
+    );
   }
 
   /**
@@ -283,9 +287,7 @@ export class Pager {
    * 用量、错误提示 —— 那些不归窗口管）。返回 `false` = 让这里别再往下套补丁
    *（`unchanged`）。
    */
-  async load(
-    onReply: (d: SessionReply) => boolean | void,
-  ): Promise<void> {
+  async load(onReply: (d: SessionReply) => boolean | void): Promise<void> {
     const sid0 = this.sid();
     const at = this.sent;
     // 发请求时手上那一窗的起点。补丁的 `replaceFrom` 是服务端按**这个**翻译过来的。
