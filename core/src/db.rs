@@ -344,6 +344,20 @@ pub struct SyncPlan {
     active: Option<String>,
 }
 
+/// `plan` 第一步的产出：**光比对，不序列化**。
+///
+/// 借的是 `store.sessions` 里那一条（所以 `plan` 拿到了 `store` 整段生命周期），
+/// 只需记下「从第几条开始、要不要整段重写」。
+struct PendingSession<'a> {
+    sess: &'a ChatSession,
+    /// 从 `sess.messages` 的第几条开始序列化（都是增量）
+    from: usize,
+    /// 要不要先把库里的旧行删掉（清空过 / 水位线不可信）
+    rewrite: bool,
+    /// 写成之后的水位线
+    saved: Saved,
+}
+
 struct PlannedSession {
     id: String,
     title: String,
@@ -579,60 +593,86 @@ impl Db {
     }
 
     /// 算出这一次要写什么（不碰盘）。没什么要写的是 `None`。
+    ///
+    /// **锁只用来比对水位线，不用来序列化。** 一次落盘的增量可能有几 MB（几十条
+    /// tool 输出每条几十 KB），而 `serde_json::to_string` 是纯 CPU 活 —— 把它放在
+    /// `inner` 锁里的话，这几 MB 的序列化期间整个库都动不了：别的会话的 `get_meta`、
+    /// 附件登记、工作项读写全在排队。手机上一个回合产出几 MB 输出是常态。
+    ///
+    /// 所以分两步：锁里只拿「谁要写、从第几条开始写、epoch 对不对」这几件事（纯比对，
+    /// 几个 HashMap 查找），出锁之后再序列化。`generation` 照旧在锁里取 —— 它才是
+    /// 「这份计划还算不算数」的判据（见 `write`）。
     pub fn plan(&self, store: &SessionStore) -> Result<Option<SyncPlan>> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        // 第一步（持锁）：只比对，不序列化。`pending` 是「要写的会话 + 从第几条开始」。
+        let (generation, gone, pending) = {
+            let g = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
 
-        // 空会话不落盘（也把它上次可能写进去的旧行清掉，见下面的 gone）：
-        // 「新对话」点了没说话、或 `/api/reset` 清空过，重启后不该又冒出来。
-        //
-        // **Router 例外**：它只有一个，而且身份靠 `meta.router_session` 记着。
-        // 要是空着不落盘，下次启动时那个 id 在库里找不到 → `ensure_router`
-        // 只能重建一个、换一个新 id。用户什么都没做，Router 却每次重启都变一个，
-        // 前言不搭后语（而且 `meta` 里那条永远指向一个不存在的会话）。
-        // 所以 Router 一建出来就落盘，哪怕一条消息都没有。
-        let keep: Vec<&ChatSession> = store
-            .sessions
-            .iter()
-            .filter(|s| s.has_content() || s.role == crate::agent::Role::Router)
-            .collect();
-        let gone: Vec<String> = g
-            .saved
-            .keys()
-            .filter(|id| !keep.iter().any(|s| &s.id == *id))
-            .cloned()
-            .collect();
-        // 不再往库里写「当前会话」（服务端没这个概念了）。见 `load` 那段。
-        let active: Option<String> = None;
-
-        let mut sessions = Vec::new();
-        for s in keep {
-            let now = Saved::of(s);
-            let prev = g.saved.get(&s.id);
-            if prev == Some(&now) {
-                continue;
-            }
-            // 会话被清空过（/api/reset）：消息变少了。不处理的话水位线还停在
-            // 旧长度，新消息的 seq 从 0 开始会被跳过不落盘，而库里的旧消息还在 ——
-            // 重启后清掉的对话又回来了。变少只可能是整个清空过，前缀也不可信，整段重写。
+            // 空会话不落盘（也把它上次可能写进去的旧行清掉，见下面的 gone）：
+            // 「新对话」点了没说话、或 `/api/reset` 清空过，重启后不该又冒出来。
             //
-            // 消息不在内存里的会话只可能改了会话头（改名、换 provider session），
-            // 消息一条都不能动 —— 空的 `messages` 在这里会被当成「清空过」。
-            let messages = if s.resident() {
-                let mut from = prev.map_or(0, |x| x.len);
-                let rewrite = s.messages.len() < from || prev.is_some_and(|x| x.epoch != s.epoch);
-                if rewrite {
-                    from = 0;
+            // **Router 例外**：它只有一个，而且身份靠 `meta.router_session` 记着。
+            // 要是空着不落盘，下次启动时那个 id 在库里找不到 → `ensure_router`
+            // 只能重建一个、换一个新 id。用户什么都没做，Router 却每次重启都变一个，
+            // 前言不搭后语（而且 `meta` 里那条永远指向一个不存在的会话）。
+            // 所以 Router 一建出来就落盘，哪怕一条消息都没有。
+            let keep: Vec<&ChatSession> = store
+                .sessions
+                .iter()
+                .filter(|s| s.has_content() || s.role == crate::agent::Role::Router)
+                .collect();
+            let gone: Vec<String> = g
+                .saved
+                .keys()
+                .filter(|id| !keep.iter().any(|s| &s.id == *id))
+                .cloned()
+                .collect();
+
+            let mut pending = Vec::new();
+            for s in keep {
+                let now = Saved::of(s);
+                let prev = g.saved.get(&s.id);
+                if prev == Some(&now) {
+                    continue;
                 }
-                let rows = s.messages[from.min(s.messages.len())..]
+                // 会话被清空过（/api/reset）：消息变少了。不处理的话水位线还停在
+                // 旧长度，新消息的 seq 从 0 开始会被跳过不落盘，而库里的旧消息还在 ——
+                // 重启后清掉的对话又回来了。变少只可能是整个清空过，前缀也不可信，整段重写。
+                //
+                // 消息不在内存里的会话只可能改了会话头（改名、换 provider session），
+                // 消息一条都不能动 —— 空的 `messages` 在这里会被当成「清空过」。
+                let (from, rewrite) = match (s.resident(), prev) {
+                    (false, _) => (0, false),
+                    (true, None) => (0, false),
+                    (true, Some(x)) => {
+                        let rewrite = s.messages.len() < x.len || x.epoch != s.epoch;
+                        (if rewrite { 0 } else { x.len }, rewrite)
+                    }
+                };
+                pending.push(PendingSession {
+                    sess: s,
+                    from: from.min(s.messages.len()),
+                    rewrite,
+                    saved: now,
+                });
+            }
+            (g.generation, gone, pending)
+        };
+
+        // 第二步（不持锁）：序列化。几个 MB 的 JSON 都在这一步。
+        let mut sessions = Vec::with_capacity(pending.len());
+        for p in pending {
+            let s = p.sess;
+            let messages = if s.resident() {
+                let rows = s.messages[p.from..]
                     .iter()
                     .map(serde_json::to_string)
                     .collect::<serde_json::Result<Vec<_>>>()?;
                 Some(PlannedMessages {
-                    rewrite,
-                    from,
+                    rewrite: p.rewrite,
+                    from: p.from,
                     rows,
                 })
             } else {
@@ -646,15 +686,17 @@ impl Db {
                 provider_session: s.provider_session.clone(),
                 role: s.role,
                 messages,
-                saved: now,
+                saved: p.saved,
             });
         }
 
+        // 不再往库里写「当前会话」（服务端没这个概念了）。见 `load` 那段。
+        let active: Option<String> = None;
         if sessions.is_empty() && gone.is_empty() && active.is_none() {
             return Ok(None);
         }
         Ok(Some(SyncPlan {
-            generation: g.generation,
+            generation,
             sessions,
             gone,
             active,
