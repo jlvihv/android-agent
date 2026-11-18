@@ -95,8 +95,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(list_sessions).post(new_session))
         // 协调层那个会话（双层架构）。只有一个，没有就现建。
         .route("/api/router", post(router_session))
-        // 某个 Router 名下的工作项（双层架构里「派出去的活」）。前端在 Router
-        // 那条会话里画一块「在干的活」，靠它。
+        // 某个 Router 派出去的会话（带每条的 state / label）。
+        //
+        // ⚠️ **前端已不调它**：原来 Router 顶上那个「在干的活」看板已经删掉了
+        // （它的信息现在由 `/api/sessions` 每行的 `state` 承载，见那边的注释）。
+        // 保留是因为：
+        //   - 它给 `scripts/agentctl.py` 之类的调试脚本用（带 `all=1` 能看到
+        //     收尾过的，`/api/sessions` 那份不带这个维度）；
+        //   - 刚经审查、有测试覆盖，删了要重新写回来成本更高。
+        // 真要删，得一并处理上面那些消费者 —— 别只删这条 route。
         .route("/api/sessions/dispatched", get(list_dispatched_sessions))
         .route("/api/search", get(search_sessions))
         .route("/api/sessions/rename", post(rename_session))

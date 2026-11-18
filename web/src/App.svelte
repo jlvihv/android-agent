@@ -24,7 +24,7 @@
   import Composer from "./components/Composer.svelte";
   import MessageList from "./components/MessageList.svelte";
   import Drawer, { type Session } from "./components/Drawer.svelte";
-    import MachineSheet from "./components/MachineSheet.svelte";
+  import MachineSheet from "./components/MachineSheet.svelte";
   import ModelSheet from "./components/ModelSheet.svelte";
   import Settings from "./components/Settings.svelte";
   import Viewer from "./components/Viewer.svelte";

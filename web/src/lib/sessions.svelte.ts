@@ -37,8 +37,7 @@ export type Session = {
    *   `done`      人验收过了
    *   `cancelled` 人不要了
    *
-   * 服务端其实还会给 `open`（`Closed::Open` 的兜底值），但 `standing()` 只在
-   * 「收尾但状态是 Open」这种数据异常时才会返回它，界面按 `idle` 处理即可。
+   * 正好是后端 `Standing::as_str()` 的五个值，不多不少。
    */
   state?: SessionState;
   /** 人看的状态名，服务端给（「在跑」「排队中」「闲着」「已验收」「已取消」） */
@@ -54,14 +53,14 @@ export type Session = {
   role?: "worker" | "router";
 };
 
-/** `Session.state` 的取值（见那个字段的注释）。 */
-export type SessionState =
-  | "working"
-  | "queued"
-  | "idle"
-  | "done"
-  | "cancelled"
-  | "open";
+/**
+ * `Session.state` 的取值（见那个字段的注释）。
+ *
+ * 正好是后端 `Standing::as_str()` 的五个值 —— **没有 `open`**：
+ * 服务端那个枚举里已经没有它了（`Standing` 的收尾态是扁平的 `Done` /
+ * `Cancelled`，「收尾了但还是 Open」那个值构造不出来）。
+ */
+export type SessionState = "working" | "queued" | "idle" | "done" | "cancelled";
 
 /** 刚落地那份的安静窗口：窗口内再来要就直接复用它 */
 const MERGE_MS = 300;

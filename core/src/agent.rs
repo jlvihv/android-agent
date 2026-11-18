@@ -502,8 +502,10 @@ pub enum Standing {
     Queued,
     /// 没在跑、没排队、也没收尾 —— 它停下了，等人看一眼
     Idle,
-    /// 人把它划掉了
-    Closed(Closed),
+    /// 人验收过了
+    Done { at: u64 },
+    /// 人不要了
+    Cancelled { at: u64 },
 }
 
 impl Standing {
@@ -517,18 +519,23 @@ impl Standing {
 
     /// 还开着吗（没被划掉）
     pub const fn open(self) -> bool {
-        !matches!(self, Self::Closed(_))
+        !matches!(self, Self::Done { .. } | Self::Cancelled { .. })
     }
 
     /// 机器读的状态名（HTTP 字段 `state`）
+    ///
+    /// **没有 `open` 这一支**。以前是 `Closed(Closed)` 包着完整的 `Closed`，
+    /// 于是 `Standing::Closed(Closed::Open)` 在类型上可表示 —— 虽然
+    /// `standing()` 只在 `is_closed()` 为真时才构造它、那个值实际到不了，
+    /// 但 match 里必须为它写一个分支（或者一个 `unreachable!()`）。
+    /// 现在 `Done` / `Cancelled` 是扁平的变体，**非法值在类型层面就不存在**。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Running => "working",
             Self::Queued => "queued",
             Self::Idle => "idle",
-            Self::Closed(Closed::Open) => "open",
-            Self::Closed(Closed::Done { .. }) => "done",
-            Self::Closed(Closed::Cancelled { .. }) => "cancelled",
+            Self::Done { .. } => "done",
+            Self::Cancelled { .. } => "cancelled",
         }
     }
 
@@ -538,7 +545,8 @@ impl Standing {
             Self::Running => "在跑",
             Self::Queued => "排队中",
             Self::Idle => "闲着",
-            Self::Closed(c) => c.label(),
+            Self::Done { .. } => "已验收",
+            Self::Cancelled { .. } => "已取消",
         }
     }
 }
@@ -705,8 +713,13 @@ impl ChatSession {
     /// 「在干这件事」—— 它是历史了。（`close_session` 本身会拒绝关在跑的会话，
     /// 但数据可能是从别处来的，比如老库、比如别处的直接调用。）
     pub fn standing(&self, busy: bool, queued: bool) -> Standing {
-        if self.closed.is_closed() {
-            return Standing::Closed(self.closed);
+        // `Closed` → `Standing` 的映射在这里收成两臂：`Open` 落不到这两个
+        // 分支上（它在上面就被 `is_closed()` 挡掉了），而 `Standing` 里
+        // 也没有「收尾了但还是 Open」这种值可写。
+        match self.closed {
+            Closed::Open => {}
+            Closed::Done { at } => return Standing::Done { at },
+            Closed::Cancelled { at } => return Standing::Cancelled { at },
         }
         if busy {
             return Standing::Running;
@@ -4064,11 +4077,11 @@ mod tests {
     fn a_closed_session_outranks_everything() {
         let mut s = ChatSession::with_role(Role::Worker);
         s.closed = Closed::Done { at: 42 };
-        assert_eq!(s.standing(true, true), Standing::Closed(Closed::Done { at: 42 }));
+        assert_eq!(s.standing(true, true), Standing::Done { at: 42 });
         s.closed = Closed::Cancelled { at: 7 };
         assert_eq!(
             s.standing(false, false),
-            Standing::Closed(Closed::Cancelled { at: 7 })
+            Standing::Cancelled { at: 7 }
         );
     }
 
@@ -4082,7 +4095,7 @@ mod tests {
         assert!(!Standing::Queued.needs_person(), "排队中不该算等人");
         assert!(Standing::Idle.needs_person(), "停下了才等人");
         assert!(!Standing::Running.needs_person());
-        assert!(!Standing::Closed(Closed::Done { at: 1 }).needs_person());
+        assert!(!Standing::Done { at: 1 }.needs_person());
     }
 
     /// `Closed` 的数据库往返：`Open` / `Done` / `Cancelled` 都还原得回来，
