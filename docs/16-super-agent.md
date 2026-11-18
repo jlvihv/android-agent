@@ -113,15 +113,16 @@ Queued / Working / WaitingReview / Blocked / Failed / Done / Cancelled
 网页、文件 —— 它转述的内容**不能当用户指令**。标记 + 提示词里那句话，是让模型
 分得清的唯一办法。
 
-### 上下文膨胀怎么办
+### 上下文：不截断，也不降级
 
-**不截断新回执**（用户明确要求）。做的是**旧回执降级**：
+**回执永远给全文。** 不截断、不在历史里降级成指针、不做任何「保留最近 N 条」。
 
-- 新到的回执**永远给全文**；
-- 历史里攒够 `KEEP_REPORTS = 4` 条之后，更早的那些换成一行指针
-  （带 `session_id`，`read_session` 能取回全文）；
-- 按**整块**降级（每多 4 条才挪一次边界），理由和 `KEEP_IMAGES` 一样：
-  每轮都挪边界会让 prompt cache 永远不命中。
+用户在这件事上的要求很明确：Router 必须能看见子会话交出来的原文。曾经实现过一版
+「旧回执降级成指针」（`KEEP_REPORTS` / `ReportBudget`），已经**整个删掉** ——
+降到历史里同样违背那条要求。上下文膨胀以后单独处理，不该以「看不见全文」为代价。
+
+测试 `agent::tests::every_report_is_sent_in_full_no_matter_how_many` 钉住这条：
+历史里堆 20 条回执，每一条都原样出现在请求里（两条协议路径都验）。
 
 ---
 
@@ -186,8 +187,7 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
 | 测试 | 守什么 |
 | --- | --- |
 | `closing_a_session_always_removes_it_from_the_waiting_count` | **不存在推不动的状态**：收尾之后必须从「等人」里消失（旧架构做不到） |
-| `a_fresh_report_is_always_delivered_in_full` | 新到的回执永远全文（不踩「到手就截断」的红线） |
-| `old_reports_collapse_to_a_pointer_that_can_still_be_followed` | 旧回执降级成指针，但指针里有 id，读得回来 |
+| `every_report_is_sent_in_full_no_matter_how_many` | 回执永远全文：历史里堆 20 条，每条都原样出现在请求里（两条协议路径） |
 | `a_worker_report_is_marked_in_both_body_and_origin` | 正文有边界标记（模型分得清）+ `origin` 有来源（代码分得清） |
 | `cannot_close_a_session_that_is_still_running` | 在跑的不许收尾（不然那一轮结果没人接） |
 | `redispatch_appends_to_the_brief_instead_of_overwriting_it` | `brief` 是验收合同，追加不覆盖 |

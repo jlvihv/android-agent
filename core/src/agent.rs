@@ -950,25 +950,19 @@ fn build_messages(
     let msgs = &sess.messages;
     let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
     let mut budget = ImageBudget::new(sess);
-    let mut reports = ReportBudget::iterator(sess);
     let mut i = 0;
     while i < msgs.len() {
         // 带附件的用户消息：正文 + 图片 / PDF 内容块拼在一条消息里。
+        // 回执（`origin == WorkerReport`）和普通用户消息在这里一视同仁：**原样发**。
+        // `origin` 只给本地用（见 `ChatMessage::User.origin`），不进请求体。
         if let ChatMessage::User {
             text,
             attachments,
-            origin,
+            ..
         } = &msgs[i]
         {
-            // 回执：新的是全文，攒够 `KEEP_REPORTS` 条之后更早的那些降级成指针。
-            let body = match origin {
-                Origin::WorkerReport { session_id } if !reports.full() => {
-                    demoted_report(session_id)
-                }
-                _ => text.clone(),
-            };
             out.push(user_message(
-                &body,
+                text,
                 attachments,
                 supports_images,
                 supports_files,
@@ -1065,75 +1059,6 @@ const KEEP_IMAGES: usize = 4;
 /// 截断点**按整块往前挪**：内联的张数在 `KEEP_IMAGES` 到 `2 * KEEP_IMAGES - 1`
 /// 之间摆动，每多读 `KEEP_IMAGES` 张图才挪一次。每挪一次前缀就变了、prompt
 /// cache 断一次，一张一挪的话每步都断。截断点只由历史推导，请求仍然是确定的。
-/// 历史里最多保留几条回执的**全文**。更早的降级成一行指针（见 [`ReportBudget`]）。
-///
-/// ## 为什么是「旧回执降级」而不是「到手就截断」
-///
-/// 用户明确否决了「回执一到就砍到 600 字」—— 那会让 Router **永远**看不到
-/// 那次汇报的全文。这里做的是另一件事：**回执到达时永远是全文**（模型当时
-/// 看得到），只有等它攒够若干条之后，更早的那些才换成指针。全文仍在会话
-/// 历史里（`conclusion` 字段 + 消息本体），随时 `read_session` 取回。
-///
-/// ## 为什么按块取整
-///
-/// 和 [`KEEP_IMAGES`] 完全同一个理由：每来一条新回执就把边界往前挪一格的话，
-/// 每轮请求的前缀都不一样，prompt cache 永远不命中。这里一次降级一整块。
-const KEEP_REPORTS: usize = 4;
-
-/// 决定历史里每一条回执要不要给全文（见 [`KEEP_REPORTS`]）。
-///
-/// 和 `ImageBudget` 是同一个套路：数历史里一共有几条回执，算出「从第几条开始
-/// 只给指针」，然后按顺序判断。
-struct ReportBudget {
-    /// 从第几条（从 0 数）开始降级
-    from: usize,
-    seen: usize,
-}
-
-impl ReportBudget {
-    fn new(sess: &ChatSession) -> Self {
-        let total = sess
-            .messages
-            .iter()
-            .filter(|m| {
-                matches!(
-                    m,
-                    ChatMessage::User {
-                        origin: Origin::WorkerReport { .. },
-                        ..
-                    }
-                )
-            })
-            .count();
-        Self {
-            // 按整块往前挪（和 ImageBudget 一字不差的理由：保住 prompt cache）
-            from: total.saturating_sub(KEEP_REPORTS) / KEEP_REPORTS * KEEP_REPORTS,
-            seen: 0,
-        }
-    }
-
-    /// 历史里的下一条回执要不要给全文
-    fn full(&mut self) -> bool {
-        let full = self.seen >= self.from;
-        self.seen += 1;
-        full
-    }
-
-    /// 历史里从头扫到尾的迭代器（`build_messages` / `build_responses_input` 用）
-    fn iterator(sess: &ChatSession) -> Self {
-        Self::new(sess)
-    }
-}
-
-/// 一条被降级的旧回执的正文：一行指针，指向还能读到全文的地方。
-fn demoted_report(session_id: &str) -> String {
-    format!(
-        "<worker_report session=\"{session_id}\" demoted=\"true\">\n\
-         （这条回报较早，全文已不在上下文里；要看就用 read_session 读会话 `{session_id}`。）\n\
-         </worker_report>"
-    )
-}
-
 struct ImageBudget {
     /// 从第几张（从 0 数）开始内联
     from: usize,
@@ -2668,29 +2593,20 @@ fn build_responses_input(
 ) -> Vec<InputItem> {
     let mut out: Vec<InputItem> = Vec::new();
     let mut budget = ImageBudget::new(sess);
-    let mut reports = ReportBudget::iterator(sess);
     for m in &sess.messages {
         match m {
             ChatMessage::System(s) => {
                 out.push(message_item("system", MessageContent::Text(s.clone())));
             }
+            // 同 `build_messages`：回执与普通用户消息一视同仁，原样发。
             ChatMessage::User {
                 text,
                 attachments,
-                origin,
-            } => {
-                // 同 `build_messages`：老回执降级成指针，新回执给全文
-                let body = match origin {
-                    Origin::WorkerReport { session_id } if !reports.full() => {
-                        demoted_report(session_id)
-                    }
-                    _ => text.clone(),
-                };
-                out.push(message_item(
-                    "user",
-                    user_message_content(&body, attachments, supports_images, supports_files),
-                ));
-            }
+                ..
+            } => out.push(message_item(
+                "user",
+                user_message_content(text, attachments, supports_images, supports_files),
+            )),
             ChatMessage::Assistant {
                 content,
                 tool_calls,
@@ -4261,28 +4177,34 @@ mod tests {
             .contains("brew"));
     }
 
-    /// **新到的回执永远是全文**（用户明确否决了「到手就截断」）。
+    /// **回执永远给全文，一条都不降级。**
     ///
-    /// 只有攒够 `KEEP_REPORTS` 条之后，**更早的**那些才降级成指针 ——
-    /// 那时 Router 已经看过全文了，指针指向 `read_session` 还能取回。
+    /// 用户的红线是「不许截断」，而且明确否决了「降到历史里换指针」这种做法 ——
+    /// 那套（`KEEP_REPORTS` / `ReportBudget` / `demoted`)已经整个删掉了。
+    /// 这个测试钉住的是：历史里哪怕堆了几十条回执，**每一条都原样出现在请求里**，
+    /// 没有任何一条被换成指针或摘要。
+    ///
+    /// 上下文膨胀是另一个问题（以后单独一轮解决），不该以牺牲「看得见全文」为代价。
     #[test]
-    fn a_fresh_report_is_always_delivered_in_full() {
+    fn every_report_is_sent_in_full_no_matter_how_many() {
         let mut sess = ChatSession::with_role(Role::Router);
         ensure_system_prompt(&mut sess, crate::prompt::router_description());
 
-        // 塞 4 条旧回执，每条都带上标记
-        for i in 0..KEEP_REPORTS {
+        // 塞 20 条（远超任何「保留最近 N 条」的阈值，如果还有那种逻辑就会露出来）
+        const N: usize = 20;
+        for i in 0..N {
             sess.messages.push(ChatMessage::from_worker(
-                format!("<worker_report session=\"s{i}\">\n第 {i} 条的正文，要够长才能验出来。\n</worker_report>"),
+                format!(
+                    "<worker_report session=\"s{i}\" closed=\"false\">\n\
+                     第 {i} 条的正文，这一句必须原样出现在请求里。\n\
+                     </worker_report>"
+                ),
                 format!("s{i}"),
             ));
         }
-        // 再来一条**新的**：它必须是全文
-        let fresh = "<worker_report session=\"new\">\n这是刚到的第 5 条，全文都该在。\n</worker_report>";
-        sess.messages.push(ChatMessage::from_worker(fresh, "new"));
 
-        let msgs = build_messages(&sess, true, false).unwrap();
-        let joined: String = msgs
+        let joined: String = build_messages(&sess, true, false)
+            .unwrap()
             .iter()
             .map(|m| match m {
                 Message::User {
@@ -4293,55 +4215,30 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(
-            joined.contains("这是刚到的第 5 条"),
-            "新到的回执必须是全文：{joined}"
-        );
-        // 全局设定 KEEP_REPORTS=4 时会话里共有 5 条，按整块取整后 from=0，
-        // 所以这一轮全都还是全文。再塞 4 条才会开始降级。
-        for i in (0..KEEP_REPORTS).rev().take(3) {
+        for i in 0..N {
             assert!(
                 joined.contains(&format!("第 {i} 条的正文")),
-                "还没到降级点，第 {i} 条也该是全文：{joined}"
+                "第 {i} 条被降级/截断了 —— 回执必须永远全文"
             );
         }
-    }
-
-    /// 攒够一整块之后，更早的回执降级成指针 —— 但**指针里有会话 id**，
-    /// 所以全文仍然可以 `read_session` 取回（不是丢失，是折叠）。
-    #[test]
-    fn old_reports_collapse_to_a_pointer_that_can_still_be_followed() {
-        let mut sess = ChatSession::with_role(Role::Router);
-        ensure_system_prompt(&mut sess, crate::prompt::router_description());
-        // 两整块
-        for i in 0..(KEEP_REPORTS * 2) {
-            sess.messages.push(ChatMessage::from_worker(
-                format!("<worker_report session=\"s{i}\">\n第 {i} 条的正文\n</worker_report>"),
-                format!("s{i}"),
-            ));
-        }
-        let msgs = build_messages(&sess, true, false).unwrap();
-        let joined: String = msgs
-            .iter()
-            .map(|m| match m {
-                Message::User {
-                    content: UserContent::Text(t),
-                } => t.clone(),
-                _ => String::new(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // 最早那一条被折叠了
-        assert!(!joined.contains("第 0 条的正文"), "第 0 条该被降级：{joined}");
-        assert!(joined.contains("demoted=\"true\""), "要标出这是降级过的：{joined}");
-        assert!(joined.contains("read_session"), "要给回去读的办法：{joined}");
-        assert!(joined.contains("s0"), "要带上是哪条会话（否则取不回来）：{joined}");
-        // 最新的那条仍然是全文
         assert!(
-            joined.contains(&format!("第 {} 条的正文", KEEP_REPORTS * 2 - 1)),
-            "最新的必须是全文：{joined}"
+            !joined.contains("demoted"),
+            "不该再有任何降级标记：{joined}"
         );
+        assert!(
+            !joined.contains("已不在上下文里"),
+            "不该再有任何替指针文案：{joined}"
+        );
+
+        // Responses API 那条路也得一样
+        let input = build_responses_input(&sess, true, false);
+        let wire = serde_json::to_string(&input).unwrap();
+        for i in 0..N {
+            assert!(
+                wire.contains(&format!("第 {i} 条的正文")),
+                "Responses 路径上第 {i} 条也该是全文"
+            );
+        }
     }
 
     /// 只比 `messages` 不够：工具表也是可缓存前缀的一部分。
