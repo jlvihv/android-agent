@@ -1139,7 +1139,7 @@ impl AppState {
     /// 把“还有没有回合在跑”告诉壳（前台服务跟这个走）。
     fn notify_turn(&self) {
         self.emit(Event::TurnActive {
-            active: !self.busy_sessions().is_empty(),
+            active: self.any_busy(),
         });
     }
 
@@ -1162,7 +1162,7 @@ impl AppState {
     /// 只补**在跑的**：完事的那一条是一次性的消息，重放就是重复通知。
     pub fn turn_snapshot(&self) -> Vec<Event> {
         let mut out = vec![Event::TurnActive {
-            active: !self.busy_sessions().is_empty(),
+            active: self.any_busy(),
         }];
         if let Ok(g) = self.turn_status.lock() {
             out.extend(g.values().cloned().map(|status| Event::Turn { status }));
@@ -1329,6 +1329,14 @@ impl AppState {
             .lock()
             .map(|g| g.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// 有没有回合在跑。
+    ///
+    /// 只问「有没有」的地方走它，不要 `busy_sessions().is_empty()` —— 那会把每个
+    /// 会话 id 都克隆一份，只为了看一眼长度（`notify_turn` 每次回合起止都调）。
+    pub fn any_busy(&self) -> bool {
+        self.turns.lock().is_ok_and(|g| !g.is_empty())
     }
 
     /// 停这个会话正在跑的回合。返回有没有在跑。

@@ -381,7 +381,7 @@ pub fn precheck(st: &AppState, sb: &LinuxSandbox) -> Result<(PathBuf, String), S
     if st.alpine.job().state == JobState::Running {
         return Err("已经在升级了".into());
     }
-    if !st.busy_sessions().is_empty() {
+    if st.any_busy() {
         return Err("有对话正在进行，等它结束再升级".into());
     }
     let rootfs = cfg.rootfs.clone();

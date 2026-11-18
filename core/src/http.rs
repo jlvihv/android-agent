@@ -3101,11 +3101,13 @@ async fn list_sessions(
     // 会话总数（`agentctl doctor` 的「会话库 N 个会话」还要它，一页看不出总数）
     let total = store.sessions.iter().filter(|s| s.has_content()).count();
     drop(store);
-    // 抽屉里给正在跑的会话打个点：切走了也知道它还在干活
+    // 抽屉里给正在跑的会话打个点：切走了也知道它还在干活。
+    //
+    // 用 HashSet 而不是对每条会话 `busy.iter().any(..)`：那是 O(会话数 × 回合数)，
+    // 而这个接口是抽屉的常规轮询（切会话、回合收尾、回前台都会拉）。
+    let busy: std::collections::HashSet<&str> = busy.iter().map(String::as_str).collect();
     for s in &mut list {
-        let running = s["id"]
-            .as_str()
-            .is_some_and(|id| busy.iter().any(|b| b == id));
+        let running = s["id"].as_str().is_some_and(|id| busy.contains(id));
         s["busy"] = json!(running);
     }
     Json(json!({
