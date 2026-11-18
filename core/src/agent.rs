@@ -1490,16 +1490,16 @@ fn clip_part(mut part: Value, total: usize, cap: usize, field: &str) -> Value {
 /// `command`、`edit` 是 `edits`/`content`、`read` 是 `path`），逐个字段判断
 /// 既容易漏又难维护。整个预览一段就够了 —— 首屏只需要 `summarize()` 那一个
 /// 短字段（它还会从 `inputText` 兜底）。
-fn clip_input(part: Value, cap: usize) -> Value {
+fn clip_input(mut part: Value, cap: usize) -> Value {
     if cap == usize::MAX {
         return part;
     }
-    // 先克隆出来，后面要整体改 `part`（不能一边借着 `part["input"]` 一边 move）
-    let Some(input) = part.get("input").cloned() else {
+    // 把 `input` **取出来**：`part` 是自有值，`remove` 就够了 —— 以前是
+    // `part.get("input").cloned()`，把整个参数对象再深拷一份（`edit` 的参数里
+    // 跟着整份文件内容，几十 KB）。
+    let Some(input) = part.as_object_mut().and_then(|o| o.remove("input")) else {
         return part;
     };
-    let full = serde_json::to_string(&input).unwrap_or_default();
-    let full_len = full.chars().count();
 
     // **先看单个长字段**：`bash` 的 `command` 经常是一整段脚本（几百到几千字），
     // 而工具行只显示它的第一行。整体序列化不到 cap 不代表没问题 —— 实测这个
@@ -1513,34 +1513,46 @@ fn clip_input(part: Value, cap: usize) -> Value {
                 k.as_str(),
                 "command" | "content" | "text" | "query" | "oldText" | "newText"
             );
-            if is_long_field {
-                if let Some(text) = v.as_str() {
-                    if text.chars().count() > LONG_FIELD_CHARS {
-                        let short: String = text.chars().take(LONG_FIELD_CHARS).collect();
-                        preview.insert(k.clone(), json!(format!("{short}…")));
-                        cut_any = true;
-                        continue;
-                    }
+            if let Some(text) = is_long_field.then(|| v.as_str()).flatten() {
+                if text.chars().count() > LONG_FIELD_CHARS {
+                    let mut short: String = text.chars().take(LONG_FIELD_CHARS).collect();
+                    short.push('…');
+                    preview.insert(k.clone(), json!(short));
+                    cut_any = true;
+                    continue;
                 }
             }
             preview.insert(k.clone(), v.clone());
         }
     }
 
+    // 一个长字段都没有：原样返回。**这一步以前不是提前的** —— 以前先
+    // `serde_json::to_string(&input)` 把整段参数序列化一遍（几十 KB）+ 数一遍字符，
+    // 然后发现没东西要截，把 `part` 原样返回。白做两次 O(内容长度) 的活。
     if !cut_any {
+        part["input"] = input;
         return part;
     }
+
+    // 到这儿才需要「原始有多长」（前端显示「原文 N 字」）
+    let full = serde_json::to_string(&input).unwrap_or_default();
+    let full_len = full.chars().count();
+
     // 字段截过之后**仍然**超 cap 的（比如一百个短字段堆在一起），才退化成一整段
     // 文本预览。判断用截断后的实际大小 —— 用原始 `full_len` 的话，一条长命令
     // 明明已经被砍到 200 字了，还会被再套一层 `__preview`（测试抓到过）。
-    let after = serde_json::to_string(&Value::Object(preview.clone()))
+    //
+    // 量长度直接序列化 `&preview`（`Map` 本身就是 `Serialize`），不再像以前那样
+    // 为了量一次大小把整张 map `clone()` 成一个 `Value`。
+    let after = serde_json::to_string(&preview)
         .map(|v| v.chars().count())
         .unwrap_or(0);
     if after > cap {
         let mut slim = serde_json::Map::new();
+        // `remove` 而不是 `get().clone()`：这几个键下面的值马上就没人要了
         for key in ["command", "path", "name", "query", "url"] {
-            if let Some(v) = preview.get(key) {
-                slim.insert(key.into(), v.clone());
+            if let Some(v) = preview.remove(key) {
+                slim.insert(key.into(), v);
             }
         }
         slim.insert(
@@ -1550,11 +1562,10 @@ fn clip_input(part: Value, cap: usize) -> Value {
         slim.insert("chars".into(), json!(full_len));
         preview = slim;
     }
-    let mut out = part;
-    out["input"] = Value::Object(preview);
-    out["inputTruncated"] = json!(true);
-    out["inputChars"] = json!(full_len);
-    out
+    part["input"] = Value::Object(preview);
+    part["inputTruncated"] = json!(true);
+    part["inputChars"] = json!(full_len);
+    part
 }
 
 /// 同 [`session_view_range`]，但把 reasoning / tool 的正文截到
@@ -2340,8 +2351,12 @@ async fn deliver_queued(
     if msgs.is_empty() {
         return false;
     }
-    let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+    // 先把 id **移**出来（`msgs` 随后要按值消费给 `append`）。以前是
+    // `msgs.iter().map(|m| m.id.clone())` —— 每条排队消息多一次 String 分配，
+    // 而这两个 id 本来就要跟着 `data-queued-delivered` 发给前端，无其它引用。
+    let mut ids: Vec<String> = Vec::with_capacity(msgs.len());
     for m in msgs {
+        ids.push(m.id);
         let msg = ChatMessage::User {
             text: m.text,
             attachments: m.attachments,
