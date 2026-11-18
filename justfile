@@ -80,7 +80,10 @@ check:
 sweep:
     cargo sweep --time 7 --manifest-path {{core}}/Cargo.toml
 
-# 后端 + 前端。前端那几个纯函数测的是窗口 / 下标对齐（连续两个 bug 都出在这），毫秒级。
+# 后端 + 前端。前端测的是窗口 / 下标对齐（连续两个 bug 都出在这）、「切走不断流」、
+# 热集合 / 队列镜像 / 会话列表的合并分页、工具展示映射，毫秒级。
+# `.svelte.ts` 由 `web/scripts/runes-plugin.ts` 编译（bunfig 里 preload），
+# 所以测试可以直接 import 模块级的 `$state`（`lib/chat.svelte.ts` 那些）。
 test:
     cargo test --manifest-path {{core}}/Cargo.toml
     cd {{web}} && bun test

@@ -114,11 +114,40 @@ export async function* parseUiStream(
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  let buf = "";
+  /**
+   * 还没消费的原始片（**不**每来一片就拼成一个大字符串）。
+   *
+   * 为什么是数组：一个帧可能很大（阶段性工具输出每 120ms 推 32 KB 尾部快照，
+   * 实测见过 200 KB 的单帧），而网络分片能把它切成几百上千片。以前每片都
+   * `buf += ...` —— 那是 O(n²) 的拷贝（200 KB / 3202 片实测 82 ms）。
+   * 攒成数组、**只在真出现帧分隔符时 join 一次**，总拷贝量回到 O(n)。
+   */
+  let parts: string[] = [];
+  /** `parts` 里已知含分隔符（或跨片边界构成分隔符）的第一片下标；-1 = 没有 */
+  let sepAt = -1;
+
+  const push = (s: string) => {
+    if (!s) return;
+    const i = parts.length;
+    parts.push(s);
+    if (sepAt !== -1) return;
+    if (s.includes("\n\n")) sepAt = i;
+    // 分隔符被切在片边界上（`\n` 在上一片末尾、`\n` 在这一片开头）
+    else if (i > 0 && parts[i - 1].endsWith("\n") && s.startsWith("\n"))
+      sepAt = i;
+  };
 
   /** 把缓冲里完整的帧都吐出去；返回 true = 撞上终止帧（后面的一律不要了） */
   const drain = function* (flush: boolean): Generator<UiChunk, boolean> {
-    buf = buf.replace(/\r\n/g, "\n");
+    if (sepAt === -1 && !flush) return false;
+
+    let buf = parts.join("");
+    parts = [];
+    sepAt = -1;
+    // 只在真出现 `\r` 时才归一化：绝大多数流（我们自己的核心就是）一个 `\r`
+    // 都没有，而 `replace` 每次都要拷一遍整个 `buf`。
+    if (buf.includes("\r")) buf = buf.replace(/\r\n/g, "\n");
+
     for (;;) {
       const idx = buf.indexOf("\n\n");
       if (idx === -1) break;
@@ -128,12 +157,16 @@ export async function* parseUiStream(
       if (parsed === DONE) return true;
       if (parsed) yield parsed;
     }
-    if (flush && buf.trim()) {
-      const parsed = parseFrame(buf);
-      buf = "";
+    if (!buf) return false;
+    if (flush) {
+      // 对端直接关了：没闭合的最后一帧也吐出来
+      const parsed = buf.trim() ? parseFrame(buf) : null;
       if (parsed === DONE) return true;
       if (parsed) yield parsed;
+      return false;
     }
+    // 剩下的半帧留着，等下一片接上
+    push(buf);
     return false;
   };
 
@@ -150,14 +183,14 @@ export async function* parseUiStream(
       clearTimeout(idle);
     }
     if (done) break;
-    buf += decoder.decode(value, { stream: true });
+    push(decoder.decode(value, { stream: true }));
     if (yield* drain(false)) {
       // 收到 `[DONE]`：剩下的字节不用读，连接也主动放掉
       void reader.cancel();
       return;
     }
   }
-  buf += decoder.decode();
+  push(decoder.decode());
   yield* drain(true);
 }
 
@@ -254,41 +287,6 @@ export function totalsOf(u: Partial<UsageTotals>): UsageTotals {
  */
 export type SessionUsage = { last: Usage; total: UsageTotals };
 
-/**
- * 用量来了就喊一声。
- *
- * 输入框上那个上下文圆环靠它实时更新。为什么不让 UI 自己去扫 parts：
- * `onUpdate` 是每个 delta 都调一次的，而 parts 里可能有几十条工具输出 ——
- * 每来一个字都扫一遍太贵（见 `summarize` 的注释）。
- * 由 `applyChunk` 直接报一声是 O(1) 的。
- */
-const usageSinks = new Set<(u: Usage) => void>();
-/** 返回退订函数（放进 `$effect` 的清理里正好） */
-export function onUsage(fn: (u: Usage) => void): () => void {
-  usageSinks.add(fn);
-  return () => {
-    usageSinks.delete(fn);
-  };
-}
-
-/**
- * 服务端把排队的那几条用户消息**交给模型了**（`data-queued-delivered`）。
- *
- * UI 靠它把那几条从「排队中」（虚线圈 + ×）挪进正文 —— 交出去之后它们就在
- * 服务端的历史里了，不是「还没发出去」的东西了。
- *
- * 和 `onUsage` 同一个理由放在这里：一个个 delta 都往 UI 里推太吵，由 reducer
- * 直接报一声。
- */
-const queuedSinks = new Set<(ids: string[]) => void>();
-/** 返回退订函数（放进 `$effect` 的清理里正好） */
-export function onQueuedDelivered(fn: (ids: string[]) => void): () => void {
-  queuedSinks.add(fn);
-  return () => {
-    queuedSinks.delete(fn);
-  };
-}
-
 /** 这条消息排进服务端的队列了（`POST /api/chat` 的全部回应就这一帧）。 */
 export function isQueued(
   c: UiChunk | null,
@@ -358,7 +356,6 @@ export type Part =
       chars?: number;
     }
   | ToolPart
-  | { type: "data"; name: string; data: unknown }
   | { type: "error"; text: string }
   /** 用户在输入框里附的图片 / PDF。服务端 `session_view` 恢复历史时才有；
    *  刚发出去的那条是本地直接拼的（同一个形状）。 */
@@ -379,6 +376,19 @@ export type Message = {
   id: string;
   role: "user" | "assistant";
   parts: Part[];
+  /**
+   * 流里的 `data-warning`（「输出被长度上限截断」「LLM 重试中」…）。
+   *
+   * **不是 part**，故意：`parts` 的下标要和**服务端**的 `view_parts_len` 对齐
+   * （它只数 reasoning / text / tool）—— `session_patch` 的 `keepParts` 就是按
+   * 那个数告诉客户端「前 k 个 part 留着、后面换掉」。往 `parts` 里塞一个服务端
+   * 不数的 part，多步回合的下一步补丁就会把它（以及它后面的一切）挤掉：实测
+   * 第一步的「输出被截断」警告在第二步到达时消失。
+   *
+   * 顺带也是内存：`data-usage` 每步一条、永不清理，塞进 `parts` 就是一个回合
+   * 几十个只增不减的 part（每条还带着整份 `session` 累计）。
+   */
+  warnings?: string[];
   /**
    * 这条消息说完了没有。**两个用途别混**：
    *   - 助手消息：还在流式（`false`）还是结束了（`true`）
@@ -502,20 +512,11 @@ export function applyChunk(msg: Message, c: UiChunk): void {
       break;
 
     default: {
-      if (c.type.startsWith("data-")) {
-        msg.parts.push({
-          type: "data",
-          name: c.type.slice(5),
-          data: (c as { data: unknown }).data,
-        });
-        // 用量单独报一声（圆环要实时的，不想让 UI 去扫 parts）
-        if (c.type === "data-usage")
-          for (const f of usageSinks) f(c.data as Usage);
-        // 排队的消息交出去了：界面把那几条从「排队中」挪进正文
-        if (c.type === "data-queued-delivered") {
-          const ids = (c.data as { ids: string[] }).ids ?? [];
-          for (const f of queuedSinks) f(ids);
-        }
+      // `data-*` 是**事件**，不是消息内容 —— 不进 `parts`（理由见 `Message.warnings`）。
+      // 消费方（`Live#onData`）通过 `consume` 的 `onChunk` 自己收。
+      if (c.type === "data-warning") {
+        const w = (c.data as { message?: string }).message;
+        if (w) (msg.warnings ??= []).push(w);
       }
       break;
     }
@@ -533,21 +534,37 @@ export async function consume(
   msg: Message,
   stream: AsyncGenerator<UiChunk, void, undefined>,
   /**
-   * 流里又出现一个 `start` —— 服务端把排队的消息交给模型了，接下来的输出属于
-   * **新的一条**助手消息（服务端的历史里也是新的一条：`session_view` 的合并
-   * 规则里，User 会打断合并）。返回新消息接着写，`null` = 还是写这一条。
-   *
-   * 不给这个回调的调用方（脚本 / 测试）一直写同一条。
+   * 两个回调。**为什么是选项对象而不是两个位置参数**：`onRestart` 老早就有，
+   * 再加一个 `onChunk` 就变成「第三个参数是对象、第二个是函数」那种谁都得回去
+   * 数一遍的签名。
    */
-  onRestart?: (prev: Message) => Message | null,
+  opts: {
+    /**
+     * 流里又出现一个 `start` —— 服务端把排队的消息交给模型了，接下来的输出属于
+     * **新的一条**助手消息（服务端的历史里也是新的一条：`session_view` 的合并
+     * 规则里，User 会打断合并）。返回新消息接着写，`null` = 还是写这一条。
+     *
+     * 不给这个回调的调用方（脚本 / 测试）一直写同一条。
+     */
+    onRestart?: (prev: Message) => Message | null;
+    /**
+     * 每一帧（`start` 之外）都叫一次，**在 `applyChunk` 之后**。
+     *
+     * 给的是「这条流属于哪条会话」的那个消费方（`lib/chat.svelte.ts`）——
+     * 用量圆环和排队交付都要 sid，而这里正好知道。以前是 `lib/sse.ts` 里的两个
+     * 全局 sink（`onUsage` / `onQueuedDelivered`）：**没有 sid**，两条会话同时
+     * 跑的时候会把 A 的用量写到 B 的圆环上。
+     */
+    onChunk?: (c: UiChunk) => void;
+  } = {},
 ): Promise<Message> {
   let cur = msg;
   // 第一条 `start` 对应的消息调用方已经建好了（`beginStreaming`），不换
   let started = false;
   for await (const c of stream) {
     if (c.type === "start") {
-      if (started && onRestart) {
-        const next = onRestart(cur);
+      if (started && opts.onRestart) {
+        const next = opts.onRestart(cur);
         if (next) {
           cur = next;
           continue;
@@ -557,6 +574,7 @@ export async function consume(
       continue;
     }
     applyChunk(cur, c);
+    opts.onChunk?.(c);
   }
   cur.done = true;
   return cur;

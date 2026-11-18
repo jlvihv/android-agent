@@ -22,7 +22,12 @@
   import { fade } from "svelte/transition";
   import type { Message, ToolPart } from "../lib/sse";
   import { sandboxPath } from "../lib/markdown";
-  import { describeInput, describeResult, failed } from "../lib/toolview";
+  import {
+    describeInput,
+    describeResult,
+    faceOf,
+    failed,
+  } from "../lib/toolview";
   import Icon from "./Icon.svelte";
   import { openViewer } from "../lib/viewer.svelte.ts";
   import Markdown from "./Markdown.svelte";
@@ -107,51 +112,30 @@
   >(null);
 
   /**
-   * 把工具调用压成一句人话。Claude 的中间步骤就是这样 ——
-   * 一行截断描述，而不是把 JSON 摊在正文里。
+   * 工具行的展示信息（摘要 / 图标 / 面板标题）**全在 `lib/toolview.ts` 的
+   * `faceOf` 里**。
+   *
+   * 以前这里有 `summarize` / `toolTitle` / `toolIcon` 三个 `switch (t.toolName)`
+   * —— 加上 `toolview.ts` 里 `describeInput` 那个，同一个映射写了四遍：加一个
+   * 工具要改四处，漏一处就是「摘要对了、图标还是时钟」。
+   *
+   * 这里只剩「拿参数」这一步（参数可能还在流，见 `summaryArgs`）。
    */
-  function summarize(t: ToolPart): string {
-    // 参数还在流式（JSON 没写完）时从半截文本里抠字段，边写边显示。
-    //
-    // 只看开头那一段：这一行只要命令 / 路径 / 网址这种排在前面的短字段。
-    // 每来一小段参数这里就重算一次：对**整段** inputText 跑正则 + 试
-    // JSON.parse —— 模型用 edit 写一个 30KB 的文件，就是几千次 × 30KB 的反复
-    // 扫描，手机上肉眼可见地卡。
-    const a = summaryArgs(t);
-    const s = (v: unknown) => (typeof v === "string" ? v : "");
-    // 只取第一行，长度交给 CSS 截断 —— 屏幕多宽就显示多少
-    const firstLine = (v: string) => v.split("\n")[0].trim();
+  const face = (t: ToolPart) => faceOf(t, summaryArgs(t));
 
-    switch (t.toolName) {
-      case "read":
-        return `读取 ${s(a.path) || "文件"}`;
-      case "bash":
-        return firstLine(s(a.command)) || "执行命令";
-      case "edit":
-        // 新建还是改写：核心用 `content` / `edits` 两个参数区分（见 core 的
-        // edit_mode），这里认同一个信号 —— 两个都给是报错的用法，认 `content`
-        // 就行（那一行也会是红的）。摘要里也分两种说法，跟图标对得上。
-        return isNewFile(a)
-          ? `新建 ${s(a.path) || "文件"}`
-          : `编辑 ${s(a.path) || "文件"}`;
-      default:
-        return t.toolName || "工具调用";
-    }
-  }
-
-  /** 折叠行的摘要从流式参数里最多看这么多字符（见 summarize） */
+  /** 折叠行的摘要从流式参数里最多看这么多字符（见 summaryArgs） */
   const SUMMARY_SCAN = 2048;
 
   /**
    * 折叠行用的参数。
    *
-   * **只看开头那一段**（见 `summarize` 里那段注释）：这一行只要命令 / 路径 /
-   * `content` 这种排在前面的短字段，而且每来一小段参数就会重算一次 —— 对整段
-   * inputText 跑，模型用 edit 写一个 30KB 的文件就是几千次 × 30KB。
-   * 新建文件的那个 `content` 就在开头（path 只有几个字符），这一截里照样认得出。
+   * **只看开头那一段**：这一行只要命令 / 路径 / `content` 这种排在前面的短字段，
+   * 而且每来一小段参数就会重算一次 —— 对整段 inputText 跑，模型用 edit 写一个
+   * 30KB 的文件就是几千次 × 30KB。新建文件的那个 `content` 就在开头（path 只有
+   * 几个字符），这一截里照样认得出。
    *
    * 除了只扫前 `SUMMARY_SCAN` 个字符，**每帧最多解析一次**：参数是一片一片流过来
-   * 的，`summarize` 和 `toolIcon` 在一次渲染里各要一次它，而 Svelte 每来一个 delta
+   * 的，`face()` 在一次渲染里可能被要两次（摘要 + 图标），而 Svelte 每来一个 delta
    * 就重跑一次渲染 —— 一帧里能来十几片。做法和 `panelArgs` / `Markdown` 一样：
    * 变化先攒着，下一帧算一遍（`partialArgs` 的解析结果按 `toolCallId` 存着，
    * 同一份文本不会算两次）。
@@ -232,44 +216,6 @@
     for (const m of text.matchAll(/"(\w+)"\s*:\s*(-?\d+)\s*[,}]/g))
       out[m[1]] = Number(m[2]);
     return out;
-  }
-
-  /** 面板标题。要短，细节放正文。 */
-  function toolTitle(t: ToolPart, args: Record<string, unknown>): string {
-    switch (t.toolName) {
-      case "read":
-        return "读取文件";
-      case "bash":
-        return "执行命令";
-      case "edit":
-        return isNewFile(args) ? "新建文件" : "编辑文件";
-      default:
-        return t.toolName || "工具调用";
-    }
-  }
-
-  /** `edit` 这次是新建文件（`content`）还是改已有文件（`edits`） */
-  const isNewFile = (a: Record<string, unknown>) => a.content !== undefined;
-
-  /** 这几个图标名字得和 Icon.svelte 里的一致（写错了下面会编译报错） */
-  type ToolIcon = "file" | "newfile" | "terminal" | "pencil" | "clock";
-
-  /**
-   * 工具那一行左边的小图标：一眼能看出这次是在读、在跑命令、还是在改文件。
-   *
-   * 不认识的工具仍然给时钟：以后核心加了新工具，是「多了个没见过的图标」
-   * 而不是「这一行空了」。类型写成 `ToolIcon`（不是 `string`）—— 图标改名的话
-   * 这里会编译报错，不会静静地画不出东西。
-   */
-  const TOOL_ICON: Record<string, ToolIcon> = {
-    read: "file",
-    bash: "terminal",
-    edit: "pencil",
-  };
-  function toolIcon(t: ToolPart): ToolIcon {
-    if (t.toolName === "edit")
-      return isNewFile(summaryArgs(t)) ? "newfile" : "pencil";
-    return TOOL_ICON[t.toolName] ?? "clock";
   }
 
   /** 参数还在流式时从半截 JSON 里抠（见 partialArgs） */
@@ -948,12 +894,12 @@
                 class="flex w-full items-center gap-2 px-2.5 py-0.5 text-left"
               >
                 <Icon
-                  name={toolIcon(tool)}
+                  name={face(tool).icon}
                   size={16}
                   class="shrink-0 {bad ? 'text-bad' : 'text-faint'}"
                 />
                 <span class="truncate text-sm {bad ? 'text-bad' : 'text-muted'}"
-                  >{summarize(tool)}</span
+                  >{face(tool).summary(summaryArgs(tool))}</span
                 >
                 {#if tool.state !== "output" && !msg.done}
                   <span class="shrink-0 text-meta text-faint">运行中</span>
@@ -964,18 +910,17 @@
                   class="ml-auto shrink-0 text-faint"
                 />
               </button>
-            {:else if part.type === "data"}
-              <!-- 用量不显示（Claude 没有，看着啰嗦）；警告要显示，
-                 否则「输出被长度上限截断」这种中途停下的提示是隐形的 -->
-              {#if part.name === "warning"}
-                {@const w = part.data as { message?: string }}
-                {#if w?.message}
-                  <p class="text-code text-warn">⚠️ {w.message}</p>
-                {/if}
-              {/if}
             {:else if part.type === "error"}
               <p class="text-code text-bad">错误：{part.text}</p>
             {/if}
+          {/each}
+          <!-- 流里的 `data-warning`（输出被长度上限截断 / LLM 重试中）。
+               放在 parts 之外：`parts` 的下标必须和服务端的 `view_parts_len`
+               对齐（`keepParts` 靠它），见 `Message.warnings` 的注释。
+               用量不显示（Claude 没有，看着啰嗦）；警告必须显示 ——
+               否则「输出被截断」这种中途停下的提示是隐形的。 -->
+          {#each msg.warnings ?? [] as w, i (i)}
+            <p class="text-code text-warn">⚠️ {w}</p>
           {/each}
         </div>
       {/if}
@@ -1090,7 +1035,7 @@
           ? null
           : describeResult(t)}
     {@const inp = describeInput(t, panelArgs)}
-    <Sheet title={toolTitle(t, panelArgs)} onclose={() => (sheet = null)}>
+    <Sheet title={faceOf(t, panelArgs).title} onclose={() => (sheet = null)}>
       <div class="flex flex-col gap-4">
         {#if inp.primary}
           <pre

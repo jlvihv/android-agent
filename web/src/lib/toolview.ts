@@ -91,32 +91,102 @@ function formatEdits(edits: unknown): string {
     .join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// 工具名 → 展示信息
+// ---------------------------------------------------------------------------
+
+/**
+ * 一个工具在界面上怎么说。**只在这一处**：摘要行（`summarize`）、面板标题
+ * （`toolTitle`）、左侧图标（`toolIcon`）、面板主行（`describeInput`）以前各自
+ * `switch (t.toolName)` 一遍 —— 加一个工具要改四处，漏一处就是「摘要对了图标不对」。
+ *
+ * `icon` 的取值必须是 `Icon.svelte` 的 `Name`（写错了编译期就报）。
+ */
+export type ToolFace = {
+  /** 折叠行左侧的图标 */
+  icon: "file" | "newfile" | "terminal" | "pencil" | "clock";
+  /** 面板标题（要短，细节放正文） */
+  title: string;
+  /**
+   * 折叠行那一句摘要。`a` 是**可能不完整**的参数（参数还在流时从半截 JSON 抠的）。
+   * 只取第一行，长度交给 CSS 截断 —— 屏幕多宽就显示多少。
+   */
+  summary: (a: Record<string, unknown>) => string;
+  /** 面板主行那个最关键的值（命令 / 路径 / 网址）取哪个字段 */
+  primary?: string;
+};
+
+/** `edit` 这次是新建文件（`content`）还是改已有文件（`edits`） */
+export const isNewFile = (a: Record<string, unknown>) =>
+  a.content !== undefined;
+
+const firstLine = (v: unknown) =>
+  (typeof v === "string" ? v : "").split("\n")[0].trim();
+
+const pathOr = (a: Record<string, unknown>, fallback: string) =>
+  str(a.path) || fallback;
+
+/** 认识的工具。不认识的走 `FACE_FALLBACK`（以后核心加了新工具，是「多了个没见过的
+ *  图标」，而不是「这一行空了」）。 */
+const FACES: Record<string, ToolFace> = {
+  read: {
+    icon: "file",
+    title: "读取文件",
+    primary: "path",
+    summary: (a) => `读取 ${pathOr(a, "文件")}`,
+  },
+  bash: {
+    icon: "terminal",
+    title: "执行命令",
+    primary: "command",
+    summary: (a) => firstLine(a.command) || "执行命令",
+  },
+  edit: {
+    // 图标和说法都看 `content` / `edits`（核心用这两个参数区分新建 / 改写，
+    // 见 `edit_mode`）—— 两个都给是报错的用法，认 `content` 就行（那一行也会
+    // 是红的）。所以 `edit` 的 icon / title / summary 是函数，不是常量。
+    icon: "pencil",
+    title: "编辑文件",
+    primary: "path",
+    summary: (a) =>
+      isNewFile(a) ? `新建 ${pathOr(a, "文件")}` : `编辑 ${pathOr(a, "文件")}`,
+  },
+};
+
+/** 不认识的工具：时钟图标 + 名字本身 */
+const FACE_FALLBACK: ToolFace = {
+  icon: "clock",
+  title: "",
+  summary: () => "",
+};
+
+/** 这个工具的展示信息（`edit` 的图标 / 标题要按参数再判一次） */
+export function faceOf(
+  t: ToolPart,
+  args: Record<string, unknown>,
+): ToolFace {
+  const f = FACES[t.toolName];
+  if (!f) {
+    const name = t.toolName || "工具调用";
+    return { ...FACE_FALLBACK, title: name, summary: () => name };
+  }
+  if (t.toolName !== "edit") return f;
+  // 新建：图标换成 newfile，标题也换
+  return isNewFile(args) ? { ...f, icon: "newfile", title: "新建文件" } : f;
+}
+
 export function describeInput(
   t: ToolPart,
   args: Record<string, unknown>,
 ): InputView {
   const a = args;
   const used = new Set<string>();
-  let primary = "";
-  const take = (k: string) => {
-    used.add(k);
-    return str(a[k]);
-  };
-
-  switch (t.toolName) {
-    case "read":
-      primary = take("path");
-      break;
-    case "bash":
-      primary = take("command");
-      break;
-    case "edit": {
-      primary = take("path");
-      // 改成功了，结果里的 diff 就是同一份改动，不必再列一遍旧文 / 新文
-      if (t.output !== undefined && isDiff(t.output)) used.add("edits");
-      break;
-    }
-  }
+  const key = faceOf(t, a).primary;
+  const primary = key ? str(a[key]) : "";
+  if (key) used.add(key);
+  // `edit` 改成功了，结果里的 diff 就是同一份改动，不必再列一遍旧文 / 新文
+  if (t.toolName === "edit" && t.output !== undefined && isDiff(t.output))
+    used.add("edits");
 
   const params = rest(a, used).map((f) =>
     f.key === "edits" && t.toolName === "edit"

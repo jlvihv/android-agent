@@ -179,8 +179,23 @@ function cells(row: string): string[] {
  * `.md` 文件时才给 —— 那种文件里的相对链接是相对它自己的，得先补成绝对路径
  * （见 `resolveRelative`）。消息里的 markdown 传空串。
  */
+/**
+ * 解析一整段 markdown。
+ *
+ * **每次都是整段重解析**，没有增量：流式时 `Markdown.svelte` 一帧调一次
+ * （变化先攒着，见那里的 `$effect`）。实测成本（`bun test` 量的，同一台机器）：
+ * 4 KB → 0.36 ms、20 KB → 1.2 ms、60 KB → 3.8 ms。也就是说一条 60 KB 的回复
+ * 在流式期间会吃掉约 22% 的帧预算 —— 还能接受，而增量解析要做对「列表能跨空行
+ * 延续」「引用能嵌套」「没闭合的围栏算到结尾」这几件事，切错一处就是排版错乱。
+ * 真到了必须优化的那天再动；**别为了省 3 ms 引入一类渲染 bug**。
+ *
+ * 已经说完的消息（`done: true`）不受影响：`text` 不再变，`$derived` 不会重算。
+ */
 export function parse(src: string, dir = ""): Block[] {
-  return blocks(src.replace(/\r\n?/g, "\n").split("\n"), dir);
+  // 只在真有 `\r` 时才归一化：我们的正文绝大多数一个都没有，而 `replace` 每次
+  // 都要拷一整段（60 KB 的回复就是白拷 60 KB）。
+  const norm = src.includes("\r") ? src.replace(/\r\n?/g, "\n") : src;
+  return blocks(norm.split("\n"), dir);
 }
 
 function blocks(lines: string[], dir: string): Block[] {

@@ -147,6 +147,10 @@ export function applyPatch(
     fresh[0] = {
       ...fresh[0],
       parts: [...old.parts.slice(0, keep), ...fresh[0].parts],
+      // 警告是**流里的事件**，服务端历史里没有（`session_view` 只回 parts）——
+      // 不带着走的话，一个多步回合里第一步的「输出被截断」在第二步补丁到达时
+      // 就没了。用 `??` 而不是无条件覆盖：补丁自己带了就听它的。
+      warnings: fresh[0].warnings ?? old.warnings,
     };
   }
   return {

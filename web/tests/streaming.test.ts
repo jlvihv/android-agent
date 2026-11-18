@@ -87,9 +87,10 @@ describe("流式推送", () => {
   });
 
   /**
-   * `beginStreaming()` 的真实实现（`store.svelte.ts`）没法在这里 import 跑：
-   * `$state` 只在 `.svelte` / `.svelte.ts` 里可用，而 `bun test` 走的是普通 TS
-   * 加载（不编译 runes）。所以这里复刻它的**那两行**，并盯住编译产物长什么样：
+   * `beginStreaming()` 的真实实现（`lib/chat.svelte.ts`，模块私有）没法直接
+   * import —— 但它的**那两行**可以在这里复刻，并盯住编译产物长什么样
+   *（`bun test` 走 `scripts/runes-plugin.ts`，`.svelte.ts` 已经能编译 runes 了，
+   * 所以这个复刻和真实现是同一套语义）：
    *
    *     const box = $state({ msg: {...} });  →  F({ msg: {...} })
    *     return box.msg;                      →  .msg
@@ -119,3 +120,4 @@ describe("流式推送", () => {
     stop();
   });
 });
+
