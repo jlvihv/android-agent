@@ -44,7 +44,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   title            TEXT NOT NULL,
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
-  provider_session TEXT NOT NULL
+  provider_session TEXT NOT NULL,
+  -- worker | router（见 agent::Role）。默认 worker：老库加这一列时已有的会话全是 worker。
+  role             TEXT NOT NULL DEFAULT 'worker'
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -158,6 +160,22 @@ CREATE TABLE IF NOT EXISTS usage (
 
 CREATE INDEX IF NOT EXISTS idx_usage_session ON usage(session_id, id);
 
+-- 双层架构：「这个 worker 会话是哪一次 dispatch 派出去的」。
+-- 一个 worker 会话可以先后被派过好几次，所以主键是 session_id，后来的覆盖先前的。
+--
+-- 为什么要落库：Worker 做完要把结果送回 Router（见 `router::report_back`），
+-- 而 Worker 的一个回合可能跑很久、中间核心被杀过 —— 只在内存里记「谁派的」
+-- 的话，重启后这条活就断了，Router 永远等不到结果。
+CREATE TABLE IF NOT EXISTS dispatched (
+  session_id TEXT PRIMARY KEY,
+  -- 派出去的那条会话（Router）
+  by_session TEXT NOT NULL,
+  -- 派出去时 Router 说那句话所在的「一轮」（用户那次请求的 id）：
+  -- 结果送回 Router 时挂在同一轮下，用户看到的是「一件事的完整来回」
+  dispatch_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 -- 远端资源的缓存（models.dev 的模型目录）：原样存下响应和抓取时刻
 CREATE TABLE IF NOT EXISTS http_cache (
   url        TEXT PRIMARY KEY,
@@ -165,6 +183,38 @@ CREATE TABLE IF NOT EXISTS http_cache (
   fetched_at INTEGER NOT NULL
 );
 ";
+
+/// 把老库补齐到当前 schema。**幂等**：每次打开都跑一遍，已经升过的一句也不做。
+///
+/// 为什么不用 `user_version` 版本号：这里只需要「这一列在不在」一种判断，而
+/// `user_version` 一引进来就得为以后每一种可能的改动预先编号，还得处理「中间
+/// 某个版本跳过了」的兼容。现在的规模下，逐个检查列/表在不在更直接，也更好读。
+/// 数量真多到需要版本号了再换。
+///
+/// 引导了 `execute_batch(SCHEMA)` 之后：新库在 `CREATE TABLE` 里已经有这些列，
+/// 这里就全是空操作；只有「在加列之前建的老库」会真的 ALTER。
+fn migrate(conn: &Connection) -> Result<()> {
+    // sessions.role（worker | router）—— 双层架构那一批加的。
+    // 用 `DEFAULT 'worker'`：老库里的会话全都是 worker，跟它们本来的行为一致。
+    if !has_column(conn, "sessions", "role")? {
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'")
+            .context("加 sessions.role")?;
+    }
+    Ok(())
+}
+
+/// 这张表里有这一列吗（`PRAGMA table_info`）。
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    // 表名只能拼进来（PRAGMA 不支持参数绑定）；调用方都是写死的常量。
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 /// 当前在用的 LLM（`llm` 表那一行）。
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -236,6 +286,7 @@ struct Saved {
     updated_at: u64,
     title: String,
     provider_session: String,
+    role: crate::agent::Role,
 }
 
 impl Saved {
@@ -246,6 +297,7 @@ impl Saved {
             updated_at: s.updated_at,
             title: s.title.clone(),
             provider_session: s.provider_session.clone(),
+            role: s.role,
         }
     }
 }
@@ -265,6 +317,7 @@ struct PlannedSession {
     created_at: u64,
     updated_at: u64,
     provider_session: String,
+    role: crate::agent::Role,
     /// 消息不在内存里的会话只更新会话头：`None`
     messages: Option<PlannedMessages>,
     /// 写成之后的水位线
@@ -297,6 +350,7 @@ impl Db {
         }
         let conn = Connection::open(path).with_context(|| format!("打开 {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("建表")?;
+        migrate(&conn).context("迁移")?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
@@ -311,6 +365,7 @@ impl Db {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
@@ -335,8 +390,12 @@ impl Db {
         // 不分开的话「借用 (*g).conn」和「可变借用 (*g).saved」会打架。
         // 增量落盘只认识读进内存的会话：库里那些不会被读出来的行（空会话、
         // 没有会话头的孤儿消息）以后就没人删了，读之前先清掉。
+        //
+        // **Router 留着**：它可以是空的（刚建、还没说话），但它的 id 被
+        // `meta.router_session` 记着，删了下次就得重建一个、换一个新 id。
         g.conn.execute_batch(
-            "DELETE FROM sessions WHERE id NOT IN (SELECT DISTINCT session_id FROM messages);
+            "DELETE FROM sessions WHERE id NOT IN (SELECT DISTINCT session_id FROM messages)
+                 AND role <> 'router';
              DELETE FROM messages WHERE session_id NOT IN (SELECT id FROM sessions);",
         )?;
 
@@ -350,9 +409,13 @@ impl Db {
             // 用户消息条数靠 payload 的开头认：`ChatMessage` 是外部标签的枚举，
             // 用户消息序列化出来是 `{"User":…`（有测试盯着）。
             let mut stmt = g.conn.prepare(
-                r#"SELECT s.id, s.title, s.created_at, s.updated_at, s.provider_session,
+                // LEFT JOIN，不是 JOIN：空的 Router 会话一行消息都没有，JOIN 会把它漏掉
+                //（漏掉 = 读不回来 = 下次又要重建一个、换新 id，见上面那段）。
+                // 普通空会话不落盘，所以 LEFT JOIN 不会让它们冒出来 —— 库里本来
+                // 就没有它们的行。
+                r#"SELECT s.id, s.title, s.created_at, s.updated_at, s.provider_session, s.role,
                           COUNT(m.seq), COALESCE(SUM(m.payload LIKE '{"User%'), 0)
-                   FROM sessions s JOIN messages m ON m.session_id = s.id
+                   FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
                    GROUP BY s.id
                    ORDER BY s.updated_at DESC"#,
             )?;
@@ -363,18 +426,20 @@ impl Db {
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, i64>(5)?,
+                    r.get::<_, String>(5)?,
                     r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
                 ))
             })?;
 
             for row in rows {
-                let (id, title, created_at, updated_at, provider_session, len, users) = row?;
+                let (id, title, created_at, updated_at, provider_session, role, len, users) = row?;
                 let s = ChatSession {
                     id,
                     title,
                     created_at: created_at.max(0) as u64,
                     updated_at: updated_at.max(0) as u64,
+                    role: crate::agent::Role::from_db(&role),
                     messages: Vec::new(),
                     provider_session,
                     stub: Some(Stub {
@@ -489,7 +554,17 @@ impl Db {
 
         // 空会话不落盘（也把它上次可能写进去的旧行清掉，见下面的 gone）：
         // 「新对话」点了没说话、或 `/api/reset` 清空过，重启后不该又冒出来。
-        let keep: Vec<&ChatSession> = store.sessions.iter().filter(|s| s.has_content()).collect();
+        //
+        // **Router 例外**：它只有一个，而且身份靠 `meta.router_session` 记着。
+        // 要是空着不落盘，下次启动时那个 id 在库里找不到 → `ensure_router`
+        // 只能重建一个、换一个新 id。用户什么都没做，Router 却每次重启都变一个，
+        // 前言不搭后语（而且 `meta` 里那条永远指向一个不存在的会话）。
+        // 所以 Router 一建出来就落盘，哪怕一条消息都没有。
+        let keep: Vec<&ChatSession> = store
+            .sessions
+            .iter()
+            .filter(|s| s.has_content() || s.role == crate::agent::Role::Router)
+            .collect();
         let gone: Vec<String> = g
             .saved
             .keys()
@@ -536,6 +611,7 @@ impl Db {
                 created_at: s.created_at,
                 updated_at: s.updated_at,
                 provider_session: s.provider_session.clone(),
+                role: s.role,
                 messages,
                 saved: now,
             });
@@ -566,18 +642,20 @@ impl Db {
         let tx = g.conn.transaction()?;
         for s in &plan.sessions {
             tx.execute(
-                "INSERT INTO sessions(id, title, created_at, updated_at, provider_session)
-                 VALUES(?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO sessions(id, title, created_at, updated_at, provider_session, role)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
                    title = excluded.title,
                    updated_at = excluded.updated_at,
-                   provider_session = excluded.provider_session",
+                   provider_session = excluded.provider_session,
+                   role = excluded.role",
                 params![
                     s.id,
                     s.title,
                     s.created_at as i64,
                     s.updated_at as i64,
-                    s.provider_session
+                    s.provider_session,
+                    s.role.as_str()
                 ],
             )?;
             let Some(m) = &s.messages else { continue };
@@ -690,6 +768,46 @@ impl Db {
             [k, v],
         )?;
         Ok(())
+    }
+
+    /// 记一笔「这个 worker 会话是 Router 派出去的」。
+    ///
+    /// 同一个会话可以被派好几次，后来的覆盖先前的：Worker 做完时回报给
+    /// **最近一次**派它的那个 Router 就行（更早那次的来回早就结束了）。
+    pub fn set_dispatch(
+        &self,
+        session_id: &str,
+        by_session: &str,
+        dispatch_id: &str,
+        at: u64,
+    ) -> Result<()> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db 锁坏了"))?;
+        g.conn.execute(
+            "INSERT INTO dispatched(session_id, by_session, dispatch_id, created_at)
+             VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET
+               by_session = excluded.by_session,
+               dispatch_id = excluded.dispatch_id,
+               created_at = excluded.created_at",
+            rusqlite::params![session_id, by_session, dispatch_id, at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 这个会话是谁派出去的（`(by_session, dispatch_id)`）。没有派工记录就是 `None`。
+    pub fn dispatch_of(&self, session_id: &str) -> Result<Option<(String, String)>> {
+        self.with(|c| {
+            let mut stmt =
+                c.prepare("SELECT by_session, dispatch_id FROM dispatched WHERE session_id = ?1")?;
+            let mut rows = stmt.query([session_id])?;
+            match rows.next()? {
+                Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
+                None => Ok(None),
+            }
+        })
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -1212,6 +1330,51 @@ mod tests {
             db.get_meta("llm").unwrap().as_deref(),
             Some("{}"),
             "provider 配置不该跟着会话一起清掉"
+        );
+    }
+
+    /// **空的 Router 会话必须能落盘并读回来。**
+    ///
+    /// 它的 id 被 `meta.router_session` 记着，是「那唯一一个协调层会话」的身份。
+    /// 如果它跟普通空会话一样不落盘，下次启动时库里没有它 → `ensure_router`
+    /// 只能重建一个、换一个新 id。表现就是：用户什么都没做，Router 却每次重启
+    /// 都变成另一条会话，`meta` 里那条永远指向一个不存在的 id。
+    ///
+    /// 守两条路：`plan` 要把它留在 keep 里（不然不写），`load` 的 LEFT JOIN 要能
+    /// 把零消息的会话行读回来（JOIN 会漏掉它）。
+    #[test]
+    fn an_empty_router_session_survives_a_restart() {
+        let db = Db::in_memory().unwrap();
+        let mut st = SessionStore::default();
+        // 一个 worker（有内容，正常落盘）+ 一个一条消息都没有的 router
+        let w = st.create();
+        st.get_mut(&w).unwrap().messages.push(msg_user("干活"));
+        let router = crate::agent::ChatSession::with_role(crate::agent::Role::Router);
+        let rid = router.id.clone();
+        st.sessions.push(router);
+
+        db.sync(&st).unwrap();
+
+        let back = db.load().unwrap();
+        let found = back.get(&rid).expect("空的 router 会话没落盘 / 没读回来");
+        assert_eq!(found.role, crate::agent::Role::Router, "角色没保住");
+        assert_eq!(found.message_count(), 0, "它确实是空的");
+        // worker 也在，谁都没被误删
+        assert!(back.get(&w).is_some());
+    }
+
+    /// 普通空会话还是**不该**落盘 —— 「新对话」点了没说话，重启后不该冒出来。
+    /// 上面那条给 router 开了例外，这里守的是「例外没有扩大到所有空会话」。
+    #[test]
+    fn an_empty_worker_session_still_does_not_persist() {
+        let db = Db::in_memory().unwrap();
+        let mut st = SessionStore::default();
+        let empty = st.create(); // worker，没消息
+        db.sync(&st).unwrap();
+        let back = db.load().unwrap();
+        assert!(
+            back.get(&empty).is_none(),
+            "空的 worker 会话不该落盘，否则每点一次「新对话」就攒一个"
         );
     }
 

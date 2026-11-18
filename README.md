@@ -217,6 +217,7 @@ App 随时被杀都没关系。
 | [docs/15-shizuku.md](docs/15-shizuku.md)                                       | **特权命令** `agent shizuku`：binder 优先的状态机、反射调隐藏 API、为什么判断留在 Rust 侧、以及「不审批」的代价           |
 | [docs/13-phone.md](docs/13-phone.md)                                           | **手机系统能力**：闹钟 / 短信 / 日历 / 联系人 / 定位 / 剪贴板 / 通知 / 朗读，以及「按机器显示不同子命令」与权限那套阻塞桥 |
 | [docs/14-mcp-and-skills.md](docs/14-mcp-and-skills.md)                         | **MCP 和 Skill**：只接远程 MCP（`agent mcp`）、skill 目录 + 提示词索引，都不进工具表                                      |
+| [docs/16-super-agent.md](docs/16-super-agent.md)                               | **双层架构**：Router（只派活，没有 shell）与 Worker；靠工具表而不靠提示词分工；`dispatch` 立即返回、做完 `report_back` 回 Router |
 
 ## 脚本
 

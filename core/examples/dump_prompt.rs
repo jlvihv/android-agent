@@ -3,6 +3,7 @@
 //!   cargo run -q --example dump_prompt                 # android 形态（这台机器上有没有设备能力，自动判）
 //!   cargo run -q --example dump_prompt android --phone  # **手机**那份（含 `agent device|clipboard|…` 清单）
 //!   cargo run -q --example dump_prompt linux            # 宿主模式：linux / macos
+//!   cargo run -q --example dump_prompt --router          # 协调层那份（不执行，只有编排工具）
 //!
 //! `--phone` / `--no-phone` 显式指定「这台机器有没有设备能力」：那一段只有真手机
 //! 上才有，而判据是**编译目标** —— 在电脑上跑这个例子时，不显式给就渲染不出
@@ -13,7 +14,7 @@
 //! 缓存读取只有输入价的 1/50，所以精简它们的意义主要不是省钱，而是：
 //! 首轮冷启动、上下文窗口占用、以及模型注意力被无关细节稀释。
 
-use agent_core::agent::tools;
+use agent_core::agent::{tools, Role};
 use agent_core::platform::Platform;
 use agent_core::prompt::system_prompt_with;
 
@@ -37,6 +38,25 @@ fn main() {
     } else {
         agent_core::linux::has_phone_capabilities()
     };
+    // --router：协调层那份提示词和工具表。它不分平台（不执行、不碰文件），
+    // 所以 platform / phone 在这里都不起作用。
+    if args.iter().any(|a| a == "--router") {
+        let prompt = agent_core::prompt::router_description();
+        println!(
+            "=== ROUTER SYSTEM_PROMPT · {} 字符 ===\n{prompt}\n",
+            prompt.chars().count()
+        );
+        for t in tools(platform, Role::Router) {
+            let schema = serde_json::to_string_pretty(&(t.schema)()).unwrap();
+            println!(
+                "=== {name} · desc {d} 字符 ===\n{desc}\n--- schema ---\n{schema}\n",
+                name = t.name,
+                d = t.description.chars().count(),
+                desc = t.description,
+            );
+        }
+        return;
+    }
     let prompt = system_prompt_with(platform, phone);
     let cjk = |s: &str| {
         s.chars()
@@ -56,7 +76,7 @@ fn main() {
         cjk(prompt)
     );
 
-    for t in tools(platform) {
+    for t in tools(platform, Role::Worker) {
         let schema = serde_json::to_string_pretty(&(t.schema)()).unwrap();
         let d = t.description.chars().count();
         let s = serde_json::to_string(&(t.schema)())

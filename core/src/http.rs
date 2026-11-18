@@ -93,6 +93,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/debug/tools", get(debug_tools))
         .route("/api/debug/system-prompt", post(debug_set_system_prompt))
         .route("/api/sessions", get(list_sessions).post(new_session))
+        // 协调层那个会话（双层架构）。只有一个，没有就现建。
+        .route("/api/router", post(router_session))
         .route("/api/search", get(search_sessions))
         .route("/api/sessions/rename", post(rename_session))
         .route("/api/sessions/delete", post(delete_session))
@@ -2957,7 +2959,9 @@ async fn debug_request(
             None => return (StatusCode::NOT_FOUND, "没有这个会话").into_response(),
         }
     };
-    crate::agent::ensure_system_prompt(&mut sess, &st.system_prompt());
+    // 按这个会话自己的角色取提示词：router 会话看到的和我们真发出去的一致。
+    let prompt = st.system_prompt_for(sess.role);
+    crate::agent::ensure_system_prompt(&mut sess, &prompt);
 
     // 和真正发出去的一致：按解析出来的协议偏好给请求体
     let images = st.cached_supports_images(&p);
@@ -2992,8 +2996,13 @@ async fn debug_request(
 ///
 /// 存在的意义：沙箱里的 `agent tools` 靠它回答「我自己有哪些工具」，
 /// 不用去翻整份请求体。给的是 Chat Completions 的形态（嵌套 `function`）。
-async fn debug_tools(State(st): State<Arc<AppState>>) -> Response {
-    match serde_json::to_value(crate::agent::tool_definitions(st.platform())) {
+async fn debug_tools(State(st): State<Arc<AppState>>, Query(q): Query<RoleQuery>) -> Response {
+    // 默认看 worker 那张（跟以前一样）；带 `?role=router` 能看到协调层那张。
+    let role = match q.role.as_deref() {
+        Some("router") => crate::agent::Role::Router,
+        _ => crate::agent::Role::Worker,
+    };
+    match serde_json::to_value(crate::agent::tool_definitions(st.platform(), role)) {
         Ok(v) => Json(json!({ "tools": v })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -3056,6 +3065,15 @@ struct SessionsQuery {
     /// 从哪一条之后接着给：上一页最后一条的 `"<createdAt>:<id>"`
     #[serde(default)]
     before: Option<String>,
+}
+
+/// 给调试端点带一个角色：`?role=router` 看协调层那张工具表 / 提示词。
+///
+/// 不给 / 认不出来一律当 worker —— 跟 `Role::from_db` 一样，旧的调用方式不能变。
+#[derive(Deserialize, Default)]
+struct RoleQuery {
+    #[serde(default)]
+    role: Option<String>,
 }
 
 /// 一页多少条（`tail` 不给时的默认档）。一屏十条左右，留一屏余量。
@@ -3138,6 +3156,67 @@ async fn new_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let id = store.create();
     drop(store);
     st.mark_sessions_dirty();
+    Json(json!({ "id": id }))
+}
+
+/// 协调层那个会话的固定位置（`meta` 表里的一行）。
+///
+/// **只有一个 Router**：双层架构里它是「全局序点」，多开一个就是两个都在跟用户
+/// 说话。所以不放在 `sessions` 列表里让用户新建 / 删除，而是用 `meta` 记住
+/// 「那一个是谁」，要用时找不到就现建一个。
+const ROUTER_META_KEY: &str = "router_session";
+
+/// 协调层会话的初始标题（见 `ensure_router`）。
+const ROUTER_TITLE: &str = "协调";
+
+/// 拿到 Router 会话，没有就建一个。返回它的 id。
+///
+/// 为什么"没有就建"而不是启动时就建：Router 的提示词和工具表跟 worker 不一样，
+/// 一个**从来不用双层**的部署不该凭空多出一个会话（它会出现在侧边栏里、会占一份
+/// 落盘）。第一次真正要用协调层时才建。
+async fn ensure_router(st: &AppState) -> String {
+    // 先看记着的那一个还在不在。记着但会话没了（用户删了 / 换库了）就重建。
+    let remembered = st.meta_get(ROUTER_META_KEY);
+    {
+        let store = st.chat.read().await;
+        if let Some(id) = &remembered {
+            if store
+                .get(id)
+                .is_some_and(|s| s.role == crate::agent::Role::Router)
+            {
+                return id.clone();
+            }
+        }
+    }
+    // 建。写锁里再查一次：两个并发的请求同时发现"没有"，不能各建一个。
+    let mut store = st.chat.write().await;
+    if let Some(id) = &remembered {
+        if store
+            .get(id)
+            .is_some_and(|s| s.role == crate::agent::Role::Router)
+        {
+            return id.clone();
+        }
+    }
+    let mut s = crate::agent::ChatSession::with_role(crate::agent::Role::Router);
+    // 起个名字：它空着的时候侧边栏得有个能认的东西。
+    // **不是硬编码在界面里**的「协调」—— 那样换个客户端、换个语言就没了。
+    // 建会话时写进 `title`，`maybe_title` 只在该字段为空时才动手，所以用户
+    // 聊起来之后这个初始名字不会被第一句话顶掉（Router 的名字该稳定）。
+    s.title = ROUTER_TITLE.to_string();
+    let id = s.id.clone();
+    store.sessions.push(s);
+    drop(store);
+    st.set_meta(ROUTER_META_KEY, &id);
+    st.mark_sessions_dirty();
+    id
+}
+
+/// `POST /api/router` → 拿协调层会话的 id（没有就建）。
+///
+/// 前端「新对话」在双层模式下走这条：它不建 worker，而是把用户领到 Router 那里。
+async fn router_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let id = ensure_router(&st).await;
     Json(json!({ "id": id }))
 }
 

@@ -39,14 +39,26 @@ pub struct ToolSpec {
     pub schema: fn() -> Value,
 }
 
-/// 工具表每个平台只建一次。
+/// 工具表每个（平台 × 角色）只建一次。
 ///
 /// 每个 step 都要把整张表序列化进请求（含那段很长的 `bash` 描述），
 /// 工具表是**可缓存前缀的一部分**，只建一次也让「字节确定」更保险。
-pub fn tools(p: Platform) -> &'static [ToolSpec] {
-    static TOOLS: [OnceLock<Vec<ToolSpec>>; 3] =
-        [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    TOOLS[p as usize].get_or_init(|| build_tools(p))
+///
+/// 索引是 `平台 * 2 + 角色槽位`（见 `Role::slot`）：同一个平台下 worker 和 router
+/// 各一份，两份都是从同一个 `Platform` 拼出来的固定字节。
+pub fn tools(p: Platform, role: Role) -> &'static [ToolSpec] {
+    static TOOLS: [OnceLock<Vec<ToolSpec>>; 6] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    TOOLS[p as usize * 2 + role.slot()].get_or_init(|| match role {
+        Role::Worker => build_tools(p),
+        Role::Router => build_router_tools(p),
+    })
 }
 
 fn build_tools(p: Platform) -> Vec<ToolSpec> {
@@ -66,6 +78,35 @@ fn build_tools(p: Platform) -> Vec<ToolSpec> {
             name: "edit",
             description: prompt::edit_description(),
             schema: prompt::edit_schema,
+        },
+    ]
+}
+
+/// Router 的工具表：**只有编排，没有执行**。
+///
+/// 这里没有 `bash` / `read` / `edit`，是故意的 —— 也是双层架构成不成立的关键：
+/// Router 一旦能执行，就会开始自己干活，然后变成「另一个 Worker」，两层就退化成
+/// 一层。靠提示词写「你别自己干」拦不住（DeepSeek 那篇的消融实验就是反面教材：
+/// 中性提示下模型 5 次运行一次都不委派）；靠工具表拦得住，因为它根本没那手。
+///
+/// 四个工具对应两件事：**看**（`list_sessions` / `read_session`）和**说**
+/// （`dispatch` 派活给 Worker、`answer` 回话给用户）。
+fn build_router_tools(_p: Platform) -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "list_sessions",
+            description: prompt::list_sessions_description(),
+            schema: prompt::list_sessions_schema,
+        },
+        ToolSpec {
+            name: "read_session",
+            description: prompt::read_session_description(),
+            schema: prompt::read_session_schema,
+        },
+        ToolSpec {
+            name: "dispatch",
+            description: prompt::dispatch_description(),
+            schema: prompt::dispatch_schema,
         },
     ]
 }
@@ -221,6 +262,52 @@ impl ChatMessage {
     }
 }
 
+/// 会话在双层架构里的角色（见 docs/16-super-agent.md）。
+///
+/// - `Worker`：干活的那一层。上下文隔离、挂完整执行工具 —— 就是以前唯一的那个东西。
+/// - `Router`：协调那一层。承接人类交互、把任务派给 Worker，**不执行具体任务**。
+///   靠工具表把它锁住（没有 bash / read / edit），不是靠提示词约束。
+///
+/// 为什么是一个枚举而不是一个 bool：以后还可能有第三种（比如只看不写的审阅层），
+/// 而 `role` 要落盘、要进缓存前缀的选取，多一种就是改一处。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Role {
+    /// 干活：完整工具表 + 普通提示词
+    #[default]
+    Worker,
+    /// 协调：只有编排工具 + router 提示词
+    Router,
+}
+
+impl Role {
+    /// 库里存成什么字串。改字串 = 改盘上格式，得配一次迁移。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Router => "router",
+        }
+    }
+
+    /// 从前缀兼容地读回来：不认识的一律当 Worker。
+    ///
+    /// **不能报错**：装回旧版本、或者以后加了新角色时旧二进制读到它，一个以
+    /// 前能打开的会话不该直接打不开。当 Worker 至少是「跟以前一样」。
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "router" => Self::Router,
+            _ => Self::Worker,
+        }
+    }
+
+    /// 工具表 / 提示词的槽位下标（见 `tools` / `tool_definitions` 那些 `OnceLock` 数组）。
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::Worker => 0,
+            Self::Router => 1,
+        }
+    }
+}
+
 /// 当前会话。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -229,6 +316,11 @@ pub struct ChatSession {
     pub title: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// 这个会话在双层架构里是哪一层（见 `Role`）。
+    ///
+    /// **它决定提示词和工具表**，所以是缓存前缀的一部分：建会话那一刻定下来，
+    /// 之后不改（换角色就是换会话）。跟着会话走、落盘（`db.rs` 的 `role` 列）。
+    pub role: Role,
     pub messages: Vec<ChatMessage>,
     /// 给 provider 做 prompt cache 路由用的稳定会话 ID
     pub provider_session: String,
@@ -270,12 +362,17 @@ pub fn now_ms() -> u64 {
 
 impl ChatSession {
     pub fn new() -> Self {
+        Self::with_role(Role::Worker)
+    }
+
+    pub fn with_role(role: Role) -> Self {
         let now = now_ms();
         Self {
             id: uuid::Uuid::now_v7().to_string(),
             title: String::new(),
             created_at: now,
             updated_at: now,
+            role,
             messages: Vec::new(),
             provider_session: new_provider_session(),
             stub: None,
@@ -609,7 +706,14 @@ impl SessionStore {
         before: Option<(u64, &str)>,
         limit: usize,
     ) -> (Vec<Value>, bool, Option<String>) {
-        let mut v: Vec<&ChatSession> = self.sessions.iter().filter(|s| s.has_content()).collect();
+        // 空会话不进列表（「新对话」点了没说话不该占位），但 **Router 例外**：
+        // 它必须一直看得见 —— 它是双层架构的入口，用户得能点回它。而且它通常
+        // 就是空的（派出去的活由 worker 干，它自己不攒消息）。
+        let mut v: Vec<&ChatSession> = self
+            .sessions
+            .iter()
+            .filter(|s| s.has_content() || s.role == Role::Router)
+            .collect();
         // created_at 撞车（同一毫秒建的）时拿 id 兜底：顺序必须**确定** ——
         // 同一个列表反复拉，每次都得一模一样，不然抽屉又会自己动
         v.sort_by(|a, b| {
@@ -642,6 +746,9 @@ impl SessionStore {
                     "title": if s.title.is_empty() { "新对话" } else { &s.title },
                     "updatedAt": s.updated_at,
                     "count": s.user_count(),
+                    // 前端靠它把协调层那条画得不一样（图标 / 固定在顶上 / 不能删）。
+                    // 不给的话界面就得靠「标题叫什么」去猜，那是猜不准的。
+                    "role": s.role.as_str(),
                 })
             })
             .collect();
@@ -1018,12 +1125,18 @@ fn user_message(
 ///
 /// 只建一次、之后共享（`Arc`）：每一步的请求都要带整张表，没必要每步重新
 /// 跑一遍 `json!` 拼 schema（也让「工具表字节确定」更没悬念）。
-pub fn tool_definitions(p: Platform) -> std::sync::Arc<[Tool]> {
-    static DEFS: [OnceLock<std::sync::Arc<[Tool]>>; 3] =
-        [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    DEFS[p as usize]
+pub fn tool_definitions(p: Platform, role: Role) -> std::sync::Arc<[Tool]> {
+    static DEFS: [OnceLock<std::sync::Arc<[Tool]>>; 6] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    DEFS[p as usize * 2 + role.slot()]
         .get_or_init(|| {
-            tools(p)
+            tools(p, role)
                 .iter()
                 .map(|t| Tool {
                     kind: "function".into(),
@@ -1039,12 +1152,18 @@ pub fn tool_definitions(p: Platform) -> std::sync::Arc<[Tool]> {
 }
 
 /// Responses API 的工具表：**扁平**的 `{"type":"function","name":…}`。
-fn tool_definitions_responses(p: Platform) -> std::sync::Arc<[crate::responses::Tool]> {
-    static DEFS: [OnceLock<std::sync::Arc<[crate::responses::Tool]>>; 3] =
-        [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    DEFS[p as usize]
+fn tool_definitions_responses(p: Platform, role: Role) -> std::sync::Arc<[crate::responses::Tool]> {
+    static DEFS: [OnceLock<std::sync::Arc<[crate::responses::Tool]>>; 6] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    DEFS[p as usize * 2 + role.slot()]
         .get_or_init(|| {
-            tools(p)
+            tools(p, role)
                 .iter()
                 .map(|t| crate::responses::Tool {
                     kind: "function",
@@ -1801,12 +1920,21 @@ async fn turn_once(
     tx: mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     let _guard = TurnGuard(core.clone(), sid.to_string());
-    // 系统提示词可能被 /api/debug/system-prompt 覆盖过，所以不能直接用常量。
-    // 在拿会话写锁之前先取出来，避免锁套锁。
-    let system_prompt = core.state.system_prompt();
     // 不活跃的会话消息不在内存里，先从库里读回来（回合进行中不会被放掉，
     // 见 `AppState::evict_idle`）
     core.state.ensure_loaded(sid).await?;
+    // 系统提示词可能被 /api/debug/system-prompt 覆盖过，所以不能直接用常量。
+    // 它**按角色分**（router 那份是另一条不可覆盖的常量），所以要先知道这个会话
+    // 是谁 —— 单独拿一次读锁问一声，在写锁之前，避免锁套锁
+    //（`system_prompt` 里会读别的 RwLock）。
+    let role = {
+        let store = core.state.chat.read().await;
+        match store.get(sid) {
+            Some(s) => s.role,
+            None => anyhow::bail!("没有这个会话: {sid}"),
+        }
+    };
+    let system_prompt = core.state.system_prompt_for(role);
     let title = {
         let mut store = core.state.chat.write().await;
         let Some(sess) = store.get_mut(sid) else {
@@ -1841,7 +1969,44 @@ async fn turn_once(
     // `LiveTurnStatus`）。出错也要推：不推的话通知栏会停在最后一个工具上，
     // 看起来像还在跑。
     status.finish(res.is_ok(), turn.abort_requested());
+    // 双层架构的闭环：如果这个会话是 Router 派出去的，把结果送回去
+    //（见 `router::report_back`）。不是派出去的会话它什么都不做。
+    //
+    // **用户自己按的停止不回报**：那是人不想让它继续了，不是「做完了」或
+    // 「失败了」，往 Router 塞一条反而多一次没意义的唤醒。
+    if !turn.abort_requested() {
+        let said = last_assistant_text(core, sid).await;
+        crate::router::report_back(core, sid, &said, res.is_ok()).await;
+    }
     res
+}
+
+/// 这个会话最后一条助手消息的正文（回报给 Router 用）。
+///
+/// 只要正文，不要工具调用和思考：Router 关心的是「它做完说了什么」，不是它
+/// 中间跑了多少条命令（那些在它自己的会话里，要看再 `read_session`）。
+async fn last_assistant_text(core: &Core, sid: &str) -> String {
+    let store = core.state.chat.read().await;
+    let Some(s) = store.get(sid) else {
+        return String::new();
+    };
+    if !s.resident() {
+        return String::new();
+    }
+    for m in s.messages.iter().rev() {
+        if let ChatMessage::Assistant { content, .. } = m {
+            let t = content.trim();
+            if !t.is_empty() {
+                // 压一下：一条长报告不该把 Router 的上下文顶满
+                return if t.chars().count() > 1500 {
+                    format!("{}…", t.chars().take(1500).collect::<String>())
+                } else {
+                    t.to_string()
+                };
+            }
+        }
+    }
+    String::new()
 }
 
 /// 往本回合所属的会话追加一条消息。
@@ -2213,7 +2378,7 @@ pub fn build_request(
     Ok(ChatRequest {
         model: model.to_string(),
         messages,
-        tools: tool_definitions(platform),
+        tools: tool_definitions(platform, sess.role),
         stream: true,
         // 要 provider 在流末尾回报 token 用量 —— 这是验证 prompt cache
         // 命中的唯一硬证据。
@@ -2237,7 +2402,7 @@ pub fn build_responses_request(
     Ok(ResponsesRequest {
         model: model.to_string(),
         input: build_responses_input(sess, supports_images, supports_files),
-        tools: tool_definitions_responses(platform),
+        tools: tool_definitions_responses(platform, sess.role),
         stream: true,
         store: false,
         include: &["reasoning.encrypted_content"],
@@ -3235,6 +3400,24 @@ fn tool_output_event(id: &str, text: &str, images: &[ImagePart]) -> Value {
     ev
 }
 
+/// Router 那四个工具的分派。不是 Router 的工具就返回 `None`，交给下面原来的逻辑。
+///
+/// 认名字、不认角色：**工具表才是权限**（router 的表里没有 read/bash/edit），
+/// 这里只是「这个名字归 `router` 模块管」。多一层角色判断反而多一处要同步的地方。
+async fn router_tool(core: &Core, name: &str, args: &Value, sid: &str) -> Option<ToolOutcome> {
+    let out = match name {
+        "list_sessions" => crate::router::list_sessions(core).await,
+        "read_session" => crate::router::read_session(core, args).await,
+        // 传 sid：派工要记「谁派的」，做完才知道回报给谁
+        "dispatch" => crate::router::dispatch_from(core, sid, args).await,
+        _ => return None,
+    };
+    Some(match out {
+        Ok(text) => ToolOutcome::text(text),
+        Err(e) => ToolOutcome::error(e),
+    })
+}
+
 /// `live`：(推给前端的通道, 工具调用 id)。给了就把 bash 的输出边跑边推过去。
 async fn execute_tool(
     core: &Core,
@@ -3252,6 +3435,16 @@ async fn execute_tool(
         || linux::WORKSPACE.to_string(),
         |sb| sb.session_cwd(Some(sid)),
     );
+
+    // ---- Router 的四个工具（见 `router.rs`）------------------------------
+    //
+    // 放在最前面，而且**不碰 cwd / 沙箱**：Router 不执行，`session_cwd` 那种
+    // 「这个会话的目录在哪」的问题对它是没有意义的。这也是一条防线 ——
+    // router 的工具表里没有 read/bash/edit，万一模型凭记忆硬调，这里
+    // 会落到末尾的「未知工具」，而不是进到下面那几条执行路径里。
+    if let Some(out) = router_tool(core, name, &args, sid).await {
+        return out;
+    }
 
     // read / bash / edit 都不走设备（`DeviceApi`）：read 和 edit 直接
     // 读写 rootfs 里的文件，bash 起 proot 子进程。
@@ -3745,7 +3938,7 @@ mod tests {
     fn every_platform_gets_a_frozen_prompt_that_matches_its_machine() {
         for p in Platform::ALL {
             let prompt = system_prompt(p);
-            let bash = &tools(p)
+            let bash = &tools(p, Role::Worker)
                 .iter()
                 .find(|t| t.name == "bash")
                 .unwrap()
@@ -3795,12 +3988,14 @@ mod tests {
                 );
             }
         }
-        let mac = &tools(Platform::Macos)[1].description;
+        let mac = &tools(Platform::Macos, Role::Worker)[1].description;
         assert!(
             mac.contains("brew") && mac.contains("BSD"),
             "macOS 要点名 BSD 用户态"
         );
-        assert!(!tools(Platform::Linux)[1].description.contains("brew"));
+        assert!(!tools(Platform::Linux, Role::Worker)[1]
+            .description
+            .contains("brew"));
     }
 
     /// 只比 `messages` 不够：工具表也是可缓存前缀的一部分。
@@ -3866,17 +4061,142 @@ mod tests {
         assert_eq!(&b[..a.len()], &a[..], "完整请求体不是前缀关系");
     }
 
+    /// **空的 Router 会话也要出现在侧边栏列表里。**
+    ///
+    /// 普通空会话不进列表是对的（「新对话」点了没说话不该占位），但 Router 必须
+    /// 例外：它是双层架构的入口，用户得能点回它；而它通常就是空的（活由 worker 干，
+    /// 它自己不攒消息）。不例外的话界面会显示「还没有对话」—— Router 明明在，
+    /// 地址栏也指着它。
+    #[test]
+    fn an_empty_router_is_listed_but_an_empty_worker_is_not() {
+        let mut st = SessionStore::default();
+        // 空的 worker（不该出现）、空的 router（该出现）、一个有内容的 worker
+        let empty_worker = st.create();
+        let router = ChatSession::with_role(Role::Router);
+        let rid = router.id.clone();
+        st.sessions.push(router);
+        let busy = st.create();
+        st.get_mut(&busy)
+            .unwrap()
+            .messages
+            .push(ChatMessage::user("干活"));
+
+        let ids: Vec<String> = st
+            .list_page(None, 0)
+            .0
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect();
+
+        assert!(ids.contains(&rid), "空的 Router 必须在列表里：{ids:?}");
+        assert!(
+            !ids.contains(&empty_worker),
+            "空的 worker 不该在列表里：{ids:?}"
+        );
+        assert!(ids.contains(&busy), "有内容的 worker 要在：{ids:?}");
+    }
+
+    /// **Router 的工具表里绝不能有执行工具** —— 这是双层架构的命根子。
+    ///
+    /// 靠提示词说「你别自己干活」拦不住（DeepSeek 那篇的消融实验：中性提示下
+    /// 模型 5 次运行一次都没委派）；拦住它的是「它手里根本没有那手」。这条测试
+    /// 一旦红了，说明有人往 router 表里加了 read/bash/edit —— 那时候双层就
+    /// 已经悄悄退化成一层了，而且在行为上完全看不出来。
+    #[test]
+    fn router_tools_cannot_execute() {
+        for p in Platform::ALL {
+            let names: Vec<&str> = tools(p, Role::Router).iter().map(|t| t.name).collect();
+            for forbidden in ["bash", "read", "edit"] {
+                assert!(
+                    !names.contains(&forbidden),
+                    "{p:?} 的 router 表里出现了 `{forbidden}`：协调层不能有执行能力"
+                );
+            }
+            // 三个编排工具都在（少一个就是某个能力悄悄没了）
+            // 并且**没有** `answer`：模型的正文本来就是给用户看的那句话，
+            // 专门为说话开一个工具只会白多一轮请求。
+            for required in ["list_sessions", "read_session", "dispatch"] {
+                assert!(
+                    names.contains(&required),
+                    "{p:?} 的 router 表里缺少 `{required}`"
+                );
+            }
+            // 反过来的那一半：worker 表里不该有编排工具（它没有派活的对象）
+            let worker: Vec<&str> = tools(p, Role::Worker).iter().map(|t| t.name).collect();
+            for orchestration in ["list_sessions", "read_session", "dispatch"] {
+                assert!(
+                    !worker.contains(&orchestration),
+                    "{p:?} 的 worker 表里出现了 `{orchestration}`：那是协调层的事"
+                );
+            }
+        }
+    }
+
+    /// Router 的提示词里**不能出现 worker 才有的东西**。
+    ///
+    /// 提示词里说有 `bash`、工具表里没有，是最坏的一种不一致：模型会一遍遍
+    /// 试着调一个不存在的工具。
+    #[test]
+    fn router_prompt_does_not_promise_execution() {
+        let prompt = crate::prompt::router_description();
+        assert!(prompt.contains("dispatch"), "得告诉它怎么派活");
+        assert!(prompt.contains("不亲自干活"), "得说清它自己不做");
+        // 「没有 shell / 读文件 / 改文件的能力」这句是明说的，不是反话
+        assert!(prompt.contains("没有 shell"), "得明说它没有 shell");
+    }
+
+    /// 前缀不变式对 **Router 也成立**：同一角色两轮之间必须是前缀关系。
+    ///
+    /// 工具表、提示词都按角色分槽，这里守的是「分槽之后没有串味」：router 的第
+    /// 二轮请求必须以第一轮为前缀，且两轮的工具表都是 router 那张。
+    #[test]
+    fn router_request_is_prefix_stable_and_uses_router_tools() {
+        let mut sess = ChatSession::with_role(Role::Router);
+        ensure_system_prompt(&mut sess, crate::prompt::router_description());
+        sess.messages.push(ChatMessage::user("帮我看看库在哪"));
+        let turn1 = wire(&sess);
+
+        sess.messages.push(ChatMessage::Assistant {
+            content: "".into(),
+            reasoning: String::new().into(),
+            tool_calls: vec![RecordedToolCall {
+                id: "c1".into(),
+                name: "list_sessions".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_items: Vec::new(),
+        });
+        sess.messages.push(ChatMessage::Tool {
+            tool_call_id: "c1".into(),
+            content: "- abc 会话1".into(),
+            images: vec![],
+        });
+        sess.messages.push(ChatMessage::user("那派给它"));
+        let turn2 = wire(&sess);
+
+        assert!(turn2.len() > turn1.len());
+        assert_eq!(&turn2[..turn1.len()], &turn1[..], "router 的前缀也不许变");
+
+        // 工具表也是 router 那张：没有一个执行工具
+        let names: Vec<&str> = tools(Platform::Android, Role::Router)
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"dispatch"), "router 得能派活");
+        assert!(!names.contains(&"bash"), "router 不执行");
+    }
+
     #[test]
     fn tool_schemas_serialize_byte_identically() {
         let once = serde_json::to_string(
-            &tools(Platform::Android)
+            &tools(Platform::Android, Role::Worker)
                 .iter()
                 .map(|t| (t.schema)())
                 .collect::<Vec<_>>(),
         )
         .unwrap();
         let twice = serde_json::to_string(
-            &tools(Platform::Android)
+            &tools(Platform::Android, Role::Worker)
                 .iter()
                 .map(|t| (t.schema)())
                 .collect::<Vec<_>>(),

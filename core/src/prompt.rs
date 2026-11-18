@@ -240,6 +240,88 @@ pub fn edit_schema() -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Router：协调那一层的提示词和四个工具的描述
+//
+// 和 worker 那三个工具的分工一样：文桘在 `prompt` 里，派发在 `agent` 里。
+// 不同的一点是这边全部是常量 —— router 不按平台分支，它不执行、不碰文件，
+// 也不关心跑在哪台机器上。
+// ---------------------------------------------------------------------------
+
+/// Router 的系统提示词。
+///
+/// 和 worker 那份一样是**常量**（拼一次就冻结，见 `system_prompt`），
+/// 区别是它不分平台：router 不执行、不读文件，沙箱形态与它无关。
+///
+/// 写的约束都是「**别自己干**」那一类 —— 但真正拦住它的是工具表（没 bash），
+/// 提示词只是让它在只剩四个工具的情况下知道怎么用。
+pub fn router_description() -> &'static str {
+    "你是协调层（Router）。用户在这里跟你说话，你不亲自干活。\n\
+     \n\
+     - 你的工作只有两件：**把事情派给合适的会话去做**，和**向用户回话**。\n\
+     - 你没有 shell、没有读文件、没有改文件的能力 —— 这不是限制，是你的定义。想改什么、跑什么、查什么，都是派给会那个的会话去办。\n\
+     - `list_sessions` 看有哪些会话、各自在干吗；`read_session` 看某个会话最近做到哪了；`dispatch` 把任务派给某个会话（不给 id 就新建一个）。\n\
+     - **你回复的正文就是给用户看的那句话** —— 不需要为说话再调工具，直接说。\n\
+     - 派出去的活不等它做完：`dispatch` 一返回就结束了，结果会以新消息的形式回来。\n\
+     - 能一起做的事合成一次 `dispatch` 里的一个任务描述；互不相干的事分几次派出去。\n\
+     - 用户问的是「做到哪了」这种状态问题，用 `read_session` 看了再答，别新开活。"
+}
+
+/// `list_sessions` 的描述。
+pub fn list_sessions_description() -> String {
+    "列出所有会话：标题、在不在跑、最近的进展一句话。派活之前先看这个，\
+     能复用已有会话就不要新建（同一个话题的上下文在那条会话里）。"
+        .to_string()
+}
+
+/// `list_sessions` 的 schema（无参数）。
+pub fn list_sessions_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {},
+    })
+}
+
+/// `read_session` 的描述。
+pub fn read_session_description() -> String {
+    "看一个会话自上次以来发生了什么：它的标题、在不在跑、最近几条消息（从旧到新）。\
+     只读，不会把它的上下文拉进你这里 —— 你看到的是摘要，不是它的全部历史。"
+        .to_string()
+}
+
+/// `read_session` 的 schema。
+pub fn read_session_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": { "type": "string", "description": "要看的会话 id（`list_sessions` 给的）" },
+            "lines": { "type": "integer", "description": "最多看最近几条（可选，默认 8，最多 30）" }
+        },
+        "required": ["session_id"]
+    })
+}
+
+/// `dispatch` 的描述。
+pub fn dispatch_description() -> String {
+    "把事情派给一个会话去做。给 session_id 就派给那个已有会话（接着它的上下文干），\
+     不给就新建一个。派完立即返回，你不等它做完 —— 它做完会把结果作为新消息送回来。\
+     任务描述要写成一个不知道前因后果的人也能看懂的样子。"
+        .to_string()
+}
+
+/// `dispatch` 的 schema。
+pub fn dispatch_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "task": { "type": "string", "description": "要让那个会话做什么（自包含，别引用只有你看得到的上下文）" },
+            "session_id": { "type": "string", "description": "派给哪个会话（可选；不给就新建一个）" },
+            "title": { "type": "string", "description": "新建会话时的标题（可选；不给就用任务描述的前几个字）" }
+        },
+        "required": ["task"]
+    })
+}
+
 /// 回合被打断时留下的工具调用结果。
 ///
 /// 正常情况下停止会把没跑完的调用补上结果（见 `drive`），这里是兜底：

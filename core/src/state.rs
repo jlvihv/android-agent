@@ -991,6 +991,28 @@ impl AppState {
         }
     }
 
+    /// 读一条 `meta` 行。没有库 / 读失败一律当「没有」—— 调用方都是「记不住就重来」
+    /// 那种（router 会话、上次连的机器），没有一条是「丢了就出大事」的。
+    ///
+    /// 与 `load_auth` 里那种严苛处理（读失败不能覆盖）不同：那里写一错就是全部
+    /// 手机 401，这里最多是多建一个会话。
+    pub fn meta_get(&self, k: &str) -> Option<String> {
+        self.db()?
+            .get_meta(k)
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+    }
+
+    /// 写一条 `meta` 行（没库就是空操作）。失败只记日志：这些都是可重建的。
+    pub fn set_meta(&self, k: &str, v: &str) {
+        if let Some(db) = self.db() {
+            if let Err(e) = db.set_meta(k, v) {
+                tracing::warn!("保存 {k} 失败（下次会重来）: {e:#}");
+            }
+        }
+    }
+
     /// 这个核心实例的 id（存在库里，重启不变）。手机按它记住配对过的电脑 ——
     /// IP 会变（DHCP），id 不变。没库的话每次启动现编一个。
     pub fn instance_id(&self) -> String {
@@ -1209,7 +1231,10 @@ impl AppState {
     }
 
     /// 整个会话的队列丢掉（删会话时用；不然那些消息永远没人取了），附件文件一起删。
-    async fn drop_queued(&self, sid: &str) {
+    ///
+    /// `pub(crate)`：`router::dispatch` 在「还没配模型」时也要用它 —— 派不出去
+    /// 就不该在界面上挂一排「排队中」。
+    pub(crate) async fn drop_queued(&self, sid: &str) {
         let gone = self
             .queued
             .lock()
@@ -1367,6 +1392,18 @@ impl AppState {
     /// 都是同一串字节，前缀缓存照常命中（见 `skills` 模块）。
     /// `Cow` 是为了什么都没装、也没覆盖时**不拷贝**那个常量。
     pub fn system_prompt(&self) -> Cow<'static, str> {
+        self.system_prompt_for(crate::agent::Role::Worker)
+    }
+
+    /// 某个角色的系统提示词。
+    ///
+    /// **Router 不吃覆盖、也不吃 skill / MCP 索引**：那两样是「这台机器上能干什么」，
+    /// 而 Router 的定义正是「不干什么」。把装上什么的清单塞给它，只会诱导它觉得自己
+    /// 也能使唤 —— 它的工具表里没有那些东西，提示词里却说有，是最坏的一种不一致。
+    pub fn system_prompt_for(&self, role: crate::agent::Role) -> Cow<'static, str> {
+        if role == crate::agent::Role::Router {
+            return Cow::Borrowed(crate::prompt::router_description());
+        }
         let base: Cow<'static, str> = match self.system_prompt.read() {
             Ok(g) => match &*g {
                 Some(s) => Cow::Owned(s.clone()),

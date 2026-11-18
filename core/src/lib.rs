@@ -53,6 +53,7 @@ pub(crate) mod reader;
 pub mod remote;
 pub(crate) mod resident;
 pub(crate) mod responses;
+pub mod router;
 pub(crate) mod search;
 pub(crate) mod shizuku;
 pub(crate) mod shizuku_parse;
