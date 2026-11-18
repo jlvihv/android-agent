@@ -23,7 +23,6 @@
     createdAt: number;
     /** 下一次触发（毫秒）；停用中是 null。**服务端现算的** */
     nextAt: number | null;
-    tzOffsetMinutes: number | null;
   };
 
   let list = $state<Schedule[]>([]);

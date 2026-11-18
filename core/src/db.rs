@@ -250,6 +250,11 @@ CREATE TABLE IF NOT EXISTS http_cache (
 -- `every_secs` 和 `cron` **恰好有一个非空**（下面的 CHECK 钉着）：两种周期语义不同
 -- （锚在创建时刻 vs 挂在墙上时钟），用一个 NULL 的列表达「这条是哪种」比存个
 -- `kind` 字符串再分叉更实在 —— 那个 kind 一存进来就能和两个数据列对不上。
+--
+-- **没有「建它时的时区」这一列**：曾经加过（`tz_offset_minutes`），但没有任何代码
+-- 读它 —— 算触发点永远用**此刻**的偏移（`schedule::utc_offset_secs`），因为任务属于
+-- 这台机器、不属于某个时区（见 docs/17 §4.2）。留着就是给下一个人一个「它好像在被
+-- 用」的错觉。真要做「你当初在 UTC+8 设的 9 点」那种提示时再加也不迟（表还没发布过）。
 CREATE TABLE IF NOT EXISTS schedules (
   id              TEXT PRIMARY KEY,
   -- 到点投给 Router 的那句话，原文一字不改
@@ -263,8 +268,6 @@ CREATE TABLE IF NOT EXISTS schedules (
   handled_through INTEGER NOT NULL,
   -- NULL = 启用中。用 NULL 而不是 0 当哨兵（和 usage.cached / machines.relay_addr 一致）
   paused_at       INTEGER,
-  -- 建它时机器所在的 UTC 偏移（分钟）。**只作参考**，不参与任何计算
-  tz_offset_minutes INTEGER,
   CHECK (handled_through >= created_at),
   CHECK (paused_at IS NULL OR paused_at >= created_at),
   -- 「两种周期，恰好一种」—— 两个都空 / 两个都有 都在这里被挡掉
@@ -1314,17 +1317,15 @@ impl Db {
         type Row = (
             String,
             String,
-            Option<i64>,
-            Option<String>,
-            i64,
-            i64,
-            Option<i64>,
-            Option<i32>,
+            Option<i64>,    // every_secs
+            Option<String>, // cron
+            i64,            // created_at
+            i64,            // handled_through
+            Option<i64>,    // paused_at
         );
         let rows: Vec<Row> = self.with(|c| {
             let mut st = c.prepare(
-                "SELECT id, prompt, every_secs, cron, created_at, handled_through, paused_at,
-                        tz_offset_minutes
+                "SELECT id, prompt, every_secs, cron, created_at, handled_through, paused_at
                    FROM schedules ORDER BY created_at, id",
             )?;
             let it = st.query_map([], |r| {
@@ -1336,14 +1337,13 @@ impl Db {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
-                    r.get(7)?,
                 ))
             })?;
             it.collect()
         })?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, prompt, every_secs, cron, created_at, handled_through, paused_at, tz) in rows {
+        for (id, prompt, every_secs, cron, created_at, handled_through, paused_at) in rows {
             // 「恰好一列非空」由建表时的 CHECK 守着。这里再兜一层：周期看不懂的那行
             // **跳过**（一条脏数据不该让**所有**闹钟都不响）——但要 warn，别静默。
             let every: Option<Recurrence> = match (every_secs, cron) {
@@ -1367,7 +1367,6 @@ impl Db {
                 created_at: created_at.max(0) as u64,
                 handled_through: handled_through.max(0) as u64,
                 paused_at: paused_at.map(|v| v.max(0) as u64),
-                tz_offset_minutes: tz,
             });
         }
         Ok(out)
@@ -1384,15 +1383,14 @@ impl Db {
         self.with(|c| {
             c.execute(
                 "INSERT INTO schedules(id, prompt, every_secs, cron, created_at, handled_through,
-                                      paused_at, tz_offset_minutes)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                      paused_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                    prompt = excluded.prompt,
                    every_secs = excluded.every_secs,
                    cron = excluded.cron,
                    handled_through = excluded.handled_through,
-                   paused_at = excluded.paused_at,
-                   tz_offset_minutes = excluded.tz_offset_minutes",
+                   paused_at = excluded.paused_at",
                 params![
                     t.id,
                     t.prompt,
@@ -1401,7 +1399,6 @@ impl Db {
                     t.created_at as i64,
                     t.handled_through as i64,
                     t.paused_at.map(|v| v as i64),
-                    t.tz_offset_minutes,
                 ],
             )
             .map(|_| ())

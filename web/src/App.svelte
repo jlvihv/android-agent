@@ -469,12 +469,18 @@
 
   // 它们按「**还没发出去**的用户消息」渲染（`done: false`）—— 消息列表里就是
   // 普通用户气泡的样子，只多一圈虚线和左边一个 ×（详见 `Queued` 的注释）。
+  //
+  // **来源要跟着带过去**：排队里的回执 / 定时任务消息如果在这里被抹成普通 user，
+  // 界面上就是一个用户气泡，而它交出去之后又变成「子会话报告」/「定时任务」
+  // —— 同一个东西凭空换个样子（`MessageList` 按这两个键分流）。
   const queuedMsgs = $derived(
     queued.map((q): Message => ({
       id: q.id,
       role: "user",
       parts: q.parts,
       done: false,
+      fromWorker: q.fromWorker,
+      fromSchedule: q.fromSchedule,
     })),
   );
 

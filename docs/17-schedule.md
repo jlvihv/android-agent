@@ -39,6 +39,11 @@ tick(10s) ──▶ 认领到点的 ──▶ 推进水位线（落库）──�
 | `handled_through` | **水位线**：截止这一刻的触发点都处理过了 |
 | `paused_at` | 人的决定，推不出来 |
 
+**没有「建它时的时区」这一列。** 曾经有过（`tz_offset_minutes`），但没有任何代码读它
+—— 算触发点永远用**此刻**的偏移。一个没人读的列虽然性质和无害（不可变快照，不是可变
+标签），但视觉上和「存了没人推的 `Stage`」一模一样：下一个人看到它就会猜它在被用。
+真要做「你当初在 UTC+8 设的 9 点」那种提示时再加（表还没发布过，改 `CREATE TABLE` 就行）。
+
 **「下次什么时候」每次现算**（`schedule::due_at` / `next_at`），只在 HTTP 响应里
 露脸，永远不落库。
 
@@ -124,7 +129,8 @@ pub enum Recurrence {
 理由：任务属于**这台机器**，不属于某个时区。「每天 9 点」这五个字的全部意义是
 「在我醒来的时候」，而「醒来」是随地理位置变的。反过来（钉死北京 9 点 = 伦敦凌晨 1 点）
 会让一条「每天早上提醒我」的任务在旅行时彻底失效 —— 而这个功能恰恰是给
-「人不在的时候」用的。界面和 HTTP 响应里都显示了当前偏移（`tzOffsetMinutes`）。
+「人不在的时候」用的。HTTP 响应里带一个**顶层的** `tzOffsetMinutes`（此刻的偏移，
+给界面显示「按当前时区算」用），**不是每条任务一份** —— 每任务一份没有消费者。
 
 **已知代价**：跨 DST 边界那一刻最多偏一小时（用「此刻的偏移」把整个搜索窗口当一个
 固定偏移算）。要精确得带时区数据库（安卓上几 MB 的 tzdb），这不是这个功能的量级。
@@ -194,9 +200,27 @@ token）。**宁可少叫一次。**
 | 层 | 在哪 | 干什么 | 不该干什么 |
 | --- | --- | --- | --- |
 | 推导 | `due_at` / `next_at` | 纯函数，给定任务+now+偏移算「响不响、响哪一次」 | 不碰锁、不分配、不 IO |
-| 存储 | `Schedules`（`AppState::schedules`） | 内存表 + **唯一写点**（水位线只能从 `claim_due` 过） | 不认识 tick |
+| 存储 | `Schedules`（`AppState::schedules`） | 内存表 + **唯一写点**（水位线只能从 `claim_due` 过）；写库全在锁外 | 锁里不做 IO；不认识 tick |
 | 循环 | `run`（`lib.rs` 里 spawn 一次） | 一个 10 秒的 `tokio::interval`：认领 → 落水位线 → 投递 | 不做格式化（真到点才拼正文） |
 | 触发 | `fire` | 拼正文、调 `router::wake` | **投递目标只有 Router** |
+
+### 7.0 锁里不做 IO
+
+`create` / `set_paused` / `delete` 三处写操作都是「**锁里只改内存，出锁再写库**」。
+理由：SQLite 一次 INSERT 在手机闪存上几毫秒到几十毫秒，而这期间 `claim_due`
+（10 秒 tick 的唯一入口）会被挡住 —— `persist_cursor` 特意用了 `spawn_blocking`，
+`save_sessions` 也把序列化移出锁外，三处该一致。
+
+写库失败时内存要回到原样（否则界面上多/少一条任务，重启之后又对不上）：
+
+| 操作 | 顺序 | 失败时 |
+| --- | --- | --- |
+| `create` | 锁里查上限 + **占位** → 出锁写库 | 撤掉占位（`retain`） |
+| `set_paused` | 锁里存一份 `before` + 改内存 → 出锁写库 | 用 `before` **整份换回去**（比逐字段还原可靠） |
+| `delete` | **先写库** → 出锁改内存 | 库失败就**什么都不动**（内存是权威副本，多响一次比悄悄少一条用户闹钟安全） |
+
+三条都有测试（`core/src/schedule.rs` 的 `*_rolls_back_*` / `*_does_not_touch_memory_*`），
+造失败的办法是把 `schedules` 表 `DROP` 掉。
 
 `db.rs` 那层只做 SQL：它不认识 `Recurrence`，也不判「该不该触发」。库里用
 「`every_secs` / `cron` 恰好一个 NULL」表达「这条是哪种周期」（有 CHECK 钉着），
@@ -239,6 +263,17 @@ token）。**宁可少叫一次。**
 | 最长固定间隔 | 30 天（`Period::MAX_SECS`） | 比它慢的用 cron 写 |
 
 ---
+
+## 9.5 排队中的那一条也带来源
+
+服务端 `queued_view` 给 `fromWorker` / `fromSchedule`，前端这条链路有三处必须一路带着
+（否则排队前后会换个样子）：
+
+1. `QueueMirror#replace`（`web/src/lib/queue.svelte.ts`）
+2. `App` 的 `queuedMsgs`（拼成 `Message` 时）
+3. `Chat#onData` 的 `data-queued-delivered`（`deliver` 返回的那几条推进正文时）
+
+`web/tests/queue.test.ts` 钉住 1 和 3。
 
 ## 10. 已知代价
 

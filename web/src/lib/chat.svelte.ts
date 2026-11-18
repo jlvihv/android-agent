@@ -325,6 +325,10 @@ export class Live {
           role: "user",
           parts: q.parts,
           done: true,
+          // 同 `App` 的 `queuedMsgs`：来源不能在这一步丢掉，否则「交出去」那一刻
+          // 气泡会从「定时任务」变回用户气泡（下一次 `load` 又变回去）。
+          fromWorker: q.fromWorker,
+          fromSchedule: q.fromSchedule,
         });
       }
     }

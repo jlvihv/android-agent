@@ -31,6 +31,16 @@ export type Queued = {
   sid: string;
   parts: Part[];
   pending?: boolean;
+  /**
+   * 这条不是用户写的，是服务端别的来源投进来的（`ChatMessage::User.origin`）。
+   *
+   * 现在有两种：子会话的回执（`fromWorker`）和定时器到点（`fromSchedule`）。
+   * 服务端 `queued_view` 就在给这两个键（和已落历史的那条用同一组），**必须
+   * 一路带到画的地方** —— 不然同一个东西在「排队中」是一个用户气泡、交出去之后
+   * 才变成「子会话报告」/「定时任务」，凭空换个样子。
+   */
+  fromWorker?: string;
+  fromSchedule?: string;
 };
 
 export class QueueMirror {
@@ -57,7 +67,15 @@ export class QueueMirror {
     const hoping = this.items.filter((q) => q.pending && q.sid === sid);
     const merged = [
       ...this.items.filter((q) => q.sid !== sid),
-      ...next.map((m): Queued => ({ id: m.id, sid, parts: m.parts })),
+      ...next.map(
+        (m): Queued => ({
+          id: m.id,
+          sid,
+          parts: m.parts,
+          fromWorker: m.fromWorker,
+          fromSchedule: m.fromSchedule,
+        }),
+      ),
       ...hoping,
     ];
     // **没变就别换数组**：`load()` 每 1.5 秒轮询一次，服务端绝大多数时候回的是

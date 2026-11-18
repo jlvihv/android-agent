@@ -217,9 +217,6 @@ pub struct ScheduledTask {
     ///
     /// 用 `Option` 而不是 `0` 当哨兵（和 `usage.cached`、`machines.relay_addr` 一致）。
     pub paused_at: Option<u64>,
-    /// 建这条时机器所在的 UTC 偏移（分钟）。**只作参考**（界面显示「你在 UTC+8 设的」），
-    /// 不参与任何计算 —— 算触发点永远用**此刻**的偏移，见 [`utc_offset_secs`]。
-    pub tz_offset_minutes: Option<i32>,
 }
 
 impl ScheduledTask {
@@ -427,23 +424,33 @@ impl Schedules {
             // 响一次（「每 30 分钟」不该在建的那一刻就吵）。
             handled_through: now,
             paused_at: None,
-            tz_offset_minutes: Some(utc_offset_secs(now) / 60),
         };
-        // 上限检查放在写锁里：两个并发请求同时看到「只有 31 条」不能各建一条
-        let mut g = self
-            .tasks
-            .write()
-            .map_err(|_| "定时任务表坏了".to_string())?;
-        if g.len() >= MAX_SCHEDULES {
-            return Err(format!(
-                "已经有 {MAX_SCHEDULES} 条定时任务了（上限）。先用 `schedules` 删掉几条不用的。"
-            ));
+        // 上限检查放在写锁里：两个并发请求同时看到「只有 31 条」不能各建一条。
+        // **锁里只有内存操作**：SQLite 写盘几毫秒到几十毫秒（手机闪存），而在锁里
+        // 做的话这段时间 `claim_due`（10 秒 tick 的唯一入口）会被挡住 —— 同一个文件
+        // 里 `persist_cursor` 特意用了 `spawn_blocking`，两处该一致。
+        {
+            let mut g = self
+                .tasks
+                .write()
+                .map_err(|_| "定时任务表坏了".to_string())?;
+            if g.len() >= MAX_SCHEDULES {
+                return Err(format!(
+                    "已经有 {MAX_SCHEDULES} 条定时任务了（上限）。先用 `schedules` 删掉几条不用的。"
+                ));
+            }
+            g.push(task.clone()); // 先占位（锁内零 IO）
         }
+        // 出锁再写库。写失败就把刚占的位撤掉 —— 内存和库不能对不上
+        // （否则界面上多一条「存不下来」的任务，重启之后就消失了）。
         if let Some(db) = st.db() {
-            db.put_schedule(&task)
-                .map_err(|e| format!("存不下来：{e:#}"))?;
+            if let Err(e) = db.put_schedule(&task) {
+                if let Ok(mut g) = self.tasks.write() {
+                    g.retain(|t| t.id != task.id);
+                }
+                return Err(format!("存不下来：{e:#}"));
+            }
         }
-        g.push(task.clone());
         Ok(task)
     }
 
@@ -458,42 +465,67 @@ impl Schedules {
         paused: bool,
     ) -> Result<ScheduledTask, String> {
         let now = now_ms();
-        let mut g = self
-            .tasks
-            .write()
-            .map_err(|_| "定时任务表坏了".to_string())?;
-        let Some(t) = g.iter_mut().find(|t| t.id == id) else {
-            return Err(format!("没有这条定时任务：`{id}`"));
+        // 锁里只改内存（理由同 `create`）。改之前把**原来那一条**整个留着，
+        // 写库失败时用它整份换回去 —— 比逐个字段还原可靠（少一个字段就是脏数据）。
+        let (before, after) = {
+            let mut g = self
+                .tasks
+                .write()
+                .map_err(|_| "定时任务表坏了".to_string())?;
+            let Some(t) = g.iter_mut().find(|t| t.id == id) else {
+                return Err(format!("没有这条定时任务：`{id}`"));
+            };
+            let paused_at = paused.then_some(now);
+            if t.paused_at == paused_at {
+                // 已经是这个状态了：什么都不做（别白写一次库）
+                return Ok(t.clone());
+            }
+            let before = t.clone();
+            t.paused_at = paused_at;
+            t.handled_through = t.handled_through.max(now);
+            (before, t.clone())
         };
-        let paused_at = paused.then_some(now);
-        if t.paused_at == paused_at {
-            // 已经是这个状态了：什么都不做（别白写一次库）
-            return Ok(t.clone());
-        }
-        t.paused_at = paused_at;
-        t.handled_through = t.handled_through.max(now);
-        let out = t.clone();
         if let Some(db) = st.db() {
-            db.put_schedule(&out)
-                .map_err(|e| format!("存不下来：{e:#}"))?;
+            if let Err(e) = db.put_schedule(&after) {
+                if let Ok(mut g) = self.tasks.write() {
+                    if let Some(t) = g.iter_mut().find(|t| t.id == id) {
+                        *t = before;
+                    }
+                }
+                return Err(format!("存不下来：{e:#}"));
+            }
         }
-        Ok(out)
+        Ok(after)
     }
 
     /// 删掉一条。返回它原来在不在。
+    ///
+    /// 顺序和 `create` / `set_paused` 相反：**先删库、再删内存**。
+    ///
+    /// 理由是回滚代价不对称：删内存是 `remove` 一个元素，删库那一行得能整份写回去
+    /// （`put_schedule` 只写它认的那几列），而「内存里还有、库里没了」这种错位
+    /// 比反过来的更安全 —— 内存是权威副本，下一轮 `claim_due` 还会让它响一次，
+    /// 而不是**悄悄少了一条用户的闹钟**。
+    ///
+    /// 锁里仍然只有内存操作：`try_write` 一次拿到就做，拿不到（有人正在 `claim_due`）
+    /// 就等一小会儿 —— 删库已经成功了，这一步不能失败。
     pub fn delete(&self, st: &AppState, id: &str) -> Result<bool, String> {
-        let mut g = self
-            .tasks
-            .write()
-            .map_err(|_| "定时任务表坏了".to_string())?;
-        let Some(at) = g.iter().position(|t| t.id == id) else {
+        let exists = self.get(id).is_some();
+        if !exists {
             return Ok(false);
-        };
+        }
         if let Some(db) = st.db() {
             db.delete_schedule(id)
                 .map_err(|e| format!("删不掉：{e:#}"))?;
         }
-        g.remove(at);
+        // 删完库再改内存。这里用阻塞的 `write()`（不是 `try_write`）：库里那一行
+        // 已经没了，内存这份**必须**跟着消失，否则下一次 tick 会投出一条
+        // 「已经不该存在」的提醒。等一小会儿比留下脏数据好。
+        let mut g = self
+            .tasks
+            .write()
+            .map_err(|_| "定时任务表坏了".to_string())?;
+        g.retain(|t| t.id != id);
         Ok(true)
     }
 
@@ -728,7 +760,6 @@ pub fn rows(st: &AppState, now: u64, tz: i32) -> Vec<serde_json::Value> {
                 "createdAt": t.created_at,
                 // **现算的**，永远不落库（见模块文档）
                 "nextAt": next_at(t, now, tz),
-                "tzOffsetMinutes": t.tz_offset_minutes,
             })
         })
         .collect()
@@ -802,7 +833,6 @@ mod tests {
             created_at,
             handled_through,
             paused_at: None,
-            tz_offset_minutes: None,
         }
     }
 
@@ -1104,6 +1134,106 @@ mod tests {
         assert!(
             core.state.db().unwrap().schedules().unwrap().is_empty(),
             "库里也没了"
+        );
+    }
+
+    // ---- 写库失败时内存不留脏数据 -----------------------------------------
+    //
+    // 三处写操作都是「锁里只改内存 → 出锁再写库」（`create` / `set_paused`，
+    // `delete` 反过来：先写库再改内存）。写库失败必须让内存也回到原样 ——
+    // 否则界面上多一条（或少一条）任务、重启之后又不见了，比直接报错糟得多。
+    //
+    // 造失败的办法：库是真的（`set_data_dir` 开出来的），但把 `schedules` 表
+    // `DROP` 掉 —— 之后任何写都必然 `no such table`。这比「只读目录」可靠
+    // （SQLite 在只读目录上会退回内存库，那样根本不会失败）。
+
+    #[test]
+    fn create_rolls_back_the_placeholder_when_the_db_write_fails() {
+        let core = Core::new();
+        // 没有库 → `st.db()` 是 None → **不写库也不失败**。这不是我们要测的路径，
+        // 所以先放一个真库，再把它的表删掉（写入必失败）。
+        core.set_data_dir(core_with_db_dir("rollback-create"));
+        core.state
+            .db()
+            .unwrap()
+            .with(|c| c.execute_batch("DROP TABLE schedules"))
+            .unwrap();
+
+        let before = core.state.schedules.list().len();
+        let err = core
+            .state
+            .schedules
+            .create(
+                &core.state,
+                "这条存不进去",
+                Recurrence::Every(Period::try_new_minutes(30).unwrap()),
+            )
+            .expect_err("表都没了，写库必然失败");
+        assert!(err.contains("存不下来"), "{err}");
+        assert_eq!(
+            core.state.schedules.list().len(),
+            before,
+            "写库失败后内存里**不能**留下那条"
+        );
+        assert!(
+            core.state
+                .schedules
+                .list()
+                .iter()
+                .all(|t| t.prompt != "这条存不进去"),
+            "占位要真的撤掉"
+        );
+    }
+
+    #[test]
+    fn set_paused_restores_the_previous_row_when_the_db_write_fails() {
+        let core = Core::new();
+        core.set_data_dir(core_with_db_dir("rollback-pause"));
+        let t = create(&core.state, "原本是启用的", Some(30), None).unwrap();
+        assert!(!t.paused());
+
+        core.state
+            .db()
+            .unwrap()
+            .with(|c| c.execute_batch("DROP TABLE schedules"))
+            .unwrap();
+
+        let err = core
+            .state
+            .schedules
+            .set_paused(&core.state, &t.id, true)
+            .expect_err("写不进去就该报错");
+        assert!(err.contains("存不下来"), "{err}");
+        let after = core
+            .state
+            .schedules
+            .get(&t.id)
+            .expect("还在（失败的只是写库）");
+        assert!(!after.paused(), "内存要整份还原成「启用中」");
+        assert_eq!(after, t, "还原成**一模一样**的那一行（含水位线）");
+    }
+
+    #[test]
+    fn delete_does_not_touch_memory_when_the_db_write_fails() {
+        let core = Core::new();
+        core.set_data_dir(core_with_db_dir("rollback-delete"));
+        let t = create(&core.state, "删不掉的那条", Some(30), None).unwrap();
+
+        core.state
+            .db()
+            .unwrap()
+            .with(|c| c.execute_batch("DROP TABLE schedules"))
+            .unwrap();
+
+        let err = core
+            .state
+            .schedules
+            .delete(&core.state, &t.id)
+            .expect_err("写不进去就该报错");
+        assert!(err.contains("删不掉"), "{err}");
+        assert!(
+            core.state.schedules.get(&t.id).is_some(),
+            "库里删失败时内存**必须**留着 —— 悄悄少一条用户的闹钟比多响一次糟"
         );
     }
 
