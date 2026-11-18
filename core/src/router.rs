@@ -116,26 +116,35 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
     let all = arg_flag(args, "all");
     let limit = arg_usize(args, "limit", LIST_MAX, 1, LIST_MAX);
+    let query = arg_str(args, "query");
 
     // 两次快照，各只拿一次锁
     let busy = state.busy_set();
     let queued = state.queued_set();
 
     // 锁里只挑选 + 排序，不做格式化
-    let (total, rows): (usize, Vec<Row>) = {
+    let (total, matched, rows): (usize, usize, Vec<Row>) = {
         let store = state.chat.read().await;
         let mut mine: Vec<&crate::agent::ChatSession> = store
             .sessions
             .iter()
             .filter(|s| s.dispatched_by() == Some(from))
             .filter(|s| all || !s.closed.is_closed())
+            .filter(|s| query.is_empty() || matches_query(s, query))
             .collect();
+        // `all` 时按**最近碰过的**排（`updated_at`）：找旧会话时「上次动它是
+        // 什么时候」比「什么时候建的」更接近「我要找的那个」。
+        // 默认（未收尾的）仍旧按 `created_at` —— 那批本来就没几条，位置要稳定。
         mine.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.id.cmp(&a.id))
+            let by_time = if all {
+                b.updated_at.cmp(&a.updated_at)
+            } else {
+                b.created_at.cmp(&a.created_at)
+            };
+            // 时间撞车（同一毫秒）时拿 id 兜底：顺序必须**确定**
+            by_time.then_with(|| b.id.cmp(&a.id))
         });
-        let total = mine.len();
+        let matched = mine.len();
         mine.truncate(limit);
         let rows = mine
             .iter()
@@ -148,11 +157,31 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
                 standing: s.standing(busy.contains(&s.id), queued.contains(&s.id)),
             })
             .collect::<Vec<_>>();
-        (total, rows)
+        // `total` = 全部（不看 query），`matched` = query 过滤之后
+        let total = if query.is_empty() {
+            matched
+        } else {
+            total_of(&store, from, all)
+        };
+        (total, matched, rows)
     };
 
     let mut out = String::new();
     if rows.is_empty() {
+        if !query.is_empty() {
+            let _ = write!(
+                out,
+                "没有匹配 `{query}` 的会话（搜的是标题 / 要求原文 / 结论，不含对话正文）。"
+            );
+            if matched == 0 && total > 0 {
+                let _ = write!(
+                    out,
+                    "你有 {total} 条{}，去掉 query 看看。",
+                    scope_label(all)
+                );
+            }
+            return Ok(out);
+        }
         out.push_str(if all {
             "还没有派过任何会话。用 dispatch 派一个。"
         } else {
@@ -165,11 +194,25 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
         .iter()
         .filter(|r| r.standing == crate::agent::Standing::Running)
         .count();
-    let _ = writeln!(
-        out,
-        "{running} 个在跑，共 {total} 个{}：",
-        if all { "（含已收尾的）" } else { "" }
-    );
+    // 头一行先说清「看到的是全部还是被截了」：模型据此决定收窄 query 还是翻页
+    //（没有翻页 —— 它要么一屏看全、要么用 query 收窄）。
+    let _ = write!(out, "{running} 个在跑，");
+    if !query.is_empty() {
+        let _ = write!(out, "匹配 `{query}` 的 {matched} 条");
+        if total != matched {
+            let _ = write!(out, "（共 {total} 条{}）", scope_label(all));
+        }
+    } else {
+        let _ = write!(out, "共 {total} 条{}", scope_label(all));
+    }
+    if matched > rows.len() {
+        let _ = write!(
+            out,
+            "，只列了前 {} 条（用 `query` 收窄，或调大 limit，最多 {LIST_MAX}）",
+            rows.len()
+        );
+    }
+    out.push_str("：\n");
     // 到这里已经不持锁了：clip / format! 都在锁外
     for r in &rows {
         // **短编号在前、完整 id 在反引号里**：编号是给人（和模型）念的，
@@ -334,6 +377,49 @@ fn no_such(store: &crate::agent::SessionStore, from: &str, raw: &str, seq: Optio
         );
     }
     out
+}
+
+/// `query` 那一段说清「看的是哪一批」（未收尾 / 连已收尾的）。
+fn scope_label(all: bool) -> &'static str {
+    if all {
+        "（含已收尾的）"
+    } else {
+        "（未收尾的）"
+    }
+}
+
+/// 这个 Router 名下**一共有多少条**（`query` 之前）。
+///
+/// 只在带 `query` 时用：要告诉模型「你有 37 条，但只有 2 条匹配」—— 不然它
+/// 会以为总数就是匹配数。
+fn total_of(store: &crate::agent::SessionStore, from: &str, all: bool) -> usize {
+    store
+        .sessions
+        .iter()
+        .filter(|s| s.dispatched_by() == Some(from))
+        .filter(|s| all || !s.closed.is_closed())
+        .count()
+}
+
+/// `query` 命中吗？
+///
+/// 搜**三个字段**，都是「免疫历史压缩」或本来就常驻的：
+///
+/// - `title` —— 便宜，而且常常就带着关键词
+/// - `brief` —— **当初的要求原文**（`Dispatch::brief`），是验收合同，压缩压不掉
+/// - `conclusion` —— **交付物**（它最后说成了什么），同样压不掉
+///
+/// **不搜消息历史**：那要 `load_messages`（阻塞 IO）+ 扫几 MB 的工具输出，代价是
+/// 这三个字段的几十倍，而收益重叠（真需要全文时 `/api/search` 已经有了）。
+/// 这条限制是**有意的**，`a_query_does_not_search_the_transcript` 盯着它。
+///
+/// 匹配语义和 `Store::search`（侧边栏那个）一致：`agent::find_fold`，大小写不敏感、
+/// Unicode 折叠正确。两处用同一个函数，免得「搜得到但提示里没有」。
+fn matches_query(s: &crate::agent::ChatSession, query: &str) -> bool {
+    crate::agent::find_fold(&s.title, query).is_some()
+        || s.brief()
+            .is_some_and(|b| crate::agent::find_fold(b, query).is_some())
+        || crate::agent::find_fold(&s.conclusion, query).is_some()
 }
 
 /// `read_session`：一条会话的详情。
@@ -1015,6 +1101,193 @@ mod tests {
             .await
             .expect_err("不是 B 的会话");
         assert!(!err.contains("A 的机密项目"), "候选也不能泄露：{err}");
+    }
+
+    // ---- `query` 搜索 ------------------------------------------------------
+
+    /// 派一条带标题的会话，返回 id / 短号。
+    async fn dispatch_titled(core: &Core, rid: &str, title: &str, task: &str) -> (String, u64) {
+        dispatch(
+            core,
+            rid,
+            &serde_json::json!({ "task": task, "title": title }),
+        )
+        .await
+        .expect("派得出去");
+        let store = core.state.chat.read().await;
+        let s = store
+            .sessions
+            .iter()
+            .filter(|s| s.dispatched_by() == Some(rid))
+            .find(|s| s.title == title)
+            .expect("刚派出去的那条");
+        (s.id.clone(), s.seq.expect("有号"))
+    }
+
+    /// **三个字段各命中一次**：标题、brief（要求原文）、conclusion（结论）。
+    ///
+    /// 变异验证：把 `matches_query` 里 brief 那一行删掉 → 「brief 命中」那一段挂。
+    #[tokio::test]
+    async fn a_query_hits_title_brief_and_conclusion() {
+        let (core, rid) = with_router("query-three").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+
+        // 三条会话，命中字段各不相同
+        let (by_title, n_title) = dispatch_titled(&core, &rid, "重写搜索索引", "干点活 A").await;
+        let (by_brief, n_brief) = dispatch_titled(
+            &core,
+            &rid,
+            "无关的标题 B",
+            "把 /workspace 里的日志清理一遍",
+        )
+        .await;
+        let (by_concl, n_concl) = dispatch_titled(&core, &rid, "无关的标题 C", "干点活 C").await;
+        // conclusion 只有「派活驱动的回合结束」才更新，测试里没有真回合：
+        // 直接写内存（`set_conclusion` 就是那条路的唯一写点）
+        core.state
+            .set_conclusion(&by_concl, "都改完了，PR 已经在评审");
+
+        // ① 标题命中
+        let out = list_sessions(&core, &rid, &serde_json::json!({ "query": "搜索索引" }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains(&format!("#{n_title}")),
+            "标题命中的那条要在：{out}"
+        );
+        assert!(
+            !out.contains(&format!("#{n_brief}")),
+            "不相关的不该出现：{out}"
+        );
+
+        // ② brief 命中（词只出现在「当初的要求原文」里）
+        let out = list_sessions(&core, &rid, &serde_json::json!({ "query": "日志清理" }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains(&format!("#{n_brief}")),
+            "brief 命中的那条要在（搜要求原文）：{out}"
+        );
+        assert!(!out.contains(&format!("#{n_title}")), "{out}");
+
+        // ③ conclusion 命中（词只出现在「它最后说成了什么」里）
+        let out = list_sessions(&core, &rid, &serde_json::json!({ "query": "已经在评审" }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains(&format!("#{n_concl}")),
+            "conclusion 命中的那条要在（搜交付物）：{out}"
+        );
+        assert!(!out.contains(&format!("#{n_title}")), "{out}");
+        let _ = (by_title, by_brief, by_concl);
+    }
+
+    /// **`query` 不搜消息历史** —— 只在对话正文里出现的词，搜不到。
+    ///
+    /// 这是**有意的限制**（理由见 `matches_query` 的文档），不是坏了。
+    /// 变异验证：把 `matches_query` 改成也扫 `s.messages` 的正文 → 这条挂。
+    #[tokio::test]
+    async fn a_query_does_not_search_the_transcript() {
+        let (core, rid) = with_router("query-no-transcript").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        let (id, n) = dispatch_titled(&core, &rid, "普通标题", "普通任务").await;
+        // 往历史里塞一句只有正文才有的词（模拟「聊过但字段里没有」）
+        {
+            let mut store = core.state.chat.write().await;
+            let s = store.get_mut(&id).unwrap();
+            s.messages
+                .push(crate::agent::ChatMessage::user("独角兽这个词只在正文里"));
+        }
+
+        let out = list_sessions(&core, &rid, &serde_json::json!({ "query": "独角兽" }))
+            .await
+            .unwrap();
+        assert!(
+            !out.contains(&format!("#{n}")),
+            "**不该**命中正文（v1 不搜历史，这是故意的）：{out}"
+        );
+        assert!(out.contains("没有匹配"), "要说清没找到：{out}");
+        assert!(out.contains("不含对话正文"), "要说清搜的是什么：{out}");
+    }
+
+    /// **总数提示**：超过 limit 时说清「共 N 条，只列了前 M 条」。
+    ///
+    /// 变异验证：把 `if matched > rows.len()` 那段删掉 → 这条挂。
+    #[tokio::test]
+    async fn the_header_says_how_many_were_left_out() {
+        let (core, rid) = with_router("query-total").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        for i in 0..5 {
+            dispatch_titled(&core, &rid, &format!("第 {i} 件"), &format!("活 {i}")).await;
+        }
+        // limit = 2：要看到「共 5 条」+「只列了前 2 条」
+        let out = list_sessions(&core, &rid, &serde_json::json!({ "limit": 2 }))
+            .await
+            .unwrap();
+        assert!(out.contains("共 5 条"), "要说清总数：{out}");
+        assert!(out.contains("只列了前 2 条"), "要说清被截了：{out}");
+        // 行数确实是 2
+        let lines = out.lines().filter(|l| l.starts_with('#')).count();
+        assert_eq!(lines, 2, "只列 2 行：{out}");
+
+        // 带 query 时：匹配数 + 总数都要有
+        let out = list_sessions(
+            &core,
+            &rid,
+            &serde_json::json!({ "query": "第 1 件", "limit": 1 }),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("匹配 `第 1 件` 的 1 条"), "{out}");
+        assert!(out.contains("共 5 条"), "查询时要给出「一共有多少」：{out}");
+    }
+
+    /// `all: true` 按 **`updated_at`** 倒序（最近碰过的在前），不是创建时间。
+    ///
+    /// 变异验证：把 `if all { updated_at } else { created_at }` 那段改回一律
+    /// `created_at` → 这条挂。
+    #[tokio::test]
+    async fn all_sorts_by_last_touched_not_created() {
+        let (core, rid) = with_router("query-sort").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        let (old_id, old_n) = dispatch_titled(&core, &rid, "先建的", "活 A").await;
+        let (_, new_n) = dispatch_titled(&core, &rid, "后建的", "活 B").await;
+        // 把**先建的**那条的 `updated_at` 推到最晚（模拟「最近又碰过它」）
+        {
+            let mut store = core.state.chat.write().await;
+            let s = store.get_mut(&old_id).unwrap();
+            s.updated_at = crate::agent::now_ms() + 10_000;
+        }
+        let out = list_sessions(&core, &rid, &serde_json::json!({ "all": true }))
+            .await
+            .unwrap();
+        let first = out.lines().find(|l| l.starts_with('#')).expect("有行");
+        assert!(
+            first.starts_with(&format!("#{old_n}")),
+            "最近碰过的那条要排第一（按 updated_at）：{out}"
+        );
+        let _ = new_n;
+    }
+
+    /// 搜索也只在**自己名下**找（不越权）。
+    #[tokio::test]
+    async fn a_query_never_matches_another_routers_sessions() {
+        let (core, rid_a) = with_router("query-perm").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch_titled(&core, &rid_a, "A 的机密项目", "活").await;
+        let rid_b = {
+            let mut store = core.state.chat.write().await;
+            store.push_new(ChatSession::with_role(Role::Router))
+        };
+        let out = list_sessions(&core, &rid_b, &serde_json::json!({ "query": "机密" }))
+            .await
+            .unwrap();
+        assert!(!out.contains("机密项目"), "不能搜到别人的会话：{out}");
     }
 
     /// 派完一条会话之后，把那个刚被 `continue_with_queued` 占住的回合结束掉。

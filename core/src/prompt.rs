@@ -321,8 +321,12 @@ pub fn router_description() -> &'static str {
 /// `list_sessions` 的描述。
 pub fn list_sessions_description() -> String {
     "列出我派出去的会话：有几个在跑、几个闲着，各自的标题和最新结论。\n\
-     回答「现在在忙什么 / 做到哪了」之前先看这个。每个条目后面有 `session_id`，\
-     要细节就用那个 id 调 `read_session`。"
+     回答「现在在忙什么 / 做到哪了」之前先看这个。\n\
+     每行开头是**短编号**（`#7` 这种）和完整 id —— 要细节、要再派活、要收尾，\
+     用短编号就行（`#7`），不用抄一长串。\n\
+     **找旧的会话**：默认只看还没收尾的（`all: true` 连已收尾的一起看，按\n\
+     「最近碰过的」排）。不知道是哪条就用 `query` 按关键词找（搜标题、当初的要求\n\
+     原文、最新结论）—— **别靠翻列表猜**，列表会被 limit 截断。"
         .to_string()
 }
 
@@ -338,6 +342,10 @@ pub fn list_sessions_schema() -> Value {
             "limit": {
                 "type": "integer",
                 "description": "最多列几个（默认 50）"
+            },
+            "query": {
+                "type": "string",
+                "description": "按关键词找旧会话：搜标题、当初的要求原文（brief）、最新结论。不搜对话正文（那要用别的办法）。找「之前那个改 README 的活」时用它，别靠翻列表猜"
             }
         }
     })
