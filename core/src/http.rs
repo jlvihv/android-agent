@@ -97,7 +97,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/router", post(router_session))
         // 某个 Router 名下的工作项（双层架构里「派出去的活」）。前端在 Router
         // 那条会话里画一块「在干的活」，靠它。
-        .route("/api/tickets", get(list_tickets))
+        .route("/api/sessions/dispatched", get(list_dispatched_sessions))
         .route("/api/search", get(search_sessions))
         .route("/api/sessions/rename", post(rename_session))
         .route("/api/sessions/delete", post(delete_session))
@@ -3235,20 +3235,22 @@ async fn ensure_router(st: &AppState) -> String {
     id
 }
 
-/// `GET /api/tickets?router=<id>&all=1` → 这个 Router 派出去的会话。
+/// `GET /api/sessions/dispatched?router=<id>&all=1` → 这个 Router 派出去的会话。
 ///
-/// **路径和字段名保留**（`tickets` / `stage` / `label` / `needsPerson` / `open`）：
-/// 前端那个看板读的就是它们。但底下已经没有 ticket 这一层了 ——
-/// 每一「行」现在是一条会话，「状态」是**现算**的，不是存出来的。
+/// 名字里的 `dispatched` 是字面意思：**派出去的那些会话**。底下没有 ticket 这一层了
+/// （见 docs/16），所以路径、handler、字段名一律用 session 词汇。
 ///
-/// 现算的三个事实：
-/// - `open` = 还没被收尾（`closed_at == 0`）**而且**这条活是派出去的
-/// - `needsPerson` = 没在跑、也没收尾（也就是「它停了，等人看一眼」）
-/// - `label` = 在跑 / 闲着 / 已收尾
+/// 每一行是一条会话，三个「状态」都是**现算**的，不是存出来的：
+/// - `state`：`working`（回合真的在跑）/ `idle`（停了、还没收尾）/ `done` / `cancelled`
+/// - `needsPerson` = 没在跑、也没收尾（「它停了，等人看一眼」）
+/// - `open` = 还没收尾
 ///
-/// 以前这里 `GROUP BY stage` 查库。现在不查库了：会话表在内存里，
+/// 以前这里是 `GROUP BY stage` 查库。现在不查库：会话表在内存里，
 /// 「在不在跑」问 `turns` 就是权威答案。
-async fn list_tickets(State(st): State<Arc<AppState>>, Query(q): Query<TicketsQuery>) -> Response {
+async fn list_dispatched_sessions(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<DispatchedQuery>,
+) -> Response {
     let Some(router) = q.router.as_deref().filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "要带 router（协调层会话的 id）").into_response();
     };
@@ -3272,7 +3274,7 @@ async fn list_tickets(State(st): State<Arc<AppState>>, Query(q): Query<TicketsQu
         .map(|s| {
             let closed = s.closed_at != 0;
             let busy = st.is_busy(&s.id);
-            let (stage, label) = if closed {
+            let (state, label) = if closed {
                 (
                     if s.closed_by == "done" { "done" } else { "cancelled" },
                     if s.closed_by == "done" { "已验收" } else { "已取消" },
@@ -3284,39 +3286,35 @@ async fn list_tickets(State(st): State<Arc<AppState>>, Query(q): Query<TicketsQu
             };
             json!({
                 "id": s.id,
-                // 前端拿它当「#N」显示。会话没有 rowid，用创建时间的后 4 位
-                // 当一个稳定又短的编号（同一毫秒建的两条会撞，但那种情况极少
-                // 且只是显示重号，不影响 id）。
-                "number": (s.created_at % 10000) as i64,
                 "title": if s.title.is_empty() { "（无标题）" } else { &s.title },
-                "stage": stage,
+                "state": state,
                 "label": label,
-                // 「等人」= 停了但还没收尾。在跑的不需要人管，收尾的更不需要。
+                // 「等人」= 停了但还没收尾。在跑的不用人管，收尾的更不用。
                 "needsPerson": !busy && !closed,
                 "open": !closed,
-                "report": if s.conclusion.is_empty() { None } else { Some("worker_report") },
-                "moving": busy,
-                "preview": crate::text::clip(&s.conclusion, 200),
+                "busy": busy,
+                // 最新结论（`conclusion`，免疫历史压缩）。空 = 还没跑过回合。
+                "conclusion": crate::text::clip(&s.conclusion, 200),
                 "dispatches": s.dispatches,
                 "createdAt": s.created_at,
                 "updatedAt": s.updated_at,
             })
         })
         .collect();
-    let working = rows.iter().filter(|r| r["moving"] == json!(true)).count();
+    let working = rows.iter().filter(|r| r["busy"] == json!(true)).count();
     let waiting = rows.iter().filter(|r| r["needsPerson"] == json!(true)).count();
     Json(json!({
         "working": working,
         "waiting": waiting,
-        "tickets": rows,
+        "sessions": rows,
     }))
     .into_response()
 }
 
 #[derive(Deserialize)]
-struct TicketsQuery {
+struct DispatchedQuery {
     router: Option<String>,
-    /// 连结束的一起列。**`all=1` 也要认**：serde 的 bool 只吃 `true`/`false`，
+    /// 连已收尾的一起列。**`all=1` 也要认**：serde 的 bool 只吃 `true`/`false`，
     /// 而手敲 curl / 脚本习惯写 `1`。给个宽松的解析，两种都收。
     #[serde(default, deserialize_with = "de_bool_lenient")]
     all: bool,

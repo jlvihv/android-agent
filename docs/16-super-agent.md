@@ -207,12 +207,28 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
    以前能显示「排队中 vs 在干」—— 那个区别现在没了（都在 `Working` 里）。
 4. **「卡住」是一等状态**：以前的 `Blocked`（虽然也从没被写过）。现在「卡住」
    只是子会话在正文里说的话，框架不懂。
-5. **前端那个看板的数据源变成现算**：每次 `/api/tickets` 都要遍历会话表。
-   会话几十条时无所谓，上千条会慢（可接受，因为 `LIST_MAX=50`）。
+5. **前端那个看板的数据源变成现算**：每次 `/api/sessions/dispatched` 都要遍历
+   会话表。会话几十条时无所谓，上千条会慢（可接受，因为 `LIST_MAX=50`）。
 
-## 10. 有意保留的兼容
+## 10. 接口与命名
 
-- **`/api/tickets` 路径和字段名没改**（`tickets` / `stage` / `label` / `needsPerson` /
-  `open`）：前端 `TicketBoard.svelte` 一行没动就能跑。字段的**值**变了
-  （`stage` 现在是 `working`/`idle`/`done`/`cancelled` 四个现算的值）。
-- **`tickets` / `session_ticket` 两张表**留着（只读不写），见 §7。
+**全部用 session 词汇**（ticket 那一层没了，名字也不该留着）：
+
+| 旧 | 新 |
+| --- | --- |
+| `GET /api/tickets` | `GET /api/sessions/dispatched` |
+| `list_tickets()` (http) | `list_dispatched_sessions()` |
+| `TicketsQuery` | `DispatchedQuery` |
+| 响应 `{"tickets": [...]}` | `{"sessions": [...]}` |
+| 行内 `stage` | `state`（`working` / `idle` / `done` / `cancelled`） |
+| 行内 `moving` | `busy` |
+| 行内 `preview` | `conclusion` |
+| 行内 `number` | 删掉（会话没有给人看的编号，用 `id`） |
+| 组件 `TicketBoard.svelte` / `TicketRow` | `DispatchedBoard.svelte` / `DispatchedRow` |
+| `refreshTickets()` / `TICKETS_POLL_MS` | `refreshDispatched()` / `DISPATCHED_POLL_MS` |
+
+**有意保留的**：
+
+- `needsPerson` / `open`：这两个是**真事实**（要不要人管、收没收尾），名字没撒谎。
+- `tickets` / `session_ticket` **两张表**：留着只读不写，里面有历史，见 §7。
+- 注释里出现的 `ticket` 字样：那是在讲「以前是什么样、为什么删」，是历史说明。

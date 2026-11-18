@@ -24,7 +24,7 @@
   import Composer from "./components/Composer.svelte";
   import MessageList from "./components/MessageList.svelte";
   import Drawer, { type Session } from "./components/Drawer.svelte";
-  import TicketBoard, { type TicketRow } from "./components/TicketBoard.svelte";
+  import DispatchedBoard, { type DispatchedRow } from "./components/DispatchedBoard.svelte";
   import MachineSheet from "./components/MachineSheet.svelte";
   import ModelSheet from "./components/ModelSheet.svelte";
   import Settings from "./components/Settings.svelte";
@@ -169,28 +169,28 @@
   );
 
   /**
-   * 协调层那条顶上的「在干的活」（`/api/tickets`）。
+   * 协调层那条顶上的「我派出去的会话」（`/api/sessions/dispatched`）。
    *
    * 只有一个 Router，所以这份数据不分会话 —— 但**只在 Router 那条会话里画**
    * （`isRouter` 判）。worker 的会话不该看到别人在干什么：它在干自己的活，
    * 看到别的活只会让它分心（而且它本来也看不到，那是 Router 的视野）。
    */
-  let tickets = $state<TicketRow[]>([]);
-  let ticketWorking = $state(0);
-  let ticketWaiting = $state(0);
+  let dispatched = $state<DispatchedRow[]>([]);
+  let dispatchedWorking = $state(0);
+  let dispatchedWaiting = $state(0);
 
-  /** 拉一次工作项。失败保持原样（下一轮再试）。 */
-  async function refreshTickets() {
+  /** 拉一次派出去的会话。失败保持原样（下一轮再试）。 */
+  async function refreshDispatched() {
     if (!isRouter || !sessionId) return;
     try {
       const d = await api<{
-        tickets?: TicketRow[];
+        sessions?: DispatchedRow[];
         working?: number;
         waiting?: number;
-      }>(`/api/tickets?router=${encodeURIComponent(sessionId)}`);
-      tickets = d.tickets ?? [];
-      ticketWorking = d.working ?? 0;
-      ticketWaiting = d.waiting ?? 0;
+      }>(`/api/sessions/dispatched?router=${encodeURIComponent(sessionId)}`);
+      dispatched = d.sessions ?? [];
+      dispatchedWorking = d.working ?? 0;
+      dispatchedWaiting = d.waiting ?? 0;
     } catch {
       /* 拉不到就先不显示，下一次再来 */
     }
@@ -276,7 +276,7 @@
     drawer = false;
     // 切到 Router 时顺手把「在干的活」拉一遍：那条会话平时是静止的（活跑在别的
     // 会话里），不主动问一次就永远是上次的旧状态。
-    void refreshTickets();
+    void refreshDispatched();
   }
 
   async function renameSession(id: string, title: string) {
@@ -301,7 +301,7 @@
     // **协调层删不掉**：它是「唯一的那个」（服务端 `POST /api/router` 幂等，
     // id 记在 `meta.router_session` 里）。删了之后 `ensureRouter` 会重建一个
     // 新的、换新 id，看起来就像「Router 不见了又出现」，而且它派出去的活
-    // 全成了孤儿（`tickets.router_id` 指向一个不存在的会话）。
+    // 全成了孤儿（`sessions.dispatched_by` 指向一个不存在的会话）。
     // 界面上也不该有这条路径 —— Drawer 那边同样过滤掉（见那里的长按菜单）。
     if (sessions.some((s) => s.id === id && s.role === "router")) return;
 
@@ -394,21 +394,21 @@
   $effect(() => {
     // 读一下让它成为依赖
     if (!isRouter || !sessionId) {
-      // 离开 Router 就清掉：worker 会话里不该残留上一段的工作项
-      tickets = [];
-      ticketWorking = 0;
-      ticketWaiting = 0;
+      // 离开 Router 就清掉：worker 会话里不该残留上一段派出去的会话
+      dispatched = [];
+      dispatchedWorking = 0;
+      dispatchedWaiting = 0;
       return;
     }
-    void refreshTickets();
+    void refreshDispatched();
   });
 
   /**
    * 还有活在跑的时候，**定时看一眼**。
    *
    * 为什么非轮询不可：`chat.on("ended")` 只在**用户正看着的那条流**收尾时触发，
-   * 而工作项跑在**别的**会话里（worker 的流根本不在这个页面）。于是之前的表现是：
-   * 派完活，面板一直显示「排队中」，直到用户去点那条 worker 会话才更新。
+   * 而派出去的活跑在**别的**会话里（那些会话的流根本不在这个页面）。于是之前的
+   * 表现是：派完活，面板一直不更新，直到用户去点那条 worker 会话。
    *
    * 只在这个前提下轮：
    *   - 正在看 Router（别的会话不需要这份数据）
@@ -417,18 +417,18 @@
    *
    * 3 秒是权衡：一件活通常跑几十秒到几分钟，3 秒的滞后感觉不到；再快就是白烧流量。
    */
-  const TICKETS_POLL_MS = 3000;
+  const DISPATCHED_POLL_MS = 3000;
   $effect(() => {
     if (!isRouter || !sessionId) return;
-    // 每一件都结束了就没什么可看的了（但保留一次「全部完成」的收尾刷新）
-    const anyOpen = tickets.some((t) => t.open);
+    // 全都收尾了就没什么可看的了（但保留一次「全部完成」的收尾刷新）
+    const anyOpen = dispatched.some((t) => t.open);
     if (!anyOpen) return;
 
     let stop = false;
     const id = setInterval(() => {
       if (stop) return;
-      if (document.visibilityState === "visible") void refreshTickets();
-    }, TICKETS_POLL_MS);
+      if (document.visibilityState === "visible") void refreshDispatched();
+    }, DISPATCHED_POLL_MS);
     return () => {
       stop = true;
       clearInterval(id);
@@ -689,7 +689,7 @@
       void loadSessions(true);
       // 一条流收尾 = 某件事可能推进了。Router 那块要跟着更新 ——
       // 哪怕收尾的是 worker 会话（用户正看着 Router，也会想知道「那件活完了」）。
-      void refreshTickets();
+      void refreshDispatched();
     }),
   );
 
@@ -756,12 +756,12 @@
     <main class="absolute inset-0 flex flex-col">
       {#if isRouter}
         <!-- 协调层顶上那块「在干的活」。`shrink-0`：它不能被压缩掉，
-             要收就收它自己内部的滚动（见 TicketBoard 的 `max-h`）。 -->
+             要收就收它自己内部的滚动（见 DispatchedBoard 的 `max-h`）。 -->
         <div class="shrink-0">
-          <TicketBoard
-            {tickets}
-            working={ticketWorking}
-            waiting={ticketWaiting}
+          <DispatchedBoard
+            sessions={dispatched}
+            working={dispatchedWorking}
+            waiting={dispatchedWaiting}
           />
         </div>
       {/if}

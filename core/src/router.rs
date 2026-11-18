@@ -1,27 +1,30 @@
-//! 协调层（Router）的工具：**看工作项**、**派工作项**，没有「做」。
+//! 协调层（Router）的工具：**看会话**、**派会话**、**收尾**，没有「做」。
 //!
 //! 这个文件只放「工具被调用时干什么」。工具表的定义（名字、描述、schema）在
 //! `agent::build_router_tools` + `prompt`，两边是一对一的关系：
 //!
 //! | 工具 | 在这儿的入口 | 干什么 |
 //! | --- | --- | --- |
-//! | `list_tickets` | [`list_tickets`] | 有哪些工作项、各自卡在哪 |
-//! | `read_ticket` | [`read_ticket`] | 读一个工作项的详情（含结果全文、执行记录） |
-//! | `dispatch` | [`dispatch`] | 开一个工作项并派出去（给了 ticket_id 就是再派一次） |
+//! | `list_sessions` | [`list_sessions`] | 我派出去的有哪些、各自在跑还是闲着 |
+//! | `read_session` | [`read_session`] | 一条的详情（当初的要求原文 + 最新结论 + 执行记录） |
+//! | `dispatch` | [`dispatch`] | 派活（给了 `session_id` 就是再派一次） |
+//! | `close_session` | [`close_session`] | 收尾（验收通过 / 不要了） |
 //!
-//! ## 为什么是「工作项」而不是「会话」
+//! ## 只有一层实体：会话
 //!
-//! 一开始这条路是错的：`dispatch` 往一条会话里塞一条消息就算派了活，Router 只能
-//! 靠 `list_sessions` 看到「这条会话忙不忙」。而会话是容器 —— 没有状态、没有产出
-//! 契约、没有终点。Router 派完就对那件事一无所知。
+//! 这个文件以前管理的是「工作项（ticket）」—— 有 `Stage` 状态机、有 `tickets` 表、
+//! 有 `session_ticket` 映射。那一层已经**整个删掉**（见 docs/16）：状态存了却没人
+//! 负责推进它，于是每个工作项都永远停在「待验收」。
 //!
-//! 现在派出去的是 `ticket::Ticket`：有标题、有状态机、有产出契约、有终点。
-//! 会话只是它的**载体**（`session_id`）。
+//! 现在派出去的就是**一条会话**。`ChatSession` 上多几行不可变记录
+//! （`brief` / `dispatched_by` / `conclusion` / `dispatches` / `closed_at`），
+//! 但它们不是状态机 —— 没有跃迁规则，也没有一处代码靠它们做分支判断。
+//! 「在不在跑」问 `AppState::turns`，「成没成」看历史 + `conclusion`。
 //!
 //! ## 引用图
 //!
-//! 每个条目都带 `read: ticket/<id>` 指针（照 dsh 的 `ticketCard`），模型能顺着
-//! 从列表走到详情、再走到执行记录。**走一步就断的列表等于没有列表**。
+//! `list_sessions` 的每个条目都带反引号里的 `session_id`，模型能拿它调
+//! `read_session` 走到详情。**走一步就断的列表等于没有列表**。
 //!
 //! ## 为什么 `dispatch` 走 `enqueue` 而不是直接 `run_turn`
 //!
@@ -38,12 +41,12 @@ use crate::agent::Role;
 use crate::state::{AppState, QueuedMsg};
 use crate::Core;
 
-/// `read_ticket` 里执行记录最多给多少条消息。
+/// `read_session` 里执行记录最多给多少条消息。
 const TRANSCRIPT_LINES_MAX: usize = 40;
 const TRANSCRIPT_LINES_DEFAULT: usize = 12;
 /// 执行记录里一条消息最多多少字。
 const TRANSCRIPT_LINE_CHARS: usize = 600;
-/// `list_tickets` 一次最多列多少个。
+/// `list_sessions` 一次最多列多少个。
 const LIST_MAX: usize = 50;
 
 /// 工具调用的结果：给模型看的那段文本。
@@ -74,7 +77,7 @@ fn arg_usize(args: &Value, key: &str, default: usize, min: usize, max: usize) ->
         .map_or(default, |n| (n as usize).clamp(min, max))
 }
 
-/// `list_tickets`：有哪些工作项、各自卡在哪。
+/// `list_sessions`：我派出去的有哪些、各自在跑还是闲着。
 ///
 /// **只列这个 Router 名下的**。默认只看还开着的 —— Router 平时关心的就是
 /// 「还没完的」，翻旧账是另一种需求（`all: true`）。
@@ -450,7 +453,7 @@ fn deliver(
 /// - 回合出错 → `failed`
 /// - 用户按了停止 → `progress`（不是「做完」也不是「失败」，是中途中止）
 ///
-/// 然后往 Router 的队列里排一条**结构化的**回执（带 ticket id 和状态），
+/// 然后往 Router 的队列里排一条**带标记的**回执（哪条会话、成没成、原话），
 /// 而不是一句散文 —— Router 醒来要知道「哪个工作项、什么状态、结果在哪」。
 pub async fn report_back(core: &Core, from_session: &str, said: &str, ok: bool, stopped: bool) {
     let state = &core.state;
