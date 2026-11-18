@@ -246,6 +246,14 @@ pub fn clip(s: &str, max: usize) -> String {
 // 库
 // ---------------------------------------------------------------------------
 
+/// 读一条工作项要哪几列，顺序必须和 [`Db::ticket_query`] 里的下标对上。
+///
+/// 以前这份清单在 `ticket_get` / `ticket_list`（两个分支）/ `ticket_query` 里
+/// 各抄一遍 —— 加一个字段要改四处，漏一处就是「某个查询读出来的字段永远是默认值」
+/// （那种 bug 不报错，只是界面上少一行）。
+const COLUMNS: &str = "rowid, id, title, brief, session_id, router_id, stage, result, report,
+                       ended_at, ended_by, dispatches, created_at, updated_at";
+
 impl Db {
     /// 开一个工作项。返回它的 id。
     #[allow(clippy::too_many_arguments)]
@@ -414,12 +422,8 @@ impl Db {
 
     /// 读一个工作项。
     pub fn ticket_get(&self, id: &str) -> anyhow::Result<Option<Ticket>> {
-        let mut found = self.ticket_query(
-            "SELECT rowid, id, title, brief, session_id, router_id, stage, result, report,
-                    ended_at, ended_by, dispatches, created_at, updated_at
-             FROM tickets WHERE id = ?1",
-            rusqlite::params![id],
-        )?;
+        let sql = format!("SELECT {COLUMNS} FROM tickets WHERE id = ?1");
+        let mut found = self.ticket_query(&sql, rusqlite::params![id])?;
         Ok(found.pop())
     }
 
@@ -445,20 +449,17 @@ impl Db {
         open_only: bool,
         limit: usize,
     ) -> anyhow::Result<Vec<Ticket>> {
-        let sql = if open_only {
-            "SELECT rowid, id, title, brief, session_id, router_id, stage, result, report,
-                    ended_at, ended_by, dispatches, created_at, updated_at
-             FROM tickets
-             WHERE router_id = ?1 AND stage NOT IN ('done', 'cancelled')
-             ORDER BY created_at DESC, id DESC LIMIT ?2"
-        } else {
-            "SELECT rowid, id, title, brief, session_id, router_id, stage, result, report,
-                    ended_at, ended_by, dispatches, created_at, updated_at
-             FROM tickets
-             WHERE router_id = ?1
-             ORDER BY created_at DESC, id DESC LIMIT ?2"
-        };
-        self.ticket_query(sql, rusqlite::params![router_id, limit as i64])
+        // 两个分支只差一句守卫，拼一次前缀就行
+        let sql = format!(
+            "SELECT {COLUMNS} FROM tickets WHERE router_id = ?1{} \
+             ORDER BY created_at DESC, id DESC LIMIT ?2",
+            if open_only {
+                " AND stage NOT IN ('done', 'cancelled')"
+            } else {
+                ""
+            }
+        );
+        self.ticket_query(&sql, rusqlite::params![router_id, limit as i64])
     }
 
     /// 「有几件事在等人」和「有几件在干」—— Router 每次醒来最该先知道的两个数。

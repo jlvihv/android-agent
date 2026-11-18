@@ -1749,7 +1749,7 @@ impl AppState {
     ///
     /// 判定结果会落盘，下次启动直接读，不用再联网。
     pub async fn supports_images_for(&self, provider: &Provider) -> bool {
-        let key = vision_key(provider);
+        let key = provider_key(provider);
         if let Some((k, v)) = cow_take(&self.vision) {
             if k == key {
                 return v;
@@ -1771,7 +1771,7 @@ impl AppState {
         }
         // 判定要联网（最多十几秒），这期间用户可能已经换了模型：只在当前
         // provider 还是**这一个**时才落盘，否则会把旧模型的能力写到新模型头上。
-        if resolved.is_some() && self.llm().is_some_and(|cur| vision_key(&cur) == key) {
+        if resolved.is_some() && self.llm().is_some_and(|cur| provider_key(&cur) == key) {
             self.set_supports_images(vision);
         }
         vision
@@ -1783,7 +1783,7 @@ impl AppState {
     /// 和视觉能力同一个套路，但 PDF 默认关：没法确定时**不显示**文件入口，
     /// 总好过发一个保证 400 的请求。
     pub async fn supports_files_for(&self, provider: &Provider) -> bool {
-        let key = files_key(provider);
+        let key = provider_key(provider);
         if let Some((k, v)) = cow_take(&self.files) {
             if k == key {
                 return v;
@@ -1803,7 +1803,7 @@ impl AppState {
         if let Ok(mut g) = self.files.write() {
             *g = Some((key.clone(), files));
         }
-        if resolved.is_some() && self.llm().is_some_and(|cur| files_key(&cur) == key) {
+        if resolved.is_some() && self.llm().is_some_and(|cur| provider_key(&cur) == key) {
             self.set_supports_files(files);
         }
         files
@@ -1811,7 +1811,7 @@ impl AppState {
 
     /// 只看缓存/已存的值（同步，给组装请求和工具用，不做网络）。
     pub fn cached_supports_images(&self, provider: &Provider) -> bool {
-        let key = vision_key(provider);
+        let key = provider_key(provider);
         if let Some((k, v)) = cow_take(&self.vision) {
             if k == key {
                 return v;
@@ -1822,7 +1822,7 @@ impl AppState {
 
     /// 同 `cached_supports_images`，但看的是 PDF / 文档输入。
     pub fn cached_supports_files(&self, provider: &Provider) -> bool {
-        let key = files_key(provider);
+        let key = provider_key(provider);
         if let Some((k, v)) = cow_take(&self.files) {
             if k == key {
                 return v;
@@ -1844,7 +1844,7 @@ impl AppState {
                 p.reasoning_effort = rec.reasoning_effort;
                 // 恢复出来的值先当已知（不用等下一次请求再联网）
                 if let Ok(mut g) = self.vision.write() {
-                    *g = Some((vision_key(&p), rec.supports_images));
+                    *g = Some((provider_key(&p), rec.supports_images));
                 }
                 // 刻意**不**给 `files` 填缓存：老配置里没有这个字段，
                 // 填了就会把「从未判定过」当成「已判定为 false」，界面就一直
@@ -1991,13 +1991,16 @@ impl Turn {
     }
 }
 
-/// 视觉判定的缓存键：base_url + 模型名。任一变了就重算。
-fn vision_key(p: &Provider) -> String {
-    format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
-}
-
-/// 文档输入判定的缓存键，和视觉那套分开存。
-fn files_key(p: &Provider) -> String {
+/// 「这个模型是谁」的缓存键：base_url + 模型名。任一变了就重算。
+///
+/// 视觉能力和文档输入能力**共用这一把键**（两个缓存分开存，键的语义一样）——
+/// 以前是两个逐字相同的函数（`vision_key` / `files_key`），改一处忘一处就会让两套
+/// 判定对同一个模型算出不同的身份。
+///
+/// 返回 owned 而不是 `Cow<str>`：调用方都要把它存进 `RwLock<Option<(String, bool)>>`
+/// 并跨 `.await` 比较，借不出来。分配只发生在「算了一次能力判定」的时候
+/// （每天几次），不在流式热路径上。
+fn provider_key(p: &Provider) -> String {
     format!("{}|{}", p.base_url.trim_end_matches('/'), p.model)
 }
 
