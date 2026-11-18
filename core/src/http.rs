@@ -3104,7 +3104,16 @@ async fn list_sessions(
     State(st): State<Arc<AppState>>,
     Query(q): Query<SessionsQuery>,
 ) -> impl IntoResponse {
-    let busy = st.busy_sessions();
+    // 「在跑」和「排队中」各拍一次快照（各只拿一次锁），交给 `standing()` 推导。
+    //
+    // 以前这里只算 `busy`（给抽屉那个 pulsing 圆点用），`state` 是这次新加的：
+    // 删掉顶部看板之后，「闲着 / 已验收 / 已取消」在界面上完全看不见了 ——
+    // 而那三个正是 session-only 重构的语义成果之一。
+    //
+    // 用 `busy_set` / `queued_set` 而不是 `busy_sessions()`（后者返回 Vec，
+    // 还得再转成集合）：这个接口是抽屉的常规轮询。
+    let busy = st.busy_set();
+    let queued = st.queued_set();
     let limit = q.tail.unwrap_or(SESSIONS_PAGE);
     // 游标拆成 `(createdAt, id)`。拆不开（老的 / 手写的）就当没给：从头来
     let before = q.before.as_deref().and_then(|b| {
@@ -3115,17 +3124,23 @@ async fn list_sessions(
         })
     });
     let store = st.chat.read().await;
-    let (mut list, has_more, next) = store.list_page(before, limit);
+    // 状态推导走 `ChatSession::standing` —— **唯一**的推导入口（见它的文档）。
+    // 不在这里另拼一遍判定，那样和 `dispatched` 列表、和测试会走偏。
+    let (mut list, has_more, next) = store.list_page_with(before, limit, |s| {
+        Some(s.standing(busy.contains(&s.id), queued.contains(&s.id)))
+    });
     // 会话总数（`agentctl doctor` 的「会话库 N 个会话」还要它，一页看不出总数）
     let total = store.sessions.iter().filter(|s| s.has_content()).count();
     drop(store);
     // 抽屉里给正在跑的会话打个点：切走了也知道它还在干活。
     //
-    // 用 HashSet 而不是对每条会话 `busy.iter().any(..)`：那是 O(会话数 × 回合数)，
-    // 而这个接口是抽屉的常规轮询（切会话、回合收尾、回前台都会拉）。
-    let busy: std::collections::HashSet<&str> = busy.iter().map(String::as_str).collect();
+    // `busy` 取自**同一份**快照，和 `state` 不矛盾，但**不是**等价关系：
+    // `standing()` 里 `closed` 排在 `busy` 前面，所以一条「已收尾的会话如果
+    // 还在跑」会是 `state="done"` + `busy=true`（数据层面可能出现，比如老库）。
+    // 界面按 `state` 画标记、按 `busy` 画那个 pulsing 圆点，各说各的事实。
     for s in &mut list {
-        let running = s["id"].as_str().is_some_and(|id| busy.contains(id));
+        let id = s["id"].as_str().unwrap_or_default().to_string();
+        let running = busy.contains(&id);
         s["busy"] = json!(running);
     }
     Json(json!({
@@ -4122,6 +4137,7 @@ fn cmd_name(c: &Command) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{is_loopback_origin, is_same_origin, parse_rev, session_rev};
+    use serde_json::json;
 
     /// 一个开着凭据、带一个真 rootfs 目录的核心：rootfs/workspace/site/index.html。
     async fn sandbox_core(
@@ -4208,6 +4224,114 @@ mod tests {
     }
 
     /// 起一个真的核心服务，返回 (base, 不跟随跳转的 client)。
+    /// **`/api/sessions` 的 `state` 必须和 `ChatSession::standing()` 一致。**
+    ///
+    /// 这是「状态只在一处推导」的守卫：如果谁哪天在 handler 里另拼一遍判断，
+    /// 这条会红。做法是造出四种状态的会话，打真实 HTTP，再逐个和
+    /// `standing()` 的结论比对。
+    #[tokio::test]
+    async fn list_sessions_reports_the_same_state_as_standing() {
+        let st = crate::state::AppState::new();
+        st.set_token(Some("s3cret".into()));
+
+        // 造四条会话：空闲 / 已验收 / 已取消 / （在跑的那个用 begin_turn 占坑）
+        let (idle, done, cancelled, running, queued) = {
+            let mut store = st.chat.write().await;
+            let mut mk = |title: &str| {
+                let mut s = crate::agent::ChatSession::new();
+                s.title = title.to_string();
+                // 有内容才会进 `list_page`（空会话不进列表）
+                s.messages.push(crate::agent::ChatMessage::user("干点活"));
+                let id = s.id.clone();
+                store.sessions.push(s);
+                id
+            };
+            (
+                mk("闲着"),
+                mk("验收过"),
+                mk("取消掉"),
+                mk("在跑"),
+                mk("排队中"),
+            )
+        };
+        st.close_session(&done, "done").await;
+        st.close_session(&cancelled, "cancelled").await;
+        // 「在跑」：占一个回合（`begin_turn` 会把它记进 `turns`）
+        let turn = st.begin_turn(&running).expect("占得上");
+
+        // 「排队中」：往队列里塞一条、且**不**占回合。
+        //
+        // 这条是必需的 —— 少了它，`standing()` 里 `queued` 那个分支就没人验，
+        // 而「handler 自己另拼一遍判断」这种变异恰恰会在 `queued` 上露馅
+        // （实测：没有这条会话时，那个变异测试照样绿）。
+        assert!(
+            st.enqueue(
+                &queued,
+                crate::state::QueuedMsg {
+                    id: "q1".into(),
+                    text: "排队等着".into(),
+                    attachments: Vec::new(),
+                    origin: crate::agent::Origin::Human,
+                }
+            )
+            .is_ok()
+        );
+
+        let (base, c) = serve(st.clone()).await;
+        let v: serde_json::Value = c
+            .get(format!("{base}/api/sessions"))
+            .header("x-agent-token", "s3cret")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = v["sessions"].as_array().expect("有 sessions");
+        assert_eq!(rows.len(), 5, "五条都该在列表里：{v}");
+
+        // 逐条比对：返回值 vs `standing()` 的推导
+        let busy = st.busy_set();
+        let queue_snapshot = st.queued_set();
+        let store = st.chat.read().await;
+        for row in rows {
+            let id = row["id"].as_str().unwrap();
+            let s = store.get(id).expect("会话在");
+            let want = s.standing(busy.contains(id), queue_snapshot.contains(id));
+            assert_eq!(
+                row["state"].as_str(),
+                Some(want.as_str()),
+                "会话 {id}（{}）的 state 和 standing() 不一致",
+                s.title
+            );
+            assert_eq!(
+                row["label"].as_str(),
+                Some(want.label()),
+                "label 也要和 standing() 一致"
+            );
+        }
+        drop(store);
+
+        // 具体几种：让断言读得懂失败原因（上面的循环已经覆盖，这里点明期望值）
+        let by = |id: &str| {
+            rows.iter()
+                .find(|r| r["id"].as_str() == Some(id))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by(&idle)["state"], json!("idle"));
+        assert_eq!(by(&done)["state"], json!("done"));
+        assert_eq!(by(&cancelled)["state"], json!("cancelled"));
+        assert_eq!(by(&running)["state"], json!("working"));
+        assert_eq!(by(&queued)["state"], json!("queued"), "排队中不能被说成闲着");
+        // `busy` 只对真在跑的那条为真
+        assert_eq!(by(&running)["busy"], json!(true));
+        assert_eq!(by(&idle)["busy"], json!(false));
+
+        st.end_turn(&running);
+        drop(turn);
+    }
+
     async fn serve(st: std::sync::Arc<crate::state::AppState>) -> (String, reqwest::Client) {
         crate::llm::install_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

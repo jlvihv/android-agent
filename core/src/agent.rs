@@ -1000,6 +1000,23 @@ impl SessionStore {
         before: Option<(u64, &str)>,
         limit: usize,
     ) -> (Vec<Value>, bool, Option<String>) {
+        self.list_page_with(before, limit, |_| None)
+    }
+
+    /// 同 [`Self::list_page`]，但每行额外带一个 `state` / `label`。
+    ///
+    /// `standing` 由调用方给：它需要 `busy` / `queued`，而那两样在 `AppState`
+    /// 里（这个类型持有的是会话表，不是运行时状态）。传 `None` 就不带这两个
+    /// 字段 —— 内部调用（`list()`）不需要它们。
+    ///
+    /// **状态只由 `ChatSession::standing` 算**，不在这里另写一遍判断：
+    /// 那份推导已经在 `http.rs` 的 dispatched 列表和测试里用了，多一份就会走偏。
+    pub fn list_page_with(
+        &self,
+        before: Option<(u64, &str)>,
+        limit: usize,
+        standing: impl Fn(&ChatSession) -> Option<crate::agent::Standing>,
+    ) -> (Vec<Value>, bool, Option<String>) {
         // 空会话不进列表（「新对话」点了没说话不该占位），但 **Router 例外**：
         // 它必须一直看得见 —— 它是双层架构的入口，用户得能点回它。而且它通常
         // 就是空的（派出去的活由 worker 干，它自己不攒消息）。
@@ -1035,7 +1052,7 @@ impl SessionStore {
         let rows = v
             .into_iter()
             .map(|s| {
-                json!({
+                let mut row = json!({
                     "id": s.id,
                     "title": if s.title.is_empty() { "新对话" } else { &s.title },
                     "updatedAt": s.updated_at,
@@ -1043,7 +1060,14 @@ impl SessionStore {
                     // 前端靠它把协调层那条画得不一样（图标 / 固定在顶上 / 不能删）。
                     // 不给的话界面就得靠「标题叫什么」去猜，那是猜不准的。
                     "role": s.role.as_str(),
-                })
+                });
+                // `state` / `label` 只在调用方给了推导时才有（见 `list_page_with`）。
+                // 前端拿 `label` 直接显示，不在那边再写一遍中文映射。
+                if let Some(st) = standing(s) {
+                    row["state"] = json!(st.as_str());
+                    row["label"] = json!(st.label());
+                }
+                row
             })
             .collect();
         (rows, has_more, next)

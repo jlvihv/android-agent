@@ -48,8 +48,24 @@
     id: string;
     title: string;
     count: number;
-    /** 这个会话有回合在跑（可以同时在几个会话里各跑一个） */
+    /**
+     * 这个会话有回合在跑。
+     *
+     * **界面已经不读它了** —— 状态一律走 `state`（`busy === true` 时
+     * `state === "working"`，但 `state` 还能表达排队/闲着/已收尾）。
+     * 服务端仍在返回（向后兼容），保留在类型里是为了让「它与 state 并存」
+     * 这件事显式可见，而不是被误删后又被谁重新发现。
+     */
     busy?: boolean;
+    /**
+     * 服务端算好的处境（`ChatSession::standing()`）：`working` / `queued` /
+     * `idle` / `done` / `cancelled`。见 `lib/sessions.svelte.ts` 的 `SessionState`。
+     *
+     * **`idle` 是常态，不给标记** —— 没标记就代表闲着、不用管（见列表里那段）。
+     */
+    state?: string;
+    /** 人看的状态名，服务端给（前端不再自己写一遍中文映射） */
+    label?: string;
     /** `router` = 协调层：图标不同、不能改名、不能删（见列表里那段） */
     role?: "worker" | "router";
   };
@@ -570,12 +586,36 @@
             >
               {isRouter ? s.title || "协调" : s.title}
             </span>
-            {#if s.busy}
-              <!-- 还在跑：切走了也看得出来 -->
+            <!-- 状态标记。
+                 **`idle` 不给标记** —— 它是常态（活干完了、闲着等你续派），
+                 每条都标一个点等于整屏噪音，反而看不出哪条值得注意。
+                 「没有标记」本身就是信息：它闲着，没事。
+
+                 层次（从显眼到安静）：
+                   working   pulsing 圆点 + 无障碍标签（唯一「正在产出」的状态）
+                   queued    静态小点（在等，但不占你注意力）
+                   done      「已验收」小字，最淡
+                   cancelled 「已取消」小字 + 删除线（一眼看出它废了）
+                 颜色只是辅助：每个都带文字或 aria-label，不靠颜色区分。 -->
+            {#if s.state === "working"}
               <span
                 class="size-1.5 shrink-0 animate-pulse rounded-full bg-warn"
-                aria-label="运行中"
+                role="img"
+                aria-label={s.label || "在跑"}
               ></span>
+            {:else if s.state === "queued"}
+              <span
+                class="size-1.5 shrink-0 rounded-full bg-faint"
+                role="img"
+                aria-label={s.label || "排队中"}
+              ></span>
+            {:else if s.state === "done" || s.state === "cancelled"}
+              <span
+                class="shrink-0 text-xs text-faint
+                       {s.state === "cancelled" ? 'line-through' : ''}"
+              >
+                {s.label || (s.state === "done" ? "已验收" : "已取消")}
+              </span>
             {/if}
           </button>
         {/if}
