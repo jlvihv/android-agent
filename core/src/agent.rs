@@ -357,6 +357,171 @@ impl Role {
     }
 }
 
+/// 一件派出去的活：谁派的、当初要它干什么、派过几次。
+///
+/// **要么整份有、要么整份没有**（`ChatSession::dispatch: Option<Dispatch>`）——
+/// 以前是三个独立的 `Option`/计数，能写出「有 brief 没 by」这种半份状态，
+/// 而迁移恰好会产生那种数据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dispatch {
+    /// 派它的那个 Router（会话 id）。回合结束时靠它找「这轮结果该告诉谁」。
+    pub by: String,
+    /// 当初要它干什么（原文，一字不改）。
+    ///
+    /// ## 为什么这行字要单独存，而不是只留在历史里
+    ///
+    /// 历史会被压缩、会被 `evict` 掉，压缩之后「当初到底要它干什么」就变成一个
+    /// 模糊的摘要了 —— 而这句话是**验收的合同**：判断它干得对不对，靠的是原话，
+    /// 不是摘要。这一行独立存在，所以免疫压缩。
+    pub brief: String,
+    /// 派过几次（同一个会话被补充要求会 +1）。
+    pub times: u32,
+}
+
+impl Dispatch {
+    /// 开一份新的派活记录。
+    pub fn new(by: impl Into<String>, brief: impl Into<String>) -> Self {
+        Self {
+            by: by.into(),
+            brief: brief.into(),
+            times: 1,
+        }
+    }
+
+    /// 补充要求：**追加**到 `brief` 末尾，不覆盖原文（那是验收合同）。
+    ///
+    /// **不动 `times`** —— 派工次数由 `AppState::reopen_session` 统一 +1
+    /// （那里是「再派一次」这个动作的唯一入口）。两处都加就会加两遍。
+    pub fn append(&mut self, addition: &str) {
+        self.brief.push_str("\n\n---\n\n（补充要求）\n");
+        self.brief.push_str(addition);
+    }
+}
+
+/// 这件活收尾了没有。
+///
+/// 以前是 `closed_at: u64` + `closed_by: String` 两列，`0` / 空串当哨兵：
+/// `0 + "done"`、`1700… + ""`、`1700… + "whatever"` 三种非法组合都能表示，
+/// 而判定散在七处写成 `closed_at != 0`、三处写成 `closed_by == "done"`。
+/// 收成这个枚举之后，非法状态在类型层面就写不出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Closed {
+    /// 还开着
+    #[default]
+    Open,
+    /// 验收过了
+    Done { at: u64 },
+    /// 不要了
+    Cancelled { at: u64 },
+}
+
+impl Closed {
+    /// 收尾了没有（`Open` 之外都算收尾）
+    pub const fn is_closed(self) -> bool {
+        !matches!(self, Self::Open)
+    }
+
+    /// 收尾的时刻，`Open` 没有
+    pub const fn at(self) -> Option<u64> {
+        match self {
+            Self::Open => None,
+            Self::Done { at } | Self::Cancelled { at } => Some(at),
+        }
+    }
+
+    /// 给人看的一句话
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "开着",
+            Self::Done { .. } => "已验收",
+            Self::Cancelled { .. } => "已取消",
+        }
+    }
+
+    /// 从库里的两列还原。**唯一**一处把哨兵翻译成枚举的地方（见 `db.rs`）。
+    ///
+    /// 判定规则：有 `at` 才算收尾；`by` 认不出来的一律当 `Done`（宁可说成
+    /// 「验收过」也不要在界面上留一个说不清的第四种状态）。`at == 0` 一律当
+    /// `Open` —— 没有时刻的「收尾」不成立。
+    pub fn from_db(at: u64, by: &str) -> Self {
+        if at == 0 {
+            return Self::Open;
+        }
+        if by == "cancelled" {
+            Self::Cancelled { at }
+        } else {
+            Self::Done { at }
+        }
+    }
+
+    /// 拆回库里的两列（`at`, `by`）。
+    pub fn to_db(self) -> (u64, &'static str) {
+        match self {
+            Self::Open => (0, ""),
+            Self::Done { at } => (at, "done"),
+            Self::Cancelled { at } => (at, "cancelled"),
+        }
+    }
+}
+
+/// 一条派出去的会话「现在什么处境」。**推导出来的，不存。**
+///
+/// 三个来源合起来算：`ChatSession::closed`（人划掉了没有）、
+/// `AppState::turns`（回合真的在跑）、`AppState` 的排队队列（派了还没开跑）。
+///
+/// 以前这份推导在 `http.rs` 和 `router.rs` 各写一遍，**优先级还是相反的**
+/// （`router` 先判 busy、`http` 先判 closed）—— 同一个会话在两个地方会得出
+/// 不同的标签。现在只有 [`ChatSession::standing`] 一处。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// 回合真的在跑
+    Running,
+    /// 没在跑，但派了活还没轮到（排队等着交给模型）
+    Queued,
+    /// 没在跑、没排队、也没收尾 —— 它停下了，等人看一眼
+    Idle,
+    /// 人把它划掉了
+    Closed(Closed),
+}
+
+impl Standing {
+    /// 要不要人来处理。
+    ///
+    /// **`Queued` 不算**：活刚派下去、正等着开跑，那不是「等你」，是「等它」。
+    /// 旧架构里 `Stage::needs_person()` 对 `Queued` 也是 false（保持一致）。
+    pub const fn needs_person(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    /// 还开着吗（没被划掉）
+    pub const fn open(self) -> bool {
+        !matches!(self, Self::Closed(_))
+    }
+
+    /// 机器读的状态名（HTTP 字段 `state`）
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "working",
+            Self::Queued => "queued",
+            Self::Idle => "idle",
+            Self::Closed(Closed::Open) => "open",
+            Self::Closed(Closed::Done { .. }) => "done",
+            Self::Closed(Closed::Cancelled { .. }) => "cancelled",
+        }
+    }
+
+    /// 给人看的一句话
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Running => "在跑",
+            Self::Queued => "排队中",
+            Self::Idle => "闲着",
+            Self::Closed(c) => c.label(),
+        }
+    }
+}
+
 /// 当前会话。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -373,36 +538,24 @@ pub struct ChatSession {
     pub messages: Vec<ChatMessage>,
     /// 给 provider 做 prompt cache 路由用的稳定会话 ID
     pub provider_session: String,
-    /// 这条会话是**被派活的**时，当初要它干什么（原文，一字不改）。
+    /// 派活信息。`None` = **这条会话不是被派的**（用户在输入框里自己开的）。
     ///
-    /// ## 为什么这行字要单独存，而不是只留在历史里
-    ///
-    /// 历史会被压缩、会被 `evict` 掉，压缩之后「当初到底要它干什么」就变成一个
-    /// 模糊的摘要了 —— 而这句话是**验收的合同**：判断它干得对不对，靠的是原话，
-    /// 不是摘要。这一行独立存在，所以免疫压缩。
-    ///
-    /// `None` = 这条会话不是被派的（用户在输入框里自己开的）。
-    pub brief: Option<String>,
-    /// 派这条会话的 Router（会话 id）。`None` = 同上。
-    ///
-    /// 回合结束时靠它找到「这轮结果该告诉谁」。
-    pub dispatched_by: Option<String>,
+    /// 三个字段以前是三个平铺的 `Option`（`brief` / `dispatched_by` / `dispatches`），
+    /// 于是「有 brief 没 by」「有 by 没 brief」这些写一半的状态都能表示 ——
+    /// 而 `db.rs` 的迁移恰好会产生那种数据（老 ticket 缺列）。收成一个 `Option`
+    /// 之后，**要么整份有、要么整份没有**，类型上就写不出半份。
+    pub dispatch: Option<Dispatch>,
     /// 最近一次回合结束时它说的那段话（给人看的一句话结论）。
     ///
     /// 和 `brief` 同理：历史压缩之后，「它最后说成了什么」不能靠摘要。
     /// 空串 = 还没跑过回合。
     pub conclusion: String,
-    /// 给它派过几次活（同一个会话被补充要求会 +1）。
-    pub dispatches: u32,
-    /// 这条会话的**活**结束于什么时候（0 = 还没结束）。
+    /// 这件活收尾了没有。以前是 `closed_at: u64` + `closed_by: String` 两列，
+    /// `0` / 空串当哨兵，6 种组合里 3 种非法。收成枚举之后非法状态写不出来。
     ///
-    /// 只记「人把这件活收尾了」这一个事实：验收过了、或者不要了。
-    /// 它**不参与任何状态判定** —— 「现在在不在跑」看的是 `AppState::turns`
-    /// （回合是真的在跑），「上一轮成没成」看的是历史里的事实。这里只有一个
-    /// 布尔量级的东西：人有没有把这件活划掉。
-    pub closed_at: u64,
-    /// 划掉它的方式：`done` / `cancelled` / 空串。只用于显示。
-    pub closed_by: String,
+    /// 它**不参与「在不在跑」的判定** —— 那个看 `AppState::turns`（回合真的在跑）。
+    /// 这里只有一个量级：人把这件活划掉了没有。
+    pub closed: Closed,
     /// 消息**不在内存里**时的摘要；`None` = 消息都在 `messages` 里。
     ///
     /// 不活跃的会话只留元数据（几十个会话、每个带一堆几十 KB 的 bash 输出，
@@ -454,12 +607,9 @@ impl ChatSession {
             role,
             messages: Vec::new(),
             provider_session: new_provider_session(),
-            brief: None,
-            dispatched_by: None,
+            dispatch: None,
             conclusion: String::new(),
-            dispatches: 0,
-            closed_at: 0,
-            closed_by: String::new(),
+            closed: Closed::Open,
             stub: None,
             loaded_at: None,
             epoch: 0,
@@ -521,6 +671,44 @@ impl ChatSession {
             Some(s) => s.users,
             None => self.messages.iter().filter(|m| m.is_user()).count(),
         }
+    }
+
+    /// 这条会话现在什么处境。**唯一**的推导入口（见 [`Standing`]）。
+    ///
+    /// `busy` 从 `AppState::turns` 来（回合真的在跑）；`queued` 从排队队列来
+    /// （派了、还没轮到）。两个都由调用方传进来，因为这个类型不持有 `AppState`。
+    ///
+    /// 优先级：**收尾 > 在跑 > 排队 > 闲着**。
+    ///
+    /// 为什么收尾排最前：一件活被划掉之后，那条会话就算还在跑也不该再被当成
+    /// 「在干这件事」—— 它是历史了。（`close_session` 本身会拒绝关在跑的会话，
+    /// 但数据可能是从别处来的，比如老库、比如别处的直接调用。）
+    pub fn standing(&self, busy: bool, queued: bool) -> Standing {
+        if self.closed.is_closed() {
+            return Standing::Closed(self.closed);
+        }
+        if busy {
+            return Standing::Running;
+        }
+        if queued {
+            return Standing::Queued;
+        }
+        Standing::Idle
+    }
+
+    /// 派这条会话的 Router（`None` = 不是派出去的）。
+    pub fn dispatched_by(&self) -> Option<&str> {
+        self.dispatch.as_ref().map(|d| d.by.as_str())
+    }
+
+    /// 当初的要求原文（`None` = 不是派出去的）。
+    pub fn brief(&self) -> Option<&str> {
+        self.dispatch.as_ref().map(|d| d.brief.as_str())
+    }
+
+    /// 派过几次（`None` = 不是派出去的）。
+    pub fn dispatch_times(&self) -> Option<u32> {
+        self.dispatch.as_ref().map(|d| d.times)
     }
 
     /// 放掉内存里的消息，只留摘要。调用方保证它们**已经落盘**。
@@ -3811,6 +3999,89 @@ async fn read_image_outcome(
 
 #[cfg(test)]
 mod tests {
+    /// **`standing()` 是唯一的推导入口，优先级写死在一处。**
+    ///
+    /// 以前 `http.rs` 和 `router.rs` 各写一份，优先级还是相反的（一个先判 busy、
+    /// 一个先判 closed）—— 同一个会话在两个地方会得出不同标签。
+    #[test]
+    fn standing_has_one_priority_order() {
+        let s = ChatSession::with_role(Role::Worker);
+        // 收尾 > 在跑 > 排队 > 闲着
+        assert_eq!(s.standing(false, false), Standing::Idle);
+        assert_eq!(s.standing(false, true), Standing::Queued);
+        assert_eq!(s.standing(true, false), Standing::Running);
+        // busy 和 queued 同时为真时，在跑赢（它确实在跑）
+        assert_eq!(s.standing(true, true), Standing::Running);
+    }
+
+    /// **收尾排最前**：划掉之后就算还在跑也不该被当成「在干这件事」。
+    #[test]
+    fn a_closed_session_outranks_everything() {
+        let mut s = ChatSession::with_role(Role::Worker);
+        s.closed = Closed::Done { at: 42 };
+        assert_eq!(s.standing(true, true), Standing::Closed(Closed::Done { at: 42 }));
+        s.closed = Closed::Cancelled { at: 7 };
+        assert_eq!(
+            s.standing(false, false),
+            Standing::Closed(Closed::Cancelled { at: 7 })
+        );
+    }
+
+    /// **`Queued` 不算「等你」。** 派了活、还没轮到，那不是等你，是等它。
+    ///
+    /// 旧架构 `Stage::needs_person()` 对 `Queued` 也是 false；一版实现里
+    /// 用 `!busy && !closed` 判定，于是 `dispatch` 之后、回合真正开跑之前
+    /// 那个窗口里会话被算进「等你」—— 计数会抖。
+    #[test]
+    fn a_queued_session_does_not_need_a_person() {
+        assert!(!Standing::Queued.needs_person(), "排队中不该算等人");
+        assert!(Standing::Idle.needs_person(), "停下了才等人");
+        assert!(!Standing::Running.needs_person());
+        assert!(!Standing::Closed(Closed::Done { at: 1 }).needs_person());
+    }
+
+    /// `Closed` 的数据库往返：`Open` / `Done` / `Cancelled` 都还原得回来，
+    /// 非法的哨兵组合收敛成合法值（而不是留一个第四种状态）。
+    #[test]
+    fn closed_round_trips_through_the_two_columns() {
+        for c in [
+            Closed::Open,
+            Closed::Done { at: 100 },
+            Closed::Cancelled { at: 200 },
+        ] {
+            let (at, by) = c.to_db();
+            assert_eq!(Closed::from_db(at, by), c, "{c:?} 往返不一致");
+        }
+        // 哨兵还原：`0` 一律当 Open（没有时刻的「收尾」不成立）
+        assert_eq!(Closed::from_db(0, "done"), Closed::Open);
+        assert_eq!(Closed::from_db(0, ""), Closed::Open);
+        // 认不出的 by 当 Done（宁可说「验收过」，别留一个说不清的状态）
+        assert_eq!(
+            Closed::from_db(500, "whatever"),
+            Closed::Done { at: 500 }
+        );
+    }
+
+    /// `Option<Dispatch>` 让「半份派活记录」写不出来：要么整份有、要么没有。
+    #[test]
+    fn a_dispatch_record_is_all_or_nothing() {
+        let mut s = ChatSession::with_role(Role::Worker);
+        assert_eq!(s.dispatched_by(), None);
+        assert_eq!(s.brief(), None);
+        assert_eq!(s.dispatch_times(), None);
+
+        s.dispatch = Some(Dispatch::new("router-1", "把这件事干了"));
+        assert_eq!(s.dispatched_by(), Some("router-1"));
+        assert_eq!(s.brief(), Some("把这件事干了"));
+        assert_eq!(s.dispatch_times(), Some(1));
+
+        // 追加：原文留着，次数不动（次数由 reopen_session 记）
+        s.dispatch.as_mut().unwrap().append("补充一句");
+        assert_eq!(s.dispatch_times(), Some(1), "append 不该动次数");
+        let b = s.brief().unwrap();
+        assert!(b.contains("把这件事干了") && b.contains("补充一句"), "{b}");
+    }
+
     use super::*;
 
     /// 侧边栏分页：游标翻页不重不漏、顺序和全量一致。

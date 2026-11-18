@@ -3240,13 +3240,19 @@ async fn ensure_router(st: &AppState) -> String {
 /// 名字里的 `dispatched` 是字面意思：**派出去的那些会话**。底下没有 ticket 这一层了
 /// （见 docs/16），所以路径、handler、字段名一律用 session 词汇。
 ///
-/// 每一行是一条会话，三个「状态」都是**现算**的，不是存出来的：
-/// - `state`：`working`（回合真的在跑）/ `idle`（停了、还没收尾）/ `done` / `cancelled`
-/// - `needsPerson` = 没在跑、也没收尾（「它停了，等人看一眼」）
-/// - `open` = 还没收尾
+/// 每一行是一条会话，处境由 [`ChatSession::standing`] **现算**（不存）：
+/// `working` / `queued` / `idle` / `done` / `cancelled`。同一份推导 `router.rs`
+/// 和测试也调 —— 以前 `http.rs` 和 `router.rs` 各写一遍，优先级还是相反的。
 ///
-/// 以前这里是 `GROUP BY stage` 查库。现在不查库：会话表在内存里，
-/// 「在不在跑」问 `turns` 就是权威答案。
+/// ## 锁与分配
+///
+/// 以前这段有三个毛病：持着全局 `chat` 读锁做 `json!` 分配和 `text::clip`
+/// （200 字符扫描）；**在循环里**对每条会话各拿一次 `turns` 锁（而 `turns` 是
+/// 所有回合起止都要拿的锁）；统计又在已经构造好的 `Vec<Value>` 上遍历、用
+/// `r["moving"] == json!(true)` 比（每次构造一个 `Value`）。
+///
+/// 现在：busy / queued 各拍**一次**快照 → 锁里只挑选+排序+统计（不格式化）
+/// → 出锁后再 `clip` / `json!`。
 async fn list_dispatched_sessions(
     State(st): State<Arc<AppState>>,
     Query(q): Query<DispatchedQuery>,
@@ -3256,59 +3262,86 @@ async fn list_dispatched_sessions(
     };
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
 
-    let store = st.chat.read().await;
-    let mut mine: Vec<&crate::agent::ChatSession> = store
-        .sessions
-        .iter()
-        .filter(|s| s.dispatched_by.as_deref() == Some(router))
-        .filter(|s| q.all || s.closed_at == 0)
-        .collect();
-    mine.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-            .then_with(|| b.id.cmp(&a.id))
-    });
-    mine.truncate(limit);
-    let rows: Vec<Value> = mine
-        .iter()
-        .map(|s| {
-            let closed = s.closed_at != 0;
-            let busy = st.is_busy(&s.id);
-            let (state, label) = if closed {
-                (
-                    if s.closed_by == "done" { "done" } else { "cancelled" },
-                    if s.closed_by == "done" { "已验收" } else { "已取消" },
-                )
-            } else if busy {
-                ("working", "在跑")
-            } else {
-                ("idle", "闲着")
-            };
+    // 两次快照，各只拿一次锁
+    let busy = st.busy_set();
+    let queued = st.queued_set();
+
+    // 锁里只挑选 + 排序 + 算轻量字段（`Standing` 是 Copy，不分配）
+    let (working, waiting, picked): (usize, usize, Vec<Row>) = {
+        let store = st.chat.read().await;
+        let mut mine: Vec<&crate::agent::ChatSession> = store
+            .sessions
+            .iter()
+            .filter(|s| s.dispatched_by() == Some(router))
+            .filter(|s| q.all || !s.closed.is_closed())
+            .collect();
+        mine.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        mine.truncate(limit);
+        let mut working = 0usize;
+        let mut waiting = 0usize;
+        let mut rows = Vec::with_capacity(mine.len());
+        for s in mine {
+            let standing = s.standing(busy.contains(&s.id), queued.contains(&s.id));
+            if standing == crate::agent::Standing::Running {
+                working += 1;
+            }
+            if standing.needs_person() {
+                waiting += 1;
+            }
+            rows.push(Row {
+                id: s.id.clone(),
+                title: s.title.clone(),
+                conclusion: s.conclusion.clone(),
+                dispatches: s.dispatch_times().unwrap_or(0),
+                created_at: s.created_at,
+                updated_at: s.updated_at,
+                standing,
+            });
+        }
+        (working, waiting, rows)
+    };
+
+    // 锁外：clip（200 字符扫描 + 分配）和 json! 都在这里
+    let sessions: Vec<Value> = picked
+        .into_iter()
+        .map(|r| {
             json!({
-                "id": s.id,
-                "title": if s.title.is_empty() { "（无标题）" } else { &s.title },
-                "state": state,
-                "label": label,
-                // 「等人」= 停了但还没收尾。在跑的不用人管，收尾的更不用。
-                "needsPerson": !busy && !closed,
-                "open": !closed,
-                "busy": busy,
+                "id": r.id,
+                "title": if r.title.is_empty() { "（无标题）" } else { &r.title },
+                "state": r.standing.as_str(),
+                "label": r.standing.label(),
+                "needsPerson": r.standing.needs_person(),
+                "open": r.standing.open(),
+                "busy": r.standing == crate::agent::Standing::Running,
                 // 最新结论（`conclusion`，免疫历史压缩）。空 = 还没跑过回合。
-                "conclusion": crate::text::clip(&s.conclusion, 200),
-                "dispatches": s.dispatches,
-                "createdAt": s.created_at,
-                "updatedAt": s.updated_at,
+                "conclusion": crate::text::clip(&r.conclusion, 200),
+                "dispatches": r.dispatches,
+                "createdAt": r.created_at,
+                "updatedAt": r.updated_at,
             })
         })
         .collect();
-    let working = rows.iter().filter(|r| r["busy"] == json!(true)).count();
-    let waiting = rows.iter().filter(|r| r["needsPerson"] == json!(true)).count();
     Json(json!({
         "working": working,
         "waiting": waiting,
-        "sessions": rows,
+        "sessions": sessions,
     }))
     .into_response()
+}
+
+/// dispatched 列表里一行（锁里挑出来、锁外格式化）。
+struct Row {
+    id: String,
+    title: String,
+    conclusion: String,
+    dispatches: u32,
+    created_at: u64,
+    updated_at: u64,
+    standing: crate::agent::Standing,
 }
 
 #[derive(Deserialize)]

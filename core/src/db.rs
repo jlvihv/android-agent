@@ -259,7 +259,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     // ticket 那一层并进 session 之后加的五列（见 docs/16）。
     //
     // 老库的 `tickets` 表**不删**：里面有派过的活的 brief / 结果，那是历史，
-    // 删了就找不回来。它只是不再被读（`drop_tickets_table` 单独处理，见下）。
+    // 删了就找不回来。它**只读不写**：`migrate()` 从这里搬一次，之后没人再碰。
     for (col, ddl) in [
         ("brief", "ALTER TABLE sessions ADD COLUMN brief TEXT"),
         (
@@ -293,35 +293,68 @@ fn migrate(conn: &Connection) -> Result<()> {
     // 每条 ticket 本来就对应一条 worker 会话（`tickets.session_id`），
     // 把 brief / 结论 / 派工次数搬过去，会话就同时是那条活的载体了。
     //
+    // ## 为什么每个子查询都要 `ORDER BY ... LIMIT 1`
+    //
+    // 同一个会话**可能有多条老 ticket**（旧架构允许「再派一次」复用同一个
+    // `session_id`，每次 `ticket_create` 是新行）。没有 `ORDER BY` 时 SQLite 给的是
+    // 物理扫描到的第一行 —— 实测可能是最旧那条，而它往往还没收尾
+    // （`ended_at = 0`）。后果是：`brief`/`result`/`dispatches` 取了旧值，
+    // `closed_at`/`closed_by` 变成 0 / 空串 —— **已收尾那条的信息完全丢掉，且不报错**。
+    //
+    // 所以每条子查询都显式取**最新**那条：`created_at DESC, id DESC`（id 兜底，
+    // 同一毫秒建的两条也能定序）。
+    //
     // 幂等：只在 `brief IS NULL` 时写（搬过的不会再被覆盖）。
-    conn.execute_batch(
-        "UPDATE sessions SET
-           brief = COALESCE(brief, (SELECT t.brief FROM tickets t WHERE t.session_id = sessions.id)),
-           dispatched_by = COALESCE(dispatched_by,
-                                    (SELECT t.router_id FROM tickets t WHERE t.session_id = sessions.id)),
-           conclusion = CASE WHEN conclusion = '' THEN
-                             COALESCE((SELECT t.result FROM tickets t WHERE t.session_id = sessions.id), '')
-                        ELSE conclusion END,
-           dispatches = MAX(dispatches,
-                            COALESCE((SELECT t.dispatches FROM tickets t WHERE t.session_id = sessions.id), 0)),
-           closed_at = COALESCE(NULLIF(closed_at, 0),
-                                (SELECT t.ended_at FROM tickets t WHERE t.session_id = sessions.id), 0),
-           closed_by = CASE WHEN closed_by = '' THEN
-                            COALESCE((SELECT t.ended_by FROM tickets t WHERE t.session_id = sessions.id), '')
-                       ELSE closed_by END
-         WHERE brief IS NULL
-           AND EXISTS (SELECT 1 FROM tickets t WHERE t.session_id = sessions.id);",
-    )
-    .context("把老 tickets 搬进 sessions")
-    .or_else(|e| {
-        // 全新库里没有 tickets 表：`EXISTS` 那句会报 no such table。
-        // 那不是错误，只是没东西可搬。
-        if e.to_string().contains("no such table") {
-            Ok(())
-        } else {
-            Err(e)
+    let newest = "WHERE t.session_id = sessions.id
+                  ORDER BY t.created_at DESC, t.id DESC LIMIT 1";
+    let migrated = conn
+        .execute(&format!(
+            "UPDATE sessions SET
+               brief = COALESCE(brief, (SELECT t.brief FROM tickets t {newest})),
+               dispatched_by = COALESCE(dispatched_by,
+                                        (SELECT t.router_id FROM tickets t {newest})),
+               conclusion = CASE WHEN conclusion = '' THEN
+                                 COALESCE((SELECT t.result FROM tickets t {newest}), '')
+                            ELSE conclusion END,
+               dispatches = MAX(dispatches,
+                                COALESCE((SELECT t.dispatches FROM tickets t {newest}), 0)),
+               closed_at = COALESCE(NULLIF(closed_at, 0),
+                                    (SELECT t.ended_at FROM tickets t {newest}), 0),
+               closed_by = CASE WHEN closed_by = '' THEN
+                                COALESCE((SELECT t.ended_by FROM tickets t {newest}), '')
+                           ELSE closed_by END
+             WHERE brief IS NULL
+               AND EXISTS (SELECT 1 FROM tickets t WHERE t.session_id = sessions.id);"
+        ), [])
+        .context("把老 tickets 搬进 sessions")
+        .or_else(|e| {
+            // 全新库里没有 tickets 表：`EXISTS` 那句会报 no such table。
+            // 那不是错误，只是没东西可搬。
+            if e.to_string().contains("no such table") {
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        })?;
+
+    // 搬不成的那些：ticket 指向的会话已经不在了（会话被删过）。
+    // 这些**不报错**（数据本来就缺一半，救不回来），但数字要能在日志里看到 ——
+    // 否则「我明明派过那么多活，怎么一条都没搬过来」永远查不出原因。
+    if let Ok(orphans) = conn.query_row(
+        "SELECT COUNT(*) FROM tickets t
+          WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = t.session_id)",
+        [],
+        |r| r.get::<_, i64>(0),
+    ) {
+        if orphans > 0 {
+            tracing::warn!(
+                "{orphans} 条老工作项的载体会话已经不在了，搬不进 sessions（{migrated} 条会话搬成功）"
+            );
         }
-    })?;
+    }
+    if migrated > 0 {
+        tracing::info!("从老 tickets 搬了 {migrated} 条会话的派活记录");
+    }
     Ok(())
 }
 
@@ -409,14 +442,14 @@ struct Saved {
     title: String,
     provider_session: String,
     role: crate::agent::Role,
-    /// 下面几项必须进水线线：不认它们的话「只是验收了、没新消息」的改动
+    /// 下面几项必须进水线：不认它们的话「只是验收了、没新消息」的改动
     /// 永远落不了盘（`plan` 会认为这条会话没变）。
-    brief: Option<String>,
-    dispatched_by: Option<String>,
+    ///
+    /// 用内存里的类型（`Option<Dispatch>` / `Closed`）而不是拆开的列：
+    /// 水位线比的是「会话变没变」，那就该比会话自己的那个值。
+    dispatch: Option<crate::agent::Dispatch>,
     conclusion: String,
-    dispatches: u32,
-    closed_at: u64,
-    closed_by: String,
+    closed: crate::agent::Closed,
 }
 
 impl Saved {
@@ -428,12 +461,9 @@ impl Saved {
             title: s.title.clone(),
             provider_session: s.provider_session.clone(),
             role: s.role,
-            brief: s.brief.clone(),
-            dispatched_by: s.dispatched_by.clone(),
+            dispatch: s.dispatch.clone(),
             conclusion: s.conclusion.clone(),
-            dispatches: s.dispatches,
-            closed_at: s.closed_at,
-            closed_by: s.closed_by.clone(),
+            closed: s.closed,
         }
     }
 }
@@ -468,12 +498,9 @@ struct PlannedSession {
     updated_at: u64,
     provider_session: String,
     role: crate::agent::Role,
-    brief: Option<String>,
-    dispatched_by: Option<String>,
+    dispatch: Option<crate::agent::Dispatch>,
     conclusion: String,
-    dispatches: u32,
-    closed_at: u64,
-    closed_by: String,
+    closed: crate::agent::Closed,
     /// 消息不在内存里的会话只更新会话头：`None`
     messages: Option<PlannedMessages>,
     /// 写成之后的水位线
@@ -598,6 +625,20 @@ impl Db {
             for row in rows {
                 let (id, title, created_at, updated_at, provider_session, role, len, users,
                      brief, dispatched_by, conclusion, dispatches, closed_at, closed_by) = row?;
+                // **列 → 类型的唯一转换点**（写入方向见 `Saved::of` / INSERT 那段）。
+                //
+                // `tickets` 时代允许「有 brief 没 by」这种半份数据（迁移会产出它）。
+                // 这里把「有 by 才算派出去的」当判据：`by` 空就没法回执，那这份
+                // dispatch 记录毫无用处，整份丢掉 —— 好过留一个半份对象在后面
+                // 每个权限过滤上静默消失。
+                let dispatch = match dispatched_by.filter(|b| !b.is_empty()) {
+                    Some(by) => Some(crate::agent::Dispatch {
+                        by,
+                        brief: brief.unwrap_or_default(),
+                        times: dispatches.max(0) as u32,
+                    }),
+                    None => None,
+                };
                 let s = ChatSession {
                     id,
                     title,
@@ -606,12 +647,9 @@ impl Db {
                     role: crate::agent::Role::from_db(&role),
                     messages: Vec::new(),
                     provider_session,
-                    brief,
-                    dispatched_by,
+                    dispatch,
                     conclusion,
-                    dispatches: dispatches.max(0) as u32,
-                    closed_at: closed_at.max(0) as u64,
-                    closed_by,
+                    closed: crate::agent::Closed::from_db(closed_at.max(0) as u64, &closed_by),
                     stub: Some(Stub {
                         len: len.max(0) as usize,
                         users: users.max(0) as usize,
@@ -808,12 +846,9 @@ impl Db {
                 updated_at: s.updated_at,
                 provider_session: s.provider_session.clone(),
                 role: s.role,
-                brief: s.brief.clone(),
-                dispatched_by: s.dispatched_by.clone(),
+                dispatch: s.dispatch.clone(),
                 conclusion: s.conclusion.clone(),
-                dispatches: s.dispatches,
-                closed_at: s.closed_at,
-                closed_by: s.closed_by.clone(),
+                closed: s.closed,
                 messages,
                 saved: p.saved,
             });
@@ -867,12 +902,13 @@ impl Db {
                     s.updated_at as i64,
                     s.provider_session,
                     s.role.as_str(),
-                    s.brief,
-                    s.dispatched_by,
+                    // **类型 → 列的唯一转换点**（读方向见 `load` 里那个 `from_db`）
+                    s.dispatch.as_ref().map(|d| d.brief.as_str()),
+                    s.dispatch.as_ref().map(|d| d.by.as_str()),
                     s.conclusion,
-                    s.dispatches as i64,
-                    s.closed_at as i64,
-                    s.closed_by
+                    s.dispatch.as_ref().map_or(0, |d| d.times) as i64,
+                    s.closed.at().unwrap_or(0) as i64,
+                    s.closed.to_db().1,
                 ],
             )?;
             let Some(m) = &s.messages else { continue };
@@ -1482,6 +1518,190 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造一个「ticket 时代的」库：`sessions` 只有老列（没有那六个新列），
+    /// 外加一张有数据的 `tickets` 表。然后跑 `migrate()`，看它搬成什么样。
+    ///
+    /// 这是 `migrate()` 唯一的测试入口 —— 之前 6 个 db 测试没有一个覆盖它，
+    /// 所以「同一会话两条 ticket 时搬错了哪条」这种 bug 一直没被发现。
+    fn legacy_db(sessions: &[(&str, &str)], tickets: &[(&str, &str, &str, i64, &str)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        // 老 schema：sessions 没有 brief / dispatched_by / conclusion /
+        // dispatches / closed_at / closed_by
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+               id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL, provider_session TEXT NOT NULL
+             );
+             CREATE TABLE tickets (
+               id TEXT PRIMARY KEY, title TEXT NOT NULL, brief TEXT NOT NULL,
+               session_id TEXT NOT NULL, router_id TEXT NOT NULL, stage TEXT NOT NULL,
+               result TEXT NOT NULL DEFAULT '', report TEXT NOT NULL DEFAULT '',
+               ended_at INTEGER NOT NULL DEFAULT 0, ended_by TEXT NOT NULL DEFAULT '',
+               dispatches INTEGER NOT NULL DEFAULT 0,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        for (id, title) in sessions {
+            conn.execute(
+                "INSERT INTO sessions(id, title, created_at, updated_at, provider_session)
+                 VALUES(?1, ?2, 1, 1, 'p')",
+                params![id, title],
+            )
+            .unwrap();
+        }
+        // (id, session_id, brief, created_at, ended_by) —— ended_at 从 ended_by 推：
+        // 空串 = 还没收尾（0），否则给一个时刻
+        for (id, sid, brief, created_at, ended_by) in tickets {
+            let ended_at = if ended_by.is_empty() { 0 } else { 900 };
+            conn.execute(
+                "INSERT INTO tickets(id, title, brief, session_id, router_id, stage, result,
+                                     ended_at, ended_by, dispatches, created_at, updated_at)
+                 VALUES(?1, 't', ?2, ?3, 'router-1', 'waiting_review', ?4, ?5, ?6, 1, ?7, ?7)",
+                params![
+                    id,
+                    brief,
+                    sid,
+                    format!("结果-{id}"),
+                    ended_at,
+                    ended_by,
+                    created_at
+                ],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// 跑完 migrate 之后，某个 session 的六个新列长什么样。
+    fn migrated_row(conn: &Connection, sid: &str) -> (String, String, String, i64, i64, String) {
+        conn.query_row(
+            "SELECT COALESCE(brief,''), COALESCE(dispatched_by,''), conclusion,
+                    dispatches, closed_at, closed_by
+             FROM sessions WHERE id = ?1",
+            [sid],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    /// **同一会话两条 ticket：搬最新那条，不是最旧那条。**
+    ///
+    /// 这是审查实测出来的真 bug：没有 `ORDER BY` 时 SQLite 给物理扫描到的第一行，
+    /// 可能是最旧、且还没收尾（`ended_at = 0`）的那条 —— 于是
+    /// `brief` / `result` / `dispatches` 取旧值，`closed_at` / `closed_by` 变 0 / 空，
+    /// **已收尾那条的信息完全丢掉**。
+    #[test]
+    fn migration_takes_the_newest_ticket_not_the_first_scanned() {
+        let conn = legacy_db(
+            &[("s1", "干活的那条")],
+            &[
+                // 旧的、还没收尾（created_at=100）
+                ("t-old", "s1", "旧的要求", 100, ""),
+                // 新的、已验收（created_at=200）
+                ("t-new", "s1", "新的要求", 200, "done"),
+            ],
+        );
+        migrate(&conn).unwrap();
+
+        let (brief, by, conclusion, dispatches, closed_at, closed_by) = migrated_row(&conn, "s1");
+        assert_eq!(brief, "新的要求", "要搬最新那条的 brief");
+        assert_eq!(by, "router-1");
+        assert_eq!(conclusion, "结果-t-new", "结论也要最新那条的");
+        assert_eq!(dispatches, 1);
+        assert_eq!(closed_at, 900, "**已收尾那条的 closed_at 不能丢**");
+        assert_eq!(closed_by, "done", "**closed_by 不能变成空串**");
+    }
+
+    /// 反过来放（新的先插、旧的后插）也要取新的 —— 证明靠的是 `created_at`
+    /// 而不是插入顺序。
+    #[test]
+    fn migration_orders_by_created_at_not_insertion_order() {
+        let conn = legacy_db(
+            &[("s1", "t")],
+            &[
+                // 新的先插进去（created_at=200）
+                ("t-new", "s1", "新的", 200, "cancelled"),
+                // 旧的后插进去（created_at=100）
+                ("t-old", "s1", "旧的", 100, ""),
+            ],
+        );
+        migrate(&conn).unwrap();
+        let (brief, _, _, _, closed_at, closed_by) = migrated_row(&conn, "s1");
+        assert_eq!(brief, "新的", "按 created_at 取最新，不看插入顺序");
+        assert_eq!(closed_by, "cancelled");
+        assert_eq!(closed_at, 900);
+    }
+
+    /// **幂等**：跑两遍 migrate，第二次一个字节都不改。
+    #[test]
+    fn migration_is_idempotent() {
+        let conn = legacy_db(
+            &[("s1", "t")],
+            &[("t1", "s1", "要求", 100, "done")],
+        );
+        migrate(&conn).unwrap();
+        let first = migrated_row(&conn, "s1");
+
+        // 手动改掉搬进来的值，再跑一遍：**不该被覆盖回去**（WHERE brief IS NULL）
+        conn.execute("UPDATE sessions SET brief = '人工改过' WHERE id = 's1'", [])
+            .unwrap();
+        migrate(&conn).unwrap();
+        let (brief, _, _, _, _, _) = migrated_row(&conn, "s1");
+        assert_eq!(brief, "人工改过", "搬过的行不该被二次迁移覆盖");
+
+        // 而没改过的行跑第二遍仍是原值
+        let conn2 = legacy_db(&[("s1", "t")], &[("t1", "s1", "要求", 100, "done")]);
+        migrate(&conn2).unwrap();
+        assert_eq!(migrated_row(&conn2, "s1"), first);
+        migrate(&conn2).unwrap();
+        assert_eq!(migrated_row(&conn2, "s1"), first, "第二次跑必须不变");
+    }
+
+    /// ticket 指向的会话不存在：**不 panic**，也不写脏数据。
+    /// （「没搬成」的计数在 `migrate` 里 `tracing::warn!` 出来，测试只验不炸。）
+    #[test]
+    fn migration_survives_orphan_tickets() {
+        let conn = legacy_db(
+            &[("s1", "还在的会话")],
+            &[
+                ("t1", "s1", "正常", 100, ""),
+                // 这条的载体会话不在了
+                ("t-orphan", "gone", "孤儿", 200, "done"),
+            ],
+        );
+        migrate(&conn).unwrap();
+
+        let (brief, _, _, _, _, _) = migrated_row(&conn, "s1");
+        assert_eq!(brief, "正常", "正常那条照样搬");
+        // 孤儿那条没有对应的 sessions 行，所以什么都没写
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions WHERE id = 'gone'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "不该为一个孤儿 ticket 凭空建会话");
+    }
+
+    /// 全新库里没有 `tickets` 表：migrate 不能报错。
+    #[test]
+    fn migration_on_a_fresh_db_without_tickets_table_is_a_noop() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).expect("全新库不该因为「没有 tickets 表」而失败");
+        // 再跑一遍（幂等）
+        migrate(&conn).expect("第二遍也不该失败");
+    }
 
     /// 增量落盘：只改了标题（重命名不动 updated_at）也得写进去；
     /// 删掉的会话要从库里清掉；清会话不能把 meta 里的配置一起清了。

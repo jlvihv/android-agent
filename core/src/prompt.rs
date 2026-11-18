@@ -278,7 +278,7 @@ pub fn router_description() -> &'static str {
      子会话干完一轮，会把它的结论推给你，形状是：\n\
      \n\
      ```\n\
-     <worker_report session=\"…\" closed=\"true|false\">\n\
+     <worker_report session=\"…\" failed=\"true|false\">\n\
      ……它说的原话……\n\
      </worker_report>\n\
      ```\n\

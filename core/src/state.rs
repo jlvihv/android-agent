@@ -1335,6 +1335,31 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// 正在跑的会话 id 快照（**只拿一次 `turns` 锁**）。
+    ///
+    /// 列一堆会话要判「谁在跑」时用它：以前是在循环里对每条会话各调一次
+    /// `is_busy()`，而 `turns` 是所有回合起止都要拿的锁 —— 会话一多就会顶到
+    /// `begin_turn` / `end_turn` 上。
+    pub fn busy_set(&self) -> std::collections::HashSet<String> {
+        self.turns
+            .lock()
+            .map(|g| g.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 有排队消息的会话 id 快照（**只拿一次 `queued` 锁**）。同 [`Self::busy_set`]。
+    pub fn queued_set(&self) -> std::collections::HashSet<String> {
+        self.queued
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter(|(_, q)| !q.is_empty())
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// 有没有回合在跑。
     ///
     /// 只问「有没有」的地方走它，不要 `busy_sessions().is_empty()` —— 那会把每个
@@ -1412,47 +1437,59 @@ impl AppState {
         g.entry(sid.to_string()).or_insert(u).clone()
     }
 
-    // ---- 会话上的「被派活」记录（见 `agent::ChatSession` 的 brief 那一段） ----
+    // ---- 会话上的「被派活」记录（见 `agent::ChatSession` 的 `dispatch` 那一段） ----
 
-    /// 这条会话是被哪个 Router 派出去的？`None` = 用户自己开的。
+    /// 这条会话是被哪个 Router 派出去的？`None` = 用户自己开的 / 数据不全。
     ///
     /// 同步读内存里的会话表（`ChatSession` 在 `chat` 锁里），不查库。
     pub fn dispatched_by(&self, sid: &str) -> Option<String> {
         let store = self.chat.try_read().ok()?;
-        store.get(sid)?.dispatched_by.clone()
+        Some(store.get(sid)?.dispatched_by()?.to_string())
     }
 
     /// 这条会话的活被划掉了吗（验收过 / 不要了）。
     pub fn is_closed(&self, sid: &str) -> bool {
+        self.closed_of(sid).is_closed()
+    }
+
+    /// 收尾状态（`Open` / `Done{at}` / `Cancelled{at}`）。
+    pub fn closed_of(&self, sid: &str) -> crate::agent::Closed {
         self.chat
             .try_read()
             .ok()
-            .and_then(|s| s.get(sid).map(|x| x.closed_at != 0))
-            .unwrap_or(false)
+            .and_then(|s| s.get(sid).map(|x| x.closed))
+            .unwrap_or_default()
     }
 
     /// 把一件活收尾（验收过 / 不要了）。
     ///
-    /// 只写两个事实：`closed_at`（什么时候）、`closed_by`（怎么收的）。
+    /// 只写一个事实：收尾方式 + 时刻（收成 `Closed` 枚举，写不出非法组合）。
     /// **不写任何「状态」** —— 「在不在跑」永远看 `turns`，「成没成」看历史。
     pub fn close_session(&self, sid: &str, by: &str) {
+        let now = crate::agent::now_ms();
+        let closed = if by == "cancelled" {
+            crate::agent::Closed::Cancelled { at: now }
+        } else {
+            crate::agent::Closed::Done { at: now }
+        };
         if let Ok(mut store) = self.chat.try_write() {
             if let Some(s) = store.get_mut(sid) {
-                s.closed_at = crate::agent::now_ms();
-                s.closed_by = by.to_string();
-                s.updated_at = crate::agent::now_ms();
+                s.closed = closed;
+                s.updated_at = now;
             }
         }
         self.mark_sessions_dirty();
     }
 
-    /// 再派一次之前把「已收尾」清掉（不然回执会被 `is_closed` 挡住）。
+    /// 再派一次之前把「已收尾」清掉（不然回执会被 `is_closed` 挡住），
+    /// 并记一次派工。
     pub fn reopen_session(&self, sid: &str) {
         if let Ok(mut store) = self.chat.try_write() {
             if let Some(s) = store.get_mut(sid) {
-                s.closed_at = 0;
-                s.closed_by.clear();
-                s.dispatches = s.dispatches.saturating_add(1);
+                s.closed = crate::agent::Closed::Open;
+                if let Some(d) = &mut s.dispatch {
+                    d.times = d.times.saturating_add(1);
+                }
                 s.updated_at = crate::agent::now_ms();
             }
         }
@@ -1462,17 +1499,16 @@ impl AppState {
     /// 补充要求：追加到 `brief` 末尾，**不覆盖原文**。
     ///
     /// 当初的要求是验收合同 —— 直接覆盖就没人记得原话是什么了。
+    ///
+    /// **只有派出去的会话才有 brief**：不是派出去的会话上 calling 它什么都不做
+    /// （不去凭空造一份 `Dispatch` —— 那需要一个 `by`，而我们没有）。
     pub fn append_brief(&self, sid: &str, addition: &str) {
         if let Ok(mut store) = self.chat.try_write() {
             if let Some(s) = store.get_mut(sid) {
-                match &mut s.brief {
-                    Some(b) => {
-                        b.push_str("\n\n---\n\n（补充要求）\n");
-                        b.push_str(addition);
-                    }
-                    None => s.brief = Some(addition.to_string()),
+                if let Some(d) = &mut s.dispatch {
+                    d.append(addition);
+                    s.updated_at = crate::agent::now_ms();
                 }
-                s.updated_at = crate::agent::now_ms();
             }
         }
         self.mark_sessions_dirty();
