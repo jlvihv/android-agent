@@ -36,6 +36,7 @@ tick(10s) ──▶ 认领到点的 ──▶ 推进水位线（落库）──�
 | `prompt` | 用户当初写的那句话，一字不改 |
 | `every_secs` 或 `cron`（**恰好一个非空**） | 用户的意图 |
 | `created_at` | 固定间隔那个节奏的**锚**（`第 k 次 = created_at + k×周期`） |
+| `anchor_at` | **这一版节奏的起点**（第 k 次 = `anchor_at + k×周期`）。不是「创建时刻」—— 改节奏会重置它 |
 | `handled_through` | **水位线**：截止这一刻的触发点都处理过了 |
 | `paused_at` | 人的决定，推不出来 |
 
@@ -57,6 +58,52 @@ tick(10s) ──▶ 认领到点的 ──▶ 推进水位线（落库）──�
 唯一的推进点是 `Schedules::claim_due`（在锁里推进，本身就是幂等栅栏）。
 
 ---
+
+## 2.5 编辑：改内容不动时间，改节奏从此刻重来
+
+一条任务可以被改（`Schedules::edit`）。两条规则，**一条都不含糊**：
+
+| 改了什么 | `anchor_at` | `handled_through` | 下一次 |
+| --- | --- | --- | --- |
+| 只改 `prompt` | 不动 | **不动** | 不变 |
+| 改节奏（含 Every↔Cron 互转） | **重置成 now** | **推到 now** | 按新节奏从 now 起算 |
+
+### 「改完会不会立刻响一次」—— 不会
+
+这是最容易搞错的一处。改节奏时把 `anchor_at` 和 `handled_through` **一起**推到
+`now`，于是 `due_at` 在 `now` 这一刻算出来的最近触发点必然 `<= now == handled_through`，
+返回 `None`。有测试钉着（`changing_the_rhythm_restarts_from_now_and_never_fires_immediately`），
+变异验证过两条（不推水位线 → 立刻响；不重置锚点 → 固定间隔落在旧相位上）。
+
+### 为什么改节奏要重置锚点
+
+不重置的话新周期套在**旧锚点的相位**上：一条「每 30 分钟」（锚点 10:00）改成
+「每 45 分钟」，下一次会落在 `10:00 + k×45min` 里最近的过去那个，可能 10 分钟后就响，
+然后才按 45 分钟走。用户说的「从现在起每 45 分钟」不是那个意思。
+
+同一个周期**重新填一遍**不算改（`if t.every != e`）：否则刚好在触发点上提交会把
+那一次跳过去。
+
+### 编辑不碰的
+
+- `id`（编辑不换身份）
+- `paused_at` —— **改一条停用中的任务，改完还是停用**。编辑不是「恢复」
+- `anchor_at`（只改文字时）—— 8:59 改个错别字，9:00 该照常响
+
+### 校验只有一份
+
+`create` 和 `edit` 共用 `check_prompt` / `make_recurrence` 两个纯函数。测试
+`edit_validates_exactly_like_create` 逐条比对**两条入口的报错文字是否逐字相同**。
+
+（唯一的例外是「什么都没给」：`create` 说「要给周期」，`edit` 说「要给要改的东西」——
+语境不同，这时候说同一句话反而是错的。）
+
+### 表约束因此改了一条
+
+`CHECK (paused_at >= anchor_at)` **删掉了**。它的原意是「停用发生在它存在之后」，
+而 `anchor_at` 现在会被 edit 往后挪 —— 一条昨天停用、今天改节奏的任务会变成
+「非法数据」（实测直接 500）。锚点不再是创建时刻，那条不变式就没有载体了。
+`CHECK (handled_through >= anchor_at)` 留着（edit 同时把两者设成 now，恒成立）。
 
 ## 3. 防风暴
 
@@ -239,9 +286,9 @@ token）。**宁可少叫一次。**
 - **HTTP**：`GET /api/schedules`、`POST /api/schedules`、
   `POST /api/schedules/paused`、`POST /api/schedules/delete`
 - **设置页**：`web/src/components/ScheduleSection.svelte`
-- **Router 的工具（2 个）**：`schedule_task`（建）、`schedules`（list/pause/resume/delete）
+- **Router 的工具（2 个）**：`schedule_task`（建）、`schedules`（list/edit/pause/resume/delete）
 
-三条入口都只是调 `schedule::create` / `set_state` / `rows` —— **校验只有一份**，
+四条入口都只是调 `schedule::create` / `edit` / `set_state` / `rows` —— **校验只有一份**，
 所以「工具能建、HTTP 不能」这种不一致不可能发生。
 
 **为什么工具只加 2 个而不是 3 个**：`schedule_task` 是高频路径（用户说「每小时提醒我」），

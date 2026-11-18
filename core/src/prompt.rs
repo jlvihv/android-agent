@@ -472,10 +472,16 @@ pub fn schedule_task_schema() -> Value {
 
 /// `schedules`（多动作）的描述。
 pub fn schedules_description() -> String {
-    "看 / 停 / 恢复 / 删定时任务。`action` 必填：\n\
+    "管理定时任务。`action` 必填：\n\
      - `list`：所有定时任务（含下次触发时间）\n\
+     - `edit`：改一条。**只给要改的那几样，没给的保持原样** ——\n\
+     改内容给 `prompt`；改时间给 `every_minutes` 或 `cron`（两者二选一，\n\
+     可以在「每 N 分钟」和 cron 之间互转）。改时间 = **从现在起按新节奏重来**，\n\
+     不会立刻响一次。\n\
      - `pause` / `resume` / `delete`：要对哪一条就带 `schedule_id`（list 里反引号里的串）\n\
-     用户说「别再提醒了」就是 `pause`（能恢复）；说「不要了」是 `delete`。"
+     用户说「别再提醒了」就是 `pause`（能恢复）；说「不要了」是 `delete`；\n\
+     说「改成六点」是 `edit` + `cron`；说「改成每两小时」是 `edit` + `every_minutes`。\n\
+     **改内容和改时间都能一次只改一样** —— 用户只提了时间就别顺手改那句话。"
         .to_string()
 }
 
@@ -486,11 +492,23 @@ pub fn schedules_schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "description": "list | pause | resume | delete"
+                "description": "list | edit | pause | resume | delete"
             },
             "schedule_id": {
                 "type": "string",
-                "description": "pause / resume / delete 时要动的那一条（list 给的反引号里的串）"
+                "description": "edit / pause / resume / delete 时要动的那一条（list 给的反引号里的串）"
+            },
+            "prompt": {
+                "type": "string",
+                "description": "（只有 edit 用）到点要投给你的新那句话。不给 = 那句话不变"
+            },
+            "every_minutes": {
+                "type": "integer",
+                "description": "（只有 edit 用）新的固定间隔，每 N 分钟。不给 = 节奏不变。和 cron 二选一"
+            },
+            "cron": {
+                "type": "string",
+                "description": "（只有 edit 用）新的 cron 表达式（5 或 6 段）。不给 = 节奏不变。和 every_minutes 二选一"
             }
         },
         "required": ["action"]

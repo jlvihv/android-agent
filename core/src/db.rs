@@ -240,7 +240,7 @@ CREATE TABLE IF NOT EXISTS http_cache (
 
 -- 定时任务：到点往 Router 的队列里投一句话，把它叫醒（见 schedule.rs）。
 --
--- **没有 `next_at` 列**。那是算出来的（`created_at + k*周期`，或者 cron 从水位线往后
+-- **没有 `next_at` 列**。那是算出来的（`anchor_at + k*周期`，或者 cron 从水位线往后
 -- 找一次），存一份就是给「没人负责推进它」留后门 —— 上一版 ticket 的 `Stage::Done`
 -- 零调用点就是这么烂掉的（见 docs/16）。
 --
@@ -263,13 +263,23 @@ CREATE TABLE IF NOT EXISTS schedules (
   every_secs      INTEGER CHECK (every_secs IS NULL OR (every_secs >= 60 AND every_secs <= 2592000)),
   -- cron 表达式原文（5 或 6 字段）。NULL = 这条是固定间隔
   cron            TEXT,
-  created_at      INTEGER NOT NULL,
+  -- **这一版节奏的起点**，不是「创建时刻」：改节奏时会被重置成那一刻（见 schedule.rs
+  -- 的 `Schedules::edit`）。第 k 次 = `anchor_at + k*周期`。
+  anchor_at       INTEGER NOT NULL,
   -- 截止此刻的触发点都处理过了（投出去，或按策略放弃）。不补跑，见 schedule.rs
   handled_through INTEGER NOT NULL,
   -- NULL = 启用中。用 NULL 而不是 0 当哨兵（和 usage.cached / machines.relay_addr 一致）
   paused_at       INTEGER,
-  CHECK (handled_through >= created_at),
-  CHECK (paused_at IS NULL OR paused_at >= created_at),
+  CHECK (handled_through >= anchor_at),
+  -- **没有 `paused_at >= anchor_at` 这条**（以前有）。它的原意是「停用发生在它存在
+  -- 之后」，而 anchor_at 现在**可以被 `edit` 往后挪**（改节奏 = 开一版新节奏，见
+  -- schedule.rs）：一条昨天停用、今天改节奏的任务，`anchor_at` 是今天、`paused_at`
+  -- 是昨天 —— 合法数据，却会被那条 CHECK 拒掉（实测：编辑停用中的任务直接 500）。
+  -- 「停用时刻 >= 建的时刻」这件事不再由 anchor_at 表达（它已经不是创建时刻，
+  -- 见下面那行的注释），所以这条不变式没有载体，就不该留着半条。
+  --
+  -- `handled_through >= anchor_at` **留着**：水位线不能早于「当前这版节奏的起点」，
+  -- 而 edit 是同时把两者设成 now 的，所以它恒成立。
   -- 「两种周期，恰好一种」—— 两个都空 / 两个都有 都在这里被挡掉
   CHECK ((every_secs IS NULL) <> (cron IS NULL))
 );
@@ -1319,14 +1329,14 @@ impl Db {
             String,
             Option<i64>,    // every_secs
             Option<String>, // cron
-            i64,            // created_at
+            i64,            // anchor_at
             i64,            // handled_through
             Option<i64>,    // paused_at
         );
         let rows: Vec<Row> = self.with(|c| {
             let mut st = c.prepare(
-                "SELECT id, prompt, every_secs, cron, created_at, handled_through, paused_at
-                   FROM schedules ORDER BY created_at, id",
+                "SELECT id, prompt, every_secs, cron, anchor_at, handled_through, paused_at
+                   FROM schedules ORDER BY anchor_at, id",
             )?;
             let it = st.query_map([], |r| {
                 Ok((
@@ -1343,7 +1353,7 @@ impl Db {
         })?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, prompt, every_secs, cron, created_at, handled_through, paused_at) in rows {
+        for (id, prompt, every_secs, cron, anchor_at, handled_through, paused_at) in rows {
             // 「恰好一列非空」由建表时的 CHECK 守着。这里再兜一层：周期看不懂的那行
             // **跳过**（一条脏数据不该让**所有**闹钟都不响）——但要 warn，别静默。
             let every: Option<Recurrence> = match (every_secs, cron) {
@@ -1364,7 +1374,7 @@ impl Db {
                 id,
                 prompt,
                 every,
-                created_at: created_at.max(0) as u64,
+                anchor_at: anchor_at.max(0) as u64,
                 handled_through: handled_through.max(0) as u64,
                 paused_at: paused_at.map(|v| v.max(0) as u64),
             });
@@ -1382,13 +1392,17 @@ impl Db {
         };
         self.with(|c| {
             c.execute(
-                "INSERT INTO schedules(id, prompt, every_secs, cron, created_at, handled_through,
+                "INSERT INTO schedules(id, prompt, every_secs, cron, anchor_at, handled_through,
                                       paused_at)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                    prompt = excluded.prompt,
                    every_secs = excluded.every_secs,
                    cron = excluded.cron,
+                   -- **anchor_at 必须在这里**：改节奏会重置它（见 schedule.rs 的
+                   -- `Schedules::edit`）。漏了的话内存里是新的、库里是旧的 ——
+                   -- 重启之后下一次触发时间会跳回旧相位（有测试钉着）。
+                   anchor_at = excluded.anchor_at,
                    handled_through = excluded.handled_through,
                    paused_at = excluded.paused_at",
                 params![
@@ -1396,7 +1410,7 @@ impl Db {
                     t.prompt,
                     every_secs,
                     cron,
-                    t.created_at as i64,
+                    t.anchor_at as i64,
                     t.handled_through as i64,
                     t.paused_at.map(|v| v as i64),
                 ],

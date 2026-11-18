@@ -99,6 +99,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 和 Router 的 `schedule_task` / `schedules` 两个工具是同一组底层函数
         // （`schedule::create` / `set_state` / `rows`）—— 两条入口，一套校验。
         .route("/api/schedules", get(list_schedules).post(create_schedule))
+        .route("/api/schedules/edit", post(edit_schedule))
         .route("/api/schedules/paused", post(set_schedule_paused))
         .route("/api/schedules/delete", post(delete_schedule))
         // 某个 Router 派出去的会话（带每条的 state / label）。
@@ -3349,9 +3350,9 @@ where
 // ---------------------------------------------------------------------------
 // 定时任务（`GET/POST /api/schedules*`，见 schedule.rs）
 //
-// 三个 handler 都只是把 JSON 摊开交给 `schedule` 模块的那几个函数：**校验只有一份**
-// （`schedule::create` / `schedule::set_state`），所以「工具能建、HTTP 不能」这种
-// 不一致不可能发生。
+// 四个 handler 都只是把 JSON 摊开交给 `schedule` 模块的那几个函数：**校验只有一份**
+// （`schedule::create` / `schedule::edit` / `schedule::set_state`），所以「工具能改、
+// HTTP 不能」这种不一致不可能发生。
 // ---------------------------------------------------------------------------
 
 /// 全部定时任务。`nextAt` 是**现算的**（服务端算，前端不自己推 —— 两处算法迟早走偏，
@@ -3379,6 +3380,17 @@ struct CreateScheduleBody {
     cron: Option<String>,
 }
 
+/// 回一条任务的最新样子（建完 / 改完都用它）。
+///
+/// 从 `rows()` 里挑：**和列表接口同一份数据**，前端不用为「刚改完那一条」再拼一遍。
+fn schedule_row(st: &AppState, id: &str) -> Value {
+    let now = crate::agent::now_ms();
+    crate::schedule::rows(st, now, crate::schedule::utc_offset_secs(now))
+        .into_iter()
+        .find(|v| v["id"] == json!(id))
+        .unwrap_or(Value::Null)
+}
+
 /// `POST /api/schedules` → 建一条。
 async fn create_schedule(
     State(st): State<Arc<AppState>>,
@@ -3388,13 +3400,43 @@ async fn create_schedule(
         Ok(t) => {
             // 建出来先保证有个 Router 可投（`ensure` 本来就「第一次真要用时才建」）
             let _ = crate::router::ensure(&st).await;
-            let now = crate::agent::now_ms();
-            Json(json!({ "schedule": crate::schedule::rows(&st, now, crate::schedule::utc_offset_secs(now))
-                .into_iter()
-                .find(|v| v["id"] == json!(t.id))
-                .unwrap_or(Value::Null) }))
-            .into_response()
+            Json(json!({ "schedule": schedule_row(&st, &t.id) })).into_response()
         }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct EditScheduleBody {
+    id: String,
+    /// 新的那句话。不给 = 那句话不变
+    #[serde(default)]
+    prompt: Option<String>,
+    /// 新的固定间隔（每 N 分钟）。不给 = 节奏不变
+    #[serde(default)]
+    every_minutes: Option<u64>,
+    /// 新的 cron 表达式。不给 = 节奏不变
+    #[serde(default)]
+    cron: Option<String>,
+}
+
+/// `POST /api/schedules/edit` → 改一条（内容 / 节奏，各改各的）。
+///
+/// 「给没给」按**键在不在**判断（`Option`）：`{"id":"x"}` 是「什么都没改」→ 400，
+/// 而 `{"id":"x","every_minutes":0}` 是「改成 0 分钟」→ 也是 400 但理由不同
+/// （后者走 `Period` 的范围校验）。
+async fn edit_schedule(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<EditScheduleBody>,
+) -> Response {
+    match crate::schedule::edit(
+        &st,
+        &body.id,
+        body.prompt.as_deref(),
+        body.every_minutes,
+        body.cron.as_deref(),
+    ) {
+        Ok(t) => Json(json!({ "schedule": schedule_row(&st, &t.id) })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
 }
@@ -4396,6 +4438,84 @@ mod tests {
             .build()
             .unwrap();
         (format!("http://{addr}"), client)
+    }
+
+    /// `POST /api/schedules/edit` 走通了（HTTP 那一层，不只是 `schedule::edit`）。
+    ///
+    /// 盯三件事：只给 `prompt` 就不动节奏、只给 `every_minutes` 就不动内容、
+    /// 回包里带的是**改完之后**那一条（前端拿它直接替换，不用再拉一遍列表）。
+    #[tokio::test]
+    async fn the_edit_endpoint_changes_only_what_was_posted() {
+        let st = crate::state::AppState::new();
+        let dir = std::env::temp_dir().join(format!("agent-edit-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // **先开库再设 token**：`open_db` 会把库里那把 token 读进来（`load_auth`），
+        // 反过来写的话 `set_token` 会被它覆盖成一把随机串，下面全部 401。
+        st.open_db(&dir);
+        st.set_token(Some("s3cret".into()));
+        let (base, c) = serve(st.clone()).await;
+
+        let resp = c
+            .post(format!("{base}/api/schedules"))
+            .header("x-agent-token", "s3cret")
+            .json(&serde_json::json!({ "prompt": "原来那句话", "every_minutes": 30 }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status.as_u16(), 200, "建一条：{text}");
+        let created: serde_json::Value = serde_json::from_str(&text).expect("是 JSON");
+        let id = created["schedule"]["id"]
+            .as_str()
+            .expect("有 id")
+            .to_string();
+
+        // 只改文字
+        let resp = c
+            .post(format!("{base}/api/schedules/edit"))
+            .header("x-agent-token", "s3cret")
+            .json(&serde_json::json!({ "id": id, "prompt": "新的话" }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status.as_u16(), 200, "只改文字：{text}");
+        let r: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(r["schedule"]["prompt"], json!("新的话"));
+        assert_eq!(r["schedule"]["everyMinutes"], json!(30), "没给周期就不许动");
+
+        // 只改节奏
+        let resp = c
+            .post(format!("{base}/api/schedules/edit"))
+            .header("x-agent-token", "s3cret")
+            .json(&serde_json::json!({ "id": id, "cron": "0 9 * * *" }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status.as_u16(), 200, "只改节奏：{text}");
+        let r: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(r["schedule"]["cron"], json!("0 9 * * *"));
+        assert_eq!(r["schedule"]["everyMinutes"], json!(null));
+        assert_eq!(
+            r["schedule"]["prompt"],
+            json!("新的话"),
+            "没给 prompt 就不许动"
+        );
+
+        // 什么都没给：400 + 一句人话
+        let resp = c
+            .post(format!("{base}/api/schedules/edit"))
+            .header("x-agent-token", "s3cret")
+            .json(&serde_json::json!({ "id": id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400);
+        assert!(resp.text().await.unwrap().contains("要给要改的东西"));
     }
 
     /// 手机上别的 App 能连 127.0.0.1：没凭据的请求一律挡在 `/api` 外面。

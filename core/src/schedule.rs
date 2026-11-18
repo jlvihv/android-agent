@@ -3,6 +3,19 @@
 //! 它不指挥任何会话。理由：否则就有两套指挥系统（用户经 Router 一套，定时器直接
 //! 投给子会话一套），迟早打架。定时任务也不需要知道目标是谁 —— 那是 Router 的判断。
 //!
+//! ## 编辑：改内容不动时间，改节奏从此刻重来
+//!
+//! 一条任务可以被 [`Schedules::edit`] 改（内容和/或节奏）。两条规则：
+//!
+//! - **只改 `prompt`** → 时间、水位线一律不动。8:59 改个错别字，9:00 该照常响。
+//! - **改节奏** → **开一版新节奏，从此刻起算**：[`ScheduledTask::anchor_at`] 和
+//!   [`ScheduledTask::handled_through`] 都推到 `now`。所以「每天 9 点」改成
+//!   「每天 18 点」下一次是 18 点、「每 1 小时」改成「每 45 分钟」下一次正好是
+//!   45 分钟之后，**两种都不会立刻响**。
+//!
+//! 为什么不重置锚点：那样新周期会套在旧锚点的相位上 —— 改完 10 分钟就响一次，
+//! 然后才按新周期走。用户说的「从现在起每 45 分钟」不是那个意思。
+//!
 //! ## 只有一份不可否认的事实：水位线
 //!
 //! **不存「下次触发时间」。** 那个字段一存进来就必然有一条路径忘了推进它 ——
@@ -170,7 +183,8 @@ impl Eq for CronExpr {}
 ///
 /// 两个变体就是两种语义，非法值写不出来：
 ///
-/// - [`Recurrence::Every`]：固定间隔，**锚在创建时刻**（第 k 次 = `created_at + k×周期`）。
+/// - [`Recurrence::Every`]：固定间隔，**锚在 [`ScheduledTask::anchor_at`]**（第 k 次 =
+///   `anchor_at + k×周期`）。改周期会把锚点重置成「改的那一刻」—— 见模块文档。
 ///   它能表达 cron 表达不了的东西（每 90 分钟）。
 /// - [`Recurrence::Cron`]：挂在**墙上时钟**上（每天 9 点、每周一 9 点）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,16 +212,30 @@ impl Recurrence {
 
 /// 一条定时任务（`schedules` 表的一行）。
 ///
-/// 除了 `handled_through`（水位线）之外全是**不可变事实**：改周期 / 改那句话 =
-/// 删了重建。没有「编辑」这个动作，也就没有「改到一半」这种中间态。
+/// ## 哪些是事实、哪些会被改
+///
+/// | 字段 | 谁改 |
+/// | --- | --- |
+/// | `id` | 建的时候定，**永不改**（编辑不换 id） |
+/// | `prompt` / `every` | 人（或 Router）用 [`Schedules::edit`] 改 |
+/// | `anchor_at` | 建的时候定；**改节奏时重置成那一刻** |
+/// | `handled_through` | 认领 / 暂停 / 恢复 / 改节奏 |
+/// | `paused_at` | 暂停 / 恢复。**编辑不碰它**（改一条停用中的任务，改完还是停用） |
+///
+/// 没有「改到一半」这种中间态：一次 `edit` 要么整份生效，要么一个字段都没动
+/// （写库失败时内存整份回滚，见 [`Schedules::edit`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledTask {
     pub id: String,
     /// 到点要投给 Router 的那句话，**原文一字不改**。
     pub prompt: String,
     pub every: Recurrence,
-    /// 创建时刻。也是 [`Recurrence::Every`] 那个节奏的锚。
-    pub created_at: u64,
+    /// **这一版节奏的起点**（第 k 次 = `anchor_at + k × 周期`）。
+    ///
+    /// 建的时候 = `now`；**改节奏的时候也重置成那一刻**（见 [`Schedules::edit`]）。
+    /// 所以它**不是**「创建时刻」—— 那个名字会让下一个人以为它永不变。
+    /// 「这条是什么时候建的」在 `id` 里（uuid v7 前 48 位就是建它的毫秒时间戳）。
+    pub anchor_at: u64,
     /// 水位线：截止这一刻的触发点都处理过了（投出去了，或按策略放弃）。
     ///
     /// **它不是「上次触发时间」**：暂停 / 恢复时也会被推到 `now`（见
@@ -255,17 +283,17 @@ pub fn due_at(task: &ScheduledTask, now: u64, tz_offset_secs: i32) -> Option<u64
         return None;
     }
     match &task.every {
-        // 固定间隔：整除定位到「now 所在的那一格」。锚在 created_at，所以重启不漂。
+        // 固定间隔：整除定位到「now 所在的那一格」。锚在 anchor_at，所以重启不漂。
         Recurrence::Every(p) => {
             let period = p.ms();
-            if now <= task.created_at {
+            if now <= task.anchor_at {
                 return None;
             }
-            let k = (now - task.created_at) / period;
+            let k = (now - task.anchor_at) / period;
             if k == 0 {
                 return None;
             }
-            let due = task.created_at + k * period;
+            let due = task.anchor_at + k * period;
             (due > task.handled_through).then_some(due)
         }
         // cron：问库「现在之前（含现在）的最近一次」。它自己会走日历。
@@ -284,8 +312,8 @@ pub fn next_at(task: &ScheduledTask, now: u64, tz_offset_secs: i32) -> Option<u6
     match &task.every {
         Recurrence::Every(p) => {
             let period = p.ms();
-            let k = now.saturating_sub(task.created_at) / period + 1;
-            Some(task.created_at + k * period)
+            let k = now.saturating_sub(task.anchor_at) / period + 1;
+            Some(task.anchor_at + k * period)
         }
         Recurrence::Cron(c) => c.next_after(local(now, tz_offset_secs)?),
     }
@@ -362,6 +390,42 @@ fn fallback_offset() -> i32 {
 // 存储
 // ---------------------------------------------------------------------------
 
+/// `prompt` 的校验。**建和改共用这一个** —— 两份校验一定会走偏
+/// （「建的时候 2000 字可以，改的时候不行」是最难查的那种不一致）。
+///
+/// 返回去掉首尾空白的那一份（调用方直接拿去存，别自己再 `trim` 一遍）。
+fn check_prompt(prompt: &str) -> Result<&str, String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("要说什么？`prompt` 是空的".to_string());
+    }
+    if prompt.chars().count() > MAX_PROMPT_CHARS {
+        return Err(format!(
+            "那句话太长了（{} 字，上限 {MAX_PROMPT_CHARS}）。精简一下，别让它变成一篇文章。",
+            prompt.chars().count()
+        ));
+    }
+    Ok(prompt)
+}
+
+/// 把「每 N 分钟 / cron 表达式」这两个互斥的入口折成一个 [`Recurrence`]。
+///
+/// **建和改共用这一个**（同 [`check_prompt`]）。错误信息也在这里，所以两条入口
+/// 拒绝同一份坏输入时说的是同一句话。
+fn make_recurrence(every_minutes: Option<u64>, cron: Option<&str>) -> Result<Recurrence, String> {
+    match (every_minutes, cron.map(str::trim).filter(|s| !s.is_empty())) {
+        (Some(m), None) => Ok(Recurrence::Every(
+            Period::try_new_minutes(m)
+                .ok_or_else(|| format!("每 {m} 分钟不行：最短 1 分钟，最长 30 天"))?,
+        )),
+        (None, Some(c)) => Ok(Recurrence::Cron(Box::new(CronExpr::parse(c)?))),
+        (Some(_), Some(_)) => {
+            Err("`every_minutes` 和 `cron` 只能给一个（它们是两种不同的周期语义）".to_string())
+        }
+        (None, None) => Err("要给周期：`every_minutes`（每 N 分钟）或者 `cron`".to_string()),
+    }
+}
+
 /// 定时任务表（内存那份）。挂在 `AppState::schedules` 上。
 ///
 /// 和 `mcp` / `api_styles` 同构：内存是权威的读副本，写的时候一同进库。表本来就
@@ -385,11 +449,7 @@ impl Schedules {
             return Vec::new();
         };
         let mut out = g.clone();
-        out.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        out.sort_by(|a, b| a.anchor_at.cmp(&b.anchor_at).then_with(|| a.id.cmp(&b.id)));
         out
     }
 
@@ -404,22 +464,13 @@ impl Schedules {
         prompt: &str,
         every: Recurrence,
     ) -> Result<ScheduledTask, String> {
-        let prompt = prompt.trim();
-        if prompt.is_empty() {
-            return Err("要说什么？`prompt` 是空的".to_string());
-        }
-        if prompt.chars().count() > MAX_PROMPT_CHARS {
-            return Err(format!(
-                "那句话太长了（{} 字，上限 {MAX_PROMPT_CHARS}）。精简一下，别让它变成一篇文章。",
-                prompt.chars().count()
-            ));
-        }
+        let prompt = check_prompt(prompt)?;
         let now = now_ms();
         let task = ScheduledTask {
             id: uuid::Uuid::now_v7().to_string(),
             prompt: prompt.to_string(),
             every,
-            created_at: now,
+            anchor_at: now,
             // 新任务的水位线 = 创建时刻：**从下一条周期开始响**，不会一建出来就立刻
             // 响一次（「每 30 分钟」不该在建的那一刻就吵）。
             handled_through: now,
@@ -485,6 +536,97 @@ impl Schedules {
             t.handled_through = t.handled_through.max(now);
             (before, t.clone())
         };
+        if let Some(db) = st.db() {
+            if let Err(e) = db.put_schedule(&after) {
+                if let Ok(mut g) = self.tasks.write() {
+                    if let Some(t) = g.iter_mut().find(|t| t.id == id) {
+                        *t = before;
+                    }
+                }
+                return Err(format!("存不下来：{e:#}"));
+            }
+        }
+        Ok(after)
+    }
+
+    /// 改一条：内容（`prompt`）和/或节奏（`every`）。**没给的那半边保持原样**。
+    ///
+    /// ## 水位线 / 锚点怎么办
+    ///
+    /// | 改了什么 | `anchor_at` | `handled_through` | 下一次 |
+    /// | --- | --- | --- | --- |
+    /// | 只改 `prompt` | 不动 | **不动** | 不变（8:59 改错别字，9:00 照常响） |
+    /// | 改 `every`（含 Every↔Cron 互转） | **重置成 now** | **推到 now** | 按新节奏从 now 起算 |
+    ///
+    /// 为什么改节奏要重置锚点：不重置的话新周期套在**旧锚点的相位**上 ——
+    /// 一条「每 30 分钟」（锚点是 10:00）改成「每 45 分钟」，下一次会落在
+    /// 10:45 之前最近的 `10:00 + k×45min`，可能 10 分钟后就响，然后才按 45 分钟走。
+    /// 用户说的「从现在起每 45 分钟」不是那个意思。
+    ///
+    /// 为什么改节奏要推水位线：**它顺带回答了「会不会立刻响一次」—— 不会。**
+    /// 两个字段一起推到 now 之后，`due_at` 在 `now` 这一刻算出来的最近触发点
+    /// 必然 `<= now = handled_through`，所以 `None`（有测试钉着）。
+    /// 这也和 [`Self::set_paused`] 的「两个方向都推水位线到 now」是同一条语义：
+    /// **这里改了意图，之前积压的那些就不算数了。**
+    ///
+    /// ## 不动的
+    ///
+    /// `id`（编辑不换身份）、`paused_at`（**改一条停用中的任务，改完还是停用** ——
+    /// 编辑不是「恢复」）。
+    ///
+    /// ## 锁与写库
+    ///
+    /// 和 `create` / `set_paused` 一个模式：锁里只改内存，出锁再写库，
+    /// 写库失败用编辑前的**整份快照**换回去。
+    pub fn edit(
+        &self,
+        st: &AppState,
+        id: &str,
+        prompt: Option<&str>,
+        every: Option<Recurrence>,
+    ) -> Result<ScheduledTask, String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("要给 `schedule_id`（`list` 里反引号里的那个串）".to_string());
+        }
+        if prompt.is_none() && every.is_none() {
+            return Err(
+                "要给要改的东西：`prompt`（说什么）或者 `every_minutes` / `cron`（多久一次）"
+                    .to_string(),
+            );
+        }
+        // 校验在锁外（它不碰共享状态，也没必要占着锁做字符串扫描）
+        let prompt = prompt.map(check_prompt).transpose()?;
+        let now = now_ms();
+        let (before, after) = {
+            let mut g = self
+                .tasks
+                .write()
+                .map_err(|_| "定时任务表坏了".to_string())?;
+            let Some(t) = g.iter_mut().find(|t| t.id == id) else {
+                return Err(format!("没有这条定时任务：`{id}`"));
+            };
+            let before = t.clone();
+            if let Some(p) = prompt {
+                t.prompt = p.to_string();
+            }
+            if let Some(e) = every {
+                // 同一个周期（原文一字不差）不算「改了节奏」—— 别白白把相位重置掉。
+                // 用户把「每天 9 点」再填一遍，不该把下一次从「明天 9 点」挪到
+                // 「从此刻起算的下一个 9 点」（那其实还是同一个 9 点，但如果刚好
+                // 在 9:00:00 那一刻提交，就会把**今天这次**跳过）。
+                if t.every != e {
+                    t.every = e;
+                    t.anchor_at = now;
+                    t.handled_through = now;
+                }
+            }
+            (before, t.clone())
+        };
+        if after == before {
+            // 一个字都没变：不写库（和 `set_paused` 那个「已经这个状态了」一致）
+            return Ok(after);
+        }
         if let Some(db) = st.db() {
             if let Err(e) = db.put_schedule(&after) {
                 if let Ok(mut g) = self.tasks.write() {
@@ -686,21 +828,30 @@ pub fn create(
     cron: Option<&str>,
 ) -> Result<ScheduledTask, String> {
     // 「两种周期二选一」在类型上是 `Recurrence`，但入口收的是两个 Option：
-    // 这里是**唯一**把它们折叠成一个 `Recurrence` 的地方。
-    let every = match (every, cron.map(str::trim).filter(|s| !s.is_empty())) {
-        (Some(m), None) => Recurrence::Every(
-            Period::try_new_minutes(m)
-                .ok_or_else(|| format!("每 {m} 分钟不行：最短 1 分钟，最长 30 天"))?,
-        ),
-        (None, Some(c)) => Recurrence::Cron(Box::new(CronExpr::parse(c)?)),
-        (Some(_), Some(_)) => {
-            return Err(
-                "`every_minutes` 和 `cron` 只能给一个（它们是两种不同的周期语义）".to_string(),
-            )
-        }
-        (None, None) => return Err("要给周期：`every_minutes`（每 N 分钟）或者 `cron`".to_string()),
+    // `make_recurrence` 是**唯一**把它们折叠起来的地方（编辑也走它）。
+    st.schedules
+        .create(st, prompt, make_recurrence(every, cron)?)
+}
+
+/// 改。**唯一入口**：HTTP 和 Router 工具都走它（和 [`create`] 一对）。
+///
+/// `prompt` / 周期**至少给一个**：两个都不给是调用方的错（那是「什么都没说」，
+/// 不是「保持原样」）。只给一个的话另一半保持原样 —— 这是用户要的「内容和时间
+/// 都能改，但不必一起改」。
+pub fn edit(
+    st: &AppState,
+    id: &str,
+    prompt: Option<&str>,
+    every_minutes: Option<u64>,
+    cron: Option<&str>,
+) -> Result<ScheduledTask, String> {
+    // 周期这一半：给了就折成 `Recurrence`（和 `create` 共用 `make_recurrence`），
+    // 没给就 `None` = 不改。
+    let every = match (every_minutes, cron.map(str::trim).filter(|s| !s.is_empty())) {
+        (None, None) => None,
+        (m, c) => Some(make_recurrence(m, c)?),
     };
-    st.schedules.create(st, prompt, every)
+    st.schedules.edit(st, id, prompt, every)
 }
 
 /// 停 / 恢复 / 删。三个动作都只认 id。
@@ -757,7 +908,9 @@ pub fn rows(st: &AppState, now: u64, tz: i32) -> Vec<serde_json::Value> {
                     Recurrence::Every(_) => None,
                 },
                 "paused": t.paused(),
-                "createdAt": t.created_at,
+                // **`anchorAt` 不是「创建时刻」**：改节奏会重置它（见 `ScheduledTask`）。
+                // 界面拿它显示「这一版节奏从什么时候起算」。
+                "anchorAt": t.anchor_at,
                 // **现算的**，永远不落库（见模块文档）
                 "nextAt": next_at(t, now, tz),
             })
@@ -805,9 +958,33 @@ pub async fn tool_schedules(
             }
             Ok(out)
         }
+        "edit" => {
+            // 「给了什么就改什么」：三个参数都是可选的，但至少一个（`edit` 自己判）。
+            // 判「给没给」用的是**原始 JSON 有没有这个键**，不是「转成 u64 之后是不是
+            // Some」—— `"every_minutes": null` 和「没这个键」在模型眼里都是没给，
+            // 而 `"every_minutes": 0` 得能走到校验里去报错（0 分钟不合法）。
+            let prompt = args
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim);
+            let every_minutes = args
+                .get("every_minutes")
+                .and_then(serde_json::Value::as_u64);
+            let cron = args
+                .get("cron")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let t = edit(st, id, prompt, every_minutes, cron)?;
+            let now = now_ms();
+            Ok(format!(
+                "改好了。{}",
+                describe(&t, now, utc_offset_secs(now))
+            ))
+        }
         "pause" | "resume" | "delete" => set_state(st, id, action),
         other => Err(format!(
-            "不认识的 action `{other}`（list / pause / resume / delete）"
+            "不认识的 action `{other}`（list / edit / pause / resume / delete）"
         )),
     }
 }
@@ -825,12 +1002,12 @@ mod tests {
     const H: i32 = 3600;
     const DAY: u64 = 86_400_000;
 
-    fn task(every: Recurrence, created_at: u64, handled_through: u64) -> ScheduledTask {
+    fn task(every: Recurrence, anchor_at: u64, handled_through: u64) -> ScheduledTask {
         ScheduledTask {
             id: "t1".into(),
             prompt: "看看那台机器还活着没".into(),
             every,
-            created_at,
+            anchor_at,
             handled_through,
             paused_at: None,
         }
@@ -1044,9 +1221,9 @@ mod tests {
         );
         assert!(!t.paused());
         // 新任务的水位线 = 创建时刻：**不会一建出来就立刻响**
-        assert_eq!(t.handled_through, t.created_at);
+        assert_eq!(t.handled_through, t.anchor_at);
         assert_eq!(
-            due_at(&t, t.created_at + 60_000, 0),
+            due_at(&t, t.anchor_at + 60_000, 0),
             None,
             "建出来一分钟内不该响"
         );
@@ -1054,10 +1231,10 @@ mod tests {
         // 模拟一次触发（把水位线推上去）
         {
             let s = &core.state.schedules;
-            let later = t.created_at + 31 * 60_000;
+            let later = t.anchor_at + 31 * 60_000;
             let claims = s.claim_due(later);
             assert_eq!(claims.len(), 1);
-            assert_eq!(claims[0].due, t.created_at + 30 * 60_000);
+            assert_eq!(claims[0].due, t.anchor_at + 30 * 60_000);
             // 后台那个 `persist_cursor` 做的事，这里直接调（测试不等 10 秒的 tick）
             core.state
                 .db()
@@ -1075,7 +1252,7 @@ mod tests {
         assert_eq!(list[0].prompt, "看看那台机器");
         assert_eq!(
             list[0].handled_through,
-            t.created_at + 30 * 60_000,
+            t.anchor_at + 30 * 60_000,
             "水位线要跟到库里"
         );
     }
@@ -1098,7 +1275,7 @@ mod tests {
             .unwrap();
         assert!(paused.paused());
         assert!(
-            paused.handled_through >= real_now.min(t.created_at),
+            paused.handled_through >= real_now.min(t.anchor_at),
             "停用时水位线跟上现在"
         );
 
@@ -1135,6 +1312,332 @@ mod tests {
             core.state.db().unwrap().schedules().unwrap().is_empty(),
             "库里也没了"
         );
+    }
+
+    // ---- 编辑 -------------------------------------------------------------
+    //
+    // 规则（模块文档里那张表）：
+    //   - 只改 prompt  → 时间/水位线一律不动
+    //   - 改节奏       → anchor_at 和 handled_through 都推到 now，**不会立刻响**
+
+    /// **只改内容：下一次触发时间不变。**
+    ///
+    /// 场景：8:59 改个错别字，9:00 该照常响。
+    ///
+    /// 变异验证：编辑时无条件把 `handled_through` 推到 now → 这条会挂
+    /// （9:00 那次被跳过）。
+    #[tokio::test]
+    async fn editing_the_prompt_keeps_the_schedule_untouched() {
+        let core = core_with_db("edit-prompt");
+        let t = create(&core.state, "看看机器", None, Some("0 9 * * *")).unwrap();
+        let tz = 8 * H;
+        // **先把它做旧**：水位线停在 10 天前。不然「现在」和创建时刻只差几毫秒，
+        // 「水位线有没有被推」这件事测不出来（曾经真的漏过一次：变异体存活）。
+        {
+            let mut g = core.state.schedules.tasks.write().unwrap();
+            g[0].anchor_at = t.anchor_at - 10 * DAY;
+            g[0].handled_through = t.anchor_at - 10 * DAY;
+        }
+        let t = core.state.schedules.get(&t.id).unwrap();
+        let now = t.handled_through;
+        let before_next = next_at(&t, now, tz).expect("有下一次");
+
+        let edited = edit(&core.state, &t.id, Some("看看那台机器"), None, None).expect("改得了");
+
+        // 「现在」已经比水位线晚了 10 天：一旦有人顺手推水位线，下面就不成立
+        assert!(
+            now_ms() - t.handled_through > 9 * DAY,
+            "测试前提：这条已经旧了"
+        );
+
+        assert_eq!(edited.prompt, "看看那台机器", "内容改了");
+        assert_eq!(edited.anchor_at, t.anchor_at, "锚点不许动");
+        assert_eq!(edited.handled_through, t.handled_through, "水位线不许动");
+        assert_eq!(edited.every, t.every, "节奏不许动");
+        assert_eq!(
+            next_at(&edited, now, tz),
+            Some(before_next),
+            "下一次触发时间必须一模一样"
+        );
+        // 而且那个「9 点」确实会响（水位线没被推到 now 之后）
+        let nine = before_next;
+        assert_eq!(due_at(&edited, nine, tz), Some(nine), "9 点该照常响");
+    }
+
+    /// **改节奏：从此刻起按新节奏重算，而且不会立刻响一次。**
+    ///
+    /// 场景：原本「每天 9 点」，水位线停在昨天 9 点；改成「每天 18 点」。
+    /// 下一次必须是**今天 18 点**（不是立刻响，也不是明天 18 点）。
+    ///
+    /// 变异验证（三条，任意一条改了这条就挂）：
+    /// 1. 改节奏时不推 `handled_through` → 立刻触发一次（`claim_due` 非空）
+    /// 2. 改节奏时不重置 `anchor_at` → 固定间隔那条会落在旧相位上
+    /// 3. 只看「改后 due 是否 > 水位线」而不推水位线 → 同上
+    #[tokio::test]
+    async fn changing_the_rhythm_restarts_from_now_and_never_fires_immediately() {
+        let core = core_with_db("edit-rhythm");
+        let tz = 8 * H;
+        let t = create(&core.state, "看看机器", None, Some("0 9 * * *")).unwrap();
+        // 把水位线放到「昨天 9 点」：模拟一条已经响过一次的任务
+        let yesterday_nine = t.anchor_at - DAY;
+        {
+            let mut g = core.state.schedules.tasks.write().unwrap();
+            g[0].handled_through = yesterday_nine;
+        }
+        let t = core.state.schedules.get(&t.id).unwrap();
+
+        let t0 = now_ms();
+        let edited = edit(&core.state, &t.id, None, None, Some("0 18 * * *")).expect("改得了");
+        assert!(edited.anchor_at >= t0, "锚点重置成「改的那一刻」");
+        assert!(edited.handled_through >= t0, "水位线推到 now");
+
+        // 1) **不会立刻响**：紧接着认领一次，一条都不该有
+        assert!(
+            core.state
+                .schedules
+                .claim_due(edited.handled_through)
+                .is_empty(),
+            "改完节奏不该立刻触发一次"
+        );
+        // 2) 下一次是**今天 18 点**，不是明天（因为 now 还没到 18 点的话今天还有一次）
+        let next = next_at(&edited, edited.handled_through, tz).expect("有下一次");
+        let d = local(next, tz).unwrap();
+        assert_eq!(
+            d.format("%H:%M").to_string(),
+            "18:00",
+            "下一次是 18 点：{d}"
+        );
+        assert!(next > edited.handled_through, "下一次必须在将来");
+        // 3) 到那个点真的会响
+        assert_eq!(due_at(&edited, next, tz), Some(next));
+    }
+
+    /// **改固定间隔：锚点重置，下一次就是「一个完整周期之后」。**
+    ///
+    /// 场景：原本「每 30 分钟」（锚点在 10:00），改成「每 45 分钟」。
+    /// 如果锚点不重置，下一次会落在 `10:00 + k×45min` 的旧相位上（可能 10 分钟后就响）。
+    #[tokio::test]
+    async fn changing_a_fixed_period_resets_the_anchor() {
+        let core = core_with_db("edit-period");
+        let t = create(&core.state, "盯着", Some(30), None).unwrap();
+        // 让 it 看起来是 3 小时前建的（旧锚点在很远的地方）
+        {
+            let mut g = core.state.schedules.tasks.write().unwrap();
+            g[0].anchor_at = t.anchor_at - 3 * H as u64 * 1000;
+            g[0].handled_through = t.anchor_at - 30 * 60_000;
+        }
+        let t0 = now_ms();
+        let edited = edit(&core.state, &t.id, None, Some(45), None).expect("改得了");
+        assert_eq!(
+            edited.every,
+            Recurrence::Every(Period::try_new_minutes(45).unwrap())
+        );
+        assert!(edited.anchor_at >= t0, "锚点重置成改的那一刻");
+        let next = next_at(&edited, edited.handled_through, 0).expect("有下一次");
+        assert_eq!(
+            next - edited.anchor_at,
+            45 * 60_000,
+            "下一次正好是一个完整周期之后（不是旧相位上的某个点）"
+        );
+        assert!(core
+            .state
+            .schedules
+            .claim_due(edited.handled_through)
+            .is_empty());
+    }
+
+    /// **Every ↔ Cron 互转**（两种周期语义不同，但编辑要能跨过去）。
+    #[tokio::test]
+    async fn editing_can_switch_between_every_and_cron() {
+        let core = core_with_db("edit-switch");
+        let t = create(&core.state, "盯着", Some(30), None).unwrap();
+        assert!(matches!(t.every, Recurrence::Every(_)));
+
+        let as_cron = edit(&core.state, &t.id, None, None, Some("0 9 * * *")).unwrap();
+        assert!(matches!(as_cron.every, Recurrence::Cron(_)), "换成 cron 了");
+
+        let back = edit(&core.state, &t.id, None, Some(15), None).unwrap();
+        assert!(matches!(back.every, Recurrence::Every(_)), "换回固定间隔");
+        assert_eq!(
+            back.every,
+            Recurrence::Every(Period::try_new_minutes(15).unwrap())
+        );
+    }
+
+    /// **编辑一条停用中的任务，改完还是停用**（编辑不是「恢复」）。
+    ///
+    /// 这条同时钉住一个**表约束**：以前有 `CHECK (paused_at >= anchor_at)`，它的
+    /// 原意是「停用发生在它存在之后」；而改节奏会把 `anchor_at` 挪到「现在」，
+    /// 于是「昨天停用、今天改节奏」变成非法数据 —— 那条 CHECK 会被 SQLite 拒掉
+    /// （实测：编辑停用中的任务直接报 `CHECK constraint failed`）。
+    /// 现在锚点不再是「创建时刻」（见 `ScheduledTask::anchor_at` 的注释），
+    /// 那条不变式没有载体了，所以删掉。
+    ///
+    /// 变异验证：把 `CHECK (paused_at IS NULL OR paused_at >= anchor_at)` 加回
+    /// `db.rs` 的建表 SQL → 这条会挂。
+    /// 另一个变异：`edit` 里顺手把 `paused_at` 清掉 → 这条也会挂。
+    #[tokio::test]
+    async fn editing_a_paused_task_leaves_it_paused() {
+        let core = core_with_db("edit-paused");
+        let t = create(&core.state, "盯着", Some(30), None).unwrap();
+        // **先把它做旧成「3 天前停用的」**（内存和库都写），否则「停用」和「改节奏」
+        // 会落在同一毫秒里，`paused_at >= anchor_at` 碰巧还成立 —— 那个表约束的回归
+        // 就测不出来（变异体验证过：不做旧的话，把 CHECK 加回去照样绿）。
+        let paused_at = t.anchor_at - 3 * DAY;
+        let old = ScheduledTask {
+            anchor_at: paused_at,
+            handled_through: paused_at,
+            paused_at: Some(paused_at),
+            ..t.clone()
+        };
+        {
+            let mut g = core.state.schedules.tasks.write().unwrap();
+            *g.first_mut().unwrap() = old.clone();
+        }
+        core.state.db().unwrap().put_schedule(&old).unwrap();
+
+        let edited =
+            edit(&core.state, &t.id, Some("换个说法"), Some(60), None).expect("停用中也能改");
+        assert!(edited.paused(), "编辑不该把停用状态顺手清掉");
+        assert_eq!(edited.paused_at, Some(paused_at), "停用时刻不该被编辑挪走");
+        assert_eq!(edited.prompt, "换个说法", "内容改了");
+        // 停用中照样不响
+        assert_eq!(due_at(&edited, now_ms(), 0), None);
+        assert_eq!(next_at(&edited, now_ms(), 0), None);
+    }
+
+    /// 编辑不存在的 id → 明确的错误（不是「静默建一条新的」）。
+    #[tokio::test]
+    async fn editing_a_missing_id_is_an_error() {
+        let core = core_with_db("edit-missing");
+        let err = edit(&core.state, "no-such-id", Some("话"), None, None).unwrap_err();
+        assert!(err.contains("没有这条定时任务"), "{err}");
+        assert!(err.contains("no-such-id"), "要说清是哪个 id：{err}");
+        assert!(core.state.schedules.list().is_empty(), "不该凭空建一条");
+    }
+
+    /// 什么都没给 → 明确的错误（不是「保持原样」）。
+    #[tokio::test]
+    async fn editing_nothing_is_rejected() {
+        let core = core_with_db("edit-nothing");
+        let t = create(&core.state, "盯着", Some(30), None).unwrap();
+        let err = edit(&core.state, &t.id, None, None, None).unwrap_err();
+        assert!(err.contains("要给要改的东西"), "{err}");
+        assert_eq!(
+            core.state.schedules.get(&t.id).unwrap(),
+            t,
+            "一个字段都不该动"
+        );
+    }
+
+    /// **校验和 `create` 是同一套**（同一份坏输入，两条入口说同一句话）。
+    ///
+    /// 变异验证：`edit` 里自己写一份长度检查（或者干脆不查）→ 这条会挂。
+    #[tokio::test]
+    async fn edit_validates_exactly_like_create() {
+        let core = core_with_db("edit-validate");
+        let t = create(&core.state, "盯着", Some(30), None).unwrap();
+
+        // 同一批**周期**坏输入，两条入口的错误逐字相同。
+        //
+        // 「周期一个都没给」不在这个列表里：create 里那是「你还没说多久一次」，
+        // edit 里那是「你什么都没说要改」（见下一个断言）—— 两条入口的语境不同，
+        // 说同一句话反而是错的。
+        let long = "字".repeat(MAX_PROMPT_CHARS + 1);
+        let cases: Vec<(Option<u64>, Option<&str>)> = vec![
+            (Some(30), Some("0 9 * * *")),  // 都给了
+            (Some(0), None),                // 0 分钟
+            (Some(30 * 24 * 60 + 1), None), // 超上限
+            (None, Some("每天九点")),       // cron 看不懂
+        ];
+        for (m, c) in cases {
+            let created = create(&core.state, "话", m, c).unwrap_err();
+            let edited = edit(&core.state, &t.id, Some("话"), m, c).unwrap_err();
+            assert_eq!(created, edited, "create 和 edit 对同一份坏输入要给同一句话");
+        }
+        // 「什么都没给」：两条入口各自说自己的话（都必须是明确的人话）
+        assert!(create(&core.state, "话", None, None)
+            .unwrap_err()
+            .contains("要给周期"));
+        assert!(edit(&core.state, &t.id, None, None, None)
+            .unwrap_err()
+            .contains("要给要改的东西"));
+        // 空 / 超长 prompt 也一致
+        let created = create(&core.state, "   ", Some(30), None).unwrap_err();
+        let edited = edit(&core.state, &t.id, Some("   "), None, None).unwrap_err();
+        assert_eq!(created, edited);
+        let created = create(&core.state, &long, Some(30), None).unwrap_err();
+        let edited = edit(&core.state, &t.id, Some(&long), None, None).unwrap_err();
+        assert_eq!(created, edited);
+    }
+
+    /// **同一个周期重新填一遍不算改节奏**（别白白把相位重置掉）。
+    ///
+    /// 变异验证：去掉 `if t.every != e` 那个判断（无条件重置）→ 这条会挂。
+    #[tokio::test]
+    async fn resubmitting_the_same_rhythm_does_not_reset_the_phase() {
+        let core = core_with_db("edit-same-rhythm");
+        let t = create(&core.state, "盯着", Some(30), None).unwrap();
+        // **先做旧**：建在 3 小时前。同一毫秒里建了又改的话，锚点"重置"和不重置
+        // 结果一样，测不出来（变异体验证过）。
+        {
+            let mut g = core.state.schedules.tasks.write().unwrap();
+            g[0].anchor_at = t.anchor_at - 3 * H as u64 * 1000;
+            g[0].handled_through = t.anchor_at - 3 * H as u64 * 1000;
+        }
+        let t = core.state.schedules.get(&t.id).unwrap();
+        let edited = edit(&core.state, &t.id, None, Some(30), None).unwrap();
+        assert_eq!(edited.anchor_at, t.anchor_at, "同样的周期不该重置锚点");
+        assert_eq!(edited.handled_through, t.handled_through, "水位线也不该动");
+        assert_eq!(edited, t, "整份都不该变");
+        assert!(
+            now_ms() - edited.anchor_at > 2 * H as u64 * 1000,
+            "测试前提：锚点确实在 3 小时前"
+        );
+    }
+
+    /// 编辑也走「锁里改内存 → 出锁写库」，写库失败要整份回滚。
+    #[tokio::test]
+    async fn edit_restores_the_previous_row_when_the_db_write_fails() {
+        let core = Core::new();
+        core.set_data_dir(core_with_db_dir("edit-rollback"));
+        let t = create(&core.state, "原来的话", Some(30), None).unwrap();
+        core.state
+            .db()
+            .unwrap()
+            .with(|c| c.execute_batch("DROP TABLE schedules"))
+            .unwrap();
+
+        let err =
+            edit(&core.state, &t.id, Some("新的话"), Some(60), None).expect_err("写不进去就该报错");
+        assert!(err.contains("存不下来"), "{err}");
+        assert_eq!(
+            core.state.schedules.get(&t.id).unwrap(),
+            t,
+            "内存要整份还原（内容 + 节奏 + 锚点 + 水位线）"
+        );
+    }
+
+    /// 编辑之后库里也是新的（不是只在内存里改）。
+    #[tokio::test]
+    async fn an_edit_reaches_the_db() {
+        let dir = core_with_db_dir("edit-db");
+        let core = Core::new();
+        core.set_data_dir(dir.clone());
+        let t = create(&core.state, "旧话", Some(30), None).unwrap();
+        let edited = edit(&core.state, &t.id, Some("新话"), Some(45), None).unwrap();
+
+        // 「重启」：同一个目录、新的 Core
+        let core2 = Core::new();
+        core2.set_data_dir(dir);
+        let got = core2.state.schedules.get(&t.id).expect("重启后还在");
+        assert_eq!(got.prompt, "新话");
+        assert_eq!(
+            got.every,
+            Recurrence::Every(Period::try_new_minutes(45).unwrap())
+        );
+        assert_eq!(got.anchor_at, edited.anchor_at, "锚点也落库了");
+        assert_eq!(got.handled_through, edited.handled_through);
     }
 
     // ---- 写库失败时内存不留脏数据 -----------------------------------------
@@ -1271,6 +1774,102 @@ mod tests {
         assert!(create(st, "话", None, Some("每天九点")).is_err());
     }
 
+    /// **`schedules` 工具的 `edit` 动作走通了**（不只是 `Schedules::edit` 那个方法）。
+    ///
+    /// 这条盯的是「模型看到的那层」：参数从 JSON 里捞出来、只改给了的那几样、
+    /// 回显里带上新的下一次触发时间。
+    #[tokio::test]
+    async fn the_schedules_tool_edits_only_what_was_given() {
+        let core = core_with_db("tool-edit");
+        let t = create(&core.state, "原来那句话", Some(30), None).unwrap();
+
+        // 只改文字
+        let out = tool_schedules(
+            &core,
+            "router",
+            &serde_json::json!({ "action": "edit", "schedule_id": t.id, "prompt": "新的话" }),
+        )
+        .await
+        .expect("改得了");
+        assert!(out.contains("改好了"), "{out}");
+        let after = core.state.schedules.get(&t.id).unwrap();
+        assert_eq!(after.prompt, "新的话");
+        assert_eq!(after.every, t.every, "没给周期就不许动节奏");
+        assert_eq!(after.anchor_at, t.anchor_at, "锚点也不许动");
+
+        // 只改节奏
+        let out = tool_schedules(
+            &core,
+            "router",
+            &serde_json::json!({ "action": "edit", "schedule_id": t.id, "cron": "0 9 * * *" }),
+        )
+        .await
+        .expect("改得了");
+        assert!(out.contains("改好了"), "{out}");
+        assert!(
+            out.contains("09:00") || out.contains("0 9"),
+            "回显要说清新节奏：{out}"
+        );
+        let after2 = core.state.schedules.get(&t.id).unwrap();
+        assert!(matches!(after2.every, Recurrence::Cron(_)), "换成 cron 了");
+        assert_eq!(after2.prompt, "新的话", "没给 prompt 就不许动内容");
+
+        // 两样都改
+        tool_schedules(
+            &core,
+            "router",
+            &serde_json::json!({
+                "action": "edit", "schedule_id": t.id,
+                "prompt": "再改一句", "every_minutes": 15
+            }),
+        )
+        .await
+        .expect("改得了");
+        let after3 = core.state.schedules.get(&t.id).unwrap();
+        assert_eq!(after3.prompt, "再改一句");
+        assert_eq!(
+            after3.every,
+            Recurrence::Every(Period::try_new_minutes(15).unwrap())
+        );
+
+        // 动作名拼错：错误信息里要列出 edit
+        let err = tool_schedules(
+            &core,
+            "router",
+            &serde_json::json!({ "action": "edt", "schedule_id": t.id }),
+        )
+        .await
+        .expect_err("拼错该报错");
+        assert!(err.contains("edit"), "要说清有哪些动作：{err}");
+        // **只有**拼错的那个动作报错，任务没被改
+        assert_eq!(core.state.schedules.get(&t.id).unwrap(), after3);
+    }
+
+    /// `edit` 动作里「什么都没给」和「给了个不合法的值」是两种错误。
+    #[tokio::test]
+    async fn the_schedules_tool_distinguishes_nothing_from_bad_value() {
+        let core = core_with_db("tool-edit-bad");
+        let t = create(&core.state, "话", Some(30), None).unwrap();
+        // 什么都没给
+        let err = tool_schedules(
+            &core,
+            "router",
+            &serde_json::json!({ "action": "edit", "schedule_id": t.id }),
+        )
+        .await
+        .expect_err("什么都没改该报错");
+        assert!(err.contains("要给要改的东西"), "{err}");
+        // 给了个 0 分钟：走到范围校验里去（不是被当成「没给」）
+        let err = tool_schedules(
+            &core,
+            "router",
+            &serde_json::json!({ "action": "edit", "schedule_id": t.id, "every_minutes": 0 }),
+        )
+        .await
+        .expect_err("0 分钟不合法");
+        assert!(err.contains("每 0 分钟不行"), "{err}");
+    }
+
     /// 上限是硬的：第 33 条被拒（而且是要人话，不是 panic）。
     #[tokio::test]
     async fn the_33rd_task_is_refused() {
@@ -1301,7 +1900,7 @@ mod tests {
         // 没配模型：消息入队但不开回合（`wake` 的唯一分支），队列里查得到
         core.state.clear_llm();
 
-        let now = t.created_at + 61 * 60_000;
+        let now = t.anchor_at + 61 * 60_000;
         let claims = core.state.schedules.claim_due(now);
         assert_eq!(claims.len(), 1);
         fire(&core, &claims[0]).await;
@@ -1353,7 +1952,7 @@ mod tests {
                 )
                 .unwrap_or_else(|m| panic!("没满，却排不进去：{}", m.id));
         }
-        let now = t.created_at + 61 * 60_000;
+        let now = t.anchor_at + 61 * 60_000;
         let claims = core.state.schedules.claim_due(now);
         assert_eq!(claims.len(), 1, "水位线照样推进（这一次算处理过了）");
         fire(&core, &claims[0]).await; // 不 panic
