@@ -338,8 +338,19 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     let sid = new_worker_session(core, from, &title, task).await?;
 
     if let Err(e) = deliver(core, &sid, task, &provider) {
-        // 派不出去就把它标成收尾+失败的样子，别让它挂在「闲着」上永远不动
-        state.close_session(&sid, "cancelled");
+        // 派不出去就把失败原因记下来，别让它挂在「闲着」上什么都没说。
+        //
+        // 这条路径上 `deliver` 唯一的失败点是 `enqueue`，而它发生在
+        // `continue_with_queued` **之前** —— 所以此刻按理没有回合在跑，
+        // 收尾守卫会放行。
+        //
+        // 万一被拒（理论上不该发生：这是刚建的会话，不可能已经有回合），
+        // **不要强行收尾** —— 那会造出「已取消但其实在跑」的自相矛盾状态。
+        // 退化成「闲着 + 一条说明失败原因的结论」：Router `read_session` 看得到，
+        // 用户也能自己关掉或者再派一次。宁可留一个能看懂的活，不留一个撒谎的状态。
+        if !state.close_session(&sid, "cancelled").await {
+            tracing::warn!("会话 {sid} 派不出去又收不了尾（回合在跑），留成「闲着」");
+        }
         state.set_conclusion(&sid, &format!("派不出去：{e}"));
         return Err(e);
     }
@@ -369,14 +380,18 @@ pub async fn close_session(core: &Core, from: &str, args: &Value) -> Reply {
     if state.is_closed(id) {
         return Ok(format!("会话 `{id}` 已经收尾过了。"));
     }
-    // 还在跑就不许收尾：先停它，不然它会跑完一条没人接的活
-    if state.is_busy(id) {
+    // **守卫在 `state::close_session` 里**（那是 `closed` 的唯一写点，而且不止
+    // 工具这一条路会写它）。这里只把它的 `false` 翻译成一句人话 ——
+    // **不再自己判一次 `is_busy`**，两份判定迟早会走偏。
+    if !state
+        .close_session(id, if done { "done" } else { "cancelled" })
+        .await
+    {
         return Err(format!(
             "会话 `{id}` 还在跑（回合没结束）。先停止它再收尾，\
              不然那一轮的结果没人接。"
         ));
     }
-    state.close_session(id, if done { "done" } else { "cancelled" });
     Ok(if done {
         format!("会话 `{id}` 已验收收尾。")
     } else {
@@ -886,6 +901,47 @@ mod tests {
         }));
     }
 
+    /// **守卫在 `state::close_session` 里，不在工具层。**
+    ///
+    /// 这条测试**绕过 Router 工具**，直接调底层写点 —— 那正是审查指出的洞：
+    /// 守卫原来只在 `router::close_session`，而 `router::dispatch` 的失败路径
+    /// 也调这个写点。守在最底层，任何调用点都拦得住。
+    #[tokio::test]
+    async fn the_busy_guard_lives_at_the_only_write_point() {
+        let (core, rid) = with_router("guard").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let sid = {
+            let store = core.state.chat.read().await;
+            store
+                .sessions
+                .iter()
+                .find(|s| s.dispatched_by() == Some(rid.as_str()))
+                .unwrap()
+                .id
+                .clone()
+        };
+        assert!(core.state.is_busy(&sid), "派完就该在跑");
+
+        // 直接调底层：必须被拒，且**什么都没写**
+        assert!(
+            !core.state.close_session(&sid, "done").await,
+            "底层写点自己就该拒绝在跑的会话"
+        );
+        assert!(
+            !core.state.is_closed(&sid),
+            "被拒之后不该留下任何收尾痕迹"
+        );
+
+        // 停下来之后同一调用点放行
+        end_running_turns(&core);
+        assert!(core.state.close_session(&sid, "done").await);
+        assert!(core.state.is_closed(&sid));
+    }
+
     /// 收尾过的会话，普通 `list_sessions` 里就不在了；`all` 才看得到。
     #[tokio::test]
     async fn a_closed_session_drops_out_of_the_default_list() {
@@ -912,7 +968,9 @@ mod tests {
         assert!(open.contains("甲"), "{open}");
         assert!(open.contains(&sid), "要给出 session_id 才读得了详情：{open}");
 
-        core.state.close_session(&sid, "done");
+        // 收起之前先把回合结束掉：守卫（`state::close_session`）会拒绝在跑的会话
+        end_running_turns(&core);
+        assert!(core.state.close_session(&sid, "done").await, "闲着的时候该收得了");
         let open = list_sessions(&core, &rid, &serde_json::json!({}))
             .await
             .unwrap();
@@ -1069,7 +1127,8 @@ mod tests {
                 .id
                 .clone()
         };
-        core.state.close_session(&sid, "done");
+        end_running_turns(&core);
+        assert!(core.state.close_session(&sid, "done").await);
 
         let err = dispatch(
             &core,

@@ -1465,20 +1465,49 @@ impl AppState {
     ///
     /// 只写一个事实：收尾方式 + 时刻（收成 `Closed` 枚举，写不出非法组合）。
     /// **不写任何「状态」** —— 「在不在跑」永远看 `turns`，「成没成」看历史。
-    pub fn close_session(&self, sid: &str, by: &str) {
+    /// 返回值：`false` = **被拒**（这个会话的回合还在跑），什么都没写。
+    ///
+    /// ## 为什么守卫必须在这里，而不是只在 `router::close_session`
+    ///
+    /// 这是 `closed` 的**唯一写点**，而写它的路径不止工具那一条
+    /// （`router::dispatch` 派不出去时也会直接调）。守卫只放在工具层的话：
+    ///
+    /// - 任何别的调用点都能造出「已收尾但其实在跑」的组合；
+    /// - 而 `standing()` 的优先级是「收尾 > 在跑」，那种组合会显示成
+    ///   「已验收」，同时界面上还在流式输出 —— 自相矛盾。
+    ///
+    /// 所以判定放在写点上，工具层只负责把 `false` 翻译成一句人话。
+    ///
+    /// ## 锁序
+    ///
+    /// **chat 写锁 → turns 读锁**（`is_busy` 内部拿 `turns`）。和 `evict_idle`
+    /// 完全一致（那里也是「同一把 chat 写锁里现查 busy」）。反方向的嵌套
+    /// （先拿 `turns` 再拿 `chat`）在这个 crate 里**不存在**：`begin_turn` /
+    /// `end_turn` 都只碰 `turns`，不碰 `chat`，所以不会成环。
+    ///
+    /// 不用 `try_write`：收尾是个低频动作（人点一下），`try_write` 一撞上就直接
+    /// 失败、静默什么都不做，那比多等一会儿糟得多。所以它是 `async` 的。
+    pub async fn close_session(&self, sid: &str, by: &str) -> bool {
         let now = crate::agent::now_ms();
         let closed = if by == "cancelled" {
             crate::agent::Closed::Cancelled { at: now }
         } else {
             crate::agent::Closed::Done { at: now }
         };
-        if let Ok(mut store) = self.chat.try_write() {
-            if let Some(s) = store.get_mut(sid) {
-                s.closed = closed;
-                s.updated_at = now;
-            }
+        let mut store = self.chat.write().await;
+        // 在同一把写锁里现查 busy（理由同 `evict_idle`：先拍快照的话，
+        // 拍完到拿锁之间可能刚好有回合开始）。
+        if self.is_busy(sid) {
+            return false;
         }
+        let Some(s) = store.get_mut(sid) else {
+            return false;
+        };
+        s.closed = closed;
+        s.updated_at = now;
+        drop(store);
         self.mark_sessions_dirty();
+        true
     }
 
     /// 再派一次之前把「已收尾」清掉（不然回执会被 `is_closed` 挡住），

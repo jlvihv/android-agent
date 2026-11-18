@@ -1519,30 +1519,79 @@ impl Db {
 mod tests {
     use super::*;
 
-    /// 造一个「ticket 时代的」库：`sessions` 只有老列（没有那六个新列），
-    /// 外加一张有数据的 `tickets` 表。然后跑 `migrate()`，看它搬成什么样。
+    /// 造一个「ticket 时代的」库，然后跑 `migrate()` 看它搬成什么样。
     ///
     /// 这是 `migrate()` 唯一的测试入口 —— 之前 6 个 db 测试没有一个覆盖它，
     /// 所以「同一会话两条 ticket 时搬错了哪条」这种 bug 一直没被发现。
+    ///
+    /// ## schema 必须是 `main` 上的**真实起点**
+    ///
+    /// 主 case 造的是 **`main`（`refactor/session-only` 分出去那一点）上的库**：
+    /// `sessions` 已经有 `role` 列（双层架构那一批加的，比 ticket 层晚、比本次早），
+    /// 但没有本次新加的六列。`tickets` 的列名 / 类型 / 默认值也逐字照抄。
+    ///
+    /// 为什么这很重要：造一个缺 `role` 的假 schema，验证的是「从最老版本直接跳到
+    /// 最新」，而**真正的升级路径是「从 main 的库升上来」**。两条路径的 SQL 执行
+    /// 序列不同（`role` 那段 `ALTER TABLE` 在假 schema 上会真跑，真实升级时被
+    /// `has_column` 跳过）—— 那等于测了一条用户永远不会走的路。
+    ///
+    /// 最老那个版本（连 `role` 都没有）单独用 [`legacy_db_oldest`] 测。
     fn legacy_db(sessions: &[(&str, &str)], tickets: &[(&str, &str, &str, i64, &str)]) -> Connection {
+        legacy_db_with(sessions, tickets, true)
+    }
+
+    /// 最老那个版本：`sessions` 连 `role` 都没有（双层架构之前）。
+    fn legacy_db_oldest(
+        sessions: &[(&str, &str)],
+        tickets: &[(&str, &str, &str, i64, &str)],
+    ) -> Connection {
+        legacy_db_with(sessions, tickets, false)
+    }
+
+    /// `with_role` = 造 `main` 上的 schema（有 `role`）还是最老那个（没有）。
+    fn legacy_db_with(
+        sessions: &[(&str, &str)],
+        tickets: &[(&str, &str, &str, i64, &str)],
+        with_role: bool,
+    ) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        // 老 schema：sessions 没有 brief / dispatched_by / conclusion /
-        // dispatches / closed_at / closed_by
-        conn.execute_batch(
+
+        // sessions：`main` 的样子（带 role）/ 最老的样子（不带 role）。
+        // 共同点是**都没有**本次新加的六列。
+        let role_col = if with_role {
+            ",\n  role             TEXT NOT NULL DEFAULT 'worker'"
+        } else {
+            ""
+        };
+        // tickets：逐字照抄 `main` 上的 `CREATE TABLE IF NOT EXISTS tickets`
+        // （列名 / 类型 / NOT NULL / DEFAULT 一个不差）。
+        conn.execute_batch(&format!(
             "CREATE TABLE sessions (
-               id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at INTEGER NOT NULL,
-               updated_at INTEGER NOT NULL, provider_session TEXT NOT NULL
-             );
-             CREATE TABLE tickets (
-               id TEXT PRIMARY KEY, title TEXT NOT NULL, brief TEXT NOT NULL,
-               session_id TEXT NOT NULL, router_id TEXT NOT NULL, stage TEXT NOT NULL,
-               result TEXT NOT NULL DEFAULT '', report TEXT NOT NULL DEFAULT '',
-               ended_at INTEGER NOT NULL DEFAULT 0, ended_by TEXT NOT NULL DEFAULT '',
-               dispatches INTEGER NOT NULL DEFAULT 0,
-               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-             );",
-        )
+  id               TEXT PRIMARY KEY,
+  title            TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  provider_session TEXT NOT NULL{role_col}
+);
+CREATE TABLE tickets (
+  id            TEXT PRIMARY KEY,
+  title         TEXT NOT NULL,
+  brief         TEXT NOT NULL,
+  session_id    TEXT NOT NULL,
+  router_id     TEXT NOT NULL,
+  stage         TEXT NOT NULL,
+  result        TEXT NOT NULL DEFAULT '',
+  report        TEXT NOT NULL DEFAULT '',
+  ended_at      INTEGER NOT NULL DEFAULT 0,
+  ended_by      TEXT NOT NULL DEFAULT '',
+  dispatches    INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);"
+        ))
         .unwrap();
+
+        // 会话：`main` 上的库一定有 role（默认 worker），所以插的时候不指定它。
         for (id, title) in sessions {
             conn.execute(
                 "INSERT INTO sessions(id, title, created_at, updated_at, provider_session)
@@ -1691,6 +1740,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 0, "不该为一个孤儿 ticket 凭空建会话");
+    }
+
+    /// **最老那个版本（连 `role` 都没有）也能升上来。**
+    ///
+    /// 主 case 造的是 `main` 的 schema（有 `role`）；这个测「双层架构之前」的库，
+    /// 那条路径上 `role` 的 `ALTER TABLE` 会真跑。两条路都得覆盖。
+    #[test]
+    fn migration_from_the_oldest_schema_without_role() {
+        let conn = legacy_db_oldest(&[("s1", "t")], &[("t1", "s1", "要求", 100, "done")]);
+        migrate(&conn).expect("最老的库也该升得上来");
+        let (brief, by, _, _, closed_at, closed_by) = migrated_row(&conn, "s1");
+        assert_eq!(brief, "要求");
+        assert_eq!(by, "router-1");
+        assert_eq!(closed_at, 900);
+        assert_eq!(closed_by, "done");
+        // `role` 被补上了，且默认 worker（老会话全是 worker）
+        let role: String = conn
+            .query_row("SELECT role FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(role, "worker");
+    }
+
+    /// **主 case 的 schema 必须和 `main` 上真实的一致**（`sessions` 已经有
+    /// `role`）。这条测试守着 helper 本身：如果有人把 `legacy_db` 改成少造一列，
+    /// 那它就不再验证真实的升级路径了 —— 而这种「测试造了个刚好能过的假库」
+    /// 是最容易悄悄发生的退化。
+    #[test]
+    fn the_legacy_fixture_matches_the_real_main_schema() {
+        let conn = legacy_db(&[], &[]);
+        // `main` 的 sessions 有 6 列（含 role），缺的是本次新加的 6 列
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(sessions)").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        for must in ["id", "title", "created_at", "updated_at", "provider_session", "role"] {
+            assert!(cols.contains(&must.to_string()), "main 的 sessions 有 {must}：{cols:?}");
+        }
+        // 本次新加的那六列**不该**在起点里（否则 migrate 就没事可做了）
+        for newly in [
+            "brief", "dispatched_by", "conclusion", "dispatches", "closed_at", "closed_by",
+        ] {
+            assert!(!cols.contains(&newly.to_string()), "起点不该有 {newly}：{cols:?}");
+        }
+        // tickets 的列名逐字对齐 main
+        let tcols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tickets)").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        for must in [
+            "id", "title", "brief", "session_id", "router_id", "stage", "result", "report",
+            "ended_at", "ended_by", "dispatches", "created_at", "updated_at",
+        ] {
+            assert!(tcols.contains(&must.to_string()), "tickets 有 {must}：{tcols:?}");
+        }
     }
 
     /// 全新库里没有 `tickets` 表：migrate 不能报错。

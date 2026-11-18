@@ -82,6 +82,21 @@ Queued / Working / WaitingReview / Blocked / Failed / Done / Cancelled
 **DB 列保持不变**（还是 `brief` / `dispatched_by` / `dispatches` / `closed_at` /
 `closed_by` 五列）—— 转换只在 `db.rs` 的 load / save 两个边界做。
 
+### 3.1.1 `closed` 的写点只有一个，守卫也在那里
+
+`AppState::close_session()` 是 `closed` 的**唯一写点**，**它在里面自己判 busy**：
+
+```rust
+pub async fn close_session(&self, sid: &str, by: &str) -> bool   // false = 被拒
+```
+
+守卫不能只放在 `router::close_session`（工具层），因为写它的路径不止那一条
+（`router::dispatch` 派不出去时也直接调）。守在最底层，任何调用点都拦得住，
+工具层只负责把 `false` 翻译成一句人话 —— **不做第二份判定**。
+
+锁序是 `chat` 写锁 → `turns` 读锁（`is_busy` 内部拿 `turns`），和 `evict_idle`
+一致。反方向不存在：`begin_turn` / `end_turn` 只碰 `turns`、不碰 `chat`。
+
 ### 3.2 `Standing`：唯一的推导入口
 
 ```rust
@@ -257,6 +272,12 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
 | `a_queued_session_does_not_need_a_person` | 排队中不算「等人」 |
 | `a_just_dispatched_session_is_not_counted_as_waiting` | `dispatch` 之后立刻统计 waiting = 0 |
 | `closed_round_trips_through_the_two_columns` | `Closed` 与两列往返，哨兵收敛 |
+| `the_busy_guard_lives_at_the_only_write_point` | 守卫在 `state::close_session`（绕过工具直接调也拦得住） |
+| `closed_from_db_never_silently_swallows_garbage` | 未知 `closed_by` 归 `Done` 不 panic |
+| `closed_from_db_rejects_a_timestamp_less_close` | `at=0` + 非空 `by` → `Open` |
+| `open_always_writes_the_empty_pair` | 脏数据读进来再写回去被纠正成 `(0,"")` |
+| `migration_from_the_oldest_schema_without_role` | 最老的库（无 `role`）也升得上来 |
+| `the_legacy_fixture_matches_the_real_main_schema` | 测试 fixture 必须和 `main` 的真实 schema 一致 |
 | `a_human_interjection_never_overwrites_the_deliverable` | 派活出结论 X → 用户插话 → `conclusion` 仍是 X |
 | `a_human_interjection_still_reports_back` | 插话那轮的回执照发（只是不动结论） |
 

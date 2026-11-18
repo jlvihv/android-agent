@@ -441,21 +441,42 @@ impl Closed {
 
     /// 从库里的两列还原。**唯一**一处把哨兵翻译成枚举的地方（见 `db.rs`）。
     ///
-    /// 判定规则：有 `at` 才算收尾；`by` 认不出来的一律当 `Done`（宁可说成
-    /// 「验收过」也不要在界面上留一个说不清的第四种状态）。`at == 0` 一律当
-    /// `Open` —— 没有时刻的「收尾」不成立。
+    /// ## 不静默吞掉脏数据
+    ///
+    /// 库里可能出现两种非法组合（老版本写的、手工改的、迁移产出的）：
+    ///
+    /// - `at != 0` 而 `by` 是个认不出来的串；
+    /// - `at == 0` 而 `by` 非空（`to_db` 把 `Open` 写成 `(0, "")`，所以这是脏的）。
+    ///
+    /// 两种都**要 warn**。以前是静默归一类 —— 一个方向是静默当 `cancelled`、
+    /// 另一个方向是静默当 `Done`，**误判方向反了但同样的静默**，出问题时
+    /// 日志里一个字都没有。
+    ///
+    /// 归类的选择：认不出的 `by` → `Done`（宁可说「验收过」，也别在界面上留一个
+    /// 说不清的第四种状态；而 `Done` 在显示上比 `Cancelled` 更中性）。
     pub fn from_db(at: u64, by: &str) -> Self {
-        if at == 0 {
-            return Self::Open;
-        }
-        if by == "cancelled" {
-            Self::Cancelled { at }
-        } else {
-            Self::Done { at }
+        match (at, by) {
+            (0, "") => Self::Open,
+            // `at == 0` 却有 `by`：时刻丢了，收尾这件事**不能成立**（没法排序、
+            // 没法显示时间），当没发生过。但要 warn —— 这说明有人写坏了数据。
+            (0, other) => {
+                tracing::warn!("会话的 closed_at=0 但 closed_by={other:?}：脏数据，按「还开着」处理");
+                Self::Open
+            }
+            (at, "done") => Self::Done { at },
+            (at, "cancelled") => Self::Cancelled { at },
+            (at, other) => {
+                tracing::warn!("认不出的 closed_by={other:?}（closed_at={at}）：按「已验收」处理");
+                Self::Done { at }
+            }
         }
     }
 
     /// 拆回库里的两列（`at`, `by`）。
+    ///
+    /// **`Open` 一律写 `(0, "")`** —— 这是一条不变式：`at == 0` 必须伴随空 `by`。
+    /// 库里若出现 `at=0` + 非空 `by`，那是别的东西写坏的，`from_db` 会 warn
+    /// 并把它读回 `Open`，写回去时自然就被纠正成 `(0, "")` 了。
     pub fn to_db(self) -> (u64, &'static str) {
         match self {
             Self::Open => (0, ""),
@@ -4060,6 +4081,39 @@ mod tests {
             Closed::from_db(500, "whatever"),
             Closed::Done { at: 500 }
         );
+    }
+
+    /// **未知的 `closed_by` 不静默**：归为 `Done`，不 panic，但会 warn。
+    #[test]
+    fn closed_from_db_never_silently_swallows_garbage() {
+        // 认不出的串：归 Done（不是 Cancelled，也不是悄悄丢掉）
+        assert_eq!(
+            Closed::from_db(500, "whatever"),
+            Closed::Done { at: 500 }
+        );
+        assert_eq!(Closed::from_db(500, ""), Closed::Done { at: 500 });
+        // 大小写/空白都不认（严格匹配，别猜）
+        assert_eq!(Closed::from_db(500, "DONE"), Closed::Done { at: 500 });
+    }
+
+    /// **`at == 0` 却有 `by`**：脏数据，按「还开着」处理（时刻都没有，
+    /// 收尾这件事不成立），并 warn。
+    #[test]
+    fn closed_from_db_rejects_a_timestamp_less_close() {
+        assert_eq!(Closed::from_db(0, "done"), Closed::Open);
+        assert_eq!(Closed::from_db(0, "cancelled"), Closed::Open);
+        assert_eq!(Closed::from_db(0, "whatever"), Closed::Open);
+    }
+
+    /// `to_db` 的 `Open` 不变式：**一律** `(0, "")`。所以上面那种脏数据
+    /// 读进来再写回去，就被自然纠正了。
+    #[test]
+    fn open_always_writes_the_empty_pair() {
+        assert_eq!(Closed::Open.to_db(), (0, ""));
+        // 脏数据 → Open → 写回 (0, "")：脏值被纠正，而不是原样留着
+        let dirty = Closed::from_db(0, "done");
+        assert_eq!(dirty, Closed::Open);
+        assert_eq!(dirty.to_db(), (0, ""));
     }
 
     /// `Option<Dispatch>` 让「半份派活记录」写不出来：要么整份有、要么没有。
