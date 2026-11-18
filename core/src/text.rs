@@ -117,6 +117,35 @@ pub fn one_line(s: &str) -> String {
     out
 }
 
+/// 压成一行，并在路上丢掉 `keep` 认为该丢的字符。
+///
+/// 比 `one_line(s.replace(..))` 少两次分配：一遍字符遍历同时做「丢掉不要的
+/// 字符」+「连续空白压成一个空格」+「去掉首尾空白」。
+///
+/// 通知栏的回复预览用它（去 markdown 记号）：那条路径**每个流式块都走**
+/// （见 `status::Reporter::streaming` 的节流）。以前是
+/// `collapsed()` 一个 String + `.replace()` 又一个 + `.trim().to_string()`
+/// 第三个，而每块的内容基本一样。
+pub fn squeeze(s: &str, keep: impl Fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            space = true;
+            continue;
+        }
+        if !keep(c) {
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        out.push(c);
+    }
+    out
+}
+
 /// 去掉协议头之后那一截（到 `/`、`?`、`#` 为止），**是 `url` 的一段** ——
 /// 调用方可以直接拿它的长度回原文上切片。
 pub fn authority(url: &str) -> &str {
@@ -202,6 +231,43 @@ mod tests {
     fn one_line_folds_whitespace() {
         assert_eq!(one_line("  a\n\n b\tc  "), "a b c");
         assert_eq!(one_line("   "), "");
+    }
+
+    /// `squeeze` 和「先 collapsed 再 replace 再 trim」必须给出同一串 ——
+    /// 它是 `status::reply_preview` 的热路径，等价性得钉住。
+    #[test]
+    fn squeeze_matches_the_three_pass_version() {
+        let drop_md = |s: &str| {
+            let folded: String = {
+                let mut out = String::new();
+                let mut space = false;
+                for c in s.chars() {
+                    if c.is_whitespace() {
+                        space = true;
+                        continue;
+                    }
+                    if space && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    space = false;
+                    out.push(c);
+                }
+                out
+            };
+            folded.replace(['*', '`', '_'], "").trim().to_string()
+        };
+        let keep = |c: char| !matches!(c, '*' | '`' | '_');
+        for s in [
+            "## 结果",
+            "**加粗** 和 `code`",
+            "a_b_c 空格",
+            "   缩进\n\n第二行  ",
+            "***",
+            "",
+            "  **前后都有空白**  ",
+        ] {
+            assert_eq!(squeeze(s, keep), drop_md(s), "输入：{s:?}");
+        }
     }
 
     #[test]

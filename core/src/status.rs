@@ -468,8 +468,8 @@ pub fn tool_detail(name: &str, args: &str) -> Option<String> {
         "read" | "edit" => string_arg(args, "path")?,
         _ => return None,
     };
-    let line = one_line(&raw);
-    (!line.is_empty()).then_some(line)
+    let line = first_line(&raw);
+    (!line.is_empty()).then_some(text::cap(&line, DETAIL_MAX))
 }
 
 /// 回复预览：正文**尾部**最后一个非空行。
@@ -483,39 +483,23 @@ pub fn reply_preview(text: &str) -> Option<String> {
         .rev()
         .map(str::trim)
         .find(|l| !l.is_empty())?;
-    let clean = collapsed(last.trim_start_matches('#').trim())
-        .replace(['*', '`', '_'], "")
-        .trim()
-        .to_string();
+    // 一次遍历同时做三件事：去 markdown 记号（`*` / `` ` `` / `_`）、把连续空白
+    // 压成一个空格、丢掉首尾空白。以前是 collapsed() 分配一个 String、
+    // `.replace()` 再分配一个、`.trim().to_string()` 再分配一个 —— 而这条路径
+    // 每个流式块都会走（见 `Reporter::streaming` 的节流）。
+    let clean = text::squeeze(last.trim_start_matches('#'), |c| {
+        !matches!(c, '*' | '`' | '_')
+    });
     (!clean.is_empty()).then(|| text::cap(&clean, DETAIL_MAX))
 }
 
-/// 第一行非空的内容，压成一行、别太长。
-fn one_line(s: &str) -> String {
-    let first = s
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or_default();
-    text::cap(&collapsed(first), DETAIL_MAX)
-}
-
-/// 连续空白压成一个空格（命令行里的缩进、正文里的换行都不该出现在一行里）。
-fn collapsed(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut space = false;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            space = true;
-            continue;
-        }
-        if space && !out.is_empty() {
-            out.push(' ');
-        }
-        space = false;
-        out.push(c);
-    }
-    out
+/// 第一行非空的内容（还没压空白、没截断）。
+///
+/// 「压成一行 + 截到 `DETAIL_MAX`」在 `text` 模块里（`text::one_line` /
+/// `text::cap`）—— 以前这里另写了一份内容一样的 `collapsed`，同一条通知和
+/// 同一条搜索摘要的空白折叠规则各走一路，改一处忘一处就会漂。
+fn first_line(s: &str) -> &str {
+    s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
 }
 
 /// 「最多看头部 `max` 字节」的终点，落在合法字符边界上。
