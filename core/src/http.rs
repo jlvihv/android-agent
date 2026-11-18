@@ -2954,17 +2954,32 @@ async fn debug_request(
     if let Err(e) = st.ensure_loaded(&sid).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
     }
-    let mut sess = {
+    // **先把系统提示词准备好，再进锁**：`system_prompt_for` 自己会读别的锁
+    // （`system_prompt` / `linux`），和会话写锁套着拿就是锁序隐患。
+    //
+    // 拿到 ready 的会话之后立刻松锁：拼请求体（几 MB 的 JSON）在锁外做。
+    //
+    // 以前这里是 `s.clone()` —— 整条会话连历史一起深拷一份，一个真实会话的
+    // `messages` 是几 MB 到几十 MB（每条 bash 输出几十 KB）。而这里只需要
+    // 「历史 + 可能补上的一条系统提示词」。
+    let (sess, has_prompt) = {
         let store = st.chat.read().await;
-        // 拷一份：不想持着锁做拼装，而这是手动的调试接口，不在乎这点开销
-        match store.get(&sid) {
-            Some(s) => s.clone(),
-            None => return (StatusCode::NOT_FOUND, "没有这个会话").into_response(),
-        }
+        let Some(s) = store.get(&sid) else {
+            return (StatusCode::NOT_FOUND, "没有这个会话").into_response();
+        };
+        let prompt = st.system_prompt_for(s.role);
+        // 按这个会话自己的角色取提示词：router 会话看到的和我们真发出去的一致。
+        // 提示词已经在历史里就**完全不用拷**（绝大多数情况）。
+        let present = s
+            .messages
+            .iter()
+            .any(|m| matches!(m, crate::agent::ChatMessage::System(t) if t == &prompt));
+        (s.clone(), (!present).then_some(prompt))
     };
-    // 按这个会话自己的角色取提示词：router 会话看到的和我们真发出去的一致。
-    let prompt = st.system_prompt_for(sess.role);
-    crate::agent::ensure_system_prompt(&mut sess, &prompt);
+    let mut sess = sess;
+    if let Some(prompt) = has_prompt {
+        crate::agent::ensure_system_prompt(&mut sess, &prompt);
+    }
 
     // 和真正发出去的一致：按解析出来的协议偏好给请求体
     let images = st.cached_supports_images(&p);
@@ -2989,6 +3004,7 @@ async fn debug_request(
         )
         .and_then(|r| Ok(serde_json::to_value(&r)?)),
     };
+
     match body {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
