@@ -247,24 +247,23 @@ CREATE TABLE IF NOT EXISTS http_cache (
   fetched_at INTEGER NOT NULL
 );
 
--- 定时任务：到点往 Router 的队列里投一句话，把它叫醒（见 schedule.rs）。
---
--- **没有 `next_at` 列**。那是算出来的（`anchor_at + k*周期`，或者 cron 从水位线往后
--- 找一次），存一份就是给「没人负责推进它」留后门 —— 上一版 ticket 的 `Stage::Done`
--- 零调用点就是这么烂掉的（见 docs/16）。
---
--- `handled_through` 是**水位线**（截止这一刻的触发点都处理过了），不是状态标签：
--- 没有跃迁规则，只有「单调不减」一条，唯一的写点是 `Schedules::claim_due`。
---
--- `every_secs` 和 `cron` **恰好有一个非空**（下面的 CHECK 钉着）：两种周期语义不同
--- （锚在创建时刻 vs 挂在墙上时钟），用一个 NULL 的列表达「这条是哪种」比存个
--- `kind` 字符串再分叉更实在 —— 那个 kind 一存进来就能和两个数据列对不上。
---
--- **没有「建它时的时区」这一列**：曾经加过（`tz_offset_minutes`），但没有任何代码
--- 读它 —— 算触发点永远用**此刻**的偏移（`schedule::utc_offset_secs`），因为任务属于
--- 这台机器、不属于某个时区（见 docs/17 §4.2）。留着就是给下一个人一个「它好像在被
--- 用」的错觉。真要做「你当初在 UTC+8 设的 9 点」那种提示时再加也不迟（表还没发布过）。
-CREATE TABLE IF NOT EXISTS schedules (
+";
+
+/// `schedules` 表的建表语句 —— **只有这一份**。
+///
+/// ## 为什么单独拎出来
+///
+/// 它有两个使用点：`SCHEMA`（新库一次建全）和 [`migrate_schedules`]（旧形状的表
+/// 改名之后要按当前形状重建）。以前这两处各抄了一份 —— 而「建表语句和迁移逻辑
+/// 不同步」正是上一轮那个「升级上来库打不开」的 bug 的成因（`anchor_at` 改名的
+/// 时候 `SCHEMA` 改了、迁移里那份没跟上/反过来）。同一张表的形状只能有一个真相。
+///
+/// **为什么不是把 `SCHEMA` 改成 `format!` 拼进去**：`SCHEMA` 是 `const`，而 `format!`
+/// 不是 const fn；改成 `LazyLock<String>` 会让每次 `execute_batch` 多一次分配
+/// （`Db::open` / `in_memory` 各一次，还有十几处测试），换来的只是「不用担心两处
+/// 走偏」—— 而那个目的用「一个常量 + 一个建库函数」已经达到了（见 [`create_all`]）。
+/// 常量拼接这条路走不通：`concat!` 只吃字面量。
+const SCHEDULES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS schedules (
   id              TEXT PRIMARY KEY,
   -- 到点投给 Router 的那句话，原文一字不改
   prompt          TEXT NOT NULL,
@@ -284,15 +283,26 @@ CREATE TABLE IF NOT EXISTS schedules (
   -- 之后」，而 anchor_at 现在**可以被 `edit` 往后挪**（改节奏 = 开一版新节奏，见
   -- schedule.rs）：一条昨天停用、今天改节奏的任务，`anchor_at` 是今天、`paused_at`
   -- 是昨天 —— 合法数据，却会被那条 CHECK 拒掉（实测：编辑停用中的任务直接 500）。
-  -- 「停用时刻 >= 建的时刻」这件事不再由 anchor_at 表达（它已经不是创建时刻，
-  -- 见下面那行的注释），所以这条不变式没有载体，就不该留着半条。
+  -- 「停用时刻 >= 建的时刻」这件事不再由 anchor_at 表达（它已经不是创建时刻），
+  -- 所以这条不变式没有载体，就不该留着半条。
   --
   -- `handled_through >= anchor_at` **留着**：水位线不能早于「当前这版节奏的起点」，
   -- 而 edit 是同时把两者设成 now 的，所以它恒成立。
   -- 「两种周期，恰好一种」—— 两个都空 / 两个都有 都在这里被挡掉
   CHECK ((every_secs IS NULL) <> (cron IS NULL))
-);
-";
+)";
+
+/// 建一张库的**全部**表（新库 / 内存库都走它）。
+///
+/// `SCHEMA` + `SCHEDULES_TABLE_SQL`：后者单独成常量是为了让 [`migrate_schedules`]
+/// 重建时**用同一份 SQL**（表形状只有一个真相）。两者都由这里执行，顺序无所谓
+/// （都是 `IF NOT EXISTS`）。
+fn create_all(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA).context("建表")?;
+    conn.execute_batch(SCHEDULES_TABLE_SQL)
+        .context("建 schedules 表")?;
+    Ok(())
+}
 
 /// 把老库补齐到当前 schema。**幂等**：每次打开都跑一遍，已经升过的一句也不做。
 ///
@@ -464,8 +474,28 @@ fn migrate_schedules(conn: &Connection) -> Result<()> {
     if has_column(conn, "schedules", "anchor_at")? {
         return Ok(());
     }
-    // 旧形状（有 created_at 没 anchor_at）：改名让开，新表由下面重建
-    tracing::warn!("schedules 表是旧形状（created_at 而不是 anchor_at），改名留档后重建");
+    // 旧形状（有 created_at 没 anchor_at）：让开，新表由下面重建。
+    //
+    // **空表直接 DROP，不留档**：用户库里那张旧 `schedules` 通常是 0 行
+    //（这张表还没发布过，中间版本的定时任务没人用），改名留档只会在他目录里
+    // 多出一张空的 `schedules_legacy` —— 纯噪音，还会让人以为「我的任务去哪了」。
+    // 有数据才留档（那时候数据本身有价值，删了就找不回来）。
+    //
+    // 实测过真库副本：`schedules` 0 行 → 修之前会建出空的 `schedules_legacy`。
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM schedules", [], |r| r.get(0))
+        .unwrap_or(0);
+    if rows == 0 {
+        conn.execute_batch("DROP TABLE schedules")
+            .context("清掉空的旧 schedules 表")?;
+        tracing::info!("旧的 schedules 表是空的（0 条任务），直接清掉后重建");
+        conn.execute_batch(SCHEDULES_TABLE_SQL)
+            .context("按当前形状重建 schedules 表")?;
+        return Ok(());
+    }
+    tracing::warn!(
+        "schedules 表是旧形状（created_at 而不是 anchor_at），{rows} 条数据改名留档后重建"
+    );
     // **目标名可能已经被占了**（`schedules_legacy` 上一次改名留下的 —— 比如用户
     // 升级过一次、又退回了旧版本、再升回来）。那时 `RENAME` 会报
     // 「there is already another table or index with this name」把整个
@@ -479,30 +509,9 @@ fn migrate_schedules(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!("ALTER TABLE schedules RENAME TO {target}"))
         .with_context(|| format!("把旧 schedules 表改名留档（-> {target}）"))?;
     tracing::warn!("旧 schedules 表改名到 {target}（数据不删）");
-    // 建当前形状的表（和 SCHEMA 里那段逐字一致 —— 只多这一处入口，
-    // 所以把建表语句抽成常量会好，但那是重构，这轮不做）
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schedules (
-           id              TEXT PRIMARY KEY,
-           prompt          TEXT NOT NULL,
-           every_secs      INTEGER CHECK (every_secs IS NULL OR (every_secs >= 60 AND every_secs <= 2592000)),
-           cron            TEXT,
-           anchor_at       INTEGER NOT NULL,
-           handled_through INTEGER NOT NULL,
-           paused_at       INTEGER,
-           CHECK (handled_through >= anchor_at),
-           CHECK ((every_secs IS NULL) <> (cron IS NULL))
-         )",
-    )
-    .context("按当前形状重建 schedules 表")?;
-    // 旧表里有几行？留个日志 —— 数据在那个 legacy 表里，人能看到
-    if let Ok(rows) = conn.query_row(&format!("SELECT COUNT(*) FROM {target}"), [], |r| {
-        r.get::<_, i64>(0)
-    }) {
-        if rows > 0 {
-            tracing::warn!("旧 schedules 表的 {rows} 条数据留在 {target}（新表是空的）");
-        }
-    }
+    // 建当前形状的表 —— **用同一份 SQL**（`SCHEDULES_TABLE_SQL`），不另抄一遍
+    conn.execute_batch(SCHEDULES_TABLE_SQL)
+        .context("按当前形状重建 schedules 表")?;
     Ok(())
 }
 
@@ -686,7 +695,7 @@ impl Db {
             std::fs::create_dir_all(dir).ok();
         }
         let conn = Connection::open(path).with_context(|| format!("打开 {}", path.display()))?;
-        conn.execute_batch(SCHEMA).context("建表")?;
+        create_all(&conn)?;
         migrate(&conn).context("迁移")?;
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -701,7 +710,7 @@ impl Db {
     /// 内存里的库（测试用；也给没有数据目录的场合）。
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        create_all(&conn)?;
         migrate(&conn)?;
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -1943,8 +1952,7 @@ mod tests {
         )
         .unwrap();
         // 走**和真库一样的两步**（SCHEMA 先、migrate 后）—— 这正是那个坑的现场
-        conn.execute_batch(SCHEMA)
-            .expect("SCHEMA 这一关就该过（索引不能在它里面）");
+        create_all(&conn).expect("建表这一关就该过（索引不能在 SCHEMA 里面）");
         migrate(&conn).expect("migrate 该成功");
         // 会话还在，seq 列补上了
         assert_eq!(
@@ -1974,7 +1982,7 @@ mod tests {
                VALUES('t1','旧任务',60,1,1);",
         )
         .unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        create_all(&conn).unwrap();
         migrate(&conn).unwrap(); // 这一步要把旧表改名让开
         assert!(
             has_column(&conn, "schedules", "anchor_at").unwrap(),
@@ -2001,6 +2009,123 @@ mod tests {
         );
     }
 
+    /// **旧 `schedules` 表是空的** → 直接 DROP，不留 `schedules_legacy`。
+    ///
+    /// 实测过真库副本：`schedules` 0 行时，改名留档会在用户目录里留下一个空的
+    /// `schedules_legacy` —— 纯噪音。有数据才留档（数据本身有价值）。
+    ///
+    /// 变异验证：把 `if rows == 0 { DROP }` 那段删掉（一律改名留档）→ 这条挂。
+    #[test]
+    fn an_empty_old_schedules_table_is_dropped_not_archived() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schedules (
+               id TEXT PRIMARY KEY, prompt TEXT NOT NULL, every_secs INTEGER, cron TEXT,
+               created_at INTEGER NOT NULL, handled_through INTEGER NOT NULL, paused_at INTEGER);",
+        )
+        .unwrap();
+        create_all(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            has_column(&conn, "schedules", "anchor_at").unwrap(),
+            "新表要建好"
+        );
+        assert!(
+            !has_column(&conn, "schedules_legacy", "id").unwrap(),
+            "空表不该留档（用户不该看到一个空的 schedules_legacy）"
+        );
+    }
+
+    /// **建表语句只有一份**：`create_all` 和 `migrate_schedules` 的重建用同一个常量。
+    ///
+    /// 这条钉的是「两处各抄一遍」这个技术债 —— 上一轮那个「升级上来库打不开」的
+    /// bug 根因就是建表语句和迁移逻辑不同步。
+    ///
+    /// **关键是三条路都要比**（第一版只比了前两条，`migrate_schedules` 那条漏了，
+    /// 于是「迁移里抄一份不同的 SQL」这个变异体**存活**）：
+    ///
+    /// 1. `create_all`（新库）
+    /// 2. `SCHEDULES_TABLE_SQL` 本身
+    /// 3. **`migrate_schedules` 从旧表重建出来的那张**
+    ///
+    /// 三条的 `sqlite_master.sql` 必须逐字相同。
+    #[test]
+    fn the_schedules_table_has_exactly_one_definition() {
+        let sql_of = |c: &Connection| -> String {
+            c.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='schedules'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("要有 schedules 表")
+        };
+        let cols_of = |c: &Connection| -> Vec<String> {
+            let mut st = c.prepare("PRAGMA table_info(schedules)").unwrap();
+            let it = st.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            it.collect::<rusqlite::Result<Vec<String>>>().unwrap()
+        };
+
+        // ① 新库（`create_all`）
+        let a = Connection::open_in_memory().unwrap();
+        create_all(&a).unwrap();
+        // ② 常量单独执行
+        let b = Connection::open_in_memory().unwrap();
+        b.execute_batch(SCHEDULES_TABLE_SQL).unwrap();
+        // ③ **旧表（有数据）→ migrate 走 RENAME 分支重建**
+        // ④ **旧表（空）→ migrate 走 DROP 分支重建**
+        // 两条分支各自 execute_batch 一次 `SCHEDULES_TABLE_SQL`，都要和常量一致。
+        let rebuild_via = |with_data: bool| -> Connection {
+            let c = Connection::open_in_memory().unwrap();
+            c.execute_batch(
+                "CREATE TABLE schedules (
+                   id TEXT PRIMARY KEY, prompt TEXT NOT NULL, every_secs INTEGER, cron TEXT,
+                   created_at INTEGER NOT NULL, handled_through INTEGER NOT NULL, paused_at INTEGER);",
+            )
+            .unwrap();
+            if with_data {
+                c.execute_batch(
+                    "INSERT INTO schedules(id,prompt,every_secs,created_at,handled_through)
+                     VALUES('t1','旧任务',60,1,1)",
+                )
+                .unwrap();
+            }
+            create_all(&c).unwrap();
+            migrate(&c).unwrap();
+            assert!(
+                has_column(&c, "schedules", "anchor_at").unwrap(),
+                "migrate 该把旧表换成当前形状"
+            );
+            c
+        };
+        let renamed = rebuild_via(true); // RENAME 分支
+        let dropped = rebuild_via(false); // DROP 分支
+
+        assert_eq!(sql_of(&a), sql_of(&b), "create_all vs 常量");
+        assert_eq!(
+            sql_of(&a),
+            sql_of(&renamed),
+            "**migrate_schedules 的 RENAME 分支必须用同一份 SQL**（不能自己抄一份）"
+        );
+        assert_eq!(
+            sql_of(&a),
+            sql_of(&dropped),
+            "**migrate_schedules 的 DROP 分支必须用同一份 SQL**"
+        );
+        assert_eq!(cols_of(&a), cols_of(&renamed), "重建后的列也要一致");
+        assert_eq!(
+            cols_of(&a),
+            vec![
+                "id",
+                "prompt",
+                "every_secs",
+                "cron",
+                "anchor_at",
+                "handled_through",
+                "paused_at"
+            ]
+        );
+    }
+
     /// `migrate()` 对**已经是当前形状**的库一句也不做（幂等）。
     ///
     /// 钉的是 `migrate_schedules` 那两个提前返回：少了它们，一个正常库每启动一次
@@ -2008,7 +2133,7 @@ mod tests {
     #[test]
     fn migrating_a_current_db_twice_changes_nothing() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        create_all(&conn).unwrap();
         migrate(&conn).unwrap();
         // 造一条任务，再 migrate 一次（模拟重启）
         conn.execute_batch(
@@ -2049,7 +2174,7 @@ mod tests {
              CREATE TABLE schedules_legacy (id TEXT PRIMARY KEY, prompt TEXT NOT NULL);",
         )
         .unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        create_all(&conn).unwrap();
         migrate(&conn).expect("不能被已存在的 schedules_legacy 挡死");
         assert!(has_column(&conn, "schedules", "anchor_at").unwrap());
         // 两份旧数据都还在（一个在 legacy，一个在 legacy2）
@@ -2347,7 +2472,7 @@ CREATE TABLE tickets (
     #[test]
     fn migration_on_a_fresh_db_without_tickets_table_is_a_noop() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        create_all(&conn).unwrap();
         migrate(&conn).expect("全新库不该因为「没有 tickets 表」而失败");
         // 再跑一遍（幂等）
         migrate(&conn).expect("第二遍也不该失败");
