@@ -58,17 +58,39 @@ fn me(sid: &str) -> &str {
     sid
 }
 
+// ---------------------------------------------------------------------------
+// 工具参数
+//
+// 每个工具都从一段 JSON 里抠几个字段。以前是九处手写的
+// `args.get("x").and_then(Value::as_str).unwrap_or("").trim()`，同一件事写九遍
+// —— 改一次语义（比如空串要不要算「没给」）得记得改九处。收敛成三个函数。
+// ---------------------------------------------------------------------------
+
+/// 取一个字符串字段（去掉首尾空白）。没给 / 类型不对都是空串。
+fn arg_str<'a>(args: &'a Value, key: &str) -> &'a str {
+    args.get(key).and_then(Value::as_str).unwrap_or("").trim()
+}
+
+/// 取一个 bool 字段。没给就是 `false`。
+fn arg_flag(args: &Value, key: &str) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// 取一个整数并夹到 `[min, max]`；没给 / 类型不对就用 `default`。
+fn arg_usize(args: &Value, key: &str, default: usize, min: usize, max: usize) -> usize {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .map_or(default, |n| (n as usize).clamp(min, max))
+}
+
 /// `list_tickets`：有哪些工作项、各自卡在哪。
 ///
 /// **只列这个 Router 名下的**。默认只看还开着的 —— Router 平时关心的就是
 /// 「还没完的」，翻旧账是另一种需求（`all: true`）。
 pub async fn list_tickets(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
-    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map_or(LIST_MAX, |n| (n as usize).clamp(1, LIST_MAX));
+    let all = arg_flag(args, "all");
+    let limit = arg_usize(args, "limit", LIST_MAX, 1, LIST_MAX);
 
     let db = state.db().ok_or("没有库，工作项不可用")?;
     let tickets = db
@@ -110,11 +132,7 @@ pub async fn list_tickets(core: &Core, from: &str, args: &Value) -> Reply {
 /// 要过程得显式要。
 pub async fn read_ticket(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
-    let id = args
-        .get("ticket_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
+    let id = arg_str(args, "ticket_id");
     if id.is_empty() {
         return Err("缺少参数 ticket_id（`list_tickets` 给的那些反引号里的串）".to_string());
     }
@@ -142,20 +160,18 @@ pub async fn read_ticket(core: &Core, from: &str, args: &Value) -> Reply {
     }
 
     // 执行记录：要了才给。它是「过程」，默认不给
-    let want = args
-        .get("what")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
+    let want = arg_str(args, "what");
     if want == "transcript" {
-        let lines = args
-            .get("lines")
-            .and_then(Value::as_u64)
-            .map_or(TRANSCRIPT_LINES_DEFAULT, |n| {
-                (n as usize).clamp(1, TRANSCRIPT_LINES_MAX)
-            });
+        let lines = arg_usize(
+            args,
+            "lines",
+            TRANSCRIPT_LINES_DEFAULT,
+            1,
+            TRANSCRIPT_LINES_MAX,
+        );
         let _ = writeln!(out);
-        match transcript(core, &t.session_id, lines).await {
+        match crate::agent::session_digest(core, &t.session_id, lines, TRANSCRIPT_LINE_CHARS).await
+        {
             Ok(text) => out.push_str(&text),
             Err(e) => {
                 let _ = writeln!(out, "执行记录读不出来：{e}");
@@ -212,65 +228,6 @@ fn stage_end(t: &Ticket) -> &'static str {
     }
 }
 
-/// 一个会话最近 `lines` 条消息，压成给模型看的一段。
-///
-/// 工具结果只留名字（`调用 bash`），不留输出 —— Router 要的是「它做到哪了」，
-/// 不是它跑过的每条命令的原文（那些要看就 `read_ticket ... what=transcript`
-/// 之后再问，或者干脆让它自己说）。
-async fn transcript(core: &Core, session_id: &str, lines: usize) -> Result<String, String> {
-    let state = &core.state;
-    // 消息可能不在内存里（stub）：读回来
-    state
-        .ensure_loaded(session_id)
-        .await
-        .map_err(|e| format!("{e:#}"))?;
-    let store = state.chat.read().await;
-    let Some(s) = store.get(session_id) else {
-        return Err("载体会话已经不在了".to_string());
-    };
-    if !s.resident() {
-        return Ok("（没有可读的消息）".to_string());
-    }
-    let msgs = &s.messages;
-    let start = msgs.len().saturating_sub(lines);
-    let mut out = format!("执行记录（最近 {lines} 条，共 {} 条）：\n", msgs.len());
-    if start > 0 {
-        let _ = writeln!(out, "（前面还有 {start} 条没显示）");
-    }
-    for m in &msgs[start..] {
-        match m {
-            crate::agent::ChatMessage::User { text, .. } => {
-                let _ = writeln!(
-                    out,
-                    "- 派活：{}",
-                    ticket::clip(text.trim(), TRANSCRIPT_LINE_CHARS)
-                );
-            }
-            crate::agent::ChatMessage::Assistant {
-                content,
-                reasoning,
-                tool_calls,
-                ..
-            } => {
-                let c = content.trim();
-                if !c.is_empty() {
-                    let _ = writeln!(out, "- 它：{}", ticket::clip(c, TRANSCRIPT_LINE_CHARS));
-                } else if !tool_calls.is_empty() {
-                    let names: Vec<&str> = tool_calls.iter().map(|t| t.name.as_str()).collect();
-                    let _ = writeln!(out, "- 它：调用 {}", names.join("、"));
-                } else if !reasoning.trim().is_empty() {
-                    let _ = writeln!(out, "- 它：（在思考）");
-                }
-            }
-            crate::agent::ChatMessage::Tool { .. } => {
-                // 工具输出是它自己的噪音，这里只要「跑过」
-            }
-            crate::agent::ChatMessage::System(_) => {}
-        }
-    }
-    Ok(out)
-}
-
 /// `dispatch`：开一个工作项并派出去。
 ///
 /// - 不给 `ticket_id` → **新建**一个工作项，给一个 worker 会话去干
@@ -282,11 +239,7 @@ async fn transcript(core: &Core, session_id: &str, lines: usize) -> Result<Strin
 /// 队列里等它）。同步等待就是把双层塌成一层。
 pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
-    let task = args
-        .get("task")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
+    let task = arg_str(args, "task");
     if task.is_empty() {
         return Err(
             "缺少参数 task（要它做什么，写成不知道前因后果的人也能看懂的样子）".to_string(),
@@ -296,12 +249,7 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     let db = state.db().ok_or("没有库，工作项不可用")?;
 
     // 再派一次：工作项已经在
-    let again = args
-        .get("ticket_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let again = arg_str(args, "ticket_id").to_string();
 
     if !again.is_empty() {
         let t = db
@@ -324,17 +272,12 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     }
 
     // 新建
-    let title = args
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let title = if title.is_empty() {
+    let given = arg_str(args, "title");
+    let title = if given.is_empty() {
         // 没给标题就用要求的前一段：模型经常只给 task，不能因此失败
-        ticket::clip(task.lines().next().unwrap_or("未命名").trim(), 40)
+        ticket::clip(task.lines().next().unwrap_or("未命名"), 40)
     } else {
-        ticket::clip(&title, 60)
+        ticket::clip(given, 60)
     };
 
     // **先看有没有模型**，再动会话：没配模型时派出去也没人跑，那就不该先建一个
@@ -343,18 +286,10 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
         return Err("还没配置模型，派出去的活没人能跑（先去设置里配一个）".to_string());
     };
 
-    // 新工作项一个自己的会话（上下文隔离：它看不到 Router 的对话）
-    let sid = {
-        let mut store = state.chat.write().await;
-        let s = crate::agent::ChatSession::with_role(Role::Worker);
-        let id = s.id.clone();
-        store.sessions.push(s);
-        if let Some(s) = store.get_mut(&id) {
-            s.title = title.clone();
-        }
-        id
-    };
-    state.mark_sessions_dirty();
+    // 新工作项一个自己的会话（上下文隔离：它看不到 Router 的对话）。
+    // `ensure_session("")` = 「没有现成的，新建一个」—— 和再派一次时
+    // 「沿用原来的、没了就新建」是同一段逻辑，不写两遍。
+    let sid = ensure_session(core, "", &title).await?;
 
     let tid = uuid::Uuid::now_v7().to_string();
     let now = crate::agent::now_ms();
@@ -411,14 +346,16 @@ async fn redispatch(
 /// 确认这条会话还在（不在了就新开一个，标题沿用）。
 async fn ensure_session(core: &Core, want: &str, title: &str) -> Result<String, String> {
     let state = &core.state;
-    {
+    // 空串 = 「一定新建」。先短路掉，省一次没用处的读锁，也让意图写在最前面。
+    if !want.is_empty() {
         let store = state.chat.read().await;
         if store.get(want).is_some_and(|s| s.role == Role::Worker) {
             return Ok(want.to_string());
         }
     }
+    // 写锁里再查一次：两个请求同时发现「没有」，不能各建一个
     let mut store = state.chat.write().await;
-    if store.get(want).is_some_and(|s| s.role == Role::Worker) {
+    if !want.is_empty() && store.get(want).is_some_and(|s| s.role == Role::Worker) {
         return Ok(want.to_string());
     }
     let s = crate::agent::ChatSession::with_role(Role::Worker);
@@ -480,24 +417,31 @@ pub async fn report_back(core: &Core, from_session: &str, said: &str, ok: bool, 
     if !t.open() {
         return;
     }
-    let report = if stopped {
-        Report::Progress
-    } else if ok {
-        Report::Ready
-    } else {
-        Report::Failed
-    };
     let text = if said.trim().is_empty() {
-        match report {
-            Report::Ready => "（这一轮没有输出）".to_string(),
-            Report::Failed => "这一轮失败了".to_string(),
-            _ => "（中途中止）".to_string(),
+        if stopped {
+            "（中途中止）".to_string()
+        } else if ok {
+            "（这一轮没有输出）".to_string()
+        } else {
+            "这一轮失败了".to_string()
         }
     } else {
         said.to_string()
     };
     let now = crate::agent::now_ms();
-    if let Err(e) = db.ticket_report(&tid, report, &text, now) {
+    // **停止走单独的跃迁**：它不是「做完」也不是「失败」，而是「没人再干了」。
+    // 走 `ticket_report(Progress)` 的话状态不变，工作项会永远停在「在干」。
+    let written = if stopped {
+        db.ticket_interrupted(&tid, &text, now)
+    } else {
+        db.ticket_report(
+            &tid,
+            if ok { Report::Ready } else { Report::Failed },
+            &text,
+            now,
+        )
+    };
+    if let Err(e) = written {
         tracing::warn!("记工作项汇报失败（Router 会收不到）: {e:#}");
         return;
     }
@@ -649,6 +593,71 @@ mod tests {
             "回执就是全部内容，不该再要一次工具调用：{}",
             q[0].text
         );
+    }
+
+    /// **回合真的开跑时，工作项必须从「排队中」变成「在干」。**
+    ///
+    /// 这是线上抓到的 bug：`dispatch` 之后的几秒（有时几分钟，那条会话正忙）里
+    /// 界面显示「排队中」是对的；但**开始跑了之后还显示「排队中」就是撒谎**。
+    /// 原来没有任何地方把 stage 设成 `Working` —— 工作项从建出来一直挂到 worker
+    /// 干完，中间全程 `Queued`。
+    #[tokio::test]
+    async fn the_ticket_turns_working_when_its_turn_really_starts() {
+        let (core, rid) = with_router("started").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+        assert_eq!(t.stage, Stage::Queued, "派完还没跑，该是排队中");
+
+        // 模拟回合开跑（`agent::turn_once` 开头做的就是这件事）
+        crate::ticket::mark_started(&core, &t.session_id).await;
+        assert_eq!(
+            db.ticket_get(&t.id).unwrap().unwrap().stage,
+            Stage::Working,
+            "开跑了就该是「在干」"
+        );
+
+        // 幂等：再来一次不会把已经是别的状态的工作项拉回来
+        db.ticket_report(&t.id, Report::Ready, "做完了", 0).unwrap();
+        crate::ticket::mark_started(&core, &t.session_id).await;
+        assert_eq!(
+            db.ticket_get(&t.id).unwrap().unwrap().stage,
+            Stage::WaitingReview,
+            "已经待验收的不该被「开跑」拉回在干"
+        );
+    }
+
+    /// **用户按停止 = 没人再干了**，不能留在「在干」。
+    ///
+    /// `Report::Progress` 有两种含义（还在动 / 被中止），让它顺带决定状态就是
+    /// 隐式状态机。停止走单独的 `ticket_interrupted`。
+    #[tokio::test]
+    async fn a_stopped_turn_never_leaves_the_ticket_working() {
+        let (core, rid) = with_router("stopped2").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let db = core.state.db().unwrap();
+        let t = db.ticket_list(&rid, true, 10).unwrap().pop().unwrap();
+        crate::ticket::mark_started(&core, &t.session_id).await;
+        assert_eq!(db.ticket_get(&t.id).unwrap().unwrap().stage, Stage::Working);
+
+        core.state.clear_llm();
+        report_back(&core, &t.session_id, "干到一半被叫停", true, true).await;
+
+        let after = db.ticket_get(&t.id).unwrap().unwrap();
+        assert_eq!(
+            after.stage,
+            Stage::Blocked,
+            "停下了就该等人，不能留在「在干」"
+        );
+        assert!(after.stage.needs_person(), "停下的事该有人看一眼");
     }
 
     /// **回执不截断。** worker 干完一件事写的那段报告就是全部的交付说明 ——

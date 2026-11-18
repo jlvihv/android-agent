@@ -3247,7 +3247,7 @@ async fn list_tickets(State(st): State<Arc<AppState>>, Query(q): Query<TicketsQu
             "needsPerson": t.stage.needs_person(),
             "open": t.open(),
             "report": t.report.map(|r| r.as_str()),
-            "preview": t.preview(200),
+            "preview": t.summary(200),
             "dispatches": t.dispatches,
             "createdAt": t.created_at,
             "updatedAt": t.updated_at,

@@ -51,27 +51,6 @@
   const dot = (t: TicketRow): string =>
     t.needsPerson ? "bg-warn" : t.open ? "bg-muted" : "bg-faint";
 
-  /**
-   * 预览压成**一行**。
-   *
-   * `/api/tickets` 给的 `preview` 是 200 字（模型要看全，界面不要）。一段 3000 字的
-   * 报告在面板上铺开就是灾难 —— 它会把聊天内容整个挤下去（实测：一个工作项占了
-   * 大半屏）。这里只取第一句 / 第一行、再压到 60 字，**要看全的点进去看会话**。
-   */
-  const oneLine = (t: TicketRow): string => {
-    const raw = (t.preview ?? "").trim();
-    if (!raw) return "";
-    // Markdown 的标题井号、表格的竖线、代码块的反引号都不是给人看的一行摘要
-    const first =
-      raw
-        .split(/\n/)
-        .map((l) => l.replace(/^[#>*\-\s]+/, "").trim())
-        .find((l) => l.length > 0) ?? "";
-    const clean = first.replace(/\|/g, " ").replace(/`/g, "");
-    const n = clean.length;
-    return n <= 60 ? clean : `${clean.slice(0, 60)}…`;
-  };
-
   /** 抬头那一句。一件事都没有时整块不显示（别占地方）。 */
   const summary = $derived(
     waiting > 0 ? `${working} 件在干，${waiting} 件等你` : `${working} 件在干`,
@@ -82,8 +61,15 @@
   <!-- 顶部留白：header 是浮层（`absolute top-0`），内容从它**下面**穿过去。
        不留这一截的话，抬头那句「N 件在干」会被菜单图标压住（踩过）。
        用和消息列表第一行同样的量：`--fade-top` 那一段 + header 自己的高度。 -->
+  <!-- 高度**必须有上限**：`main` 里它和 MessageList 是兄弟，而 MessageList 是
+       `h-full` —— 面板没上限的话两者加起来超过 100%，底部就被输入框盖住了
+       （线上抓到的 bug）。`max-h` 之后列表还拿 `h-full`，但多出来的部分会
+       被 `main` 裁掉，输入框的 `--composer-h` 留白才真的够用。 -->
   <div class="px-4 pb-1 pt-[calc(2.75rem+env(safe-area-inset-top))]">
-    <div class="rounded-2xl bg-surface px-3 py-2 text-sm" aria-label="在干的活">
+    <div
+      class="max-h-[38vh] overflow-y-auto overscroll-y-contain rounded-2xl bg-surface px-3 py-2 text-sm"
+      aria-label="在干的活"
+    >
       <p class="mb-1 flex items-center gap-1.5 text-xs text-faint">
         <Icon name="sparkle" size={12} class="shrink-0 text-muted" />
         <span>{summary}</span>
@@ -98,9 +84,9 @@
             <span class="min-w-0 flex-1">
               <span class="text-fg">{t.title}</span>
               <span class="ml-1.5 text-xs text-faint">{t.label}</span>
-              {#if oneLine(t)}
+              {#if t.preview}
                 <span class="block truncate text-xs text-muted"
-                  >{oneLine(t)}</span
+                  >{t.preview}</span
                 >
               {/if}
             </span>

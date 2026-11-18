@@ -1920,6 +1920,13 @@ async fn turn_once(
     tx: mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     let _guard = TurnGuard(core.clone(), sid.to_string());
+    // 这一轮如果是在干一个工作项，把它推到「在干」。
+    //
+    // **必须在这里**（回合真的开始了），不能在 `dispatch` 里：`dispatch` 只是把
+    // 消息排进队列，那条会话可能正忙着，几秒甚至几分钟之后才真正开跑。在
+    // `dispatch` 里就标「在干」等于撒谎（还没跑）；永远不标又会让界面一直显示
+    // 「排队中」（跑完了还显示排队中，那是之前的样子）。
+    crate::ticket::mark_started(core, sid).await;
     // 不活跃的会话消息不在内存里，先从库里读回来（回合进行中不会被放掉，
     // 见 `AppState::evict_idle`）
     core.state.ensure_loaded(sid).await?;
@@ -1979,6 +1986,68 @@ async fn turn_once(
     let said = last_assistant_text(core, sid).await;
     crate::router::report_back(core, sid, &said, res.is_ok(), turn.abort_requested()).await;
     res
+}
+
+/// 把一条会话最近 `lines` 条消息压成给人看的一段（Router 的「执行记录」）。
+///
+/// 和 `last_assistant_text` 放在一起：两个都是「会话消息 → 给人看的一段文字」，
+/// 属于会话自己的知识，不该让 `router` 模块去摸 `ChatMessage` 的内部结构
+///（它现在只调这个函数，不知道消息是 enum、有几个变体）。
+///
+/// 工具结果只留「调用过」：它是过程的噪音，Router 要的是「它做到哪了」。
+pub async fn session_digest(
+    core: &Core,
+    session_id: &str,
+    lines: usize,
+    line_chars: usize,
+) -> Result<String, String> {
+    let state = &core.state;
+    // 消息可能不在内存里（stub）：读回来
+    state
+        .ensure_loaded(session_id)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let store = state.chat.read().await;
+    let Some(s) = store.get(session_id) else {
+        return Err("载体会话已经不在了".to_string());
+    };
+    if !s.resident() {
+        return Ok("（没有可读的消息）".to_string());
+    }
+    let clip = |t: &str| crate::ticket::clip(t, line_chars);
+    let msgs = &s.messages;
+    let start = msgs.len().saturating_sub(lines);
+    let mut out = format!("执行记录（最近 {lines} 条，共 {} 条）：\n", msgs.len());
+    if start > 0 {
+        let _ = writeln!(out, "（前面还有 {start} 条没显示）");
+    }
+    for m in &msgs[start..] {
+        match m {
+            ChatMessage::User { text, .. } => {
+                let _ = writeln!(out, "- 派活：{}", clip(text.trim()));
+            }
+            ChatMessage::Assistant {
+                content,
+                reasoning,
+                tool_calls,
+                ..
+            } => {
+                let c = content.trim();
+                if !c.is_empty() {
+                    let _ = writeln!(out, "- 它：{}", clip(c));
+                } else if !tool_calls.is_empty() {
+                    let names: Vec<&str> = tool_calls.iter().map(|t| t.name.as_str()).collect();
+                    let _ = writeln!(out, "- 它：调用 {}", names.join("、"));
+                } else if !reasoning.trim().is_empty() {
+                    let _ = writeln!(out, "- 它：（在思考）");
+                }
+            }
+            // 工具输出是它自己的噪音，这里只要「跑过」
+            ChatMessage::Tool { .. } => {}
+            ChatMessage::System(_) => {}
+        }
+    }
+    Ok(out)
 }
 
 /// 这个会话最后一条助手消息的正文（回报给 Router 用）。

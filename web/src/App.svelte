@@ -393,13 +393,46 @@
    */
   $effect(() => {
     // 读一下让它成为依赖
-    if (isRouter && sessionId) void refreshTickets();
-    else {
+    if (!isRouter || !sessionId) {
       // 离开 Router 就清掉：worker 会话里不该残留上一段的工作项
       tickets = [];
       ticketWorking = 0;
       ticketWaiting = 0;
+      return;
     }
+    void refreshTickets();
+  });
+
+  /**
+   * 还有活在跑的时候，**定时看一眼**。
+   *
+   * 为什么非轮询不可：`chat.on("ended")` 只在**用户正看着的那条流**收尾时触发，
+   * 而工作项跑在**别的**会话里（worker 的流根本不在这个页面）。于是之前的表现是：
+   * 派完活，面板一直显示「排队中」，直到用户去点那条 worker 会话才更新。
+   *
+   * 只在这个前提下轮：
+   *   - 正在看 Router（别的会话不需要这份数据）
+   *   - 还有未结束的活（全结束就停 —— Router 那条平时是静止的，空转只是烧电）
+   *   - 页面可见（切到后台就别问了，回来那一下 `visibilitychange` 会补）
+   *
+   * 3 秒是权衡：一件活通常跑几十秒到几分钟，3 秒的滞后感觉不到；再快就是白烧流量。
+   */
+  const TICKETS_POLL_MS = 3000;
+  $effect(() => {
+    if (!isRouter || !sessionId) return;
+    // 每一件都结束了就没什么可看的了（但保留一次「全部完成」的收尾刷新）
+    const anyOpen = tickets.some((t) => t.open);
+    if (!anyOpen) return;
+
+    let stop = false;
+    const id = setInterval(() => {
+      if (stop) return;
+      if (document.visibilityState === "visible") void refreshTickets();
+    }, TICKETS_POLL_MS);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
   });
 
   /**
@@ -716,38 +749,46 @@
     <!-- 不要给 main 加 z-index：`z-0` 会形成层叠上下文，把里面
          弹出面板的 z-50 困住，压不过同级 z-20 的输入框（踩过）。
          z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
-    <main class="absolute inset-0">
+    <!-- `main` 是**竖向 flex**：上面的面板按自己需要占高（有上限），下面的消息列表
+         拿剩下的。以前是普通块级流 —— 面板 + `h-full` 的列表 = 超过 100%，
+         多出来的部分被输入框盖住（线上抓到的 bug）。`min-h-0` 不能省：
+         flex 子项默认 `min-height: auto`，列表的内部滚动会失效、整页跟着长。 -->
+    <main class="absolute inset-0 flex flex-col">
       {#if isRouter}
-        <!-- 协调层顶上那块「在干的活」。它不占消息流的位置（absolute 的 main 里面
-             正常走文档流），所以消息多了会自然把它顶上去。 -->
-        <TicketBoard
-          {tickets}
-          working={ticketWorking}
-          waiting={ticketWaiting}
-        />
+        <!-- 协调层顶上那块「在干的活」。`shrink-0`：它不能被压缩掉，
+             要收就收它自己内部的滚动（见 TicketBoard 的 `max-h`）。 -->
+        <div class="shrink-0">
+          <TicketBoard
+            {tickets}
+            working={ticketWorking}
+            waiting={ticketWaiting}
+          />
+        </div>
       {/if}
-      {#if messages.length === 0 && queuedMsgs.length === 0}
-        <!-- 空界面那一句按**这一层是谁**说：协调层说「派给我」，worker 说「想什么」。
+      <div class="min-h-0 flex-1">
+        {#if messages.length === 0 && queuedMsgs.length === 0}
+          <!-- 空界面那一句按**这一层是谁**说：协调层说「派给我」，worker 说「想什么」。
              同一句「来思考些什么?」放在 Router 上是不对的 —— Router 不思考、它派活。 -->
-        <h1
-          class="grid h-full place-items-center px-8 text-center text-2xl font-normal"
-        >
-          {isRouter ? "说点什么，它会把活派下去" : "来思考些什么?"}
-        </h1>
-      {:else}
-        <MessageList
-          {messages}
-          pending={queuedMsgs}
-          ondrop={dropQueued}
-          follow={current?.ownSend ?? 0}
-          session={sessionId}
-          hasolder={hasOlder}
-          onloadearlier={loadOlder}
-          onprefetch={prefetchOlder}
-          ontrim={trimOldPages}
-          step={MSG_WINDOW}
-        />
-      {/if}
+          <h1
+            class="grid h-full place-items-center px-8 text-center text-2xl font-normal"
+          >
+            {isRouter ? "说点什么，它会把活派下去" : "来思考些什么?"}
+          </h1>
+        {:else}
+          <MessageList
+            {messages}
+            pending={queuedMsgs}
+            ondrop={dropQueued}
+            follow={current?.ownSend ?? 0}
+            session={sessionId}
+            hasolder={hasOlder}
+            onloadearlier={loadOlder}
+            onprefetch={prefetchOlder}
+            ontrim={trimOldPages}
+            step={MSG_WINDOW}
+          />
+        {/if}
+      </div>
     </main>
 
     <!--

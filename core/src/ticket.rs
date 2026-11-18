@@ -154,14 +154,18 @@ impl Report {
         }
     }
 
-    /// 这个汇报把工作项推进到哪个状态。
-    pub const fn stage(self) -> Stage {
+    /// 这个汇报把工作项推进到哪个状态。`None` = **状态不变**。
+    ///
+    /// `Progress` 返回 `None`，不是 `Working`：它有两种来源，含义相反 ——
+    /// ①「还在动」（中途汇报），状态该保持原样；②「用户按了停止」（中途中止），
+    /// 那时工作项不该被说成「在干」（没人干了，也不会有人再汇报）。
+    /// 一开始把它硬映射成 `Working`，于是停止之后界面永远显示「在干」。
+    pub const fn stage(self) -> Option<Stage> {
         match self {
-            Self::Ready => Stage::WaitingReview,
-            Self::Blocked => Stage::Blocked,
-            Self::Failed => Stage::Failed,
-            // 还在动：状态不变（还是 Working）
-            Self::Progress => Stage::Working,
+            Self::Ready => Some(Stage::WaitingReview),
+            Self::Blocked => Some(Stage::Blocked),
+            Self::Failed => Some(Stage::Failed),
+            Self::Progress => None,
         }
     }
 }
@@ -201,19 +205,22 @@ impl Ticket {
         self.stage.open()
     }
 
-    /// 给人看的一行摘要（列表里的 `preview`）。
-    pub fn preview(&self, max: usize) -> String {
-        let text = self.result.trim();
-        if text.is_empty() {
-            return String::new();
-        }
-        clip(text, max)
-    }
-
-    /// 结果的第一句（`result` 可能很长，列表只要一句）
-    pub fn headline(&self) -> String {
-        let first = self.result.trim().lines().next().unwrap_or("").trim();
-        clip(first, 160)
+    /// 结果的一句话摘要（列表里那一行）。
+    ///
+    /// 取**第一行非空的**，压到 `max` 字。以前有两个几乎一样的方法
+    /// （`preview` 取全文再截、`headline` 取第一行），调用点各挑一个，读的人
+    /// 得先比一遍才知道差别 —— 合成一个，语义写在一处。
+    ///
+    /// 为什么是第一行而不是全文：一段 3000 字带表格的报告在列表里铺开就是把
+    /// 界面吃掉了（踩过）。要看全文的去 `read_ticket` / 那条会话。
+    pub fn summary(&self, max: usize) -> String {
+        let first = self
+            .result
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        clip(first, max)
     }
 }
 
@@ -295,20 +302,35 @@ impl Db {
         })
     }
 
-    /// 改状态（顺带推进 `updated_at`）。
-    pub fn ticket_set_stage(&self, id: &str, stage: Stage, at: u64) -> anyhow::Result<()> {
+    /// 回合真的开始了：`Queued` → `Working`。
+    ///
+    /// **这是唯一一处把工作项推到「在干」的地方**，而且必须绑在回合开始
+    /// （`begin_turn` 之后）—— 一开始没有这一步，工作项从建出来到 worker 干完
+    /// 一直停在 `Queued`，界面就一直显示「排队中」，而实际上早就在跑了。
+    ///
+    /// 只从 `Queued` 推（带 `WHERE stage = 'queued'`）：一个已经在 `WaitingReview`
+    /// 或者 `Blocked` 的工作项被再派一次时是 `dispatch` 自己把它改回 `Queued` 的，
+    /// 这里不抢。这条条件也是幂等的保证 —— 重复调用不会把 `Failed` 拉回 `Working`。
+    pub fn ticket_started(&self, id: &str, at: u64) -> anyhow::Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE tickets SET stage = ?2, updated_at = ?3 WHERE id = ?1",
-                rusqlite::params![id, stage.as_str(), at as i64],
+                "UPDATE tickets SET stage = ?2, updated_at = ?3
+                 WHERE id = ?1 AND stage = ?4",
+                rusqlite::params![
+                    id,
+                    Stage::Working.as_str(),
+                    at as i64,
+                    Stage::Queued.as_str()
+                ],
             )?;
             Ok(())
         })
     }
 
-    /// 记一次汇报：正文 + 类型 + 状态（状态由类型推出来）。
+    /// 记一次汇报：正文 + 类型（+ 状态，当这次汇报决定了新状态时）。
     ///
-    /// **`progress` 不动状态**：那是「它还在动」的信号，不是状态变化。
+    /// 状态推不推由 `Report::stage()` 决定 —— 它返回 `None` 的汇报（`progress`）
+    /// 只记正文和时刻，不动状态。
     pub fn ticket_report(
         &self,
         id: &str,
@@ -316,20 +338,41 @@ impl Db {
         text: &str,
         at: u64,
     ) -> anyhow::Result<()> {
-        let stage = report.stage();
-        self.with(|c| {
-            if report == Report::Progress {
-                // 只更新正文和时刻，stage 保持原样（可能还是 Queued 呢）
-                c.execute(
-                    "UPDATE tickets SET result = ?2, report = ?3, updated_at = ?4 WHERE id = ?1",
-                    rusqlite::params![id, text, report.as_str(), at as i64],
-                )?;
-            } else {
+        self.with(|c| match report.stage() {
+            Some(stage) => {
                 c.execute(
                     "UPDATE tickets SET result = ?2, report = ?3, stage = ?4, updated_at = ?5 WHERE id = ?1",
                     rusqlite::params![id, text, report.as_str(), stage.as_str(), at as i64],
                 )?;
+                Ok(())
             }
+            None => {
+                c.execute(
+                    "UPDATE tickets SET result = ?2, report = ?3, updated_at = ?4 WHERE id = ?1",
+                    rusqlite::params![id, text, report.as_str(), at as i64],
+                )?;
+                Ok(())
+            }
+        })
+    }
+
+    /// 中途中止：用户按了停止 / 回合被打断。**没人再干了**，所以不能留在 `Working`。
+    ///
+    /// 单独一个跃迁而不是靠 `Report::Progress` 推状态：那个既表示「还在动」也表示
+    /// 「被中止」，含义相反；让汇报类型去顺带决定状态就成了隐式状态机。
+    pub fn ticket_interrupted(&self, id: &str, text: &str, at: u64) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE tickets SET result = ?2, report = ?3, stage = ?4, updated_at = ?5
+                 WHERE id = ?1 AND stage IN ('queued', 'working')",
+                rusqlite::params![
+                    id,
+                    text,
+                    Report::Progress.as_str(),
+                    Stage::Blocked.as_str(),
+                    at as i64
+                ],
+            )?;
             Ok(())
         })
     }
@@ -452,6 +495,22 @@ impl Db {
     }
 }
 
+/// 这条会话这一轮如果是在干工作项，把它推到「在干」。
+///
+/// 在 `agent::turn_once` 的开头调 —— **回合真的开跑了**那一刻。`dispatch` 只是
+/// 把消息排进队列（那条会话可能正忙着），在那里标「在干」是撒谎。
+///
+/// 失败只记日志：工作项状态不准不该让一轮活跑不起来。
+pub async fn mark_started(core: &crate::Core, session_id: &str) {
+    let Some(db) = core.state.db() else { return };
+    let Ok(Some(tid)) = db.ticket_of_session(session_id) else {
+        return; // 不是在干工作项（用户自己开的会话 / Router 自己）
+    };
+    if let Err(e) = db.ticket_started(&tid, crate::agent::now_ms()) {
+        tracing::warn!("工作项没能标成「在干」（界面会一直显示排队中）: {e:#}");
+    }
+}
+
 /// 渲染一个工作项的一行（给模型看的）。
 ///
 /// 形状照抄 dsh 的 `ticketCard`：**紧凑 + 带 `read:` 指针**。
@@ -463,7 +522,7 @@ pub fn card(t: &Ticket) -> String {
             let _ = write!(line, "（还在动）");
         }
     }
-    let head = t.headline();
+    let head = t.summary(160);
     if !head.is_empty() {
         let _ = write!(line, "：{head}");
     }
