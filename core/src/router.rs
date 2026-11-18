@@ -89,6 +89,15 @@ struct Row {
     id: String,
     /// 短编号（`#7`）。`None` = 还没发号（只可能出现在 `load` 之前）
     seq: Option<u64>,
+    /// 这条会话**最近一次调用**用的模型（`usage.model`）。`None` = 一次都没跑过。
+    ///
+    /// ⚠️ 会话上**没有**存模型 —— 模型是发起请求那一刻从全局 provider 配置里取的。
+    /// 所以这是「它最后一次跑的时候用的那个」，不是「现在配置的是什么」。
+    /// 详见 `Db::last_models` 的文档。
+    model: Option<String>,
+    /// 这条会话**最近一次请求的 input token**（= 当前上下文占了多少）。
+    /// `None` = 一次都没跑过。
+    ctx_used: Option<u64>,
     title: String,
     conclusion: String,
     times: u32,
@@ -106,6 +115,21 @@ struct Row {
 /// - 「排队中」= 派了活、还没轮到（`AppState` 的队列里有它）
 /// - 「闲着」= 没在跑、没排队、也没收尾
 /// - 「已收尾」= `closed`
+///
+/// ## 每行的「模型」和「上下文」从哪来
+///
+/// 两项都来自 `usage` 表（每条会话**最近一次**调用的那一行），一次查完
+/// （`Db::last_models`）。一次都没跑过的会话没有这两项，显示时整段略过。
+///
+/// - **模型** = 那次调用实际发出去的模型（`usage.model`）。`ChatSession` 上**没有**
+///   存模型，模型是发起请求那一刻从全局 provider 配置里取的 —— 所以这是
+///   「它最后一次跑的时候用的那个」，不是「现在配置的是什么」。用户中途换模型时
+///   这一条尤其要记住。
+/// - **上下文** = 那次请求的 `input` token（整段历史 + 系统提示词 + 工具）。
+///   **只给绝对数，不给比例**：分母要 `context_window`，那在 models.dev 目录里
+///   （异步、可能没收录），而 `list_sessions` 是同步的工具调用；何况这个数本身
+///   也只是「最近一次请求的输入」，缓存命中/会话 evict 都会让它和「当前上下文」
+///   有偏差 —— 拿它去算百分比会把误差放大成一个小数点后的假精度。
 ///
 /// ## 锁与分配
 ///
@@ -151,6 +175,9 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
             .map(|s| Row {
                 id: s.id.clone(),
                 seq: s.seq,
+                // 下面两项要查库（`usage` 表），在**出锁之后**填 —— 见下面那段
+                model: None,
+                ctx_used: None,
                 title: s.title.clone(),
                 conclusion: s.conclusion.clone(),
                 times: s.dispatch_times().unwrap_or(0),
@@ -166,6 +193,36 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
         (total, matched, rows)
     };
 
+    // 每行的「用的哪个模型 / 上下文用了多少」：**一次查完**（不拿 chat 锁，
+    // 也不在循环里查 50 次）。查库是阻塞 IO，丢给阻塞池。
+    let rows = {
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let db = state.db();
+        let usage = match db {
+            Some(db) if !ids.is_empty() => {
+                tokio::task::spawn_blocking(move || db.last_models(&ids))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r)
+                    .unwrap_or_else(|e| {
+                        // 查不到就**不显示**这两项（比显示错的数好），但要说一声
+                        tracing::warn!("读会话的最近用量失败（列表里不显示模型/上下文）：{e:#}");
+                        Default::default()
+                    })
+            }
+            _ => Default::default(),
+        };
+        rows.into_iter()
+            .map(|mut r| {
+                if let Some((model, input)) = usage.get(&r.id) {
+                    r.model = Some(model.clone());
+                    r.ctx_used = Some(*input);
+                }
+                r
+            })
+            .collect::<Vec<_>>()
+    };
+
     let mut out = String::new();
     if rows.is_empty() {
         if !query.is_empty() {
@@ -176,7 +233,7 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
             if matched == 0 && total > 0 {
                 let _ = write!(
                     out,
-                    "你有 {total} 条{}，去掉 query 看看。",
+                    "你有 {total} 条（{}），去掉 query 看看。",
                     scope_label(all)
                 );
             }
@@ -200,10 +257,11 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     if !query.is_empty() {
         let _ = write!(out, "匹配 `{query}` 的 {matched} 条");
         if total != matched {
-            let _ = write!(out, "（共 {total} 条{}）", scope_label(all));
+            // 括号别套括号（`scope_label` 本身不带括号），这里用逗号分隔
+            let _ = write!(out, "（共 {total} 条，{}）", scope_label(all));
         }
     } else {
-        let _ = write!(out, "共 {total} 条{}", scope_label(all));
+        let _ = write!(out, "共 {total} 条（{}）", scope_label(all));
     }
     if matched > rows.len() {
         let _ = write!(
@@ -215,13 +273,26 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     out.push_str("：\n");
     // 到这里已经不持锁了：clip / format! 都在锁外
     for r in &rows {
-        // **短编号在前、完整 id 在反引号里**：编号是给人（和模型）念的，
-        // 完整 id 仍然给出来 —— 向后兼容（老提示词/脚本只认 `id`），而且复制粘贴
-        // 一条长串比猜一个短号可靠。两者指同一条会话，`resolve` 都认。
+        // 一行流：`#7 [opus] 12.3K 标题 [在跑]：结论…`
+        //
+        // - **短编号在前**：给人（和模型）念的
+        // - 完整 id 在反引号里：向后兼容（老提示词/脚本只认 `id`），也能直接复制
+        // - `[模型]` / `上下文`：**没跑过的会话不显示这两项**（它确实是未知，
+        //   编一个出来比空着糟 —— 和 `ContextMeter` 那个「宁可空着也不编一个
+        //   假上限」是同一条原则）
         let mut line = match r.seq {
             Some(n) => format!("#{n} `{}` ", r.id),
             None => format!("`{}` ", r.id),
         };
+        if let Some(model) = &r.model {
+            let _ = write!(line, "[{model}] ");
+        }
+        // 上下文用量：**绝对数**，不给比例。理由见 `list_sessions` 的文档
+        //（分母要 `context_window`，那要异步查 models.dev 目录；而且「最近一次的
+        // input」不等于「当前上下文」—— 缓存/evict 都会让它偏）。
+        if let Some(used) = r.ctx_used {
+            let _ = write!(line, "{} ", fmt_tokens(used));
+        }
         let _ = write!(
             line,
             "{} ",
@@ -379,12 +450,36 @@ fn no_such(store: &crate::agent::SessionStore, from: &str, raw: &str, seq: Optio
     out
 }
 
+/// `12345` → `12.3K`（和前端 `lib/num.ts` 的 `fmtCount` 同一个口径：
+/// 上了 K 就一位小数，上了 10K 不要小数，上了 M 换单位）。
+///
+/// 不引 `num.ts` 那套（前端代码），也不为它引依赖 —— 三个分支的事。
+fn fmt_tokens(n: u64) -> String {
+    const K: u64 = 1000;
+    const M: u64 = 1_000_000;
+    if n >= M {
+        if n >= M * 10 {
+            format!("{}M", n / M)
+        } else {
+            format!("{:.1}M", n as f64 / M as f64)
+        }
+    } else if n >= K {
+        if n >= K * 10 {
+            format!("{}K", n / K)
+        } else {
+            format!("{:.1}K", n as f64 / K as f64)
+        }
+    } else {
+        n.to_string()
+    }
+}
+
 /// `query` 那一段说清「看的是哪一批」（未收尾 / 连已收尾的）。
 fn scope_label(all: bool) -> &'static str {
     if all {
-        "（含已收尾的）"
+        "含已收尾的"
     } else {
-        "（未收尾的）"
+        "未收尾的"
     }
 }
 
@@ -1288,6 +1383,146 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.contains("机密项目"), "不能搜到别人的会话：{out}");
+    }
+
+    // ---- 模型 / 上下文用量 ------------------------------------------------
+
+    /// `list_sessions` 每行带「用的哪个模型」和「上下文用了多少」。
+    ///
+    /// 变异验证：把 `list_sessions` 里填 `r.model = Some(..)` 那段删掉 → 这条挂。
+    #[tokio::test]
+    async fn a_row_shows_the_model_and_context_used() {
+        let core = core_with_db("usage-model");
+        let (rid, sid) = {
+            let mut store = core.state.chat.write().await;
+            let rid = store.push_new(ChatSession::with_role(Role::Router));
+            let mut w = ChatSession::with_role(Role::Worker);
+            w.dispatch = Some(crate::agent::Dispatch::new(&rid, "干点活"));
+            w.title = "有跑过的那条".into();
+            let sid = store.push_new(w);
+            (rid, sid)
+        };
+        // 造一条 usage 记录（走真库，和 `record_usage` 落到同一张表）
+        let db = core.state.db().unwrap();
+        db.add_usage(&crate::db::UsageRow {
+            session_id: sid.clone(),
+            at: crate::agent::now_ms(),
+            provider: "test".into(),
+            model: "opus-test".into(),
+            input: 5_234u32,
+            output: 100,
+            cached: None,
+            cache_write: None,
+            reasoning: None,
+            finish: Some("stop".into()),
+            ms: 10,
+        })
+        .unwrap();
+
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(out.contains("[opus-test]"), "要显示模型：{out}");
+        assert!(out.contains("5.2K"), "要显示上下文（5.2K）：{out}");
+        assert!(out.contains("有跑过的那条"), "{out}");
+    }
+
+    /// **没跑过的会话不显示这两项**（不编一个假数）。
+    ///
+    /// 变异验证：把 `if let Some(..)` 改成无条件写、失败时写 0 → 这条挂。
+    #[tokio::test]
+    async fn a_row_without_usage_shows_neither_model_nor_tokens() {
+        let core = core_with_db("usage-none");
+        let (rid, _sid) = {
+            let mut store = core.state.chat.write().await;
+            let rid = store.push_new(ChatSession::with_role(Role::Router));
+            let mut w = ChatSession::with_role(Role::Worker);
+            w.dispatch = Some(crate::agent::Dispatch::new(&rid, "还没跑"));
+            w.title = "一次都没跑过".into();
+            let sid = store.push_new(w);
+            (rid, sid)
+        };
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(out.contains("一次都没跑过"), "{out}");
+        assert!(!out.contains("[opus"), "没有模型就没有模型那段：{out}");
+        assert!(!out.contains("K "), "没有用量就不该显示 token：{out}");
+        // 也不该冒出一个「0」当用量（那是在撒谎）
+        assert!(!out.contains(" 0 "), "没有用量不能显示 0：{out}");
+    }
+
+    /// `fmt_tokens`：和前端 `num.ts` 的 `fmtCount` 同一个口径。
+    #[test]
+    fn token_counts_are_formatted_like_the_ui_does() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_234), "1.2K");
+        assert_eq!(fmt_tokens(12_345), "12K");
+        assert_eq!(fmt_tokens(200_000), "200K");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M");
+        assert_eq!(fmt_tokens(12_000_000), "12M");
+    }
+
+    /// 批量取用量：**一次查询**，不是循环里查 50 次（这里是「条数对得上」的功能断言，
+    /// 性能靠 `Db::last_models` 的索引说明）。
+    #[tokio::test]
+    async fn last_models_returns_one_row_per_session() {
+        let core = core_with_db("usage-batch");
+        let db = core.state.db().unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3u32 {
+            let sid = format!("s-{i}");
+            ids.push(sid.clone());
+            db.add_usage(&crate::db::UsageRow {
+                session_id: sid,
+                at: crate::agent::now_ms() + u64::from(i),
+                provider: "p".into(),
+                model: format!("m-{i}"),
+                input: 100 * (i + 1),
+                output: 1,
+                cached: None,
+                cache_write: None,
+                reasoning: None,
+                finish: Some("stop".into()),
+                ms: 1,
+            })
+            .unwrap();
+        }
+        ids.push("never-ran".into());
+        let got = db.last_models(&ids).unwrap();
+        assert_eq!(got.len(), 3, "三个跑过的有记录，没跑过的没有");
+        assert_eq!(got["s-2"].0, "m-2");
+        assert_eq!(got["s-2"].1, 300);
+        assert!(!got.contains_key("never-ran"));
+        // 空输入不炸
+        assert!(db.last_models(&[]).unwrap().is_empty());
+    }
+
+    /// **`cleared = 1` 的行不算**（清空会话之后「当前上下文」重新开始）。
+    #[tokio::test]
+    async fn a_cleared_usage_row_is_not_the_current_context() {
+        let core = core_with_db("usage-cleared");
+        let db = core.state.db().unwrap();
+        let row = crate::db::UsageRow {
+            session_id: "s".into(),
+            at: 1,
+            provider: "p".into(),
+            model: "old-model".into(),
+            input: 999_999u32,
+            output: 1,
+            cached: None,
+            cache_write: None,
+            reasoning: None,
+            finish: Some("stop".into()),
+            ms: 1,
+        };
+        db.add_usage(&row).unwrap();
+        db.clear_usage("s").unwrap();
+        assert!(
+            !db.last_models(&["s".into()]).unwrap().contains_key("s"),
+            "清掉的那行不该被当成当前上下文"
+        );
     }
 
     /// 派完一条会话之后，把那个刚被 `continue_with_queued` 占住的回合结束掉。

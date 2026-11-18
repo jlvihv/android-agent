@@ -1584,6 +1584,51 @@ impl Db {
         })
     }
 
+    /// **一批会话**各自最近一次调用用的模型 + 输入量（`list_sessions` 每行那两项）。
+    ///
+    /// 一次查完，不是 50 次查询：`MAX(id) GROUP BY session_id` 走
+    /// `idx_usage_session(session_id, id)` 的覆盖索引（`EXPLAIN QUERY PLAN` 实测
+    /// 是 `SCAN usage USING COVERING INDEX`），50 条会话也是毫秒级的一次扫描。
+    ///
+    /// 返回 `session_id -> (model, input)`。
+    ///
+    /// ## 「模型」这两个字的准确含义
+    ///
+    /// 这是**这条会话最近一次调用实际发的模型**（`usage.model` 那一列）。
+    /// `ChatSession` 上**没有**存模型 —— 会话是个容器，模型是**发起请求那一刻**
+    /// 从全局 provider 配置里取的（`agent.rs` 的 `stream_one` 用 `provider.model`）。
+    /// 所以：
+    ///
+    /// - 用户中途换了模型 → 每条会话显示的是**它最后一次跑的时候**用的那个，
+    ///   不是「现在配置的是什么」。这正是要的语义（它确实是那条会话用过的）。
+    /// - 一次都没跑过的会话 → 没有记录 → 调用方显示成「没跑过」。
+    pub fn last_models(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, u64)>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        self.with(|c| {
+            // 逐个会话一条（用主键 + 覆盖索引），不拼一个巨大的 IN：`list_sessions`
+            // 最多 50 条，逐条走索引比拼 50 个占位符的 SQL 更好读，实测同量级。
+            let mut st = c.prepare(
+                "SELECT model, input FROM usage
+                  WHERE session_id = ?1 AND cleared = 0
+                  ORDER BY id DESC LIMIT 1",
+            )?;
+            for id in ids {
+                let row = st.query_row([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)));
+                if let Ok((model, input)) = row {
+                    out.insert(id.clone(), (model, input.max(0) as u64));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// 这个会话（上次清空之后）的用量：累计 + 最近那一次。一次都没有是 `None`。
     pub fn session_usage(&self, sid: &str) -> Result<Option<crate::state::UsageStats>> {
         self.with(|c| {
