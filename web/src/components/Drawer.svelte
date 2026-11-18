@@ -50,6 +50,8 @@
     count: number;
     /** 这个会话有回合在跑（可以同时在几个会话里各跑一个） */
     busy?: boolean;
+    /** `router` = 协调层：图标不同、不能改名、不能删（见列表里那段） */
+    role?: "worker" | "router";
   };
   /** 搜索命中（GET /api/search） */
   export type Hit = {
@@ -537,8 +539,14 @@
             class="my-1 w-full rounded-2xl bg-active px-3 py-3 text-base text-fg outline-none"
           />
         {:else}
+          {@const isRouter = s.role === "router"}
           <button
-            onpointerdown={(e) => pressStart(e, "session", s.id)}
+            onpointerdown={(e) => {
+              // 协调层不弹长按菜单：它不能重命名、也不能删（见 App 的
+              // `deleteSession`，那里也拦了一道）。按住还是能点开它。
+              if (isRouter) return;
+              pressStart(e, "session", s.id);
+            }}
             onpointerup={pressEnd}
             onpointercancel={pressEnd}
             oncontextmenu={(e) => e.preventDefault()}
@@ -549,8 +557,19 @@
             class="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left
                    {s.id === current ? 'bg-active' : ''}"
           >
-            <Icon name="chat" size={18} class="shrink-0 text-muted" />
-            <span class="min-w-0 flex-1 truncate text-base">{s.title}</span>
+            <!-- 协调层用四角星，跟 worker 那个气泡分开：一眼看得出「这条不是干活的，
+                 是派活的」。颜色也用 fg 而不是 muted —— 它是入口，不是第 N 条历史。 -->
+            <Icon
+              name={isRouter ? "sparkle" : "chat"}
+              size={18}
+              class="shrink-0 {isRouter ? 'text-fg' : 'text-muted'}"
+            />
+            <span
+              class="min-w-0 flex-1 truncate text-base
+                     {isRouter ? 'font-medium' : ''}"
+            >
+              {isRouter ? s.title || "协调" : s.title}
+            </span>
             {#if s.busy}
               <!-- 还在跑：切走了也看得出来 -->
               <span

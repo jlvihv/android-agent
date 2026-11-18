@@ -154,16 +154,72 @@
    */
   const list = new SessionList();
   const sessions = $derived(list.items);
+
+  /**
+   * 现在看的是不是协调层（Router）。
+   *
+   * 从**列表里那一行**的 `role` 判，而不是拿 id 跟 `routerId` 比：
+   * `routerId` 是异步拿到的、可能还是空串（首屏那一帧），而列表里那行是
+   * 已经渲染出来的事实。两边不一致时以列表为准 —— 界面画的就是它。
+   */
+  const isRouter = $derived(
+    !!sessionId &&
+      sessions.some((s) => s.id === sessionId && s.role === "router"),
+  );
   const loadSessions = (force = false) => list.load(force);
   const loadMoreSessions = () => void list.more();
 
+  /**
+   * 协调层那个会话的 id（`POST /api/router`，幂等：没有就建，有就返回同一个）。
+   *
+   * 缓存住：一屏里会问好几次（首屏、点新对话、删完会话），而它永远只有一个。
+   * 不用 `$state`：它不驱动渲染，只是个 id。
+   */
+  let routerId = "";
+
+  /** 拿协调层会话的 id（失败返回 `""`，调用方按「没有」处理）。 */
+  async function ensureRouter(): Promise<string> {
+    if (routerId) return routerId;
+    try {
+      const d = await post<{ id?: string }>("/api/router");
+      routerId = d.id ?? "";
+    } catch {
+      /* 拿不到就当没有：退回原来「空对话」的行为，不该因此开不了 App */
+    }
+    return routerId;
+  }
+
+  /**
+   * 点头部的「新对话」。
+   *
+   * **双层之后它回到 Router**，不是回到空输入框：用户想说的是「我有新的事」，
+   * 而「新的事」该交给协调层去派 —— 直接把他丢进一个 worker 的空对话，
+   * 等于绕过了那一层，Vec 也就白做了。
+   *
+   * `syncUrl` 用 push（跟用户点一下 Router 那条一模一样，后退能回上一条会话）。
+   * 不能先 `clearUrl()`：那会压一格「回到空对话」，用户按后退会先看到空对话
+   * —— 而他根本没去过那里。
+   *
+   * 拿不到 Router（没配模型 / 请求失败）就退回老行为：空对话 + 清地址。
+   */
   function newSession() {
-    // **不请求服务端**：新会话到第一句话才建（`Chat#send` 里那段），这里只把
-    // 草稿清空 —— 点了不发就不会攒出一堆空会话。
-    chat.newDraft();
-    // 新会话还没有 id：地址收回根路径（不带 id 的 `/` 就是「新对话」的意思）
-    clearUrl();
     drawer = false;
+    void (async () => {
+      const id = await ensureRouter();
+      if (!id) {
+        // 没有协调层：跟以前一样，清草稿、回根路径
+        chat.newDraft();
+        clearUrl();
+        return;
+      }
+      if (chat.viewing === id) {
+        // 已经在 Router 上了：**什么都不做**。Router 的历史要留着（那是
+        // 「派过哪些活」的来路，清掉它就断片了）。地址本来也是对的。
+        return;
+      }
+      chat.show(id);
+      syncUrl(id);
+    })();
   }
 
   /**
@@ -210,6 +266,13 @@
    * 删别的时候什么都不用动：列表重拉一次，当前会话原样留着。
    */
   async function deleteSession(id: string) {
+    // **协调层删不掉**：它是「唯一的那个」（服务端 `POST /api/router` 幂等，
+    // id 记在 `meta.router_session` 里）。删了之后 `ensureRouter` 会重建一个
+    // 新的、换新 id，看起来就像「Router 不见了又出现」，而且它派出去的活
+    // 全成了孤儿（`dispatched` 表里 `by_session` 指向一个不存在的会话）。
+    // 界面上也不该有这条路径 —— Drawer 那边同样过滤掉（见那里的长按菜单）。
+    if (sessions.some((s) => s.id === id && s.role === "router")) return;
+
     const isCurrent = id === sessionId;
     // 这条会话没了：消息、流、它排着的队一起丢掉（`forget` 里做）
     chat.forget(id);
@@ -219,8 +282,17 @@
       /* 删不掉的话下一次拉列表它还在，界面不会撒谎 */
     }
     if (isCurrent) {
-      // 地址也收回根：`/s/<删掉的那条>` 是个死链接了
-      clearUrl();
+      // 当前那条被删了：回 Router（双层里那是唯一的「家」）。
+      // 拿不到 Router（没配模型）才退回空对话 —— 跟以前一样。
+      routerId = ""; // 万一是 Router 自己（不该走到，防御一下），下次重新问
+      const home = await ensureRouter();
+      if (home) {
+        chat.show(home);
+        syncUrl(home, true);
+      } else {
+        chat.show("");
+        clearUrl();
+      }
     }
     await Promise.all([loadSessions(true), current?.load()]);
   }
@@ -247,9 +319,32 @@
       // 先给首屏这条 history 打上我们的标记 —— 否则「从第一条会话后退回首屏」
       // 时那条 `state` 是 null，路由判据认不出来（见 `markCurrentEntry`）。
       markCurrentEntry();
-      // `chat.show("")` = 空对话（`/` 就是「新对话」）。没带 id 时也要走一趟：
-      // `viewing` 得有个确定的值，界面才不会停在「还没初始化」上。
-      chat.show(sessionFromPath() ?? "");
+      const want = sessionFromPath();
+      if (want) {
+        // 地址栏点名了一条会话（刷新 / 分享 / 从历史回来）：就看它
+        chat.show(want);
+      } else {
+        // **没点名 → 打开协调层（Router）**，这是双层架构的入口。
+        //
+        // 以前这里是 `chat.show("")`（空对话）：冷启动就是「来思考些什么?」。
+        // 双层之后那样不对 —— 用户面对的第一个对象应该是一个**对话**，
+        // 而不是一个空输入框（空输入框只对「我自己要打字」成立，而 Router 那条
+        // 才是「这里可以说话、它会把活派下去」的地方）。
+        //
+        // 先把 `viewing` 设成空（界面有个确定的值，不停在「还没初始化」上），
+        // 再去问 Router 的 id。拿不到（没配模型、请求失败）就**留在空对话**上
+        // —— 那时候双层本来就不成立，空对话是唯一说得通的状态。
+        chat.show("");
+        void (async () => {
+          const id = await ensureRouter();
+          // 这期间用户可能已经自己点了一条会话 / 地址变了：别把它的选择覆盖掉。
+          // 判据是「还停在 `""` 上、地址还是 `/`」—— 两条都成立才切过去。
+          if (id && !chat.viewing && !sessionFromPath()) {
+            chat.show(id);
+            syncUrl(id, true); // replace：首屏这一下不该在历史里留一格
+          }
+        })();
+      }
       void loadSessions();
     }),
   );
@@ -374,9 +469,12 @@
   // 它们按「**还没发出去**的用户消息」渲染（`done: false`）—— 消息列表里就是
   // 普通用户气泡的样子，只多一圈虚线和左边一个 ×（详见 `Queued` 的注释）。
   const queuedMsgs = $derived(
-    queued.map(
-      (q): Message => ({ id: q.id, role: "user", parts: q.parts, done: false }),
-    ),
+    queued.map((q): Message => ({
+      id: q.id,
+      role: "user",
+      parts: q.parts,
+      done: false,
+    })),
   );
 
   // 左上角那个菜单按钮：窄屏是开抽屉；宽屏是**收 / 展**侧边栏
@@ -564,8 +662,12 @@
          z-auto 的定位元素不建层叠上下文，浮层的 z-10 依旧在它上面。 -->
     <main class="absolute inset-0">
       {#if messages.length === 0 && queuedMsgs.length === 0}
-        <h1 class="grid h-full place-items-center text-2xl font-normal">
-          来思考些什么?
+        <!-- 空界面那一句按**这一层是谁**说：协调层说「派给我」，worker 说「想什么」。
+             同一句「来思考些什么?」放在 Router 上是不对的 —— Router 不思考、它派活。 -->
+        <h1
+          class="grid h-full place-items-center px-8 text-center text-2xl font-normal"
+        >
+          {isRouter ? "说点什么，它会把活派下去" : "来思考些什么?"}
         </h1>
       {:else}
         <MessageList

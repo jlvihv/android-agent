@@ -96,7 +96,10 @@ describe("more（游标分页）", () => {
   });
 
   test("滚到底会反复触发：别叠请求", async () => {
-    const calls = fakeApi([{ sessions: [], next: "c" }, { sessions: [], next: null }]);
+    const calls = fakeApi([
+      { sessions: [], next: "c" },
+      { sessions: [], next: null },
+    ]);
     const list = new SessionList();
     await list.load();
     await Promise.all([list.more(), list.more(), list.more()]);
@@ -132,5 +135,59 @@ describe("more（游标分页）", () => {
     await pending;
     expect(calls.length).toBe(2);
     expect(list.items.map((s) => s.id)).toEqual(["a"]);
+  });
+});
+
+/**
+ * 协调层（router）永远排第一。
+ *
+ * 这是**界面的呈现决定**，不是服务端的排序：服务端按创建时间倒序是为了位置稳定
+ * （见 core 的 `list_page`），而「Router 钉在最上面」只有这个界面要。放在前端做，
+ * 服务端不用为某一个客户端让步。
+ */
+describe("协调层永远第一条", () => {
+  const r = (id: string): Session => ({
+    id,
+    title: id,
+    count: 1,
+    role: "router",
+  });
+  const w = (id: string): Session => ({
+    id,
+    title: id,
+    count: 1,
+    role: "worker",
+  });
+
+  test("首屏：router 在中间也会被挪到第一条", async () => {
+    // 服务端按创建时间倒序给：worker 比 router 新，所以 router 在中间
+    fakeApi([{ sessions: [w("a"), r("R"), w("b")] }]);
+    const list = new SessionList();
+    await list.load();
+    expect(list.items.map((s) => s.id)).toEqual(["R", "a", "b"]);
+  });
+
+  test("没有 router 时原样不动（顺序完全交给服务端）", async () => {
+    fakeApi([{ sessions: [w("a"), w("b")] }]);
+    const list = new SessionList();
+    await list.load();
+    expect(list.items.map((s) => s.id)).toEqual(["a", "b"]);
+  });
+
+  test("翻页追加页里混进 router：仍然只有一条在最前，不会出现两个「第一条」", async () => {
+    fakeApi([
+      { sessions: [r("R"), w("a")], next: "cur" },
+      // 第二页理论上不会有 router，但万一有也不该插在中间
+      { sessions: [w("x"), r("R2")], next: null },
+    ]);
+    const list = new SessionList();
+    await list.load();
+    await list.more();
+    expect(list.items.map((s) => s.id)).toEqual(["R", "R2", "a", "x"]);
+  });
+
+  test("纯函数本身：无 router 返回原数组（不白拷一份）", () => {
+    const v = [w("a"), w("b")];
+    expect(SessionList.pinRouter(v)).toBe(v);
   });
 });

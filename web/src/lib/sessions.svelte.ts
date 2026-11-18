@@ -28,6 +28,13 @@ export type Session = {
   count: number;
   /** 这条会话此刻有没有回合在跑（那个闪烁的小圆点） */
   busy?: boolean;
+  /**
+   * 这一层是谁（`worker` 干活 / `router` 协调）。
+   *
+   * 协调层那条**永远排第一**（见 `items` 的排序），且删不掉 —— 它是「唯一的那个」
+   * （服务端 `POST /api/router` 幂等，`meta.router_session` 记着它的 id）。
+   */
+  role?: "worker" | "router";
 };
 
 /** 刚落地那份的安静窗口：窗口内再来要就直接复用它 */
@@ -41,7 +48,31 @@ const MERGE_MS = 300;
 const INFLIGHT_MAX_MS = 10_000;
 
 export class SessionList {
+  /**
+   * 抽屉里那份列表。**协调层（router）永远第一条** —— 赋值一律走 `pinRouter()`。
+   *
+   * 为什么在前端排而不是让服务端排：服务端那次排序是给**所有**消费者用的
+   * （侧边栏、搜索、CLI），它按创建时间排是为了「位置稳定」。而「Router 钉在最上面」
+   * 是**这一个界面**的呈现决定 —— 换个客户端可能想放在别处。放在这里改一处就够，
+   * 服务端也不用为某一个前端让步。
+   */
   items = $state<Session[]>([]);
+
+  /**
+   * 把协调层那条挪到最前面。其余保持原顺序。
+   *
+   * `items` 的两个赋值点（首屏 `load`、翻页 `more`）都要过它：第二页里哪怕混进一条
+   * router（不该有，但万一），也会被顶回第一条，不会出现两个「第一条」。
+   *
+   * 不用 getter/setter 包 `items`：Svelte 5 的 `$state` 编译期只处理字段声明，
+   * 一个 accessor 对里的 `$state` 语义容易出岔子（读得到、但依赖追踪不跟手）。
+   * 显式在赋值点调一个纯函数，读的人一眼看得出「排序在哪发生」。
+   */
+  static pinRouter(v: Session[]): Session[] {
+    const router = v.filter((s) => s.role === "router");
+    if (router.length === 0) return v;
+    return [...router, ...v.filter((s) => s.role !== "router")];
+  }
   /**
    * 第一页之后的游标（`/api/sessions` 的 `next`）。`null` = 已经到底 / 还没拉过。
    *
@@ -112,7 +143,7 @@ export class SessionList {
         const d = await api<{ sessions?: Session[]; next?: string | null }>(
           `/api/sessions${keep ? `?tail=${keep}` : ""}`,
         );
-        this.items = d.sessions ?? [];
+        this.items = SessionList.pinRouter(d.sessions ?? []);
         // 整份重来：游标也跟着回到第一页之后（之前翻出来的那些没了）
         this.next = d.next ?? null;
         this.moreError = false;
@@ -151,10 +182,10 @@ export class SessionList {
       if (this.next !== cursor || this.items.length !== at) return;
       // 按 id 去重：翻页期间新建的会话会顶到最前面，理论上不该重复，但宁可少一行
       const have = new Set(this.items.map((s) => s.id));
-      this.items = [
+      this.items = SessionList.pinRouter([
         ...this.items,
         ...(d.sessions ?? []).filter((s) => !have.has(s.id)),
-      ];
+      ]);
       this.next = d.next ?? null;
     } catch {
       // **不要**静默：以前这里什么都不做，界面上那行「载入中…」既没变成错误、
