@@ -67,15 +67,13 @@ export class QueueMirror {
     const hoping = this.items.filter((q) => q.pending && q.sid === sid);
     const merged = [
       ...this.items.filter((q) => q.sid !== sid),
-      ...next.map(
-        (m): Queued => ({
-          id: m.id,
-          sid,
-          parts: m.parts,
-          fromWorker: m.fromWorker,
-          fromSchedule: m.fromSchedule,
-        }),
-      ),
+      ...next.map((m): Queued => ({
+        id: m.id,
+        sid,
+        parts: m.parts,
+        fromWorker: m.fromWorker,
+        fromSchedule: m.fromSchedule,
+      })),
       ...hoping,
     ];
     // **没变就别换数组**：`load()` 每 1.5 秒轮询一次，服务端绝大多数时候回的是

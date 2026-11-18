@@ -205,7 +205,9 @@
     {#each list as s (s.id)}
       {#if editingId === s.id}
         <!-- 编辑态：整行换成表单（不新开浮层 —— 手机上多一层就多一次点错） -->
-        <div class="flex flex-col gap-2 border-b-2 border-ink px-3.5 py-3 last:border-b-0">
+        <div
+          class="flex flex-col gap-2 border-b-2 border-ink px-3.5 py-3 last:border-b-0"
+        >
           <input
             bind:value={editPrompt}
             placeholder="到点要对协调层说什么"
@@ -273,8 +275,7 @@
           class="flex items-center gap-3 border-b-2 border-ink px-3.5 py-3 last:border-b-0"
         >
           <span class="min-w-0 flex-1">
-            <span
-              class="line-clamp-2 text-row {s.paused ? 'text-muted' : ''}"
+            <span class="line-clamp-2 text-row {s.paused ? 'text-muted' : ''}"
               >{s.prompt}</span
             >
             <span class="block text-meta text-faint">
@@ -325,7 +326,13 @@
       >
       {#if mode === "every"}
         <span class="text-meta text-muted">每</span>
-        <input bind:value={minutes} type="number" min="1" max="43200" class={num} />
+        <input
+          bind:value={minutes}
+          type="number"
+          min="1"
+          max="43200"
+          class={num}
+        />
         <span class="text-meta text-muted">分钟</span>
       {:else}
         <input
