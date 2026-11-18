@@ -97,13 +97,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/router", post(router_session))
         // 某个 Router 派出去的会话（带每条的 state / label）。
         //
-        // ⚠️ **前端已不调它**：原来 Router 顶上那个「在干的活」看板已经删掉了
-        // （它的信息现在由 `/api/sessions` 每行的 `state` 承载，见那边的注释）。
+        // ⚠️ **当前没有已知的前端或脚本消费者。**
+        //
+        // 原来 Router 顶上那个「在干的活」看板调它，那个看板已经删掉了 ——
+        // 它表达的信息现在由 `/api/sessions` 每行的 `state` 承载（见那边的注释）。
+        //
         // 保留是因为：
-        //   - 它给 `scripts/agentctl.py` 之类的调试脚本用（带 `all=1` 能看到
-        //     收尾过的，`/api/sessions` 那份不带这个维度）；
+        //   - 它有 `all=1` 这个维度（连已收尾的一起列），而 `/api/sessions` 没有；
         //   - 刚经审查、有测试覆盖，删了要重新写回来成本更高。
-        // 真要删，得一并处理上面那些消费者 —— 别只删这条 route。
+        //
+        // 真要删，得一并处理那些**可能的外部使用者**（调试脚本、别处的客户端）——
+        // 别只删这条 route。
         .route("/api/sessions/dispatched", get(list_dispatched_sessions))
         .route("/api/search", get(search_sessions))
         .route("/api/sessions/rename", post(rename_session))
