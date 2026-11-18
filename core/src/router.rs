@@ -50,14 +50,6 @@ const LIST_MAX: usize = 50;
 /// 工具调用的结果：给模型看的那段文本。
 pub type Reply = Result<String, String>;
 
-/// 现在在哪儿（Router 自己的会话 id）。
-///
-/// 工作项按 `router_id` 分组 —— 一个部署只有一个 Router，但库里记着这件事，
-/// 将来多 Router 时不用改表。
-fn me(sid: &str) -> &str {
-    sid
-}
-
 // ---------------------------------------------------------------------------
 // 工具参数
 //
@@ -94,10 +86,10 @@ pub async fn list_tickets(core: &Core, from: &str, args: &Value) -> Reply {
 
     let db = state.db().ok_or("没有库，工作项不可用")?;
     let tickets = db
-        .ticket_list(me(from), !all, limit)
+        .ticket_list(from, !all, limit)
         .map_err(|e| format!("读工作项失败：{e:#}"))?;
     let (working, waiting) = db
-        .ticket_counts(me(from))
+        .ticket_counts(from)
         .map_err(|e| format!("读工作项失败：{e:#}"))?;
 
     let mut out = String::new();
@@ -142,7 +134,7 @@ pub async fn read_ticket(core: &Core, from: &str, args: &Value) -> Reply {
         .map_err(|e| format!("读工作项失败：{e:#}"))?
         .ok_or_else(|| format!("没有这个工作项: `{id}`"))?;
     // 权限：只能看自己名下的。不是自己的当作不存在（不泄露别人有什么）。
-    if t.router_id != me(from) {
+    if t.router_id != from {
         return Err(format!("没有这个工作项: `{id}`"));
     }
 
@@ -245,15 +237,16 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
             "缺少参数 task（要它做什么，写成不知道前因后果的人也能看懂的样子）".to_string(),
         );
     }
-    let router = me(from).to_string();
+    let router = from;
     let db = state.db().ok_or("没有库，工作项不可用")?;
 
-    // 再派一次：工作项已经在
-    let again = arg_str(args, "ticket_id").to_string();
+    // 再派一次：工作项已经在。借 `args` 里的那一截就行（`args` 在这个函数里活着），
+    // 以前为绕借用检查把它 to_string 了一份。
+    let again = arg_str(args, "ticket_id");
 
     if !again.is_empty() {
         let t = db
-            .ticket_get(&again)
+            .ticket_get(again)
             .map_err(|e| format!("读工作项失败：{e:#}"))?
             .ok_or_else(|| format!("没有这个工作项: `{again}`"))?;
         if t.router_id != router {
@@ -309,7 +302,7 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
 
     Ok(format!(
         "开了工作项 #{}（`{tid}`），交给一条新会话去干。它做完会把结果送回来。",
-        db.ticket_get(&tid).ok().flatten().map_or(0, |t| t.number())
+        db.ticket_number(&tid).ok().flatten().unwrap_or(0)
     ))
 }
 

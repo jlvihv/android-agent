@@ -423,6 +423,19 @@ impl Db {
         Ok(found.pop())
     }
 
+    /// 只取编号（`rowid`）。`ticket_create` 之后回话要用它，而 `ticket_get` 会把
+    /// 整条工作项（含 brief / result 两个大字段）读出来 —— 只为了一个数字。
+    pub fn ticket_number(&self, id: &str) -> anyhow::Result<Option<i64>> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT rowid FROM tickets WHERE id = ?1")?;
+            let mut rows = stmt.query([id])?;
+            Ok(match rows.next()? {
+                Some(r) => Some(r.get(0)?),
+                None => None,
+            })
+        })
+    }
+
     /// 某个 Router 名下的工作项（新的在前）。
     ///
     /// `open_only`：只要还开着的 —— Router 平时关心的就是「还没完的」。
