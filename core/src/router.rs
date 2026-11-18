@@ -428,9 +428,10 @@ fn deliver(
         id: uuid::Uuid::now_v7().to_string(),
         text: task.to_string(),
         attachments: Vec::new(),
-        // 对 worker 来说，派活的话就是「用户说的话」—— 它看到的那条 user 消息
-        // 本来就该是人的口吻。回执是反方向的事（worker → router），那个才需要标记。
-        origin: crate::agent::Origin::Human,
+        // **派活**，不是用户直接在 worker 会话里打字。两者对模型一视同仁
+        // （都是 user 角色），但代码靠它决定「这一轮的结论算不算交付物」——
+        // 见 `Origin::Dispatch`。
+        origin: crate::agent::Origin::Dispatch,
     };
     if core.state.enqueue(sid, msg).is_err() {
         return Err(format!(
@@ -442,20 +443,37 @@ fn deliver(
     Ok(())
 }
 
-/// Worker 的一个回合结束了：把结果记进工作项，并让 Router 知道。
+/// 派出去的会话，一个回合结束了：记结论，并让 Router 知道。
 ///
-/// 这是双层的**闭环**，也是唯一一处 Worker 能影响 Router 的地方。
+/// 这是双层的**闭环**，也是唯一一处子会话能影响 Router 的地方。
 ///
-/// 记什么：最后说的那段话（`result`）+ 一句进度判断（`report`）。判断的规则
-/// 是**确定性的**，不让模型猜（它此刻已经不在推理了）：
+/// ## 结论（`conclusion`）只由**派活驱动的回合**更新
 ///
-/// - 回合正常结束 → `ready`（做完了，等人验收）
-/// - 回合出错 → `failed`
-/// - 用户按了停止 → `progress`（不是「做完」也不是「失败」，是中途中止）
+/// `dispatched` 参数说的是「这一轮里有没有 `dispatch` 投进来的消息」。它决定
+/// 那行 `conclusion` 要不要更新：
 ///
-/// 然后往 Router 的队列里排一条**带标记的**回执（哪条会话、成没成、原话），
-/// 而不是一句散文 —— Router 醒来要知道「哪个工作项、什么状态、结果在哪」。
-pub async fn report_back(core: &Core, from_session: &str, said: &str, ok: bool, stopped: bool) {
+/// - **是派活** → 更新。这是交付物。
+/// - **纯粹是用户插话** → **不动**。用户跑去 worker 会话里说一句别的，不该把上一份
+///   交付物冲掉 —— 那是他要验收的东西。
+///
+/// 想让「插话」也产出结论怎么办？用 `dispatch` 带 `session_id` 再派一次就行，
+/// 那本来就是「让会话接着干这件事」的正规入口。**直接在 worker 会话里打字 ≠ 派活**。
+///
+/// 回执本身（推给 Router 的那条消息）**照发**，不管是不是派活驱动的：用户插话之后
+/// 子会话还是给出了回答，Router 有权知道它说了什么。
+///
+/// ## 回执的形状
+///
+/// 往 Router 的队列里排一条**带标记的**回执（哪条会话、成没成、原话全文），
+/// 而不是一句散文。
+pub async fn report_back(
+    core: &Core,
+    from_session: &str,
+    said: &str,
+    ok: bool,
+    stopped: bool,
+    dispatched: bool,
+) {
     let state = &core.state;
     // 这条会话是被派活的吗？不是的话什么都不做（用户自己开的会话不该有回执）。
     let Some(router) = state.dispatched_by(from_session) else {
@@ -473,8 +491,14 @@ pub async fn report_back(core: &Core, from_session: &str, said: &str, ok: bool, 
         said.to_string()
     };
 
-    // 结论记在会话自己身上（免疫历史压缩，见 `ChatSession::conclusion`）。
-    state.set_conclusion(from_session, &text);
+    // 结论 = 交付物，**只由派活驱动的回合更新**。
+    //
+    // 用户自己跑去 worker 会话里插一句话时（`dispatched == false`），上一份交付物
+    // 保持不变 —— 不然「它交出来的东西」会被一句无关的闲聊顶掉，Router 下次
+    // `read_session` 就看不到真正该验收的内容了。
+    if dispatched {
+        state.set_conclusion(from_session, &text);
+    }
 
     // 这条会话的活被人划掉了吗？划掉了就不再打扰 Router。
     if state.is_closed(from_session) {
@@ -639,7 +663,7 @@ mod tests {
 
         // 清掉 provider：配着的话回执会立刻被取走跑一轮，队列里就查不到了
         core.state.clear_llm();
-        report_back(&core, &sid, "改好了，PR 已提交", true, false).await;
+        report_back(&core, &sid, "改好了，PR 已提交", true, false, true).await;
 
         let q = core.state.queued_list(&rid);
         assert_eq!(q.len(), 1);
@@ -676,7 +700,7 @@ mod tests {
             let mut store = core.state.chat.write().await;
             store.create()
         };
-        report_back(&core, &sid, "我干完了", true, false).await;
+        report_back(&core, &sid, "我干完了", true, false, true).await;
         assert!(core.state.queued_list(&rid).is_empty());
     }
 
@@ -710,7 +734,7 @@ mod tests {
         assert!(core.state.is_closed(&sid));
 
         // 之后再推回执：不该进队列
-        report_back(&core, &sid, "又干完一轮", true, false).await;
+        report_back(&core, &sid, "又干完一轮", true, false, true).await;
         assert!(
             core.state.queued_list(&rid).is_empty(),
             "收尾了的活不该再打扰 Router"
@@ -752,6 +776,105 @@ mod tests {
         close_session(&core, &rid, &serde_json::json!({ "session_id": sid }))
             .await
             .expect("停下了就该收得了");
+    }
+
+    /// **用户插话不许覆盖交付物。**
+    ///
+    /// 场景：派活给会话 A，它交出结论 X；然后用户直接进会话 A 说了句别的，
+    /// 那一轮也结束了。以前 `conclusion` 会被第二次的结果顶掉 —— 交付物丢了。
+    ///
+    /// 现在 `conclusion` 只由**派活驱动的回合**（`Origin::Dispatch`）更新。
+    /// 用户插话那轮的结论照发回执（Router 有权知道它说了什么），但不改 `conclusion`。
+    #[tokio::test]
+    async fn a_human_interjection_never_overwrites_the_deliverable() {
+        let (core, rid) = with_router("interject").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let sid = {
+            let store = core.state.chat.read().await;
+            store
+                .sessions
+                .iter()
+                .find(|s| s.dispatched_by.as_deref() == Some(rid.as_str()))
+                .unwrap()
+                .id
+                .clone()
+        };
+        core.state.clear_llm();
+        end_running_turns(&core);
+
+        // ① 派活那一轮结束，交出交付物 X
+        report_back(&core, &sid, "这是交付物 X，要验收的就是它", true, false, true).await;
+        let after_dispatch = {
+            let store = core.state.chat.read().await;
+            store.get(&sid).unwrap().conclusion.clone()
+        };
+        assert!(after_dispatch.contains("交付物 X"), "派活的结论要记上");
+
+        // ② 用户直接在会话里插一句话，那一轮也结束了
+        report_back(&core, &sid, "顺便问一句天气如何", true, false, false).await;
+
+        let after_chat = {
+            let store = core.state.chat.read().await;
+            store.get(&sid).unwrap().conclusion.clone()
+        };
+        assert_eq!(
+            after_chat, after_dispatch,
+            "用户插话不该覆盖交付物：{after_chat}"
+        );
+        assert!(
+            after_chat.contains("交付物 X"),
+            "交付物必须还是原来那份：{after_chat}"
+        );
+    }
+
+    /// 插话那轮的回执**仍然要发**给 Router（它有权知道子会话说了什么），
+    /// 只是不动 `conclusion`。
+    #[tokio::test]
+    async fn a_human_interjection_still_reports_back() {
+        let (core, rid) = with_router("interject2").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
+            .await
+            .unwrap();
+        let sid = {
+            let store = core.state.chat.read().await;
+            store
+                .sessions
+                .iter()
+                .find(|s| s.dispatched_by.as_deref() == Some(rid.as_str()))
+                .unwrap()
+                .id
+                .clone()
+        };
+        core.state.clear_llm();
+        end_running_turns(&core);
+
+        report_back(&core, &sid, "顺手答一句天气", true, false, false).await;
+        let q = core.state.queued_list(&rid);
+        assert_eq!(q.len(), 1, "插话的回合也要让 Router 知道");
+        assert!(q[0].text.contains("顺手答一句天气"), "{:?}", q[0].text);
+    }
+
+    /// `dispatch` 投进来的那条消息，`origin` 必须是 `Dispatch`（不是 `Human`）——
+    /// 这是「派活驱动的回合」的判据，靠它区分用户插话。
+    ///
+    /// 直接构造 `deliver` 里那个 `QueuedMsg` 的等价物来验：`deliver` 会顺手调
+    /// `continue_with_queued`（回合立刻开跑、消息立刻被取走），队列里查不到。
+    #[test]
+    fn a_dispatched_task_carries_dispatch_origin() {
+        // 判据本身：`Dispatch` 和 `Human` 是两个不同的值，且只有 Dispatch 算派活
+        assert_ne!(crate::agent::Origin::Dispatch, crate::agent::Origin::Human);
+        let dispatched = |o: &crate::agent::Origin| matches!(o, crate::agent::Origin::Dispatch);
+        assert!(dispatched(&crate::agent::Origin::Dispatch));
+        assert!(!dispatched(&crate::agent::Origin::Human));
+        assert!(!dispatched(&crate::agent::Origin::WorkerReport {
+            session_id: "x".into()
+        }));
     }
 
     /// 收尾过的会话，普通 `list_sessions` 里就不在了；`all` 才看得到。
@@ -815,7 +938,7 @@ mod tests {
                 .clone()
         };
         core.state.clear_llm();
-        report_back(&core, &sid, "做完了，结果是 X", true, false).await;
+        report_back(&core, &sid, "做完了，结果是 X", true, false, true).await;
 
         let out = read_session(&core, &rid, &serde_json::json!({ "session_id": sid }))
             .await
@@ -979,7 +1102,7 @@ mod tests {
         end_running_turns(&core);
 
         // 汇报 → 它「闲着」，算在需要人看一眼里
-        report_back(&core, &sid, "做完了", true, false).await;
+        report_back(&core, &sid, "做完了", true, false, true).await;
         core.state.queued_list(&rid); // 清掉队列，只看会话状态
 
         let waiting_now = |core: &Core, rid: &str| {

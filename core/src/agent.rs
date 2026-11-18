@@ -131,6 +131,14 @@ pub enum Origin {
     /// 真人在输入框里打的（也包括 `/api/chat` 来的、脚本发的）
     #[default]
     Human,
+    /// **派活**：Router 用 `dispatch` 把这一句投进这条会话（见 `router::deliver`）。
+    ///
+    /// 和 `Human` 分开是为了一个具体的事：`conclusion`（交付物）只该由**派活驱动的
+    /// 回合**更新。用户自己跑去 worker 会话里插一句话，不该把上一份交付物冲掉。
+    ///
+    /// 对模型来说两者没区别（都是 `user` 角色、原样发出去）—— 它看到的就是
+    /// 「用户要我干这个」。
+    Dispatch,
     /// 子会话回合结束时推回来的回执（见 `router::report_back`）
     WorkerReport { session_id: String },
 }
@@ -2042,6 +2050,14 @@ async fn turn_once(
         }
     };
     let system_prompt = core.state.system_prompt_for(role);
+    // 这一轮里有没有**派活**（`dispatch` 投进来的）？
+    //
+    // 在外面算：`msgs` 会被下面的块消费掉，而 `report_back` 在块外要用。
+    // 队列里可能混着两种（派活 + 用户插话），只要有一条是派活就算 ——
+    // 那说明这一轮确实在推进那件活。
+    let dispatched = msgs
+        .iter()
+        .any(|(_, _, origin)| matches!(origin, Origin::Dispatch));
     let title = {
         let mut store = core.state.chat.write().await;
         let Some(sess) = store.get_mut(sid) else {
@@ -2084,7 +2100,15 @@ async fn turn_once(
     // 用户按的停止**也要记**：那不是「做完」也不是「失败」，是中途中止 ——
     // 工作项得知道，不然它会永远挂在「在干」上。
     let said = last_assistant_text(core, sid).await;
-    crate::router::report_back(core, sid, &said, res.is_ok(), turn.abort_requested()).await;
+    crate::router::report_back(
+        core,
+        sid,
+        &said,
+        res.is_ok(),
+        turn.abort_requested(),
+        dispatched,
+    )
+    .await;
     res
 }
 

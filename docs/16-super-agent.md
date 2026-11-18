@@ -98,6 +98,25 @@ Queued / Working / WaitingReview / Blocked / Failed / Done / Cancelled
 除此之外什么判断都不做：该不该叫人、叫醒之后怎么办，全由模型读了内容自己决定。
 框架不数「连续失败几次」—— 失败是历史里的事实，模型自己看。
 
+### 交付物（`conclusion`）只由**派活驱动的回合**更新
+
+`Origin` 有三个值，各管一件事：
+
+| `Origin` | 谁写的 | `conclusion` 更新吗 |
+| --- | --- | --- |
+| `Dispatch` | Router 用 `dispatch` 投进会话的那句话 | **是** —— 这是交付物 |
+| `Human` | 用户在输入框里打的（`/api/chat`） | **否** |
+| `WorkerReport` | 子会话回合结束推回来的回执 | 不适用（这是另一条会话的消息） |
+
+**为什么 `Human` 不更新**：你派活给会话 A，它交出结论 X；然后你直接进 A 说了句
+别的，那一轮也结束了。如果 `conclusion` 被第二次的结果顶掉，**上一份交付物就丢了**
+—— 而那是你要验收的东西。
+
+想让「插话」也产出结论，用 `dispatch` 带 `session_id` 再派一次（那是「让会话接着干
+这件事」的正规入口）。**直接在 worker 会话里打字 ≠ 派活。**
+
+插话那轮的回执**照发**给 Router（它有权知道子会话说了什么），只是不动 `conclusion`。
+
 ### 回执长什么样
 
 ```
@@ -192,6 +211,8 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
 | `cannot_close_a_session_that_is_still_running` | 在跑的不许收尾（不然那一轮结果没人接） |
 | `redispatch_appends_to_the_brief_instead_of_overwriting_it` | `brief` 是验收合同，追加不覆盖 |
 | `router_tools_cannot_execute` | Router 表里没有 `bash`/`read`/`edit` |
+| `a_human_interjection_never_overwrites_the_deliverable` | 派活出结论 X → 用户插话 → `conclusion` 仍是 X |
+| `a_human_interjection_still_reports_back` | 插话那轮的回执照发（只是不动结论） |
 
 ---
 
