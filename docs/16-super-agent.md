@@ -8,7 +8,7 @@
 
 ## 1. 一句话
 
-**只有 session 一个实体。Router 是其中一条会话，它用四个工具派活、看进度、收尾。**
+**只有 session 一个实体。Router 是其中一条会话，它用五个工具派活、看进度、定时。**
 
 没有 ticket、没有 stage 列、没有状态机。
 
@@ -39,8 +39,10 @@ Queued / Working / WaitingReview / Blocked / Failed / Done / Cancelled
 | 旧 stage                               | 现在怎么得到                                         |
 | -------------------------------------- | ---------------------------------------------------- |
 | `Working` / `Queued`                   | `AppState::turns`（在跑）/ 队列里有它（排队中）      |
-| `WaitingReview` / `Blocked` / `Failed` | 没在跑 + 没收尾 = 等人看一眼；成没成看历史           |
-| `Done` / `Cancelled`                   | `Closed::Done` / `Closed::Cancelled`（人把它划掉了） |
+| `WaitingReview` / `Blocked` / `Failed` | 没在跑 = 闲着，等人看一眼；成没成看历史               |
+
+`Done` / `Cancelled` 现在**没有对应物**了：到了「闲着」就是到头，一条会话永远可以
+接着派，没有「把这件事关掉」这一步（见 §10）。
 
 **「在不在跑」的权威事实一直在 `turns` 里**，从来没在 `stage` 里。存一份一样的
 信息只是给了它一个撒谎的机会。
@@ -65,7 +67,6 @@ Queued / Working / WaitingReview / Blocked / Failed / Done / Cancelled
 | `messages`                                   | 回合                   | 历史                                                           | —                    |
 | **`dispatch: Option<Dispatch>`**             | `dispatch` 新建时      | `by`（谁派的）+ `brief`（当初的要求原文）+ `times`（派过几次） | 算不出来             |
 | **`conclusion`**                             | **派活驱动的**回合结束 | 最新一次的交付物。免疫压缩                                     | 算不出来             |
-| **`closed: Closed`**                         | `close_session`        | 人把它划掉了吗（`Open`/`Done`/`Cancelled`）                    | 算不出来（人决定的） |
 
 「在不在跑」**不在这个表里** —— 它在 `AppState::turns`（真的在跑才在里面）。
 
@@ -75,53 +76,51 @@ Queued / Working / WaitingReview / Blocked / Failed / Done / Cancelled
 
 | 以前                                                    | 问题                                                                                                                                              | 现在                                                   |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| `closed_at: u64` + `closed_by: String`                  | `0`/空串当哨兵；6 种组合里 3 种非法（`0+"done"`、`1700…+""`、`1700…+"whatever"`）；判定散在 7 处写 `closed_at != 0`、3 处写 `closed_by == "done"` | `Closed` 枚举                                          |
 | `brief` / `dispatched_by` / `dispatches` 三个独立字段   | 能写出「有 brief 没 by」的半份记录（**迁移恰好会产出它**），然后在权限过滤上静默消失                                                              | `Option<Dispatch>`，要么整份有、要么没有               |
-| `http.rs` 和 `router.rs` 各写一份「现在什么处境」的推导 | **优先级还是相反的**（一个先判 busy、一个先判 closed），同一会话两处不同标签                                                                      | `ChatSession::standing(busy, queued) -> Standing` 一处 |
+| `http.rs` 和 `router.rs` 各写一份「现在什么处境」的推导 | **优先级还是相反的**，同一会话两处不同标签                                                                                                        | `ChatSession::standing(busy, queued) -> Standing` 一处 |
 
-**DB 列保持不变**（还是 `brief` / `dispatched_by` / `dispatches` / `closed_at` /
-`closed_by` 五列）—— 转换只在 `db.rs` 的 load / save 两个边界做。
+**DB 列保持不变**（还是 `brief` / `dispatched_by` / `conclusion` / `dispatches` 四列）
+—— 转换只在 `db.rs` 的 load / save 两个边界做。
 
-### 3.1.1 `closed` 的写点只有一个，守卫也在那里
+### 3.1.1 「接着干」只有一条路：`dispatch` 带 `session_id`
 
-`AppState::close_session()` 是 `closed` 的**唯一写点**，**它在里面自己判 busy**：
+`redispatch()` 做两件事，各自只有一个写点：
 
 ```rust
-pub async fn close_session(&self, sid: &str, by: &str) -> bool   // false = 被拒
+AppState::append_brief(sid, task)    // 追加到 brief 末尾，不覆盖原文（那是验收合同）
+AppState::redispatch_session(sid)    // dispatch.times +1
 ```
 
-守卫不能只放在 `router::close_session`（工具层），因为写它的路径不止那一条
-（`router::dispatch` 派不出去时也直接调）。守在最底层，任何调用点都拦得住，
-工具层只负责把 `false` 翻译成一句人话 —— **不做第二份判定**。
-
-锁序是 `chat` 写锁 → `turns` 读锁（`is_busy` 内部拿 `turns`），和 `evict_idle`
-一致。反方向不存在：`begin_turn` / `end_turn` 只碰 `turns`、不碰 `chat`。
+**`times` 只在后者加** —— `Dispatch::append` 不动它，两处都加就加两遍。
 
 ### 3.2 `Standing`：唯一的推导入口
 
 ```rust
 pub fn standing(&self, busy: bool, queued: bool) -> Standing {
-    if self.closed.is_closed() { return Standing::Closed(self.closed); }
     if busy { return Standing::Running; }
     if queued { return Standing::Queued; }
     Standing::Idle
 }
 ```
 
-优先级 **收尾 > 在跑 > 排队 > 闲着**。`needs_person()` 只对 `Idle` 为真 ——
+只有三个值：**在跑 / 排队中 / 闲着**。`needs_person()` 只对 `Idle` 为真 ——
 **`Queued` 不算「等你」**（活派下去了、还没轮到，那是等它，不是等你；
 旧架构 `Stage::needs_person()` 对 `Queued` 也是 false）。
 
+**没有终态。** 以前这里有一个 `Closed` 枚举（`Open` / `Done{at}` / `Cancelled{at}`）
+排在 `busy` 前面，库里还有 `closed_at` + `closed_by` 两列。删掉了 —— 理由见 §10。
+
 ---
 
-## 4. 四个工具
+## 4. 五个工具
 
 | 工具            | 干什么                                                         |
 | --------------- | -------------------------------------------------------------- |
 | `list_sessions` | 我派出去的有哪些、各自在跑还是闲着、最新结论。**现算**，不查库 |
 | `read_session`  | 一条的详情：当初的要求原文 + 最新结论 + （可选）执行记录       |
 | `dispatch`      | 派活。不带 `session_id` 新开一条，带了就往那条再派（追加要求） |
-| `close_session` | 收尾。`outcome=cancelled` = 不要了，否则 = 验收通过            |
+| `schedule_task` | 建一条定时任务：到点往 Router 投一句话（那时它被叫醒）         |
+| `schedules`     | 定时任务的多动作工具（list / edit / pause / delete）            |
 
 **没有 `list_tickets` / `read_ticket` / `ticket_id`** —— 那一层没了。
 
@@ -227,9 +226,8 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
 
 ## 7. 落盘与迁移
 
-`sessions` 表加了六列（`brief` / `dispatched_by` / `conclusion` / `dispatches` /
-`closed_at` / `closed_by`；内存里收成 `Dispatch` + `Closed`，列名不变）。
-`migrate()` 是幂等的：
+`sessions` 表加了四列（`brief` / `dispatched_by` / `conclusion` / `dispatches`；
+内存里收成 `Dispatch`，列名不变）。`migrate()` 是幂等的：
 
 1. 老库没有这些列 → `ALTER TABLE` 加上；
 2. 老 `tickets` 表里的记录 → **搬一次**进对应的 session
@@ -238,8 +236,8 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
 **每个标量子查询都必须 `ORDER BY t.created_at DESC, t.id DESC LIMIT 1`。**
 同一个会话可能有多条老 ticket（旧架构「再派一次」复用同一个 `session_id`，
 每次新建一行）。没有 `ORDER BY` 时 SQLite 给物理扫描到的第一行 —— 可能是最旧、
-且还没收尾（`ended_at = 0`）的那条：于是 `brief`/`result`/`dispatches` 取旧值，
-`closed_at`/`closed_by` 变 0 / 空串，**已收尾那条的信息完全丢掉且不报错**。
+的那条：于是 `brief`/`result`/`dispatches` 取旧值，**最新那次的要求和交付物
+完全丢掉且不报错**。
 `db::tests::migration_takes_the_newest_ticket_not_the_first_scanned` 钉住这条
 （把它改回「取任意」，测试立刻红）。
 
@@ -257,25 +255,23 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
 
 | 测试                                                         | 守什么                                                               |
 | ------------------------------------------------------------ | -------------------------------------------------------------------- |
-| `closing_a_session_always_removes_it_from_the_waiting_count` | **不存在推不动的状态**：收尾之后必须从「等人」里消失（旧架构做不到） |
+| `the_waiting_count_comes_from_standing_not_a_stored_state`   | **不存在推不动的状态**：再派一次就从「等人」里消失（不用谁去「关掉」它） |
 | `every_report_is_sent_in_full_no_matter_how_many`            | 回执永远全文：历史里堆 20 条，每条都原样出现在请求里（两条协议路径） |
 | `a_worker_report_is_marked_in_both_body_and_origin`          | 正文有边界标记（模型分得清）+ `origin` 有来源（代码分得清）          |
-| `cannot_close_a_session_that_is_still_running`               | 在跑的不许收尾（不然那一轮结果没人接）                               |
+| `a_running_session_can_still_be_dispatched_to`               | 在跑的会话也能再派（消息排队等着）—— 会话没有终态                   |
+| `list_sessions_lists_every_session_of_mine`                  | 列表没有「收尾过滤」：闲着的会话还在，总数按全部算                  |
+| `an_old_db_with_closed_columns_gets_them_dropped`            | 老库的 `closed_at`/`closed_by` 删掉；162 条数据不丢；跑两遍不报错    |
 | `redispatch_appends_to_the_brief_instead_of_overwriting_it`  | `brief` 是验收合同，追加不覆盖                                       |
 | `router_tools_cannot_execute`                                | Router 表里没有 `bash`/`read`/`edit`                                 |
-| `migration_takes_the_newest_ticket_not_the_first_scanned`    | 迁移取最新那条 ticket，不丢已收尾状态                                |
+| `migration_takes_the_newest_ticket_not_the_first_scanned`    | 迁移取最新那条 ticket（要求和交付物都取最新那份）                    |
 | `migration_orders_by_created_at_not_insertion_order`         | 按 `created_at` 定序，不看插入顺序                                   |
 | `migration_is_idempotent`                                    | 跑两遍不改动                                                         |
 | `migration_survives_orphan_tickets`                          | 孤儿 ticket 不 panic、不建空会话                                     |
 | `migration_on_a_fresh_db_without_tickets_table_is_a_noop`    | 全新库不报错                                                         |
-| `standing_has_one_priority_order`                            | 收尾 > 在跑 > 排队 > 闲着，只有一处定义                              |
+| `standing_has_one_priority_order`                            | 在跑 > 排队 > 闲着，只有一处定义                                     |
+| `standing_has_exactly_three_states`                          | `Standing` 就是 `working`/`queued`/`idle` 三个值                     |
 | `a_queued_session_does_not_need_a_person`                    | 排队中不算「等人」                                                   |
 | `a_just_dispatched_session_is_not_counted_as_waiting`        | `dispatch` 之后立刻统计 waiting = 0                                  |
-| `closed_round_trips_through_the_two_columns`                 | `Closed` 与两列往返，哨兵收敛                                        |
-| `the_busy_guard_lives_at_the_only_write_point`               | 守卫在 `state::close_session`（绕过工具直接调也拦得住）              |
-| `closed_from_db_never_silently_swallows_garbage`             | 未知 `closed_by` 归 `Done` 不 panic                                  |
-| `closed_from_db_rejects_a_timestamp_less_close`              | `at=0` + 非空 `by` → `Open`                                          |
-| `open_always_writes_the_empty_pair`                          | 脏数据读进来再写回去被纠正成 `(0,"")`                                |
 | `migration_from_the_oldest_schema_without_role`              | 最老的库（无 `role`）也升得上来                                      |
 | `the_legacy_fixture_matches_the_real_main_schema`            | 测试 fixture 必须和 `main` 的真实 schema 一致                        |
 | `a_human_interjection_never_overwrites_the_deliverable`      | 派活出结论 X → 用户插话 → `conclusion` 仍是 X                        |
@@ -291,12 +287,49 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
    现在身份就是会话，**删了会话就丢了这件事的记录**。
 2. **`dispatches` 的派工历史**：以前也只记次数，没记每次派了什么。现在也一样
    （但 `brief` 是追加的，所以要求演变还留得住）。
-3. **7 个状态的显示粒度**：现在只有「在跑 / 闲着 / 已收尾」三种标签。
+3. **7 个状态的显示粒度**：现在只有「在跑 / 排队中 / 闲着」三种标签。
    以前能显示「排队中 vs 在干」—— 那个区别现在没了（都在 `Working` 里）。
 4. **「卡住」是一等状态**：以前的 `Blocked`（虽然也从没被写过）。现在「卡住」
    只是子会话在正文里说的话，框架不懂。
 5. **前端那个看板的数据源变成现算**：每次 `/api/sessions/dispatched` 都要遍历
    会话表。会话几十条时无所谓，上千条会慢（可接受，因为 `LIST_MAX=50`）。
+
+### 9.1 后来又把「收尾（closed）」整个删掉了
+
+上一版在会话上留了 `closed: Closed`（`Open` / `Done{at}` / `Cancelled{at}`）、
+库里两列（`closed_at` / `closed_by`）、Router 一个 `close_session` 工具，
+`list_sessions` 还默认只列「还没收尾的」（`all: true` 才看全）。**全删了。**
+
+理由：**一个会话应该始终可以继续，所以不存在「收尾」这个终态。**
+
+而且它当时已经是个空转的字段：
+
+- 前端**没有**验收/取消按钮；
+- 后端**没有** `POST /api/sessions/close`；
+- 唯一的写点是 Router 的 `close_session` 工具 —— 也就是只有 AI 能关；
+- 它带来的副作用是 `list_sessions` 默认多一层过滤，让「找会话」多绕一步。
+
+删掉之后：
+
+| 以前 | 现在 |
+| --- | --- |
+| `Closed` 枚举 + `closed_at`/`closed_by` 两列 | 没有（老库的两列由 `migrate()` `DROP COLUMN`） |
+| `Standing` 五态（含 `Done` / `Cancelled`） | 三态：`Running` / `Queued` / `Idle` |
+| Router 工具 6 个 | 5 个（`list_sessions` / `read_session` / `dispatch` / `schedule_task` / `schedules`） |
+| `list_sessions` 默认只列未收尾的，`all: true` 看全 | 没有 `all` 参数 —— 列的就是「我的所有会话」 |
+| `/api/sessions/dispatched` 有 `all` 查询参数和 `open` 字段 | 都没有（`needsPerson` 留着，它由 `standing` 现算） |
+| 前端 `SessionState` 五值 | 三值：`"working"` / `"queued"` / `"idle"` |
+
+**「已收尾的会话不出现」这个依赖的替代品**：`list_sessions` 本来就有游标分页
+（`before`）和 `query` 收窄 —— 会话再多也是翻页 + 搜索，不需要一个「过滤掉旧账」
+的开关。`/api/sessions/dispatched` 有 `limit`（默认 50，上限 100）。
+
+**迁移**：老库那两列里有值（用户那个库 162 条会话都填着），所以不能只改建表 SQL
+—— 那只会让新库干净、老库留两个死列。`migrate()` 里加了 `drop_closed_columns()`：
+列在就 `ALTER TABLE sessions DROP COLUMN`，不在就什么都不做（幂等）；删不掉只
+`tracing::warn!`、不中断迁移（库打得开优先于列干净）。测试
+`an_old_db_with_closed_columns_gets_them_dropped` 造一个 162 条会话的老库，
+断言数据不丢、两列没了、`Db::open` 两遍都不报错。
 
 ## 10. 接口与命名
 
@@ -308,7 +341,7 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
 | `list_tickets()` (http)                 | `list_dispatched_sessions()`                         |
 | `TicketsQuery`                          | `DispatchedQuery`                                    |
 | 响应 `{"tickets": [...]}`               | `{"sessions": [...]}`                                |
-| 行内 `stage`                            | `state`（`working` / `idle` / `done` / `cancelled`） |
+| 行内 `stage`                            | `state`（`working` / `queued` / `idle`）             |
 | 行内 `moving`                           | `busy`                                               |
 | 行内 `preview`                          | `conclusion`                                         |
 | 行内 `number`                           | 删掉（会话没有给人看的编号，用 `id`）                |
@@ -317,6 +350,7 @@ MessageList.svelte             role=user && fromWorker → 画成「子会话报
 
 **有意保留的**：
 
-- `needsPerson` / `open`：这两个是**真事实**（要不要人管、收没收尾），名字没撒谎。
+- `needsPerson`：**真事实**（这条会话要不要人看一眼），由 `Standing::needs_person()`
+  现算（只有 `idle` 为真）。`open` 那个字段**删掉了** —— 「收没收尾」已经不存在。
 - `tickets` / `session_ticket` **两张表**：留着只读不写，里面有历史，见 §7。
 - 注释里出现的 `ticket` 字样：那是在讲「以前是什么样、为什么删」，是历史说明。

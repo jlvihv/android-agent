@@ -241,7 +241,7 @@ pub fn edit_schema() -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Router：协调那一层的提示词和四个工具的描述
+// Router：协调那一层的提示词和五个工具的描述
 //
 // 和 worker 那三个工具的分工一样：文桘在 `prompt` 里，派发在 `agent` 里。
 // 不同的一点是这边全部是常量 —— router 不按平台分支，它不执行、不碰文件，
@@ -258,16 +258,18 @@ pub fn edit_schema() -> Value {
 ///
 /// 关键是把「工作项」这个概念说清楚：它派出去的不是「一条会话」，是**一件事**。
 /// 会话是载体，用户和它自己看到的都该是「事情走到哪一步」。
+///
+/// **没有「收尾」这个动作**：一条会话永远可以接着干（`dispatch` 带 `session_id`），
+/// 所以提示词里只说「派」和「看」，不给它一个「把这件事关掉」的工具。
 pub fn router_description() -> &'static str {
     "你是协调层（Router）。用户在这里跟你说话，你不亲自干活。\n\
      \n\
-     - 你的工作只有两件：**把事情派下去**，和**盯着它们走到收尾**。\n\
+     - 你的工作只有两件：**把事情派下去**，和**盯着它们的进展**。\n\
      - 你没有 shell、没有读文件、没有改文件的能力 —— 这不是限制，是你的定义。\n\
      - 派出去的是**一条会话**：它有自己的上下文（看不到我们这段对话，所以 `task` 要写成\
      不知道前因后果的人也能看懂）。它干完/卡住会把结论推给你，那时你会被叫醒。\n\
      - `dispatch` 派活（不带 `session_id` 就新开一条）；`list_sessions` 看有哪些、\
-     各自在跑还是闲着；`read_session` 读一条的详情（当初的要求原文 + 最新结论 + 过程）；\
-     `close_session` 把一件活收尾（验收通过 / 不要了）。\n\
+     各自在跑还是闲着；`read_session` 读一条的详情（当初的要求原文 + 最新结论 + 过程）。\n\
      - **你回复的正文就是给用户看的那句话** —— 不需要为说话再调工具，直接说。\n\
      - 派出去的活**不等**它做完：`dispatch` 一返回就结束了。**不要轮询、不要 sleep、\
      不要反复 list 等它** —— 没事就结束回合。\n\
@@ -292,7 +294,7 @@ pub fn router_description() -> &'static str {
      - 它在问问题（「要不要删这个文件？」）：那是要你决定或要你转告用户的，\
      你读完自己判断怎么答。\n\
      - 想知道它干完活之后现在是什么处境：`read_session` 看它的结论和过程。\n\
-     - 觉得这件事完了就 `close_session` 收尾；觉得还要改就 `dispatch` 带 `session_id` 再派。\n\
+     - 觉得还要改就 `dispatch` 带 `session_id` 再派 —— 会话永远可以接着干，没有「关掉」这一步。\n\
      \n\
      ## 你会收到 `schedule` 消息\n\
      \n\
@@ -346,9 +348,9 @@ pub fn router_description() -> &'static str {
 pub fn list_sessions_description() -> String {
     "列出我派出去的会话：有几个在跑、几个闲着，各自的标题和最新结论。\n\
      回答「现在在忙什么 / 做到哪了」之前先看这个。\n\
-     每行开头是**短编号**（`#7` 这种）和完整 id —— 要细节、要再派活、要收尾，\
+     每行开头是**短编号**（`#7` 这种）和完整 id —— 要细节、要再派活，\
      用短编号就行（`#7`），不用抄一长串。\n\
-     默认只看还没收尾的（`all: true` 连已收尾的一起看），按**最近碰过的**排。\n\
+     列的是**你派出去的全部会话**，按**最近碰过的**排。\n\
      \n\
      两种用法，别混：\n\
      - **知道要找什么** → `query` 按关键词找（标题 / 要求原文 / 结论 / **对话正文**，\n\
@@ -363,10 +365,6 @@ pub fn list_sessions_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "all": {
-                "type": "boolean",
-                "description": "连已经收尾的一起列（默认只看还没收尾的）"
-            },
             "limit": {
                 "type": "integer",
                 "description": "最多列几个（默认 50）"
@@ -445,32 +443,6 @@ pub fn dispatch_schema() -> Value {
             }
         },
         "required": ["task"]
-    })
-}
-
-/// `close_session` 的描述。
-pub fn close_session_description() -> String {
-    "把一件活收尾。`outcome` 不给 = 验收通过（`done`），给 `cancelled` = 不要了。\n\
-     收尾之后那条会话不再往回推结论，`list_sessions` 默认也不再列它。\n\
-     它还在跑的时候不能收尾 —— 先让它停下。"
-        .to_string()
-}
-
-/// `close_session` 的 schema。
-pub fn close_session_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "要收尾的会话：短编号 `#7` 或完整 id 都行"
-            },
-            "outcome": {
-                "type": "string",
-                "description": "`cancelled` = 不要了；不给或 `done` = 验收通过"
-            }
-        },
-        "required": ["session_id"]
     })
 }
 

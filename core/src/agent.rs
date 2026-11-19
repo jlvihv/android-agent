@@ -89,11 +89,11 @@ fn build_tools(p: Platform) -> Vec<ToolSpec> {
 /// 一层。靠提示词写「你别自己干」拦不住（DeepSeek 那篇的消融实验就是反面教材：
 /// 中性提示下模型 5 次运行一次都不委派）；靠工具表拦得住，因为它根本没那手。
 ///
-/// 六个工具：**看**（`list_sessions` / `read_session`）、**说**（`dispatch`）、
-/// **收尾**（`close_session`）、**定时**（`schedule_task` / `schedules`）。
+/// 五个工具：**看**（`list_sessions` / `read_session`）、**说**（`dispatch`）、
+/// **定时**（`schedule_task` / `schedules`）。
 /// `answer` 故意没有 —— 正文就是给用户看的话。
 ///
-/// 「定时」那两个是唯一**让 Router 影响未来**的工具（前四个都只作用于当下这一轮）。
+/// 「定时」那两个是唯一**让 Router 影响未来**的工具（前三个都只作用于当下这一轮）。
 /// 它们只往定时器里写一条待办，到点还是投回这里 —— 指挥系统始终只有一套。
 fn build_router_tools(_p: Platform) -> Vec<ToolSpec> {
     vec![
@@ -112,13 +112,8 @@ fn build_router_tools(_p: Platform) -> Vec<ToolSpec> {
             description: prompt::dispatch_description(),
             schema: prompt::dispatch_schema,
         },
-        ToolSpec {
-            name: "close_session",
-            description: prompt::close_session_description(),
-            schema: prompt::close_session_schema,
-        },
         // 定时任务（见 `schedule`）。**两个不是三个**：`schedule_task` 是高频路径，
-        // 剩下三个低频 CRUD 收进一个多动作工具 —— 工具面从 4 涨到 6 而不是 7，
+        // 剩下三个低频 CRUD 收进一个多动作工具 —— 工具面从 3 涨到 5 而不是 6，
         // 而「选错工具」的概率跟工具数一起涨。
         ToolSpec {
             name: "schedule_task",
@@ -420,7 +415,7 @@ impl Dispatch {
 
     /// 补充要求：**追加**到 `brief` 末尾，不覆盖原文（那是验收合同）。
     ///
-    /// **不动 `times`** —— 派工次数由 `AppState::reopen_session` 统一 +1
+    /// **不动 `times`** —— 派工次数由 `AppState::redispatch_session` 统一 +1
     /// （那里是「再派一次」这个动作的唯一入口）。两处都加就会加两遍。
     pub fn append(&mut self, addition: &str) {
         self.brief.push_str("\n\n---\n\n（补充要求）\n");
@@ -428,116 +423,21 @@ impl Dispatch {
     }
 }
 
-/// 这件活收尾了没有。
-///
-/// 以前是 `closed_at: u64` + `closed_by: String` 两列，`0` / 空串当哨兵：
-/// `0 + "done"`、`1700… + ""`、`1700… + "whatever"` 三种非法组合都能表示，
-/// 而判定散在七处写成 `closed_at != 0`、三处写成 `closed_by == "done"`。
-/// 收成这个枚举之后，非法状态在类型层面就写不出来。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Closed {
-    /// 还开着
-    #[default]
-    Open,
-    /// 验收过了
-    Done { at: u64 },
-    /// 不要了
-    Cancelled { at: u64 },
-}
-
-impl Closed {
-    /// 收尾了没有（`Open` 之外都算收尾）
-    pub const fn is_closed(self) -> bool {
-        !matches!(self, Self::Open)
-    }
-
-    /// 收尾的时刻，`Open` 没有
-    pub const fn at(self) -> Option<u64> {
-        match self {
-            Self::Open => None,
-            Self::Done { at } | Self::Cancelled { at } => Some(at),
-        }
-    }
-
-    /// 给人看的一句话
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Open => "开着",
-            Self::Done { .. } => "已验收",
-            Self::Cancelled { .. } => "已取消",
-        }
-    }
-
-    /// 从库里的两列还原。**唯一**一处把哨兵翻译成枚举的地方（见 `db.rs`）。
-    ///
-    /// ## 不静默吞掉脏数据
-    ///
-    /// 库里可能出现两种非法组合（老版本写的、手工改的、迁移产出的）：
-    ///
-    /// - `at != 0` 而 `by` 是个认不出来的串；
-    /// - `at == 0` 而 `by` 非空（`to_db` 把 `Open` 写成 `(0, "")`，所以这是脏的）。
-    ///
-    /// 两种都**要 warn**。以前是静默归一类 —— 一个方向是静默当 `cancelled`、
-    /// 另一个方向是静默当 `Done`，**误判方向反了但同样的静默**，出问题时
-    /// 日志里一个字都没有。
-    ///
-    /// 归类的选择：认不出的 `by` → `Done`（宁可说「验收过」，也别在界面上留一个
-    /// 说不清的第四种状态；而 `Done` 在显示上比 `Cancelled` 更中性）。
-    pub fn from_db(at: u64, by: &str) -> Self {
-        match (at, by) {
-            (0, "") => Self::Open,
-            // `at == 0` 却有 `by`：时刻丢了，收尾这件事**不能成立**（没法排序、
-            // 没法显示时间），当没发生过。但要 warn —— 这说明有人写坏了数据。
-            (0, other) => {
-                tracing::warn!(
-                    "会话的 closed_at=0 但 closed_by={other:?}：脏数据，按「还开着」处理"
-                );
-                Self::Open
-            }
-            (at, "done") => Self::Done { at },
-            (at, "cancelled") => Self::Cancelled { at },
-            (at, other) => {
-                tracing::warn!("认不出的 closed_by={other:?}（closed_at={at}）：按「已验收」处理");
-                Self::Done { at }
-            }
-        }
-    }
-
-    /// 拆回库里的两列（`at`, `by`）。
-    ///
-    /// **`Open` 一律写 `(0, "")`** —— 这是一条不变式：`at == 0` 必须伴随空 `by`。
-    /// 库里若出现 `at=0` + 非空 `by`，那是别的东西写坏的，`from_db` 会 warn
-    /// 并把它读回 `Open`，写回去时自然就被纠正成 `(0, "")` 了。
-    pub fn to_db(self) -> (u64, &'static str) {
-        match self {
-            Self::Open => (0, ""),
-            Self::Done { at } => (at, "done"),
-            Self::Cancelled { at } => (at, "cancelled"),
-        }
-    }
-}
-
 /// 一条派出去的会话「现在什么处境」。**推导出来的，不存。**
 ///
-/// 三个来源合起来算：`ChatSession::closed`（人划掉了没有）、
-/// `AppState::turns`（回合真的在跑）、`AppState` 的排队队列（派了还没开跑）。
+/// 两个来源合起来算：`AppState::turns`（回合真的在跑）和 `AppState` 的
+/// 排队队列（派了还没开跑）。两者都不是 —— 那就是`Idle`。
 ///
 /// 以前这份推导在 `http.rs` 和 `router.rs` 各写一遍，**优先级还是相反的**
-/// （`router` 先判 busy、`http` 先判 closed）—— 同一个会话在两个地方会得出
-/// 不同的标签。现在只有 [`ChatSession::standing`] 一处。
+/// —— 同一个会话在两个地方会得出不同的标签。现在只有 [`ChatSession::standing`] 一处。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
     /// 回合真的在跑
     Running,
     /// 没在跑，但派了活还没轮到（排队等着交给模型）
     Queued,
-    /// 没在跑、没排队、也没收尾 —— 它停下了，等人看一眼
+    /// 没在跑、没排队 —— 它停下了，等人看一眼
     Idle,
-    /// 人验收过了
-    Done { at: u64 },
-    /// 人不要了
-    Cancelled { at: u64 },
 }
 
 impl Standing {
@@ -549,25 +449,12 @@ impl Standing {
         matches!(self, Self::Idle)
     }
 
-    /// 还开着吗（没被划掉）
-    pub const fn open(self) -> bool {
-        !matches!(self, Self::Done { .. } | Self::Cancelled { .. })
-    }
-
     /// 机器读的状态名（HTTP 字段 `state`）
-    ///
-    /// **没有 `open` 这一支**。以前是 `Closed(Closed)` 包着完整的 `Closed`，
-    /// 于是 `Standing::Closed(Closed::Open)` 在类型上可表示 —— 虽然
-    /// `standing()` 只在 `is_closed()` 为真时才构造它、那个值实际到不了，
-    /// 但 match 里必须为它写一个分支（或者一个 `unreachable!()`）。
-    /// 现在 `Done` / `Cancelled` 是扁平的变体，**非法值在类型层面就不存在**。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Running => "working",
             Self::Queued => "queued",
             Self::Idle => "idle",
-            Self::Done { .. } => "done",
-            Self::Cancelled { .. } => "cancelled",
         }
     }
 
@@ -577,8 +464,6 @@ impl Standing {
             Self::Running => "在跑",
             Self::Queued => "排队中",
             Self::Idle => "闲着",
-            Self::Done { .. } => "已验收",
-            Self::Cancelled { .. } => "已取消",
         }
     }
 }
@@ -628,12 +513,6 @@ pub struct ChatSession {
     /// 和 `brief` 同理：历史压缩之后，「它最后说成了什么」不能靠摘要。
     /// 空串 = 还没跑过回合。
     pub conclusion: String,
-    /// 这件活收尾了没有。以前是 `closed_at: u64` + `closed_by: String` 两列，
-    /// `0` / 空串当哨兵，6 种组合里 3 种非法。收成枚举之后非法状态写不出来。
-    ///
-    /// 它**不参与「在不在跑」的判定** —— 那个看 `AppState::turns`（回合真的在跑）。
-    /// 这里只有一个量级：人把这件活划掉了没有。
-    pub closed: Closed,
     /// 消息**不在内存里**时的摘要；`None` = 消息都在 `messages` 里。
     ///
     /// 不活跃的会话只留元数据（几十个会话、每个带一堆几十 KB 的 bash 输出，
@@ -703,7 +582,6 @@ impl ChatSession {
             provider_session: new_provider_session(),
             dispatch: None,
             conclusion: String::new(),
-            closed: Closed::Open,
             stub: None,
             loaded_at: None,
             epoch: 0,
@@ -772,20 +650,8 @@ impl ChatSession {
     /// `busy` 从 `AppState::turns` 来（回合真的在跑）；`queued` 从排队队列来
     /// （派了、还没轮到）。两个都由调用方传进来，因为这个类型不持有 `AppState`。
     ///
-    /// 优先级：**收尾 > 在跑 > 排队 > 闲着**。
-    ///
-    /// 为什么收尾排最前：一件活被划掉之后，那条会话就算还在跑也不该再被当成
-    /// 「在干这件事」—— 它是历史了。（`close_session` 本身会拒绝关在跑的会话，
-    /// 但数据可能是从别处来的，比如老库、比如别处的直接调用。）
+    /// 优先级：**在跑 > 排队 > 闲着**。一条会话永远可以继续，所以没有终态。
     pub fn standing(&self, busy: bool, queued: bool) -> Standing {
-        // `Closed` → `Standing` 的映射在这里收成两臂：`Open` 落不到这两个
-        // 分支上（它在上面就被 `is_closed()` 挡掉了），而 `Standing` 里
-        // 也没有「收尾了但还是 Open」这种值可写。
-        match self.closed {
-            Closed::Open => {}
-            Closed::Done { at } => return Standing::Done { at },
-            Closed::Cancelled { at } => return Standing::Cancelled { at },
-        }
         if busy {
             return Standing::Running;
         }
@@ -4010,7 +3876,7 @@ fn tool_output_event(id: &str, text: &str, images: &[ImagePart]) -> Value {
     ev
 }
 
-/// Router 那四个工具的分派。不是 Router 的工具就返回 `None`，交给下面原来的逻辑。
+/// Router 那五个工具的分派。不是 Router 的工具就返回 `None`，交给下面原来的逻辑。
 ///
 /// 认名字、不认角色：**工具表才是权限**（router 的表里没有 read/bash/edit），
 /// 这里只是「这个名字归 `router` 模块管」。多一层角色判断反而多一处要同步的地方。
@@ -4020,8 +3886,7 @@ async fn router_tool(core: &Core, name: &str, args: &Value, sid: &str) -> Option
         "read_session" => crate::router::read_session(core, sid, args).await,
         // 传 sid：新会话要记「谁派的」，做完才知道汇报给谁
         "dispatch" => crate::router::dispatch(core, sid, args).await,
-        "close_session" => crate::router::close_session(core, sid, args).await,
-        // 定时任务（见 `schedule`）：和上面四个一样，只是「写一条待办」，不执行任何东西
+        // 定时任务（见 `schedule`）：和上面三个一样，只是「写一条待办」，不执行任何东西
         "schedule_task" => crate::schedule::tool_schedule_task(core, args).await,
         "schedules" => crate::schedule::tool_schedules(core, sid, args).await,
         _ => return None,
@@ -4050,7 +3915,7 @@ async fn execute_tool(
         |sb| sb.session_cwd(Some(sid)),
     );
 
-    // ---- Router 的四个工具（见 `router.rs`）------------------------------
+    // ---- Router 的几个工具（见 `router.rs`）------------------------------
     //
     // 放在最前面，而且**不碰 cwd / 沙箱**：Router 不执行，`session_cwd` 那种
     // 「这个会话的目录在哪」的问题对它是没有意义的。这也是一条防线 ——
@@ -4224,12 +4089,12 @@ async fn read_image_outcome(
 mod tests {
     /// **`standing()` 是唯一的推导入口，优先级写死在一处。**
     ///
-    /// 以前 `http.rs` 和 `router.rs` 各写一份，优先级还是相反的（一个先判 busy、
-    /// 一个先判 closed）—— 同一个会话在两个地方会得出不同标签。
+    /// 以前 `http.rs` 和 `router.rs` 各写一份，优先级还是相反的 —— 同一个会话
+    /// 在两个地方会得出不同标签。
     #[test]
     fn standing_has_one_priority_order() {
         let s = ChatSession::with_role(Role::Worker);
-        // 收尾 > 在跑 > 排队 > 闲着
+        // 在跑 > 排队 > 闲着
         assert_eq!(s.standing(false, false), Standing::Idle);
         assert_eq!(s.standing(false, true), Standing::Queued);
         assert_eq!(s.standing(true, false), Standing::Running);
@@ -4237,76 +4102,25 @@ mod tests {
         assert_eq!(s.standing(true, true), Standing::Running);
     }
 
-    /// **收尾排最前**：划掉之后就算还在跑也不该被当成「在干这件事」。
+    /// **`Standing` 只有三种值**：一条会话永远可以继续，所以没有终态。
+    /// 这条钉住「闲着是唯一的不在跑状态」。
     #[test]
-    fn a_closed_session_outranks_everything() {
-        let mut s = ChatSession::with_role(Role::Worker);
-        s.closed = Closed::Done { at: 42 };
-        assert_eq!(s.standing(true, true), Standing::Done { at: 42 });
-        s.closed = Closed::Cancelled { at: 7 };
-        assert_eq!(s.standing(false, false), Standing::Cancelled { at: 7 });
+    fn standing_has_exactly_three_states() {
+        let all = [Standing::Running, Standing::Queued, Standing::Idle];
+        let names: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        assert_eq!(names, vec!["working", "queued", "idle"]);
     }
 
     /// **`Queued` 不算「等你」。** 派了活、还没轮到，那不是等你，是等它。
     ///
     /// 旧架构 `Stage::needs_person()` 对 `Queued` 也是 false；一版实现里
-    /// 用 `!busy && !closed` 判定，于是 `dispatch` 之后、回合真正开跑之前
+    /// 用 `!busy` 之外再加一个条件判定，于是 `dispatch` 之后、回合真正开跑之前
     /// 那个窗口里会话被算进「等你」—— 计数会抖。
     #[test]
     fn a_queued_session_does_not_need_a_person() {
         assert!(!Standing::Queued.needs_person(), "排队中不该算等人");
         assert!(Standing::Idle.needs_person(), "停下了才等人");
         assert!(!Standing::Running.needs_person());
-        assert!(!Standing::Done { at: 1 }.needs_person());
-    }
-
-    /// `Closed` 的数据库往返：`Open` / `Done` / `Cancelled` 都还原得回来，
-    /// 非法的哨兵组合收敛成合法值（而不是留一个第四种状态）。
-    #[test]
-    fn closed_round_trips_through_the_two_columns() {
-        for c in [
-            Closed::Open,
-            Closed::Done { at: 100 },
-            Closed::Cancelled { at: 200 },
-        ] {
-            let (at, by) = c.to_db();
-            assert_eq!(Closed::from_db(at, by), c, "{c:?} 往返不一致");
-        }
-        // 哨兵还原：`0` 一律当 Open（没有时刻的「收尾」不成立）
-        assert_eq!(Closed::from_db(0, "done"), Closed::Open);
-        assert_eq!(Closed::from_db(0, ""), Closed::Open);
-        // 认不出的 by 当 Done（宁可说「验收过」，别留一个说不清的状态）
-        assert_eq!(Closed::from_db(500, "whatever"), Closed::Done { at: 500 });
-    }
-
-    /// **未知的 `closed_by` 不静默**：归为 `Done`，不 panic，但会 warn。
-    #[test]
-    fn closed_from_db_never_silently_swallows_garbage() {
-        // 认不出的串：归 Done（不是 Cancelled，也不是悄悄丢掉）
-        assert_eq!(Closed::from_db(500, "whatever"), Closed::Done { at: 500 });
-        assert_eq!(Closed::from_db(500, ""), Closed::Done { at: 500 });
-        // 大小写/空白都不认（严格匹配，别猜）
-        assert_eq!(Closed::from_db(500, "DONE"), Closed::Done { at: 500 });
-    }
-
-    /// **`at == 0` 却有 `by`**：脏数据，按「还开着」处理（时刻都没有，
-    /// 收尾这件事不成立），并 warn。
-    #[test]
-    fn closed_from_db_rejects_a_timestamp_less_close() {
-        assert_eq!(Closed::from_db(0, "done"), Closed::Open);
-        assert_eq!(Closed::from_db(0, "cancelled"), Closed::Open);
-        assert_eq!(Closed::from_db(0, "whatever"), Closed::Open);
-    }
-
-    /// `to_db` 的 `Open` 不变式：**一律** `(0, "")`。所以上面那种脏数据
-    /// 读进来再写回去，就被自然纠正了。
-    #[test]
-    fn open_always_writes_the_empty_pair() {
-        assert_eq!(Closed::Open.to_db(), (0, ""));
-        // 脏数据 → Open → 写回 (0, "")：脏值被纠正，而不是原样留着
-        let dirty = Closed::from_db(0, "done");
-        assert_eq!(dirty, Closed::Open);
-        assert_eq!(dirty.to_db(), (0, ""));
     }
 
     /// `Option<Dispatch>` 让「半份派活记录」写不出来：要么整份有、要么没有。
@@ -4737,7 +4551,7 @@ mod tests {
         for i in 0..N {
             sess.messages.push(ChatMessage::from_worker(
                 format!(
-                    "<worker_report session=\"s{i}\" closed=\"false\">\n\
+                    "<worker_report session=\"s{i}\" failed=\"false\">\n\
                      第 {i} 条的正文，这一句必须原样出现在请求里。\n\
                      </worker_report>"
                 ),
@@ -4896,19 +4710,32 @@ mod tests {
                     "{p:?} 的 router 表里出现了 `{forbidden}`：协调层不能有执行能力"
                 );
             }
-            // 四个编排工具都在（少一个就是某个能力悄悄没了）：
-            // 看（list_sessions / read_session）、派（dispatch）、收尾（close_session）。
+            // 五个编排工具都在（少一个就是某个能力悄悄没了）：
+            // 看（list_sessions / read_session）、派（dispatch）、定时（schedule_task / schedules）。
             // 并且**没有** `answer`：模型的正文本来就是给用户看的那句话，
             // 专门为说话开一个工具只会白多一轮请求。
-            for required in ["list_sessions", "read_session", "dispatch", "close_session"] {
+            for required in [
+                "list_sessions",
+                "read_session",
+                "dispatch",
+                "schedule_task",
+                "schedules",
+            ] {
                 assert!(
                     names.contains(&required),
                     "{p:?} 的 router 表里缺少 `{required}`"
                 );
             }
+            assert_eq!(names.len(), 5, "{p:?} 的 router 工具表只有五个：{names:?}");
             // 反过来的那一半：worker 表里不该有编排工具（它没有派活的对象）
             let worker: Vec<&str> = tools(p, Role::Worker).iter().map(|t| t.name).collect();
-            for orchestration in ["list_sessions", "read_session", "dispatch", "close_session"] {
+            for orchestration in [
+                "list_sessions",
+                "read_session",
+                "dispatch",
+                "schedule_task",
+                "schedules",
+            ] {
                 assert!(
                     !worker.contains(&orchestration),
                     "{p:?} 的 worker 表里出现了 `{orchestration}`：那是协调层的事"

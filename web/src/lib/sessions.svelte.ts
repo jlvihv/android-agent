@@ -42,13 +42,12 @@ export type Session = {
    *   `working`   回合正在跑
    *   `queued`    派了活、还没轮到
    *   `idle`      停下了、闲着（**这是常态**，界面上不给标记）
-   *   `done`      人验收过了
-   *   `cancelled` 人不要了
    *
-   * 正好是后端 `Standing::as_str()` 的五个值，不多不少。
+   * 正好是后端 `Standing::as_str()` 的三个值，不多不少 —— 会话没有终态
+   * （一条会话永远可以接着派），所以没有第四个值。
    */
   state?: SessionState;
-  /** 人看的状态名，服务端给（「在跑」「排队中」「闲着」「已验收」「已取消」） */
+  /** 人看的状态名，服务端给（「在跑」「排队中」「闲着」） */
   label?: string;
   /** 最后更新时间（毫秒）。服务端一直在给，以前类型里漏了。 */
   updatedAt?: number;
@@ -64,11 +63,10 @@ export type Session = {
 /**
  * `Session.state` 的取值（见那个字段的注释）。
  *
- * 正好是后端 `Standing::as_str()` 的五个值 —— **没有 `open`**：
- * 服务端那个枚举里已经没有它了（`Standing` 的收尾态是扁平的 `Done` /
- * `Cancelled`，「收尾了但还是 Open」那个值构造不出来）。
+ * 正好是后端 `Standing::as_str()` 的三个值。**`idle` 是唯一的不在跑状态** ——
+ * 会话没有「收尾」这个终态，所以没有 `done` / `cancelled`。
  */
-export type SessionState = "working" | "queued" | "idle" | "done" | "cancelled";
+export type SessionState = "working" | "queued" | "idle";
 
 /** 刚落地那份的安静窗口：窗口内再来要就直接复用它 */
 const MERGE_MS = 300;

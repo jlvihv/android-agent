@@ -3152,10 +3152,8 @@ async fn list_sessions(
     drop(store);
     // 抽屉里给正在跑的会话打个点：切走了也知道它还在干活。
     //
-    // `busy` 取自**同一份**快照，和 `state` 不矛盾，但**不是**等价关系：
-    // `standing()` 里 `closed` 排在 `busy` 前面，所以一条「已收尾的会话如果
-    // 还在跑」会是 `state="done"` + `busy=true`（数据层面可能出现，比如老库）。
-    // 界面按 `state` 画标记、按 `busy` 画那个 pulsing 圆点，各说各的事实。
+    // `busy` 取自**同一份**快照，和 `state` 不矛盾：`state == "working"` 时
+    // `busy` 一定是 true。界面按 `state` 画标记、按 `busy` 画那个 pulsing 圆点。
     for s in &mut list {
         let id = s["id"].as_str().unwrap_or_default().to_string();
         let running = busy.contains(&id);
@@ -3215,14 +3213,14 @@ async fn new_session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({ "id": id }))
 }
 
-/// `GET /api/sessions/dispatched?router=<id>&all=1` → 这个 Router 派出去的会话。
+/// `GET /api/sessions/dispatched?router=<id>` → 这个 Router 派出去的会话。
 ///
 /// 名字里的 `dispatched` 是字面意思：**派出去的那些会话**。底下没有 ticket 这一层了
 /// （见 docs/16），所以路径、handler、字段名一律用 session 词汇。
 ///
 /// 每一行是一条会话，处境由 [`ChatSession::standing`] **现算**（不存）：
-/// `working` / `queued` / `idle` / `done` / `cancelled`。同一份推导 `router.rs`
-/// 和测试也调 —— 以前 `http.rs` 和 `router.rs` 各写一遍，优先级还是相反的。
+/// `working` / `queued` / `idle`。同一份推导 `router.rs` 和测试也调 ——
+/// 以前 `http.rs` 和 `router.rs` 各写一遍，优先级还是相反的。
 ///
 /// ## 锁与分配
 ///
@@ -3253,7 +3251,6 @@ async fn list_dispatched_sessions(
             .sessions
             .iter()
             .filter(|s| s.dispatched_by() == Some(router))
-            .filter(|s| q.all || !s.closed.is_closed())
             .collect();
         mine.sort_by(|a, b| {
             b.created_at
@@ -3295,7 +3292,6 @@ async fn list_dispatched_sessions(
                 "state": r.standing.as_str(),
                 "label": r.standing.label(),
                 "needsPerson": r.standing.needs_person(),
-                "open": r.standing.open(),
                 "busy": r.standing == crate::agent::Standing::Running,
                 // 最新结论（`conclusion`，免疫历史压缩）。空 = 还没跑过回合。
                 "conclusion": crate::text::clip(&r.conclusion, 200),
@@ -3327,24 +3323,8 @@ struct Row {
 #[derive(Deserialize)]
 struct DispatchedQuery {
     router: Option<String>,
-    /// 连已收尾的一起列。**`all=1` 也要认**：serde 的 bool 只吃 `true`/`false`，
-    /// 而手敲 curl / 脚本习惯写 `1`。给个宽松的解析，两种都收。
-    #[serde(default, deserialize_with = "de_bool_lenient")]
-    all: bool,
     #[serde(default)]
     limit: Option<usize>,
-}
-
-/// `1` / `0` / `true` / `false` / 空 都认。
-fn de_bool_lenient<'de, D>(d: D) -> Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = Option::<String>::deserialize(d)?;
-    Ok(matches!(
-        s.as_deref().map(str::trim),
-        Some("1" | "true" | "yes" | "on")
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4320,15 +4300,15 @@ mod tests {
     /// **`/api/sessions` 的 `state` 必须和 `ChatSession::standing()` 一致。**
     ///
     /// 这是「状态只在一处推导」的守卫：如果谁哪天在 handler 里另拼一遍判断，
-    /// 这条会红。做法是造出四种状态的会话，打真实 HTTP，再逐个和
+    /// 这条会红。做法是造出三种状态的会话，打真实 HTTP，再逐个和
     /// `standing()` 的结论比对。
     #[tokio::test]
     async fn list_sessions_reports_the_same_state_as_standing() {
         let st = crate::state::AppState::new();
         st.set_token(Some("s3cret".into()));
 
-        // 造四条会话：空闲 / 已验收 / 已取消 / （在跑的那个用 begin_turn 占坑）
-        let (idle, done, cancelled, running, queued) = {
+        // 造三条会话：闲着 / 在跑 / 排队中（后两个靠 begin_turn / enqueue 造）
+        let (idle, running, queued) = {
             let mut store = st.chat.write().await;
             let mut mk = |title: &str| {
                 let mut s = crate::agent::ChatSession::new();
@@ -4339,16 +4319,8 @@ mod tests {
                 store.push_new(s);
                 id
             };
-            (
-                mk("闲着"),
-                mk("验收过"),
-                mk("取消掉"),
-                mk("在跑"),
-                mk("排队中"),
-            )
+            (mk("闲着"), mk("在跑"), mk("排队中"))
         };
-        st.close_session(&done, "done").await;
-        st.close_session(&cancelled, "cancelled").await;
         // 「在跑」：占一个回合（`begin_turn` 会把它记进 `turns`）
         let turn = st.begin_turn(&running).expect("占得上");
 
@@ -4380,7 +4352,7 @@ mod tests {
             .await
             .unwrap();
         let rows = v["sessions"].as_array().expect("有 sessions");
-        assert_eq!(rows.len(), 5, "五条都该在列表里：{v}");
+        assert_eq!(rows.len(), 3, "三条都该在列表里：{v}");
 
         // 逐条比对：返回值 vs `standing()` 的推导
         let busy = st.busy_set();
@@ -4412,8 +4384,6 @@ mod tests {
                 .clone()
         };
         assert_eq!(by(&idle)["state"], json!("idle"));
-        assert_eq!(by(&done)["state"], json!("done"));
-        assert_eq!(by(&cancelled)["state"], json!("cancelled"));
         assert_eq!(by(&running)["state"], json!("working"));
         assert_eq!(
             by(&queued)["state"],

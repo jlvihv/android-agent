@@ -1,4 +1,4 @@
-//! 协调层（Router）的工具：**看会话**、**派会话**、**收尾**，没有「做」。
+//! 协调层（Router）的工具：**看会话**、**派会话**、**定时**，没有「做」。
 //!
 //! 这个文件只放「工具被调用时干什么」。工具表的定义（名字、描述、schema）在
 //! `agent::build_router_tools` + `prompt`，两边是一对一的关系：
@@ -8,18 +8,21 @@
 //! | `list_sessions` | [`list_sessions`] | 我派出去的有哪些、各自在跑还是闲着 |
 //! | `read_session` | [`read_session`] | 一条的详情（当初的要求原文 + 最新结论 + 执行记录） |
 //! | `dispatch` | [`dispatch`] | 派活（给了 `session_id` 就是再派一次） |
-//! | `close_session` | [`close_session`] | 收尾（验收通过 / 不要了） |
+//! | `schedule_task` / `schedules` | `crate::schedule` | 定时任务（见那个模块） |
 //!
 //! ## 只有一层实体：会话
 //!
 //! 这个文件以前管理的是「工作项（ticket）」—— 有 `Stage` 状态机、有 `tickets` 表、
 //! 有 `session_ticket` 映射。那一层已经**整个删掉**（见 docs/16）：状态存了却没人
-//! 负责推进它，于是每个工作项都永远停在「待验收」。
+//! 负责推进它，于是每个工作项都永远停在「没人读的中间态」。
 //!
 //! 现在派出去的就是**一条会话**。`ChatSession` 上多几行不可变记录
-//! （`brief` / `dispatched_by` / `conclusion` / `dispatches` / `closed_at`），
-//! 但它们不是状态机 —— 没有跃迁规则，也没有一处代码靠它们做分支判断。
+//! （`brief` / `dispatched_by` / `conclusion` / `dispatches`），它们不是状态机 ——
+//! 没有跃迁规则，也没有一处代码靠它们做分支判断。
 //! 「在不在跑」问 `AppState::turns`，「成没成」看历史 + `conclusion`。
+//!
+//! **会话没有终态**：`dispatch` 带 `session_id` 可以一直派下去，所以没有一个
+//! 「这条已经收尾了」的字段。
 //!
 //! ## 引用图
 //!
@@ -57,7 +60,7 @@ pub type Reply = Result<String, String>;
 //
 // 每个工具都从一段 JSON 里抠几个字段。以前是九处手写的
 // `args.get("x").and_then(Value::as_str).unwrap_or("").trim()`，同一件事写九遍
-// —— 改一次语义（比如空串要不要算「没给」）得记得改九处。收敛成三个函数。
+// —— 改一次语义（比如空串要不要算「没给」）得记得改九处。收敛成两个函数。
 // ---------------------------------------------------------------------------
 
 /// 取一个字符串字段（去掉首尾空白）。没给 / 类型不对都是空串。
@@ -70,11 +73,6 @@ pub(crate) fn arg_str_pub<'a>(args: &'a Value, key: &str) -> &'a str {
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> &'a str {
     args.get(key).and_then(Value::as_str).unwrap_or("").trim()
-}
-
-/// 取一个 bool 字段。没给就是 `false`。
-fn arg_flag(args: &Value, key: &str) -> bool {
-    args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
 /// 取一个整数并夹到 `[min, max]`；没给 / 类型不对就用 `default`。
@@ -156,12 +154,7 @@ fn parse_cursor(b: &str) -> Option<(u64, &str)> {
 /// （子串搜索本来就用不上 B-tree；上 FTS 要新表 + 同步逻辑，这个量级不值得）。
 ///
 /// 调用方在 `spawn_blocking` 里跑它，不占 worker。
-fn fulltext_hits(
-    db: &crate::db::Db,
-    query: &str,
-    from: &str,
-    all: bool,
-) -> std::collections::HashMap<String, String> {
+fn fulltext_hits(db: &crate::db::Db, query: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     // LIKE 的转义：`%` `_` 在 payload 里出现会让匹配跑偏（用户搜「100%」时）
     let pat = format!("%{}%", query.replace('%', r"\%").replace('_', r"\_"));
@@ -179,9 +172,8 @@ fn fulltext_hits(
     let Ok(rows) = rows else {
         return out;
     };
-    // 归属 / 收尾过滤要问内存里的会话表 —— 但这里**不拿锁**：调用方已经把
-    // 允许的 id 集合通过参数约束了？没有。所以退回「先收下，锁外再筛」：
-    // 拼一个 id 集合给调用方用（调用方在锁里 filter）。
+    // 归属过滤要问内存里的会话表 —— 但这里**不拿锁**：先全收下（每条会话只留
+    // 第一条命中），归属筛选由调用方在锁里做（见 `list_sessions`）。
     for (sid, payload) in rows {
         if out.contains_key(&sid) {
             continue; // 每条会话只留第一条（ORDER BY seq DESC → 最近的）
@@ -200,7 +192,6 @@ fn fulltext_hits(
             out.insert(sid, sn);
         }
     }
-    let _ = (from, all); // 归属过滤在调用方的锁里做（见 `list_sessions`）
     out
 }
 
@@ -254,15 +245,14 @@ struct Row {
 
 /// `list_sessions`：我派出去的有哪些、各自在跑还是闲着。
 ///
-/// **只列这个 Router 名下的**。默认只看还没收尾的 —— Router 平时关心的就是
-/// 「还没完的」，翻旧账是另一种需求（`all: true`）。
+/// **只列这个 Router 名下的**，也就是「我的所有会话」—— 会话没有终态，
+/// 派出去的一直在列表里（翻旧账靠游标分页，不靠过滤）。
 ///
 /// **不存状态，全部现算**（见 `ChatSession::standing`）：
 ///
 /// - 「在跑」= `AppState::turns` 里有没有它（回合真的在跑，不是谁记的标签）
 /// - 「排队中」= 派了活、还没轮到（`AppState` 的队列里有它）
-/// - 「闲着」= 没在跑、没排队、也没收尾
-/// - 「已收尾」= `closed`
+/// - 「闲着」= 没在跑、没排队（唯一的不在跑状态）
 ///
 /// ## 每行的「模型」和「上下文」从哪来
 ///
@@ -296,7 +286,6 @@ struct Row {
 /// —— 而 `turns` 是所有回合起止都要拿的锁，会话一多就会顶到 `begin_turn` 上。
 pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     let state = &core.state;
-    let all = arg_flag(args, "all");
     let limit = arg_usize(args, "limit", LIST_LIMIT_DEFAULT, 1, LIST_MAX);
     let query = arg_str(args, "query");
     let sort = Sort::parse(arg_str(args, "sort"));
@@ -317,9 +306,7 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
         match state.db() {
             Some(db) => {
                 let q = query.to_string();
-                let from_owned = from.to_string();
-                let all_flag = all;
-                tokio::task::spawn_blocking(move || fulltext_hits(&db, &q, &from_owned, all_flag))
+                tokio::task::spawn_blocking(move || fulltext_hits(&db, &q))
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!("全文搜索任务挂了：{e}");
@@ -333,12 +320,11 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     let (total, matched, rows, next): (usize, usize, Vec<Row>, Option<String>) = {
         let store = state.chat.read().await;
 
-        // 挑：归属 + 收尾过滤 + query（三字段 **或** 全文命中）
+        // 挑：归属 + query（三字段 **或** 全文命中）
         let mut mine: Vec<&crate::agent::ChatSession> = store
             .sessions
             .iter()
             .filter(|s| s.dispatched_by() == Some(from))
-            .filter(|s| all || !s.closed.is_closed())
             .filter(|s| query.is_empty() || matches_fields(s, query) || ft.contains_key(&s.id))
             .collect();
 
@@ -382,7 +368,7 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
             })
             .collect::<Vec<_>>();
         // `total` = 全部（不看 query / 不看游标），`matched` = 过滤之后（含游标）
-        let total = count_of(&store, from, all);
+        let total = count_of(&store, from);
         (total, matched, rows, next)
     };
 
@@ -437,19 +423,11 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
                 "没有匹配 `{query}` 的会话（搜过标题 / 要求原文 / 结论 / **对话正文**）。"
             );
             if matched == 0 && total > 0 {
-                let _ = write!(
-                    out,
-                    "你有 {total} 条（{}），去掉 query 看看。",
-                    scope_label(all)
-                );
+                let _ = write!(out, "你有 {total} 条，去掉 query 看看。");
             }
             return Ok(out);
         }
-        out.push_str(if all {
-            "还没有派过任何会话。用 dispatch 派一个。"
-        } else {
-            "现在没有未收尾的会话。用 dispatch 派一个。"
-        });
+        out.push_str("还没有派过任何会话。用 dispatch 派一个。");
         return Ok(out);
     }
 
@@ -462,20 +440,16 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
     let _ = write!(out, "{running} 个在跑，");
     match (query.is_empty(), before.is_some()) {
         (true, false) => {
-            let _ = write!(out, "共 {total} 条（{}）", scope_label(all));
+            let _ = write!(out, "共 {total} 条");
         }
         (true, true) => {
             // 翻页时 `matched` 是「游标之后还剩多少」
-            let _ = write!(
-                out,
-                "还剩 {matched} 条（共 {total} 条，{}，第 2 页起）",
-                scope_label(all)
-            );
+            let _ = write!(out, "还剩 {matched} 条（共 {total} 条，第 2 页起）");
         }
         (false, _) => {
             let _ = write!(out, "匹配 `{query}` 的 {matched} 条");
             if total != matched {
-                let _ = write!(out, "（全部 {total} 条，{}）", scope_label(all));
+                let _ = write!(out, "（全部 {total} 条）");
             }
         }
     }
@@ -564,7 +538,7 @@ pub async fn list_sessions(core: &Core, from: &str, args: &Value) -> Reply {
 // ---------------------------------------------------------------------------
 // 短编号（`#7`）解析
 //
-// **三个工具共用这一个函数**（`read_session` / `dispatch` / `close_session`）。
+// **两个工具共用这一个函数**（`read_session` / `dispatch`）。
 // 分开写就是我以前最讨厌的那种「三处各判一遍、语义迟早走偏」。
 // ---------------------------------------------------------------------------
 
@@ -802,25 +776,15 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// `query` 那一段说清「看的是哪一批」（未收尾 / 连已收尾的）。
-fn scope_label(all: bool) -> &'static str {
-    if all {
-        "含已收尾的"
-    } else {
-        "未收尾的"
-    }
-}
-
 /// 这个 Router 名下**一共有多少条**（`query` 之前）。
 ///
 /// 只在带 `query` 时用：要告诉模型「你有 37 条，但只有 2 条匹配」—— 不然它
 /// 会以为总数就是匹配数。
-fn count_of(store: &crate::agent::SessionStore, from: &str, all: bool) -> usize {
+fn count_of(store: &crate::agent::SessionStore, from: &str) -> usize {
     store
         .sessions
         .iter()
         .filter(|s| s.dispatched_by() == Some(from))
-        .filter(|s| all || !s.closed.is_closed())
         .count()
 }
 
@@ -871,11 +835,10 @@ pub async fn read_session(core: &Core, from: &str, args: &Value) -> Reply {
                 s.brief().map(str::to_string),
                 s.conclusion.clone(),
                 s.dispatch_times().unwrap_or(0),
-                s.closed,
             ),
         }
     };
-    let (id, title, brief, conclusion, dispatches, closed) = info;
+    let (id, title, brief, conclusion, dispatches) = info;
     let id = id.as_str();
 
     let mut out = String::new();
@@ -905,10 +868,6 @@ pub async fn read_session(core: &Core, from: &str, args: &Value) -> Reply {
         let _ = writeln!(out, "最新结论：");
         let _ = writeln!(out, "{}", conclusion.trim());
     }
-    if closed.is_closed() {
-        let _ = writeln!(out, "这条活已经收尾了（{}）。", closed.label());
-    }
-
     // 执行记录：要了才给。它是「过程」，默认不给
     let want = arg_str(args, "what");
     if want == "transcript" {
@@ -937,14 +896,8 @@ pub async fn read_session(core: &Core, from: &str, args: &Value) -> Reply {
     let _ = writeln!(out);
     if state.is_busy(id) {
         let _ = writeln!(out, "它正在跑。等它的回执，不要重复派同一个活。");
-    } else if closed.is_closed() {
-        let _ = writeln!(out, "这件事已经收尾了。要重新做就新建一个会话。");
     } else {
-        let _ = writeln!(
-            out,
-            "它现在闲着。要它接着干就 `dispatch` 带上 session_id；\
-             觉得行了就 `close_session` 收尾。"
-        );
+        let _ = writeln!(out, "它现在闲着。要它接着干就 `dispatch` 带上 session_id。");
     }
     Ok(out)
 }
@@ -968,18 +921,12 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     // 再派一次：会话已经在
     let raw = arg_str(args, "session_id");
     if !raw.is_empty() {
-        let (again, closed) = {
+        let again = {
             let store = state.chat.read().await;
             // 解析（含权限）。短名 `#7` 和完整 id 都认 —— 这里必须走 `resolve`，
             // 否则「list 里看到 #7、dispatch 说没有这条会话」这种割裂会出现。
-            let s = resolve(&store, from, raw)?;
-            (s.id.clone(), s.closed.is_closed())
+            resolve(&store, from, raw)?.id.clone()
         };
-        if closed {
-            return Err(format!(
-                "会话 `{again}` 已经收尾了。要重开就新建一个，别往收尾的上头派。"
-            ));
-        }
         return redispatch(core, &again, task).await;
     }
 
@@ -1001,19 +948,10 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
     let sid = new_worker_session(core, from, &title, task).await?;
 
     if let Err(e) = deliver(core, &sid, task, &provider) {
-        // 派不出去就把失败原因记下来，别让它挂在「闲着」上什么都没说。
-        //
-        // 这条路径上 `deliver` 唯一的失败点是 `enqueue`，而它发生在
-        // `continue_with_queued` **之前** —— 所以此刻按理没有回合在跑，
-        // 收尾守卫会放行。
-        //
-        // 万一被拒（理论上不该发生：这是刚建的会话，不可能已经有回合），
-        // **不要强行收尾** —— 那会造出「已取消但其实在跑」的自相矛盾状态。
+        // 派不出去就把失败原因记下来，别让它挂在「闲着」上什么都没说 ——
         // 退化成「闲着 + 一条说明失败原因的结论」：Router `read_session` 看得到，
-        // 用户也能自己关掉或者再派一次。宁可留一个能看懂的活，不留一个撒谎的状态。
-        if !state.close_session(&sid, "cancelled").await {
-            tracing::warn!("会话 {sid} 派不出去又收不了尾（回合在跑），留成「闲着」");
-        }
+        // 用户也能自己再派一次。（会话没有「取消」这个终态，所以这里只需要
+        // 把失败原因写成结论。）
         state.set_conclusion(&sid, &format!("派不出去：{e}"));
         return Err(e);
     }
@@ -1022,47 +960,6 @@ pub async fn dispatch(core: &Core, from: &str, args: &Value) -> Reply {
         "开了会话 `{sid}`（{}），已经派出去。它做完会把结论推回来。",
         title
     ))
-}
-
-/// `close_session`：把一件活收尾（验收过了 / 不要了）。
-///
-/// 这是唯一一个「人（或 Router 代表的人）主动结束一件事」的动作。
-/// 不需要别的状态：结束就是结束，没有「正在结束」。
-pub async fn close_session(core: &Core, from: &str, args: &Value) -> Reply {
-    let state = &core.state;
-    let raw = arg_str(args, "session_id");
-    if raw.is_empty() {
-        return Err("缺少参数 session_id（短编号 `#7` 或完整 id 都行）".to_string());
-    }
-    let outcome = arg_str(args, "outcome");
-    let done = outcome != "cancelled";
-
-    // 解析（含权限）+ 取出真 id：后面全用真 id（`seq` 不是身份，`id` 才是）
-    let id = {
-        let store = state.chat.read().await;
-        resolve(&store, from, raw)?.id.clone()
-    };
-    let id = id.as_str();
-    if state.is_closed(id) {
-        return Ok(format!("会话 `{id}` 已经收尾过了。"));
-    }
-    // **守卫在 `state::close_session` 里**（那是 `closed` 的唯一写点，而且不止
-    // 工具这一条路会写它）。这里只把它的 `false` 翻译成一句人话 ——
-    // **不再自己判一次 `is_busy`**，两份判定迟早会走偏。
-    if !state
-        .close_session(id, if done { "done" } else { "cancelled" })
-        .await
-    {
-        return Err(format!(
-            "会话 `{id}` 还在跑（回合没结束）。先停止它再收尾，\
-             不然那一轮的结果没人接。"
-        ));
-    }
-    Ok(if done {
-        format!("会话 `{id}` 已验收收尾。")
-    } else {
-        format!("会话 `{id}` 已取消。")
-    })
 }
 
 /// 往已有会话再派一次。
@@ -1074,8 +971,8 @@ async fn redispatch(core: &Core, sid: &str, task: &str) -> Reply {
     // 要求变了：把它追加到 brief 上（当初的要求是验收合同，不能直接覆盖 ——
     // 覆盖了就没人记得原话是什么了）
     state.append_brief(sid, task);
-    // 重新开跑前先把「已收尾」清掉（不然回执会被 `is_closed` 挡住）
-    state.reopen_session(sid);
+    // 记一次派工（`times` +1）。**只有这一处加** —— `Dispatch::append` 不动它。
+    state.redispatch_session(sid);
     if let Err(e) = deliver(core, sid, task, &provider) {
         state.set_conclusion(sid, &format!("派不出去：{e}"));
         return Err(e);
@@ -1187,11 +1084,6 @@ pub async fn report_back(
         state.set_conclusion(from_session, &text);
     }
 
-    // 这条会话的活被人划掉了吗？划掉了就不再打扰 Router。
-    if state.is_closed(from_session) {
-        return;
-    }
-
     // **全文给，一个字都不截。**
     //
     // 一开始照 dsh 抄了个 600 字上限 + 「要看全文就调 read_session」的指针。两处都蠢：
@@ -1214,9 +1106,8 @@ pub async fn report_back(
     // 「回执一律给全文」，写到历史里也是一样。上下文膨胀是另一个问题，
     // 以后单独解决，不该以「看不见全文」为代价。
     let body = format!(
-        // 属性名是 `failed`，不是 `closed` —— 它说的是**这一轮成功了没有**
-        // （`ok`），和「这条会话收尾了没有」（`closed`）是两回事。以前这个名字
-        // 在 `main` 上就写错了，本轮一并改掉（提示词里也同步改了）。
+        // 属性名说「这一轮成功了没有」（`ok`）。别叫成 `closed` 那类名字 ——
+        // 那是「会话结束了吗」的意思，而会话根本没有终态，一个名字撒两个谎。
         "<worker_report session=\"{sid}\" failed={failed}>\n\
          {text}\n\
          </worker_report>\n\
@@ -1452,7 +1343,7 @@ mod tests {
 
     /// **短名不是权限的后门**：猜别人的号 → 「没有这条会话」。
     ///
-    /// 场景：两个 Router（A 和 B），A 派了一条（`#1`），B 拿 `#1` 去 read/close/dispatch
+    /// 场景：两个 Router（A 和 B），A 派了一条（`#1`），B 拿 `#1` 去 read/dispatch
     /// 都必须失败 —— 而且**失败信息里不能泄露 A 那条的标题**。
     ///
     /// 变异验证：把 `resolve` 里 `mine()` 的 `dispatched_by == Some(from)` 过滤去掉
@@ -1484,12 +1375,6 @@ mod tests {
         assert!(
             !err.contains("A 的秘密任务"),
             "错误信息**不能泄露**别人会话的标题：{err}"
-        );
-        // close_session
-        assert!(
-            close_session(&core, &rid_b, &serde_json::json!({ "session_id": short }))
-                .await
-                .is_err()
         );
         // dispatch 再派一次
         assert!(dispatch(
@@ -1778,7 +1663,7 @@ mod tests {
         assert!(out.contains("对话正文"), "要说清搜过正文：{out}");
     }
 
-    /// **总数提示**：超过 limit 时说清「共 N 条，只列了前 M 条」。    /// **总数提示**：超过 limit 时说清「共 N 条，只列了前 M 条」。
+    /// **总数提示**：超过 limit 时说清「共 N 条，只列了前 M 条」。
     ///
     /// 变异验证：把 `if matched > rows.len()` 那段删掉 → 这条挂。
     #[tokio::test]
@@ -1817,12 +1702,11 @@ mod tests {
         );
     }
 
-    /// `all: true` 按 **`updated_at`** 倒序（最近碰过的在前），不是创建时间。
+    /// 默认按 **`updated_at`** 倒序（最近碰过的在前），不是创建时间。
     ///
-    /// 变异验证：把 `if all { updated_at } else { created_at }` 那段改回一律
-    /// `created_at` → 这条挂。
+    /// 变异验证：把 `Sort::Updated` 那支改成一律 `created_at` → 这条挂。
     #[tokio::test]
-    async fn all_sorts_by_last_touched_not_created() {
+    async fn it_sorts_by_last_touched_not_created() {
         let (core, rid) = with_router("query-sort").await;
         core.state
             .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
@@ -1834,7 +1718,7 @@ mod tests {
             let s = store.get_mut(&old_id).unwrap();
             s.updated_at = crate::agent::now_ms() + 10_000;
         }
-        let out = list_sessions(&core, &rid, &serde_json::json!({ "all": true }))
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
             .await
             .unwrap();
         let first = out.lines().find(|l| l.starts_with('#')).expect("有行");
@@ -2488,12 +2372,8 @@ mod tests {
         assert_eq!(w.title, "改错别字");
         assert_eq!(w.brief(), Some("把 README 的错别字改掉"), "要求原文要记着");
         assert_eq!(w.dispatch_times(), Some(1));
-        assert!(
-            matches!(w.closed, crate::agent::Closed::Open),
-            "刚派出去还没收尾"
-        );
         // 关键：**没有任何 state 字段**。有的只是能算出来的事实。
-        assert!(!core.state.is_closed(&w.id));
+        assert_eq!(w.standing(false, false), crate::agent::Standing::Idle);
     }
 
     #[tokio::test]
@@ -2574,80 +2454,6 @@ mod tests {
         };
         report_back(&core, &sid, "我干完了", true, false, true).await;
         assert!(core.state.queued_list(&rid).is_empty());
-    }
-
-    /// **收尾之后不再推回执。** 这是「验收/取消」唯一的实际效果。
-    #[tokio::test]
-    async fn a_closed_session_stops_reporting() {
-        let (core, rid) = with_router("closed").await;
-        core.state
-            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
-        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
-            .await
-            .unwrap();
-        let sid = {
-            let store = core.state.chat.read().await;
-            store
-                .sessions
-                .iter()
-                .find(|s| s.dispatched_by() == Some(rid.as_str()))
-                .unwrap()
-                .id
-                .clone()
-        };
-        core.state.clear_llm();
-        end_running_turns(&core);
-
-        // 收尾
-        let out = close_session(&core, &rid, &serde_json::json!({ "session_id": sid }))
-            .await
-            .expect("闲着的时候该收得了");
-        assert!(out.contains("已验收"), "{out}");
-        assert!(core.state.is_closed(&sid));
-
-        // 之后再推回执：不该进队列
-        report_back(&core, &sid, "又干完一轮", true, false, true).await;
-        assert!(
-            core.state.queued_list(&rid).is_empty(),
-            "收尾了的活不该再打扰 Router"
-        );
-
-        // 但结论照样更新（历史/结论是记录，不是通道）
-        let store = core.state.chat.read().await;
-        assert!(store.get(&sid).unwrap().conclusion.contains("又干完一轮"));
-    }
-
-    /// **还在跑的时候不许收尾** —— 不然那一轮的结果没人接。
-    #[tokio::test]
-    async fn cannot_close_a_session_that_is_still_running() {
-        let (core, rid) = with_router("busy").await;
-        core.state
-            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
-        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
-            .await
-            .unwrap();
-        let sid = {
-            let store = core.state.chat.read().await;
-            store
-                .sessions
-                .iter()
-                .find(|s| s.dispatched_by() == Some(rid.as_str()))
-                .unwrap()
-                .id
-                .clone()
-        };
-        // `dispatch` 会真的开跑 —— 所以此刻会话正在跑（这是真实行为，不是假装的）
-        assert!(core.state.is_busy(&sid), "派完就该在跑");
-        let err = close_session(&core, &rid, &serde_json::json!({ "session_id": sid }))
-            .await
-            .expect_err("在跑的时候不该收得了");
-        assert!(err.contains("还在跑"), "{err}");
-
-        // 停下之后再收尾就成功了（把「拒绝」和「允许」两个方向都钉住）
-        core.state.end_turn(&sid);
-        close_session(&core, &rid, &serde_json::json!({ "session_id": sid }))
-            .await
-            .expect("停下了就该收得了");
     }
 
     /// **用户插话不许覆盖交付物。**
@@ -2757,14 +2563,13 @@ mod tests {
         }));
     }
 
-    /// **守卫在 `state::close_session` 里，不在工具层。**
+    /// **一条会话永远可以接着派** —— 包括它还在跑的时候（那条消息排队等着）。
     ///
-    /// 这条测试**绕过 Router 工具**，直接调底层写点 —— 那正是审查指出的洞：
-    /// 守卫原来只在 `router::close_session`，而 `router::dispatch` 的失败路径
-    /// 也调这个写点。守在最底层，任何调用点都拦得住。
+    /// 这是「会话没有终态」那条不变式的正面表达。（这条测试以前测的是
+    /// 「在跑的会话不许收尾」，那个动作已经不存在了。）
     #[tokio::test]
-    async fn the_busy_guard_lives_at_the_only_write_point() {
-        let (core, rid) = with_router("guard").await;
+    async fn a_running_session_can_still_be_dispatched_to() {
+        let (core, rid) = with_router("again-busy").await;
         core.state
             .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
         dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
@@ -2780,72 +2585,76 @@ mod tests {
                 .id
                 .clone()
         };
+        // `dispatch` 会真的开跑 —— 所以此刻会话正在跑（真实行为，不是假装的）
         assert!(core.state.is_busy(&sid), "派完就该在跑");
 
-        // 直接调底层：必须被拒，且**什么都没写**
-        assert!(
-            !core.state.close_session(&sid, "done").await,
-            "底层写点自己就该拒绝在跑的会话"
-        );
-        assert!(!core.state.is_closed(&sid), "被拒之后不该留下任何收尾痕迹");
-
-        // 停下来之后同一调用点放行
-        end_running_turns(&core);
-        assert!(core.state.close_session(&sid, "done").await);
-        assert!(core.state.is_closed(&sid));
-    }
-
-    /// 收尾过的会话，普通 `list_sessions` 里就不在了；`all` 才看得到。
-    #[tokio::test]
-    async fn a_closed_session_drops_out_of_the_default_list() {
-        let (core, rid) = with_router("list").await;
-        core.state
-            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
-        dispatch(
+        let out = dispatch(
             &core,
             &rid,
-            &serde_json::json!({ "task": "干点活", "title": "甲" }),
+            &serde_json::json!({ "task": "再加一句", "session_id": sid }),
         )
         .await
-        .unwrap();
-        let sid = {
-            let store = core.state.chat.read().await;
+        .expect("在跑的会话也该派得进去（消息排队等着）");
+        assert!(out.contains("又派给"), "{out}");
+
+        let store = core.state.chat.read().await;
+        assert_eq!(store.get(&sid).unwrap().dispatch_times(), Some(2));
+        // 还是同一条会话，没有多建
+        assert_eq!(
             store
                 .sessions
                 .iter()
-                .find(|s| s.dispatched_by() == Some(rid.as_str()))
-                .unwrap()
-                .id
-                .clone()
-        };
+                .filter(|x| x.dispatched_by() == Some(rid.as_str()))
+                .count(),
+            1
+        );
+    }
 
-        let seq = {
+    /// **`list_sessions` 列的是「我的所有会话」** —— 汇报过、闲着的也还在，
+    /// 没有「已收尾的不列」这层过滤（那个 `all` 参数已经删了）。
+    ///
+    /// 这条以前测的是「收尾的会从默认列表里掉出去、加 `all` 才看得到」。
+    #[tokio::test]
+    async fn list_sessions_lists_every_session_of_mine() {
+        let (core, rid) = with_router("list").await;
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        for title in ["甲", "乙"] {
+            dispatch(
+                &core,
+                &rid,
+                &serde_json::json!({ "task": "干点活", "title": title }),
+            )
+            .await
+            .unwrap();
+        }
+        let (sid, seq) = {
             let store = core.state.chat.read().await;
-            store.get(&sid).and_then(|s| s.seq).expect("有号")
+            let s = store
+                .sessions
+                .iter()
+                .find(|s| s.title == "甲")
+                .expect("甲在");
+            (s.id.clone(), s.seq.expect("有号"))
         };
-        let open = list_sessions(&core, &rid, &serde_json::json!({}))
-            .await
-            .unwrap();
-        assert!(open.contains("甲"), "{open}");
-        assert!(
-            open.contains(&format!("#{seq}")),
-            "要给出短编号（#{seq}）才找得到它：{open}"
-        );
 
-        // 收起之前先把回合结束掉：守卫（`state::close_session`）会拒绝在跑的会话
+        // 甲汇报完 → 闲着（这是唯一的「不在跑」状态，不是一个终态）
+        core.state.clear_llm();
         end_running_turns(&core);
+        report_back(&core, &sid, "做完了", true, false, true).await;
+        core.state.queued_list(&rid); // 清掉回执队列，只看列表
+
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(out.contains("甲"), "闲着（汇报过）的会话还在列表里：{out}");
+        assert!(out.contains("乙"), "两条都在：{out}");
         assert!(
-            core.state.close_session(&sid, "done").await,
-            "闲着的时候该收得了"
+            out.contains(&format!("#{seq}")),
+            "要给出短编号（#{seq}）才找得到它：{out}"
         );
-        let open = list_sessions(&core, &rid, &serde_json::json!({}))
-            .await
-            .unwrap();
-        assert!(!open.contains("甲"), "收尾了就不该在默认列表里：{open}");
-        let all = list_sessions(&core, &rid, &serde_json::json!({ "all": true }))
-            .await
-            .unwrap();
-        assert!(all.contains("甲"), "加 all 才看得到：{all}");
+        // 头一行给的是「我的全部会话」，不是「未收尾的」
+        assert!(out.contains("共 2 条"), "总数要按全部会话算：{out}");
     }
 
     /// `read_session` 给的是「当初的要求原文 + 最新结论」，而不是让人去猜。
@@ -2978,42 +2787,10 @@ mod tests {
         );
     }
 
-    /// 收尾过的不能再派。
-    #[tokio::test]
-    async fn cannot_redispatch_a_closed_session() {
-        let (core, rid) = with_router("ended").await;
-        core.state
-            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
-        dispatch(&core, &rid, &serde_json::json!({ "task": "干点活" }))
-            .await
-            .unwrap();
-        let sid = {
-            let store = core.state.chat.read().await;
-            store
-                .sessions
-                .iter()
-                .find(|s| s.dispatched_by() == Some(rid.as_str()))
-                .unwrap()
-                .id
-                .clone()
-        };
-        end_running_turns(&core);
-        assert!(core.state.close_session(&sid, "done").await);
-
-        let err = dispatch(
-            &core,
-            &rid,
-            &serde_json::json!({ "task": "再干", "session_id": sid }),
-        )
-        .await
-        .expect_err("收尾的不该能再派");
-        assert!(err.contains("已经收尾"), "{err}");
-    }
-
     /// **`dispatch` 之后立刻统计，waiting 必须是 0。**
     ///
-    /// 那个窗口里会话既没在跑（回合还没开跑）、也没收尾 —— 一版实现用
-    /// `!busy && !closed` 判 needsPerson，于是它被算进「等你」，计数会抖。
+    /// 那个窗口里会话既没在跑（回合还没开跑）、也没闲着 —— 一版实现只用
+    /// `!busy` 判 needsPerson，于是它被算进「等你」，计数会抖。
     /// 现在 `standing()` 认得「排队中」这个状态，它不算等人。
     #[tokio::test]
     async fn a_just_dispatched_session_is_not_counted_as_waiting() {
@@ -3047,16 +2824,16 @@ mod tests {
         );
     }
 
-    /// **不存在「谁都推不动」的状态。**
+    /// **「等你」是从 `standing()` 现算的，不是一个存下来的状态。**
     ///
     /// 这是新架构要钉住的那条不变式。旧的 `tickets.stage` 有 7 个变体、
-    /// 其中 `Done`/`Cancelled` 零调用点 —— 于是一个 ticket 永远停在
-    /// `WaitingReview`，`needs_person()` 永远为真，「N 件等你」只增不减。
+    /// 其中两个零调用点 —— 于是一个 ticket 永远停在没人读的中间态，
+    /// `needs_person()` 永远为真，「N 件等你」只增不减。
     ///
-    /// 现在只有一个事实（`closed_at`）和一个现算的答案，所以：
-    /// **任何一条派出去的会话，收尾之后都不可能还留在「等人」里。**
+    /// 现在只有「在跑 / 排队中 / 闲着」三个现算的事实：闲着 = 等人看一眼，
+    /// **再派一次就立刻不在「等人」里了**（不需要任何人去「关掉」它）。
     #[tokio::test]
-    async fn closing_a_session_always_removes_it_from_the_waiting_count() {
+    async fn the_waiting_count_comes_from_standing_not_a_stored_state() {
         let (core, rid) = with_router("invariant").await;
         core.state
             .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
@@ -3081,24 +2858,35 @@ mod tests {
         core.state.queued_list(&rid); // 清掉队列，只看会话状态
 
         let waiting_now = |core: &Core, rid: &str| {
+            let busy = core.state.busy_set();
+            let queued = core.state.queued_set();
             let store = core.state.chat.try_read().unwrap();
             store
                 .sessions
                 .iter()
                 .filter(|s| s.dispatched_by() == Some(rid))
-                .filter(|s| !s.closed.is_closed() && !core.state.is_busy(&s.id))
+                .filter(|s| {
+                    s.standing(busy.contains(&s.id), queued.contains(&s.id))
+                        .needs_person()
+                })
                 .count()
         };
-        assert_eq!(waiting_now(&core, &rid), 1, "闲着还没收尾 = 等人看一眼");
+        assert_eq!(waiting_now(&core, &rid), 1, "闲着 = 等人看一眼");
 
-        // 收尾 → 必须从「等人」里消失
-        close_session(&core, &rid, &serde_json::json!({ "session_id": sid }))
-            .await
-            .unwrap();
+        // 再派一次 → 立刻不在「等人」里（它开始跑了 / 排上队了）
+        core.state
+            .set_llm(crate::llm::Provider::openai("sk-test-not-used"));
+        dispatch(
+            &core,
+            &rid,
+            &serde_json::json!({ "task": "接着干", "session_id": sid }),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             waiting_now(&core, &rid),
             0,
-            "收尾之后必须从「等人」里消失 —— 旧架构做不到这一点"
+            "再派一次就该从「等人」里消失 —— 不需要谁去关掉它"
         );
     }
 
@@ -3111,7 +2899,7 @@ mod tests {
             let mut store = core.state.chat.write().await;
             store.create()
         };
-        let out = list_sessions(&core, &rid, &serde_json::json!({ "all": true }))
+        let out = list_sessions(&core, &rid, &serde_json::json!({}))
             .await
             .unwrap();
         assert!(
