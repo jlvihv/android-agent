@@ -60,10 +60,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 那是 App 自己的身份，这是 adb/root 身份（见 core/src/shizuku.rs）
         .route("/api/shizuku", post(shizuku_run))
         .route("/api/websearch", post(web_search))
-        .route(
-            "/api/websearch/config",
-            get(search_config).post(set_search_config),
-        )
+        .route("/api/websearch/config", get(search_config))
         // 回合跑完弹不弹系统通知（桌面宿主模式）。手机上这个开关没有意义
         // （壳自己会发），`available()` 为假时 POST 会明确拒绝
         .route("/api/notify", get(notify_config).post(set_notify_config))
@@ -1517,19 +1514,18 @@ async fn list_skills(State(st): State<Arc<AppState>>) -> Json<Value> {
 /// **这是联网搜索的唯一入口**：沙箱里的 `agent search` 走它（能在一行 shell 里
 /// 说清的能力不必再开一个工具）。
 ///
-/// 两种回法：
+/// 那段给模型看的文字由 `search::report` 一处产出（连抬头 `3 条 · DeepSeek`
+/// 一起），这里只决定怎么包：
 ///
-/// - 默认 JSON：`{ok, provider, count, output}`。`output` 是给模型看的那段文字
-///   （见 `search::format_hits`）—— 格式化发生在这里，不在 CLI 里，因为两处各写
-///   一份就会漂。
-/// - `format: "text"`：直接回 `text/plain`，就是那段文字 + 一行抬头
-///   （`3 条 · exa-mcp`）。**`agent search` 用这个** —— 打 JSON 的话模型和界面上
-///   看到的是一串带 `\n` 转义的字符串（“网址后面怎么都有个 \n”），
-///   而且 CLI 还得依赖 jq 才能把它拆开。
+/// - 默认 JSON：`{ok, provider, count, output}`；
+/// - `format: "text"`：直接回 `text/plain`，就是 `output` 本身。
+///   **`agent search` 用这个** —— 打 JSON 的话模型和界面上看到的是一串带
+///   `\n` 转义的字符串（“网址后面怎么都有个 \n”），而且 CLI 还得依赖 jq
+///   才能把它拆开。
 ///
-/// 和 `/api/browser` 一样的理由存在：调试、以及让沙箱里的 `agent search` 能直接用。
+/// 条数的默认值和上限不在这里：`num_results` 缺省就交给 `search::run`（那边
+/// 按 DeepSeek 的 `count: 1..=50` 收口），这里只做「给没给」的翻译。
 async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let core = Core::from(st);
     let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let as_text = body.get("format").and_then(|v| v.as_str()) == Some("text");
     let text = |s: String| {
@@ -1552,40 +1548,30 @@ async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) ->
     let num = body
         .get("num_results")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(5) as usize;
-    match core.search_web(query, num).await {
-        Ok(found) => {
+        .map(|n| n as usize);
+    match crate::search::run(&st, query, num).await {
+        Ok(hits) => {
+            let output = crate::search::report(&hits);
             if as_text {
-                return text(format!(
-                    "{} 条 · {}\n\n{}",
-                    found.hits.len(),
-                    found.provider,
-                    crate::search::format_hits(&found)
-                ));
+                return text(output);
             }
             Json(json!({
                 "ok": true,
-                "provider": found.provider,
-                "count": found.hits.len(),
-                "output": crate::search::format_hits(&found),
+                "provider": crate::search::provider_name(),
+                "count": hits.len(),
+                "output": output,
             }))
             .into_response()
         }
-        // 429 之类的“能自己恢复”的失败：200 + error 字段，调用方（模型/CLI）
+        // 429 / 402 之类的失败：200 + error 字段，调用方（模型/CLI）
         // 看得到原因和解法，而不是一句 500
         Err(e) => {
             if as_text {
-                return text(format!("搜索失败：{:#}", e));
+                return text(format!("搜索失败：{e:#}"));
             }
             Json(json!({ "ok": false, "error": format!("{e:#}") })).into_response()
         }
     }
-}
-
-#[derive(Deserialize)]
-struct SearchConfigBody {
-    #[serde(default)]
-    exa_api_key: String,
 }
 
 /// `GET /api/notify` → 这台机器会不会在回合跑完时弹系统通知。
@@ -1623,40 +1609,18 @@ async fn set_notify_config(State(st): State<Arc<AppState>>, Json(b): Json<Notify
     }
 }
 
-/// `GET /api/websearch/config` → 配没配 Exa key（设置页用）。key 本身不回，只回末尾几位。
+/// `GET /api/websearch/config` → 联网搜索能不能用（设置页用）。
+///
+/// 搜索走 DeepSeek 的 Search API，key 就是「模型提供商 → DeepSeek」那一行 ——
+/// 所以这里**没有自己的输入框**，只回报配没配、key 末尾几位、走的是哪家。
+/// key 本身不回（见 docs/09）。
 async fn search_config(State(st): State<Arc<AppState>>) -> Json<Value> {
-    let key = crate::search::read_key(&st).await;
+    let key = crate::search::read_key(&st);
     Json(json!({
+        "provider": crate::search::provider_name(),
         "configured": key.is_some(),
         "keyHint": key.as_deref().map(crate::providers::key_hint),
     }))
-}
-
-/// `POST /api/websearch/config` → 存 Exa 的 key（库里 `meta` 的 `exa_api_key`）。
-///
-/// 空字符串就是清掉。不配也能搜（走 Exa 免 key 的公开端点，按 IP 限额）；免费额度
-/// 用完了才需要它（见 docs/09）。设置页「联网搜索」那一栏就是填它的。
-async fn set_search_config(
-    State(st): State<Arc<AppState>>,
-    Json(body): Json<SearchConfigBody>,
-) -> Response {
-    let Some(db) = crate::state::cow_take(&st.db) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "会话库没打开").into_response();
-    };
-    let key = body.exa_api_key.trim();
-    let res = if key.is_empty() {
-        db.delete_meta("exa_api_key")
-    } else {
-        db.set_meta("exa_api_key", key)
-    };
-    match res {
-        Ok(()) => Json(json!({
-            "ok": true,
-            "configured": !key.is_empty(),
-        }))
-        .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
-    }
 }
 
 /// `POST /api/edit` → 直接在沙箱里改文件（对应 `edit` 工具）。

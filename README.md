@@ -210,7 +210,7 @@ App 随时被杀都没关系。
 | [docs/06-persistence-and-background.md](docs/06-persistence-and-background.md) | 会话持久化（为什么是 SQLite）、后台运行与**实时更新的通知**                                                               |
 | [docs/07-debugging.md](docs/07-debugging.md)                                   | 无线调试 + agentctl + `/api/debug/*`：不重装 APK 也能调                                                                   |
 | [docs/08-browser.md](docs/08-browser.md)                                       | agent 的浏览器：无头 WebView、看板、截图                                                                                  |
-| [docs/09-search.md](docs/09-search.md)                                         | 联网搜索：Exa 的两种接口、为什么不要钱                                                                                    |
+| [docs/09-search.md](docs/09-search.md)                                         | 联网搜索：DeepSeek Search API、为什么把 Exa 换掉                                                                          |
 | [docs/10-tools-vs-sandbox.md](docs/10-tools-vs-sandbox.md)                     | **工具表为什么只有三个**：判据、代价、加能力的步骤                                                                        |
 | [docs/11-host-mode.md](docs/11-host-mode.md)                                   | **桌面**：桌面上不套沙箱，直接用这台机器（怎么做的、代价）                                                                |
 | [docs/12-relay.md](docs/12-relay.md)                                           | **换机器**：手机/电脑连到另一台机器上的核心（隧道、局域网/中继、页面不拿凭据、部署与验证）                                |

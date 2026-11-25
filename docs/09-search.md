@@ -1,82 +1,98 @@
-# 联网搜索：Exa，以及为什么它不要钱
+# 联网搜索：DeepSeek 的 Search API
 
-> 数据日期：2026-10-12（价格与限额以 Exa 官网为准）
+> 数据日期：2026-11-26（价格与限额以 DeepSeek 官网为准）
 
 ---
 
-## 1. 两条路
+## 1. 一个端点，一个 key
 
-`core/src/search.rs`，思路和 pi-web-access 的 `exa.ts` 一样：
+`core/src/search.rs`：
 
-|                    | 端点                                          | 凭据        | 限流                     |
-| ------------------ | --------------------------------------------- | ----------- | ------------------------ |
-| **默认（没 key）** | `https://mcp.exa.ai/mcp?tools=web_search_exa` | **不需要**  | 按 IP：2 次/秒、50 次/天 |
-| 配了 key           | `https://api.exa.ai/search`                   | `x-api-key` | 按 Exa 账号额度          |
+| 端点                                            | 凭据                                       | 限流           | 计费                   |
+| ----------------------------------------------- | ------------------------------------------ | -------------- | ---------------------- |
+| `POST https://api.deepseek.com/v1/tools/search` | `Authorization: Bearer <DeepSeek API Key>` | 账号级 QPS 100 | 5 元 / 1000 次成功请求 |
 
-没 key 那条打的是一段**裸的 MCP JSON-RPC**，不做 `initialize` 握手 ——
-这个端点无状态，一次 `tools/call` 就够：
+**搜索没有自己的配置项。** key 只认「模型提供商 → DeepSeek」那一行（`providers` 表里
+`deepseek` 的 `api_key`），而且**必须是 platform.deepseek.com 的官方 key**：
+
+- **不借用别家的 key**。OpenCode Go / Zen 看着也是 DeepSeek 系模型，但它们的 key
+  打 `api.deepseek.com` 是 **401**（实测 `oc_sk_…` → `Your api key … is invalid`）。
+  中转站同理：搜索端点不在它们代理的范围内。所以平时聊天走 OpenCode Go 的人，
+  这一栏仍然显示「未配置」，要单独填一个官方 key。
+- **不遍历 `providers` 找「任意一个能用的」**。用一个打不通的 key 换回 401、白跑
+  一轮，比「明确说没配」糟得多。
+- **没有环境变量、没有单独的搜索配置**（以前那个 `exa_api_key` 已经删了）。
+
+请求体：
 
 ```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "tools/call",
-  "params": {
-    "name": "web_search_exa",
-    "arguments": { "query": "…", "numResults": 5 }
-  }
-}
+{ "query": "…", "count": 5, "need_content": false }
 ```
 
-响应是 **SSE**（`event: message` + 一行 `data: {…}`）。解析要两种都认：
-先扫 `data:` 行，扫不到就整段当 JSON（MCP 规范两种都允许）。
+响应 `{ "results": [...] }`，每项有 `title` / `url` / `snippet`（短摘要，给前端）/
+`summary`（600～800 字长摘要，给模型读）/ `site_name` / `date` / `rerank_score`（≥1.5
+算优质）/ `authority`（≥3 算极权威）。我们取 `summary`，空了退回 `snippet`；标题空了
+退回 `site_name`，再退回域名。
 
-## 2. 为什么不要钱
+摘要**原样进上下文**，不做任何 Markdown / 实体清洗 —— 模型自己认识 Markdown，代码块和
+`C#` 这类内容被"清洗"只会被改坏（第一版全局删 `#` 就把 `C#` 删成了 `C`）。`report` 只做
+两件事：按字数截断（成本），以及把续行加上缩进（排版）。
 
-看 hosted server 的源码（`exa-labs/exa-mcp-server` 的 `api/mcp.ts`）：
+`query` 支持搜索语法（原样透传给搜索服务，我们不做解析）：`site:` / `-site:` / `-词` /
+`"精确短语"` / `lang:zh,en` / `after:2025-01-01` / `before:`，可以组合。
 
-- 服务端启动时 `let exaApiKey = process.env.EXA_API_KEY` —— **Exa 自己的 key 在
-  它的 Vercel 环境里**，匿名请求就用它去打 Exa API。客户端从头到尾看不到也不需要。
-- 免费档限流常量就写在那个文件里：`RATE_LIMIT_QPS=2`、`RATE_LIMIT_DAILY=50`，
-  按 IP、**只算 `tools/call`**（`initialize`/`tools/list` 不计数），
-  而且只对"没自带 key"的请求生效。
+## 2. 为什么把 Exa 换掉
 
-**这是获客漏斗，不是做慈善。** Exa 花钱买"任何 MCP 客户端零配置就能用"这个
-默认位，再靠两件事转化：① 免费档只给 `web_search_exa` / `web_fetch_exa`，
-好用的 `web_search_advanced_exa`（域名/日期/分类过滤）和 deep researcher
-全要自带 key —— 源码里就是 `requiresUserProvidedApiKey: true`；
-② 50 次/天一到就弹"去 dashboard 建 key"。
+以前默认走 Exa 的**公开 MCP 端点**（`https://mcp.exa.ai/mcp`，不需要任何凭据，服务端
+拿 Exa 自己的 key 去打，按 **IP** 限流 2 次/秒、50 次/天）。那是 Exa 的获客漏斗，好处是
+零配置，代价是：
 
-## 3. 手机上必须知道的两个边界
+- 额度按 IP。运营商 CGNAT 下那 50 次是**同一个出口 IP 上所有人共用**的，随时 429，
+  而且不是我们的 bug —— 错误文案只能写「等一下 / 去配 key / 改用 browser」。
+- 免费档只给基础搜索，`web_search_advanced_exa` 和 deep researcher 都要自带 key。
+- 端点和工具名随时可能变，没有 SLA。
 
-1. **额度按 IP 算**。运营商 CGNAT 下，那 50 次/天 是**同一个出口 IP 上所有人
-   共用**的 —— 随时可能撞 429，而且这不是我们的 bug。所以 429 的文案必须
-   写出路（等一下再试 / 配 key / 改用 browser 打开搜索引擎），而不是一句
-   "搜索失败"。
-2. **没有 SLA**。端点和工具名随时可能变。解析失败时错误里要带上原始响应片段，
-   这样在手机上也能一眼看出是"接口变了"还是"网络问题"。
+换成 DeepSeek 之后：**已经有 key 了**（对话在用），按次计费但便宜（5 元/1000 次，无结果
+不计费），限流按账号而不是按出口 IP，而且 `count` 只影响条数不影响价格。
 
-## 4. 配 key（免费用完了才需要）
+**代价说清楚**：现在没 key 就搜不了（以前「零配置勉强能用」）。所以缺 key 的报错必须
+给出路：去设置里填 / 用 `agent browser` 打开搜索引擎 / `curl` 已知 URL。见第 4 节。
 
-桌面和手机一样：设置 → 联网搜索里填（写进库的 `meta`），**没有环境变量那条路**。
+## 3. 手机上必须知道的三个边界
 
-手机：key 存在会话库的 `search` 那一行（和 provider 配置同一个理由：写 JSON 文件
-时进程被杀就是半截文件）。设一次：
+1. **402 ≠ 401**。401 是 key 错/失效（去设置里重填），402 是账号余额不足（充值）。混成
+   一句「搜索失败」的话，用户在手机上根本没法判断该干什么。429 也单独一条文案。
+2. **没有 key 就没有搜索**。这是刻意换来的确定性：不再有「有时候能搜有时候不能、原因
+   在别人家」的状态。
+3. **正文不拉**（`need_content: false`）。十篇全文进历史 = 进提示词缓存 = 按 token 烧钱，
+   而且 DeepSeek 的 Search 只要返回了结果就计费，拉正文只是让上下文变大，不省钱。
+
+## 4. 配 key
+
+桌面和手机一样：设置 → 模型提供商 → DeepSeek 里填一个**官方 key**
+（[platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)，写进
+`providers` 表），**没有环境变量那条路** —— 配置只有一个来源，不然「界面上填的」和
+「shell 里带的」会互相打架。
+
+设置页的「联网搜索」一栏现在**只有状态，没有输入框**：显示走哪家、配没配、key 末尾几位。
+想用 curl 看一眼：
 
 ```sh
-# 在电脑上
-curl -sS -H "x-agent-token: <token>" -H 'content-type: application/json' \
-     -d '{"exa_api_key":"exa-…"}' http://127.0.0.1:18787/api/websearch/config
+curl -sS -H "x-agent-token: <token>" http://127.0.0.1:18787/api/websearch/config
+# {"provider":"DeepSeek","configured":true,"keyHint":"…c7f1"}
 ```
 
-清掉传空字符串。没做界面：这是个"额度用完才需要"的逃生口，先用 curl 设就够。
+以前那个 `POST /api/websearch/config {"exa_api_key": "…"}` **已经删了**。库里如果还留着
+老的 `exa_api_key`（`meta` 表），那是死数据，不读也不清 —— 想清就
+`DELETE FROM meta WHERE k='exa_api_key'`。
 
 ## 5. 输出为什么这么小气
 
 搜索结果进历史 = 进提示词缓存前缀 = **按钱算**。所以每条片段截 400 字、
-整段封顶 4000 字（`core/src/search.rs` 的 `format_hits` —— 搜索不是工具了，
-格式化就发生在核心这一层，`/api/websearch` 把它放在响应的 `output` 字段里；
-为什么要这样拆，见 [docs/10](10-tools-vs-sandbox.md)）。
+整段封顶 4000 字。排版只在 `core/src/search.rs` 的 `report` 一处做 —— 连抬头
+`3 条 · DeepSeek` 和正文一起出（分两处拼就会漂：以前抬头在 `http.rs`、正文在
+`search.rs`）。`/api/websearch` 把它放在响应的 `output` 字段里；为什么格式化在
+核心这层，见 [docs/10](10-tools-vs-sandbox.md)。
 
 要读全文是**另一件事**，让模型自己挑：
 
@@ -84,7 +100,9 @@ curl -sS -H "x-agent-token: <token>" -H 'content-type: application/json' \
 - 要登录态 / JS 渲染 / 点按钮 → `agent browser navigate` 打开那个链接（见 `docs/08`）
 - 接口返回 JSON → `bash` 里 `curl … | jq`
 
-把十篇全文（几十 KB）塞进历史才是真浪费。
+（DeepSeek 还有个 `POST /v1/tools/fetch` 能把单页抓成 Markdown，也是同一个 key、5 元/1000
+次、QPS 25。暂时没接：全文按需读用 `curl` / `browser` 就够，不必再多一层计费和失败面。
+真接的话它和 Search 是一对，放在 `search.rs` 里最合适。）
 
 ## 6. 怎么调
 
@@ -102,9 +120,9 @@ just phone
 两种回法：
 
 - 默认 JSON：`{ok, provider, count, output}` —— `output` 就是给模型看的那段文字；
-- `format: "text"`：直接回 `text/plain`（一段抬头 `3 条 · exa-mcp` + 正文）。
+- `format: "text"`：直接回 `text/plain`（一段抬头 `3 条 · DeepSeek` + 正文）。
   **`agent search` 用这个**：JSON 里的换行是 `\n` 转义，模型和界面上看到的就是
   一长串带转义的字符串（“网址后面怎么都有个 `\n`”），而且 CLI 还得靠 `jq`
   才能把它拆开。要原始 JSON 就直接 `agent debug post /api/websearch '{…}'`。
 
-日志：失败会带原始响应片段；成功的搜索结果不进日志（那是模型上下文的事）。
+日志：失败会带原始响应片段（key 已打码）；成功的搜索结果不进日志（那是模型上下文的事）。

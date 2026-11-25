@@ -33,7 +33,7 @@
    *   同时配好，在选择模型面板里点哪家的模型就切到哪家
    * - 手机权限（PermissionsSection）：只在手机 App 里有
    * - MCP 服务、技能（McpSection / SkillsSection）
-   * - 联网搜索（SearchSection）：Exa key，可选
+   * - 联网搜索（SearchSection）：只显示状态 —— 用的是 DeepSeek 的 key，没有单独的配置项
    * - 用量（UsageSection）
    * - 连接手机（PairingSection）：配对码，只有电脑上自己开这个页面时才有
    * - Linux 沙箱（SandboxSection）：Alpine 版本 / 升级，桌面宿主模式下没有

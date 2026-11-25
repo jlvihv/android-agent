@@ -1,74 +1,139 @@
-//! 联网搜索：Exa。
+//! 联网搜索：DeepSeek 的 Search API。
 //!
-//! 两条路，思路和 pi-web-access 的 `exa.ts` 一样：
+//! 一个端点：`POST https://api.deepseek.com/v1/tools/search`，Bearer 鉴权（错误格式
+//! 和对话那套 OpenAI 兼容的一样）。key **只认「模型提供商 → DeepSeek」那一行，
+//! 而且必须是 platform.deepseek.com 的官方 key** —— OpenCode Go / Zen、中转站的
+//! key 打这个端点是 401（见 `read_key`）。没配就说清楚去哪配。
 //!
-//! - **没有 key**（默认）：Exa 的**公开 MCP 端点** `https://mcp.exa.ai/mcp`。
-//!   它不要任何凭据 —— 服务端拿 **Exa 自己的 key** 去打 Exa 的 API，然后按
-//!   **IP** 限流（`RATE_LIMIT_QPS=2`、`RATE_LIMIT_DAILY=50`，只算 `tools/call`）。
-//!   为什么免费：这是 Exa 的获客漏斗，零配置就能用才有人把它写进默认配置；
-//!   免费档只给基础搜索，advanced / agent 那些工具要 key。
-//! - **有 key**：直连 `https://api.exa.ai/search`，无限流。
-//!   key 从会话库的 `meta` 拿（设置页写的，桌面和手机同一条路）。
+//! 为什么不留「免 key 也能搜」那条路：以前打的是 Exa 的公开 MCP 端点，靠对方
+//! 自己的 key 按 **IP** 限流（2 次/秒、50 次/天）。在运营商 CGNAT 下那 50 次是
+//! 同一个出口 IP 上所有人共用的，随时 429，而且不是我们的 bug —— 一个「默认能
+//! 用、但随时不可用且原因在别人家」的能力，不如明确要 key（见 docs/09）。
 //!
-//! 手机上两个必须知道的边界：
+//! 几条要用到的边界：
 //!
-//! 1. 限流按 **IP**。运营商 CGNAT 下，那个 50/天 是同一个出口 IP 上所有人
-//!    共用的 —— 随时可能撞到 429，**不是我们的 bug**，所以错误文案要写清楚
-//!    怎么加 key。
-//! 2. 没有 SLA。端点和工具名随时可能变，所以 429 / 解析失败都要给出"换个做法"
-//!    的出路（用 browser 打开搜索引擎、或者用 key 直连）。
-//!
-//! 拿到的只是标题 + 链接 + 片段。**读全文是另外的事**：静态页面用 bash 的 curl，
-//! 要登录态 / JS 渲染 / 点按钮就用 `browser`。
+//! - 计费**按成功的请求次数**（无结果 / 失败不计费），`count` 只影响条数不影响价格 ——
+//!   多要几条不额外花钱，但**进了上下文的仍然被截**（见 `report`：每条 400 字、
+//!   整段 4000 字），所以别指望「要 50 条」能拿回更多信息。**正文不要**
+//!   （`need_content: false`）—— 十篇全文进了历史就是按 token 烧钱。
+//! - 限流按**账号** QPS 100，超了 429；402 是余额不足（不是 key 错），文案要分开。
+//! - 拿到的只是标题 + 链接 + 摘要。**读全文是另外的事**：静态页面用 bash 的 curl，
+//!   要登录态 / JS 渲染 / 点按钮就用 `browser`。
 
 use std::time::Duration;
 
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde::Deserialize;
 
 use crate::state::AppState;
 
-/// 免 key 的公开 MCP 端点。`?tools=` 决定服务端注册哪些工具
-/// （注册多了会增加它给模型看的工具表，我们只要一个）。
-const EXA_MCP: &str = "https://mcp.exa.ai/mcp?tools=web_search_exa";
-/// 带 key 时直连的 REST 端点。
-const EXA_API: &str = "https://api.exa.ai/search";
+/// Search 端点。和 chat 同一个 host：`api.deepseek.com`。
+const SEARCH_URL: &str = "https://api.deepseek.com/v1/tools/search";
+
+/// key 从这一家服务商的凭据里拿（`providers.rs` 的预设 id）。
+const PROVIDER: &str = "deepseek";
+
+/// 没指定条数时取几条。也在这里定义上限 —— 条数的规矩只放一处，
+/// 接口层（`/api/websearch`）不再各写一个默认值。
+const DEFAULT_COUNT: usize = 5;
+const MAX_COUNT: usize = 50;
+/// DeepSeek 的 `count` 上限就是 50：写错了在编译期就发现，不用等线上 400。
+const _: () = assert!(MAX_COUNT <= 50);
 
 const TIMEOUT: Duration = Duration::from_secs(40);
 
 /// 一条搜索结果。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug)]
 pub struct Hit {
     pub title: String,
     pub url: String,
-    /// 片段（可能是多条 highlight 拼起来的）。**不是全文**。
+    /// 摘要，**原样**（多半是 `summary`，空了退回 `snippet`）。是 Markdown 也好、
+    /// 带换行也好，都不动 —— 模型自己认识，我们改只会改坏（见 docs/09）。
     pub snippet: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Found {
-    pub hits: Vec<Hit>,
-    /// 走的是哪条路（`exa-mcp` / `exa-api`），给日志和工具输出用
-    pub provider: &'static str,
+/// 这个能力挂在哪家身上（给模型看的抬头、设置页都用它）。
+pub fn provider_name() -> &'static str {
+    crate::providers::display_name(PROVIDER)
 }
 
-/// 搜索结果 → 模型看的文本。
+/// 搜索用的 key：**只认 DeepSeek 官方那一行**（`providers` 表的 `deepseek`）。
+///
+/// 「写死」到什么程度，以及为什么不放宽：
+///
+/// - **只按 id 取 `deepseek`**，不遍历 `providers` 找「任何一个能用的 key」。搜索
+///   结果的好坏直接决定模型下一步看什么，用一个打不通的 key 换回一句 401、再白
+///   跑一轮，比「明确说没配」糟得多。
+/// - **不借用 OpenCode Go / Zen 的 key**：它们看着也是 DeepSeek 系模型，但打
+///   `api.deepseek.com` 是 401（实测 `oc_sk_…` → `Your api key … is invalid`）。
+///   中转站同理 —— 搜索端点不在它们代理的范围内。
+/// - **没有环境变量、没有单独的搜索配置**：配置只有一个来源（设置页写进
+///   `providers` 表），不然「界面上填的」和「shell 里带的」会互相打架。
+///
+/// 在内存里的 `providers` 缓存中取，不查库 —— 搜索是每回合都可能调一次的路径，
+/// 没必要为一次读 key 去碰 SQLite。
+pub fn read_key(state: &AppState) -> Option<String> {
+    // 不看 `Creds.base_url`：内置那家的 Base URL 是写死的（`providers::preset`），
+    // 这个字段只给「其他（OpenAI 兼容）」用，`providers::provider` 对内置的也忽略它。
+    // 拿它当判据等于让「搜索能不能用」取决于一个没人设的字段 —— 真填了非官方
+    // endpoint，401 的文案会把原因说清楚，那比这里静默判死好。
+    state
+        .provider_creds(PROVIDER)
+        .map(|c| c.api_key.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+/// 每个失败文案里都带这一句：搜索不可用时，模型手里还有别的路，
+/// 别让它卡死在「搜索失败了」。
+const ELSEWHERE: &str =
+    "改用 `agent browser navigate` 打开搜索引擎（bing.com / duckduckgo.com）自己找";
+
+/// 搜一次。`num` 是 `None` 就用 [`DEFAULT_COUNT`]（条数的默认值和上限都在这里定）。
+///
+/// 没配 key 就直接说清楚去哪配，不去猜别的后端。
+pub async fn run(state: &AppState, query: &str, num: Option<usize>) -> anyhow::Result<Vec<Hit>> {
+    let query = query.trim();
+    anyhow::ensure!(!query.is_empty(), "缺少参数 query");
+    let num = num.unwrap_or(DEFAULT_COUNT).clamp(1, MAX_COUNT);
+
+    let key = read_key(state).ok_or_else(|| {
+        anyhow::anyhow!(
+            "联网搜索只认 platform.deepseek.com 的官方 API Key，现在没配。三条出路：\
+             ① 设置 → 模型提供商 → DeepSeek 里填一个官方 key（哪怕平时聊天走 \
+             OpenCode Go，搜索也要单独填这一行 —— 别家的 key 打这个端点会 401）；\
+             ② {ELSEWHERE}；\
+             ③ 已知 URL 的静态页面直接 `curl`。"
+        )
+    })?;
+    search_api(query, num, &key).await
+}
+
+// ---------------------------------------------------------------------------
+// 结果 → 模型看的文本
+// ---------------------------------------------------------------------------
+
+/// 结果 → 一段排好版的文字（**连抬头一起**）。
+///
+/// 抬头和正文放在一个函数里：`/api/websearch` 的 JSON 和 `agent search` 的纯文本
+/// 用的是同一段东西，分两处拼就会漂（以前抬头在 `http.rs`、正文在这儿，改一处
+/// 忘一处）。
 ///
 /// 这段文字会进历史、进提示词缓存，所以**按钱算**：每条片段截到 400 字、
 /// 整段封顶 4000 字。要读全文是另一件事，让模型自己挑一条去 `curl` /
 /// `agent browser`。把十篇全文（几十 KB）塞进历史才是真浪费。
-///
-/// 放这儿而不是 `agent.rs`：搜索已经不是工具了（唯一入口是沙箱里的
-/// `agent search`），这段文字由 `/api/websearch` 直接回给 CLI。
-pub fn format_hits(found: &Found) -> String {
-    if found.hits.is_empty() {
-        return "没搜到结果。换个说法，或者用 `agent browser navigate` 打开搜索引擎自己翻。"
-            .to_string();
+pub fn report(hits: &[Hit]) -> String {
+    let mut out = format!("{} 条 · {}\n\n", hits.len(), provider_name());
+    if hits.is_empty() {
+        out.push_str(
+            "没搜到结果。换个说法，或者用 `agent browser navigate` 打开搜索引擎自己翻。\n",
+        );
+        return out;
     }
-    let mut out = String::new();
     let mut chars = 0usize;
-    for (i, h) in found.hits.iter().enumerate() {
+    for (i, h) in hits.iter().enumerate() {
+        // 摘要原样留着（Markdown、代码块、换行都是信息），只按字数截断 ——
+        // 截断是为了省钱，不是为了"好看"。
         let snip: String = h.snippet.chars().take(400).collect();
+        let snip = snip.trim().replace('\n', "\n   ");
         let item = format!("{}. {}\n   {}\n   {}\n", i + 1, h.title, h.url, snip);
         chars += item.chars().count();
         out.push_str(&item);
@@ -80,285 +145,144 @@ pub fn format_hits(found: &Found) -> String {
     out
 }
 
-/// 找 key：只在库里（`meta` 的 `exa_api_key`，设置页写的）。
-///
-/// 曾经还有一条 `EXA_API_KEY` 环境变量压库一头（桌面开发）—— 删了：配置只有
-/// 一个来源，不然「界面上填的」和「shell 里带的」会互相打架（LLM 那边同一个教训）。
-pub async fn read_key(state: &AppState) -> Option<String> {
-    // 一次 SQLite 查询：不能坐在 tokio worker 上（`Db` 是 std Mutex，落盘写大事务时
-    // 会等一阵；worker 只有 4 个）。
-    let db = crate::state::cow_take(&state.db)?;
-    tokio::task::spawn_blocking(move || db.get_meta("exa_api_key").ok().flatten())
-        .await
-        .ok()
-        .flatten()
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-}
-
-/// 搜一次。`key` 有就直连，没有就走公开 MCP。
-pub async fn run(query: &str, num: usize, key: Option<&str>) -> anyhow::Result<Found> {
-    let query = query.trim();
-    anyhow::ensure!(!query.is_empty(), "缺少参数 query");
-    let num = num.clamp(1, 20);
-
-    match key {
-        Some(k) => search_api(query, num, k).await,
-        None => search_mcp(query, num).await,
-    }
-}
-
 // ---------------------------------------------------------------------------
-// 免 key：公开 MCP
+// DeepSeek Search API
 // ---------------------------------------------------------------------------
 
-async fn search_mcp(query: &str, num: usize) -> anyhow::Result<Found> {
+/// 响应形状（只取用得上的字段；多出来的 `site_icon` / `authority` / `date` 由
+/// serde 忽略）。用结构体而不是 `Value` 逐层 `get`：字段名写错在编译期就发现，
+/// 也不会给每个字段写一遍 `and_then(as_str)`。
+#[derive(Deserialize)]
+struct Resp {
+    #[serde(default)]
+    results: Vec<Item>,
+}
+
+#[derive(Deserialize)]
+struct Item {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    snippet: String,
+    /// 长摘要（600～800 字），本来就是给模型读的
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    site_name: Option<String>,
+}
+
+async fn search_api(query: &str, num: usize, key: &str) -> anyhow::Result<Vec<Hit>> {
     let client = crate::llm::shared_http()?;
-
-    // 一条裸的 JSON-RPC。**不做 initialize 握手** —— 这个端点无状态，
-    // 一次 tools/call 就够（pi-web-access 也是这么打的）。
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "web_search_exa",
-            "arguments": { "query": query, "numResults": num }
-        }
-    });
+    // `need_content: false`：只要摘要。正文留给模型自己按需 `curl` / `browser` 读，
+    // 一次性拉十篇全文塞进历史是纯粹的浪费。
+    let body = serde_json::json!({ "query": query, "count": num, "need_content": false });
 
     let resp = client
-        .post(EXA_MCP)
-        .header("content-type", "application/json")
-        // 两个都要带上：服务端可能回 SSE，也可能直接回 JSON
-        .header("accept", "application/json, text/event-stream")
-        // 有它 Exa 那边能看出是哪个客户端（他们用来统计/排查）
-        .header("x-exa-source", "android-agent")
+        .post(SEARCH_URL)
+        .header("authorization", format!("Bearer {key}"))
         .timeout(TIMEOUT)
         .json(&body)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("连不上 Exa 的搜索端点: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("连不上 DeepSeek 的搜索端点: {e}"))?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-
-    if status.as_u16() == 429 {
-        anyhow::bail!(
-            "Exa 免费额度用尽（按 IP 限 2 次/秒、50 次/天）。这个额度是**同一个出口 IP \
-             共用**的，别人的手机也可能把它用掉。三条出路：① 过一会儿再试；\
-             ② 让用户在 设置 → 联网搜索 里填一个 Exa key；\
-             ③ 改用 browser 打开搜索引擎（bing.com / duckduckgo.com）自己找。\
-             原始响应：{}",
-            text.chars().take(200).collect::<String>()
-        );
-    }
     if !status.is_success() {
-        anyhow::bail!(
-            "Exa MCP 返回 {status}：{}",
-            text.chars().take(300).collect::<String>()
-        );
+        anyhow::bail!("{}", api_error(status, &text, key));
     }
 
-    let payload = crate::mcp::decode_rpc_body(&text)?;
-    if let Some(err) = payload.get("error") {
-        anyhow::bail!("Exa MCP 报错：{err}");
-    }
-    let content = payload
-        .pointer("/result/content/0/text")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Exa MCP 没给内容：{}",
-                text.chars().take(200).collect::<String>()
-            )
-        })?;
-    if payload
-        .pointer("/result/isError")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        anyhow::bail!(
-            "Exa MCP 报错：{}",
-            content.chars().take(300).collect::<String>()
-        );
-    }
-
-    Ok(Found {
-        hits: parse_mcp_text(content, num),
-        provider: "exa-mcp",
-    })
+    let resp: Resp = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("DeepSeek Search 的响应不是 JSON: {e}"))?;
+    Ok(resp.results.iter().filter_map(hit_of).take(num).collect())
 }
 
-/// 解析 MCP 给的文本块。形状是：
-///
-/// ```text
-/// Title: 标题
-/// URL: https://…
-/// Published: …
-/// Author: …
-/// Highlights:
-/// 片段…
-///
-/// ---
-///
-/// Title: …
-/// ```
-fn parse_mcp_text(text: &str, num: usize) -> Vec<Hit> {
-    let mut hits = Vec::new();
-    for block in text.split("\n\n---") {
-        let mut title = String::new();
-        let mut url = String::new();
-        let mut body = String::new();
-        let mut in_body = false;
+/// 失败的文案：每种状态码都给出「接下来干什么」，而不是一句 500。
+fn api_error(status: reqwest::StatusCode, text: &str, key: &str) -> String {
+    // 别把 key 回显出去（有的网关会把请求头原样带回来）
+    let raw: String = text.replace(key, "***").chars().take(300).collect();
+    match status.as_u16() {
+        401 => format!(
+            "DeepSeek 说这个 API Key 无效（401）。搜索只认 platform.deepseek.com 的官方 \
+             key —— OpenCode Go / Zen 或中转站的 key 打这个端点是 401，不能用。\
+             去 设置 → 模型提供商 → DeepSeek 换一个官方 key，或者{ELSEWHERE}。原始响应：{raw}"
+        ),
+        402 => format!(
+            "DeepSeek 账号余额不足（402），搜索按成功请求计费（5 元 / 1000 次）。\
+             充值后再试，或者{ELSEWHERE}。原始响应：{raw}"
+        ),
+        429 => format!(
+            "DeepSeek 的搜索 QPS 用完了（账号级 100 次/秒，429）。\
+             等一下再试，或者{ELSEWHERE}。原始响应：{raw}"
+        ),
+        _ => format!("DeepSeek Search 返回 {status}：{raw}"),
+    }
+}
 
-        for line in block.lines() {
-            let line = line.trim_end();
-            if !in_body {
-                if let Some(v) = line.strip_prefix("Title:") {
-                    title = v.trim().to_string();
-                    continue;
-                }
-                if let Some(v) = line.strip_prefix("URL:") {
-                    url = v.trim().to_string();
-                    continue;
-                }
-                if line.starts_with("Highlights:") {
-                    in_body = true;
-                    continue;
-                }
-                if let Some(v) = line.strip_prefix("Text:") {
-                    body.push_str(v.trim());
-                    body.push(' ');
-                    in_body = true;
-                    continue;
-                }
-                // Published / Author 之类：模型看片段就够了，不占额度
-            } else {
-                let t = line.trim();
-                if !t.is_empty() && t != "---" {
-                    body.push_str(t);
-                    body.push(' ');
-                }
-            }
-        }
-
-        if url.starts_with("http") {
-            // MCP 那边没标题时会写 `Title: N/A` —— 别让模型看到一排 "N/A"，
-            // 回退成域名至少能看出是哪个站
-            let t = title.trim();
-            hits.push(Hit {
-                title: if t.is_empty() || t.eq_ignore_ascii_case("n/a") {
-                    host_of(&url)
+/// 一条结果 → `Hit`。`None` = 这条没法用（没链接 / 不是 http，模型拿到也没用）。
+fn hit_of(item: &Item) -> Option<Hit> {
+    let url = item.url.trim();
+    if !url.starts_with("http") {
+        return None;
+    }
+    // 优先 `summary`（长摘要），空了退回 `snippet` —— 服务端缺字段时会给空串，
+    // 空串要当成没有，不能拿它盖住另一个。
+    let raw = [&item.summary, &item.snippet]
+        .into_iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    let title = item.title.trim();
+    let title = if title.is_empty() {
+        // 没标题时回退成站点名，再退成域名，别让模型看到一排空白
+        item.site_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let host = crate::text::host_name(url);
+                if host.is_empty() {
+                    url.to_string()
                 } else {
-                    title
-                },
-                url,
-                snippet: squeeze(&body),
-            });
-        }
-        if hits.len() >= num {
-            break;
-        }
-    }
-    hits
-}
-
-/// 去掉 Markdown 标记和多余空白，留一段能读的片段。
-fn squeeze(s: &str) -> String {
-    let cleaned = s
-        .replace("**", "")
-        .replace("###", "")
-        .replace('#', " ")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'");
-    crate::text::one_line(&cleaned)
-}
-
-/// 回退标题用：域名；连域名都认不出（没有协议头）就原样给 URL，别给空标题。
-fn host_of(url: &str) -> String {
-    let host = crate::text::host_name(url);
-    if host.is_empty() {
-        url.to_string()
+                    host
+                }
+            })
     } else {
-        host
-    }
+        title.to_string()
+    };
+    Some(Hit {
+        title,
+        url: url.to_string(),
+        snippet: raw.to_string(),
+    })
 }
 
-// ---------------------------------------------------------------------------
-// 带 key：直连 REST
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn search_api(query: &str, num: usize, key: &str) -> anyhow::Result<Found> {
-    let client = crate::llm::shared_http()?;
-    let body = json!({
-        "query": query,
-        "type": "auto",
-        "numResults": num,
-        "contents": { "highlights": true },
-    });
+    fn parse(json: &str) -> Vec<Hit> {
+        let resp: Resp = serde_json::from_str(json).unwrap();
+        resp.results.iter().filter_map(hit_of).collect()
+    }
 
-    let resp = client
-        .post(EXA_API)
-        .header("x-api-key", key)
-        .header("x-exa-integration", "android-agent")
-        .timeout(TIMEOUT)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("连不上 Exa: {e}"))?;
-
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        // 别把 key 回显出去
-        let safe = text.replace(key, "***");
-        anyhow::bail!(
-            "Exa API 返回 {status}：{}",
-            safe.chars().take(300).collect::<String>()
+    /// 摘要原样保留：`**` 是 Markdown，模型自己认识，我们不碰。
+    #[test]
+    fn 优先_summary_没标题退回域名() {
+        let hits = parse(
+            r#"{"results":[
+                {"title":"A","url":"https://example.com/a","snippet":"短","summary":"长：**3.21** 发布"},
+                {"url":"https://news.example.org/b","summary":"","snippet":"只有短摘要"},
+                {"title":"没有链接","summary":"丢"},
+                {"title":"不是 http","url":"ftp://x/y"}
+            ]}"#,
         );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].snippet, "长：**3.21** 发布");
+        assert_eq!(hits[1].title, "news.example.org");
+        assert_eq!(hits[1].snippet, "只有短摘要");
     }
-
-    let v: Value =
-        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Exa API 的响应不是 JSON: {e}"))?;
-    let mut hits = Vec::new();
-    if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
-        for item in arr.iter().take(num) {
-            let Some(url) = item.get("url").and_then(|u| u.as_str()) else {
-                continue;
-            };
-            let title = item
-                .get("title")
-                .and_then(|t| t.as_str())
-                .filter(|t| !t.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| host_of(url));
-            let snippet = item
-                .get("highlights")
-                .and_then(|h| h.as_array())
-                .map(|hl| {
-                    hl.iter()
-                        .filter_map(|x| x.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| {
-                    item.get("text")
-                        .and_then(|t| t.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_default();
-            hits.push(Hit {
-                title,
-                url: url.to_string(),
-                snippet: squeeze(&snippet),
-            });
-        }
-    }
-    Ok(Found {
-        hits,
-        provider: "exa-api",
-    })
 }

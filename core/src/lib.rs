@@ -677,17 +677,6 @@ impl Core {
         }
     }
 
-    /// 联网搜索。key 有就直连 Exa API，没有就走他们那个免 key 的公开 MCP
-    /// 端点（按 IP 限流，见 `search` 模块）。
-    pub async fn search_web(
-        &self,
-        query: &str,
-        num: usize,
-    ) -> anyhow::Result<crate::search::Found> {
-        let key = crate::search::read_key(&self.state).await;
-        crate::search::run(query, num, key.as_deref()).await
-    }
-
     /// 把要内联给模型的图片字节落盘，返回绝对路径。
     ///
     /// **为什么落盘**：带图的消息进了历史之后，后面每一轮都要重发同一张图

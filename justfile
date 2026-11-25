@@ -75,6 +75,22 @@ build:
 check:
     cargo clippy --manifest-path {{core}}/Cargo.toml --all-targets -- -D warnings
 
+# 格式化：Rust 用 rustfmt，前端和**文档**用 bun fmt（它认 .ts/.svelte/.css/.md/.json，
+# 而且比 prettier 快一个量级，不用另装依赖）。
+#
+# 为什么两个都跑：Rust 那边有 rustfmt，markdown / svelte 它不管；bun fmt 反过来不懂
+# Rust。所以 `just fmt` 是「一次跑完两边」，别只跑一个 —— 只跑 bun fmt 会留下没排版的
+# Rust，只跑 cargo fmt 会留下没排版的文档。
+#
+# `--check` 变体给 CI / 提交前用：**只检查不改**，有需要格式化的就非 0 退出。
+fmt:
+    cargo fmt --manifest-path {{core}}/Cargo.toml
+    bun fmt .
+
+fmt-check:
+    cargo fmt --manifest-path {{core}}/Cargo.toml --check
+    bun fmt -c .
+
 # 清掉 7 天没用过的产物（dev / bindgen / NDK 各一份 target，实测 55GB）。
 # 需要一次 `cargo install cargo-sweep`。
 sweep:

@@ -960,7 +960,7 @@ const MAX_ORPHANS: usize = 20;
 
 impl ProcsReport {
     /// 给模型看的排版。**在核心侧排好**，CLI 直接打 —— 免得两处各写一份
-    /// （`search.rs` 的 `format_hits` 就是这么搬过来的）。
+    /// （`search.rs` 的 `report` 就是这么搬过来的）。
     pub fn to_text(&self) -> String {
         if self.host {
             let p = crate::platform::Platform::host();

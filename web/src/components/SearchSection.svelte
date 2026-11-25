@@ -1,21 +1,22 @@
 <script lang="ts">
   /**
-   * 设置页「联网搜索」一栏：Exa 的 key。
+   * 设置页「联网搜索」一栏：**没有输入框**。
    *
-   * 不填也能搜：走 Exa 免 key 的公开端点（按出口 IP 限额：2 次/秒、50 次/天，同一个
-   * 出口的人共用）。用完了才需要填（见 docs/09）。key 本身服务端不回，只回末尾几位。
-   * 存进库（`meta` 的 `exa_api_key`），**没有环境变量那条路**。
+   * 搜索走 DeepSeek 官方的 Search API（`core/src/search.rs`），key 只认「模型提供商 →
+   * DeepSeek」那一行，而且必须是 **platform.deepseek.com 的官方 key** ——
+   * OpenCode Go / Zen 或中转站的 key 打那个端点是 401（实测过，见 docs/09）。
+   * 所以平时聊天走 OpenCode Go 的话，这一栏仍是「未配置」，得单独填一个官方 key。
    */
-  import { api, post } from "../lib/api";
+  import { api } from "../lib/api";
 
   type Config = {
+    /** 走的是哪家（核心那边是常量，不是用户可选的） */
+    provider: string;
     configured: boolean;
     keyHint: string | null;
   };
 
   let cfg = $state<Config | null>(null);
-  let key = $state("");
-  let busy = $state(false);
   let err = $state("");
 
   async function load() {
@@ -26,66 +27,34 @@
     }
   }
 
+  // 和别的 Section 一个写法：`load` 取出来、`$effect` 只负责触发
   $effect(() => {
     void load();
   });
-
-  async function save(value: string) {
-    busy = true;
-    err = "";
-    try {
-      await post("/api/websearch/config", { exa_api_key: value });
-      key = "";
-      await load();
-    } catch (e) {
-      err = String(e).replace(/^Error: /, "");
-    } finally {
-      busy = false;
-    }
-  }
-
-  const input =
-    "min-w-0 flex-1 rounded-2xl bg-surface px-4 py-3.5 text-row outline-none placeholder:text-faint";
 </script>
 
 {#if cfg}
   <h2 class="px-1 pt-6 pb-2 text-meta text-muted">联网搜索</h2>
-  <div class="flex gap-2">
-    <input
-      bind:value={key}
-      type="password"
-      placeholder={cfg.configured
-        ? `已保存 ${cfg.keyHint ?? ""}，填新的会替换`
-        : "Exa API Key（可选）"}
-      autocapitalize="off"
-      autocorrect="off"
-      spellcheck="false"
-      onkeydown={(e) => e.key === "Enter" && key.trim() && save(key.trim())}
-      class={input}
-    />
-    <button
-      onclick={() => save(key.trim())}
-      disabled={busy || !key.trim()}
-      class="shrink-0 rounded-full bg-fg px-5 text-ui font-medium text-ink disabled:opacity-40"
-    >
-      保存
-    </button>
+  <div class="rounded-2xl bg-surface px-4 py-3.5">
+    <p class="text-row">
+      {cfg.provider}
+      {#if cfg.configured}
+        <span class="text-accent">已配置 {cfg.keyHint ?? ""}</span>
+      {:else}
+        <span class="text-muted">未配置</span>
+      {/if}
+    </p>
+    <p class="pt-1.5 text-meta leading-relaxed text-faint">
+      用的是「模型提供商 → DeepSeek」里的 key，必须是
+      <a href="https://platform.deepseek.com/api_keys" class="text-accent"
+        >platform.deepseek.com</a
+      >
+      的官方 key（OpenCode Go / Zen、中转站的 key 打不通搜索端点，会 401）。按成功的请求计费（5
+      元 / 1000 次，搜不到不计费）。
+      {#if !cfg.configured}
+        去上面那一栏填一个官方 key 就能用。
+      {/if}
+    </p>
   </div>
-  {#if cfg.configured}
-    <button
-      onclick={() => save("")}
-      disabled={busy}
-      class="px-1 pt-2 text-meta text-bad disabled:opacity-40"
-    >
-      清掉这个 key（回到免费额度）
-    </button>
-  {/if}
-  <p class="px-1 pt-2 text-meta leading-relaxed text-faint">
-    不填也能搜：免费额度按出口 IP 算（每天 50 次、每秒 2
-    次，同一个网络的人共用），用完了再填。
-    <a href="https://dashboard.exa.ai/api-keys" class="text-accent"
-      >去 Exa 获取 key</a
-    >
-  </p>
   {#if err}<p class="px-1 pt-2 text-xs text-bad">{err}</p>{/if}
 {/if}
