@@ -161,10 +161,7 @@ const FACE_FALLBACK: ToolFace = {
 };
 
 /** 这个工具的展示信息（`edit` 的图标 / 标题要按参数再判一次） */
-export function faceOf(
-  t: ToolPart,
-  args: Record<string, unknown>,
-): ToolFace {
+export function faceOf(t: ToolPart, args: Record<string, unknown>): ToolFace {
   const f = FACES[t.toolName];
   if (!f) {
     const name = t.toolName || "工具调用";

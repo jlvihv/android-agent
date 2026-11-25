@@ -620,7 +620,10 @@ export class Chat {
    *
    * 事件名见 `#subs` 上面那段。返回值那个 `() => void` 是 `$effect` 的清理约定。
    */
-  on<E extends keyof ChatEvents>(event: E, fn: ChatEvents[E][number]): () => void {
+  on<E extends keyof ChatEvents>(
+    event: E,
+    fn: ChatEvents[E][number],
+  ): () => void {
     const list: ((...a: never[]) => void)[] = this.#subs[event];
     list.push(fn as (...a: never[]) => void);
     return () => {

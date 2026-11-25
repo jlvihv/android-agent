@@ -295,7 +295,10 @@ describe("两路并发：用量 / 排队不串会话", () => {
     await settle();
     net.pushers["a"]!.push(start());
     // 服务端说：A 的 q-a 交给模型了
-    net.pushers["a"]!.push({ type: "data-queued-delivered", data: { ids: ["q-a"] } });
+    net.pushers["a"]!.push({
+      type: "data-queued-delivered",
+      data: { ids: ["q-a"] },
+    });
     await settle();
 
     const a = chat.get("a")!;

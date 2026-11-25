@@ -189,7 +189,9 @@ describe("事件：新会话什么时候进侧边栏", () => {
     expect(events).toContain("started");
     expect(events).toContain("ended");
     // 顺序：created → started → ended
-    expect(events.indexOf("created:s-re")).toBeLessThan(events.indexOf("started"));
+    expect(events.indexOf("created:s-re")).toBeLessThan(
+      events.indexOf("started"),
+    );
     expect(events.indexOf("started")).toBeLessThan(events.indexOf("ended"));
     chat.close();
   });

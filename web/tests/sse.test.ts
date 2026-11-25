@@ -9,7 +9,12 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { applyChunk, parseUiStream, type Message, type UiChunk } from "../src/lib/sse";
+import {
+  applyChunk,
+  parseUiStream,
+  type Message,
+  type UiChunk,
+} from "../src/lib/sse";
 import { applyPatch } from "../src/lib/session";
 
 /** 把几段字节做成一个流。`hang` = 发完不关（学服务端的 keep-alive）。 */
@@ -94,10 +99,7 @@ describe("parseUiStream", () => {
 
   test("`\r\n` 的流也能认（跨片的 `\r` | `\n\r\n`）", async () => {
     const got = await collect(
-      res([
-        'data: {"type":"text-delta","id":"t","delta":"a"}\r',
-        "\n\r\n",
-      ]),
+      res(['data: {"type":"text-delta","id":"t","delta":"a"}\r', "\n\r\n"]),
     );
     expect(got).toHaveLength(1);
     expect(got[0]).toMatchObject({ delta: "a" });

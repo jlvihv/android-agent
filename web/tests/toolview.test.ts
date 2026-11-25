@@ -21,7 +21,9 @@ const tool = (name: string, input: unknown = {}): ToolPart => ({
 
 describe("faceOf", () => {
   test("read：文件图标 + 路径", () => {
-    const f = faceOf(tool("read", { path: "/root/a.txt" }), { path: "/root/a.txt" });
+    const f = faceOf(tool("read", { path: "/root/a.txt" }), {
+      path: "/root/a.txt",
+    });
     expect(f.icon).toBe("file");
     expect(f.title).toBe("读取文件");
     expect(f.summary({ path: "/root/a.txt" })).toBe("读取 /root/a.txt");

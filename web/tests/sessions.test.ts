@@ -96,7 +96,10 @@ describe("more（游标分页）", () => {
   });
 
   test("滚到底会反复触发：别叠请求", async () => {
-    const calls = fakeApi([{ sessions: [], next: "c" }, { sessions: [], next: null }]);
+    const calls = fakeApi([
+      { sessions: [], next: "c" },
+      { sessions: [], next: null },
+    ]);
     const list = new SessionList();
     await list.load();
     await Promise.all([list.more(), list.more(), list.more()]);

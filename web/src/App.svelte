@@ -374,9 +374,12 @@
   // 它们按「**还没发出去**的用户消息」渲染（`done: false`）—— 消息列表里就是
   // 普通用户气泡的样子，只多一圈虚线和左边一个 ×（详见 `Queued` 的注释）。
   const queuedMsgs = $derived(
-    queued.map(
-      (q): Message => ({ id: q.id, role: "user", parts: q.parts, done: false }),
-    ),
+    queued.map((q): Message => ({
+      id: q.id,
+      role: "user",
+      parts: q.parts,
+      done: false,
+    })),
   );
 
   // 左上角那个菜单按钮：窄屏是开抽屉；宽屏是**收 / 展**侧边栏
