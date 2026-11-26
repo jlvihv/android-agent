@@ -20,10 +20,12 @@
 //! - 拿到的只是标题 + 链接 + 摘要。**读全文是另外的事**：静态页面用 bash 的 curl，
 //!   要登录态 / JS 渲染 / 点按钮就用 `browser`。
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::linux::LinuxSandbox;
 use crate::state::AppState;
 
 /// Search 端点。和 chat 同一个 host：`api.deepseek.com`。
@@ -111,38 +113,146 @@ pub async fn run(state: &AppState, query: &str, num: Option<usize>) -> anyhow::R
 // 结果 → 模型看的文本
 // ---------------------------------------------------------------------------
 
-/// 结果 → 一段排好版的文字（**连抬头一起**）。
+/// 整段输出最多这么多字（**不是**每条摘要的字数上限）。
+///
+/// 为什么是整段预算而不是「每条截 400 字」：DeepSeek 返回的 `summary` 是
+/// **600～800 字、本来就是给模型读的**（实测还有 1900+ 字的），把一条完整摘要
+/// 砍在第 400 个字上等于给模型半截话，而它自己还看不出来。整段预算下每条都
+/// 完整，超了就在条与条之间断开，并明说「还有几条没显示」。
+///
+/// 20K 是按钱算的：这段文字进历史 = 进提示词缓存前缀。20K 汉字 ≈ 20K token，
+/// 一次搜索的上下文成本大致和一篇长文档相当 —— 换来的是「搜一次就够，不用
+/// 反复搜同一个东西」。真要看全文仍然让模型自己 `curl` / `browser` 挑着读。
+///
+/// 超了的那几条不丢：写进临时文件，路径跟在正文后面（和 `bash` 输出溢出同一个
+/// 套路，见 `LinuxSandbox::spill_captured`）。模型要那几条没显示的，`read` /
+/// `grep` 那个文件就行，不用再搜一次（再搜一次是要花钱的）。
+const BUDGET: usize = 20_000;
+
+/// 结果 → 给模型看的一段文字（**连抬头一起**）。
 ///
 /// 抬头和正文放在一个函数里：`/api/websearch` 的 JSON 和 `agent search` 的纯文本
 /// 用的是同一段东西，分两处拼就会漂（以前抬头在 `http.rs`、正文在这儿，改一处
 /// 忘一处）。
 ///
-/// 这段文字会进历史、进提示词缓存，所以**按钱算**：每条片段截到 400 字、
-/// 整段封顶 4000 字。要读全文是另一件事，让模型自己挑一条去 `curl` /
-/// `agent browser`。把十篇全文（几十 KB）塞进历史才是真浪费。
-pub fn report(hits: &[Hit]) -> String {
-    let mut out = format!("{} 条 · {}\n\n", hits.len(), provider_name());
+/// 摘要**原样**给（Markdown、代码块、换行都是信息）。超预算时按**条**截停，超出的
+/// 那些整份写进 `spill_dir` 的临时文件（和 `bash` 输出溢出同一个套路），路径附在
+/// 正文后面 —— 不丢数据，也不用再搜一次（再搜是要花钱的）。
+///
+/// 全程只往一个 `String` 里写：不逐条 `format!` 出中间串（每轮一次分配 + 一次
+/// 拷贝），字符数也不重新遍历整个输出 —— 只数刚追加的那一段。超预算就
+/// `truncate` 回退（`String::truncate` 只改长度，O(1)）。
+pub fn report(hits: &[Hit], sandbox: Option<&LinuxSandbox>) -> String {
+    // 抬头 + 每条的大致字数，一次算好容量：省掉长到 20KB 过程中的反复 realloc。
+    // 估算不用准，超了 `push_str` 自己会再涨，少了也不浪费。
+    let estimate = hits
+        .iter()
+        .map(|h| h.title.len() + h.url.len() + h.snippet.len() + 8)
+        .sum::<usize>()
+        .min(BUDGET + 1024)
+        + 64;
+    let mut out = String::with_capacity(estimate);
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "{} 条 · {}\n", hits.len(), provider_name());
     if hits.is_empty() {
         out.push_str(
             "没搜到结果。换个说法，或者用 `agent browser navigate` 打开搜索引擎自己翻。\n",
         );
         return out;
     }
-    let mut chars = 0usize;
+
+    let mut chars = out.chars().count();
+    let mut shown = hits.len();
     for (i, h) in hits.iter().enumerate() {
-        // 摘要原样留着（Markdown、代码块、换行都是信息），只按字数截断 ——
-        // 截断是为了省钱，不是为了"好看"。
-        let snip: String = h.snippet.chars().take(400).collect();
-        let snip = snip.trim().replace('\n', "\n   ");
-        let item = format!("{}. {}\n   {}\n   {}\n", i + 1, h.title, h.url, snip);
-        chars += item.chars().count();
-        out.push_str(&item);
-        if chars > 4000 {
-            out.push_str("…（结果太长，已截断；调小条数或换更准的说法）\n");
+        let mark = out.len();
+        let _ = write!(out, "{}. {}\n   {}\n   ", i + 1, h.title, h.url);
+        // 摘要里的换行跟着缩进，多行也不散架。没有换行时直接借原文，不复制。
+        let snip = h.snippet.trim();
+        if snip.contains('\n') {
+            for (k, line) in snip.split('\n').enumerate() {
+                if k > 0 {
+                    out.push_str("\n   ");
+                }
+                out.push_str(line);
+            }
+        } else {
+            out.push_str(snip);
+        }
+        out.push('\n');
+
+        // 只数刚写进去的这一段，不重新遍历整个输出
+        let added = out[mark..].chars().count();
+        // 第一条无论如何都给：一条都不显示的话，这个回答就没意义了
+        if i > 0 && chars + added > BUDGET {
+            out.truncate(mark);
+            shown = i;
             break;
         }
+        chars += added;
     }
+    if shown == hits.len() {
+        return out;
+    }
+
+    // 超了：**只把没显示的那几条**写进临时文件（正文里已经有的不必再存一份），
+    // 并在正文里说清还有几条、在哪
+    let rest = &hits[shown..];
+    let spilled = sandbox.and_then(|sb| spill(rest, sb));
+    let _ = match &spilled {
+        Some(p) => writeln!(
+            out,
+            "…（到字数上限了，剩余 {} 条结果在 {p}，要看 `read {p}`）",
+            rest.len()
+        ),
+        // 写不进临时文件（没有沙箱 / 磁盘满）只能老实说，别假装有
+        None => writeln!(
+            out,
+            "…（到字数上限了，剩余 {} 条结果没显示；调小条数或换更准的说法）",
+            rest.len()
+        ),
+    };
     out
+}
+
+/// 把**没显示的那几条**写进临时目录（`spill_dir`，`gc` 会按 `agent-out-` 前缀
+/// 清扫），返回**模型看到的**那个路径。
+///
+/// 只存剩下的，不存全文：正文里已经有的那几条，模型已经知道了，再存一份只会让
+/// 它 `read` 的时候把已知内容重读一遍（还白占磁盘）。
+///
+/// 走 `spill_dir` 而不是自己拼 `/tmp`：沙箱里那是 rootfs 的 /tmp（模型能直接
+/// `read`），桌面上就是系统临时目录 —— 两种模式同一个写法，和 bash 溢出一样。
+///
+/// 序号从 1 起重新编（不是接着正文的）：文件是独立的一份，接着编会让模型以为
+/// 前面几条也在这文件里。抬头写明「这是接着正文的那几条」。
+fn spill(rest: &[Hit], sandbox: &LinuxSandbox) -> Option<String> {
+    let (dir, guest_dir) = sandbox.spill_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let name = format!("agent-out-search-{}.md", uuid::Uuid::now_v7());
+    let body_len: usize = rest
+        .iter()
+        .map(|h| h.snippet.len() + h.title.len() + 32)
+        .sum();
+    let mut body = String::with_capacity(body_len + 96);
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        body,
+        "# {} 条 · {}（搜索结果里超出字数上限的那部分）\n",
+        rest.len(),
+        provider_name()
+    );
+    for (i, h) in rest.iter().enumerate() {
+        let _ = writeln!(
+            body,
+            "{}. {}\n   {}\n\n{}\n",
+            i + 1,
+            h.title,
+            h.url,
+            h.snippet.trim()
+        );
+    }
+    std::fs::write(dir.join(&name), body).ok()?;
+    Some(Path::new(&guest_dir).join(&name).display().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -284,5 +394,25 @@ mod tests {
         assert_eq!(hits[0].snippet, "长：**3.21** 发布");
         assert_eq!(hits[1].title, "news.example.org");
         assert_eq!(hits[1].snippet, "只有短摘要");
+    }
+
+    /// 超预算时按**条**截停（不是切半截），并说明还有几条；没沙箱就直说没有路径。
+    #[test]
+    fn 超预算按条截停_不切半截() {
+        let mk = |i: usize| Hit {
+            title: format!("标题 {i}"),
+            url: format!("https://e.com/{i}"),
+            // 每条 8000 字：三条就超 20K
+            snippet: "字".repeat(8000),
+        };
+        let hits: Vec<Hit> = (0..3).map(mk).collect();
+        let text = report(&hits, None);
+        // 第三条整条没要，前两条是完整的（末尾不是半截而被裁掉的痕迹）
+        assert!(text.contains("1. 标题 0"), "第一条要给");
+        assert!(text.contains("2. 标题 1"), "第二条要给");
+        assert!(!text.contains("3. 标题 2"), "第三条超预算，整条不要");
+        assert!(text.contains("剩余 1 条结果没显示"), "{text}");
+        // 8000 个「字」一个都不能少
+        assert!(text.matches('字').count() >= 16_000, "整条摘要都要在");
     }
 }

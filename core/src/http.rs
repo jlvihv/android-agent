@@ -1551,7 +1551,7 @@ async fn web_search(State(st): State<Arc<AppState>>, Json(body): Json<Value>) ->
         .map(|n| n as usize);
     match crate::search::run(&st, query, num).await {
         Ok(hits) => {
-            let output = crate::search::report(&hits);
+            let output = crate::search::report(&hits, st.linux().as_deref());
             if as_text {
                 return text(output);
             }

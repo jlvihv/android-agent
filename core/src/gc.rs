@@ -118,7 +118,8 @@ pub fn sweep(
 
 /// 临时目录里哪些文件名是**我们**留的（别的都别碰，哪怕过期了）。
 ///
-/// - `agent-out-*.log`：bash 输出溢出（`LinuxSandbox::spill_captured`）
+/// - `agent-out-*.log` / `.md`：溢出。bash 的输出（`LinuxSandbox::spill_captured`）
+///   和搜索结果的完整版（`search::spill`）都在这儿
 /// - `<名字>.new` / `.new.2`：`edit` 的 create 模式撞上已存在文件时把内容放这儿了，
 ///   等模型 `mv` 过去（`LinuxSandbox::spill_new_file`）
 fn is_spill_name(name: &str) -> bool {
